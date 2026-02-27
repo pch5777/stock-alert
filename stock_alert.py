@@ -570,36 +570,207 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     }
 
 # ============================================================
-# 중기 눌림목 스캐너 — 테마 종목 전체 스캔
+# 중기 눌림목 스캐너 후보군 자동 확장
+# ============================================================
+_dynamic_candidates = {}   # code → {name, desc, added_ts}
+
+def refresh_dynamic_candidates():
+    """
+    거래량 상위 50종목을 자동으로 후보군에 편입
+    → THEME_MAP에 없는 종목(아주IB투자, 국전약품 등)도 포착 가능
+    매일 장 시작 시 + 1시간마다 갱신
+    """
+    try:
+        # 거래량 급증 상위 종목
+        vol_stocks = get_volume_surge_stocks()
+        # 상한가 근접 상위 종목
+        upper_stocks = get_upper_limit_stocks()
+        candidates = {s["code"]: s["name"] for s in vol_stocks + upper_stocks if s.get("code")}
+        for code, name in candidates.items():
+            if code not in _dynamic_candidates:
+                _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
+        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목")
+    except Exception as e:
+        print(f"⚠️ 동적 후보군 갱신 오류: {e}")
+
+def get_all_scan_candidates() -> list:
+    """
+    THEME_MAP + 동적 후보군 합산 → 중복 제거
+    반환: [(code, name, desc), ...]
+    """
+    seen = set()
+    result = []
+    # THEME_MAP 우선
+    for theme_info in THEME_MAP.values():
+        for c, n in theme_info["stocks"]:
+            if c not in seen:
+                seen.add(c); result.append((c, n, theme_info["desc"]))
+    # 동적 후보군 추가 (THEME_MAP에 없는 종목만)
+    for code, info in _dynamic_candidates.items():
+        if code not in seen:
+            seen.add(code); result.append((code, info["name"], info["desc"]))
+    return result
+
+# ============================================================
+# 장중 실시간 눌림목 돌파 감지
+# ============================================================
+def check_intraday_pullback_breakout(code: str, name: str) -> dict:
+    """
+    어제까지 눌림 완성 + 오늘 장 중 돌파 실시간 감지
+    (일봉 완성 기다리지 않음 → 아주IB투자, 국전약품 같은 케이스 포착)
+
+    조건:
+      - 어제까지 일봉: 1차 급등 이후 눌림 패턴 완성
+      - 오늘 장 중:  거래량 폭발 (5일 평균 3배 이상)
+                     + 현재가 > 어제 종가 (양봉 진행 중)
+                     + 상승률 5% 이상 (돌파 신호)
+    """
+    # 어제까지 데이터로 눌림 패턴 확인 (오늘 제외)
+    items = get_daily_data(code, MID_SURGE_LOOKBACK_DAYS + MID_PULLBACK_DAYS_MAX + 5)
+    if len(items) < 8:
+        return {}
+
+    # 오늘 실시간 데이터
+    cur = get_stock_price(code)
+    if not cur or not cur.get("price"):
+        return {}
+    today_price  = cur["price"]
+    today_chg    = cur["change_rate"]
+    today_vol    = cur["today_vol"]
+    vol_ratio    = cur["volume_ratio"]
+
+    # 최소 조건: 오늘 +5% 이상, 거래량 3배 이상
+    if today_chg < 5.0 or vol_ratio < 3.0:
+        return {}
+
+    # 어제까지 데이터에서 눌림 패턴 확인
+    hist = items[:-1]   # 오늘 제외 (어제까지)
+    if len(hist) < 6:
+        return {}
+
+    prev_close = hist[-1]["close"]  # 어제 종가
+
+    # 1차 급등 탐색 (어제까지 데이터)
+    surge_peak_price = 0; surge_pct = 0; surge_peak_idx = -1
+    for i in range(len(hist)-1, max(0, len(hist)-MID_SURGE_LOOKBACK_DAYS)-1, -1):
+        candidate_high = hist[i]["high"]
+        search_start   = max(0, i - MID_SURGE_LOOKBACK_DAYS)
+        lows = [hist[j]["low"] for j in range(search_start, i+1) if hist[j]["low"]]
+        if not lows: continue
+        base_low = min(lows)
+        pct = (candidate_high - base_low) / base_low * 100
+        if pct >= MID_SURGE_MIN_PCT and candidate_high > surge_peak_price:
+            surge_peak_price = candidate_high; surge_pct = round(pct,1); surge_peak_idx = i
+
+    if surge_peak_idx < 0 or surge_peak_price == 0:
+        return {}
+
+    # 눌림 확인 (고점 이후 ~ 어제까지)
+    after_peak = hist[surge_peak_idx+1:]
+    if not after_peak:
+        return {}
+    pullback_low  = min(d["low"]  for d in after_peak if d["low"])
+    pullback_days = len(after_peak)
+    pullback_pct  = round((surge_peak_price - pullback_low) / surge_peak_price * 100, 1)
+
+    if not (MID_PULLBACK_MIN <= pullback_pct <= MID_PULLBACK_MAX):
+        return {}
+    if not (MID_PULLBACK_DAYS_MIN <= pullback_days <= MID_PULLBACK_DAYS_MAX):
+        return {}
+
+    # 거래량 감소 여부
+    surge_vols    = [d["vol"] for d in hist[max(0,surge_peak_idx-3):surge_peak_idx+1] if d["vol"]]
+    pb_vols       = [d["vol"] for d in after_peak if d["vol"]]
+    avg_surge_vol = sum(surge_vols)/len(surge_vols) if surge_vols else 0
+    avg_pb_vol    = sum(pb_vols)/len(pb_vols) if pb_vols else 0
+    vol_dried     = avg_pb_vol < avg_surge_vol * 0.7 if avg_surge_vol else False
+
+    # 오늘 돌파 강도
+    z    = get_volume_zscore(code, today_vol)
+    rs   = get_relative_strength(today_chg)
+    ma20 = sum(d["close"] for d in hist[-20:])/20 if len(hist)>=20 else 0
+    ma20_dev = round((today_price-ma20)/ma20*100,1) if ma20 else 0
+
+    # 스코어
+    score = 0; reasons = []
+    reasons.append(f"⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)")
+    if surge_pct >= 40: score+=25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
+    elif surge_pct >= 25: score+=20; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
+    else: score+=15; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
+
+    if vol_dried: score+=15; reasons.append(f"✅ 눌림 중 거래량 감소 확인 (건강한 조정)")
+    else: score+=8; reasons.append(f"🟡 눌림 {pullback_pct:.0f}% ({pullback_days}일간)")
+
+    if 15 <= pullback_pct <= 30: score+=15; reasons.append(f"🎯 황금 눌림 구간 ({pullback_pct:.0f}%)")
+    elif pullback_pct < 15: score+=8; reasons.append(f"🟡 얕은 눌림 ({pullback_pct:.0f}%)")
+    else: score+=5; reasons.append(f"🟠 깊은 눌림 ({pullback_pct:.0f}%)")
+
+    # 오늘 돌파 신호 강도
+    if today_chg >= 20: score+=30; reasons.append(f"🚨 오늘 +{today_chg:.0f}% 강력 돌파!")
+    elif today_chg >= 10: score+=20; reasons.append(f"🔥 오늘 +{today_chg:.0f}% 돌파")
+    else: score+=10; reasons.append(f"📈 오늘 +{today_chg:.1f}% 돌파 시작")
+
+    if vol_ratio >= 10: score+=20; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 폭발 (5일 평균 대비)")
+    elif vol_ratio >= 5: score+=15; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 급증")
+    else: score+=8; reasons.append(f"📊 거래량 {vol_ratio:.1f}배")
+
+    if z >= VOL_ZSCORE_MIN: score+=10; reasons.append(f"📊 거래량 Z-score {z:.1f}σ")
+    if rs >= RS_MIN: score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
+    if ma20_dev > 0: score+=5; reasons.append(f"📐 20일선 돌파 (+{ma20_dev:.1f}%)")
+
+    if score < 45:
+        return {}
+
+    grade = "A" if score>=80 else "B" if score>=60 else "C"
+    entry = today_price
+    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+
+    return {
+        "code": code, "name": name, "price": today_price, "change_rate": today_chg,
+        "volume_ratio": vol_ratio, "signal_type": "MID_PULLBACK",
+        "is_intraday": True,   # 장중 돌파 표시
+        "grade": grade, "score": score,
+        "surge_pct": surge_pct, "pullback_pct": pullback_pct, "pullback_days": pullback_days,
+        "current_pullback": round((surge_peak_price-today_price)/surge_peak_price*100,1),
+        "vol_dried": vol_dried, "vol_recovered": True, "is_bullish": True,
+        "ma20_dev": ma20_dev, "rs": rs, "vol_zscore": z,
+        "entry_price": entry, "stop_loss": stop, "target_price": target,
+        "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
+        "reasons": reasons, "detected_at": datetime.now(),
+    }
+
+# ============================================================
+# 중기 눌림목 스캐너 — THEME_MAP + 동적 후보군 전체 스캔
 # ============================================================
 def run_mid_pullback_scan():
     """
-    5분마다 THEME_MAP 전체 종목 중기 눌림목 체크
-    → 조건 충족 시 텔레그램 알림
+    5분마다 전체 후보군 중기 눌림목 체크
+    ① 일봉 완성 기준 중기 눌림목 (THEME_MAP + 동적 후보군)
+    ② 장중 실시간 돌파 감지 (거래량 급증 종목 즉시 체크)
     """
     if not is_market_open() or _bot_paused:
         return
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 중기 눌림목 스캔...", flush=True)
 
-    all_codes = []
-    for theme_info in THEME_MAP.values():
-        all_codes.extend([(c, n, theme_info["desc"]) for c, n in theme_info["stocks"]])
-    # 중복 제거
-    seen = set()
-    unique_codes = []
-    for c, n, d in all_codes:
-        if c not in seen:
-            seen.add(c); unique_codes.append((c, n, d))
+    # 동적 후보군 갱신 (30분마다)
+    if not _dynamic_candidates or time.time() - min(
+            v["added_ts"] for v in _dynamic_candidates.values()) > 1800:
+        refresh_dynamic_candidates()
 
+    all_candidates = get_all_scan_candidates()
     signals = []
-    for code, name, theme_desc in unique_codes:
+
+    for code, name, theme_desc in all_candidates:
         if time.time() - _mid_pullback_alert_history.get(code, 0) < MID_ALERT_COOLDOWN:
             continue
         try:
+            # ① 일봉 기준 중기 눌림목
             result = analyze_mid_pullback(code, name)
+            if not result:
+                # ② 일봉 패턴 미완성이면 장중 돌파 감지로 재시도
+                result = check_intraday_pullback_breakout(code, name)
             if result:
                 result["theme_desc"] = theme_desc
-                # 섹터 모멘텀 추가
                 sector_info = calc_sector_momentum(code, name)
                 result["sector_info"] = sector_info
                 result["score"] += sector_info.get("bonus", 0)
@@ -617,7 +788,8 @@ def run_mid_pullback_scan():
     for s in signals[:3]:  # 상위 3개만
         send_mid_pullback_alert(s)
         _mid_pullback_alert_history[s["code"]] = time.time()
-        print(f"  ✓ 중기 눌림목: {s['name']} [{s['grade']}등급] {s['score']}점")
+        tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+        print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
 
 def send_mid_pullback_alert(s: dict):
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
@@ -632,8 +804,9 @@ def send_mid_pullback_alert(s: dict):
         sector_block = (f"\n🏭 섹터 동반: <b>{len(si['rising'])}/{len(si.get('detail',[]))}개</b> 상승 중\n"
                         + "".join([f"  📈 {r['name']} {r['change_rate']:+.1f}%\n" for r in si["rising"][:4]]))
 
+    intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     send(
-        f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}\n"
+        f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
         f"<b>{s['name']}</b>  ({s['code']})\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -717,24 +890,87 @@ def get_investor_trend(code: str) -> dict:
 # 섹터 모멘텀
 # ============================================================
 def get_sector_stocks_from_kis(code: str) -> list:
+    """
+    동일 업종 종목 조회 (3단계 폴백)
+
+    1순위: 거래량 급증 + 상한가 근접 종목 중 업종코드 직접 매칭
+           → 실제 장 중 움직이는 동업종 종목만 추출 (가장 실용적)
+    2순위: 등락률 상위 조회 전체에서 업종코드 필터
+    3순위: 그래도 없으면 빈 결과 (업종 조회 실패 표시)
+    """
     cached = _sector_cache.get(code)
-    if cached and time.time() - cached["ts"] < 3600: return cached["stocks"]
+    if cached and time.time() - cached["ts"] < 3600:
+        return cached["stocks"]
     try:
-        data  = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
-                          "FHKST01010100", {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code})
-        o     = data.get("output",{})
-        bstp_code = o.get("bstp_cls_code","")
-        bstp_name = o.get("bstp_kor_isnm","")
-        if not bstp_code: return []
-        data2  = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-member",
-                           "FHPST02430000",
-                           {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":bstp_code,"FID_INPUT_CNT_1":"20"})
-        stocks = [(i.get("mksc_shrn_iscd",""),i.get("hts_kor_isnm",""))
-                  for i in data2.get("output",[])
-                  if i.get("mksc_shrn_iscd") and i.get("mksc_shrn_iscd") != code][:10]
-        _sector_cache[code] = {"sector":bstp_name,"stocks":stocks,"ts":time.time()}
+        # 1단계: 해당 종목의 업종 코드·이름 조회
+        data      = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+                              "FHKST01010100",
+                              {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code})
+        o         = data.get("output", {})
+        bstp_code = o.get("bstp_cls_code", "")
+        bstp_name = o.get("bstp_kor_isnm", "") or "동일업종"
+
+        if not bstp_code:
+            _sector_cache[code] = {"sector":"업종미상","stocks":[],"ts":time.time()}
+            return []
+
+        stocks = []
+
+        # 2단계: 거래량 상위 + 상한가 근접 종목을 각각 업종코드 조회해서 매칭
+        # → "지금 같이 움직이는 종목"을 실시간으로 찾는 가장 실용적인 방법
+        candidates = {}
+        try:
+            for s in get_volume_surge_stocks() + get_upper_limit_stocks():
+                if s.get("code") and s["code"] != code:
+                    candidates[s["code"]] = s["name"]
+        except: pass
+
+        for peer_code, peer_name in list(candidates.items())[:30]:
+            if len(stocks) >= 8: break
+            try:
+                d2 = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+                               "FHKST01010100",
+                               {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":peer_code})
+                peer_bstp = d2.get("output",{}).get("bstp_cls_code","")
+                if peer_bstp == bstp_code:
+                    stocks.append((peer_code, peer_name))
+                time.sleep(0.1)
+            except: continue
+
+        # 3단계: 위에서도 없으면 등락률 상위 전체에서 한번 더 시도
+        if not stocks:
+            try:
+                data3 = _safe_get(
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
+                    "FHPST01700000",
+                    {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170",
+                     "FID_INPUT_ISCD":"0000","FID_RANK_SORT_CLS_CODE":"0",
+                     "FID_INPUT_CNT_1":"50","FID_PRC_CLS_CODE":"0",
+                     "FID_INPUT_PRICE_1":"500","FID_INPUT_PRICE_2":"",
+                     "FID_VOL_CNT":"1000","FID_TRGT_CLS_CODE":"0",
+                     "FID_TRGT_EXLS_CLS_CODE":"0","FID_DIV_CLS_CODE":"0",
+                     "FID_RSFL_RATE1":"-30","FID_RSFL_RATE2":"30"}
+                )
+                for i in data3.get("output",[]):
+                    peer_code = i.get("mksc_shrn_iscd","")
+                    if not peer_code or peer_code == code: continue
+                    try:
+                        d4 = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+                                       "FHKST01010100",
+                                       {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":peer_code})
+                        if d4.get("output",{}).get("bstp_cls_code","") == bstp_code:
+                            stocks.append((peer_code, i.get("hts_kor_isnm","")))
+                        time.sleep(0.1)
+                    except: continue
+                    if len(stocks) >= 6: break
+            except: pass
+
+        _sector_cache[code] = {"sector": bstp_name, "stocks": stocks, "ts": time.time()}
+        print(f"  🏭 [{bstp_name}] 동업종 {len(stocks)}개 조회됨 (업종코드: {bstp_code})")
         return stocks
-    except: return []
+    except Exception as e:
+        print(f"⚠️ 섹터 조회 오류 ({code}): {e}")
+        return []
 
 def get_theme_sector_stocks(code: str) -> tuple:
     for theme_key, theme_info in THEME_MAP.items():
@@ -865,13 +1101,30 @@ def send(text: str):
 
 def _sector_block(s: dict) -> str:
     si = s.get("sector_info")
-    if not si or not si.get("detail"): return ""
-    block = f"🏭 <b>섹터 모멘텀</b> [{si.get('theme','')}]  +{si.get('bonus',0)}점\n"
-    for r in si.get("rising",[])[:5]:
-        block += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>" \
-                 + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
-    for r in si.get("flat",[])[:3]:
-        block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+    if not si:
+        return ""
+
+    theme   = si.get("theme", "")
+    bonus   = si.get("bonus", 0)
+    summary = si.get("summary", "")
+    rising  = si.get("rising", [])
+    flat    = si.get("flat", [])
+    detail  = si.get("detail", [])
+
+    # detail이 아예 없으면 (업종 조회 실패) → 간단 메시지만
+    if not detail:
+        return f"🏭 섹터: {summary if summary else '업종 조회 실패 (API 제한)'}\n━━━━━━━━━━━━━━━\n\n"
+
+    block = f"🏭 <b>섹터 모멘텀</b> [{theme}]"
+    block += f"  +{bonus}점\n" if bonus > 0 else "\n"
+    block += f"  {summary}\n"
+
+    for r in rising[:5]:
+        vol_tag = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
+        block  += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}\n"
+    for r in flat[:3]:
+        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+
     return block + "━━━━━━━━━━━━━━━\n\n"
 
 def send_alert(s: dict):
@@ -1358,29 +1611,28 @@ def run_scan():
 # ============================================================
 if __name__ == "__main__":
     print("="*55)
-    print("📈 KIS 주식 급등 알림 봇 v14 시작")
+    print("📈 KIS 주식 급등 알림 봇 v14.1 시작")
     print("="*55)
 
     load_carry_stocks()
     load_tracker_feedback()
+    refresh_dynamic_candidates()   # 시작 시 동적 후보군 초기 로딩
 
     send(
-        "🤖 <b>주식 급등 알림 봇 ON (v14)</b>\n\n"
+        "🤖 <b>주식 급등 알림 봇 ON (v14.1)</b>\n\n"
         "✅ 한국투자증권 API 연결\n\n"
         "<b>📡 스캔 주기</b>\n"
         "• 당일 급등/상한가: 1분\n"
         "• <b>중기 눌림목 스캔: 5분</b>\n"
         "• 뉴스 (3개 소스): 2분\n"
         "• DART 공시: 3분  |  종합: 15:30\n\n"
-        "<b>⭐ v14 신규 — 퀀트펀드 원리 적용</b>\n"
-        "🏆 중기 눌림목 스캐너 (A/B/C 등급)\n"
-        "  ├ 1차 급등 확인 (20일 내 +15%↑)\n"
-        "  ├ 건강한 눌림 확인 (거래량 감소)\n"
-        "  ├ 재상승 시작 신호 (양봉+거래량 회복)\n"
-        "  └ 황금 눌림 구간 (15~30%) 우선\n"
-        "📐 20일선 괴리율 (평균회귀 필터)\n"
-        "💪 코스피 상대강도 (시장 중립)\n"
-        "📊 거래량 Z-score (통계적 이상 탐지)\n\n"
+        "<b>⭐ v14.1 개선 — 포착률 향상</b>\n"
+        "🔍 <b>전체 시장 자동 편입</b>\n"
+        "  └ 거래량·상한가 상위 종목 자동 스캔\n"
+        "     (THEME_MAP 미등록 종목도 포착)\n"
+        "⚡️ <b>장중 실시간 돌파 감지</b>\n"
+        "  └ 어제까지 눌림 완성 + 오늘 장중 거래량\n"
+        "     폭발 순간 즉시 알림\n\n"
         "<b>💬 명령어</b>  /status  /list  /stop  /resume"
     )
 
@@ -1391,6 +1643,7 @@ if __name__ == "__main__":
     schedule.every(30).seconds.do(poll_telegram_commands)
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
         _clear_all_cache(),
+        refresh_dynamic_candidates(),
         send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
              f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
     ))
