@@ -167,10 +167,17 @@ _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
 _bot_paused         = False
-_mid_pullback_alert_history = {}   # 중기 눌림목 알림 이력
+_mid_pullback_alert_history = {}
 _early_feedback     = {"total": 0, "success": 0}
 _early_price_min_dynamic  = EARLY_PRICE_MIN
 _early_volume_min_dynamic = EARLY_VOLUME_MIN
+
+# ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
+_dynamic_theme_map  = {}   # theme_key → {desc, reason, stocks:[(code,name)], ts}
+DYNAMIC_THEME_FILE  = "dynamic_themes.json"
+CORR_MIN            = 0.70   # 피어슨 상관계수 최소값
+CORR_LOOKBACK       = 20     # 상관관계 계산 기간 (일)
+NEWS_COOCCUR_FILE   = "news_cooccur.json"  # 뉴스 공동언급 저장
 
 # ============================================================
 # 🕐 시간 유틸
@@ -425,7 +432,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         if not base_low:
             continue
         pct = (candidate_high - base_low) / base_low * 100
-        if pct >= MID_SURGE_MIN_PCT and candidate_high > surge_peak_price:
+        if pct >= _dynamic["mid_surge_min_pct"] and candidate_high > surge_peak_price:
             surge_peak_price = candidate_high
             surge_from_price = base_low
             surge_peak_idx   = i
@@ -445,7 +452,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     pullback_pct   = round((surge_peak_price - pullback_low) / surge_peak_price * 100, 1)
 
     # 눌림 깊이·기간 검증
-    if not (MID_PULLBACK_MIN <= pullback_pct <= MID_PULLBACK_MAX):
+    if not (_dynamic["mid_pullback_min"] <= pullback_pct <= _dynamic["mid_pullback_max"]):
         return {}
     if not (MID_PULLBACK_DAYS_MIN <= pullback_days <= MID_PULLBACK_DAYS_MAX):
         return {}
@@ -467,7 +474,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     is_bullish = today_close > today_open if today_open else False
 
     # 거래량 회복 (눌림 평균 대비)
-    vol_recovered = (today_vol >= avg_pullback_vol * MID_VOL_RECOVERY_MIN) if avg_pullback_vol else False
+    vol_recovered = (today_vol >= avg_pullback_vol * _dynamic["mid_vol_recovery"]) if avg_pullback_vol else False
 
     # 20일 이동평균 계산
     ma_items = items[-20:]
@@ -659,7 +666,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         if not lows: continue
         base_low = min(lows)
         pct = (candidate_high - base_low) / base_low * 100
-        if pct >= MID_SURGE_MIN_PCT and candidate_high > surge_peak_price:
+        if pct >= _dynamic["mid_surge_min_pct"] and candidate_high > surge_peak_price:
             surge_peak_price = candidate_high; surge_pct = round(pct,1); surge_peak_idx = i
 
     if surge_peak_idx < 0 or surge_peak_price == 0:
@@ -673,7 +680,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     pullback_days = len(after_peak)
     pullback_pct  = round((surge_peak_price - pullback_low) / surge_peak_price * 100, 1)
 
-    if not (MID_PULLBACK_MIN <= pullback_pct <= MID_PULLBACK_MAX):
+    if not (_dynamic["mid_pullback_min"] <= pullback_pct <= _dynamic["mid_pullback_max"]):
         return {}
     if not (MID_PULLBACK_DAYS_MIN <= pullback_days <= MID_PULLBACK_DAYS_MAX):
         return {}
@@ -787,6 +794,7 @@ def run_mid_pullback_scan():
     signals.sort(key=lambda x: x["score"], reverse=True)
     for s in signals[:3]:  # 상위 3개만
         send_mid_pullback_alert(s)
+        save_signal_log(s)   # ★ 결과 자동 추적 등록
         _mid_pullback_alert_history[s["code"]] = time.time()
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
@@ -798,11 +806,28 @@ def send_mid_pullback_alert(s: dict):
     reasons     = "\n".join(s["reasons"])
     atr_tag     = " (ATR)" if s.get("atr_used") else " (고정)"
 
-    sector_block = ""
-    si = s.get("sector_info")
-    if si and si.get("rising"):
-        sector_block = (f"\n🏭 섹터 동반: <b>{len(si['rising'])}/{len(si.get('detail',[]))}개</b> 상승 중\n"
-                        + "".join([f"  📈 {r['name']} {r['change_rate']:+.1f}%\n" for r in si["rising"][:4]]))
+    si = s.get("sector_info") or {}
+    theme     = si.get("theme", "")
+    rising    = si.get("rising", [])
+    flat      = si.get("flat", [])
+    detail    = si.get("detail", [])
+    si_summary = si.get("summary", "")
+    bonus     = si.get("bonus", 0)
+
+    if detail:
+        bonus_tag    = f"  +{bonus}점" if bonus > 0 else ""
+        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 <b>섹터 모멘텀</b> [{theme}]{bonus_tag}\n"
+        if si_summary:
+            sector_block += f"  {si_summary}\n"
+        for r in rising[:5]:
+            vol_tag       = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
+            sector_block += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}\n"
+        for r in flat[:3]:
+            sector_block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+    elif theme:
+        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
+    else:
+        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터: 조회 실패\n"
 
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     send(
@@ -824,8 +849,8 @@ def send_mid_pullback_alert(s: dict):
         f"💰 현재가: <b>{s['price']:,}원</b>  ({s['change_rate']:+.1f}%)\n"
         f"🎯 진입가: <b>{s['entry_price']:,}원</b>\n"
         f"🛡 손절가: <b>{s['stop_loss']:,}원</b>  (-{s['stop_pct']:.1f}%){atr_tag}\n"
-        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{s['target_pct']:.1f}%){atr_tag}\n\n"
-        f"⚠️ 투자 판단은 본인 책임입니다"
+        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{s['target_pct']:.1f}%){atr_tag}"
+        + _chart_links(s["code"], s["name"])
     )
 
 # ============================================================
@@ -972,28 +997,263 @@ def get_sector_stocks_from_kis(code: str) -> list:
         print(f"⚠️ 섹터 조회 오류 ({code}): {e}")
         return []
 
+# ============================================================
+# ① 가격 상관관계 기반 동적 테마 탐지
+# ============================================================
+def calc_price_correlation(code_a: str, code_b: str) -> float:
+    """두 종목의 최근 N일 수익률 피어슨 상관계수 계산"""
+    try:
+        items_a = get_daily_data(code_a, CORR_LOOKBACK + 5)
+        items_b = get_daily_data(code_b, CORR_LOOKBACK + 5)
+        closes_a = [i["close"] for i in items_a[-CORR_LOOKBACK:] if i["close"]]
+        closes_b = [i["close"] for i in items_b[-CORR_LOOKBACK:] if i["close"]]
+        n = min(len(closes_a), len(closes_b))
+        if n < 10:
+            return 0.0
+        # 일간 수익률로 변환
+        rets_a = [(closes_a[i] - closes_a[i-1]) / closes_a[i-1] for i in range(1, n)]
+        rets_b = [(closes_b[i] - closes_b[i-1]) / closes_b[i-1] for i in range(1, n)]
+        n2 = len(rets_a)
+        mean_a = sum(rets_a) / n2
+        mean_b = sum(rets_b) / n2
+        cov  = sum((rets_a[i]-mean_a)*(rets_b[i]-mean_b) for i in range(n2)) / n2
+        std_a = math.sqrt(sum((r-mean_a)**2 for r in rets_a) / n2)
+        std_b = math.sqrt(sum((r-mean_b)**2 for r in rets_b) / n2)
+        if std_a == 0 or std_b == 0:
+            return 0.0
+        return round(cov / (std_a * std_b), 3)
+    except:
+        return 0.0
+
+def build_correlation_theme(code: str, name: str) -> list:
+    """
+    급등 종목과 상관관계 높은 종목들을 탐색 → 동적 테마 구성
+    거래량 상위 + 상한가 상위에서 후보 선정 → 상관계수 0.7 이상만 채택
+    캐시 1시간
+    """
+    cache_key = f"corr_{code}"
+    cached = _sector_cache.get(cache_key)
+    if cached and time.time() - cached["ts"] < 3600:
+        return cached["peers"]
+
+    try:
+        candidates = {}
+        for s in (get_volume_surge_stocks() + get_upper_limit_stocks()):
+            c = s.get("code","")
+            if c and c != code:
+                candidates[c] = s.get("name", c)
+        # 최대 20개 후보만 계산 (API 부하 방지)
+        peers = []
+        for peer_code, peer_name in list(candidates.items())[:20]:
+            corr = calc_price_correlation(code, peer_code)
+            if corr >= CORR_MIN:
+                peers.append((peer_code, peer_name, corr))
+            time.sleep(0.05)
+        peers.sort(key=lambda x: x[2], reverse=True)
+        result = [(c, n) for c, n, _ in peers[:6]]
+        _sector_cache[cache_key] = {"peers": result, "ts": time.time()}
+        if result:
+            print(f"  🔗 [{name}] 가격 상관관계 종목 {len(result)}개: {[n for _,n in result]}")
+        return result
+    except Exception as e:
+        print(f"⚠️ 상관관계 계산 오류 ({code}): {e}")
+        return []
+
+# ============================================================
+# ② 뉴스 공동언급 기반 테마 자동 확장
+# ============================================================
+_news_cooccur = {}   # code → {peers: {code: count}, last_headline: str, ts}
+
+def extract_stock_mentions(headlines: list, known_stocks: dict) -> dict:
+    """
+    뉴스 헤드라인에서 종목명 추출 → 같은 기사에 함께 언급된 종목 쌍 기록
+    known_stocks: {code: name}
+    """
+    cooccur = {}   # code → {peer_code: count}
+    for headline in headlines:
+        mentioned = [code for code, name in known_stocks.items() if name in headline]
+        if len(mentioned) < 2:
+            continue
+        for i, c1 in enumerate(mentioned):
+            for c2 in mentioned[i+1:]:
+                cooccur.setdefault(c1, {}).setdefault(c2, 0)
+                cooccur[c1][c2] += 1
+                cooccur.setdefault(c2, {}).setdefault(c1, 0)
+                cooccur[c2][c1] += 1
+    return cooccur
+
+def update_news_cooccur(headlines: list):
+    """뉴스 공동언급 DB 업데이트 (뉴스 스캔 시마다 호출)"""
+    global _news_cooccur
+    # 알려진 종목 풀 구성 (THEME_MAP + 동적 후보군)
+    known = {}
+    for ti in THEME_MAP.values():
+        for c, n in ti["stocks"]:
+            known[c] = n
+    for c, info in _dynamic_candidates.items():
+        known[c] = info["name"]
+
+    new_pairs = extract_stock_mentions(headlines, known)
+    for code, peers in new_pairs.items():
+        if code not in _news_cooccur:
+            _news_cooccur[code] = {"peers": {}, "ts": time.time()}
+        for peer_code, cnt in peers.items():
+            prev = _news_cooccur[code]["peers"].get(peer_code, 0)
+            _news_cooccur[code]["peers"][peer_code] = prev + cnt
+        _news_cooccur[code]["ts"] = time.time()
+
+    # 파일 저장 (장 마감 후 분석용)
+    try:
+        with open(NEWS_COOCCUR_FILE, "w") as f:
+            json.dump(_news_cooccur, f, ensure_ascii=False, indent=2)
+    except: pass
+
+def get_news_cooccur_peers(code: str) -> list:
+    """뉴스에서 함께 언급된 횟수 상위 종목 반환 [(code, name, count)]"""
+    if code not in _news_cooccur:
+        return []
+    peers_raw = _news_cooccur[code]["peers"]
+    # 알려진 종목 이름 역매핑
+    name_map = {}
+    for ti in THEME_MAP.values():
+        for c, n in ti["stocks"]: name_map[c] = n
+    for c, info in _dynamic_candidates.items():
+        name_map[c] = info["name"]
+
+    result = sorted(
+        [(c, name_map.get(c, c), cnt) for c, cnt in peers_raw.items() if cnt >= 2],
+        key=lambda x: x[2], reverse=True
+    )
+    return result[:6]
+
+# ============================================================
+# ③ THEME_MAP 자동 업데이트 (급등 감지 시 호출)
+# ============================================================
+def auto_update_theme(code: str, name: str, trigger: str = "급등"):
+    """
+    급등/상한가/중기눌림목 포착 시 해당 종목의 상관관계 종목을 동적 테마로 등록
+    trigger: 왜 이 테마가 만들어졌는지 (알림에 표시됨)
+    """
+    global _dynamic_theme_map
+
+    # 이미 등록된 테마면 스킵
+    for tk, ti in _dynamic_theme_map.items():
+        if code in [c for c, _ in ti["stocks"]]:
+            return
+
+    # 가격 상관관계 + 뉴스 공동언급 통합
+    corr_peers  = build_correlation_theme(code, name)        # [(code, name)]
+    news_peers_raw = get_news_cooccur_peers(code)            # [(code, name, count)]
+    news_peers  = [(c, n) for c, n, _ in news_peers_raw]
+
+    # 합산 (중복 제거)
+    seen = set()
+    all_peers = []
+    for c, n in (corr_peers + news_peers):
+        if c not in seen and c != code:
+            seen.add(c); all_peers.append((c, n))
+
+    if not all_peers:
+        return
+
+    # 이유 설명 생성
+    reasons = []
+    if corr_peers:
+        reasons.append(f"가격 상관관계 {len(corr_peers)}종목")
+    if news_peers:
+        reasons.append(f"뉴스 공동언급 {len(news_peers)}종목")
+    reason_str = " + ".join(reasons)
+
+    theme_key = f"auto_{code}_{datetime.now().strftime('%m%d')}"
+    _dynamic_theme_map[theme_key] = {
+        "desc":   f"{name} 연관 테마 ({trigger})",
+        "reason": reason_str,
+        "stocks": [(code, name)] + all_peers,
+        "ts":     time.time(),
+    }
+    print(f"  🆕 동적 테마 생성: [{theme_key}] {name} + {[n for _,n in all_peers]} ({reason_str})")
+
+    # 파일 저장
+    try:
+        with open(DYNAMIC_THEME_FILE, "w") as f:
+            json.dump({k: {**v, "stocks": v["stocks"]} for k,v in _dynamic_theme_map.items()},
+                      f, ensure_ascii=False, indent=2)
+    except: pass
+
+def load_dynamic_themes():
+    """장 시작 시 동적 테마 파일 복원"""
+    global _dynamic_theme_map
+    try:
+        with open(DYNAMIC_THEME_FILE, "r") as f:
+            data = json.load(f)
+        # 오늘 날짜 것만 유지
+        today = datetime.now().strftime("%m%d")
+        _dynamic_theme_map = {k: v for k, v in data.items() if today in k or
+                               time.time() - v.get("ts", 0) < 86400}
+        if _dynamic_theme_map:
+            print(f"  📂 동적 테마 {len(_dynamic_theme_map)}개 복원")
+    except: pass
+
 def get_theme_sector_stocks(code: str) -> tuple:
-    for theme_key, theme_info in THEME_MAP.items():
-        if code in [c for c,_ in theme_info["stocks"]]:
-            return theme_key, [(c,n) for c,n in theme_info["stocks"] if c != code]
-    return "기타업종", get_sector_stocks_from_kis(code)
+    """
+    종목 코드 → (테마명, [(peer_code, peer_name)]) 반환
+    우선순위:
+      1. 하드코딩 THEME_MAP
+      2. 동적 테마맵 (가격상관관계 + 뉴스 공동언급으로 자동 생성)
+      3. KIS 업종코드 매칭
+    각 소스를 병합해서 가장 풍부한 정보 제공
+    """
+    peers_all = {}   # code → (name, source, reason)
+
+    # 1. THEME_MAP
+    theme_name = "기타업종"
+    for tk, ti in THEME_MAP.items():
+        if code in [c for c,_ in ti["stocks"]]:
+            theme_name = tk
+            for c, n in ti["stocks"]:
+                if c != code:
+                    peers_all[c] = (n, "테마", tk)
+            break
+
+    # 2. 동적 테마맵
+    dyn_reason = ""
+    for tk, ti in _dynamic_theme_map.items():
+        if code in [c for c,_ in ti["stocks"]]:
+            if theme_name == "기타업종":
+                theme_name = ti["desc"]
+            dyn_reason = ti.get("reason", "")
+            for c, n in ti["stocks"]:
+                if c != code and c not in peers_all:
+                    peers_all[c] = (n, "동적테마", ti["desc"])
+            break
+
+    # 3. KIS 업종코드 매칭 (나머지 채우기용)
+    kis_peers = get_sector_stocks_from_kis(code)
+    for c, n in kis_peers:
+        if c not in peers_all:
+            peers_all[c] = (n, "업종코드", "")
+
+    peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
+    return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
 
 def calc_sector_momentum(code: str, name: str) -> dict:
-    theme_name, peers = get_theme_sector_stocks(code)
+    theme_name, peers, peers_all = get_theme_sector_stocks(code)
     if not peers:
-        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[]}
+        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
     results = []
     for peer_code, peer_name in peers[:8]:
         try:
             cur = get_stock_price(peer_code)
             if not cur: continue
             cr, vr = cur.get("change_rate",0), cur.get("volume_ratio",0)
+            src, rsn = peers_all.get(peer_code, (peer_name, "업종코드", ""))[1:]
             results.append({"code":peer_code,"name":peer_name,"change_rate":cr,"volume_ratio":vr,
-                             "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0})
+                             "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0,
+                             "source":src, "reason":rsn})
             time.sleep(0.15)
         except: continue
     if not results:
-        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[]}
+        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
     total, react_cnt = len(results), sum(1 for r in results if r["weak"])
     strong_cnt = sum(1 for r in results if r["strong"])
     react_ratio = react_cnt / total
@@ -1005,22 +1265,86 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     elif react_ratio >= 1.0:  summary = f"🔥 섹터 전체 동반 상승! ({theme_name}: {react_cnt}/{total})"
     elif react_ratio >= 0.5:  summary = f"✅ 섹터 절반 이상 반응 ({theme_name}: {react_cnt}/{total})"
     else:                     summary = f"🟡 섹터 일부 반응 ({theme_name}: {react_cnt}/{total})"
+
+    # 소스별 분류 (알림에 '왜 묶였는지' 표시용)
+    sources = {}
+    for r in results:
+        src = r.get("source","업종코드")
+        sources.setdefault(src, []).append(r["name"])
+
     return {"bonus":bonus,"theme":theme_name,"summary":summary,
-            "rising":rising,"flat":flat,"detail":results}
+            "rising":rising,"flat":flat,"detail":results,"sources":sources}
 
 # ============================================================
 # 💾 저장·복원
 # ============================================================
-def save_early_detect(stock: dict):
+# ============================================================
+# 📋 신호 로그 저장 (모든 신호 유형 공통)
+# ============================================================
+SIGNAL_LOG_FILE = "signal_log.json"   # 모든 신호 추적 (신규)
+
+def save_signal_log(stock: dict):
+    """
+    알림 발송된 모든 신호를 로그에 저장
+    - UPPER_LIMIT / NEAR_UPPER / SURGE / EARLY_DETECT / MID_PULLBACK / ENTRY_POINT
+    - 이후 track_signal_results()가 목표가·손절가 도달 여부를 자동 체크
+    """
     try:
         data = {}
         try:
-            with open(EARLY_LOG_FILE,"r") as f: data = json.load(f)
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+
+        code     = stock["code"]
+        sig_type = stock.get("signal_type", "UNKNOWN")
+        # 같은 종목이 이미 추적 중이면 업데이트하지 않음 (중복 방지)
+        log_key  = f"{code}_{stock.get('detected_at', datetime.now()).strftime('%Y%m%d%H%M')}"
+
+        data[log_key] = {
+            "log_key":      log_key,
+            "code":         code,
+            "name":         stock["name"],
+            "signal_type":  sig_type,
+            "score":        stock.get("score", 0),
+            "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
+            "sector_theme": stock.get("sector_info", {}).get("theme", ""),
+            "detect_date":  datetime.now().strftime("%Y%m%d"),
+            "detect_time":  datetime.now().strftime("%H:%M:%S"),
+            "detect_price": stock["price"],
+            "change_at_detect": stock.get("change_rate", 0),
+            "volume_ratio": stock.get("volume_ratio", 0),
+            "entry_price":  stock.get("entry_price", stock["price"]),
+            "stop_price":   stock.get("stop_loss", 0),
+            "target_price": stock.get("target_price", 0),
+            "atr_used":     stock.get("atr_used", False),
+            # 추적 결과 (초기값)
+            "status":       "추적중",
+            "exit_price":   0,
+            "exit_date":    "",
+            "exit_time":    "",
+            "pnl_pct":      0.0,
+            "exit_reason":  "",   # "목표가", "손절가", "시간초과", "수동"
+            "max_price":    stock["price"],   # 추적 중 최고가 (MDD 계산용)
+            "min_price":    stock["price"],   # 추적 중 최저가
+        }
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
+    except Exception as e:
+        print(f"⚠️ 신호 저장 오류: {e}")
+
+# 하위 호환성 유지 (기존 EARLY_LOG_FILE도 동시에 저장)
+def save_early_detect(stock: dict):
+    save_signal_log(stock)
+    try:
+        data = {}
+        try:
+            with open(EARLY_LOG_FILE, "r") as f: data = json.load(f)
         except: pass
         code = stock["code"]
         if code not in data:
             data[code] = {
-                "code":code,"name":stock["name"],
+                "code": code, "name": stock["name"],
                 "detect_time":  datetime.now().strftime("%H:%M"),
                 "detect_date":  datetime.now().strftime("%Y%m%d"),
                 "detect_price": stock["price"],
@@ -1029,12 +1353,166 @@ def save_early_detect(stock: dict):
                 "entry_price":  stock["entry_price"],
                 "stop_price":   stock["stop_loss"],
                 "target_price": stock["target_price"],
-                "status":"추적중","pnl_pct":0,"exit_price":0,"exit_date":"",
+                "signal_type":  stock.get("signal_type", "EARLY_DETECT"),
+                "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
+                "status": "추적중", "pnl_pct": 0, "exit_price": 0, "exit_date": "",
             }
-            with open(EARLY_LOG_FILE,"w") as f:
+            with open(EARLY_LOG_FILE, "w") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ EARLY 저장 오류: {e}")
+
+# ============================================================
+# 📡 신호 결과 자동 추적 (매 스캔마다 호출)
+# ============================================================
+# 추적 제한 시간: 신호 발생 후 최대 N일
+TRACK_MAX_DAYS   = 5
+# 시간 초과 시 당일 종가 기준으로 결과 기록
+TRACK_TIMEOUT_RESULT = "시간초과"
+
+_tracking_notified = set()   # 이미 결과 알림 보낸 log_key
+
+def track_signal_results():
+    """
+    추적 중인 모든 신호의 현재가를 조회해서
+    ① 목표가 도달 → 수익 확정
+    ② 손절가 도달 → 손실 확정
+    ③ N일 경과   → 현재가 기준 결과 기록
+    결과 확정 시 텔레그램 알림 발송
+    """
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: return
+
+        updated = False
+        today   = datetime.now().strftime("%Y%m%d")
+
+        for log_key, rec in data.items():
+            if rec.get("status") != "추적중": continue
+            if log_key in _tracking_notified:  continue
+
+            code         = rec["code"]
+            entry        = rec.get("entry_price", 0)
+            stop         = rec.get("stop_price",  0)
+            target       = rec.get("target_price", 0)
+            detect_date  = rec.get("detect_date", today)
+
+            if not entry or not stop or not target: continue
+
+            # 경과 일수 계산
+            try:
+                elapsed_days = (datetime.strptime(today, "%Y%m%d") -
+                                datetime.strptime(detect_date, "%Y%m%d")).days
+            except:
+                elapsed_days = 0
+
+            # 현재가 조회
+            try:
+                cur   = get_stock_price(code)
+                price = cur.get("price", 0)
+                if not price: continue
+            except:
+                continue
+
+            # 최고가·최저가 업데이트 (MDD 계산용)
+            rec["max_price"] = max(rec.get("max_price", price), price)
+            rec["min_price"] = min(rec.get("min_price", price), price)
+            updated = True
+
+            # ── 결과 판정 ──
+            exit_reason = None
+            exit_price  = price
+
+            if price >= target:
+                exit_reason = "목표가"
+            elif price <= stop:
+                exit_reason = "손절가"
+            elif elapsed_days >= TRACK_MAX_DAYS:
+                exit_reason = TRACK_TIMEOUT_RESULT
+
+            if not exit_reason:
+                continue   # 아직 추적 중
+
+            # 수익률 계산
+            pnl_pct = round((exit_price - entry) / entry * 100, 2) if entry else 0
+            status  = "수익" if pnl_pct > 0 else ("손실" if pnl_pct < 0 else "본전")
+
+            # 로그 업데이트
+            rec["status"]      = status
+            rec["exit_price"]  = exit_price
+            rec["exit_date"]   = today
+            rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
+            rec["pnl_pct"]     = pnl_pct
+            rec["exit_reason"] = exit_reason
+            _tracking_notified.add(log_key)
+
+            # ── 결과 알림 ──
+            _send_tracking_result(rec)
+            print(f"  📊 추적 완료: {rec['name']} {pnl_pct:+.1f}% ({exit_reason})")
+
+        if updated:
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            # tracker 피드백 즉시 갱신
+            load_tracker_feedback()
+
+    except Exception as e:
+        print(f"⚠️ 추적 오류: {e}")
+
+
+def _send_tracking_result(rec: dict):
+    """결과 확정 텔레그램 알림"""
+    pnl      = rec["pnl_pct"]
+    reason   = rec["exit_reason"]
+    sig_type = rec.get("signal_type", "")
+    name     = rec["name"]
+    entry    = rec.get("entry_price", 0)
+    exit_p   = rec["exit_price"]
+    max_p    = rec.get("max_price", exit_p)
+    min_p    = rec.get("min_price", exit_p)
+    theme    = rec.get("sector_theme", "")
+    bonus    = rec.get("sector_bonus", 0)
+
+    if reason == "목표가":
+        emoji = "🎯✅"; title = "목표가 달성!"
+    elif reason == "손절가":
+        emoji = "🛡🔴"; title = "손절가 도달"
+    elif reason == TRACK_TIMEOUT_RESULT:
+        emoji = "⏱"; title = f"{TRACK_MAX_DAYS}일 경과 결과"
+    else:
+        emoji = "📊"; title = "결과 확정"
+
+    pnl_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+    sig_labels = {
+        "UPPER_LIMIT":"상한가", "NEAR_UPPER":"상한가근접",
+        "SURGE":"급등", "EARLY_DETECT":"조기포착",
+        "MID_PULLBACK":"중기눌림목", "ENTRY_POINT":"단기눌림목",
+        "STRONG_BUY":"강력매수",
+    }
+    sig_label = sig_labels.get(sig_type, sig_type)
+
+    # 테마 동반 여부 표시
+    theme_tag = f"\n🏭 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
+
+    # MDD (최대 낙폭)
+    mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
+
+    send(
+        f"{emoji} <b>[자동 추적 결과]</b>  {title}\n"
+        f"<b>{name}</b>  ({rec['code']})\n"
+        f"신호: {sig_label}  |  감지: {rec.get('detect_date','')} {rec.get('detect_time','')}\n"
+        f"{theme_tag}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"진입가:  <b>{entry:,}원</b>\n"
+        f"청산가:  <b>{exit_p:,}원</b>  ({reason})\n"
+        f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
+        f"최대낙폭: {mdd:+.1f}%\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>"
+        + _chart_links(rec["code"], name)
+    )
 
 def save_carry_stocks():
     try:
@@ -1068,31 +1546,194 @@ def load_carry_stocks():
                  "\n\n눌림목 체크 재개")
     except: pass
 
+# ============================================================
+# 🧠 자동 조건 조정 엔진
+# ============================================================
+AUTO_TUNE_FILE = "auto_tune_log.json"   # 조정 이력 저장
+MIN_SAMPLES    = 10   # 조정 판단에 필요한 최소 샘플 수
+
+# 동적 조정 변수 (기본값 = 파라미터 원본값)
+_dynamic = {
+    # 조기 포착
+    "early_price_min":    EARLY_PRICE_MIN,
+    "early_volume_min":   EARLY_VOLUME_MIN,
+    # 중기 눌림목
+    "mid_surge_min_pct":  MID_SURGE_MIN_PCT,
+    "mid_pullback_min":   MID_PULLBACK_MIN,
+    "mid_pullback_max":   MID_PULLBACK_MAX,
+    "mid_vol_recovery":   MID_VOL_RECOVERY_MIN,
+    # 급등 진입
+    "min_score_normal":   60,
+    "min_score_strict":   70,
+    # 테마 가중치 (테마 동반 시 최소 점수 완화)
+    "themed_score_bonus": 0,
+}
+
 def load_tracker_feedback():
-    global _early_feedback, _early_price_min_dynamic, _early_volume_min_dynamic
+    """기존 함수 — 하위 호환용. auto_tune()을 호출"""
+    auto_tune(notify=False)
+
+def auto_tune(notify: bool = True):
+    """
+    signal_log.json 기반으로 신호 유형별 성과를 분석해서
+    조건을 자동으로 조정. 매주 월요일 장 시작 + 장 마감 시 호출.
+
+    조정 원칙:
+      - 승률 < 40%  → 조건 강화 (더 까다롭게)
+      - 승률 > 70%  → 조건 완화 (더 많이 잡기)
+      - 40~70%      → 유지
+      - 샘플 < MIN_SAMPLES 이면 조정 안 함 (통계 불충분)
+      - 단독 vs 테마 동반 격차 > 20%p → 테마 없는 신호 기준 상향
+    """
+    global _dynamic, _early_price_min_dynamic, _early_volume_min_dynamic
+
     try:
-        with open(EARLY_LOG_FILE,"r") as f: data = json.load(f)
-        completed = [v for v in data.values() if v.get("status") in ["수익","손실","종료"]]
-        if len(completed) < 5: return
-        success = sum(1 for v in completed if v.get("pnl_pct",0) > 0)
-        total   = len(completed)
-        rate    = success / total
-        _early_feedback = {"total":total,"success":success,"rate":rate}
-        if rate >= 0.70:
-            _early_price_min_dynamic  = max(EARLY_PRICE_MIN - 2, 7.0)
-            _early_volume_min_dynamic = max(EARLY_VOLUME_MIN - 2, 7.0)
-        elif rate < 0.50:
-            _early_price_min_dynamic  = min(EARLY_PRICE_MIN + 2, 15.0)
-            _early_volume_min_dynamic = min(EARLY_VOLUME_MIN + 2, 15.0)
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: return
+
+        completed = [v for v in data.values()
+                     if v.get("status") in ["수익", "손실", "본전"]]
+        if len(completed) < 5:
+            return
+
+        changes = []   # 변경 내역 (알림용)
+
+        # ── 신호 유형별 승률 계산 ──
+        by_type = {}
+        for v in completed:
+            t = v.get("signal_type", "기타")
+            by_type.setdefault(t, []).append(v)
+
+        # ── EARLY_DETECT 조정 ──
+        early_recs = by_type.get("EARLY_DETECT", [])
+        if len(early_recs) >= MIN_SAMPLES:
+            rate = sum(1 for r in early_recs if r["pnl_pct"] > 0) / len(early_recs)
+            old_p = _dynamic["early_price_min"]
+            old_v = _dynamic["early_volume_min"]
+            if rate < 0.40:
+                _dynamic["early_price_min"]  = min(old_p + 2.0, 18.0)
+                _dynamic["early_volume_min"] = min(old_v + 2.0, 18.0)
+                changes.append(f"🔍 조기포착 조건 강화 (승률 {rate*100:.0f}%)\n"
+                                f"   가격 {old_p}→{_dynamic['early_price_min']}%  "
+                                f"거래량 {old_v}→{_dynamic['early_volume_min']}배")
+            elif rate > 0.70:
+                _dynamic["early_price_min"]  = max(old_p - 1.0, 7.0)
+                _dynamic["early_volume_min"] = max(old_v - 1.0, 7.0)
+                changes.append(f"🔍 조기포착 조건 완화 (승률 {rate*100:.0f}%)\n"
+                                f"   가격 {old_p}→{_dynamic['early_price_min']}%  "
+                                f"거래량 {old_v}→{_dynamic['early_volume_min']}배")
+            _early_price_min_dynamic  = _dynamic["early_price_min"]
+            _early_volume_min_dynamic = _dynamic["early_volume_min"]
+
+        # ── MID_PULLBACK 조정 ──
+        mid_recs = by_type.get("MID_PULLBACK", [])
+        if len(mid_recs) >= MIN_SAMPLES:
+            rate = sum(1 for r in mid_recs if r["pnl_pct"] > 0) / len(mid_recs)
+            # 평균 눌림 깊이 분석 (수익 종목 vs 손실 종목)
+            win_recs  = [r for r in mid_recs if r["pnl_pct"] > 0]
+            lose_recs = [r for r in mid_recs if r["pnl_pct"] <= 0]
+
+            old_surge = _dynamic["mid_surge_min_pct"]
+            old_min   = _dynamic["mid_pullback_min"]
+            old_max   = _dynamic["mid_pullback_max"]
+
+            if rate < 0.40:
+                # 조건 강화: 더 강한 1차 급등 요구
+                _dynamic["mid_surge_min_pct"] = min(old_surge + 3.0, 25.0)
+                # 눌림 범위 좁히기 (황금 구간만)
+                _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 15.0)
+                _dynamic["mid_pullback_max"]  = max(old_max - 5.0, 30.0)
+                changes.append(f"🏆 중기눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
+                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%\n"
+                                f"   눌림범위 {old_min}~{old_max}→"
+                                f"{_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%")
+            elif rate > 0.70:
+                _dynamic["mid_surge_min_pct"] = max(old_surge - 2.0, 10.0)
+                _dynamic["mid_pullback_min"]  = max(old_min - 2.0, 8.0)
+                changes.append(f"🏆 중기눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
+                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
+
+        # ── 최소 점수 조정 ──
+        all_recs = completed
+        if len(all_recs) >= MIN_SAMPLES:
+            rate = sum(1 for r in all_recs if r["pnl_pct"] > 0) / len(all_recs)
+            old_n = _dynamic["min_score_normal"]
+            old_s = _dynamic["min_score_strict"]
+            if rate < 0.40:
+                _dynamic["min_score_normal"] = min(old_n + 5, 80)
+                _dynamic["min_score_strict"] = min(old_s + 5, 85)
+                changes.append(f"⭐ 최소 점수 강화: {old_n}→{_dynamic['min_score_normal']}점")
+            elif rate > 0.70:
+                _dynamic["min_score_normal"] = max(old_n - 3, 50)
+                _dynamic["min_score_strict"] = max(old_s - 3, 60)
+                changes.append(f"⭐ 최소 점수 완화: {old_n}→{_dynamic['min_score_normal']}점")
+
+        # ── 단독 vs 테마 격차 분석 ──
+        solo_recs   = [r for r in completed if not r.get("sector_bonus", 0)]
+        themed_recs = [r for r in completed if r.get("sector_bonus", 0)]
+        if len(solo_recs) >= 5 and len(themed_recs) >= 5:
+            solo_rate   = sum(1 for r in solo_recs   if r["pnl_pct"] > 0) / len(solo_recs)
+            themed_rate = sum(1 for r in themed_recs if r["pnl_pct"] > 0) / len(themed_recs)
+            gap = themed_rate - solo_rate
+            old_bonus = _dynamic["themed_score_bonus"]
+            if gap > 0.20:
+                # 테마 동반 종목에 점수 보너스 → 더 잘 잡히게
+                # 단독 신호 최소 점수는 올려서 필터링 강화
+                _dynamic["themed_score_bonus"] = min(old_bonus + 5, 20)
+                changes.append(f"🏭 테마 동반 우대 강화\n"
+                                f"   격차 {gap*100:.0f}%p → 테마 보너스 {old_bonus}→{_dynamic['themed_score_bonus']}점\n"
+                                f"   (단독 {solo_rate*100:.0f}%  테마 {themed_rate*100:.0f}%)")
+            elif gap < 0.05:
+                _dynamic["themed_score_bonus"] = max(old_bonus - 3, 0)
+
+        # ── 조정 이력 저장 ──
+        if changes:
+            tune_log = {}
+            try:
+                with open(AUTO_TUNE_FILE, "r") as f: tune_log = json.load(f)
+            except: pass
+            tune_log[datetime.now().strftime("%Y%m%d_%H%M")] = {
+                "changes":  changes,
+                "params":   dict(_dynamic),
+                "samples":  len(completed),
+            }
+            with open(AUTO_TUNE_FILE, "w") as f:
+                json.dump(tune_log, f, ensure_ascii=False, indent=2)
+
+            if notify:
+                change_text = "\n".join(changes)
+                send(f"🔧 <b>조건 자동 조정 완료</b>\n"
+                     f"근거: {len(completed)}건 결과 분석\n"
+                     f"━━━━━━━━━━━━━━━\n"
+                     f"{change_text}\n\n"
+                     f"/stats 로 전체 통계 확인")
         else:
-            _early_price_min_dynamic  = EARLY_PRICE_MIN
-            _early_volume_min_dynamic = EARLY_VOLUME_MIN
-        print(f"  📊 EARLY 성공률: {rate*100:.0f}% ({success}/{total})")
-    except: pass
+            print(f"  🧠 자동 조정: 변경 없음 ({len(completed)}건 분석)")
+
+    except Exception as e:
+        print(f"⚠️ 자동 조정 오류: {e}")
 
 # ============================================================
-# 📨 텔레그램
+# 📊 차트 기능 (이미지 전송 + 링크)
 # ============================================================
+def _chart_links(code: str, name: str) -> str:
+    """차트 링크 블록 — 네이버 / KIS 모바일앱"""
+    # KIS 모바일앱 딥링크: 종목 상세 화면 바로 열기
+    kis_deep = f"kakaotalk://plusfriend/chat/kisabroad"  # 범용 앱 딥링크
+    kis_web  = f"https://m.kisdisc.com/stock/chart/{code}"
+    naver    = f"https://finance.naver.com/item/fchart.naver?code={code}"
+    daum     = f"https://finance.daum.net/quotes/A{code}#chart/day"
+
+    return (
+        f"\n━━━━━━━━━━━━━━━\n"
+        f"📊 <b>차트 바로가기</b>\n"
+        f'  <a href="{naver}">📈 네이버 차트</a>   '
+        f'  <a href="{daum}">📉 다음 차트</a>\n'
+        f'  <a href="{kis_web}">🏦 KIS 차트</a>\n'
+    )
+
 def send(text: str):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -1107,23 +1748,36 @@ def _sector_block(s: dict) -> str:
     theme   = si.get("theme", "")
     bonus   = si.get("bonus", 0)
     summary = si.get("summary", "")
+    detail  = si.get("detail", [])
     rising  = si.get("rising", [])
     flat    = si.get("flat", [])
-    detail  = si.get("detail", [])
+    sources = si.get("sources", {})
 
-    # detail이 아예 없으면 (업종 조회 실패) → 간단 메시지만
-    if not detail:
-        return f"🏭 섹터: {summary if summary else '업종 조회 실패 (API 제한)'}\n━━━━━━━━━━━━━━━\n\n"
+    if not detail and not summary:
+        return f"🏭 <b>섹터 모멘텀</b> [{theme}]  업종 조회 실패\n━━━━━━━━━━━━━━━\n\n"
 
-    block = f"🏭 <b>섹터 모멘텀</b> [{theme}]"
-    block += f"  +{bonus}점\n" if bonus > 0 else "\n"
-    block += f"  {summary}\n"
+    bonus_tag = f"  +{bonus}점" if bonus > 0 else ""
+    block = f"🏭 <b>섹터 모멘텀</b> [{theme}]{bonus_tag}\n"
+
+    # 왜 이 종목들이 묶였는지 표시
+    if "동적테마" in sources:
+        block += f"  🔗 연관 근거: 가격 상관관계·뉴스 공동언급\n"
+    if "테마" in sources:
+        block += f"  📌 테마 등록 종목\n"
+    if "업종코드" in sources and len(sources) == 1:
+        block += f"  📂 동일 업종 분류\n"
+
+    if summary:
+        block += f"  {summary}\n"
 
     for r in rising[:5]:
-        vol_tag = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
-        block  += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}\n"
+        src_tag  = " 🔗" if r.get("source") == "동적테마" else ""
+        vol_tag  = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
+        block   += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
+
     for r in flat[:3]:
-        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+        src_tag = " 🔗" if r.get("source") == "동적테마" else ""
+        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%{src_tag}\n"
 
     return block + "━━━━━━━━━━━━━━━\n\n"
 
@@ -1167,8 +1821,8 @@ def send_alert(s: dict):
         + _sector_block(s)
         + f"{entry_msg}\n\n"
         f"🛡 손절가: <b>{s['stop_loss']:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
-        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n\n"
-        f"⚠️ 투자 판단은 본인 책임입니다"
+        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
+        + _chart_links(s["code"], s["name"])
     )
 
 # ============================================================
@@ -1179,8 +1833,8 @@ def analyze(stock: dict) -> dict:
     vol_ratio = stock.get("volume_ratio",0); price = stock.get("price",0)
     if not code or price < 500: return {}
 
-    strict   = is_strict_time()
-    min_score = 70 if strict else 60
+    strict    = is_strict_time()
+    min_score = _dynamic["min_score_strict"] if strict else _dynamic["min_score_normal"]
     score, reasons, signal_type = 0, [], None
 
     if change_rate >= 29.0:
@@ -1427,7 +2081,7 @@ def send_news_theme_alert(signal: dict):
          f"🏭 섹터 반응: <b>{len(signal['rising'])}/{signal['total']}개</b> ({react_pct}%)  +{signal['sector_bonus']}점\n\n"
          +(f"🔥 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
          +(f"🎯 <b>아직 안 오른 종목 (추격 기회)</b>\n{not_yet_block}\n" if not_yet_block else "")
-         +"━━━━━━━━━━━━━━━\n⚠️ 투자 판단은 본인 책임입니다")
+         +"━━━━━━━━━━━━━━━")
 
 # ============================================================
 # DART
@@ -1457,28 +2111,137 @@ def run_dart_intraday():
             if not matched_urgent and not matched_pos: continue
             _dart_seen_ids.add(rcept_no)
             is_risk = any(kw in title for kw in DART_RISK_KEYWORDS)
-            try:    cur = get_stock_price(code)
-            except: cur = {}
-            price, change_rate = cur.get("price",0), cur.get("change_rate",0)
-            vol_ratio = cur.get("volume_ratio",0)
+
+            # ── 주가 상세 조회 (실패해도 최대한 표시) ──
+            cur         = {}
+            price       = 0
+            change_rate = 0
+            vol_ratio   = 0
+            today_vol   = 0
+            for _attempt in range(2):
+                try:
+                    cur         = get_stock_price(code)
+                    price       = cur.get("price", 0)
+                    change_rate = cur.get("change_rate", 0)
+                    vol_ratio   = cur.get("volume_ratio", 0)
+                    today_vol   = cur.get("today_vol", 0)
+                    if price: break
+                except: time.sleep(1)
+
             if not (change_rate >= 1.0) and not is_risk:
                 print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵"); continue
-            sector_info = calc_sector_momentum(code,company) if price else {"bonus":0,"detail":[],"rising":[],"flat":[]}
-            emoji = "🚨" if is_risk else ("🚀" if change_rate>=5.0 else "📢")
-            price_str = (f"\n💰 현재가: <b>{price:,}원</b>  (<b>{change_rate:+.1f}%</b>)"
-                         +(f"  🔊{vol_ratio:.1f}x" if vol_ratio>=2 else "")) if price else ""
+
+            # ── 추가 지표 (각각 독립적으로 실패 허용) ──
+            z = 0
+            try: z = get_volume_zscore(code, today_vol) if today_vol else 0
+            except: pass
+
+            rs = 0
+            try: rs = get_relative_strength(change_rate)
+            except: pass
+
+            ma20_dev = 0.0
+            try: ma20_dev = get_ma20_deviation(code)
+            except: pass
+
+            prev_upper = False
+            try: prev_upper = was_upper_limit_yesterday(code)
+            except: pass
+
+            # 외국인·기관 수급
+            inv_text = ""
+            try:
+                inv   = get_investor_trend(code)
+                f_net = inv.get("foreign_net", 0)
+                i_net = inv.get("institution_net", 0)
+                if   f_net > 0 and i_net > 0: inv_text = "\n✅ 외국인+기관 동시 순매수"
+                elif f_net > 0:               inv_text = "\n🟡 외국인 순매수"
+                elif i_net > 0:               inv_text = "\n🟡 기관 순매수"
+                elif f_net < 0 and i_net < 0: inv_text = "\n🔴 외국인+기관 동시 순매도"
+            except: pass
+
+            # ATR 손절·목표가
+            entry = price or 0
+            stop = target = stop_pct = target_pct = 0
+            atr_used = False
+            if price:
+                try:
+                    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+                except: pass
+            atr_tag = " (ATR)" if atr_used else " (고정)"
+
+            # 섹터 모멘텀
+            sector_info = {"bonus":0,"detail":[],"rising":[],"flat":[],"theme":"","summary":""}
+            try:
+                if price:
+                    sector_info = calc_sector_momentum(code, company)
+            except: pass
+
+            # ── 이모지 및 등급 ──
+            emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
+            tag   = "⚠️ 위험 공시" if is_risk else "✅ 주요 공시"
+            all_kw = list(dict.fromkeys(matched_urgent + matched_pos))
+
+            # ── 주가 블록 (항상 표시, 조회 실패 시 안내) ──
+            if price:
+                vol_str    = f"<b>{vol_ratio:.1f}배</b> (5일 평균 대비)" if vol_ratio else "조회 중"
+                zscore_str = f"  📊 Z={z:.1f}σ" if z >= VOL_ZSCORE_MIN else ""
+                rs_str     = f"  💪 RS={rs:.1f}x" if rs >= RS_MIN else ""
+                ma_str     = f"  📐 20일선 {ma20_dev:+.1f}%" if ma20_dev else ""
+                prev_str   = "\n🔁 전일 상한가 종목" if prev_upper else ""
+                price_block = (
+                    f"\n━━━━━━━━━━━━━━━\n"
+                    f"💰 현재가: <b>{price:,}원</b>  (<b>{change_rate:+.1f}%</b>)\n"
+                    f"📊 거래량: {vol_str}{zscore_str}\n"
+                    f"📈 코스피 상대강도: {rs_str if rs_str else '—'}{ma_str}"
+                    f"{inv_text}{prev_str}"
+                )
+            else:
+                price_block = "\n━━━━━━━━━━━━━━━\n💰 현재가: 조회 실패 (장 중 API 지연)"
+
+            # ── 손절·목표가 블록 ──
+            if price and stop and target:
+                stop_block = (
+                    f"\n━━━━━━━━━━━━━━━\n"
+                    f"🎯 진입가: <b>{entry:,}원</b>\n"
+                    f"🛡 손절가: <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+                    f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
+                )
+            else:
+                stop_block = ""
+
+            # ── 섹터 블록 ──
             sector_block = ""
-            if sector_info.get("detail"):
-                react_cnt = len(sector_info.get("rising",[]))
-                sector_block = (f"\n🏭 섹터 반응: <b>{react_cnt}/{len(sector_info['detail'])}개</b>\n"
-                                +"".join([f"  📈 {r['name']} {r['change_rate']:+.1f}%\n"
-                                          for r in sector_info.get("rising",[])[:4]]))
-            all_kw = list(dict.fromkeys(matched_urgent+matched_pos))
-            send(f"{emoji} <b>[공시+주가 연동]</b>  {'⚠️ 위험' if is_risk else '✅ 주요'}\n"
-                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-                 f"<b>{company}</b>  ({code})\n📌 {title}"
-                 f"{price_str}\n🔑 {', '.join(all_kw)}{sector_block}\n\n"
-                 f"⚠️ 투자 판단은 본인 책임입니다")
+            rising = sector_info.get("rising", [])
+            flat   = sector_info.get("flat", [])
+            detail = sector_info.get("detail", [])
+            theme  = sector_info.get("theme", "")
+            if detail:
+                react_cnt    = len(rising)
+                total_cnt    = len(detail)
+                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
+                sector_block += "".join([
+                    f"  📈 {r['name']} {r['change_rate']:+.1f}%"
+                    + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
+                    for r in rising[:4]
+                ])
+                for r in flat[:2]:
+                    sector_block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+            elif theme:
+                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
+
+            send(
+                f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"<b>{company}</b>  ({code})\n"
+                f"📌 {title}\n"
+                f"🔑 키워드: {', '.join(all_kw)}"
+                f"{price_block}"
+                f"{sector_block}"
+                f"{stop_block}"
+                + _chart_links(code, company)
+            )
+            print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
     except Exception as e: print(f"⚠️ DART 오류: {e}")
 
 def analyze_dart_disclosures():
@@ -1517,26 +2280,202 @@ def poll_telegram_commands():
                             params={"offset":_tg_offset,"timeout":5},timeout=10)
         for update in resp.json().get("result",[]):
             _tg_offset = update["update_id"]+1
-            text = update.get("message",{}).get("text","").strip().lower()
+            # 대소문자 구분 없이 처리 (원본 텍스트 보존)
+            raw  = update.get("message",{}).get("text","").strip()
+            text = raw.lower()
             if not text.startswith("/"): continue
+
+            # ── /status ──
             if text == "/status":
                 rate_str = (f"\n📊 EARLY 성공률: {_early_feedback['success']}/{_early_feedback['total']} "
-                            f"({_early_feedback.get('rate',0)*100:.0f}%)")  if _early_feedback.get("total",0)>=5 else ""
+                            f"({_early_feedback.get('rate',0)*100:.0f}%)") if _early_feedback.get("total",0)>=5 else ""
                 send(f"🤖 <b>봇 상태</b>  {'⏸ 일시정지' if _bot_paused else '▶️ 실행 중'}\n"
                      f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
                      f"📡 장 {'열림' if is_market_open() else '닫힘'}\n"
-                     f"👁 감시: {len(_detected_stocks)}개  |  중기 눌림목 이력: {len(_mid_pullback_alert_history)}개\n"
-                     f"⚙️ EARLY 조건: >{_early_price_min_dynamic}%, >{_early_volume_min_dynamic}배{rate_str}")
+                     f"👁 감시: {len(_detected_stocks)}개  |  동적테마: {len(_dynamic_theme_map)}개\n"
+                     f"⚙️ EARLY 조건: >{_early_price_min_dynamic}%, >{_early_volume_min_dynamic}배{rate_str}\n\n"
+                     f"💬 /result 종목명 수익률  로 결과 기록\n"
+                     f"예) /result 대주산업 +12.5")
+
+            # ── /list ──
             elif text == "/list":
-                if not _detected_stocks: send("📋 감시 중인 종목 없음")
-                else: send("📋 <b>감시 중인 종목</b>\n"+"\n".join([f"• <b>{v['name']}</b> ({k}) — {v.get('carry_day',0)}일차" for k,v in _detected_stocks.items()]))
+                if not _detected_stocks:
+                    send("📋 감시 중인 종목 없음")
+                else:
+                    send("📋 <b>감시 중인 종목</b>\n" +
+                         "\n".join([f"• <b>{v['name']}</b> ({k}) — {v.get('carry_day',0)}일차"
+                                    for k, v in _detected_stocks.items()]))
+
+            # ── /stop / /resume ──
             elif text == "/stop":
-                _bot_paused=True; send("⏸ <b>봇 일시정지</b>  /resume 으로 재개")
+                _bot_paused = True;  send("⏸ <b>봇 일시정지</b>  /resume 으로 재개")
             elif text == "/resume":
-                _bot_paused=False; send("▶️ <b>봇 재개</b>")
+                _bot_paused = False; send("▶️ <b>봇 재개</b>")
+
+            # ── /result 종목명 수익률 ──
+            elif text.startswith("/result"):
+                _handle_result_command(raw)
+
+            # ── /stats ──
+            elif text == "/stats":
+                _send_stats()
+
+            # ── /help ──
             else:
-                send("📌 명령어:\n/status  /list  /stop  /resume")
-    except Exception as e: print(f"⚠️ TG 명령어 오류: {e}")
+                send("📌 <b>명령어 목록</b>\n\n"
+                     "/status  — 봇 상태\n"
+                     "/list    — 감시 중 종목\n"
+                     "/stop    — 알림 정지\n"
+                     "/resume  — 알림 재개\n"
+                     "/stats   — 신호 유형별 승률 통계\n\n"
+                     "<b>/result 종목명 수익률</b>\n"
+                     "예) /result 대주산업 +12.5\n"
+                     "예) /result 한국첨단소재 -8.1\n"
+                     "예) /result 국전약품 0")
+    except Exception as e:
+        print(f"⚠️ TG 명령어 오류: {e}")
+
+
+def _handle_result_command(raw: str):
+    """
+    /result 종목명 수익률  처리
+    예) /result 대주산업 +12.5
+    → early_detect_log.json 에서 해당 종목 찾아 결과 업데이트
+    → 신호 유형별 승률 통계 자동 갱신
+    """
+    try:
+        parts = raw.strip().split()
+        if len(parts) < 3:
+            send("⚠️ 형식: /result 종목명 수익률\n예) /result 대주산업 +12.5"); return
+        name_input = parts[1]
+        pnl_str    = parts[2].replace("%","")
+        pnl        = float(pnl_str)
+
+        # early_detect_log에서 종목명으로 찾기
+        data = {}
+        try:
+            with open(EARLY_LOG_FILE,"r") as f: data = json.load(f)
+        except: pass
+
+        matched_code = None
+        for code, info in data.items():
+            if name_input in info.get("name",""):
+                matched_code = code; break
+
+        result_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+        status       = "수익" if pnl > 0 else ("손실" if pnl < 0 else "본전")
+
+        if matched_code:
+            data[matched_code]["status"]     = status
+            data[matched_code]["pnl_pct"]    = pnl
+            data[matched_code]["exit_date"]  = datetime.now().strftime("%Y%m%d")
+            with open(EARLY_LOG_FILE,"w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            signal_type = data[matched_code].get("signal_type","EARLY_DETECT")
+            send(f"{result_emoji} <b>결과 기록 완료</b>\n"
+                 f"종목: <b>{data[matched_code]['name']}</b>\n"
+                 f"수익률: <b>{pnl:+.1f}%</b>  ({status})\n"
+                 f"신호: {signal_type}\n\n"
+                 f"/stats 로 전체 통계 확인")
+            load_tracker_feedback()   # 피드백 즉시 반영
+        else:
+            # 로그에 없으면 새로 추가 (직접 매매한 종목도 기록 가능)
+            new_code = f"manual_{datetime.now().strftime('%m%d%H%M')}"
+            data[new_code] = {
+                "code": new_code, "name": name_input,
+                "detect_date": datetime.now().strftime("%Y%m%d"),
+                "signal_type": "MANUAL",
+                "status": status, "pnl_pct": pnl,
+                "exit_date": datetime.now().strftime("%Y%m%d"),
+            }
+            with open(EARLY_LOG_FILE,"w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            send(f"{result_emoji} <b>결과 기록 완료 (수동)</b>\n"
+                 f"종목: <b>{name_input}</b>\n"
+                 f"수익률: <b>{pnl:+.1f}%</b>  ({status})\n\n"
+                 f"/stats 로 전체 통계 확인")
+    except ValueError:
+        send("⚠️ 수익률 형식 오류. 예) /result 대주산업 +12.5")
+    except Exception as e:
+        send(f"⚠️ 결과 기록 오류: {e}")
+
+
+def _send_stats():
+    """신호 유형별 승률·평균 수익률 통계 전송 (signal_log.json 기반)"""
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+
+        completed = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
+        tracking  = [v for v in data.values() if v.get("status") == "추적중"]
+
+        if len(completed) < 3:
+            send(f"📊 아직 결과가 {len(completed)}건뿐이에요. (추적 중: {len(tracking)}건)\n"
+                 f"결과가 쌓이면 자동으로 통계가 갱신돼요."); return
+
+        type_labels = {
+            "UPPER_LIMIT":  "🚨 상한가",
+            "NEAR_UPPER":   "🔥 상한가근접",
+            "STRONG_BUY":   "💎 강력매수",
+            "SURGE":        "📈 급등",
+            "EARLY_DETECT": "🔍 조기포착",
+            "ENTRY_POINT":  "🎯 단기눌림목",
+            "MID_PULLBACK": "🏆 중기눌림목",
+            "MANUAL":       "✏️ 수동",
+        }
+
+        total_pnl  = [v["pnl_pct"] for v in completed]
+        total_win  = sum(1 for p in total_pnl if p > 0)
+        avg_pnl    = sum(total_pnl) / len(total_pnl)
+        total_rate = total_win / len(total_pnl) * 100
+
+        msg = (f"📊 <b>자동 추적 성과 통계</b>\n"
+               f"완료 {len(completed)}건  |  추적 중 {len(tracking)}건\n"
+               f"전체 승률 <b>{total_rate:.0f}%</b>  |  평균 <b>{avg_pnl:+.1f}%</b>\n"
+               f"━━━━━━━━━━━━━━━\n")
+
+        # 신호 유형별
+        by_type = {}
+        for v in completed:
+            t = v.get("signal_type", "기타")
+            by_type.setdefault(t, []).append(v)
+
+        for t, recs in sorted(by_type.items(), key=lambda x: -len(x[1])):
+            pnls = [r["pnl_pct"] for r in recs]
+            win  = sum(1 for p in pnls if p > 0)
+            rate = win / len(pnls) * 100
+            avg  = sum(pnls) / len(pnls)
+            best = max(pnls); worst = min(pnls)
+            label = type_labels.get(t, t)
+            bar   = "🟢" * int(rate/20) + "⬜" * (5 - int(rate/20))
+            # 청산 이유 분포
+            reasons = {}
+            for r in recs:
+                ex = r.get("exit_reason", "?")
+                reasons[ex] = reasons.get(ex, 0) + 1
+            reason_str = "  ".join([f"{k}:{v}건" for k, v in reasons.items()])
+            msg += (f"\n{label}  ({len(recs)}건)\n"
+                    f"  {bar}  승률 {rate:.0f}%  평균 {avg:+.1f}%\n"
+                    f"  최고 {best:+.1f}%  최저 {worst:+.1f}%\n"
+                    f"  {reason_str}\n")
+
+        # 단독 vs 테마 동반 비교
+        solo   = [v for v in completed if not v.get("sector_bonus", 0)]
+        themed = [v for v in completed if v.get("sector_bonus", 0)]
+        if solo and themed:
+            solo_avg   = sum(v["pnl_pct"] for v in solo)   / len(solo)
+            themed_avg = sum(v["pnl_pct"] for v in themed) / len(themed)
+            solo_win   = sum(1 for v in solo   if v["pnl_pct"] > 0) / len(solo)   * 100
+            themed_win = sum(1 for v in themed if v["pnl_pct"] > 0) / len(themed) * 100
+            msg += (f"\n━━━━━━━━━━━━━━━\n"
+                    f"🔍 단독 상승:  승률 {solo_win:.0f}%  평균 {solo_avg:+.1f}% ({len(solo)}건)\n"
+                    f"🏭 테마 동반:  승률 {themed_win:.0f}%  평균 {themed_avg:+.1f}% ({len(themed)}건)\n")
+
+        send(msg)
+    except Exception as e:
+        send(f"⚠️ 통계 오류: {e}")
 
 # ============================================================
 # 장 마감
@@ -1550,21 +2489,222 @@ def on_market_close():
         _detected_stocks[code]["detected_at"] = datetime.now()
         carry_list.append(f"• {info['name']} ({code}) - {carry_day+1}일차")
     save_carry_stocks()
-    load_tracker_feedback()
-    msg = (f"🔔 <b>장 마감</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
-           f"감시 종목: <b>{len(_detected_stocks)}개</b>\n")
-    if carry_list:
-        msg += f"\n📂 <b>이월 ({len(carry_list)}개)</b>\n"+"\n".join(carry_list)
+    auto_tune(notify=True)   # 장 마감마다 조건 자동 조정
+
+    # ── 당일 신호 추적 결과 요약 ──
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        data = {}
+        with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+        today_recs = [v for v in data.values() if v.get("detect_date") == today]
+        done_recs  = [v for v in today_recs if v.get("status") != "추적중"]
+        tracking   = [v for v in today_recs if v.get("status") == "추적중"]
+
+        sig_labels = {
+            "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+        }
+
+        summary_lines = []
+        wins = losses = 0
+        for v in done_recs:
+            pnl   = v.get("pnl_pct", 0)
+            emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+            label = sig_labels.get(v.get("signal_type",""),"")
+            theme = f" [{v['sector_theme']}]" if v.get("sector_bonus",0) > 0 else " [단독]"
+            summary_lines.append(f"  {emoji} {v['name']} {pnl:+.1f}% ({label}{theme})")
+            if pnl > 0: wins += 1
+            elif pnl < 0: losses += 1
+
+        # 아직 추적 중인 종목은 현재가 기준으로 잠정 수익률 계산
+        tracking_lines = []
+        for v in tracking[:5]:
+            try:
+                cur = get_stock_price(v["code"])
+                price = cur.get("price", 0)
+                entry = v.get("entry_price", 0)
+                if price and entry:
+                    pnl = round((price - entry) / entry * 100, 1)
+                    e2  = "🟡" if pnl >= 0 else "🟠"
+                    tracking_lines.append(f"  {e2} {v['name']} {pnl:+.1f}% (추적중)")
+                time.sleep(0.15)
+            except: continue
+
+        msg = (f"🔔 <b>장 마감 리포트</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
+               f"감시: <b>{len(_detected_stocks)}개</b>")
+
+        if today_recs:
+            total_done = len(done_recs)
+            win_rate   = round(wins / total_done * 100) if total_done else 0
+            msg += (f"\n\n📊 <b>오늘 신호 결과</b>  ({total_done}건 완료)\n"
+                    f"  승률: <b>{win_rate}%</b>  |  수익 {wins}건  손실 {losses}건\n")
+            if summary_lines:
+                msg += "\n".join(summary_lines) + "\n"
+            if tracking_lines:
+                msg += f"\n⏳ <b>추적 중</b> ({len(tracking)}건)\n" + "\n".join(tracking_lines) + "\n"
+
+        if carry_list:
+            msg += f"\n📂 <b>이월</b> ({len(carry_list)}개)\n" + "\n".join(carry_list)
+
+    except Exception as e:
+        msg = (f"🔔 <b>장 마감</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
+               f"감시 종목: <b>{len(_detected_stocks)}개</b>\n")
+        if carry_list:
+            msg += f"\n📂 <b>이월</b> ({len(carry_list)}개)\n" + "\n".join(carry_list)
+
     send(msg)
     analyze_dart_disclosures()
 
-# ============================================================
-# 스캔 루프
-# ============================================================
+def send_weekly_report():
+    """매주 월요일 장 시작 시 지난주 성과 자동 발송 + AI 분석"""
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: return
+
+        today     = datetime.now()
+        last_mon  = (today - timedelta(days=today.weekday() + 7)).strftime("%Y%m%d")
+        last_sun  = (today - timedelta(days=today.weekday() + 1)).strftime("%Y%m%d")
+
+        week_recs = [v for v in data.values()
+                     if last_mon <= v.get("detect_date","") <= last_sun
+                     and v.get("status") in ["수익","손실","본전"]]
+
+        if not week_recs:
+            send(f"📅 <b>주간 리포트</b>  {last_mon[:4]}.{last_mon[4:6]}.{last_mon[6:]} ~ {last_sun[6:]}\n지난주 완료된 신호 없음")
+            return
+
+        pnls     = [v["pnl_pct"] for v in week_recs]
+        wins     = sum(1 for p in pnls if p > 0)
+        losses   = sum(1 for p in pnls if p < 0)
+        win_rate = round(wins / len(pnls) * 100)
+        avg_pnl  = round(sum(pnls) / len(pnls), 1)
+        best     = max(week_recs, key=lambda x: x["pnl_pct"])
+        worst    = min(week_recs, key=lambda x: x["pnl_pct"])
+
+        by_type = {}
+        for v in week_recs:
+            t = v.get("signal_type","기타")
+            by_type.setdefault(t, []).append(v["pnl_pct"])
+
+        type_labels = {
+            "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+        }
+        type_lines = ""
+        for t, ps in sorted(by_type.items(), key=lambda x: -len(x[1])):
+            w = sum(1 for p in ps if p > 0)
+            type_lines += f"  {type_labels.get(t,t)}: {w}/{len(ps)}건  평균 {sum(ps)/len(ps):+.1f}%\n"
+
+        solo_pnls   = [v["pnl_pct"] for v in week_recs if not v.get("sector_bonus",0)]
+        themed_pnls = [v["pnl_pct"] for v in week_recs if v.get("sector_bonus",0)]
+        compare = ""
+        if solo_pnls and themed_pnls:
+            compare = (f"\n🔍 단독:  승률 {sum(1 for p in solo_pnls if p>0)/len(solo_pnls)*100:.0f}%"
+                       f"  평균 {sum(solo_pnls)/len(solo_pnls):+.1f}%  ({len(solo_pnls)}건)\n"
+                       f"🏭 테마:  승률 {sum(1 for p in themed_pnls if p>0)/len(themed_pnls)*100:.0f}%"
+                       f"  평균 {sum(themed_pnls)/len(themed_pnls):+.1f}%  ({len(themed_pnls)}건)")
+
+        report_text = (
+            f"총 {len(week_recs)}건  승률 {win_rate}%  평균 {avg_pnl:+.1f}%  "
+            f"수익 {wins}건 손실 {losses}건\n"
+            f"{type_lines}{compare}\n"
+            f"최고: {best['name']} {best['pnl_pct']:+.1f}%  "
+            f"최저: {worst['name']} {worst['pnl_pct']:+.1f}%"
+        )
+
+        send(
+            f"📅 <b>주간 자동 리포트</b>\n"
+            f"{last_mon[:4]}.{last_mon[4:6]}.{last_mon[6:]} ~ {last_sun[:4]}.{last_sun[4:6]}.{last_sun[6:]}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{report_text}"
+        )
+
+        # ── AI 분석 (Claude API) ──
+        auto_tune(notify=True)                          # 조건 자동 조정
+        _send_ai_analysis(week_recs, report_text)       # Claude가 패턴 분석
+
+    except Exception as e:
+        print(f"⚠️ 주간 리포트 오류: {e}")
+
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+
+def _send_ai_analysis(week_recs: list, summary: str):
+    """
+    주간 결과를 Claude API로 분석 요청 → 개선 제안 텔레그램 발송
+    봇 스스로 자기 신호를 평가하고 개선점을 찾음
+    """
+    try:
+        # 상세 데이터 구성
+        details = []
+        for v in week_recs:
+            details.append(
+                f"- {v['name']} [{v.get('signal_type','')}] "
+                f"진입{v.get('entry_price',0):,} → {v.get('exit_reason','')} {v['pnl_pct']:+.1f}% "
+                f"테마:{v.get('sector_theme','없음')} 보너스:{v.get('sector_bonus',0)}점 "
+                f"손절:{v.get('stop_price',0):,} 목표:{v.get('target_price',0):,}"
+            )
+        detail_text = "\n".join(details)
+
+        # 현재 동적 파라미터 상태
+        params_text = (
+            f"조기포착 최소가격변동: {_dynamic['early_price_min']}%\n"
+            f"조기포착 최소거래량: {_dynamic['early_volume_min']}배\n"
+            f"중기눌림목 1차급등: {_dynamic['mid_surge_min_pct']}%\n"
+            f"중기눌림목 눌림범위: {_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%\n"
+            f"최소점수(일반/엄격): {_dynamic['min_score_normal']}/{_dynamic['min_score_strict']}점\n"
+            f"테마보너스: {_dynamic['themed_score_bonus']}점"
+        )
+
+        prompt = f"""당신은 한국 주식 알림 봇의 성과를 분석하는 퀀트 분석가입니다.
+
+[지난주 신호 결과 요약]
+{summary}
+
+[종목별 상세]
+{detail_text}
+
+[현재 봇 파라미터]
+{params_text}
+
+위 데이터를 분석해서 다음을 한국어로 답해주세요:
+
+1. **패턴 분석** (2~3줄): 수익 종목과 손실 종목에서 보이는 공통점
+2. **개선 제안** (구체적 수치 포함, 2~3가지): 어떤 파라미터를 어떻게 바꾸면 좋을지
+3. **주의 신호** (1줄): 다음 주에 특히 조심해야 할 패턴
+
+간결하게, 실행 가능한 제안 위주로 작성해주세요."""
+
+        resp = requests.post(
+            ANTHROPIC_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        result = resp.json()
+        ai_text = result.get("content", [{}])[0].get("text", "")
+
+        if ai_text:
+            # 텔레그램 4096자 제한 고려해서 앞 1200자만
+            send(f"🤖 <b>AI 주간 분석</b>\n━━━━━━━━━━━━━━━\n{ai_text[:1200]}")
+    except Exception as e:
+        print(f"⚠️ AI 분석 오류: {e}")
 def run_news_scan():
     if not is_market_open() or _bot_paused: return
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 뉴스 스캔...", flush=True)
     try:
+        headlines = fetch_all_news()
+        if headlines:
+            # 뉴스 공동언급 DB 업데이트 (백그라운드)
+            threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
         for signal in analyze_news_theme(): send_news_theme_alert(signal)
     except Exception as e: print(f"⚠️ 뉴스 오류: {e}")
 
@@ -1589,21 +2729,34 @@ def run_scan():
                 alerts.append(s); seen.add(s["code"])
         for s in check_pullback_signals():
             if s["code"] not in seen: alerts.append(s); seen.add(s["code"])
-        alerts.sort(key=lambda x: x["score"], reverse=True)
-        if not alerts: print("  → 조건 충족 없음"); return
-        print(f"  → {len(alerts)}개 감지!")
-        for s in alerts:
-            print(f"  ✓ {s['name']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
-            send_alert(s); _alert_history[s["code"]] = time.time()
-            if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
-            if s["signal_type"] != "ENTRY_POINT":
-                if s["code"] not in _detected_stocks:
-                    _detected_stocks[s["code"]] = {"name":s["name"],"high_price":s["price"],
-                        "entry_price":s["entry_price"],"stop_loss":s["stop_loss"],
-                        "target_price":s["target_price"],"detected_at":s["detected_at"],"carry_day":0}
-                elif s["price"] > _detected_stocks[s["code"]]["high_price"]:
-                    _detected_stocks[s["code"]]["high_price"] = s["price"]
-            time.sleep(1)
+        if not alerts: print("  → 조건 충족 없음")
+        else:
+            print(f"  → {len(alerts)}개 감지!")
+            for s in alerts:
+                print(f"  ✓ {s['name']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
+                send_alert(s); _alert_history[s["code"]] = time.time()
+                # ★ 모든 신호 유형 저장 (EARLY_DETECT 한정 → 전체로 확장)
+                save_signal_log(s)
+                if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
+                # 동적 테마 자동 생성 (백그라운드)
+                try:
+                    threading.Thread(
+                        target=auto_update_theme,
+                        args=(s["code"], s["name"], s["signal_type"]),
+                        daemon=True
+                    ).start()
+                except: pass
+                if s["signal_type"] != "ENTRY_POINT":
+                    if s["code"] not in _detected_stocks:
+                        _detected_stocks[s["code"]] = {"name":s["name"],"high_price":s["price"],
+                            "entry_price":s["entry_price"],"stop_loss":s["stop_loss"],
+                            "target_price":s["target_price"],"detected_at":s["detected_at"],"carry_day":0}
+                    elif s["price"] > _detected_stocks[s["code"]]["high_price"]:
+                        _detected_stocks[s["code"]]["high_price"] = s["price"]
+                time.sleep(1)
+
+        # ★ 추적 중인 신호 결과 자동 체크 (매 스캔마다)
+        track_signal_results()
     except Exception as e: print(f"⚠️ 스캔 오류: {e}")
 
 # ============================================================
@@ -1616,6 +2769,7 @@ if __name__ == "__main__":
 
     load_carry_stocks()
     load_tracker_feedback()
+    load_dynamic_themes()
     refresh_dynamic_candidates()   # 시작 시 동적 후보군 초기 로딩
 
     send(
@@ -1641,6 +2795,7 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
     schedule.every(30).seconds.do(poll_telegram_commands)
+    schedule.every().monday.at("09:01").do(send_weekly_report)   # 매주 월요일 자동 주간 리포트
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
         _clear_all_cache(),
         refresh_dynamic_candidates(),
