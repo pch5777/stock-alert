@@ -1446,6 +1446,40 @@ def track_signal_results():
             rec["min_price"] = min(rec.get("min_price", price), price)
             updated = True
 
+            # ── 분할 청산 가이드 (목표가 도달 전 중간 알림) ──
+            if entry and target:
+                pnl_now  = (price - entry) / entry * 100
+                half_pct = (target - entry) / entry * 100 / 2   # 목표의 절반
+                partial_key = f"{log_key}_partial"
+                if (pnl_now >= half_pct
+                        and partial_key not in _tracking_notified
+                        and half_pct > 3.0):
+                    _tracking_notified.add(partial_key)
+                    inv_info = ""
+                    try:
+                        inv   = get_investor_trend(code)
+                        f_net = inv.get("foreign_net", 0)
+                        i_net = inv.get("institution_net", 0)
+                        if f_net > 0 and i_net > 0:
+                            inv_info = "\n  ✅ 외국인+기관 순매수 — 홀딩 우호적"
+                        elif f_net < 0 or i_net < 0:
+                            inv_info = "\n  ⚠️ 외국인/기관 매도 전환 — 익절 고려"
+                    except: pass
+                    send_with_chart_buttons(
+                        f"💡 <b>[분할 청산 타이밍]</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {pnl_now/((target-entry)/entry*100)*100:.0f}%)\n"
+                        f"📍 현재가: <b>{price:,}원</b>\n"
+                        f"🏆 목표가: <b>{target:,}원</b>  (+{(target-entry)/entry*100:.1f}%)\n"
+                        f"{inv_info}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"💡 절반 익절 후 나머지 홀딩 전략 고려",
+                        code, rec["name"]
+                    )
+                    print(f"  💡 분할 청산 가이드: {rec['name']} +{pnl_now:.1f}%")
+
             # ── 결과 판정 ──
             exit_reason = None
             exit_price  = price
@@ -1488,11 +1522,12 @@ def track_signal_results():
 
 
 def _send_tracking_result(rec: dict):
-    """결과 확정 텔레그램 알림"""
+    """결과 확정 텔레그램 알림 + 손절 원인 분석"""
     pnl      = rec["pnl_pct"]
     reason   = rec["exit_reason"]
     sig_type = rec.get("signal_type", "")
     name     = rec["name"]
+    code     = rec["code"]
     entry    = rec.get("entry_price", 0)
     exit_p   = rec["exit_price"]
     max_p    = rec.get("max_price", exit_p)
@@ -1517,17 +1552,49 @@ def _send_tracking_result(rec: dict):
         "STRONG_BUY":"강력매수",
     }
     sig_label = sig_labels.get(sig_type, sig_type)
-
-    # 테마 동반 여부 표시
     theme_tag = f"\n🏭 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
-
-    # MDD (최대 낙폭)
     mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
+
+    # ── 손절 원인 분석 ──
+    cause_block = ""
+    if reason == "손절가":
+        causes = []
+        try:
+            cur = get_stock_price(code)
+            p   = cur.get("price", 0)
+            if p:
+                inv = get_investor_trend(code)
+                f_net = inv.get("foreign_net", 0)
+                i_net = inv.get("institution_net", 0)
+                vr    = cur.get("volume_ratio", 0)
+
+                if f_net < -5000:  causes.append(f"🔴 외국인 대량 매도 ({f_net:+,}주)")
+                elif f_net < 0:    causes.append(f"🟠 외국인 순매도 ({f_net:+,}주)")
+                if i_net < -3000:  causes.append(f"🔴 기관 대량 매도 ({i_net:+,}주)")
+                elif i_net < 0:    causes.append(f"🟠 기관 순매도 ({i_net:+,}주)")
+                if vr and vr < 0.5: causes.append(f"📉 거래량 급감 ({vr:.1f}배 — 매수세 소멸)")
+                if vr and vr > 5:   causes.append(f"🌊 거래량 급증 속 하락 (세력 매도 가능성)")
+                if not causes:      causes.append("⚠️ 특이 원인 미감지 (기술적 손절)")
+        except: causes = ["조회 실패"]
+        cause_block = "\n━━━━━━━━━━━━━━━\n🔍 <b>손절 원인 분석</b>\n" + "\n".join(f"  {c}" for c in causes) + "\n"
+
+    # ── 분할 청산 가이드 (수익 시) ──
+    profit_guide = ""
+    if pnl > 0 and reason == "목표가" and entry and target:
+        target = rec.get("target_price", exit_p)
+        r2 = int(entry + (target - entry) * 1.5)
+        profit_guide = (
+            f"\n━━━━━━━━━━━━━━━\n"
+            f"💡 <b>추가 보유 고려</b>\n"
+            f"  현재 +{pnl:.1f}% 달성\n"
+            f"  R2 목표: {r2:,}원  (+{(r2-entry)/entry*100:.1f}%)\n"
+            f"  → 절반 익절 후 나머지 홀딩 전략\n"
+        )
 
     send_with_chart_buttons(
         f"{emoji} <b>[자동 추적 결과]</b>  {title}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{pnl_emoji} <b>{name}</b>  <code>{rec['code']}</code>\n"
+        f"{pnl_emoji} <b>{name}</b>  <code>{code}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"신호: {sig_label}  |  감지: {rec.get('detect_date','')} {rec.get('detect_time','')}\n"
         f"{theme_tag}\n"
@@ -1537,8 +1604,10 @@ def _send_tracking_result(rec: dict):
         f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
         f"최대낙폭: {mdd:+.1f}%\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>",
-        rec["code"], name
+        f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>"
+        f"{cause_block}"
+        f"{profit_guide}",
+        code, name
     )
 
 def save_carry_stocks():
@@ -2046,9 +2115,10 @@ def analyze(stock: dict) -> dict:
             inv = get_investor_trend(code)
             f_net, i_net = inv.get("foreign_net",0), inv.get("institution_net",0)
             if f_net>0 and i_net>0: score+=25; signal_type="STRONG_BUY"; reasons.append("✅ 외국인+기관 동시 순매수")
-            elif f_net>0: score+=10; reasons.append("🟡 외국인 순매수")
-            elif i_net>0: score+=10; reasons.append("🟡 기관 순매수")
-        except: pass
+            elif f_net>0: score+=10; reasons.append(f"🟡 외국인 순매수 ({f_net:+,}주)")
+            elif i_net>0: score+=10; reasons.append(f"🟡 기관 순매수 ({i_net:+,}주)")
+            elif f_net<0 and i_net<0: reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
+        except: inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -2748,6 +2818,81 @@ def on_market_close():
     send(msg)
     analyze_dart_disclosures()
 
+def send_premarket_briefing():
+    """
+    매일 08:50 — 장 시작 10분 전 브리핑
+    ① 이월 감시 종목 현황 (현재가 기준 잠정 수익률)
+    ② 어제 상한가 종목 (오늘 연속 상한가 후보)
+    ③ 오늘 예정 주요 공시 (DART)
+    ④ 현재 동적 파라미터 상태
+    """
+    today = datetime.now().strftime("%Y-%m-%d (%a)")
+    msg   = f"🌅 <b>장 시작 전 브리핑</b>  {today}\n━━━━━━━━━━━━━━━\n"
+
+    # ── ① 이월 감시 종목 ──
+    if _detected_stocks:
+        msg += f"\n📂 <b>감시 중 종목</b>  ({len(_detected_stocks)}개)\n"
+        for code, info in list(_detected_stocks.items())[:6]:
+            try:
+                cur   = get_stock_price(code)
+                price = cur.get("price", 0)
+                entry = info.get("entry_price", 0)
+                if price and entry:
+                    pnl = round((price - entry) / entry * 100, 1)
+                    dot = "🟢" if pnl >= 0 else "🔴"
+                    msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
+                time.sleep(0.15)
+            except: continue
+    else:
+        msg += "\n📂 감시 중 종목 없음\n"
+
+    # ── ② 어제 상한가 종목 ──
+    try:
+        upper_yest = []
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        upper_yest = [v for v in data.values()
+                      if v.get("detect_date") == yesterday
+                      and v.get("signal_type") == "UPPER_LIMIT"]
+        if upper_yest:
+            msg += f"\n🔁 <b>전일 상한가 → 오늘 연속 주목</b>\n"
+            for v in upper_yest[:4]:
+                msg += f"  🚨 {v['name']}  ({v['code']})\n"
+    except: pass
+
+    # ── ③ 오늘 DART 예정 공시 (최근 등록 기준) ──
+    try:
+        if DART_API_KEY:
+            today_str = datetime.now().strftime("%Y%m%d")
+            dart_list = _fetch_dart_list(today_str)
+            hot = [i for i in dart_list[:10]
+                   if any(kw in i.get("report_nm","")
+                          for kw in ["유상증자","무상증자","합병","분할","실적","배당","자사주"])]
+            if hot:
+                msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
+                for h in hot[:4]:
+                    msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
+    except: pass
+
+    # ── ④ 현재 파라미터 상태 ──
+    tuned = any([
+        _dynamic["early_price_min"]  != EARLY_PRICE_MIN,
+        _dynamic["mid_surge_min_pct"] != MID_SURGE_MIN_PCT,
+        _dynamic["min_score_normal"] != 60,
+    ])
+    if tuned:
+        msg += (f"\n⚙️ <b>자동 조정된 파라미터</b>\n"
+                f"  조기포착 기준: {_dynamic['early_price_min']:.0f}%  "
+                f"중기눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
+                f"  최소점수: {_dynamic['min_score_normal']}점\n")
+
+    msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+    send(msg)
+
+
 def send_weekly_report():
     """매주 월요일 장 시작 시 지난주 성과 자동 발송 + AI 분석"""
     try:
@@ -2987,7 +3132,8 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
     schedule.every(30).seconds.do(poll_telegram_commands)
-    schedule.every().monday.at("09:01").do(send_weekly_report)   # 매주 월요일 자동 주간 리포트
+    schedule.every().monday.at("09:01").do(send_weekly_report)
+    schedule.every().day.at("08:50").do(send_premarket_briefing)  # 장 시작 전 브리핑
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
         _clear_all_cache(),
         refresh_dynamic_candidates(),
