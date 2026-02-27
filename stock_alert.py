@@ -173,11 +173,22 @@ _early_price_min_dynamic  = EARLY_PRICE_MIN
 _early_volume_min_dynamic = EARLY_VOLUME_MIN
 
 # ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
-_dynamic_theme_map  = {}   # theme_key → {desc, reason, stocks:[(code,name)], ts}
+_dynamic_theme_map  = {}
 DYNAMIC_THEME_FILE  = "dynamic_themes.json"
-CORR_MIN            = 0.70   # 피어슨 상관계수 최소값
-CORR_LOOKBACK       = 20     # 상관관계 계산 기간 (일)
-NEWS_COOCCUR_FILE   = "news_cooccur.json"  # 뉴스 공동언급 저장
+CORR_MIN            = 0.70
+CORR_LOOKBACK       = 20
+NEWS_COOCCUR_FILE   = "news_cooccur.json"
+
+# ── 섹터 지속 모니터링 ──
+# code → {name, known_codes:set, last_update:ts, alert_count:int}
+_sector_monitor     = {}
+SECTOR_MONITOR_INTERVAL = 600   # 10분마다 재조회
+SECTOR_MONITOR_MAX_HOURS = 6    # 최대 6시간 모니터링
+
+# ── 진입가 감지 ──
+# log_key → {code, name, entry_price, notified:bool, signal_type, detect_time}
+_entry_watch        = {}
+ENTRY_TOLERANCE_PCT = 2.0       # 진입가 ±2% 이내 진입 시 알림
 
 # ============================================================
 # 🕐 시간 유틸
@@ -792,9 +803,11 @@ def run_mid_pullback_scan():
         return
 
     signals.sort(key=lambda x: x["score"], reverse=True)
-    for s in signals[:3]:  # 상위 3개만
+    for s in signals[:3]:
         send_mid_pullback_alert(s)
-        save_signal_log(s)   # ★ 결과 자동 추적 등록
+        save_signal_log(s)
+        register_entry_watch(s)                     # ★ 진입가 감시 등록
+        start_sector_monitor(s["code"], s["name"])  # ★ 섹터 지속 모니터링
         _mid_pullback_alert_history[s["code"]] = time.time()
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
@@ -805,6 +818,19 @@ def send_mid_pullback_alert(s: dict):
     now_str     = datetime.now().strftime("%H:%M:%S")
     reasons     = "\n".join(s["reasons"])
     atr_tag     = " (ATR)" if s.get("atr_used") else " (고정)"
+    entry  = s.get("entry_price", 0)
+    stop   = s.get("stop_loss", 0)
+    target = s.get("target_price", 0)
+    price  = s.get("price", 0)
+    diff_from_entry = ((price - entry) / entry * 100) if entry and price else 0
+    entry_block = (
+        f"┌─────────────────────\n"
+        f"│ 🟣 <b>진입 포인트</b>\n"
+        f"│ 🎯 진입가  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
+        f"│ 🛡 손절가  <b>{stop:,}원</b>  (-{s['stop_pct']:.1f}%){atr_tag}\n"
+        f"│ 🏆 목표가  <b>{target:,}원</b>  (+{s['target_pct']:.1f}%){atr_tag}\n"
+        f"└─────────────────────"
+    )
 
     si = s.get("sector_info") or {}
     theme     = si.get("theme", "")
@@ -830,10 +856,11 @@ def send_mid_pullback_alert(s: dict):
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터: 조회 실패\n"
 
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
-    send(
+    send_with_chart_buttons(
         f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
-        f"<b>{s['name']}</b>  ({s['code']})\n"
-        f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n\n"
+        f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🟣 <b>{s['name']}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>패턴 요약</b>\n"
         f"  1차 급등: <b>+{s['surge_pct']:.0f}%</b>\n"
@@ -847,10 +874,8 @@ def send_mid_pullback_alert(s: dict):
         f"━━━━━━━━━━━━━━━\n"
         f"{sector_block}\n"
         f"💰 현재가: <b>{s['price']:,}원</b>  ({s['change_rate']:+.1f}%)\n"
-        f"🎯 진입가: <b>{s['entry_price']:,}원</b>\n"
-        f"🛡 손절가: <b>{s['stop_loss']:,}원</b>  (-{s['stop_pct']:.1f}%){atr_tag}\n"
-        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{s['target_pct']:.1f}%){atr_tag}"
-        + _chart_links(s["code"], s["name"])
+        f"\n{entry_block}",
+        s["code"], s["name"]
     )
 
 # ============================================================
@@ -1499,9 +1524,11 @@ def _send_tracking_result(rec: dict):
     # MDD (최대 낙폭)
     mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
 
-    send(
+    send_with_chart_buttons(
         f"{emoji} <b>[자동 추적 결과]</b>  {title}\n"
-        f"<b>{name}</b>  ({rec['code']})\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{pnl_emoji} <b>{name}</b>  <code>{rec['code']}</code>\n"
+        f"━━━━━━━━━━━━━━━\n"
         f"신호: {sig_label}  |  감지: {rec.get('detect_date','')} {rec.get('detect_time','')}\n"
         f"{theme_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -1510,8 +1537,8 @@ def _send_tracking_result(rec: dict):
         f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
         f"최대낙폭: {mdd:+.1f}%\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>"
-        + _chart_links(rec["code"], name)
+        f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>",
+        rec["code"], name
     )
 
 def save_carry_stocks():
@@ -1719,20 +1746,142 @@ def auto_tune(notify: bool = True):
 # 📊 차트 기능 (이미지 전송 + 링크)
 # ============================================================
 def _chart_links(code: str, name: str) -> str:
-    """차트 링크 블록 — 네이버 / KIS 모바일앱"""
-    # KIS 모바일앱 딥링크: 종목 상세 화면 바로 열기
-    kis_deep = f"kakaotalk://plusfriend/chat/kisabroad"  # 범용 앱 딥링크
-    kis_web  = f"https://m.kisdisc.com/stock/chart/{code}"
-    naver    = f"https://finance.naver.com/item/fchart.naver?code={code}"
-    daum     = f"https://finance.daum.net/quotes/A{code}#chart/day"
+    """차트 링크 — 인라인 키보드 버튼으로 외부 브라우저 오픈"""
+    # 빈 문자열 반환 (링크는 send_with_chart_buttons로 별도 처리)
+    return ""
 
-    return (
-        f"\n━━━━━━━━━━━━━━━\n"
-        f"📊 <b>차트 바로가기</b>\n"
-        f'  <a href="{naver}">📈 네이버 차트</a>   '
-        f'  <a href="{daum}">📉 다음 차트</a>\n'
-        f'  <a href="{kis_web}">🏦 KIS 차트</a>\n'
-    )
+# ============================================================
+# 📡 섹터 지속 모니터링
+# ============================================================
+def start_sector_monitor(code: str, name: str):
+    if code in _sector_monitor:
+        return
+    _sector_monitor[code] = {
+        "name": name, "known_codes": set(),
+        "last_update": time.time(), "alert_count": 0, "start_ts": time.time(),
+    }
+    def _monitor_loop(code=code, name=name):
+        while True:
+            time.sleep(SECTOR_MONITOR_INTERVAL)
+            info = _sector_monitor.get(code)
+            if not info: break
+            if not is_market_open():
+                _sector_monitor.pop(code, None); break
+            if (time.time() - info["start_ts"]) / 3600 > SECTOR_MONITOR_MAX_HOURS:
+                _sector_monitor.pop(code, None); break
+            try:
+                _sector_cache.pop(code, None)
+                si = calc_sector_momentum(code, name)
+                if not si.get("detail"): continue
+                new_rising = [r for r in si.get("rising",[]) if r["code"] not in info["known_codes"]]
+                info["known_codes"].update({r["code"] for r in si.get("detail",[])})
+                if new_rising or info["alert_count"] == 0:
+                    info["alert_count"] += 1
+                    theme   = si.get("theme",""); rising = si.get("rising",[]); flat = si.get("flat",[])
+                    bonus   = si.get("bonus",0); summary = si.get("summary","")
+                    new_set = {x["code"] for x in new_rising}
+                    tag     = f"🆕 {len(new_rising)}종목 추가" if new_rising and info["alert_count"]>1 else f"#{info['alert_count']}회 업데이트"
+                    lines   = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
+                    lines  += f"  {summary}\n" if summary else ""
+                    for r in rising[:5]:
+                        vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
+                        new_t = " 🆕" if r["code"] in new_set else ""
+                        lines += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}\n"
+                    for r in flat[:2]:
+                        lines += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+                    if bonus > 0:
+                        lines += f"  💡 섹터 가산점: +{bonus}점\n"
+                    send_with_chart_buttons(
+                        f"🏭 <b>[{name} 섹터 모니터링]</b>\n━━━━━━━━━━━━━━━\n{lines}",
+                        code, name
+                    )
+            except Exception as e:
+                print(f"⚠️ 섹터 모니터 오류 ({code}): {e}")
+    threading.Thread(target=_monitor_loop, daemon=True).start()
+    print(f"  📡 섹터 모니터링 시작: {name}")
+
+# ============================================================
+# 🎯 진입가 감지
+# ============================================================
+def register_entry_watch(s: dict):
+    entry = s.get("entry_price", 0)
+    if not entry: return
+    log_key = f"{s['code']}_{datetime.now().strftime('%Y%m%d%H%M')}"
+    _entry_watch[log_key] = {
+        "code": s["code"], "name": s["name"], "entry_price": entry,
+        "stop_loss": s.get("stop_loss",0), "target_price": s.get("target_price",0),
+        "signal_type": s.get("signal_type",""), "detect_time": datetime.now().strftime("%H:%M"),
+        "notified": False, "registered_ts": time.time(),
+    }
+    print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원")
+
+def check_entry_watch():
+    if not _entry_watch: return
+    expired = []
+    for log_key, watch in list(_entry_watch.items()):
+        if time.time() - watch["registered_ts"] > 86400 or watch["notified"]:
+            expired.append(log_key); continue
+        try:
+            cur = get_stock_price(watch["code"])
+            price = cur.get("price", 0)
+            if not price: continue
+            entry    = watch["entry_price"]
+            diff_pct = (price - entry) / entry * 100
+            if abs(diff_pct) <= ENTRY_TOLERANCE_PCT:
+                watch["notified"] = True
+                sig_labels = {
+                    "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
+                }
+                sig      = sig_labels.get(watch["signal_type"], watch["signal_type"])
+                diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
+                stop_pct = round((watch["stop_loss"]  - entry) / entry * 100, 1) if entry else 0
+                tgt_pct  = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
+                send_with_chart_buttons(
+                    f"🔔🔔 <b>[진입가 도달!]</b> 🔔🔔\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                    f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"┌─────────────────────\n"
+                    f"│ ⚡️ <b>지금 진입 구간!</b>\n"
+                    f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+                    f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
+                    f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
+                    f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
+                    f"└─────────────────────",
+                    watch["code"], watch["name"]
+                )
+                print(f"  🎯 진입가 도달: {watch['name']} {price:,} / 진입 {entry:,}")
+                expired.append(log_key)
+        except: continue
+    for k in expired:
+        _entry_watch.pop(k, None)
+
+def send_with_chart_buttons(text: str, code: str, name: str):
+    """
+    텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
+    버튼은 기기 기본 브라우저(외부)로 열림
+    """
+    naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": f"📈 {name} 차트 보기 (네이버)", "url": naver},
+        ]]
+    }
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         text,
+                "parse_mode":   "HTML",
+                "reply_markup": keyboard,
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 오류: {e}")
 
 def send(text: str):
     try:
@@ -1787,6 +1936,17 @@ def send_alert(s: dict):
     title = {"UPPER_LIMIT":"상한가 감지","NEAR_UPPER":"상한가 근접","STRONG_BUY":"강력 매수 신호",
              "SURGE":"급등 감지","ENTRY_POINT":"★ 눌림목 진입 시점 ★",
              "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
+
+    # 신호 유형별 종목명 색상 이모지
+    name_dot = {
+        "UPPER_LIMIT": "🔴",   # 빨강 - 상한가 (최고 강도)
+        "NEAR_UPPER":  "🟠",   # 주황 - 상한가 근접
+        "STRONG_BUY":  "🟢",   # 초록 - 강력 매수
+        "SURGE":       "🟡",   # 노랑 - 급등
+        "EARLY_DETECT":"🔵",   # 파랑 - 조기 포착
+        "ENTRY_POINT": "🟣",   # 보라 - 눌림목 진입
+    }.get(s["signal_type"], "⚪")
+
     stars    = "★" * min(int(s["score"]/20), 5)
     now_str  = datetime.now().strftime("%H:%M:%S")
     stop_pct = s.get("stop_pct",7.0); target_pct = s.get("target_pct",15.0)
@@ -1794,23 +1954,51 @@ def send_alert(s: dict):
     strict_warn = "\n⏰ <b>장 시작·마감 근접 — 변동성 주의</b>\n" if is_strict_time() else ""
     prev_tag    = "\n🔁 <b>전일 상한가!</b> 연속 상한가 가능성" if s.get("prev_upper") else ""
 
+    # 진입가 강조 블록
+    entry  = s.get("entry_price", 0)
+    stop   = s.get("stop_loss", 0)
+    target = s.get("target_price", 0)
+    price  = s.get("price", 0)
+    diff_from_entry = ((price - entry) / entry * 100) if entry and price else 0
+
     detected_at = s.get("detected_at", datetime.now())
     if s["signal_type"] == "ENTRY_POINT":
-        entry_msg = f"⚡️ <b>지금 눌림목 진입 구간!</b>\n🎯 진입가: <b>{s['entry_price']:,}원</b>"
+        entry_block = (
+            f"┌─────────────────────\n"
+            f"│ ⚡️ <b>지금 진입 구간!</b>\n"
+            f"│ 🎯 진입가  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
+            f"│ 🛡 손절가  <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🏆 목표가  <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"└─────────────────────"
+        )
     elif s["signal_type"] == "EARLY_DETECT":
-        entry_msg = f"⚡️ <b>지금 바로 진입 고려!</b>\n🎯 목표 진입가: <b>{s['entry_price']:,}원</b>"
+        entry_block = (
+            f"┌─────────────────────\n"
+            f"│ ⚡️ <b>선진입 고려!</b>\n"
+            f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
+            f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"└─────────────────────"
+        )
     else:
         elapsed = minutes_since(detected_at)
-        if elapsed < 30:
-            entry_msg = (f"⏰ <b>눌림목 대기 중</b> ({30-elapsed}분 후 체크)\n"
-                         f"🎯 목표 진입가: <b>{s['entry_price']:,}원</b>")
-        else:
-            entry_msg = (f"📡 <b>눌림목 실시간 체크 중</b>\n"
-                         f"🎯 목표 진입가: <b>{s['entry_price']:,}원</b>")
+        wait_msg = f"⏰ 눌림목 대기 ({30-elapsed}분 후 체크)" if elapsed < 30 else "📡 눌림목 실시간 체크 중"
+        entry_block = (
+            f"┌─────────────────────\n"
+            f"│ {wait_msg}\n"
+            f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
+            f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"└─────────────────────"
+        )
 
-    send(
-        f"{emoji} <b>[{title}]</b>\n<b>{s['name']}</b>  {s['code']}\n🕐 {now_str}\n"
-        f"{strict_warn}\n"
+    send_with_chart_buttons(
+        f"{emoji} <b>[{title}]</b>\n"
+        f"🕐 {now_str}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{strict_warn}"
         f"💰 현재가: <b>{s['price']:,}원</b>  (<b>{s['change_rate']:+.1f}%</b>)\n"
         f"📊 거래량: <b>{s['volume_ratio']:.1f}배</b> (5일 평균 대비)\n"
         f"⭐ 신호강도: {stars} ({s['score']}점)\n"
@@ -1819,10 +2007,8 @@ def send_alert(s: dict):
         + "\n".join(s["reasons"]) + "\n"
         f"━━━━━━━━━━━━━━━\n\n"
         + _sector_block(s)
-        + f"{entry_msg}\n\n"
-        f"🛡 손절가: <b>{s['stop_loss']:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
-        f"🏆 목표가: <b>{s['target_price']:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
-        + _chart_links(s["code"], s["name"])
+        + f"\n{entry_block}",
+        s["code"], s["name"]
     )
 
 # ============================================================
@@ -2170,12 +2356,16 @@ def run_dart_intraday():
                 except: pass
             atr_tag = " (ATR)" if atr_used else " (고정)"
 
-            # 섹터 모멘텀
+            # 섹터 모멘텀 (실패 시 백그라운드 재시도)
             sector_info = {"bonus":0,"detail":[],"rising":[],"flat":[],"theme":"","summary":""}
             try:
                 if price:
                     sector_info = calc_sector_momentum(code, company)
             except: pass
+
+            # 섹터 지속 모니터링 + 진입가 감시 등록 (공시 발생 종목)
+            if price:
+                start_sector_monitor(code, company)
 
             # ── 이모지 및 등급 ──
             emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
@@ -2230,16 +2420,18 @@ def run_dart_intraday():
             elif theme:
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
 
-            send(
+            send_with_chart_buttons(
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
-                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-                f"<b>{company}</b>  ({code})\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"{'🔴' if is_risk else '🟡'} <b>{company}</b>  <code>{code}</code>\n"
+                f"━━━━━━━━━━━━━━━\n"
                 f"📌 {title}\n"
                 f"🔑 키워드: {', '.join(all_kw)}"
                 f"{price_block}"
                 f"{sector_block}"
-                f"{stop_block}"
-                + _chart_links(code, company)
+                f"{stop_block}",
+                code, company
             )
             print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
     except Exception as e: print(f"⚠️ DART 오류: {e}")
@@ -2735,10 +2927,10 @@ def run_scan():
             for s in alerts:
                 print(f"  ✓ {s['name']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[s["code"]] = time.time()
-                # ★ 모든 신호 유형 저장 (EARLY_DETECT 한정 → 전체로 확장)
                 save_signal_log(s)
                 if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
-                # 동적 테마 자동 생성 (백그라운드)
+                register_entry_watch(s)                     # ★ 진입가 감시 등록
+                start_sector_monitor(s["code"], s["name"])  # ★ 섹터 지속 모니터링
                 try:
                     threading.Thread(
                         target=auto_update_theme,
@@ -2755,8 +2947,8 @@ def run_scan():
                         _detected_stocks[s["code"]]["high_price"] = s["price"]
                 time.sleep(1)
 
-        # ★ 추적 중인 신호 결과 자동 체크 (매 스캔마다)
-        track_signal_results()
+        check_entry_watch()     # ★ 매 스캔마다 진입가 도달 체크
+        track_signal_results()  # ★ 추적 중인 신호 결과 자동 체크
     except Exception as e: print(f"⚠️ 스캔 오류: {e}")
 
 # ============================================================
