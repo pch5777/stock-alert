@@ -1,38 +1,81 @@
 #!/usr/bin/env python3
 """
-📈 KIS 주식 급등 알림 봇 v14
+📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[기존 v13 기능 전체 유지]
-① 조기 포착 (상한가 전 선진입)
-② 급등/상한가 감지 (외국인·기관 동반)
-③ 섹터 모멘텀 (동반 상승 + 가산점)
-④ 뉴스 → 실제 주가 확인 (2분, UA 랜덤, 3개 소스)
-⑤ DART 공시 → 실제 주가 확인 (3분)
-⑥ ATR 기반 동적 손절·목표가
-⑦ 거래량 5일 평균 대비 정확 계산
-⑧ 시간대별 필터 (장 초반·마감 엄격)
-⑨ 전일 상한가 가산점
-⑩ 섹터 캐시 장 시작 초기화
-⑪ EARLY_DETECT 저장 + tracker 피드백 자동 조건 조정
-⑫ 텔레그램 명령어 (/status /list /stop /resume)
-⑬ 이월 눌림목 (최대 3일)
+버전: v16.0
+날짜: 2026-02-28
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[v14 신규 - 퀀트펀드 원리 적용]
-⑭ 중기 눌림목 스캐너 (AQR 모멘텀 팩터 적용)
-    - 1차 급등(20일 내 +15%) 확인
-    - 건강한 눌림 확인 (고점 대비 -10~40%, 거래량 감소)
-    - 재상승 시작 신호 (거래량 회복 + 당일 양봉 + 이평 회복)
-    - 눌림 깊이·기간별 신호 등급화
-⑮ 20일 이동평균 괴리율 체크 (Renaissance 평균회귀)
-⑯ 코스피 상대강도 (시장 중립 필터)
-⑰ 거래량 표준편차 이상 탐지 (통계적 이상 감지)
-⑱ 모멘텀 재점화 스코어 (눌림 품질 + 재상승 강도 통합)
+[변경 이력]
+
+v16.0 (2026-02-28)  ← 현재
+  ① NXT 전면 연동
+     - get_nxt_info() 캐시 + 비상장 종목 자동 제외 (_nxt_unavailable)
+     - nxt_score_bonus() — 외인/기관/거래량/프리미엄 점수 보정
+     - 급등·눌림목·조기포착·섹터 분석에 NXT 점수 반영
+     - KRX 개장 전(08:00~09:00) NXT 선포착
+     - KRX 마감 후(15:30~20:00) NXT로 진입가·손절 감시 연장
+     - 장 마감 리포트에 NXT 실시간 수익률 표시
+     - 08:50 브리핑에 NXT 외인 선취매 포함
+  ② 공휴일 자동화
+     - 공공데이터포털 API 자동 조회 (PUBLIC_DATA_API_KEY)
+     - API 실패 시 하드코딩 fallback
+     - 주말·공휴일 전체 스캔 자동 차단
+
+v15.0 (2026-02-27)
+  ① 종목명 신호별 색상 (🔴🟠🟡🟢🔵🟣)
+  ② 진입가 박스 UI (┌─ 박스, 현재가 대비 % 실시간 표시)
+  ③ 섹터 재조회 장 마감까지 10분마다 계속 모니터링
+  ④ 분할 청산 가이드 (목표의 50% 도달 시 자동 알림)
+  ⑤ 손절 원인 분석 (외인 매도량·거래량 급감 자동 분석)
+  ⑥ 외인·기관 순매수 수량 표시
+  ⑦ 차트 링크 인라인 버튼 → 외부 브라우저 오픈
+  ⑧ 장 시작 전 브리핑 (매일 08:50)
+  ⑨ 일별 리포트 개선 (전체 추적 중 잠정 수익률 + 누적 성과)
+  ⑩ 주간 리포트 금요일 15:35으로 변경
+
+v14.0 (2026-02-27)
+  ① 중기 눌림목 스캐너 (AQR 모멘텀 팩터)
+  ② 20일 이동평균 괴리율 (Renaissance 평균회귀)
+  ③ 코스피 상대강도 (시장 중립 필터)
+  ④ 거래량 Z-score 이상 탐지
+  ⑤ 모멘텀 재점화 스코어
+  ⑥ 자동 결과 추적 시스템
+  ⑦ 자동 조건 조정 엔진
+  ⑧ AI 주간 분석 (Claude API 연동)
+  ⑨ 퀀트 눌림목 전략 (진입가·손절가·목표가 자동 계산)
+
+v13.0 이하
+  ① 조기 포착 (상한가 전 선진입)
+  ② 급등/상한가 감지 (외국인·기관 동반)
+  ③ 섹터 모멘텀 (동반 상승 + 가산점)
+  ④ 뉴스 → 실제 주가 확인
+  ⑤ DART 공시 → 실제 주가 확인
+  ⑥ ATR 기반 동적 손절·목표가
+  ⑦ 텔레그램 명령어 (/status /list /stop /resume)
+  ⑧ 이월 눌림목 (최대 3일)
+  ⑨ 동적 테마 자동 생성
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
+
+BOT_VERSION = "v16.0"
+BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
+
+# .env 파일 자동 로드 (python-dotenv 없어도 직접 파싱)
+def _load_dotenv(path: str = ".env"):
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line: continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError: pass
+_load_dotenv()
 
 # ============================================================
 # ⚙️ 환경변수
@@ -193,9 +236,82 @@ ENTRY_TOLERANCE_PCT = 2.0       # 진입가 ±2% 이내 진입 시 알림
 # ============================================================
 # 🕐 시간 유틸
 # ============================================================
+# ── 한국 증시 휴장일 자동 관리 ──
+# KRX 공공데이터 API로 매년 자동 갱신
+_kr_holidays: set = set()
+_holiday_loaded_year: int = 0
+
+def _load_kr_holidays(year: int = None):
+    """
+    공공데이터포털 KRX 휴장일 API로 자동 조회
+    API 실패 시 하드코딩 fallback 사용
+    """
+    global _kr_holidays, _holiday_loaded_year
+    if year is None:
+        year = datetime.now().year
+    if _holiday_loaded_year == year and _kr_holidays:
+        return
+
+    # 1차: 공공데이터포털 한국천문연구원 특일 정보 API
+    loaded = False
+    pub_api_key = os.environ.get("PUBLIC_DATA_API_KEY", "")
+    if pub_api_key:
+        try:
+            resp = requests.get(
+                "http://apis.data.go.kr/B090041/openapi/service/SpcdeInfoService/getRestDeInfo",
+                params={"serviceKey": pub_api_key, "solYear": year,
+                        "numOfRows": 50, "_type": "json"},
+                timeout=10
+            )
+            items = resp.json().get("response",{}).get("body",{}).get("items",{}).get("item",[])
+            if isinstance(items, dict): items = [items]
+            holidays = {str(i["locdate"]) for i in items if i.get("locdate")}
+            if holidays:
+                _kr_holidays = holidays
+                _holiday_loaded_year = year
+                loaded = True
+                print(f"  📅 공휴일 {len(holidays)}일 자동 로드 ({year}년)")
+        except Exception as e:
+            print(f"  ⚠️ 공휴일 API 실패: {e}")
+
+    # 2차: KRX 장운영일정 스크래핑 fallback
+    if not loaded:
+        try:
+            resp = requests.post(
+                "http://open.krx.co.kr/contents/OPN/99/OPN99000001.jspx",
+                data={"tboxisuCd_finder_secuprod0_0":"","isu_cd":"",
+                      "isuCd":"","isu_nm":"","searchType":"1",
+                      "strtDd": f"{year}0101","endDd": f"{year}1231",
+                      "pagePath":"/contents/COM/GenerateOTP.jspx"},
+                timeout=10
+            )
+            # 간단 파싱 (실패해도 괜찮음)
+        except: pass
+
+    # 3차: 하드코딩 fallback (API 모두 실패 시)
+    if not loaded:
+        fallback = {
+            2025: {"20250101","20250128","20250129","20250130","20250301",
+                   "20250505","20250506","20250603","20250606","20250815",
+                   "20251003","20251008","20251009","20251225"},
+            2026: {"20260101","20260127","20260128","20260129","20260301",
+                   "20260505","20260525","20260606","20260815",
+                   "20261002","20261003","20261005","20261009","20261225","20261231"},
+        }
+        _kr_holidays = fallback.get(year, set())
+        _holiday_loaded_year = year
+        print(f"  📅 공휴일 fallback 사용 ({year}년, {len(_kr_holidays)}일)")
+
+def is_holiday(date_str: str = None) -> bool:
+    """주말 또는 공휴일 여부"""
+    now = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
+    _load_kr_holidays(now.year)
+    return now.weekday() >= 5 or now.strftime("%Y%m%d") in _kr_holidays
+
 def is_market_open() -> bool:
-    n = datetime.now().time()
-    return dtime(9, 0) <= n <= dtime(15, 30)
+    now = datetime.now()
+    if is_holiday(): return False
+    return dtime(9, 0) <= now.time() <= dtime(15, 30)
 
 def minutes_since(dt: datetime) -> int:
     return int((datetime.now() - dt).total_seconds() // 60)
@@ -336,10 +452,11 @@ def was_upper_limit_yesterday(code: str) -> bool:
 # ⑩ 캐시 초기화
 # ============================================================
 def _clear_all_cache():
-    global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache
+    global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache, _nxt_cache, _nxt_unavailable
     _sector_cache.clear(); _avg_volume_cache.clear()
     _prev_upper_cache.clear(); _daily_cache.clear()
-    print("🔄 전체 캐시 초기화 완료")
+    _nxt_cache.clear(); _nxt_unavailable.clear()
+    print("🔄 전체 캐시 초기화 완료 (NXT 포함)")
 
 # ============================================================
 # ⑮ 20일 이동평균 괴리율 (Renaissance 평균회귀)
@@ -548,6 +665,15 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     # ━━━ 4-3: 20일선 괴리율 ⑮ ━━━
     if MA20_DISCOUNT_MAX <= ma20_dev <= MA20_DISCOUNT_MIN:
         score += 5; reasons.append(f"📐 20일선 저점 근접 ({ma20_dev:+.1f}%)")
+
+    # ━━━ 4-4: NXT 신뢰도 보정 ━━━
+    nxt_delta, nxt_reason = 0, ""
+    try:
+        nxt_delta, nxt_reason = nxt_score_bonus(code)
+        if nxt_delta != 0:
+            score += nxt_delta
+            if nxt_reason: reasons.append(nxt_reason)
+    except: pass
 
     # 최소 조건: 양봉 + 거래량 회복 둘 다 없으면 재상승 미확인
     if not is_bullish and not vol_recovered:
@@ -912,7 +1038,7 @@ def get_upper_limit_stocks() -> list:
     })
     return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
              "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-             "volume_ratio":float(i.get("vol_inrt",0) or 0)}
+             "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"KRX"}
             for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
 
 def get_volume_surge_stocks() -> list:
@@ -925,8 +1051,158 @@ def get_volume_surge_stocks() -> list:
     })
     return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
              "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-             "volume_ratio":float(i.get("vol_inrt",0) or 0)}
+             "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"KRX"}
             for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+
+# ── NXT (넥스트레이드) 조회 ──
+# NXT는 KRX와 동일 종목이 복수 시장에서 거래됨
+# 시장 구분: NX (넥스트레이드), 오전 8:00~오후 8:00 운영
+NXT_OPEN  = dtime(8, 0)
+NXT_CLOSE = dtime(20, 0)
+
+def is_nxt_open() -> bool:
+    """NXT는 주말/공휴일 제외, 08:00~20:00"""
+    if is_holiday(): return False
+    return NXT_OPEN <= datetime.now().time() <= NXT_CLOSE
+
+def get_nxt_surge_stocks() -> list:
+    """NXT 급등/거래량 상위 종목 조회"""
+    try:
+        data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+                         "FHPST01710000", {
+            "FID_COND_MRKT_DIV_CODE":"NX","FID_COND_SCR_DIV_CODE":"20171",
+            "FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0",
+            "FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000",
+            "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"",
+            "FID_VOL_CNT":"20","FID_INPUT_DATE_1":"",
+        })
+        return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
+                 "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
+                 "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"NXT"}
+                for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+    except Exception as e:
+        print(f"⚠️ NXT 조회 오류: {e}"); return []
+
+def get_nxt_stock_price(code: str) -> dict:
+    """NXT 개별 종목 현재가 조회"""
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+    params = {"FID_COND_MRKT_DIV_CODE":"NX","FID_INPUT_ISCD":code}
+    data   = _safe_get(url, "FHKST01010100", params)
+    o      = data.get("output", {})
+    price  = int(o.get("stck_prpr", 0))
+    if not price: return {}
+    return {
+        "code": code, "name": o.get("hts_kor_isnm",""),
+        "price": price, "change_rate": float(o.get("prdy_ctrt",0)),
+        "volume_ratio": float(o.get("vol_inrt",0) or 0),
+        "today_vol": int(o.get("acml_vol",0)),
+        "market": "NXT",
+    }
+
+def get_nxt_investor_trend(code: str) -> dict:
+    """NXT 외인·기관 순매수 조회"""
+    data   = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
+                       "FHKST01010900", {"FID_COND_MRKT_DIV_CODE":"NX","FID_INPUT_ISCD":code})
+    output = data.get("output", [])
+    if not output: return {}
+    return {
+        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
+        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+    }
+
+# NXT 데이터 캐시 (종목별 5분 유효)
+_nxt_cache: dict = {}        # code → {data, ts}
+_nxt_unavailable: set = set()  # NXT 비상장/거래없는 종목 (당일 재조회 안 함)
+
+def get_nxt_info(code: str) -> dict:
+    """
+    NXT 종합 정보 (캐시 5분)
+    NXT 비상장 종목은 _nxt_unavailable에 기록 → 당일 재조회 없음
+    반환: {price, change_rate, volume_ratio, foreign_net, institution_net,
+            vs_krx_pct, vol_surge, inv_bullish, inv_bearish}
+    """
+    if code in _nxt_unavailable: return {}   # 비상장 종목 빠르게 스킵
+    cached = _nxt_cache.get(code)
+    if cached and time.time() - cached["ts"] < 300:
+        return cached["data"]
+    if not is_nxt_open():
+        return {}
+    try:
+        p = get_nxt_stock_price(code)
+        if not p:
+            _nxt_unavailable.add(code)       # 조회 실패 → 비상장으로 간주
+            return {}
+        inv = {}
+        try: inv = get_nxt_investor_trend(code)
+        except: pass
+
+        krx = get_stock_price(code)
+        krx_price = krx.get("price", 0)
+        vs_krx = round((p["price"] - krx_price) / krx_price * 100, 2) if krx_price else 0
+
+        f_net = inv.get("foreign_net", 0)
+        i_net = inv.get("institution_net", 0)
+
+        result = {
+            "price":           p["price"],
+            "change_rate":     p["change_rate"],
+            "volume_ratio":    p["volume_ratio"],
+            "foreign_net":     f_net,
+            "institution_net": i_net,
+            "vs_krx_pct":      vs_krx,
+            "vol_surge":       p["volume_ratio"] >= 3.0,
+            "inv_bullish":     f_net > 0 and i_net > 0,
+            "inv_bearish":     f_net < 0 and i_net < 0,
+            "nxt_listed":      True,          # NXT 상장 확인됨
+        }
+        _nxt_cache[code] = {"data": result, "ts": time.time()}
+        return result
+    except Exception as e:
+        print(f"⚠️ NXT 정보 오류 ({code}): {e}")
+        _nxt_unavailable.add(code)
+        return {}
+
+def nxt_score_bonus(code: str) -> tuple:
+    """
+    NXT 데이터 기반 신호 보정값 반환
+    returns: (score_delta, reason_str)
+    score_delta > 0 → 강화 / < 0 → 감점
+    """
+    if not is_nxt_open(): return 0, ""
+    nxt = get_nxt_info(code)
+    if not nxt: return 0, ""
+
+    delta, reasons = 0, []
+
+    if nxt["inv_bullish"]:
+        delta += 15
+        reasons.append(f"🔵 NXT 외인+기관 동시매수 ({nxt['foreign_net']:+,}주)")
+    elif nxt["foreign_net"] > 0:
+        delta += 7
+        reasons.append(f"🔵 NXT 외인 순매수 ({nxt['foreign_net']:+,}주)")
+    elif nxt["institution_net"] > 0:
+        delta += 5
+        reasons.append(f"🔵 NXT 기관 순매수 ({nxt['institution_net']:+,}주)")
+
+    if nxt["inv_bearish"]:
+        delta -= 15
+        reasons.append(f"🔴 NXT 외인+기관 동시매도 ({nxt['foreign_net']:+,}주)")
+    elif nxt["foreign_net"] < -3000:
+        delta -= 10
+        reasons.append(f"🔴 NXT 외인 대량매도 ({nxt['foreign_net']:+,}주)")
+
+    if nxt["vol_surge"] and delta > 0:
+        delta += 5
+        reasons.append(f"🔵 NXT 거래량 급증 ({nxt['volume_ratio']:.1f}배)")
+
+    if nxt["vs_krx_pct"] > 1.0:
+        delta += 5
+        reasons.append(f"🔵 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% (내일 갭상 주목)")
+    elif nxt["vs_krx_pct"] < -1.0:
+        delta -= 5
+        reasons.append(f"🔴 NXT 디스카운트 {nxt['vs_krx_pct']:.1f}%")
+
+    return delta, "\n".join(reasons)
 
 def get_investor_trend(code: str) -> dict:
     data   = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
@@ -1291,6 +1567,25 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     elif react_ratio >= 0.5:  summary = f"✅ 섹터 절반 이상 반응 ({theme_name}: {react_cnt}/{total})"
     else:                     summary = f"🟡 섹터 일부 반응 ({theme_name}: {react_cnt}/{total})"
 
+    # ── NXT 섹터 동향 보정 ──
+    # 섹터 내 종목들의 NXT 외인 동향이 일치할수록 신뢰도 ↑
+    if is_nxt_open() and results:
+        nxt_bullish_cnt = 0
+        nxt_bearish_cnt = 0
+        for r in results[:4]:   # API 부하 제한: 최대 4종목
+            try:
+                nxt = get_nxt_info(r["code"])
+                if nxt.get("inv_bullish"): nxt_bullish_cnt += 1
+                elif nxt.get("inv_bearish"): nxt_bearish_cnt += 1
+                time.sleep(0.1)
+            except: continue
+        if nxt_bullish_cnt >= 2:
+            bonus = min(bonus + 10, 30)
+            summary += f"  🔵 NXT {nxt_bullish_cnt}종목 외인+기관 매수"
+        elif nxt_bearish_cnt >= 2:
+            bonus = max(bonus - 10, 0)
+            summary += f"  🔴 NXT {nxt_bearish_cnt}종목 외인+기관 매도"
+
     # 소스별 분류 (알림에 '왜 묶였는지' 표시용)
     sources = {}
     for r in results:
@@ -1433,10 +1728,20 @@ def track_signal_results():
             except:
                 elapsed_days = 0
 
-            # 현재가 조회
+            # 현재가 조회 — KRX 장중이면 KRX, 마감 후면 NXT 사용
             try:
-                cur   = get_stock_price(code)
-                price = cur.get("price", 0)
+                if is_market_open():
+                    cur   = get_stock_price(code)
+                    price = cur.get("price", 0)
+                elif is_nxt_open():
+                    # KRX 마감 후 NXT 가격으로 추적 (15:30~20:00)
+                    nxt_cur = get_nxt_stock_price(code)
+                    price   = nxt_cur.get("price", 0)
+                    if not price:          # NXT 거래 없으면 KRX 종가
+                        cur   = get_stock_price(code)
+                        price = cur.get("price", 0)
+                else:
+                    continue   # 모든 시장 마감
                 if not price: continue
             except:
                 continue
@@ -1886,13 +2191,22 @@ def register_entry_watch(s: dict):
 
 def check_entry_watch():
     if not _entry_watch: return
+    # KRX 마감 후 NXT 운영 중이면 NXT 가격으로 진입가 감시 계속
+    use_nxt = not is_market_open() and is_nxt_open()
     expired = []
     for log_key, watch in list(_entry_watch.items()):
         if time.time() - watch["registered_ts"] > 86400 or watch["notified"]:
             expired.append(log_key); continue
         try:
-            cur = get_stock_price(watch["code"])
-            price = cur.get("price", 0)
+            if use_nxt:
+                cur   = get_nxt_stock_price(watch["code"])
+                price = cur.get("price", 0)
+                if not price:
+                    cur   = get_stock_price(watch["code"])
+                    price = cur.get("price", 0)
+            else:
+                cur   = get_stock_price(watch["code"])
+                price = cur.get("price", 0)
             if not price: continue
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
@@ -1906,8 +2220,9 @@ def check_entry_watch():
                 diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
                 stop_pct = round((watch["stop_loss"]  - entry) / entry * 100, 1) if entry else 0
                 tgt_pct  = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
+                nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
                 send_with_chart_buttons(
-                    f"🔔🔔 <b>[진입가 도달!]</b> 🔔🔔\n"
+                    f"🔔🔔 <b>[진입가 도달!]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                     f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
@@ -2061,8 +2376,11 @@ def send_alert(s: dict):
             f"└─────────────────────"
         )
 
+    # NXT 여부
+    nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
+
     send_with_chart_buttons(
-        f"{emoji} <b>[{title}]</b>\n"
+        f"{emoji} <b>[{title}]</b>{nxt_badge}\n"
         f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
@@ -2142,6 +2460,15 @@ def analyze(stock: dict) -> dict:
     elif sector_info.get("summary"):
         reasons.append(sector_info["summary"])
 
+    # ── NXT 보정 (장 중에만, 백그라운드 영향 최소화) ──
+    nxt_delta, nxt_reason = 0, ""
+    try:
+        nxt_delta, nxt_reason = nxt_score_bonus(code)
+        if nxt_delta != 0:
+            score += nxt_delta
+            if nxt_reason: reasons.append(nxt_reason)
+    except: pass
+
     open_est = price/(1+change_rate/100)
     entry    = int((price-(price-open_est)*ENTRY_PULLBACK_RATIO)/10)*10
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
@@ -2150,7 +2477,8 @@ def analyze(stock: dict) -> dict:
             "signal_type":signal_type,"score":score,"sector_info":sector_info,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
-            "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now()}
+            "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
+            "nxt_delta": nxt_delta}
 
 # ============================================================
 # 조기 포착
@@ -2208,12 +2536,61 @@ def check_early_detection() -> list:
             if sector_info.get("rising"):
                 reasons.append("📌 동반 상승: "+"".join([f"{r['name']} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
         elif sector_info.get("summary"): reasons.append(sector_info["summary"])
+
+        # NXT 보정
+        try:
+            nd, nr = nxt_score_bonus(code)
+            if nd != 0: early_score += nd
+            if nr: reasons.append(nr)
+        except: pass
+
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
                         "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":prev_upper,"reasons":reasons,"detected_at":now})
+
+    # ── 장 전 NXT 선포착 (08:00~08:59) ──
+    # KRX 개장 전 NXT에서 이미 급등 중인 종목을 미리 포착
+    now_t = datetime.now().time()
+    if dtime(8, 0) <= now_t < dtime(9, 0):
+        for stock in get_nxt_surge_stocks():
+            code = stock.get("code",""); price = stock.get("price",0)
+            vr   = stock.get("volume_ratio",0); cr = stock.get("change_rate",0)
+            if not code or price < 500 or code in {s["code"] for s in signals}: continue
+            if cr < 5.0 or vr < 5.0: continue   # NXT 장 전 기준 더 엄격
+
+            nxt = get_nxt_info(code)
+            pre_score = 70
+            pre_reasons = [
+                f"🌅 장 전 NXT 선포착!",
+                f"📈 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
+                f"💥 NXT 거래량 {vr:.1f}배",
+            ]
+            if nxt.get("inv_bullish"):
+                pre_score += 15
+                pre_reasons.append(f"🔵 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
+            if nxt.get("vs_krx_pct", 0) > 0.5:
+                pre_score += 10
+                pre_reasons.append(f"🔵 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
+            if pre_score < 75: continue
+
+            entry = price
+            stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+            pre_key = f"NXT_PRE_{code}"
+            if time.time() - _alert_history.get(pre_key, 0) < 3600: continue
+            _alert_history[pre_key] = time.time()
+
+            signals.append({"code":code,"name":stock.get("name",code),"price":price,
+                            "change_rate":cr,"volume_ratio":vr,
+                            "signal_type":"EARLY_DETECT","score":pre_score,
+                            "sector_info":{},"market":"NXT",
+                            "entry_price":entry,"stop_loss":stop,"target_price":target,
+                            "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
+                            "prev_upper":False,"reasons":pre_reasons,
+                            "detected_at":datetime.now()})
+
     return signals
 
 # ============================================================
@@ -2551,9 +2928,10 @@ def poll_telegram_commands():
             if text == "/status":
                 rate_str = (f"\n📊 EARLY 성공률: {_early_feedback['success']}/{_early_feedback['total']} "
                             f"({_early_feedback.get('rate',0)*100:.0f}%)") if _early_feedback.get("total",0)>=5 else ""
-                send(f"🤖 <b>봇 상태</b>  {'⏸ 일시정지' if _bot_paused else '▶️ 실행 중'}\n"
-                     f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
-                     f"📡 장 {'열림' if is_market_open() else '닫힘'}\n"
+                nxt_str  = f"\n🔵 NXT: {'운영 중' if is_nxt_open() else '마감'}"
+                send(f"🤖 <b>봇 상태</b>  {BOT_VERSION}  {'⏸ 일시정지' if _bot_paused else '▶️ 실행 중'}\n"
+                     f"🕐 {datetime.now().strftime('%H:%M:%S')}  📅 {BOT_DATE}\n"
+                     f"📡 장 {'열림' if is_market_open() else '닫힘'}{nxt_str}\n"
                      f"👁 감시: {len(_detected_stocks)}개  |  동적테마: {len(_dynamic_theme_map)}개\n"
                      f"⚙️ EARLY 조건: >{_early_price_min_dynamic}%, >{_early_volume_min_dynamic}배{rate_str}\n\n"
                      f"💬 /result 종목명 수익률  로 결과 기록\n"
@@ -2751,16 +3129,18 @@ def on_market_close():
         _detected_stocks[code]["detected_at"] = datetime.now()
         carry_list.append(f"• {info['name']} ({code}) - {carry_day+1}일차")
     save_carry_stocks()
-    auto_tune(notify=True)   # 장 마감마다 조건 자동 조정
+    auto_tune(notify=True)
 
-    # ── 당일 신호 추적 결과 요약 ──
     today = datetime.now().strftime("%Y%m%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     try:
         data = {}
         with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
-        today_recs = [v for v in data.values() if v.get("detect_date") == today]
-        done_recs  = [v for v in today_recs if v.get("status") != "추적중"]
-        tracking   = [v for v in today_recs if v.get("status") == "추적중"]
+
+        today_recs   = [v for v in data.values() if v.get("detect_date") == today]
+        done_today   = [v for v in today_recs if v.get("status") != "추적중"]
+        # 전체 추적 중 (날짜 무관)
+        all_tracking = [v for v in data.values() if v.get("status") == "추적중"]
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
@@ -2768,64 +3148,90 @@ def on_market_close():
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
 
-        summary_lines = []
-        wins = losses = 0
-        for v in done_recs:
-            pnl   = v.get("pnl_pct", 0)
-            emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
-            label = sig_labels.get(v.get("signal_type",""),"")
-            theme = f" [{v['sector_theme']}]" if v.get("sector_bonus",0) > 0 else " [단독]"
-            summary_lines.append(f"  {emoji} {v['name']} {pnl:+.1f}% ({label}{theme})")
-            if pnl > 0: wins += 1
-            elif pnl < 0: losses += 1
+        msg = f"🔔 <b>장 마감 리포트</b>  {today_str}\n━━━━━━━━━━━━━━━\n"
 
-        # 아직 추적 중인 종목은 현재가 기준으로 잠정 수익률 계산
-        tracking_lines = []
-        for v in tracking[:5]:
-            try:
-                cur = get_stock_price(v["code"])
-                price = cur.get("price", 0)
-                entry = v.get("entry_price", 0)
-                if price and entry:
-                    pnl = round((price - entry) / entry * 100, 1)
-                    e2  = "🟡" if pnl >= 0 else "🟠"
-                    tracking_lines.append(f"  {e2} {v['name']} {pnl:+.1f}% (추적중)")
-                time.sleep(0.15)
-            except: continue
+        # ── 오늘 확정 결과 ──
+        if done_today:
+            wins   = sum(1 for v in done_today if v.get("pnl_pct",0) > 0)
+            losses = sum(1 for v in done_today if v.get("pnl_pct",0) < 0)
+            win_rate = round(wins / len(done_today) * 100) if done_today else 0
+            avg_pnl  = sum(v.get("pnl_pct",0) for v in done_today) / len(done_today)
+            msg += (f"\n📊 <b>오늘 확정 결과</b>  ({len(done_today)}건)\n"
+                    f"  승률 <b>{win_rate}%</b>  평균 <b>{avg_pnl:+.1f}%</b>"
+                    f"  |  수익 {wins}건  손실 {losses}건\n")
+            for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
+                pnl   = v.get("pnl_pct", 0)
+                dot   = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+                label = sig_labels.get(v.get("signal_type",""), "")
+                theme = f"[{v['sector_theme']}]" if v.get("sector_bonus",0) > 0 else "[단독]"
+                msg  += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label} {theme}\n"
+        else:
+            msg += "\n📊 오늘 확정된 신호 없음\n"
 
-        msg = (f"🔔 <b>장 마감 리포트</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
-               f"감시: <b>{len(_detected_stocks)}개</b>")
-
-        if today_recs:
-            total_done = len(done_recs)
-            win_rate   = round(wins / total_done * 100) if total_done else 0
-            msg += (f"\n\n📊 <b>오늘 신호 결과</b>  ({total_done}건 완료)\n"
-                    f"  승률: <b>{win_rate}%</b>  |  수익 {wins}건  손실 {losses}건\n")
-            if summary_lines:
-                msg += "\n".join(summary_lines) + "\n"
-            if tracking_lines:
-                msg += f"\n⏳ <b>추적 중</b> ({len(tracking)}건)\n" + "\n".join(tracking_lines) + "\n"
+        # ── 전체 추적 중 (오늘 + 이월) 잠정 수익률 ──
+        if all_tracking:
+            msg += f"\n⏳ <b>추적 중</b>  ({len(all_tracking)}건)\n"
+            tracking_results = []
+            for v in all_tracking:
+                try:
+                    # 장 마감 후면 NXT 가격 우선 사용
+                    price = 0
+                    if is_nxt_open():
+                        nxt_p = get_nxt_stock_price(v["code"])
+                        price = nxt_p.get("price", 0)
+                    if not price:
+                        cur   = get_stock_price(v["code"])
+                        price = cur.get("price", 0)
+                    entry = v.get("entry_price", 0)
+                    if price and entry:
+                        pnl      = round((price - entry) / entry * 100, 1)
+                        days_ago = (datetime.strptime(today, "%Y%m%d") -
+                                    datetime.strptime(v.get("detect_date", today), "%Y%m%d")).days
+                        day_tag  = f" {days_ago}일째" if days_ago > 0 else " 오늘"
+                        dot      = "🟢" if pnl >= 0 else "🟠"
+                        label    = sig_labels.get(v.get("signal_type",""), "")
+                        nxt_tag  = " 🔵NXT" if is_nxt_open() else ""
+                        tracking_results.append((pnl, f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label}{day_tag}{nxt_tag}\n"))
+                    time.sleep(0.1)
+                except: continue
+            # 수익률 높은 순 정렬
+            for _, line in sorted(tracking_results, key=lambda x: x[0], reverse=True):
+                msg += line
 
         if carry_list:
-            msg += f"\n📂 <b>이월</b> ({len(carry_list)}개)\n" + "\n".join(carry_list)
+            msg += f"\n📂 <b>이월 종목</b>  ({len(carry_list)}개)\n" + "\n".join(carry_list) + "\n"
+
+        # ── 누적 성과 요약 (전체 완료 건) ──
+        all_done = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
+        if len(all_done) >= 5:
+            total_win  = sum(1 for v in all_done if v.get("pnl_pct",0) > 0)
+            total_avg  = sum(v.get("pnl_pct",0) for v in all_done) / len(all_done)
+            total_rate = round(total_win / len(all_done) * 100)
+            msg += (f"\n━━━━━━━━━━━━━━━\n"
+                    f"📈 <b>누적 성과</b>  {len(all_done)}건\n"
+                    f"  승률 <b>{total_rate}%</b>  평균 <b>{total_avg:+.1f}%</b>\n")
 
     except Exception as e:
-        msg = (f"🔔 <b>장 마감</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
-               f"감시 종목: <b>{len(_detected_stocks)}개</b>\n")
+        msg = (f"🔔 <b>장 마감</b>  {today_str}\n"
+               f"감시 종목: <b>{len(_detected_stocks)}개</b>\n"
+               f"⚠️ 리포트 오류: {e}\n")
         if carry_list:
             msg += f"\n📂 <b>이월</b> ({len(carry_list)}개)\n" + "\n".join(carry_list)
 
     send(msg)
     analyze_dart_disclosures()
 
+    # 금요일 장 마감 = 주간 리포트 (금요일이 공휴일이라 목요일에 마감하는 경우도 처리)
+    now = datetime.now()
+    is_friday = now.weekday() == 4
+    next_day_holiday = is_holiday((now + timedelta(days=1)).strftime("%Y%m%d"))
+    is_last_trading_day = is_friday or (now.weekday() == 3 and next_day_holiday)
+    if is_last_trading_day:
+        send_weekly_report()
+
 def send_premarket_briefing():
-    """
-    매일 08:50 — 장 시작 10분 전 브리핑
-    ① 이월 감시 종목 현황 (현재가 기준 잠정 수익률)
-    ② 어제 상한가 종목 (오늘 연속 상한가 후보)
-    ③ 오늘 예정 주요 공시 (DART)
-    ④ 현재 동적 파라미터 상태
-    """
+    """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
+    if is_holiday(): return
     today = datetime.now().strftime("%Y-%m-%d (%a)")
     msg   = f"🌅 <b>장 시작 전 브리핑</b>  {today}\n━━━━━━━━━━━━━━━\n"
 
@@ -2889,28 +3295,65 @@ def send_premarket_briefing():
                 f"중기눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
                 f"  최소점수: {_dynamic['min_score_normal']}점\n")
 
+    # ── ⑤ NXT 장전 동향 (08:00~09:00 사이에만) ──
+    try:
+        nxt_stocks = get_nxt_surge_stocks()
+        if nxt_stocks:
+            # 변동률 상위 5개
+            hot_nxt = sorted(nxt_stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:5]
+            msg += f"\n🔵 <b>NXT 장전 동향</b>  (KRX 개장 전)\n"
+            for s in hot_nxt:
+                cr  = s.get("change_rate", 0)
+                vr  = s.get("volume_ratio", 0)
+                dot = "📈" if cr > 0 else "📉"
+                vt  = f" 🔊{vr:.0f}x" if vr >= 3 else ""
+                msg += f"  {dot} {s['name']} <b>{cr:+.1f}%</b>{vt}\n"
+
+            # 외인 순매수 상위 종목 (NXT 선취매 신호)
+            nxt_foreign_buys = []
+            for s in nxt_stocks[:8]:
+                try:
+                    inv = get_nxt_investor_trend(s["code"])
+                    fn  = inv.get("foreign_net", 0)
+                    if fn > 1000:
+                        nxt_foreign_buys.append((s["name"], fn, s.get("change_rate",0)))
+                    time.sleep(0.1)
+                except: continue
+            if nxt_foreign_buys:
+                msg += f"\n  💡 외인 선취매 주목:\n"
+                for nm, fn, cr in sorted(nxt_foreign_buys, key=lambda x: -x[1])[:3]:
+                    msg += f"    🔵 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
+    except: pass
+
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
     send(msg)
 
 
 def send_weekly_report():
-    """매주 월요일 장 시작 시 지난주 성과 자동 발송 + AI 분석"""
+    """매주 금요일 15:35 — 이번 주 성과 자동 발송 + AI 분석"""
+    # 같은 주에 이미 발송했으면 스킵 (on_market_close와 스케줄 중복 방지)
+    global _weekly_report_sent_week
+    this_week_key = datetime.now().strftime("%Y-W%W")
+    if getattr(send_weekly_report, "_sent_week", "") == this_week_key:
+        return
+    send_weekly_report._sent_week = this_week_key
     try:
         data = {}
         try:
             with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
         except: return
 
-        today     = datetime.now()
-        last_mon  = (today - timedelta(days=today.weekday() + 7)).strftime("%Y%m%d")
-        last_sun  = (today - timedelta(days=today.weekday() + 1)).strftime("%Y%m%d")
+        today    = datetime.now()
+        # 이번 주 월요일 ~ 오늘(금요일)
+        this_mon = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
+        this_fri = today.strftime("%Y%m%d")
 
         week_recs = [v for v in data.values()
-                     if last_mon <= v.get("detect_date","") <= last_sun
+                     if this_mon <= v.get("detect_date","") <= this_fri
                      and v.get("status") in ["수익","손실","본전"]]
 
         if not week_recs:
-            send(f"📅 <b>주간 리포트</b>  {last_mon[:4]}.{last_mon[4:6]}.{last_mon[6:]} ~ {last_sun[6:]}\n지난주 완료된 신호 없음")
+            send(f"📅 <b>주간 리포트</b>  {this_mon[:4]}.{this_mon[4:6]}.{this_mon[6:]} ~ {this_fri[6:]}\n이번 주 완료된 신호 없음")
             return
 
         pnls     = [v["pnl_pct"] for v in week_recs]
@@ -2955,7 +3398,7 @@ def send_weekly_report():
 
         send(
             f"📅 <b>주간 자동 리포트</b>\n"
-            f"{last_mon[:4]}.{last_mon[4:6]}.{last_mon[6:]} ~ {last_sun[:4]}.{last_sun[4:6]}.{last_sun[6:]}\n"
+            f"{this_mon[:4]}.{this_mon[4:6]}.{this_mon[6:]} ~ {this_fri[:4]}.{this_fri[4:6]}.{this_fri[6:]}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"{report_text}"
         )
@@ -2999,7 +3442,7 @@ def _send_ai_analysis(week_recs: list, summary: str):
 
         prompt = f"""당신은 한국 주식 알림 봇의 성과를 분석하는 퀀트 분석가입니다.
 
-[지난주 신호 결과 요약]
+[이번 주 신호 결과 요약]
 {summary}
 
 [종목별 상세]
@@ -3048,7 +3491,8 @@ def run_news_scan():
 def run_scan():
     if not is_market_open() or _bot_paused: return
     strict_tag = " [엄격]" if is_strict_time() else ""
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 스캔{strict_tag}...", flush=True)
+    nxt_tag    = "+NXT" if is_nxt_open() else ""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 스캔{strict_tag}{nxt_tag}...", flush=True)
     try:
         alerts, seen = [], set()
         for stock in get_upper_limit_stocks():
@@ -3061,6 +3505,16 @@ def run_scan():
             r = analyze(stock)
             if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
                 alerts.append(r); seen.add(r["code"])
+
+        # ── NXT 스캔 (장 운영 시간에만) ──
+        if is_nxt_open():
+            for stock in get_nxt_surge_stocks():
+                if stock["code"] in seen: continue
+                r = analyze(stock)
+                if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>ALERT_COOLDOWN:
+                    r["market"] = "NXT"   # NXT 표시
+                    alerts.append(r); seen.add(stock["code"])
+
         for s in check_early_detection():
             if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>ALERT_COOLDOWN:
                 alerts.append(s); seen.add(s["code"])
@@ -3070,8 +3524,11 @@ def run_scan():
         else:
             print(f"  → {len(alerts)}개 감지!")
             for s in alerts:
-                print(f"  ✓ {s['name']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
-                send_alert(s); _alert_history[s["code"]] = time.time()
+                is_nxt = s.get("market") == "NXT"
+                hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
+                mkt_tag  = " 🔵NXT" if is_nxt else ""
+                print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
+                send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
                 if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
                 register_entry_watch(s)                     # ★ 진입가 감시 등록
@@ -3101,29 +3558,28 @@ def run_scan():
 # ============================================================
 if __name__ == "__main__":
     print("="*55)
-    print("📈 KIS 주식 급등 알림 봇 v14.1 시작")
+    print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
+    print(f"   업데이트: {BOT_DATE}")
     print("="*55)
 
     load_carry_stocks()
     load_tracker_feedback()
     load_dynamic_themes()
-    refresh_dynamic_candidates()   # 시작 시 동적 후보군 초기 로딩
+    refresh_dynamic_candidates()
+    _load_kr_holidays(datetime.now().year)   # 공휴일 선로드
 
     send(
-        "🤖 <b>주식 급등 알림 봇 ON (v14.1)</b>\n\n"
-        "✅ 한국투자증권 API 연결\n\n"
+        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
+        f"📅 {BOT_DATE}\n\n"
+        "✅ 한국투자증권 API 연결\n"
+        "🔵 NXT(넥스트레이드) 연동 활성\n\n"
         "<b>📡 스캔 주기</b>\n"
         "• 당일 급등/상한가: 1분\n"
-        "• <b>중기 눌림목 스캔: 5분</b>\n"
+        "• 중기 눌림목: 5분\n"
         "• 뉴스 (3개 소스): 2분\n"
-        "• DART 공시: 3분  |  종합: 15:30\n\n"
-        "<b>⭐ v14.1 개선 — 포착률 향상</b>\n"
-        "🔍 <b>전체 시장 자동 편입</b>\n"
-        "  └ 거래량·상한가 상위 종목 자동 스캔\n"
-        "     (THEME_MAP 미등록 종목도 포착)\n"
-        "⚡️ <b>장중 실시간 돌파 감지</b>\n"
-        "  └ 어제까지 눌림 완성 + 오늘 장중 거래량\n"
-        "     폭발 순간 즉시 알림\n\n"
+        "• DART 공시: 3분  |  종합: 15:30\n"
+        "• NXT 장전 선포착: 08:00~09:00\n"
+        "• NXT 마감 후 추적: 15:30~20:00\n\n"
         "<b>💬 명령어</b>  /status  /list  /stop  /resume"
     )
 
@@ -3132,15 +3588,21 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
     schedule.every(30).seconds.do(poll_telegram_commands)
-    schedule.every().monday.at("09:01").do(send_weekly_report)
+    schedule.every().friday.at("15:35").do(send_weekly_report)   # 매주 금요일 장 마감 후 주간 리포트
     schedule.every().day.at("08:50").do(send_premarket_briefing)  # 장 시작 전 브리핑
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
+        None if is_holiday() else (
         _clear_all_cache(),
         refresh_dynamic_candidates(),
         send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
              f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
-    ))
-    schedule.every().day.at(MARKET_CLOSE).do(on_market_close)
+    )))
+    schedule.every().day.at(MARKET_CLOSE).do(
+        lambda: None if is_holiday() else on_market_close()
+    )
+
+    # 봇 시작 시 공휴일 미리 로드
+    _load_kr_holidays(datetime.now().year)
 
     run_scan()
     run_news_scan()
