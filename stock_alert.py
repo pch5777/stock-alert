@@ -8,19 +8,34 @@
 
 [변경 이력]
 
-v22.0 (2026-02-28)  ← 현재
-  ① 캐시 메모리 누수 수정 (_clear_all_cache 완성)
-     추가된 캐시: _early_cache, _news_reverse_cache, _kospi_cache
-                  _sector_monitor, _today_top_signals, _pending_info_alerts
-     → 장 시작마다 6개 캐시가 누락돼 메모리 무한 증가하던 버그 수정
-  ② 뉴스 이중 크롤링 제거 (45초마다 2회→1회)
-     run_news_scan → fetch_all_news() 1회 호출
-     analyze_news_theme(headlines=) 파라미터로 재사용
-     → Railway 크롤링 차단 위험 50% 감소, CPU 절감
-  ③ run_news_scan NXT 시간 포함
-     is_market_open() → is_any_market_open() (NXT 20:00까지 뉴스 스캔)
-  ④ 섹터 모니터 NXT 장 마감 반영
-     is_market_open() → is_any_market_open() (NXT 마감까지 섹터 유지)
+v24.0 (2026-02-28)  ← 현재
+  ① TOP 5 알림 1시간 간격 자동 발송
+     - 10:00부터 장마감까지 매 정시 자동 발송
+     - KRX 마감(15:30) 후에도 NXT 운영 중이면 계속 발송 (최대 19:00)
+     - is_any_market_open() 체크로 장 닫힌 시간은 자동 스킵
+     - _top_signal_sent_today 플래그 제거 (반복 발송 방해 요소 제거)
+     - /top 명령어도 플래그 우회 코드 불필요 → 단순화
+     - 알림 헤더에 발송 시각 표시 (예: "최우선 종목 TOP 5  02/28 11:00")
+
+v23.0 (2026-02-28)
+  ① 자동 백업 시스템
+     - GitHub Gist 백업: 6시간마다 자동 실행 (비공개 Gist)
+     - 텔레그램 파일 전송: Gist 토큰 없을 때 대안
+     - /백업 명령어: 즉시 수동 백업 + Gist ID 확인
+     - /설정 명령어: Gist 토큰 발급 가이드 포함
+     - Railway Variables: GITHUB_GIST_TOKEN 하나만 추가하면 됨
+  ② 성능 최적화 (렉/버벅임 제거)
+     - run_scan 신호당 sleep(1) 제거 (5신호=5초 블록 → 0초)
+     - 섹터 모니터 스레드 최대 8개 제한 (무제한 → 제어)
+     - 뉴스 역추적 30분 쿨다운 (동일 종목 중복 크롤링 방지)
+     - _pending_info_alerts 최대 20개 + 1시간 자동 만료 (무한 누적 방지)
+  ③ 메뉴 버튼 일일 성과 추가 + TOP 3→5
+     - 📊 일일 성과 버튼 추가 (/daily 또는 /오늘)
+     - 오늘 확정 결과 + 추적 중 잠정 수익률 (NXT 우선)
+     - 최우선 종목 TOP 3 → TOP 5로 확대
+     - 메뉴·BotFather 목록 모두 반영
+
+v22.0 (2026-02-28)
 
 v21.0 (2026-02-28)
   ① 장 마감 기준 NXT 완전 반영 + 앞으로의 기준 통일
@@ -85,7 +100,7 @@ v18.0 (2026-02-28)
      - 재시작 시 텔레그램 복원 현황 알림
 
 v17.0 (2026-02-28)
-  ① 오늘의 최우선 종목 TOP 3 (10:00 자동 발송 + /top 즉시 조회)
+  ① 오늘의 최우선 종목 TOP 5 (10:00 자동 발송 + /top 즉시 조회)
   ② 진입 재알림 (30분 쿨다운, 최대 3회)
   ③ 텔레그램 명령어 추가 (/top /nxt /week /compact)
   ④ 급등 종목 뉴스 역추적 (백그라운드 자동 조회)
@@ -138,7 +153,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v22.0"
+BOT_VERSION = "v24.0"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -167,6 +182,13 @@ KIS_BASE_URL       = "https://openapi.koreainvestment.com:9443"
 DART_API_KEY       = os.environ.get("DART_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# 백업 설정 (선택)
+# GITHUB_GIST_TOKEN: github.com → Settings → Developer settings → Personal access tokens → gist 권한
+# GITHUB_GIST_ID: 최초 실행 시 자동 생성, 이후 동일 Gist에 덮어씀
+GITHUB_GIST_TOKEN  = os.environ.get("GITHUB_GIST_TOKEN", "")
+GITHUB_GIST_ID     = os.environ.get("GITHUB_GIST_ID", "")   # 비워두면 자동 생성
+BACKUP_INTERVAL_H  = 6   # 6시간마다 자동 백업
 
 # ============================================================
 # 📊 파라미터
@@ -315,8 +337,7 @@ ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 �
 
 # ── 오늘의 최우선 종목 ──
 _today_top_signals: dict = {}
-TOP_SIGNAL_SEND_AT       = "10:00"
-_top_signal_sent_today: bool = False
+TOP_SIGNAL_SEND_AT       = "10:00"  # 시작 시각 (이후 1시간마다 반복)
 
 # ── 뉴스 역추적 캐시 ──
 _news_reverse_cache: dict = {}
@@ -597,6 +618,116 @@ def was_upper_limit_yesterday(code: str) -> bool:
 # ============================================================
 # ⑩ 캐시 초기화
 # ============================================================
+# ============================================================
+# 💾 자동 백업 시스템
+# ============================================================
+_last_backup_ts: float = 0
+_gist_id_runtime: str  = GITHUB_GIST_ID   # 런타임 중 생성된 Gist ID 보관
+
+def backup_to_gist() -> bool:
+    """
+    현재 stock_alert.py를 GitHub Gist에 자동 백업
+    - GITHUB_GIST_ID 있으면 기존 Gist 업데이트 (PATCH)
+    - 없으면 새 Gist 생성 (POST) → ID를 _gist_id_runtime에 저장
+    반환: 성공 여부
+    """
+    global _gist_id_runtime
+    if not GITHUB_GIST_TOKEN:
+        return False
+    try:
+        script_path = os.path.abspath(__file__)
+        with open(script_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        ts_str   = datetime.now().strftime("%Y-%m-%d %H:%M")
+        filename = f"stock_alert_{BOT_VERSION}.py"
+        headers  = {
+            "Authorization": f"token {GITHUB_GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        payload = {
+            "description": f"주식 급등 알림 봇 {BOT_VERSION} — 백업 {ts_str}",
+            "public": False,
+            "files": {filename: {"content": code}},
+        }
+        if _gist_id_runtime:
+            # 기존 Gist 업데이트
+            resp = requests.patch(
+                f"https://api.github.com/gists/{_gist_id_runtime}",
+                json=payload, headers=headers, timeout=20
+            )
+        else:
+            # 새 Gist 생성
+            resp = requests.post(
+                "https://api.github.com/gists",
+                json=payload, headers=headers, timeout=20
+            )
+            if resp.status_code in (200, 201):
+                _gist_id_runtime = resp.json().get("id", "")
+                print(f"  💾 새 Gist 생성: {_gist_id_runtime}")
+
+        ok = resp.status_code in (200, 201)
+        if ok:
+            print(f"  💾 Gist 백업 완료: {BOT_VERSION}  {ts_str}")
+        else:
+            print(f"  ⚠️ Gist 백업 실패: {resp.status_code}")
+        return ok
+    except Exception as e:
+        print(f"  ⚠️ Gist 백업 오류: {e}")
+        return False
+
+def backup_to_telegram() -> bool:
+    """
+    현재 stock_alert.py를 텔레그램으로 파일 전송 (백업용)
+    GitHub 토큰 없을 때 대안으로 사용
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        script_path = os.path.abspath(__file__)
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(script_path, "rb") as f:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": f"💾 자동 백업  {BOT_VERSION}  {ts_str}",
+                },
+                files={"document": (f"stock_alert_{BOT_VERSION}_{datetime.now().strftime('%Y%m%d_%H%M')}.py", f)},
+                timeout=30
+            )
+        ok = resp.status_code == 200
+        if ok: print(f"  💾 텔레그램 파일 백업 완료: {ts_str}")
+        else:  print(f"  ⚠️ 텔레그램 백업 실패: {resp.status_code}")
+        return ok
+    except Exception as e:
+        print(f"  ⚠️ 텔레그램 백업 오류: {e}")
+        return False
+
+def run_auto_backup(notify: bool = False):
+    """
+    자동 백업 실행 — Gist 우선, 없으면 텔레그램 파일 전송
+    notify=True면 텔레그램으로 백업 완료 메시지도 전송
+    """
+    global _last_backup_ts
+    now = time.time()
+    if now - _last_backup_ts < BACKUP_INTERVAL_H * 3600 - 60:
+        return   # 인터벌 미달
+    _last_backup_ts = now
+
+    ok_gist = backup_to_gist()
+    ok_tg   = False
+    if not ok_gist:
+        ok_tg = backup_to_telegram()
+
+    if notify and (ok_gist or ok_tg):
+        method = "GitHub Gist" if ok_gist else "텔레그램 파일"
+        send(f"💾 <b>자동 백업 완료</b>  {BOT_VERSION}\n"
+             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+             f"📦 방법: {method}")
+    elif notify and not ok_gist and not ok_tg:
+        print("  ⚠️ 백업 실패 — GITHUB_GIST_TOKEN 또는 텔레그램 설정 확인")
+
+
 def _clear_all_cache():
     global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache
     global _nxt_cache, _nxt_unavailable, _early_cache, _news_reverse_cache
@@ -2471,20 +2602,19 @@ def register_top_signal(s: dict):
         }
 
 def send_top_signals():
-    """매일 10:00 — 오전 최우선 종목 TOP 3 발송"""
-    global _top_signal_sent_today
-    if _top_signal_sent_today or not _today_top_signals: return
-    _top_signal_sent_today = True
+    """10:00~장마감까지 1시간마다 — 최우선 종목 TOP 5 발송"""
+    if not _today_top_signals: return
 
     sig_labels = {
         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
         "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
         "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
     }
-    top3 = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:3]
-    msg  = f"🏆 <b>오늘의 최우선 종목</b>  {datetime.now().strftime('%m/%d')}\n━━━━━━━━━━━━━━━\n"
-    for i, t in enumerate(top3, 1):
-        medal   = ["🥇","🥈","🥉"][i-1]
+    top5  = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:5]
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+    msg   = f"🏆 <b>최우선 종목 TOP 5</b>  {datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━━\n"
+    for i, t in enumerate(top5, 1):
+        medal   = medals[i-1]
         sig     = sig_labels.get(t["signal_type"], t["signal_type"])
         nxt_tag = f"  🔵NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
         entry   = t.get("entry_price", 0)
@@ -2502,9 +2632,7 @@ def send_top_signals():
 
 def reset_top_signals_daily():
     """장 시작 시 최우선 종목 풀 초기화"""
-    global _top_signal_sent_today
     _today_top_signals.clear()
-    _top_signal_sent_today = False
 
 
 def register_entry_watch(s: dict):
@@ -2634,20 +2762,27 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
         _pending_info_alerts.append({"text": text, "ts": time.time()})
 
 def flush_info_alerts():
-    """INFO 알림 묶음 발송 (10분마다 스케줄)"""
+    """INFO 알림 묶음 발송 (5분마다 스케줄) + 오래된 항목 자동 제거"""
     if not _pending_info_alerts: return
-    # 10분 이상 된 것만 발송
     now = time.time()
+    # 1시간 이상 된 항목은 조용히 제거 (너무 오래된 참고 알림은 의미 없음)
+    stale = [a for a in _pending_info_alerts if now - a["ts"] > 3600]
+    for a in stale:
+        _pending_info_alerts.remove(a)
+    # 최대 20개 초과 시 오래된 것부터 제거
+    while len(_pending_info_alerts) > 20:
+        _pending_info_alerts.pop(0)
+    # 5분 이상 된 것만 발송
     to_send = [a for a in _pending_info_alerts if now - a["ts"] >= 300]
     if not to_send: return
     for a in to_send:
-        _pending_info_alerts.remove(a)
+        try: _pending_info_alerts.remove(a)
+        except: pass
     if len(to_send) == 1:
         send(to_send[0]["text"])
     else:
         combined = f"🔵 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
         for a in to_send:
-            # 각 알림에서 첫 줄만 요약
             first_line = a["text"].split("\n")[0][:60]
             combined  += f"• {first_line}\n"
         send(combined)
@@ -3080,8 +3215,13 @@ def fetch_news_for_stock(code: str, name: str) -> list:
     _news_reverse_cache[code] = {"news": news, "ts": time.time()}
     return news
 
+_news_alert_sent: dict = {}   # code → ts (뉴스 알림 쿨다운, 30분)
+
 def news_block_for_alert(code: str, name: str) -> str:
-    """알림 메시지에 삽입할 뉴스 블록 생성"""
+    """알림 직후 백그라운드로 뉴스 역추적 — 30분 쿨다운으로 중복 크롤링 방지"""
+    now = time.time()
+    if now - _news_alert_sent.get(code, 0) < 1800: return  # 30분 쿨다운
+    _news_alert_sent[code] = now
     def _fetch():
         try:
             articles = fetch_news_for_stock(code, name)
@@ -3096,7 +3236,6 @@ def news_block_for_alert(code: str, name: str) -> str:
                 code, name
             )
         except: pass
-    # 알림 직후 백그라운드로 뉴스 조회 (메인 알림 속도 영향 없음)
     threading.Thread(target=_fetch, daemon=True).start()
 
 def fetch_naver_news() -> list:
@@ -3395,19 +3534,20 @@ def _send_menu(title: str = ""):
             [
                 {"text": "🤖 봇 상태",        "callback_data": "cmd_status"},
                 {"text": "📋 감시 종목",       "callback_data": "cmd_list"},
-                {"text": "🏆 오늘 TOP 3",      "callback_data": "cmd_top"},
+                {"text": "🏆 오늘 TOP 5",      "callback_data": "cmd_top"},
+            ],
+            [
+                {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
+                {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
+                {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
             ],
             [
                 {"text": "🔵 NXT 현황",        "callback_data": "cmd_nxt"},
-                {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
-                {"text": "📊 승률 통계",       "callback_data": "cmd_stats"},
-            ],
-            [
                 {"text": "⏸ 알림 정지",        "callback_data": "cmd_stop"},
                 {"text": "▶️ 알림 재개",        "callback_data": "cmd_resume"},
-                {"text": "🗜 컴팩트 전환",      "callback_data": "cmd_compact"},
             ],
             [
+                {"text": "🗜 컴팩트 전환",      "callback_data": "cmd_compact"},
                 {"text": "⚙️ BotFather 설정법", "callback_data": "cmd_setup"},
             ],
         ]
@@ -3442,6 +3582,7 @@ def _handle_callback(callback_id: str, data: str):
         "cmd_status":  "/status",
         "cmd_list":    "/list",
         "cmd_top":     "/top",
+        "cmd_daily":   "/daily",
         "cmd_nxt":     "/nxt",
         "cmd_week":    "/week",
         "cmd_stats":   "/stats",
@@ -3503,7 +3644,7 @@ def poll_telegram_commands():
                 _bot_paused = False; send("▶️ <b>봇 재개</b>")
 
             # ── /compact — 컴팩트 모드 토글 ──
-            elif text == "/compact":
+            elif text in ("/compact", "/컴팩트"):
                 global _compact_mode
                 _compact_mode = not _compact_mode
                 _save_compact_mode()
@@ -3512,16 +3653,29 @@ def poll_telegram_commands():
                            "📋 <b>상세 모드 ON</b>\n알림이 기존 상세 포맷으로 발송됩니다"
                 send(mode_str)
 
+            # ── /백업 — 즉시 수동 백업 ──
+            elif text in ("/백업", "/backup"):
+                send("💾 <b>수동 백업 시작...</b>")
+                ok_gist = backup_to_gist()
+                ok_tg   = False
+                if not ok_gist:
+                    ok_tg = backup_to_telegram()
+                if ok_gist:
+                    send(f"✅ <b>GitHub Gist 백업 완료</b>  {BOT_VERSION}\n"
+                         f"Gist ID: <code>{_gist_id_runtime}</code>")
+                elif ok_tg:
+                    send(f"✅ <b>텔레그램 파일 백업 완료</b>  {BOT_VERSION}")
+                else:
+                    send("❌ 백업 실패\n"
+                         "Railway Variables에 <b>GITHUB_GIST_TOKEN</b> 설정 필요\n"
+                         "또는 텔레그램 봇 설정 확인")
+
             # ── /top — 오늘의 최우선 종목 즉시 조회 ──
             elif text == "/top":
                 if not _today_top_signals:
                     send("📊 오늘 포착된 신호 없음 (장 시작 후 신호 누적 중)")
                 else:
-                    send_top_signals.__wrapped__ = True   # 플래그 우회 강제 발송
-                    _top_signal_sent_today_bak = _top_signal_sent_today
-                    globals()["_top_signal_sent_today"] = False
                     send_top_signals()
-                    globals()["_top_signal_sent_today"] = _top_signal_sent_today_bak
 
             # ── /nxt — NXT 현재 동향 즉시 조회 ──
             elif text == "/nxt":
@@ -3586,6 +3740,72 @@ def poll_telegram_commands():
                 except Exception as e:
                     send(f"⚠️ 주간 조회 오류: {e}")
 
+            # ── /daily — 오늘 일일 성과 즉시 조회 ──
+            elif text in ("/daily", "/오늘"):
+                try:
+                    data = {}
+                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+                    today     = datetime.now().strftime("%Y%m%d")
+                    today_str = datetime.now().strftime("%m/%d")
+                    sig_labels = {
+                        "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+                        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+                    }
+                    today_recs   = [v for v in data.values() if v.get("detect_date") == today]
+                    done_today   = [v for v in today_recs if v.get("status") != "추적중"]
+                    tracking_today = [v for v in today_recs if v.get("status") == "추적중"]
+                    # 이월 추적 중 포함
+                    all_tracking = [v for v in data.values() if v.get("status") == "추적중"]
+
+                    if not today_recs and not all_tracking:
+                        send(f"📊 {today_str} 오늘 신호 없음"); continue
+
+                    msg = f"📊 <b>일일 성과</b>  {today_str}  {datetime.now().strftime('%H:%M')}\n━━━━━━━━━━━━━━━\n"
+
+                    # ── 오늘 확정 결과 ──
+                    if done_today:
+                        pnls     = [v.get("pnl_pct",0) for v in done_today]
+                        wins     = sum(1 for p in pnls if p > 0)
+                        losses   = sum(1 for p in pnls if p < 0)
+                        avg_pnl  = sum(pnls) / len(pnls)
+                        win_rate = round(wins / len(done_today) * 100)
+                        msg += (f"\n✅ <b>오늘 확정  {len(done_today)}건</b>\n"
+                                f"  승률 <b>{win_rate}%</b>  평균 <b>{avg_pnl:+.1f}%</b>"
+                                f"  수익 {wins}건  손실 {losses}건\n")
+                        for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
+                            pnl  = v.get("pnl_pct", 0)
+                            dot  = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+                            sig  = sig_labels.get(v.get("signal_type",""), "")
+                            msg += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {sig}\n"
+                    else:
+                        msg += "\n📭 오늘 확정된 신호 없음\n"
+
+                    # ── 추적 중 잠정 수익률 ──
+                    if all_tracking:
+                        msg += f"\n⏳ <b>추적 중  {len(all_tracking)}건</b>  (잠정)\n"
+                        rows = []
+                        for v in all_tracking:
+                            try:
+                                price = 0
+                                if is_nxt_open() and is_nxt_listed(v.get("code","")):
+                                    price = get_nxt_stock_price(v["code"]).get("price", 0)
+                                if not price:
+                                    price = get_stock_price(v["code"]).get("price", 0)
+                                entry = v.get("entry_price", 0)
+                                if price and entry:
+                                    pnl = (price - entry) / entry * 100
+                                    nxt_tag = " 🔵" if is_nxt_open() and is_nxt_listed(v.get("code","")) else ""
+                                    rows.append((pnl, v["name"], nxt_tag))
+                            except: continue
+                        for pnl, name, nxt_tag in sorted(rows, key=lambda x: x[0], reverse=True):
+                            dot = "🟢" if pnl >= 0 else "🟠"
+                            msg += f"  {dot} {name} <b>{pnl:+.1f}%</b>{nxt_tag}\n"
+
+                    send(msg)
+                except Exception as e:
+                    send(f"⚠️ 일일 성과 조회 오류: {e}")
+
             # ── /result 종목명 수익률 ──
             elif text.startswith("/result"):
                 _handle_result_command(raw)
@@ -3610,10 +3830,11 @@ def poll_telegram_commands():
                     "<code>"
                     "status - 🤖 봇 상태 및 버전 확인\n"
                     "list - 📋 현재 감시 중인 종목 목록\n"
-                    "top - 🏆 오늘의 최우선 종목 TOP 3\n"
+                    "top - 🏆 오늘의 최우선 종목 TOP 5\n"
+                    "daily - 📊 오늘 일일 성과 즉시 조회\n"
                     "nxt - 🔵 NXT 넥스트레이드 실시간 동향\n"
                     "week - 📅 이번 주 잠정 성과 조회\n"
-                    "stats - 📊 신호 유형별 승률 통계\n"
+                    "stats - 📈 신호 유형별 승률 통계\n"
                     "compact - 🗜 컴팩트·상세 알림 모드 전환\n"
                     "stop - ⏸ 알림 일시 정지\n"
                     "resume - ▶️ 알림 재개\n"
@@ -4208,10 +4429,12 @@ def run_scan():
                 send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
                 if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
-                register_entry_watch(s)                     # ★ 진입가 감시 등록
-                register_top_signal(s)                      # ★ 최우선 종목 풀 등록
-                start_sector_monitor(s["code"], s["name"])  # ★ 섹터 지속 모니터링
-                news_block_for_alert(s["code"], s["name"])  # ★ 뉴스 역추적 (백그라운드)
+                register_entry_watch(s)
+                register_top_signal(s)
+                # 섹터 모니터: 동시 최대 8개 스레드 제한
+                if len(_sector_monitor) < 8:
+                    start_sector_monitor(s["code"], s["name"])
+                news_block_for_alert(s["code"], s["name"])
                 try:
                     threading.Thread(
                         target=auto_update_theme,
@@ -4226,7 +4449,7 @@ def run_scan():
                             "target_price":s["target_price"],"detected_at":s["detected_at"],"carry_day":0}
                     elif s["price"] > _detected_stocks[s["code"]]["high_price"]:
                         _detected_stocks[s["code"]]["high_price"] = s["price"]
-                time.sleep(1)
+                # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
         check_entry_watch()     # ★ 진입가 도달 체크
         check_reentry_watch()   # ★ 손절 후 재진입 감시
@@ -4272,9 +4495,12 @@ if __name__ == "__main__":
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every().day.at("08:50").do(send_premarket_briefing)
-    schedule.every().day.at("10:00").do(                         # 오전 10시 최우선 종목 TOP 3
-        lambda: None if is_holiday() else send_top_signals()
-    )
+    # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
+    # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
+    for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
+        schedule.every().day.at(_top_hhmm).do(
+            lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
+        )
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
         None if is_holiday() else (
         _clear_all_cache(),
@@ -4293,6 +4519,8 @@ if __name__ == "__main__":
             print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() and _reentry_watch else None
     )
+    # 6시간마다 자동 백업 (Gist 우선, 없으면 텔레그램 파일)
+    schedule.every(BACKUP_INTERVAL_H).hours.do(lambda: run_auto_backup(notify=False))
 
     # 봇 시작 시 공휴일 미리 로드
     _load_kr_holidays(datetime.now().year)
