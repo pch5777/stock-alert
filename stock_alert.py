@@ -8,7 +8,48 @@
 
 [변경 이력]
 
-v24.0 (2026-02-28)  ← 현재
+v27.0 (2026-02-28)  ← 현재
+  ① 결과 미입력 알림 NXT 반영
+     - KRX 마감(15:30)과 NXT 마감(20:05) 두 시점에서 모두 발송
+     - 중복 방지 플래그로 같은 날 2회 이상 발송 안 함
+     - NXT 운영 중이면 NXT 가격 기준 현재 수익률 표시
+     - 미입력 시 처리 방식 명확히 안내 (자동 5일 추적 후 종가 기록)
+  ② Railway 환경변수 TZ 경고
+     - TZ=Asia/Seoul 미설정 시 시작 시 경고 출력
+     - DART_API_KEY 환경변수 주석 명확화
+
+v26.0 (2026-02-28)
+  ① 동적 파라미터 영구 저장 (재시작 후에도 유지)
+     - auto_tune 조정값을 dynamic_params.json에 저장
+     - 봇 시작 시 자동으로 이전 조정값 복원
+     - Railway 재시작해도 학습된 조건값 유지
+  ② /result 수동입력 개선
+     - signal_log.json (메인) + early_detect_log.json 동시 업데이트
+     - 입력값과 현재가 기준 수익률 차이 5%p 이상이면 경고
+     - 로그에 없는 종목도 수동 기록 가능 (signal_log에 MANUAL로 추가)
+  ③ 장 마감 시 결과 미입력 종목 자동 알림
+     - 오늘 신호 중 아직 추적중인 종목 목록 자동 발송
+     - 현재가와 현재 수익률 함께 표시
+     - /result 입력 가이드 포함
+
+v25.0 (2026-02-28)
+  ① 시간대별 승률 분석 추가
+     - 장초반(09:00~10:00) / 오전(10:00~12:00) / 오후(12:00~14:00) / 장후반(14:00~15:30) 구간별 승률
+     - /stats 에 시간대 분석 섹션 추가
+     - 장마감 리포트에도 오늘 시간대 요약 포함
+  ② 손실 패턴 자동 분석 강화
+     - 손절 원인 유형화: 거래량소멸 / 외인매도 / 시장급락 / 단순손절
+     - 손실 종목 공통점 자동 추출 (시간대 / 신호유형 / 테마여부)
+     - /stats 에 "손실 패턴" 섹션 추가
+     - 주간리포트 AI 분석 프롬프트에 손실패턴 데이터 포함
+  ③ auto_tune 더 적극적으로 개선
+     - MIN_SAMPLES 20→5 (더 빠르게 반응)
+     - 조정 주기: 장마감마다 → 매일 + 샘플 3건 이상이면 즉시 반영
+     - 손절률 연속 3회 이상이면 즉시 조건 강화 (긴급 튜닝)
+     - ATR 손절배수 동적 조정 추가 (손절이 너무 타이트/루즈하면 자동 보정)
+     - 시간대별 승률 낮은 구간 자동 감지 → 해당 구간 최소점수 상향
+
+v24.0 (2026-02-28)
   ① TOP 5 알림 1시간 간격 자동 발송
      - 10:00부터 장마감까지 매 정시 자동 발송
      - KRX 마감(15:30) 후에도 NXT 운영 중이면 계속 발송 (최대 19:00)
@@ -153,7 +194,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v24.0"
+BOT_VERSION = "v27.0"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -179,9 +220,15 @@ KIS_APP_KEY        = os.environ.get("KIS_APP_KEY", "")
 KIS_APP_SECRET     = os.environ.get("KIS_APP_SECRET", "")
 KIS_ACCOUNT_NO     = os.environ.get("KIS_ACCOUNT_NO", "")
 KIS_BASE_URL       = "https://openapi.koreainvestment.com:9443"
-DART_API_KEY       = os.environ.get("DART_API_KEY", "")
+DART_API_KEY       = os.environ.get("DART_API_KEY", "")      # DART 공시 API
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# TZ=Asia/Seoul 을 Railway 환경변수에 설정하면 모든 시간 계산이 한국 시간 기준
+# (설정 안 하면 UTC 기준 → 스캔 시간이 9시간 어긋남)
+_tz = os.environ.get("TZ", "")
+if not _tz:
+    print("⚠️ 환경변수 TZ 미설정 — Railway Variables에 TZ=Asia/Seoul 추가 권장")
 
 # 백업 설정 (선택)
 # GITHUB_GIST_TOKEN: github.com → Settings → Developer settings → Personal access tokens → gist 권한
@@ -1977,6 +2024,82 @@ TRACK_TIMEOUT_RESULT = "시간초과"
 
 _tracking_notified = set()   # 이미 결과 알림 보낸 log_key
 
+# ============================================================
+# ✍️ 수동 매도 결과 입력 보조
+# ============================================================
+def _send_pending_result_reminder():
+    """
+    장 마감 시 추적 중인 종목 중 오늘 신호이면서 아직 결과 미입력인 것들을
+    텔레그램으로 알려줌.
+
+    ※ 입력하지 않으면?
+      - 목표가/손절가 도달 시 자동 확정 (계속 감시)
+      - TRACK_MAX_DAYS(5일) 경과 시 그날 종가 기준으로 자동 기록
+      - NXT 상장 종목은 20:00까지 자동 감시 후 기록
+    """
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: return
+
+        today   = datetime.now().strftime("%Y%m%d")
+        pending = [
+            v for v in data.values()
+            if v.get("status") == "추적중"
+            and v.get("detect_date") == today
+        ]
+        if not pending:
+            return
+
+        # NXT 운영 중이면 NXT 마감 후 발송 (20:05), KRX만이면 15:30 후 발송
+        # 이 함수는 두 시점 모두에서 호출되므로 중복 방지 플래그 사용
+        reminder_key = f"reminder_{today}"
+        if reminder_key in _tracking_notified:
+            return
+        _tracking_notified.add(reminder_key)
+
+        nxt_running = is_nxt_open()
+        timing_note = ("🔵 NXT 마감(20:00) 후에도 NXT 상장 종목은 자동 감시됩니다."
+                       if nxt_running else
+                       "💡 내일도 자동 추적됩니다. (최대 5일)")
+
+        msg = (f"✍️ <b>오늘 결과 미입력 종목</b>  ({len(pending)}건)\n"
+               f"━━━━━━━━━━━━━━━\n"
+               f"실제 매도하셨다면 /result 로 입력해주세요.\n"
+               f"입력 안 하셔도 봇이 자동 추적합니다.\n\n")
+
+        sig_labels = {
+            "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+        }
+        for v in pending:
+            entry = v.get("entry_price", 0)
+            code  = v.get("code", "")
+            # NXT 먼저, 없으면 KRX 현재가
+            try:
+                if is_nxt_open() and is_nxt_listed(code):
+                    cur_p = get_nxt_stock_price(code).get("price", 0) or get_stock_price(code).get("price", 0)
+                else:
+                    cur_p = get_stock_price(code).get("price", 0)
+                cur_pnl = round((cur_p - entry) / entry * 100, 1) if entry and cur_p else 0
+                pnl_emoji = "🟢" if cur_pnl >= 0 else "🔴"
+                cur_str = f"  현재 {cur_p:,}원  {pnl_emoji}{cur_pnl:+.1f}%"
+            except:
+                cur_str = ""
+            sig = sig_labels.get(v.get("signal_type",""), "")
+            msg += (f"• <b>{v['name']}</b>  {sig}\n"
+                    f"  진입 {entry:,}원  손절 {v.get('stop_price',0):,}  목표 {v.get('target_price',0):,}\n"
+                    f"{cur_str}\n"
+                    f"  → <code>/result {v['name']} +수익률</code>\n\n")
+
+        msg += f"━━━━━━━━━━━━━━━\n{timing_note}"
+        send(msg)
+
+    except Exception as e:
+        print(f"⚠️ 결과 입력 알림 오류: {e}")
+
 def track_signal_results():
     """
     추적 중인 모든 신호의 현재가를 조회해서
@@ -2100,6 +2223,17 @@ def track_signal_results():
             # ── 결과 알림 ──
             _send_tracking_result(rec)
             print(f"  📊 추적 완료: {rec['name']} {pnl_pct:+.1f}% ({exit_reason})")
+
+            # 연속 손절 카운터 업데이트 (긴급 튜닝용)
+            global _consecutive_loss_count
+            if pnl_pct <= 0:
+                _consecutive_loss_count += 1
+                if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
+                    print(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 실행")
+                    auto_tune(notify=True)
+                    _consecutive_loss_count = 0
+            else:
+                _consecutive_loss_count = 0   # 수익 나면 카운터 리셋
 
         if updated:
             with open(SIGNAL_LOG_FILE, "w") as f:
@@ -2354,8 +2488,9 @@ def load_carry_stocks():
 # ============================================================
 # 🧠 자동 조건 조정 엔진
 # ============================================================
-AUTO_TUNE_FILE = "auto_tune_log.json"   # 조정 이력 저장
-MIN_SAMPLES    = 10   # 조정 판단에 필요한 최소 샘플 수
+AUTO_TUNE_FILE   = "auto_tune_log.json"   # 조정 이력 저장
+DYNAMIC_PARAMS_FILE = "dynamic_params.json"  # 조정된 파라미터 영구 저장
+MIN_SAMPLES      = 5    # 20→5: 더 빠르게 반응 (적은 샘플로도 조정)
 
 # 동적 조정 변수 (기본값 = 파라미터 원본값)
 _dynamic = {
@@ -2372,25 +2507,155 @@ _dynamic = {
     "min_score_strict":   70,
     # 테마 가중치 (테마 동반 시 최소 점수 완화)
     "themed_score_bonus": 0,
+    # ATR 손절배수 동적 조정
+    "atr_stop_mult":      ATR_STOP_MULT,
+    # 시간대별 최소점수 보정 (기본 0: 보정 없음, +N: 해당 시간대 더 엄격)
+    "timeslot_score_adj": {"장초반": 0, "오전": 0, "오후": 0, "장후반": 0},
 }
+
+# 긴급 튜닝: 연속 손절 카운터
+_consecutive_loss_count: int = 0
+EMERGENCY_TUNE_THRESHOLD   = 3   # 연속 손절 N회 → 즉시 조건 강화
+
+def _save_dynamic_params():
+    """
+    현재 _dynamic 값을 파일에 저장
+    → Railway 재시작 후에도 조정값 유지
+    """
+    try:
+        with open(DYNAMIC_PARAMS_FILE, "w") as f:
+            json.dump(_dynamic, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ dynamic_params 저장 실패: {e}")
+
+def _load_dynamic_params():
+    """
+    저장된 _dynamic 값을 불러와서 현재 세션에 복원
+    파일 없으면 기본값 유지
+    """
+    global _dynamic, _early_price_min_dynamic, _early_volume_min_dynamic
+    try:
+        with open(DYNAMIC_PARAMS_FILE) as f:
+            saved = json.load(f)
+        # 저장된 값 중 유효한 키만 덮어씀 (새로 추가된 키는 기본값 유지)
+        for k, v in saved.items():
+            if k in _dynamic:
+                _dynamic[k] = v
+        _early_price_min_dynamic  = _dynamic["early_price_min"]
+        _early_volume_min_dynamic = _dynamic["early_volume_min"]
+        print(f"  🔧 동적 파라미터 복원 완료 (min_score={_dynamic['min_score_normal']}점, "
+              f"atr_stop={_dynamic['atr_stop_mult']})")
+    except FileNotFoundError:
+        print("  🔧 dynamic_params.json 없음 → 기본값 사용")
+    except Exception as e:
+        print(f"  ⚠️ dynamic_params 복원 실패: {e}")
 
 def load_tracker_feedback():
     """기존 함수 — 하위 호환용. auto_tune()을 호출"""
     auto_tune(notify=False)
 
+def _get_timeslot(detect_time: str) -> str:
+    """
+    신호 발생 시간(HH:MM:SS 또는 HH:MM)을 4개 구간으로 분류
+    장초반 09:00~10:00 / 오전 10:00~12:00 / 오후 12:00~14:00 / 장후반 14:00~15:30
+    """
+    try:
+        t = detect_time[:5]   # "HH:MM"
+        h, m = int(t[:2]), int(t[3:])
+        minutes = h * 60 + m
+        if minutes < 10 * 60:              return "장초반"   # ~10:00
+        elif minutes < 12 * 60:            return "오전"     # 10:00~12:00
+        elif minutes < 14 * 60:            return "오후"     # 12:00~14:00
+        else:                              return "장후반"   # 14:00~
+    except:
+        return "기타"
+
+def analyze_timeslot_winrate(completed: list) -> dict:
+    """
+    완료 신호를 시간대별로 분류해 승률·평균 수익률 반환
+    반환: {"장초반": {"win":N,"total":N,"avg":F}, ...}
+    """
+    slots = {"장초반": [], "오전": [], "오후": [], "장후반": [], "기타": []}
+    for r in completed:
+        t = r.get("detect_time", r.get("detected_at", ""))
+        slot = _get_timeslot(t)
+        slots[slot].append(r["pnl_pct"])
+    result = {}
+    for slot, pnls in slots.items():
+        if not pnls: continue
+        result[slot] = {
+            "win":   sum(1 for p in pnls if p > 0),
+            "total": len(pnls),
+            "avg":   round(sum(pnls) / len(pnls), 1),
+            "rate":  round(sum(1 for p in pnls if p > 0) / len(pnls) * 100, 0),
+        }
+    return result
+
+def analyze_loss_pattern(completed: list) -> str:
+    """
+    손실 종목들의 공통 패턴 분석 → 텍스트 요약 반환
+    분석 항목: 손절 이유 분포 / 시간대 / 신호유형 / 테마여부
+    """
+    losses = [r for r in completed if r.get("pnl_pct", 0) <= 0]
+    if len(losses) < 3:
+        return ""
+
+    lines = [f"🔴 <b>손실 패턴 분석</b>  ({len(losses)}건)"]
+
+    # 손절 이유 분포
+    reasons = {}
+    for r in losses:
+        ex = r.get("exit_reason", "?")
+        reasons[ex] = reasons.get(ex, 0) + 1
+    reason_str = "  ".join([f"{k}:{v}건" for k, v in sorted(reasons.items(), key=lambda x: -x[1])])
+    lines.append(f"  청산 이유: {reason_str}")
+
+    # 시간대별 손실 집중도
+    slot_counts = {}
+    for r in losses:
+        t = r.get("detect_time", r.get("detected_at", ""))
+        slot = _get_timeslot(t)
+        slot_counts[slot] = slot_counts.get(slot, 0) + 1
+    worst_slot = max(slot_counts, key=slot_counts.get) if slot_counts else None
+    if worst_slot:
+        lines.append(f"  손실 집중 시간대: {worst_slot} ({slot_counts[worst_slot]}건)")
+
+    # 신호 유형별 손실
+    type_counts = {}
+    for r in losses:
+        t = r.get("signal_type", "기타")
+        type_counts[t] = type_counts.get(t, 0) + 1
+    worst_type = max(type_counts, key=type_counts.get) if type_counts else None
+    if worst_type:
+        type_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+                       "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수"}
+        lines.append(f"  손실 많은 신호: {type_labels.get(worst_type, worst_type)} ({type_counts[worst_type]}건)")
+
+    # 단독 vs 테마 손실 비율
+    solo_loss   = sum(1 for r in losses if not r.get("sector_bonus", 0))
+    themed_loss = sum(1 for r in losses if r.get("sector_bonus", 0))
+    if solo_loss + themed_loss > 0:
+        lines.append(f"  단독:{solo_loss}건  테마동반:{themed_loss}건")
+
+    return "\n".join(lines)
+
 def auto_tune(notify: bool = True):
     """
     signal_log.json 기반으로 신호 유형별 성과를 분석해서
-    조건을 자동으로 조정. 매주 월요일 장 시작 + 장 마감 시 호출.
+    조건을 자동으로 조정. 장 마감마다 호출.
 
     조정 원칙:
       - 승률 < 40%  → 조건 강화 (더 까다롭게)
       - 승률 > 70%  → 조건 완화 (더 많이 잡기)
       - 40~70%      → 유지
-      - 샘플 < MIN_SAMPLES 이면 조정 안 함 (통계 불충분)
-      - 단독 vs 테마 동반 격차 > 20%p → 테마 없는 신호 기준 상향
+      - 샘플 < MIN_SAMPLES(5건) 이면 조정 안 함
+      - 연속 손절 3회 이상 → 긴급 즉시 강화
+      - 시간대별 승률 낮은 구간 → 해당 구간 최소점수 상향
+      - ATR 손절배수 동적 조정
     """
     global _dynamic, _early_price_min_dynamic, _early_volume_min_dynamic
+    global _consecutive_loss_count
 
     try:
         data = {}
@@ -2400,10 +2665,10 @@ def auto_tune(notify: bool = True):
 
         completed = [v for v in data.values()
                      if v.get("status") in ["수익", "손실", "본전"]]
-        if len(completed) < 5:
+        if len(completed) < MIN_SAMPLES:
             return
 
-        changes = []   # 변경 내역 (알림용)
+        changes = []
 
         # ── 신호 유형별 승률 계산 ──
         by_type = {}
@@ -2411,7 +2676,23 @@ def auto_tune(notify: bool = True):
             t = v.get("signal_type", "기타")
             by_type.setdefault(t, []).append(v)
 
-        # ── EARLY_DETECT 조정 ──
+        # ── ① 긴급 튜닝: 연속 손절 3회 이상 ──
+        recent = sorted(completed, key=lambda x: x.get("exit_date","") + x.get("exit_time",""))[-5:]
+        recent_loss_streak = 0
+        for r in reversed(recent):
+            if r.get("pnl_pct", 0) <= 0:
+                recent_loss_streak += 1
+            else:
+                break
+        if recent_loss_streak >= EMERGENCY_TUNE_THRESHOLD:
+            old_n = _dynamic["min_score_normal"]
+            old_s = _dynamic["min_score_strict"]
+            _dynamic["min_score_normal"] = min(old_n + 8, 85)
+            _dynamic["min_score_strict"] = min(old_s + 8, 90)
+            changes.append(f"🚨 <b>긴급 튜닝</b>: 연속 손절 {recent_loss_streak}회\n"
+                           f"   최소점수 즉시 강화: {old_n}→{_dynamic['min_score_normal']}점")
+
+        # ── ② EARLY_DETECT 조정 ──
         early_recs = by_type.get("EARLY_DETECT", [])
         if len(early_recs) >= MIN_SAMPLES:
             rate = sum(1 for r in early_recs if r["pnl_pct"] > 0) / len(early_recs)
@@ -2432,22 +2713,15 @@ def auto_tune(notify: bool = True):
             _early_price_min_dynamic  = _dynamic["early_price_min"]
             _early_volume_min_dynamic = _dynamic["early_volume_min"]
 
-        # ── MID_PULLBACK 조정 ──
+        # ── ③ MID_PULLBACK 조정 ──
         mid_recs = by_type.get("MID_PULLBACK", [])
         if len(mid_recs) >= MIN_SAMPLES:
-            rate = sum(1 for r in mid_recs if r["pnl_pct"] > 0) / len(mid_recs)
-            # 평균 눌림 깊이 분석 (수익 종목 vs 손실 종목)
-            win_recs  = [r for r in mid_recs if r["pnl_pct"] > 0]
-            lose_recs = [r for r in mid_recs if r["pnl_pct"] <= 0]
-
+            rate      = sum(1 for r in mid_recs if r["pnl_pct"] > 0) / len(mid_recs)
             old_surge = _dynamic["mid_surge_min_pct"]
             old_min   = _dynamic["mid_pullback_min"]
             old_max   = _dynamic["mid_pullback_max"]
-
             if rate < 0.40:
-                # 조건 강화: 더 강한 1차 급등 요구
                 _dynamic["mid_surge_min_pct"] = min(old_surge + 3.0, 25.0)
-                # 눌림 범위 좁히기 (황금 구간만)
                 _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 15.0)
                 _dynamic["mid_pullback_max"]  = max(old_max - 5.0, 30.0)
                 changes.append(f"🏆 중기눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
@@ -2460,10 +2734,9 @@ def auto_tune(notify: bool = True):
                 changes.append(f"🏆 중기눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
 
-        # ── 최소 점수 조정 ──
-        all_recs = completed
-        if len(all_recs) >= MIN_SAMPLES:
-            rate = sum(1 for r in all_recs if r["pnl_pct"] > 0) / len(all_recs)
+        # ── ④ 최소 점수 조정 ──
+        if len(completed) >= MIN_SAMPLES:
+            rate  = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
             old_n = _dynamic["min_score_normal"]
             old_s = _dynamic["min_score_strict"]
             if rate < 0.40:
@@ -2475,20 +2748,51 @@ def auto_tune(notify: bool = True):
                 _dynamic["min_score_strict"] = max(old_s - 3, 60)
                 changes.append(f"⭐ 최소 점수 완화: {old_n}→{_dynamic['min_score_normal']}점")
 
-        # ── 단독 vs 테마 격차 분석 ──
+        # ── ⑤ ATR 손절배수 동적 조정 ──
+        # 손절가 도달 비율이 높으면 손절이 너무 타이트 → 배수 늘리기
+        # 만료(timeout) 비율이 높으면 손절이 너무 루즈 → 배수 줄이기
+        stop_hits   = sum(1 for r in completed if r.get("exit_reason") == "손절가")
+        timeout_hit = sum(1 for r in completed if r.get("exit_reason") in ["만료", "timeout", TRACK_TIMEOUT_RESULT])
+        old_atr     = _dynamic["atr_stop_mult"]
+        if len(completed) >= MIN_SAMPLES:
+            stop_ratio    = stop_hits   / len(completed)
+            timeout_ratio = timeout_hit / len(completed)
+            if stop_ratio > 0.50 and old_atr < 2.5:
+                _dynamic["atr_stop_mult"] = round(min(old_atr + 0.2, 2.5), 1)
+                changes.append(f"📐 ATR 손절배수 확대: {old_atr}→{_dynamic['atr_stop_mult']} (손절 너무 빈번)")
+            elif timeout_ratio > 0.40 and old_atr > 1.0:
+                _dynamic["atr_stop_mult"] = round(max(old_atr - 0.2, 1.0), 1)
+                changes.append(f"📐 ATR 손절배수 축소: {old_atr}→{_dynamic['atr_stop_mult']} (손절 너무 느슨)")
+
+        # ── ⑥ 시간대별 승률 분석 → 낮은 구간 최소점수 상향 ──
+        slot_stats = analyze_timeslot_winrate(completed)
+        new_slot_adj = dict(_dynamic["timeslot_score_adj"])
+        slot_changes = []
+        for slot, st in slot_stats.items():
+            if st["total"] < 3: continue
+            old_adj = new_slot_adj.get(slot, 0)
+            if st["rate"] < 35 and old_adj < 20:
+                new_slot_adj[slot] = old_adj + 5
+                slot_changes.append(f"{slot}(승률{st['rate']:.0f}%→+{new_slot_adj[slot]}점)")
+            elif st["rate"] > 70 and old_adj > 0:
+                new_slot_adj[slot] = max(old_adj - 3, 0)
+                slot_changes.append(f"{slot}(승률{st['rate']:.0f}%→점수 완화)")
+        if slot_changes:
+            _dynamic["timeslot_score_adj"] = new_slot_adj
+            changes.append(f"🕐 시간대별 점수 조정: {', '.join(slot_changes)}")
+
+        # ── ⑦ 단독 vs 테마 격차 분석 ──
         solo_recs   = [r for r in completed if not r.get("sector_bonus", 0)]
         themed_recs = [r for r in completed if r.get("sector_bonus", 0)]
-        if len(solo_recs) >= 5 and len(themed_recs) >= 5:
+        if len(solo_recs) >= 3 and len(themed_recs) >= 3:
             solo_rate   = sum(1 for r in solo_recs   if r["pnl_pct"] > 0) / len(solo_recs)
             themed_rate = sum(1 for r in themed_recs if r["pnl_pct"] > 0) / len(themed_recs)
-            gap = themed_rate - solo_rate
-            old_bonus = _dynamic["themed_score_bonus"]
+            gap         = themed_rate - solo_rate
+            old_bonus   = _dynamic["themed_score_bonus"]
             if gap > 0.20:
-                # 테마 동반 종목에 점수 보너스 → 더 잘 잡히게
-                # 단독 신호 최소 점수는 올려서 필터링 강화
                 _dynamic["themed_score_bonus"] = min(old_bonus + 5, 20)
                 changes.append(f"🏭 테마 동반 우대 강화\n"
-                                f"   격차 {gap*100:.0f}%p → 테마 보너스 {old_bonus}→{_dynamic['themed_score_bonus']}점\n"
+                                f"   격차 {gap*100:.0f}%p → 보너스 {old_bonus}→{_dynamic['themed_score_bonus']}점\n"
                                 f"   (단독 {solo_rate*100:.0f}%  테마 {themed_rate*100:.0f}%)")
             elif gap < 0.05:
                 _dynamic["themed_score_bonus"] = max(old_bonus - 3, 0)
@@ -2501,7 +2805,7 @@ def auto_tune(notify: bool = True):
             except: pass
             tune_log[datetime.now().strftime("%Y%m%d_%H%M")] = {
                 "changes":  changes,
-                "params":   dict(_dynamic),
+                "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
                 "samples":  len(completed),
             }
             with open(AUTO_TUNE_FILE, "w") as f:
@@ -2514,6 +2818,8 @@ def auto_tune(notify: bool = True):
                      f"━━━━━━━━━━━━━━━\n"
                      f"{change_text}\n\n"
                      f"/stats 로 전체 통계 확인")
+            # ★ 조정값 파일에 저장 → 재시작 후에도 유지
+            _save_dynamic_params()
         else:
             print(f"  🧠 자동 조정: 변경 없음 ({len(completed)}건 분석)")
 
@@ -3857,8 +4163,8 @@ def _handle_result_command(raw: str):
     """
     /result 종목명 수익률  처리
     예) /result 대주산업 +12.5
-    → early_detect_log.json 에서 해당 종목 찾아 결과 업데이트
-    → 신호 유형별 승률 통계 자동 갱신
+    → signal_log.json (메인) + early_detect_log.json (하위호환) 동시 업데이트
+    → 자동 튜닝 즉시 반영
     """
     try:
         parts = raw.strip().split()
@@ -3868,49 +4174,97 @@ def _handle_result_command(raw: str):
         pnl_str    = parts[2].replace("%","")
         pnl        = float(pnl_str)
 
-        # early_detect_log에서 종목명으로 찾기
-        data = {}
-        try:
-            with open(EARLY_LOG_FILE,"r") as f: data = json.load(f)
-        except: pass
-
-        matched_code = None
-        for code, info in data.items():
-            if name_input in info.get("name",""):
-                matched_code = code; break
-
         result_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
         status       = "수익" if pnl > 0 else ("손실" if pnl < 0 else "본전")
+        today        = datetime.now().strftime("%Y%m%d")
+        matched_name = None
+        signal_type  = "MANUAL"
 
-        if matched_code:
-            data[matched_code]["status"]     = status
-            data[matched_code]["pnl_pct"]    = pnl
-            data[matched_code]["exit_date"]  = datetime.now().strftime("%Y%m%d")
-            with open(EARLY_LOG_FILE,"w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            signal_type = data[matched_code].get("signal_type","EARLY_DETECT")
-            send(f"{result_emoji} <b>결과 기록 완료</b>\n"
-                 f"종목: <b>{data[matched_code]['name']}</b>\n"
-                 f"수익률: <b>{pnl:+.1f}%</b>  ({status})\n"
-                 f"신호: {signal_type}\n\n"
-                 f"/stats 로 전체 통계 확인")
-            load_tracker_feedback()   # 피드백 즉시 반영
-        else:
-            # 로그에 없으면 새로 추가 (직접 매매한 종목도 기록 가능)
-            new_code = f"manual_{datetime.now().strftime('%m%d%H%M')}"
-            data[new_code] = {
-                "code": new_code, "name": name_input,
-                "detect_date": datetime.now().strftime("%Y%m%d"),
-                "signal_type": "MANUAL",
+        # ── ① signal_log.json 에서 추적 중인 종목 찾기 (메인) ──
+        sig_data = {}
+        sig_matched_key = None
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: sig_data = json.load(f)
+        except: pass
+
+        # 종목명 포함 + 추적중 상태인 것 우선 매칭
+        for key, rec in sig_data.items():
+            if name_input in rec.get("name", "") and rec.get("status") == "추적중":
+                sig_matched_key = key
+                matched_name    = rec["name"]
+                signal_type     = rec.get("signal_type", "MANUAL")
+                # 현재가 조회해서 수익률 검증
+                try:
+                    cur_p = get_stock_price(rec["code"]).get("price", 0)
+                    entry = rec.get("entry_price", 0)
+                    if cur_p and entry:
+                        auto_pnl = round((cur_p - entry) / entry * 100, 1)
+                        # 입력값과 자동계산값이 5%p 이상 차이나면 경고
+                        if abs(pnl - auto_pnl) > 5:
+                            send(f"⚠️ 입력 수익률({pnl:+.1f}%)과 현재가 기준({auto_pnl:+.1f}%) 차이가 큽니다.\n"
+                                 f"현재가: {cur_p:,}원  |  입력값 그대로 기록합니다.")
+                except: pass
+                break
+
+        if sig_matched_key:
+            sig_data[sig_matched_key].update({
+                "status":      status,
+                "pnl_pct":     pnl,
+                "exit_date":   today,
+                "exit_time":   datetime.now().strftime("%H:%M:%S"),
+                "exit_reason": "수동입력",
+            })
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+
+        # ── ② early_detect_log.json 도 동시 업데이트 (하위 호환) ──
+        early_data = {}
+        try:
+            with open(EARLY_LOG_FILE, "r") as f: early_data = json.load(f)
+        except: pass
+
+        early_matched = None
+        for code, info in early_data.items():
+            if name_input in info.get("name", ""):
+                early_matched = code; break
+
+        if early_matched:
+            early_data[early_matched].update({
                 "status": status, "pnl_pct": pnl,
-                "exit_date": datetime.now().strftime("%Y%m%d"),
+                "exit_date": today,
+            })
+        else:
+            # 둘 다 없으면 수동 기록으로 signal_log에 새로 추가
+            new_key = f"manual_{datetime.now().strftime('%m%d%H%M')}"
+            sig_data[new_key] = {
+                "log_key": new_key, "code": new_key,
+                "name": name_input, "signal_type": "MANUAL",
+                "detect_date": today, "detect_time": datetime.now().strftime("%H:%M:%S"),
+                "detect_price": 0, "entry_price": 0,
+                "stop_price": 0, "target_price": 0,
+                "status": status, "pnl_pct": pnl,
+                "exit_date": today, "exit_time": datetime.now().strftime("%H:%M:%S"),
+                "exit_reason": "수동입력",
+                "score": 0, "sector_bonus": 0, "sector_theme": "",
             }
-            with open(EARLY_LOG_FILE,"w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            send(f"{result_emoji} <b>결과 기록 완료 (수동)</b>\n"
-                 f"종목: <b>{name_input}</b>\n"
-                 f"수익률: <b>{pnl:+.1f}%</b>  ({status})\n\n"
-                 f"/stats 로 전체 통계 확인")
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+            matched_name = name_input
+
+        if early_matched:
+            with open(EARLY_LOG_FILE, "w") as f:
+                json.dump(early_data, f, ensure_ascii=False, indent=2)
+
+        display_name = matched_name or name_input
+        send(f"{result_emoji} <b>결과 기록 완료</b>\n"
+             f"종목: <b>{display_name}</b>\n"
+             f"수익률: <b>{pnl:+.1f}%</b>  ({status})\n"
+             f"신호: {signal_type}\n\n"
+             f"/stats 로 전체 통계 확인")
+
+        # 즉시 자동 튜닝 반영
+        load_tracker_feedback()
+
     except ValueError:
         send("⚠️ 수익률 형식 오류. 예) /result 대주산업 +12.5")
     except Exception as e:
@@ -3990,6 +4344,25 @@ def _send_stats():
                     f"🔍 단독 상승:  승률 {solo_win:.0f}%  평균 {solo_avg:+.1f}% ({len(solo)}건)\n"
                     f"🏭 테마 동반:  승률 {themed_win:.0f}%  평균 {themed_avg:+.1f}% ({len(themed)}건)\n")
 
+        # ── 시간대별 승률 분석 ──
+        slot_stats = analyze_timeslot_winrate(completed)
+        if slot_stats:
+            slot_order = ["장초반", "오전", "오후", "장후반", "기타"]
+            msg += "\n━━━━━━━━━━━━━━━\n🕐 <b>시간대별 승률</b>\n"
+            for slot in slot_order:
+                if slot not in slot_stats: continue
+                st  = slot_stats[slot]
+                adj = _dynamic["timeslot_score_adj"].get(slot, 0)
+                adj_str = f"  [+{adj}점 보정 중]" if adj > 0 else ""
+                bar = "🟢" * int(st["rate"] / 20) + "⬜" * (5 - int(st["rate"] / 20))
+                msg += (f"  {slot}: {bar}  승률 {st['rate']:.0f}%  "
+                        f"평균 {st['avg']:+.1f}%  ({st['total']}건){adj_str}\n")
+
+        # ── 손실 패턴 분석 ──
+        loss_pattern = analyze_loss_pattern(completed)
+        if loss_pattern:
+            msg += f"\n━━━━━━━━━━━━━━━\n{loss_pattern}\n"
+
         send(msg)
     except Exception as e:
         send(f"⚠️ 통계 오류: {e}")
@@ -4016,6 +4389,7 @@ def on_market_close():
         carry_list.append(f"• {info['name']} ({code}) - {carry_day+1}일차")
     save_carry_stocks()
     auto_tune(notify=True)
+    _send_pending_result_reminder()   # ★ 오늘 미입력 종목 알림
 
     today = datetime.now().strftime("%Y%m%d")
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -4469,6 +4843,7 @@ if __name__ == "__main__":
     load_tracker_feedback()
     load_dynamic_themes()
     refresh_dynamic_candidates()
+    _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
     _load_kr_holidays(datetime.now().year)   # 공휴일 선로드
 
     send(
@@ -4512,12 +4887,13 @@ if __name__ == "__main__":
     schedule.every().day.at(MARKET_CLOSE).do(
         lambda: None if is_holiday() else on_market_close()
     )
-    # NXT 완전 마감 후 잔여 재진입 감시 초기화 (NXT 상장 종목용)
+    # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
     schedule.every().day.at("20:05").do(
         lambda: (
             _reentry_watch.clear(),
+            _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
             print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
-        ) if not is_holiday() and _reentry_watch else None
+        ) if not is_holiday() else None
     )
     # 6시간마다 자동 백업 (Gist 우선, 없으면 텔레그램 파일)
     schedule.every(BACKUP_INTERVAL_H).hours.do(lambda: run_auto_backup(notify=False))
