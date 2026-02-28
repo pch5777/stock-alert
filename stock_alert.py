@@ -8,7 +8,87 @@
 
 [변경 이력]
 
-v16.0 (2026-02-28)  ← 현재
+v22.0 (2026-02-28)  ← 현재
+  ① 캐시 메모리 누수 수정 (_clear_all_cache 완성)
+     추가된 캐시: _early_cache, _news_reverse_cache, _kospi_cache
+                  _sector_monitor, _today_top_signals, _pending_info_alerts
+     → 장 시작마다 6개 캐시가 누락돼 메모리 무한 증가하던 버그 수정
+  ② 뉴스 이중 크롤링 제거 (45초마다 2회→1회)
+     run_news_scan → fetch_all_news() 1회 호출
+     analyze_news_theme(headlines=) 파라미터로 재사용
+     → Railway 크롤링 차단 위험 50% 감소, CPU 절감
+  ③ run_news_scan NXT 시간 포함
+     is_market_open() → is_any_market_open() (NXT 20:00까지 뉴스 스캔)
+  ④ 섹터 모니터 NXT 장 마감 반영
+     is_market_open() → is_any_market_open() (NXT 마감까지 섹터 유지)
+
+v21.0 (2026-02-28)
+  ① 장 마감 기준 NXT 완전 반영 + 앞으로의 기준 통일
+     is_any_market_open()  — KRX or NXT 중 하나라도 열리면 True
+     is_nxt_listed(code)   — NXT 상장 여부 확인 (비상장 캐시 활용)
+     effective_market_close() — 실질 마감 여부
+  ② 재진입 감시 NXT 연장
+     - KRX only 종목: 15:30 마감 → 초기화
+     - NXT 상장 종목: 20:00까지 NXT 가격으로 계속 감시
+     - 20:05 스케줄로 NXT 마감 후 전체 초기화
+  ③ 손절 후 재진입 등록 NXT 포함
+     - KRX 장중: KRX 가격으로 등록
+     - KRX 마감 후 NXT 운영 중: NXT 가격으로 등록
+  ④ run_scan NXT 전용 모드
+     - KRX 마감(15:30) 후에도 NXT 스캔·추적 체크 계속
+     - 조기포착·단기눌림목은 KRX 장중에만 (NXT 마감 시까지 아님)
+  ⑤ run_mid_pullback_scan NXT 포함
+     - KRX 마감 후에도 NXT 급등 종목 눌림목 체크 계속
+
+v20.0 (2026-02-28)
+  ① 텔레그램 인라인 버튼 메뉴
+     - /menu 또는 /도움 → 9개 기능 버튼으로 즉시 실행
+     - 인라인 버튼 콜백 처리 (_handle_callback)
+     - 알 수 없는 명령어 → 자동으로 메뉴 표시
+  ② /설정 명령어 — BotFather 자동완성 등록 가이드
+     - 복붙 가능한 한글 설명 목록 자동 출력
+     - 등록 후 / 입력 시 한글 설명 자동완성 활성
+  ③ 진입가 재알림 주기 최적화
+     - 쿨다운: 30분 → 10분 (진입 구간 빠르게 지나감)
+     - 20초 스캔 기준 조기포착 재확인 간격 조정
+  ④ 손절 후 재진입 감시 최적화
+     - 반등 조건: +5% → +3% (V자 반등 빠른 포착)
+     - 거래량 조건: 2.0배 → 1.5배 완화
+     - 만료 기준: 시간 제한 → 장 마감 시 자동 일괄 초기화
+
+v19.0 (2026-02-28)
+  ① 전체 스캔 주기 최적화 (KIS API 한도 내 최대 속도)
+     급등 스캔:    60초 → 20초  (3배 빠름)
+     뉴스 스캔:   120초 → 45초
+     DART 공시:   180초 → 60초  (3배 빠름)
+     중기 눌림목:  300초 → 90초
+     섹터 모니터:  600초 → 180초
+     텔레그램:      30초 → 10초  (명령어 즉시 반응)
+     INFO 묶음:    600초 → 300초
+  ② 조기 포착 재확인 간격 조정 (20초 스캔 기준 맞춤)
+
+v18.0 (2026-02-28)
+  ① 알림 3단계 중요도 분류 (🔴긴급 / 🟡일반 / 🔵참고)
+     - get_alert_level() — 신호유형+점수+NXT보정으로 자동 결정
+     - INFO 알림 10분마다 묶음 발송 (flush_info_alerts)
+  ② 컴팩트 알림 모드
+     - /compact 명령어로 즉시 전환
+     - 1~2줄 요약: 종목명 / 변동률 / 점수 / 진입·손절·목표 / RR
+     - 설정 파일 저장 (재시작 후에도 유지)
+  ③ 손절 후 재진입 감시
+     - 손절 확정 즉시 _reentry_watch 등록
+     - 손절가 대비 +5% 반등 + 거래량 2배 이상 시 재진입 후보 알림
+     - 최대 3시간 감시 후 자동 만료
+  ④ Railway 재시작 완전 복원
+     - carry_stocks + signal_log 추적 중 종목 동시 복원
+     - 컴팩트 모드 설정 복원
+     - 재시작 시 텔레그램 복원 현황 알림
+
+v17.0 (2026-02-28)
+  ① 오늘의 최우선 종목 TOP 3 (10:00 자동 발송 + /top 즉시 조회)
+  ② 진입 재알림 (30분 쿨다운, 최대 3회)
+  ③ 텔레그램 명령어 추가 (/top /nxt /week /compact)
+  ④ 급등 종목 뉴스 역추적 (백그라운드 자동 조회)
   ① NXT 전면 연동
      - get_nxt_info() 캐시 + 비상장 종목 자동 제외 (_nxt_unavailable)
      - nxt_score_bonus() — 외인/기관/거래량/프리미엄 점수 보정
@@ -58,7 +138,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v16.0"
+BOT_VERSION = "v22.0"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -99,10 +179,10 @@ EARLY_PRICE_MIN       = 10.0
 EARLY_VOLUME_MIN      = 10.0
 EARLY_HOGA_RATIO      = 3.0
 EARLY_CONFIRM_COUNT   = 2
-SCAN_INTERVAL         = 60
+SCAN_INTERVAL         = 20    # 60→20초 (KIS API 분당 20회 한도 내 최대)
 ALERT_COOLDOWN        = 1800
-NEWS_SCAN_INTERVAL    = 120
-DART_INTERVAL         = 180
+NEWS_SCAN_INTERVAL    = 45    # 120→45초 (크롤링 차단 방지 최소값)
+DART_INTERVAL         = 60    # 180→60초 (DART API 여유 있음)
 MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
@@ -120,15 +200,15 @@ STRICT_OPEN_MINUTES  = 10
 STRICT_CLOSE_MINUTES = 10
 
 # ⑭ 중기 눌림목 파라미터
-MID_PULLBACK_SCAN_INTERVAL = 300        # 5분마다 중기 눌림목 스캔
-MID_SURGE_MIN_PCT          = 15.0       # 1차 급등 최소 상승률
-MID_SURGE_LOOKBACK_DAYS    = 20         # 1차 급등 탐색 기간
-MID_PULLBACK_MIN           = 10.0       # 눌림 최소 깊이 (%)
-MID_PULLBACK_MAX           = 40.0       # 눌림 최대 깊이 (%)
-MID_PULLBACK_DAYS_MIN      = 2          # 눌림 최소 기간 (일)
-MID_PULLBACK_DAYS_MAX      = 15         # 눌림 최대 기간 (일)
-MID_VOL_RECOVERY_MIN       = 1.5        # 재상승 시 거래량 회복 배수
-MID_ALERT_COOLDOWN         = 86400      # 중기 눌림목 알림 24시간 쿨다운
+MID_PULLBACK_SCAN_INTERVAL = 90     # 300→90초 (일봉 기반이라 이 이상 빠르면 의미 없음)
+MID_SURGE_MIN_PCT          = 15.0
+MID_SURGE_LOOKBACK_DAYS    = 20
+MID_PULLBACK_MIN           = 10.0
+MID_PULLBACK_MAX           = 40.0
+MID_PULLBACK_DAYS_MIN      = 2
+MID_PULLBACK_DAYS_MAX      = 15
+MID_VOL_RECOVERY_MIN       = 1.5
+MID_ALERT_COOLDOWN         = 86400
 
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
@@ -223,15 +303,56 @@ CORR_LOOKBACK       = 20
 NEWS_COOCCUR_FILE   = "news_cooccur.json"
 
 # ── 섹터 지속 모니터링 ──
-# code → {name, known_codes:set, last_update:ts, alert_count:int}
 _sector_monitor     = {}
-SECTOR_MONITOR_INTERVAL = 600   # 10분마다 재조회
-SECTOR_MONITOR_MAX_HOURS = 6    # 최대 6시간 모니터링
+SECTOR_MONITOR_INTERVAL  = 180   # 600→180초 (3분)
+SECTOR_MONITOR_MAX_HOURS = 6
 
 # ── 진입가 감지 ──
-# log_key → {code, name, entry_price, notified:bool, signal_type, detect_time}
 _entry_watch        = {}
-ENTRY_TOLERANCE_PCT = 2.0       # 진입가 ±2% 이내 진입 시 알림
+ENTRY_TOLERANCE_PCT  = 2.0   # 진입가 ±2% 이내 → 진입 구간
+ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
+ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
+
+# ── 오늘의 최우선 종목 ──
+_today_top_signals: dict = {}
+TOP_SIGNAL_SEND_AT       = "10:00"
+_top_signal_sent_today: bool = False
+
+# ── 뉴스 역추적 캐시 ──
+_news_reverse_cache: dict = {}
+
+# ── 컴팩트 알림 모드 ──
+# True면 1~2줄 요약, False면 기존 상세 포맷
+_compact_mode: bool = False
+COMPACT_MODE_FILE   = "compact_mode.json"
+
+def _load_compact_mode():
+    global _compact_mode
+    try:
+        with open(COMPACT_MODE_FILE) as f:
+            _compact_mode = json.load(f).get("compact", False)
+    except: pass
+
+def _save_compact_mode():
+    try:
+        with open(COMPACT_MODE_FILE, "w") as f:
+            json.dump({"compact": _compact_mode}, f)
+    except: pass
+
+# ── 알림 중요도 레벨 ──
+# CRITICAL(🔴): 즉시 발송  NORMAL(🟡): 즉시 발송  INFO(🔵): 묶어서 10분마다
+ALERT_LEVEL_CRITICAL = "CRITICAL"
+ALERT_LEVEL_NORMAL   = "NORMAL"
+ALERT_LEVEL_INFO     = "INFO"
+_pending_info_alerts: list = []   # INFO 레벨 묶음 대기열
+INFO_FLUSH_INTERVAL  = 300        # 600→300초 (5분)
+
+# ── 손절 후 재진입 감시 ──
+# code → {name, stop_price, ts, signal_type, entry, stop, target}
+# 만료 기준: 시간 제한 없이 장 마감(on_market_close)에서 일괄 초기화
+_reentry_watch: dict = {}
+REENTRY_BOUNCE_PCT  = 3.0   # 5→3% (V자 반등 빠른 포착)
+REENTRY_VOL_MIN     = 1.5   # 2.0→1.5배 (조건 완화)
 
 # ============================================================
 # 🕐 시간 유틸
@@ -312,6 +433,31 @@ def is_market_open() -> bool:
     now = datetime.now()
     if is_holiday(): return False
     return dtime(9, 0) <= now.time() <= dtime(15, 30)
+
+def is_any_market_open() -> bool:
+    """
+    KRX 또는 NXT 중 하나라도 열려 있으면 True
+    코드 전반에서 '장이 완전히 끝났는가'를 판단할 때 사용
+    - KRX: 09:00~15:30
+    - NXT: 08:00~20:00
+    """
+    return is_market_open() or is_nxt_open()
+
+def is_nxt_listed(code: str) -> bool:
+    """
+    해당 종목이 NXT에 상장돼 있는지 확인
+    _nxt_unavailable에 없으면 상장된 것으로 간주 (조회 시 자동 판별)
+    """
+    return code not in _nxt_unavailable
+
+def effective_market_close() -> bool:
+    """
+    '실질적 장 마감' 여부
+    - NXT 상장 종목: NXT 20:00 이후
+    - KRX only 종목: KRX 15:30 이후
+    코드에서 '장이 완전히 끝났다'는 판단이 필요할 때 사용
+    """
+    return not is_any_market_open()
 
 def minutes_since(dt: datetime) -> int:
     return int((datetime.now() - dt).total_seconds() // 60)
@@ -452,11 +598,17 @@ def was_upper_limit_yesterday(code: str) -> bool:
 # ⑩ 캐시 초기화
 # ============================================================
 def _clear_all_cache():
-    global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache, _nxt_cache, _nxt_unavailable
-    _sector_cache.clear(); _avg_volume_cache.clear()
-    _prev_upper_cache.clear(); _daily_cache.clear()
-    _nxt_cache.clear(); _nxt_unavailable.clear()
-    print("🔄 전체 캐시 초기화 완료 (NXT 포함)")
+    global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache
+    global _nxt_cache, _nxt_unavailable, _early_cache, _news_reverse_cache
+    global _kospi_cache, _sector_monitor, _pending_info_alerts
+    _sector_cache.clear();       _avg_volume_cache.clear()
+    _prev_upper_cache.clear();   _daily_cache.clear()
+    _nxt_cache.clear();          _nxt_unavailable.clear()
+    _early_cache.clear();        _news_reverse_cache.clear()
+    _sector_monitor.clear();     _pending_info_alerts.clear()
+    _kospi_cache["ts"] = 0;      _kospi_cache["change"] = 0.0
+    reset_top_signals_daily()    # 날짜 넘어가면 TOP 종목 풀도 초기화
+    print("🔄 전체 캐시 초기화 완료 (NXT + 전체 캐시 포함)")
 
 # ============================================================
 # ⑮ 20일 이동평균 괴리율 (Renaissance 평균회귀)
@@ -888,13 +1040,15 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
 # ============================================================
 def run_mid_pullback_scan():
     """
-    5분마다 전체 후보군 중기 눌림목 체크
-    ① 일봉 완성 기준 중기 눌림목 (THEME_MAP + 동적 후보군)
-    ② 장중 실시간 돌파 감지 (거래량 급증 종목 즉시 체크)
+    90초마다 전체 후보군 중기 눌림목 체크
+    ① 일봉 완성 기준 중기 눌림목 (KRX 장중에만)
+    ② KRX 마감 후에도 NXT 급등 종목은 눌림목 체크 계속
     """
-    if not is_market_open() or _bot_paused:
-        return
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 중기 눌림목 스캔...", flush=True)
+    krx_open = is_market_open()
+    nxt_open = is_nxt_open()
+    if not krx_open and not nxt_open: return
+    if _bot_paused: return
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 중기 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...", flush=True)
 
     # 동적 후보군 갱신 (30분마다)
     if not _dynamic_candidates or time.time() - min(
@@ -1915,6 +2069,91 @@ def _send_tracking_result(rec: dict):
         code, name
     )
 
+    # ── 손절 시 재진입 감시 등록 (KRX + NXT 모두) ──
+    if reason == "손절가" and is_any_market_open():
+        try:
+            # KRX 장중이면 KRX 가격, 마감 후 NXT 있으면 NXT 가격
+            if is_market_open():
+                cur_price = get_stock_price(code).get("price", 0)
+            elif is_nxt_open():
+                cur_price = get_nxt_stock_price(code).get("price", 0) or get_stock_price(code).get("price", 0)
+            else:
+                cur_price = 0
+            if cur_price:
+                _reentry_watch[code] = {
+                    "name":        name,
+                    "stop_price":  cur_price,
+                    "entry":       rec.get("entry_price", 0),
+                    "stop":        rec.get("stop_price", 0),
+                    "target":      rec.get("target_price", 0),
+                    "signal_type": rec.get("signal_type", ""),
+                    "ts":          time.time(),
+                }
+                print(f"  🔄 재진입 감시 등록: {name} ({code}) 손절가 {cur_price:,}")
+        except: pass
+
+def check_reentry_watch():
+    """
+    손절 종목 재진입 감시 — 20초마다 run_scan에서 호출
+    만료: 장 완전 마감(KRX only→15:30, NXT 상장→20:00) 또는 on_market_close
+    조건: 손절가 대비 +3% 반등 + 거래량 1.5배 이상
+    """
+    if not _reentry_watch: return
+    expired = []
+    for code, w in list(_reentry_watch.items()):
+        # 종목별 실질 마감 판단
+        nxt_ok  = is_nxt_open() and is_nxt_listed(code)
+        krx_ok  = is_market_open()
+        if not krx_ok and not nxt_ok:
+            expired.append(code); continue   # 모든 시장 마감 → 만료
+        try:
+            # KRX 장중이면 KRX 가격, 마감 후면 NXT 가격
+            if krx_ok:
+                cur   = get_stock_price(code)
+                price = cur.get("price", 0)
+                vr    = cur.get("volume_ratio", 0)
+            else:
+                cur   = get_nxt_stock_price(code)
+                price = cur.get("price", 0)
+                vr    = cur.get("volume_ratio", 0)
+                if not price:   # NXT 거래 없으면 스킵 (마감 아님)
+                    continue
+            if not price: continue
+
+            bounce = (price - w["stop_price"]) / w["stop_price"] * 100
+            mkt_tag = " 🔵NXT" if not krx_ok and nxt_ok else ""
+            if bounce >= REENTRY_BOUNCE_PCT and vr >= REENTRY_VOL_MIN:
+                sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
+                              "SURGE":"급등","EARLY_DETECT":"조기포착",
+                              "MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목"}
+                sig = sig_labels.get(w["signal_type"], w["signal_type"])
+                stop_new, target_new, sp, tp, atr = calc_stop_target(code, price)
+                rr = round((target_new - price) / (price - stop_new), 1) if price > stop_new else 0
+                send_with_chart_buttons(
+                    f"🔄 <b>[손절 후 재진입 후보{mkt_tag}]</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🟡 <b>{w['name']}</b>  <code>{code}</code>\n"
+                    f"원신호: {sig}\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📍 손절가:  {w['stop_price']:,}원\n"
+                    f"📈 현재가:  <b>{price:,}원</b>  (+{bounce:.1f}% 반등)\n"
+                    f"🔊 거래량:  {vr:.1f}배 (회복)\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"┌─────────────────────\n"
+                    f"│ 🎯 재진입가  <b>{price:,}원</b>\n"
+                    f"│ 🛡 손절가   <b>{stop_new:,}원</b>  (-{sp:.1f}%)\n"
+                    f"│ 🏆 목표가   <b>{target_new:,}원</b>  (+{tp:.1f}%)\n"
+                    f"│ 손익비:    {rr:.1f} : 1\n"
+                    f"└─────────────────────\n"
+                    f"⚠️ 손절 후 재진입 — 물타기 아님, 새 포지션으로 판단",
+                    code, w["name"]
+                )
+                expired.append(code)
+                print(f"  🔄 재진입 신호: {w['name']} {price:,} (+{bounce:.1f}%){mkt_tag}")
+        except: continue
+    for code in expired:
+        _reentry_watch.pop(code, None)
+
 def save_carry_stocks():
     try:
         with open(CARRY_FILE,"w") as f:
@@ -1928,6 +2167,8 @@ def save_carry_stocks():
     except Exception as e: print(f"⚠️ 이월 저장 실패: {e}")
 
 def load_carry_stocks():
+    """Railway 재시작 시 추적 상태 전체 복원"""
+    # ① 이월 종목 복원
     try:
         with open(CARRY_FILE,"r") as f: data = json.load(f)
         for code, info in data.items():
@@ -1942,10 +2183,42 @@ def load_carry_stocks():
             }
         if _detected_stocks:
             print(f"📂 이월 종목 {len(_detected_stocks)}개 복원")
-            send(f"📂 <b>이월 종목 복원</b>\n" +
-                 "\n".join([f"• {v['name']} ({k})" for k,v in _detected_stocks.items()]) +
-                 "\n\n눌림목 체크 재개")
     except: pass
+
+    # ② signal_log에서 추적 중 종목 복원 (이월 파일에 없는 당일 추적 종목)
+    try:
+        with open(SIGNAL_LOG_FILE,"r") as f: sig_data = json.load(f)
+        today = datetime.now().strftime("%Y%m%d")
+        restored = 0
+        for rec in sig_data.values():
+            code = rec.get("code","")
+            if (rec.get("status") == "추적중"
+                    and rec.get("detect_date") == today
+                    and code not in _detected_stocks):
+                _detected_stocks[code] = {
+                    "name":        rec["name"],
+                    "high_price":  rec.get("detect_price", 0),
+                    "entry_price": rec.get("entry_price", 0),
+                    "stop_loss":   rec.get("stop_price", 0),
+                    "target_price":rec.get("target_price", 0),
+                    "detected_at": datetime.now(),
+                    "carry_day":   0,
+                }
+                restored += 1
+        if restored:
+            print(f"  📋 signal_log에서 추적 중 종목 {restored}개 추가 복원")
+    except: pass
+
+    # 복원 알림
+    if _detected_stocks:
+        send(f"🔄 <b>봇 재시작 — 추적 상태 복원</b>\n"
+             f"📂 감시 중 종목 {len(_detected_stocks)}개\n" +
+             "\n".join([f"• {v['name']} ({k})" for k,v in list(_detected_stocks.items())[:6]]) +
+             ("\n  ..." if len(_detected_stocks) > 6 else "") +
+             "\n\n📡 스캔 재개")
+
+    # ③ 컴팩트 모드 복원
+    _load_compact_mode()
 
 # ============================================================
 # 🧠 자동 조건 조정 엔진
@@ -2139,7 +2412,8 @@ def start_sector_monitor(code: str, name: str):
             time.sleep(SECTOR_MONITOR_INTERVAL)
             info = _sector_monitor.get(code)
             if not info: break
-            if not is_market_open():
+            # NXT 포함 실질 장 마감 체크
+            if not is_any_market_open():
                 _sector_monitor.pop(code, None); break
             if (time.time() - info["start_ts"]) / 3600 > SECTOR_MONITOR_MAX_HOURS:
                 _sector_monitor.pop(code, None); break
@@ -2177,6 +2451,62 @@ def start_sector_monitor(code: str, name: str):
 # ============================================================
 # 🎯 진입가 감지
 # ============================================================
+def register_top_signal(s: dict):
+    """신호 발생마다 오늘의 최우선 종목 풀에 추가 (점수 높은 종목 유지)"""
+    code  = s.get("code","")
+    score = s.get("score", 0)
+    if not code: return
+    existing = _today_top_signals.get(code, {})
+    if score > existing.get("score", 0):
+        _today_top_signals[code] = {
+            "score":       score,
+            "name":        s.get("name", code),
+            "signal_type": s.get("signal_type",""),
+            "entry_price": s.get("entry_price", 0),
+            "stop_loss":   s.get("stop_loss", 0),
+            "target_price":s.get("target_price", 0),
+            "reasons":     s.get("reasons", []),
+            "detected_at": datetime.now().strftime("%H:%M"),
+            "nxt_delta":   s.get("nxt_delta", 0),
+        }
+
+def send_top_signals():
+    """매일 10:00 — 오전 최우선 종목 TOP 3 발송"""
+    global _top_signal_sent_today
+    if _top_signal_sent_today or not _today_top_signals: return
+    _top_signal_sent_today = True
+
+    sig_labels = {
+        "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+    }
+    top3 = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:3]
+    msg  = f"🏆 <b>오늘의 최우선 종목</b>  {datetime.now().strftime('%m/%d')}\n━━━━━━━━━━━━━━━\n"
+    for i, t in enumerate(top3, 1):
+        medal   = ["🥇","🥈","🥉"][i-1]
+        sig     = sig_labels.get(t["signal_type"], t["signal_type"])
+        nxt_tag = f"  🔵NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
+        entry   = t.get("entry_price", 0)
+        stop    = t.get("stop_loss", 0)
+        target  = t.get("target_price", 0)
+        rr      = round((target - entry) / (entry - stop), 1) if entry and stop and entry > stop else 0
+        msg += (
+            f"\n{medal} <b>{t['name']}</b>  {sig}  {t['score']}점{nxt_tag}\n"
+            f"   포착: {t['detected_at']}\n"
+            f"   🎯 진입 {entry:,}  🛡 손절 {stop:,}  🏆 목표 {target:,}\n"
+            f"   손익비: {rr:.1f}:1\n"
+        )
+    msg += "\n━━━━━━━━━━━━━━━\n💡 점수·NXT·손익비 종합 순위"
+    send(msg)
+
+def reset_top_signals_daily():
+    """장 시작 시 최우선 종목 풀 초기화"""
+    global _top_signal_sent_today
+    _today_top_signals.clear()
+    _top_signal_sent_today = False
+
+
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry: return
@@ -2185,7 +2515,9 @@ def register_entry_watch(s: dict):
         "code": s["code"], "name": s["name"], "entry_price": entry,
         "stop_loss": s.get("stop_loss",0), "target_price": s.get("target_price",0),
         "signal_type": s.get("signal_type",""), "detect_time": datetime.now().strftime("%H:%M"),
-        "notified": False, "registered_ts": time.time(),
+        "last_notified_ts": 0,   # 0 = 아직 미알림, 이후 타임스탬프로 쿨다운 관리
+        "notify_count": 0,       # 알림 횟수 (최대 3회)
+        "registered_ts": time.time(),
     }
     print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원")
 
@@ -2210,19 +2542,33 @@ def check_entry_watch():
             if not price: continue
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
+
+            # 진입가 ±2% 이내 진입 구간
             if abs(diff_pct) <= ENTRY_TOLERANCE_PCT:
-                watch["notified"] = True
+                now_ts       = time.time()
+                last_ts      = watch.get("last_notified_ts", 0)
+                notify_count = watch.get("notify_count", 0)
+                cooldown_sec = ENTRY_REWATCH_MINS * 60
+
+                # 최대 3회, 쿨다운 지난 경우만 알림
+                if notify_count >= 3: expired.append(log_key); continue
+                if now_ts - last_ts < cooldown_sec: continue
+
+                watch["last_notified_ts"] = now_ts
+                watch["notify_count"]     = notify_count + 1
+
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
                 }
-                sig      = sig_labels.get(watch["signal_type"], watch["signal_type"])
-                diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
-                stop_pct = round((watch["stop_loss"]  - entry) / entry * 100, 1) if entry else 0
-                tgt_pct  = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
+                sig        = sig_labels.get(watch["signal_type"], watch["signal_type"])
+                diff_str   = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
+                stop_pct   = round((watch["stop_loss"]   - entry) / entry * 100, 1) if entry else 0
+                tgt_pct    = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
                 nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
+                count_tag  = f"  ({notify_count+1}/3회)" if notify_count > 0 else ""
                 send_with_chart_buttons(
-                    f"🔔🔔 <b>[진입가 도달!]</b> 🔔🔔{nxt_notice}\n"
+                    f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                     f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
@@ -2236,8 +2582,7 @@ def check_entry_watch():
                     f"└─────────────────────",
                     watch["code"], watch["name"]
                 )
-                print(f"  🎯 진입가 도달: {watch['name']} {price:,} / 진입 {entry:,}")
-                expired.append(log_key)
+                print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
         except: continue
     for k in expired:
         _entry_watch.pop(k, None)
@@ -2272,6 +2617,54 @@ def send(text: str):
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                       json={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML"},timeout=10)
     except Exception as e: print(f"⚠️ 텔레그램 오류: {e}")
+
+def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
+                  code: str = "", name: str = ""):
+    """
+    중요도별 알림 발송
+    CRITICAL / NORMAL → 즉시 발송
+    INFO              → _pending_info_alerts 대기열에 추가 (10분마다 묶음 발송)
+    """
+    if level in (ALERT_LEVEL_CRITICAL, ALERT_LEVEL_NORMAL):
+        if code and name:
+            send_with_chart_buttons(text, code, name)
+        else:
+            send(text)
+    else:  # INFO
+        _pending_info_alerts.append({"text": text, "ts": time.time()})
+
+def flush_info_alerts():
+    """INFO 알림 묶음 발송 (10분마다 스케줄)"""
+    if not _pending_info_alerts: return
+    # 10분 이상 된 것만 발송
+    now = time.time()
+    to_send = [a for a in _pending_info_alerts if now - a["ts"] >= 300]
+    if not to_send: return
+    for a in to_send:
+        _pending_info_alerts.remove(a)
+    if len(to_send) == 1:
+        send(to_send[0]["text"])
+    else:
+        combined = f"🔵 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
+        for a in to_send:
+            # 각 알림에서 첫 줄만 요약
+            first_line = a["text"].split("\n")[0][:60]
+            combined  += f"• {first_line}\n"
+        send(combined)
+
+def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
+    """
+    신호 유형 + 점수 → 중요도 레벨 결정
+    CRITICAL: 상한가·강력매수·NXT보정 +10 이상 고점수
+    NORMAL:   급등·조기포착·중기눌림목
+    INFO:     참고용 섹터 업데이트·낮은 점수
+    """
+    if signal_type in ("UPPER_LIMIT", "STRONG_BUY"): return ALERT_LEVEL_CRITICAL
+    if signal_type == "NEAR_UPPER" and score >= 85:  return ALERT_LEVEL_CRITICAL
+    if nxt_delta >= 10 and score >= 80:              return ALERT_LEVEL_CRITICAL
+    if score >= 75:                                   return ALERT_LEVEL_NORMAL
+    if score >= 60:                                   return ALERT_LEVEL_NORMAL
+    return ALERT_LEVEL_INFO
 
 def _sector_block(s: dict) -> str:
     si = s.get("sector_info")
@@ -2321,14 +2714,34 @@ def send_alert(s: dict):
              "SURGE":"급등 감지","ENTRY_POINT":"★ 눌림목 진입 시점 ★",
              "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
 
-    # 신호 유형별 종목명 색상 이모지
+    level    = get_alert_level(s["signal_type"], s.get("score",0), s.get("nxt_delta",0))
+    nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
+    lvl_icon  = {"CRITICAL":"🔴","NORMAL":"🟡","INFO":"🔵"}.get(level,"🟡")
+
+    # ── 컴팩트 모드 ──
+    if _compact_mode:
+        name_dot = {"UPPER_LIMIT":"🔴","NEAR_UPPER":"🟠","STRONG_BUY":"🟢",
+                    "SURGE":"🟡","EARLY_DETECT":"🔵","ENTRY_POINT":"🟣"}.get(s["signal_type"],"⚪")
+        entry  = s.get("entry_price", 0)
+        stop   = s.get("stop_loss", 0)
+        target = s.get("target_price", 0)
+        rr     = round((target-entry)/(entry-stop),1) if entry and stop and entry>stop else 0
+        compact_text = (
+            f"{lvl_icon}{emoji} {name_dot}<b>{s['name']}</b>  {s['change_rate']:+.1f}%  "
+            f"{s['score']}점{nxt_badge}\n"
+            f"진입 {entry:,} | 손절 {stop:,} | 목표 {target:,}  RR {rr:.1f}"
+        )
+        send_by_level(compact_text, level, s["code"], s["name"])
+        return
+
+    # ── 상세 모드 (기존) ──
     name_dot = {
-        "UPPER_LIMIT": "🔴",   # 빨강 - 상한가 (최고 강도)
-        "NEAR_UPPER":  "🟠",   # 주황 - 상한가 근접
-        "STRONG_BUY":  "🟢",   # 초록 - 강력 매수
-        "SURGE":       "🟡",   # 노랑 - 급등
-        "EARLY_DETECT":"🔵",   # 파랑 - 조기 포착
-        "ENTRY_POINT": "🟣",   # 보라 - 눌림목 진입
+        "UPPER_LIMIT": "🔴",
+        "NEAR_UPPER":  "🟠",
+        "STRONG_BUY":  "🟢",
+        "SURGE":       "🟡",
+        "EARLY_DETECT":"🔵",
+        "ENTRY_POINT": "🟣",
     }.get(s["signal_type"], "⚪")
 
     stars    = "★" * min(int(s["score"]/20), 5)
@@ -2376,10 +2789,18 @@ def send_alert(s: dict):
             f"└─────────────────────"
         )
 
-    # NXT 여부
+    # NXT 여부 (상세 모드용 - 컴팩트는 위에서 처리됨)
     nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
 
-    send_with_chart_buttons(
+    _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
+                       stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
+                       entry_block, level)
+
+# ── 내부 헬퍼: 상세 모드 실제 발송 (send_alert에서 호출) ──
+def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
+                       stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
+                       entry_block, level):
+    send_by_level(
         f"{emoji} <b>[{title}]</b>{nxt_badge}\n"
         f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -2395,7 +2816,7 @@ def send_alert(s: dict):
         f"━━━━━━━━━━━━━━━\n\n"
         + _sector_block(s)
         + f"\n{entry_block}",
-        s["code"], s["name"]
+        level, s["code"], s["name"]
     )
 
 # ============================================================
@@ -2504,7 +2925,7 @@ def check_early_detection() -> list:
         if cache is None:
             _early_cache[code] = {"count":1,"last_price":price,"last_time":now}; continue
         elapsed = (now - cache["last_time"]).seconds
-        if 50 <= elapsed <= 180:
+        if 15 <= elapsed <= 80:   # 20초 스캔 기준: 1~4회 사이 재확인
             if price >= cache["last_price"]:
                 cache["count"]+=1; cache["last_price"]=price; cache["last_time"]=now
             else: _early_cache[code]={"count":1,"last_price":price,"last_time":now}; continue
@@ -2630,6 +3051,54 @@ def check_pullback_signals() -> list:
 # ============================================================
 # 뉴스 (3개 소스 병렬)
 # ============================================================
+def fetch_news_for_stock(code: str, name: str) -> list:
+    """
+    급등 종목 → 관련 뉴스 역추적
+    네이버 금융 종목 뉴스 페이지 스크래핑
+    returns: [{"title": str, "time": str}, ...]  최대 3건
+    """
+    cached = _news_reverse_cache.get(code)
+    if cached and time.time() - cached.get("ts", 0) < 1800:
+        return cached.get("news", [])
+    news = []
+    try:
+        url  = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1&sm=title_entity_id.basic"
+        resp = requests.get(url, headers=_random_ua(), timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("table.type5 tr")
+        for row in rows[:5]:
+            title_el = row.select_one("td.title a")
+            time_el  = row.select_one("td.date")
+            if not title_el: continue
+            title = title_el.get_text(strip=True)
+            t     = time_el.get_text(strip=True) if time_el else ""
+            # 종목명 또는 관련 키워드 포함 여부 필터
+            if len(title) > 5:
+                news.append({"title": title[:40], "time": t})
+            if len(news) >= 3: break
+    except: pass
+    _news_reverse_cache[code] = {"news": news, "ts": time.time()}
+    return news
+
+def news_block_for_alert(code: str, name: str) -> str:
+    """알림 메시지에 삽입할 뉴스 블록 생성"""
+    def _fetch():
+        try:
+            articles = fetch_news_for_stock(code, name)
+            if not articles: return
+            lines = "\n".join(f"  📰 {a['title']}  <i>{a['time']}</i>" for a in articles)
+            send_with_chart_buttons(
+                f"📰 <b>[{name} 관련 뉴스]</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"{lines}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"💡 뉴스 있음 — 재료 확인 후 진입 판단",
+                code, name
+            )
+        except: pass
+    # 알림 직후 백그라운드로 뉴스 조회 (메인 알림 속도 영향 없음)
+    threading.Thread(target=_fetch, daemon=True).start()
+
 def fetch_naver_news() -> list:
     try:
         resp = requests.get("https://finance.naver.com/news/news_list.naver?mode=LSS2D&section_id=101&section_id2=258",
@@ -2663,8 +3132,10 @@ def fetch_all_news() -> list:
     for t in threads: t.join(timeout=8)
     return list(dict.fromkeys(results))
 
-def analyze_news_theme() -> list:
-    signals = []; headlines = fetch_all_news()
+def analyze_news_theme(headlines: list = None) -> list:
+    signals = []
+    if headlines is None:                      # 직접 호출 시에만 크롤링
+        headlines = fetch_all_news()
     if not headlines: return []
     print(f"  📰 뉴스 {len(headlines)}건 (3개 소스)")
     for theme_key, theme_info in THEME_MAP.items():
@@ -2912,6 +3383,76 @@ def analyze_dart_disclosures():
 # ============================================================
 _tg_offset = 0
 
+def _send_menu(title: str = ""):
+    """
+    인라인 버튼 메뉴 발송
+    버튼을 누르면 해당 명령어 텍스트가 채팅창에 입력됨
+    (텔레그램 callback_query 방식 대신 switch_inline_query_current_chat 사용)
+    """
+    menu_title = title or "📌 <b>명령어 메뉴</b>  — 버튼을 눌러 실행하세요"
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🤖 봇 상태",        "callback_data": "cmd_status"},
+                {"text": "📋 감시 종목",       "callback_data": "cmd_list"},
+                {"text": "🏆 오늘 TOP 3",      "callback_data": "cmd_top"},
+            ],
+            [
+                {"text": "🔵 NXT 현황",        "callback_data": "cmd_nxt"},
+                {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
+                {"text": "📊 승률 통계",       "callback_data": "cmd_stats"},
+            ],
+            [
+                {"text": "⏸ 알림 정지",        "callback_data": "cmd_stop"},
+                {"text": "▶️ 알림 재개",        "callback_data": "cmd_resume"},
+                {"text": "🗜 컴팩트 전환",      "callback_data": "cmd_compact"},
+            ],
+            [
+                {"text": "⚙️ BotFather 설정법", "callback_data": "cmd_setup"},
+            ],
+        ]
+    }
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id":    TELEGRAM_CHAT_ID,
+                "text":       menu_title,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard,
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"⚠️ 메뉴 발송 오류: {e}")
+        send(menu_title)   # 버튼 실패 시 텍스트로 폴백
+
+def _handle_callback(callback_id: str, data: str):
+    """인라인 버튼 콜백 처리"""
+    # 버튼 누름 확인 응답 (텔레그램 필수)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id},
+            timeout=5
+        )
+    except: pass
+
+    cmd_map = {
+        "cmd_status":  "/status",
+        "cmd_list":    "/list",
+        "cmd_top":     "/top",
+        "cmd_nxt":     "/nxt",
+        "cmd_week":    "/week",
+        "cmd_stats":   "/stats",
+        "cmd_stop":    "/stop",
+        "cmd_resume":  "/resume",
+        "cmd_compact": "/compact",
+        "cmd_setup":   "/설정",
+    }
+    return cmd_map.get(data, "")
+
+
 def poll_telegram_commands():
     global _tg_offset, _bot_paused
     try:
@@ -2919,8 +3460,17 @@ def poll_telegram_commands():
                             params={"offset":_tg_offset,"timeout":5},timeout=10)
         for update in resp.json().get("result",[]):
             _tg_offset = update["update_id"]+1
-            # 대소문자 구분 없이 처리 (원본 텍스트 보존)
-            raw  = update.get("message",{}).get("text","").strip()
+
+            # ── 인라인 버튼 콜백 처리 ──
+            cb = update.get("callback_query")
+            if cb:
+                text = _handle_callback(cb["id"], cb.get("data",""))
+                if not text: continue
+                raw = text
+            else:
+                raw  = update.get("message",{}).get("text","").strip()
+                if not raw: continue
+
             text = raw.lower()
             if not text.startswith("/"): continue
 
@@ -2952,6 +3502,90 @@ def poll_telegram_commands():
             elif text == "/resume":
                 _bot_paused = False; send("▶️ <b>봇 재개</b>")
 
+            # ── /compact — 컴팩트 모드 토글 ──
+            elif text == "/compact":
+                global _compact_mode
+                _compact_mode = not _compact_mode
+                _save_compact_mode()
+                mode_str = "🗜 <b>컴팩트 모드 ON</b>\n알림이 1~2줄 요약으로 발송됩니다" \
+                           if _compact_mode else \
+                           "📋 <b>상세 모드 ON</b>\n알림이 기존 상세 포맷으로 발송됩니다"
+                send(mode_str)
+
+            # ── /top — 오늘의 최우선 종목 즉시 조회 ──
+            elif text == "/top":
+                if not _today_top_signals:
+                    send("📊 오늘 포착된 신호 없음 (장 시작 후 신호 누적 중)")
+                else:
+                    send_top_signals.__wrapped__ = True   # 플래그 우회 강제 발송
+                    _top_signal_sent_today_bak = _top_signal_sent_today
+                    globals()["_top_signal_sent_today"] = False
+                    send_top_signals()
+                    globals()["_top_signal_sent_today"] = _top_signal_sent_today_bak
+
+            # ── /nxt — NXT 현재 동향 즉시 조회 ──
+            elif text == "/nxt":
+                if not is_nxt_open():
+                    send("🔵 NXT 현재 마감 중 (08:00~20:00 운영)")
+                else:
+                    try:
+                        stocks = get_nxt_surge_stocks()
+                        if not stocks:
+                            send("🔵 NXT 현재 급등 종목 없음")
+                        else:
+                            top = sorted(stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:7]
+                            lines = "\n".join(
+                                f"  {'📈' if s['change_rate']>0 else '📉'} {s['name']} "
+                                f"<b>{s['change_rate']:+.1f}%</b>  🔊{s.get('volume_ratio',0):.0f}x"
+                                for s in top
+                            )
+                            send(f"🔵 <b>NXT 실시간 동향</b>  {datetime.now().strftime('%H:%M')}\n"
+                                 f"━━━━━━━━━━━━━━━\n{lines}")
+                    except Exception as e:
+                        send(f"⚠️ NXT 조회 오류: {e}")
+
+            # ── /week — 이번 주 잠정 성과 즉시 조회 ──
+            elif text == "/week":
+                try:
+                    data = {}
+                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+                    today    = datetime.now()
+                    this_mon = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
+                    this_fri = today.strftime("%Y%m%d")
+                    week_done    = [v for v in data.values()
+                                    if this_mon <= v.get("detect_date","") <= this_fri
+                                    and v.get("status") in ["수익","손실","본전"]]
+                    week_tracking = [v for v in data.values()
+                                     if this_mon <= v.get("detect_date","") <= this_fri
+                                     and v.get("status") == "추적중"]
+                    if not week_done and not week_tracking:
+                        send("📅 이번 주 신호 없음"); continue
+                    msg = f"📅 <b>이번 주 잠정 성과</b>  {this_mon[4:6]}/{this_mon[6:]} ~ {this_fri[4:6]}/{this_fri[6:]}\n━━━━━━━━━━━━━━━\n"
+                    if week_done:
+                        pnls    = [v["pnl_pct"] for v in week_done]
+                        wins    = sum(1 for p in pnls if p > 0)
+                        avg_pnl = sum(pnls) / len(pnls)
+                        msg += (f"\n✅ <b>확정</b>  {len(week_done)}건\n"
+                                f"  승률 {wins/len(week_done)*100:.0f}%  평균 {avg_pnl:+.1f}%\n")
+                        for v in sorted(week_done, key=lambda x: x.get("pnl_pct",0), reverse=True)[:5]:
+                            dot = "✅" if v["pnl_pct"]>0 else "🔴"
+                            msg += f"  {dot} {v['name']} {v['pnl_pct']:+.1f}%\n"
+                    if week_tracking:
+                        msg += f"\n⏳ <b>추적 중</b>  {len(week_tracking)}건\n"
+                        for v in week_tracking[:4]:
+                            try:
+                                cur   = get_stock_price(v["code"])
+                                price = cur.get("price",0)
+                                entry = v.get("entry_price",0)
+                                if price and entry:
+                                    pnl = (price-entry)/entry*100
+                                    dot = "🟢" if pnl>=0 else "🟠"
+                                    msg += f"  {dot} {v['name']} {pnl:+.1f}% (잠정)\n"
+                            except: continue
+                    send(msg)
+                except Exception as e:
+                    send(f"⚠️ 주간 조회 오류: {e}")
+
             # ── /result 종목명 수익률 ──
             elif text.startswith("/result"):
                 _handle_result_command(raw)
@@ -2960,18 +3594,40 @@ def poll_telegram_commands():
             elif text == "/stats":
                 _send_stats()
 
-            # ── /help ──
+            # ── /menu 또는 /도움 — 버튼 메뉴 ──
+            elif text in ("/menu", "/도움", "/help"):
+                _send_menu()
+
+            # ── /설정 — BotFather 명령어 등록 가이드 ──
+            elif text in ("/설정", "/setup"):
+                send(
+                    "⚙️ <b>BotFather 명령어 등록 방법</b>\n"
+                    "텔레그램에서 / 입력 시 한글 설명이 자동완성으로 뜨게 됩니다\n\n"
+                    "<b>① @BotFather 에게 아래 명령어 전송</b>\n"
+                    "<code>/setcommands</code>\n\n"
+                    "<b>② 봇 선택 후 아래 내용 그대로 복붙</b>\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "<code>"
+                    "status - 🤖 봇 상태 및 버전 확인\n"
+                    "list - 📋 현재 감시 중인 종목 목록\n"
+                    "top - 🏆 오늘의 최우선 종목 TOP 3\n"
+                    "nxt - 🔵 NXT 넥스트레이드 실시간 동향\n"
+                    "week - 📅 이번 주 잠정 성과 조회\n"
+                    "stats - 📊 신호 유형별 승률 통계\n"
+                    "compact - 🗜 컴팩트·상세 알림 모드 전환\n"
+                    "stop - ⏸ 알림 일시 정지\n"
+                    "resume - ▶️ 알림 재개\n"
+                    "menu - 📌 버튼 메뉴 열기\n"
+                    "result - ✍️ 수익률 수동 기록 (예: result 대주산업 +12.5)"
+                    "</code>\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "③ 등록 완료 후 채팅창에서 / 입력하면\n"
+                    "   한글 설명과 함께 자동완성이 나타납니다"
+                )
+
+            # ── 알 수 없는 명령어 → 메뉴 표시 ──
             else:
-                send("📌 <b>명령어 목록</b>\n\n"
-                     "/status  — 봇 상태\n"
-                     "/list    — 감시 중 종목\n"
-                     "/stop    — 알림 정지\n"
-                     "/resume  — 알림 재개\n"
-                     "/stats   — 신호 유형별 승률 통계\n\n"
-                     "<b>/result 종목명 수익률</b>\n"
-                     "예) /result 대주산업 +12.5\n"
-                     "예) /result 한국첨단소재 -8.1\n"
-                     "예) /result 국전약품 0")
+                _send_menu(f"❓ <b>'{raw}'</b> 는 알 수 없는 명령어예요\n아래 버튼으로 실행해보세요")
     except Exception as e:
         print(f"⚠️ TG 명령어 오류: {e}")
 
@@ -3121,6 +3777,15 @@ def _send_stats():
 # 장 마감
 # ============================================================
 def on_market_close():
+    # 재진입 감시 — KRX only 종목만 초기화, NXT 상장 종목은 20:00까지 유지
+    nxt_remain = {c: w for c, w in _reentry_watch.items() if is_nxt_listed(c)}
+    krx_only   = {c: w for c, w in _reentry_watch.items() if not is_nxt_listed(c)}
+    if krx_only:
+        for c in krx_only: _reentry_watch.pop(c, None)
+        print(f"  🔄 KRX 재진입 감시 {len(krx_only)}건 만료 (15:30)")
+    if nxt_remain:
+        print(f"  🔵 NXT 재진입 감시 {len(nxt_remain)}건 유지 (→20:00)")
+
     carry_list = []
     for code, info in list(_detected_stocks.items()):
         carry_day = info.get("carry_day",0)
@@ -3478,48 +4143,60 @@ def _send_ai_analysis(week_recs: list, summary: str):
     except Exception as e:
         print(f"⚠️ AI 분석 오류: {e}")
 def run_news_scan():
-    if not is_market_open() or _bot_paused: return
+    if not is_any_market_open() or _bot_paused: return   # NXT 포함 체크
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 뉴스 스캔...", flush=True)
     try:
-        headlines = fetch_all_news()
-        if headlines:
-            # 뉴스 공동언급 DB 업데이트 (백그라운드)
-            threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
-        for signal in analyze_news_theme(): send_news_theme_alert(signal)
+        headlines = fetch_all_news()   # 한 번만 호출
+        if not headlines: return
+        # 뉴스 공동언급 DB 업데이트 (백그라운드)
+        threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
+        # 테마 분석은 가져온 헤드라인 재사용 (이중 크롤링 제거)
+        for signal in analyze_news_theme(headlines=headlines):
+            send_news_theme_alert(signal)
     except Exception as e: print(f"⚠️ 뉴스 오류: {e}")
 
 def run_scan():
-    if not is_market_open() or _bot_paused: return
+    # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
+    krx_open = is_market_open()
+    nxt_open = is_nxt_open()
+    if not krx_open and not nxt_open: return   # 모든 시장 마감
+    if _bot_paused: return
+
     strict_tag = " [엄격]" if is_strict_time() else ""
-    nxt_tag    = "+NXT" if is_nxt_open() else ""
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 스캔{strict_tag}{nxt_tag}...", flush=True)
+    mkt_tag    = "KRX+NXT" if krx_open and nxt_open else ("NXT전용" if nxt_open else "KRX")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 스캔{strict_tag} [{mkt_tag}]...", flush=True)
     try:
         alerts, seen = [], set()
-        for stock in get_upper_limit_stocks():
-            if stock["code"] in seen: continue
-            r = analyze(stock)
-            if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
-                alerts.append(r); seen.add(r["code"])
-        for stock in get_volume_surge_stocks():
-            if stock["code"] in seen: continue
-            r = analyze(stock)
-            if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
-                alerts.append(r); seen.add(r["code"])
 
-        # ── NXT 스캔 (장 운영 시간에만) ──
-        if is_nxt_open():
+        # KRX 스캔 (장 중에만)
+        if krx_open:
+            for stock in get_upper_limit_stocks():
+                if stock["code"] in seen: continue
+                r = analyze(stock)
+                if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
+                    alerts.append(r); seen.add(r["code"])
+            for stock in get_volume_surge_stocks():
+                if stock["code"] in seen: continue
+                r = analyze(stock)
+                if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
+                    alerts.append(r); seen.add(r["code"])
+
+        # ── NXT 스캔 (NXT 운영 시간에만) ──
+        if nxt_open:
             for stock in get_nxt_surge_stocks():
                 if stock["code"] in seen: continue
                 r = analyze(stock)
                 if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>ALERT_COOLDOWN:
-                    r["market"] = "NXT"   # NXT 표시
+                    r["market"] = "NXT"
                     alerts.append(r); seen.add(stock["code"])
 
-        for s in check_early_detection():
-            if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>ALERT_COOLDOWN:
-                alerts.append(s); seen.add(s["code"])
-        for s in check_pullback_signals():
-            if s["code"] not in seen: alerts.append(s); seen.add(s["code"])
+        # 조기포착·단기눌림목은 KRX 장중에만 의미 있음
+        if krx_open:
+            for s in check_early_detection():
+                if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>ALERT_COOLDOWN:
+                    alerts.append(s); seen.add(s["code"])
+            for s in check_pullback_signals():
+                if s["code"] not in seen: alerts.append(s); seen.add(s["code"])
         if not alerts: print("  → 조건 충족 없음")
         else:
             print(f"  → {len(alerts)}개 감지!")
@@ -3532,7 +4209,9 @@ def run_scan():
                 save_signal_log(s)
                 if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
                 register_entry_watch(s)                     # ★ 진입가 감시 등록
+                register_top_signal(s)                      # ★ 최우선 종목 풀 등록
                 start_sector_monitor(s["code"], s["name"])  # ★ 섹터 지속 모니터링
+                news_block_for_alert(s["code"], s["name"])  # ★ 뉴스 역추적 (백그라운드)
                 try:
                     threading.Thread(
                         target=auto_update_theme,
@@ -3549,8 +4228,9 @@ def run_scan():
                         _detected_stocks[s["code"]]["high_price"] = s["price"]
                 time.sleep(1)
 
-        check_entry_watch()     # ★ 매 스캔마다 진입가 도달 체크
-        track_signal_results()  # ★ 추적 중인 신호 결과 자동 체크
+        check_entry_watch()     # ★ 진입가 도달 체크
+        check_reentry_watch()   # ★ 손절 후 재진입 감시
+        track_signal_results()  # ★ 추적 중 신호 결과 체크
     except Exception as e: print(f"⚠️ 스캔 오류: {e}")
 
 # ============================================================
@@ -3574,31 +4254,44 @@ if __name__ == "__main__":
         "✅ 한국투자증권 API 연결\n"
         "🔵 NXT(넥스트레이드) 연동 활성\n\n"
         "<b>📡 스캔 주기</b>\n"
-        "• 당일 급등/상한가: 1분\n"
-        "• 중기 눌림목: 5분\n"
-        "• 뉴스 (3개 소스): 2분\n"
-        "• DART 공시: 3분  |  종합: 15:30\n"
+        "• 급등/상한가 스캔: <b>20초</b>\n"
+        "• 중기 눌림목: <b>90초</b>\n"
+        "• 뉴스 (3개 소스): <b>45초</b>\n"
+        "• DART 공시: <b>60초</b>\n"
+        "• 텔레그램 명령어: <b>10초</b>\n"
         "• NXT 장전 선포착: 08:00~09:00\n"
         "• NXT 마감 후 추적: 15:30~20:00\n\n"
-        "<b>💬 명령어</b>  /status  /list  /stop  /resume"
+        "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
+        "⚙️ <b>/설정</b> — BotFather 명령어 자동완성 등록법"
     )
 
     schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(run_news_scan)
     schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
-    schedule.every(30).seconds.do(poll_telegram_commands)
-    schedule.every().friday.at("15:35").do(send_weekly_report)   # 매주 금요일 장 마감 후 주간 리포트
-    schedule.every().day.at("08:50").do(send_premarket_briefing)  # 장 시작 전 브리핑
+    schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
+    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
+    schedule.every().day.at("08:50").do(send_premarket_briefing)
+    schedule.every().day.at("10:00").do(                         # 오전 10시 최우선 종목 TOP 3
+        lambda: None if is_holiday() else send_top_signals()
+    )
     schedule.every().day.at(MARKET_OPEN).do(lambda: (
         None if is_holiday() else (
         _clear_all_cache(),
+        reset_top_signals_daily(),                               # 최우선 종목 풀 초기화
         refresh_dynamic_candidates(),
         send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
              f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
     )))
     schedule.every().day.at(MARKET_CLOSE).do(
         lambda: None if is_holiday() else on_market_close()
+    )
+    # NXT 완전 마감 후 잔여 재진입 감시 초기화 (NXT 상장 종목용)
+    schedule.every().day.at("20:05").do(
+        lambda: (
+            _reentry_watch.clear(),
+            print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
+        ) if not is_holiday() and _reentry_watch else None
     )
 
     # 봇 시작 시 공휴일 미리 로드
