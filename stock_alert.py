@@ -8,7 +8,15 @@
 
 [변경 이력]
 
-v27.0 (2026-02-28)  ← 현재
+v28.0 (2026-03-01)  ← 현재
+  ① RSI 보조지표 추가 (과매수 신호 차단, 과매도 눌림목 우대)
+  ② 이동평균 정배열 필터 (역배열 시 신호 차단)
+  ③ 볼린저밴드 돌파 가중 (+15점)
+  ④ 유사패턴 매칭 (signal_log 기반 과거 성공률 표시)
+  ⑤ 모든 파라미터 auto_tune 자동 최적화 연동
+  ⑥ 알림 메시지에 보조지표 요약 표시
+
+v27.0 (2026-02-28)  
   ① 결과 미입력 알림 NXT 반영
      - KRX 마감(15:30)과 NXT 마감(20:05) 두 시점에서 모두 발송
      - 중복 방지 플래그로 같은 날 2회 이상 발송 안 함
@@ -194,7 +202,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v27.0"
+BOT_VERSION = "v30.0"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -605,6 +613,197 @@ def get_daily_data(code: str, days: int = 60) -> list:
         return items
     except:
         return []
+
+# ============================================================
+# ⑦-A 보조지표 계산 (RSI / 이동평균 / 볼린저밴드 / 유사패턴)
+# ============================================================
+
+def calc_rsi(items: list, period: int = None) -> float:
+    """
+    RSI 계산. period는 _dynamic["rsi_period"] 자동 적용.
+    반환: 0~100 (70↑ 과매수, 30↓ 과매도)
+    """
+    period = period or int(_dynamic.get("rsi_period", 14))
+    closes = [i["close"] for i in items if i.get("close")]
+    if len(closes) < period + 1:
+        return 50.0  # 데이터 부족 시 중립값
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        diff = closes[-(period + 1 - i)] - closes[-(period + 2 - i)]
+        (gains if diff > 0 else losses).append(abs(diff))
+    avg_gain = sum(gains) / period if gains else 0
+    avg_loss = sum(losses) / period if losses else 0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def calc_ma_trend(items: list) -> dict:
+    """
+    이동평균선 정배열 여부 확인.
+    _dynamic["ma_short"/"ma_mid"/"ma_long"] 자동 적용.
+    반환: {"aligned": bool, "short": float, "mid": float, "long": float, "desc": str}
+    """
+    s = int(_dynamic.get("ma_short", 5))
+    m = int(_dynamic.get("ma_mid",   20))
+    l = int(_dynamic.get("ma_long",  60))
+    closes = [i["close"] for i in items if i.get("close")]
+    if len(closes) < l:
+        return {"aligned": None, "short": 0, "mid": 0, "long": 0, "desc": "데이터부족"}
+    ma_s = sum(closes[-s:]) / s
+    ma_m = sum(closes[-m:]) / m
+    ma_l = sum(closes[-l:]) / l
+    aligned   = ma_s > ma_m > ma_l          # 정배열
+    partially = ma_s > ma_m or ma_m > ma_l  # 부분 정배열
+    if aligned:
+        desc = f"✅ 정배열 ({s}>{m}>{l}일)"
+    elif partially:
+        desc = f"🟡 부분정배열"
+    else:
+        desc = f"🔴 역배열"
+    return {"aligned": aligned, "partial": partially,
+            "short": round(ma_s), "mid": round(ma_m), "long": round(ma_l), "desc": desc}
+
+def calc_bollinger(items: list, period: int = None, k: float = 2.0) -> dict:
+    """
+    볼린저밴드 계산.
+    반환: {"upper": int, "mid": int, "lower": int,
+           "pct_b": float,  # 현재가가 밴드 내 위치 (0=하단, 1=상단)
+           "breakout": bool, "desc": str}
+    """
+    period = period or int(_dynamic.get("bb_period", 20))
+    closes = [i["close"] for i in items if i.get("close")]
+    if len(closes) < period:
+        return {"upper": 0, "mid": 0, "lower": 0, "pct_b": 0.5, "breakout": False, "desc": "데이터부족"}
+    window = closes[-period:]
+    mid    = sum(window) / period
+    std    = (sum((c - mid) ** 2 for c in window) / period) ** 0.5
+    upper  = int(mid + k * std)
+    lower  = int(mid - k * std)
+    cur    = closes[-1]
+    pct_b  = round((cur - lower) / (upper - lower), 2) if upper != lower else 0.5
+    breakout = cur >= upper
+    if breakout:
+        desc = f"🚀 상단 돌파 (밴드폭 {(upper-lower)/mid*100:.1f}%)"
+    elif pct_b >= 0.8:
+        desc = f"🔥 상단 근접 ({pct_b*100:.0f}%)"
+    elif pct_b <= 0.2:
+        desc = f"🎯 하단 근접 ({pct_b*100:.0f}%) — 반등 가능"
+    else:
+        desc = f"밴드 중간 ({pct_b*100:.0f}%)"
+    return {"upper": upper, "mid": int(mid), "lower": lower,
+            "pct_b": pct_b, "breakout": breakout, "desc": desc}
+
+def calc_indicators(code: str) -> dict:
+    """
+    RSI + MA + 볼린저밴드 한 번에 계산.
+    get_daily_data 캐시 활용 → API 추가 호출 없음.
+    반환: {"rsi": float, "ma": dict, "bb": dict, "filter_pass": bool, "score_adj": int, "summary": str}
+    """
+    try:
+        items = get_daily_data(code, 70)
+        if len(items) < 20:
+            return {"rsi": 50, "ma": {}, "bb": {}, "filter_pass": True, "score_adj": 0, "summary": ""}
+
+        rsi = calc_rsi(items)
+        ma  = calc_ma_trend(items)
+        bb  = calc_bollinger(items)
+
+        score_adj   = 0
+        filter_pass = True
+        reasons     = []
+
+        # ── 기능별 가중치 적용 ──
+        w_rsi = _dynamic.get("feat_w_rsi", 1.0)
+        w_ma  = _dynamic.get("feat_w_ma",  1.0)
+        w_bb  = _dynamic.get("feat_w_bb",  1.0)
+
+        # ── RSI 필터 ──
+        rsi_overbuy  = float(_dynamic.get("rsi_overbuy",  70))
+        rsi_oversell = float(_dynamic.get("rsi_oversell", 30))
+        if w_rsi > 0:
+            if rsi >= rsi_overbuy:
+                score_adj   -= int(15 * w_rsi)
+                filter_pass  = w_rsi < 0.5   # 가중치 낮으면 차단 안 함
+                reasons.append(f"⛔ RSI {rsi} 과매수 (w={w_rsi})")
+            elif rsi <= rsi_oversell:
+                score_adj += int(10 * w_rsi)
+                reasons.append(f"🎯 RSI {rsi} 과매도 +{int(10*w_rsi)}점")
+            elif rsi >= 60:
+                score_adj += int(5 * w_rsi)
+                reasons.append(f"📊 RSI {rsi} 강세 +{int(5*w_rsi)}점")
+
+        # ── 이동평균 필터 ──
+        if w_ma > 0:
+            if ma.get("aligned") is False and not ma.get("partial"):
+                score_adj -= int(10 * w_ma)
+                if w_ma >= 0.8: filter_pass = False
+                reasons.append(f"⛔ {ma.get('desc','역배열')} (w={w_ma})")
+            elif ma.get("aligned"):
+                score_adj += int(10 * w_ma)
+                reasons.append(f"✅ {ma.get('desc','정배열')} +{int(10*w_ma)}점")
+            elif ma.get("partial"):
+                score_adj += int(3 * w_ma)
+                reasons.append(f"🟡 부분정배열 +{int(3*w_ma)}점")
+
+        # ── 볼린저밴드 필터 ──
+        if w_bb > 0:
+            if bb.get("breakout"):
+                score_adj += int(15 * w_bb)
+                reasons.append(f"🚀 볼린저 상단 돌파 +{int(15*w_bb)}점")
+            elif bb.get("pct_b", 0.5) <= 0.2:
+                score_adj += int(8 * w_bb)
+                reasons.append(f"🎯 볼린저 하단 근접 +{int(8*w_bb)}점")
+
+        summary = "\n".join(reasons) if reasons else ""
+        return {"rsi": rsi, "ma": ma, "bb": bb,
+                "filter_pass": filter_pass, "score_adj": score_adj, "summary": summary}
+    except Exception as e:
+        print(f"  ⚠️ 지표 계산 오류 ({code}): {e}")
+        return {"rsi": 50, "ma": {}, "bb": {}, "filter_pass": True, "score_adj": 0, "summary": ""}
+
+# ── 유사 패턴 매칭 (signal_log 기반) ──
+def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> str:
+    """
+    signal_log.json에서 비슷한 조건의 과거 신호를 찾아 성공률 반환.
+    유사 기준: 같은 신호 유형 + 상승률 ±3% + 거래량 ±3배
+    반환: 텔레그램 표시용 문자열 (없으면 "")
+    """
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: return ""
+
+        completed = [v for v in data.values()
+                     if v.get("status") in ["수익","손실","본전"]
+                     and v.get("signal_type") == signal_type]
+        if len(completed) < 3:
+            return ""
+
+        # 유사 조건 필터
+        similar = [v for v in completed
+                   if abs(v.get("change_at_detect", 0) - change_rate) <= 3.0
+                   and abs(v.get("volume_ratio", 0) - vol_ratio) <= 3.0]
+
+        if len(similar) < 2:
+            # 유사 조건 없으면 같은 신호 유형 전체 통계
+            similar = completed
+
+        wins     = sum(1 for v in similar if v["pnl_pct"] > 0)
+        win_rate = round(wins / len(similar) * 100)
+        avg_pnl  = round(sum(v["pnl_pct"] for v in similar) / len(similar), 1)
+        best     = max(similar, key=lambda x: x["pnl_pct"])
+        worst    = min(similar, key=lambda x: x["pnl_pct"])
+
+        bar = "🟢" * (win_rate // 20) + "⬜" * (5 - win_rate // 20)
+        label = "유사 조건" if len(similar) < len(completed) else "동일 신호 유형"
+
+        return (f"🔍 <b>과거 유사 패턴</b> ({label} {len(similar)}건)\n"
+                f"  {bar} 성공률 {win_rate}%  평균 {avg_pnl:+.1f}%\n"
+                f"  최고 {best['pnl_pct']:+.1f}%  최저 {worst['pnl_pct']:+.1f}%")
+    except:
+        return ""
 
 # ============================================================
 # ⑦ 거래량 5일 평균 대비 정확 계산
@@ -1827,6 +2026,163 @@ def load_dynamic_themes():
             print(f"  📂 동적 테마 {len(_dynamic_theme_map)}개 복원")
     except: pass
 
+
+# ============================================================
+# 🏗️ 실질 섹터 분류 (4레이어 가중 스코어)
+# ============================================================
+_dart_related_cache: dict = {}   # code → {related: [...], ts}
+_real_sector_cache:  dict = {}   # code → {sector_id, score, peers, ts}
+
+def get_dart_related_stocks(code: str) -> list:
+    """
+    DART 지분공시에서 모자/관계회사 종목 조회.
+    반환: [(code, name, reason)] 
+    예: [("005930", "삼성전자", "최대주주")]
+    캐시 24시간 (지분관계는 자주 안 바뀜)
+    """
+    if not DART_API_KEY:
+        return []
+    cached = _dart_related_cache.get(code)
+    if cached and time.time() - cached["ts"] < 86400:
+        return cached["related"]
+    try:
+        # DART 기업개황에서 corp_code 조회
+        url = "https://opendart.fss.or.kr/api/company.json"
+        resp = _session.get(url, params={"crtfc_key": DART_API_KEY, "stock_code": code}, timeout=10)
+        if resp.status_code != 200:
+            _dart_related_cache[code] = {"related": [], "ts": time.time()}
+            return []
+        corp_code = resp.json().get("corp_code", "")
+        if not corp_code:
+            _dart_related_cache[code] = {"related": [], "ts": time.time()}
+            return []
+
+        # 최대주주 현황 조회 (대표적 지분 공시)
+        url2  = "https://opendart.fss.or.kr/api/hyslrSttus.json"
+        year  = datetime.now().strftime("%Y")
+        resp2 = _session.get(url2, params={
+            "crtfc_key": DART_API_KEY, "corp_code": corp_code,
+            "bsns_year": year, "reprt_code": "11011"  # 사업보고서
+        }, timeout=10)
+        items = resp2.json().get("list", []) if resp2.status_code == 200 else []
+
+        related = []
+        for item in items:
+            relate_stock = item.get("stock_code", "").strip()
+            relate_name  = item.get("nm", "").strip()
+            relate_type  = item.get("relate", "").strip()
+            if relate_stock and relate_stock != code:
+                related.append((relate_stock, relate_name, relate_type or "관계회사"))
+        _dart_related_cache[code] = {"related": related[:10], "ts": time.time()}
+        return related[:10]
+    except:
+        _dart_related_cache[code] = {"related": [], "ts": time.time()}
+        return []
+
+def calc_real_sector_score(code_a: str, code_b: str,
+                            name_a: str = "", name_b: str = "") -> dict:
+    """
+    두 종목 간 실질 섹터 연관성 스코어 (0~100).
+    4가지 레이어 가중 합산:
+      ① 주가 상관계수 0.7↑  → 40점
+      ② 당일 동반 상승 중   → 30점
+      ③ DART 지분 연결      → 20점
+      ④ 뉴스 동시 언급      → 10점
+    반환: {"score": int, "layers": dict, "label": str}
+    """
+    score   = 0
+    layers  = {}
+
+    # ① 주가 상관계수 (60일)
+    try:
+        corr = calc_price_correlation(code_a, code_b)
+        if corr >= 0.7:
+            pts = int(40 * min((corr - 0.7) / 0.3 + 0.5, 1.0))  # 0.7→20점, 1.0→40점
+            score += pts
+            layers["상관계수"] = f"{corr:.2f} (+{pts}점)"
+        elif corr >= 0.5:
+            score += 10
+            layers["상관계수"] = f"{corr:.2f} (+10점)"
+    except: pass
+
+    # ② 당일 동반 상승 (실시간)
+    try:
+        pa = get_stock_price(code_a)
+        pb = get_stock_price(code_b)
+        cr_a = pa.get("change_rate", 0)
+        cr_b = pb.get("change_rate", 0)
+        if cr_a >= 2.0 and cr_b >= 2.0:
+            score += 30
+            layers["동반상승"] = f"+{cr_a:.1f}%/+{cr_b:.1f}% (+30점)"
+        elif cr_a >= 1.0 and cr_b >= 1.0:
+            score += 15
+            layers["동반상승"] = f"+{cr_a:.1f}%/+{cr_b:.1f}% (+15점)"
+    except: pass
+
+    # ③ DART 지분 관계
+    try:
+        related = get_dart_related_stocks(code_a)
+        dart_hit = next((r for r in related if r[0] == code_b), None)
+        if dart_hit:
+            score += 20
+            layers["DART지분"] = f"{dart_hit[2]} (+20점)"
+    except: pass
+
+    # ④ 뉴스 동시 언급
+    try:
+        cooccur_a = _news_cooccur.get(code_a, {}).get("peers", {})
+        if code_b in cooccur_a and cooccur_a[code_b] >= 2:
+            score += 10
+            layers["뉴스동시언급"] = f"{cooccur_a[code_b]}회 (+10점)"
+    except: pass
+
+    if score >= 60:   label = "🔴 강한 연관"
+    elif score >= 40: label = "🟠 보통 연관"
+    elif score >= 20: label = "🟡 약한 연관"
+    else:             label = "⬜ 연관 없음"
+
+    return {"score": score, "layers": layers, "label": label}
+
+def get_real_sector_peers(code: str, name: str) -> list:
+    """
+    현재 스캔 중인 종목 후보군에서 실질 섹터 스코어 40 이상인 종목 반환.
+    캐시 30분.
+    반환: [(code, name, score, label)]
+    """
+    cache_key = f"real_{code}"
+    cached = _real_sector_cache.get(cache_key)
+    if cached and time.time() - cached["ts"] < 1800:
+        return cached["peers"]
+
+    try:
+        candidates = {}
+        for s in (get_volume_surge_stocks() + get_upper_limit_stocks()):
+            c = s.get("code","")
+            if c and c != code:
+                candidates[c] = s.get("name", c)
+
+        # DART 관계회사도 후보에 추가
+        for dart_code, dart_name, _ in get_dart_related_stocks(code):
+            if dart_code not in candidates:
+                candidates[dart_code] = dart_name
+
+        peers = []
+        for peer_code, peer_name in list(candidates.items())[:25]:
+            rs = calc_real_sector_score(code, peer_code, name, peer_name)
+            if rs["score"] >= 40:
+                peers.append((peer_code, peer_name, rs["score"], rs["label"]))
+            time.sleep(0.05)
+
+        peers.sort(key=lambda x: x[2], reverse=True)
+        result = peers[:8]
+        _real_sector_cache[cache_key] = {"peers": result, "ts": time.time()}
+        if result:
+            print(f"  🏗️ [{name}] 실질섹터: {[(n, s) for _, n, s, _ in result[:3]]}")
+        return result
+    except Exception as e:
+        print(f"⚠️ 실질섹터 계산 오류 ({code}): {e}")
+        return []
+
 def get_theme_sector_stocks(code: str) -> tuple:
     """
     종목 코드 → (테마명, [(peer_code, peer_name)]) 반환
@@ -1952,12 +2308,28 @@ def save_signal_log(stock: dict):
         # 같은 종목이 이미 추적 중이면 업데이트하지 않음 (중복 방지)
         log_key  = f"{code}_{stock.get('detected_at', datetime.now()).strftime('%Y%m%d%H%M')}"
 
+        # 신호 발생 시 활성화된 기능 플래그 기록
+        indic    = stock.get("indic", {})
+        position = stock.get("position", {})
+        feature_flags = {
+            "rsi":              indic.get("rsi", 50),
+            "ma_aligned":       indic.get("ma", {}).get("aligned"),
+            "bb_breakout":      indic.get("bb", {}).get("breakout", False),
+            "sector_bonus":     stock.get("sector_info", {}).get("bonus", 0),
+            "regime":           stock.get("regime", "normal"),
+            "earnings_risk":    stock.get("earnings_risk", "none"),
+            "position_pct":     position.get("pct", 8.0),
+            "nxt_delta":        stock.get("nxt_delta", 0),
+            "indic_score_adj":  indic.get("score_adj", 0),
+        }
+
         data[log_key] = {
             "log_key":      log_key,
             "code":         code,
             "name":         stock["name"],
             "signal_type":  sig_type,
             "score":        stock.get("score", 0),
+            "grade":        stock.get("grade", "B"),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "detect_date":  datetime.now().strftime("%Y%m%d"),
@@ -1965,19 +2337,21 @@ def save_signal_log(stock: dict):
             "detect_price": stock["price"],
             "change_at_detect": stock.get("change_rate", 0),
             "volume_ratio": stock.get("volume_ratio", 0),
+            "rsi_at_signal": indic.get("rsi", 50),
             "entry_price":  stock.get("entry_price", stock["price"]),
             "stop_price":   stock.get("stop_loss", 0),
             "target_price": stock.get("target_price", 0),
             "atr_used":     stock.get("atr_used", False),
+            "feature_flags": feature_flags,
             # 추적 결과 (초기값)
             "status":       "추적중",
             "exit_price":   0,
             "exit_date":    "",
             "exit_time":    "",
             "pnl_pct":      0.0,
-            "exit_reason":  "",   # "목표가", "손절가", "시간초과", "수동"
-            "max_price":    stock["price"],   # 추적 중 최고가 (MDD 계산용)
-            "min_price":    stock["price"],   # 추적 중 최저가
+            "exit_reason":  "",
+            "max_price":    stock["price"],
+            "min_price":    stock["price"],
         }
         with open(SIGNAL_LOG_FILE, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2511,6 +2885,30 @@ _dynamic = {
     "atr_stop_mult":      ATR_STOP_MULT,
     # 시간대별 최소점수 보정 (기본 0: 보정 없음, +N: 해당 시간대 더 엄격)
     "timeslot_score_adj": {"장초반": 0, "오전": 0, "오후": 0, "장후반": 0},
+    # ── 보조지표 파라미터 (auto_tune 자동 조정) ──
+    "rsi_period":    14,
+    "rsi_overbuy":   70.0,
+    "rsi_oversell":  30.0,
+    "ma_short":       5,
+    "ma_mid":        20,
+    "ma_long":       60,
+    "bb_period":     20,
+    # ── 기능별 가중치 (auto_tune이 자동 조정, 0=비활성화) ──
+    "feat_w_rsi":       1.0,    # RSI 필터 가중치
+    "feat_w_ma":        1.0,    # 이동평균 정배열 가중치
+    "feat_w_bb":        1.0,    # 볼린저밴드 가중치
+    "feat_w_sector":    1.0,    # 섹터 모멘텀 가중치
+    "feat_w_nxt":       1.0,    # NXT 보정 가중치
+    # ── 시장 국면 판단 ──
+    "regime_mode":         "normal",   # "bull" / "normal" / "bear" / "crash"
+    "regime_score_mult":   1.0,        # 신호 점수 배율 (하락장 0.7, 상승장 1.2)
+    "regime_min_add":      0,          # 최소 점수 추가 보정
+    # ── 포지션 사이징 ──
+    "position_base_pct":   8.0,        # 기본 투자비중 (%)
+    # ── 손익비 동적 조정 ──
+    "atr_target_mult":     ATR_TARGET_MULT,   # 목표가 배수 (변동성 따라 조정)
+    # ── 포트폴리오 동시 신호 관리 ──
+    "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
 }
 
 # 긴급 튜닝: 연속 손절 카운터
@@ -2796,6 +3194,88 @@ def auto_tune(notify: bool = True):
                                 f"   (단독 {solo_rate*100:.0f}%  테마 {themed_rate*100:.0f}%)")
             elif gap < 0.05:
                 _dynamic["themed_score_bonus"] = max(old_bonus - 3, 0)
+
+        # ── ⑧ 목표가 배수 동적 조정 ──
+        # 목표가 도달 비율이 낮고 만료 많으면 → 목표가 너무 높음 → 배수 축소
+        target_hits = sum(1 for r in completed if r.get("exit_reason") == "목표가")
+        if len(completed) >= MIN_SAMPLES:
+            tgt_ratio = target_hits / len(completed)
+            old_tgt   = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
+            if tgt_ratio < 0.20 and old_tgt > 2.0:
+                _dynamic["atr_target_mult"] = round(max(old_tgt - 0.3, 2.0), 1)
+                changes.append(f"🎯 목표가 배수 축소: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 {tgt_ratio*100:.0f}%)")
+            elif tgt_ratio > 0.50 and old_tgt < 5.0:
+                _dynamic["atr_target_mult"] = round(min(old_tgt + 0.2, 5.0), 1)
+                changes.append(f"🎯 목표가 배수 확대: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 양호)")
+
+        # ── ⑨ 포지션 기본비중 자동 조정 ──
+        # 전체 승률 높으면 비중 살짝 상향, 낮으면 하향
+        if len(completed) >= MIN_SAMPLES * 2:
+            overall_win = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
+            old_pos = _dynamic.get("position_base_pct", 8.0)
+            if overall_win > 0.65 and old_pos < 15.0:
+                _dynamic["position_base_pct"] = round(min(old_pos + 0.5, 15.0), 1)
+                changes.append(f"💰 포지션 비중 상향: {old_pos}%→{_dynamic['position_base_pct']}% (승률 {overall_win*100:.0f}%)")
+            elif overall_win < 0.40 and old_pos > 4.0:
+                _dynamic["position_base_pct"] = round(max(old_pos - 1.0, 4.0), 1)
+                changes.append(f"💰 포지션 비중 하향: {old_pos}%→{_dynamic['position_base_pct']}% (승률 저조)")
+
+        # ── ⑩ 기능별 기여도 분석 + 자동 가중치 조정 ──
+        # feature_flags가 기록된 충분한 샘플이 있을 때만 분석
+        feat_recs = [r for r in completed if r.get("feature_flags")]
+        if len(feat_recs) >= MIN_SAMPLES * 2:
+            feat_analyses = {
+                "feat_w_rsi":    ("rsi",         lambda r: r.get("feature_flags",{}).get("indic_score_adj",0) != 0),
+                "feat_w_ma":     ("ma_aligned",  lambda r: r.get("feature_flags",{}).get("ma_aligned") is True),
+                "feat_w_bb":     ("bb_breakout", lambda r: r.get("feature_flags",{}).get("bb_breakout") is True),
+                "feat_w_sector": ("sector",      lambda r: r.get("feature_flags",{}).get("sector_bonus",0) > 0),
+                "feat_w_nxt":    ("nxt",         lambda r: r.get("feature_flags",{}).get("nxt_delta",0) != 0),
+            }
+            for feat_key, (feat_name, feat_filter) in feat_analyses.items():
+                with_feat    = [r for r in feat_recs if feat_filter(r)]
+                without_feat = [r for r in feat_recs if not feat_filter(r)]
+                if len(with_feat) < 3 or len(without_feat) < 3:
+                    continue
+                win_with    = sum(1 for r in with_feat    if r["pnl_pct"] > 0) / len(with_feat)
+                win_without = sum(1 for r in without_feat if r["pnl_pct"] > 0) / len(without_feat)
+                avg_with    = sum(r["pnl_pct"] for r in with_feat)    / len(with_feat)
+                avg_without = sum(r["pnl_pct"] for r in without_feat) / len(without_feat)
+                old_w = _dynamic.get(feat_key, 1.0)
+                contribution = (win_with - win_without) + (avg_with - avg_without) / 20
+
+                if contribution < -0.15 and old_w > 0.3:
+                    # 기능이 오히려 수익을 깎고 있음 → 가중치 축소
+                    new_w = round(max(old_w - 0.2, 0.2), 1)
+                    _dynamic[feat_key] = new_w
+                    changes.append(
+                        f"🔻 [{feat_name}] 기여도 저조 → 가중치 {old_w}→{new_w} "
+                        f"(있을때 승률{win_with*100:.0f}% vs 없을때 {win_without*100:.0f}%)"
+                    )
+                elif contribution > 0.15 and old_w < 1.5:
+                    # 기능이 수익에 기여 → 가중치 강화
+                    new_w = round(min(old_w + 0.1, 1.5), 1)
+                    _dynamic[feat_key] = new_w
+                    changes.append(
+                        f"🔺 [{feat_name}] 기여도 양호 → 가중치 {old_w}→{new_w} "
+                        f"(있을때 승률{win_with*100:.0f}% vs 없을때 {win_without*100:.0f}%)"
+                    )
+
+        # ── ⑧ RSI 기간 자동 조정 ──
+        # RSI 차단된 신호 중 이후 성공한 케이스 비율이 높으면 → 기준 완화
+        if len(completed) >= MIN_SAMPLES * 2:
+            blocked_ok = [r for r in completed
+                          if r.get("rsi_at_signal", 50) >= _dynamic["rsi_overbuy"]
+                          and r["pnl_pct"] > 0]
+            all_rsi_high = [r for r in completed if r.get("rsi_at_signal", 50) >= 65]
+            if len(all_rsi_high) >= 3:
+                rsi_high_rate = sum(1 for r in all_rsi_high if r["pnl_pct"] > 0) / len(all_rsi_high)
+                old_ob = _dynamic["rsi_overbuy"]
+                if rsi_high_rate > 0.65 and old_ob < 80:
+                    _dynamic["rsi_overbuy"] = min(old_ob + 2, 80)
+                    changes.append(f"📊 RSI 과매수 기준 완화: {old_ob:.0f}→{_dynamic['rsi_overbuy']:.0f} (고RSI 성공률 {rsi_high_rate*100:.0f}%)")
+                elif rsi_high_rate < 0.35 and old_ob > 60:
+                    _dynamic["rsi_overbuy"] = max(old_ob - 2, 60)
+                    changes.append(f"📊 RSI 과매수 기준 강화: {old_ob:.0f}→{_dynamic['rsi_overbuy']:.0f} (고RSI 성공률 저조)")
 
         # ── 조정 이력 저장 ──
         if changes:
@@ -3233,14 +3713,50 @@ def send_alert(s: dict):
     # NXT 여부 (상세 모드용 - 컴팩트는 위에서 처리됨)
     nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
 
+
+    # 보조지표 + 포지션 사이징 + 유사패턴 블록
+    indic = s.get("indic") or calc_indicators(code)
+    rsi     = indic.get("rsi", 50)
+    ma_desc = indic.get("ma", {}).get("desc", "")
+    bb_desc = indic.get("bb", {}).get("desc", "")
+    indic_block = (
+        f"━━━━━━━━━━━━━━━\n"
+        f"📐 <b>보조지표</b>\n"
+        f"  RSI {rsi}  |  {ma_desc}\n"
+        f"  볼린저: {bb_desc}\n"
+    ) if ma_desc else ""
+
+    pos = s.get("position", {})
+    if pos:
+        pct   = pos.get("pct", 8.0)
+        guide = pos.get("guide", "")
+        wr    = pos.get("win_rate")
+        samp  = pos.get("samples", 0)
+        wr_str = f"  과거승률 {wr:.0f}% ({samp}건)\n" if wr else ""
+        position_block = (
+            f"━━━━━━━━━━━━━━━\n"
+            f"💰 <b>포지션 가이드</b>  권장 <b>{pct}%</b>\n"
+            f"{wr_str}"
+            f"  {guide}\n"
+        )
+    else:
+        position_block = ""
+
+    pattern_block = find_similar_patterns(
+        s["code"], s["signal_type"],
+        s.get("change_rate", 0), s.get("volume_ratio", 0)
+    )
+    if pattern_block:
+        pattern_block = "━━━━━━━━━━━━━━━\n" + pattern_block + "\n"
+
     _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
-                       entry_block, level)
+                       entry_block, indic_block, position_block, pattern_block, level)
 
 # ── 내부 헬퍼: 상세 모드 실제 발송 (send_alert에서 호출) ──
 def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
-                       entry_block, level):
+                       entry_block, indic_block, position_block, pattern_block, level):
     send_by_level(
         f"{emoji} <b>[{title}]</b>{nxt_badge}\n"
         f"🕐 {now_str}\n"
@@ -3254,11 +3770,16 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
         f"{prev_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
         + "\n".join(s["reasons"]) + "\n"
-        f"━━━━━━━━━━━━━━━\n\n"
+        + indic_block
+        + position_block
+        + pattern_block
+        + "━━━━━━━━━━━━━━━\n\n"
         + _sector_block(s)
         + f"\n{entry_block}",
         level, s["code"], s["name"]
     )
+
+
 
 # ============================================================
 # 분석 엔진 (당일 급등)
@@ -3302,6 +3823,16 @@ def analyze(stock: dict) -> dict:
 
     if score < min_score: return {}
 
+    # ── 보조지표 필터 (RSI / 이동평균 / 볼린저밴드) ──
+    indic = calc_indicators(code)
+    if not indic["filter_pass"] and signal_type not in ("UPPER_LIMIT", "NEAR_UPPER"):
+        return {}
+    score += indic["score_adj"]
+    if indic["summary"]:
+        for line in indic["summary"].split("\n"):
+            if line: reasons.append(line)
+    if score < min_score: return {}
+
     # 전일 상한가 ⑨
     prev_upper = was_upper_limit_yesterday(code)
     if prev_upper: score+=10; reasons.append("🔁 전일 상한가 → 연속 상한가 가능성")
@@ -3331,16 +3862,51 @@ def analyze(stock: dict) -> dict:
             if nxt_reason: reasons.append(nxt_reason)
     except: pass
 
+    # ── ① 시장 국면 보정 ──
+    regime = get_market_regime()
+    regime_mode = regime.get("mode", "normal")
+    if regime_mode == "crash" and signal_type not in ("UPPER_LIMIT", "STRONG_BUY"):
+        return {}   # 급락장: 상한가/강력매수만 허용
+    min_add = regime.get("min_add", 0)
+    if score < min_score + min_add: return {}
+    if regime_mode != "normal":
+        reasons.append(f"🌐 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
+
+    # ── ④ 실적 발표 필터 ──
+    earnings = check_earnings_risk(code, stock.get("name", code))
+    if earnings["risk"] == "high":
+        reasons.append(earnings["desc"])
+    elif earnings["risk"] == "warn":
+        reasons.append(earnings["desc"])
+        score = int(score * 0.85)   # 실적 발표 3일 전 → 점수 15% 감점
+        if score < min_score: return {}
+
     open_est = price/(1+change_rate/100)
     entry    = int((price-(price-open_est)*ENTRY_PULLBACK_RATIO)/10)*10
-    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+
+    # ── ③ 손익비 동적 조정 ──
+    stop, target, stop_pct, target_pct, atr_used = calc_dynamic_stop_target(code, entry)
+
+    # 등급 계산
+    if   score >= 80: grade = "A"
+    elif score >= 60: grade = "B"
+    else:             grade = "C"
+
+    # ── ② 포지션 사이징 ──
+    position = calc_position_size(signal_type, score, grade)
+
     return {"code":code,"name":stock.get("name",code),"price":price,
             "change_rate":change_rate,"volume_ratio":vol_ratio,
             "signal_type":signal_type,"score":score,"sector_info":sector_info,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
-            "nxt_delta": nxt_delta}
+            "nxt_delta": nxt_delta,
+            "regime": regime_mode,
+            "earnings_risk": earnings["risk"],
+            "position": position,
+            "indic": indic,
+            "grade": grade}
 
 # ============================================================
 # 조기 포착
@@ -4363,6 +4929,57 @@ def _send_stats():
         if loss_pattern:
             msg += f"\n━━━━━━━━━━━━━━━\n{loss_pattern}\n"
 
+        # ── 시장 국면 현황 ──
+        regime = get_market_regime()
+        rmode  = regime.get("mode", "normal")
+        rlabels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+        mult_map = {"bull":"기준 완화 (×1.15)","normal":"표준","bear":"기준 강화 (×0.75)","crash":"급락장 — 상한가만 허용"}
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"🌐 <b>현재 시장 국면</b>: {rlabels.get(rmode,'보통장')}\n"
+                f"  코스피 당일 {regime.get('chg_1d',0):+.1f}%  |  5일 {regime.get('chg_5d',0):+.1f}%\n"
+                f"  신호 기준: {mult_map.get(rmode,'표준')}\n")
+
+        # ── 포지션 사이징 요약 ──
+        if completed:
+            a_recs = [v for v in completed if v.get("grade","B") == "A"]
+            b_recs = [v for v in completed if v.get("grade","B") == "B"]
+            if a_recs:
+                a_avg = sum(v["pnl_pct"] for v in a_recs) / len(a_recs)
+                a_win = sum(1 for v in a_recs if v["pnl_pct"] > 0) / len(a_recs) * 100
+                msg += (f"\n━━━━━━━━━━━━━━━\n"
+                        f"💰 <b>등급별 성과</b>\n"
+                        f"  A등급: {len(a_recs)}건  승률 {a_win:.0f}%  평균 {a_avg:+.1f}%\n")
+            if b_recs:
+                b_avg = sum(v["pnl_pct"] for v in b_recs) / len(b_recs)
+                b_win = sum(1 for v in b_recs if v["pnl_pct"] > 0) / len(b_recs) * 100
+                msg += f"  B등급: {len(b_recs)}건  승률 {b_win:.0f}%  평균 {b_avg:+.1f}%\n"
+
+        # ── 현재 _dynamic 파라미터 요약 ──
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"⚙️ <b>현재 자동 조정 파라미터</b>\n"
+                f"  최소점수: {_dynamic['min_score_normal']}점 (엄격: {_dynamic['min_score_strict']}점)\n"
+                f"  RSI 과매수 기준: {_dynamic['rsi_overbuy']:.0f}\n"
+                f"  ATR 손절:{_dynamic['atr_stop_mult']} / 목표:{_dynamic.get('atr_target_mult', ATR_TARGET_MULT)}\n"
+                f"  포지션 기본비중: {_dynamic.get('position_base_pct',8.0)}%\n")
+
+        # ── 기능별 기여도 현황 ──
+        feat_labels = {
+            "feat_w_rsi":    "RSI 필터",
+            "feat_w_ma":     "이동평균",
+            "feat_w_bb":     "볼린저밴드",
+            "feat_w_sector": "섹터모멘텀",
+            "feat_w_nxt":    "NXT 보정",
+        }
+        msg += f"\n━━━━━━━━━━━━━━━\n🔧 <b>기능별 가중치</b> (auto_tune 자동 조정)\n"
+        for fk, flabel in feat_labels.items():
+            w = _dynamic.get(fk, 1.0)
+            if w >= 1.2:   status = "🔺 강화"
+            elif w >= 0.8: status = "✅ 정상"
+            elif w >= 0.4: status = "🔻 약화"
+            else:           status = "⛔ 거의 비활성"
+            bar = "█" * int(w * 5) + "░" * max(0, 5 - int(w * 5))
+            msg += f"  {flabel}: {bar} {w:.1f}  {status}\n"
+
         send(msg)
     except Exception as e:
         send(f"⚠️ 통계 오류: {e}")
@@ -4585,6 +5202,23 @@ def send_premarket_briefing():
                     msg += f"    🔵 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
     except: pass
 
+    # ── 시장 국면 브리핑 ──
+    try:
+        regime = get_market_regime()
+        rmode  = regime.get("mode", "normal")
+        rlabels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+        regime_warn = ""
+        if rmode == "crash":
+            regime_warn = "\n⚠️ <b>급락장 모드</b> — 상한가 신호만 발송됩니다"
+        elif rmode == "bear":
+            regime_warn = "\n🟠 <b>하락장 모드</b> — 신호 기준 강화, 포지션 축소 권장"
+        elif rmode == "bull":
+            regime_warn = "\n🟢 <b>상승장 모드</b> — 신호 기준 완화, 적극 대응 가능"
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
+                f"{regime_warn}\n")
+    except: pass
+
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
     send(msg)
 
@@ -4750,6 +5384,294 @@ def run_news_scan():
             send_news_theme_alert(signal)
     except Exception as e: print(f"⚠️ 뉴스 오류: {e}")
 
+
+# ============================================================
+# 🌐 ① 시장 국면 판단 (Market Regime)
+# ============================================================
+_regime_cache = {"mode": "normal", "ts": 0, "kospi_5d": []}
+
+def get_market_regime() -> dict:
+    """
+    코스피 5일 흐름으로 시장 국면 판단.
+    bull(상승) / normal(보통) / bear(하락) / crash(급락)
+    → 국면별로 신호 기준 자동 강화/완화
+    """
+    if time.time() - _regime_cache["ts"] < 600:  # 10분 캐시
+        return _regime_cache
+
+    try:
+        chg_today = get_kospi_change()
+        items = get_daily_data("0001", 10)  # 코스피 일봉
+        if not items:
+            return _regime_cache
+
+        # 5일 누적 등락
+        closes = [i["close"] for i in items if i.get("close")]
+        if len(closes) >= 5:
+            chg_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+        else:
+            chg_5d = 0
+
+        # 국면 판단
+        if chg_today <= -3.0 or chg_5d <= -7.0:
+            mode = "crash"
+        elif chg_today <= -1.5 or chg_5d <= -3.0:
+            mode = "bear"
+        elif chg_today >= 1.0 and chg_5d >= 2.0:
+            mode = "bull"
+        else:
+            mode = "normal"
+
+        # 신호 배율 설정
+        mult_map  = {"crash": 0.5, "bear": 0.75, "normal": 1.0, "bull": 1.15}
+        add_map   = {"crash": 15,  "bear": 8,    "normal": 0,   "bull": -5}
+
+        # ── NXT 시간대 보정 (15:30~20:00) ──
+        # KRX 마감 후 NXT만 운영 중이면 거래량 얇아서 변동성 높음
+        # → 포지션 비중 자동 축소, 목표가 보수적
+        nxt_only = is_nxt_open() and not is_market_open()
+        if nxt_only:
+            # NXT 단독 시간대: 국면 한 단계 보수적으로
+            nxt_mode_map = {"bull": "normal", "normal": "bear",
+                            "bear": "bear",   "crash":  "crash"}
+            mode = nxt_mode_map.get(mode, mode)
+            mult_map[mode] = max(mult_map.get(mode, 1.0) * 0.85, 0.5)
+
+        _regime_cache.update({
+            "mode":     mode,
+            "chg_1d":   chg_today,
+            "chg_5d":   chg_5d,
+            "mult":     mult_map[mode],
+            "min_add":  add_map[mode],
+            "nxt_only": nxt_only,
+            "ts":       time.time(),
+        })
+        _dynamic["regime_mode"]       = mode
+        _dynamic["regime_score_mult"] = mult_map[mode]
+        _dynamic["regime_min_add"]    = add_map[mode]
+
+    except Exception as e:
+        print(f"⚠️ 시장 국면 판단 오류: {e}")
+
+    return _regime_cache
+
+def regime_label() -> str:
+    r = get_market_regime()
+    labels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+    return labels.get(r.get("mode","normal"), "🔵 보통장")
+
+# ============================================================
+# 💰 ② 포지션 사이징 가이드 (Kelly 기반)
+# ============================================================
+def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
+    """
+    신호 등급 + 과거 승률 기반 권장 투자비중 계산.
+    켈리 공식: f = (p*b - q) / b  (p=승률, q=1-p, b=손익비)
+    반환: {"pct": float, "amount_guide": str, "kelly": float}
+    """
+    try:
+        # 과거 신호 유형별 승률 조회
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+
+        same_type = [v for v in data.values()
+                     if v.get("signal_type") == signal_type
+                     and v.get("status") in ["수익","손실","본전"]]
+
+        if len(same_type) >= 5:
+            wins  = sum(1 for v in same_type if v["pnl_pct"] > 0)
+            p     = wins / len(same_type)
+            avg_w = sum(v["pnl_pct"] for v in same_type if v["pnl_pct"] > 0) / max(wins, 1)
+            avg_l = abs(sum(v["pnl_pct"] for v in same_type if v["pnl_pct"] < 0) / max(len(same_type)-wins, 1))
+            b     = avg_w / avg_l if avg_l else 2.0
+            kelly = max(0, (p * b - (1-p)) / b)
+            kelly = min(kelly * 0.5, 0.20)  # 하프 켈리, 최대 20%
+        else:
+            p     = 0.55  # 기본값
+            kelly = 0.08
+
+        # 등급별 보정
+        grade_mult = {"A": 1.3, "B": 1.0, "C": 0.7}.get(grade, 1.0)
+
+        # 시장 국면 보정
+        regime_info  = get_market_regime()
+        regime       = regime_info.get("mode", "normal")
+        nxt_only     = regime_info.get("nxt_only", False)
+        regime_mult  = {"bull": 1.2, "normal": 1.0, "bear": 0.6, "crash": 0.3}.get(regime, 1.0)
+        # NXT 단독 시간대: 포지션 비중 추가 20% 축소
+        if nxt_only:
+            regime_mult = max(regime_mult * 0.8, 0.3)
+
+        base_pct = _dynamic.get("position_base_pct", 8.0)
+        final_pct = round(min(base_pct * grade_mult * regime_mult, 20.0), 1)
+
+        if regime in ("bear", "crash"):
+            guide = f"⚠️ {regime_label()} — 비중 축소 권장"
+        elif grade == "A" and p >= 0.6:
+            guide = f"💪 고확률 신호 — 적극 진입 고려"
+        else:
+            guide = f"📊 표준 비중"
+
+        return {
+            "pct":    final_pct,
+            "kelly":  round(kelly * 100, 1),
+            "guide":  guide,
+            "win_rate": round(p * 100, 1) if len(same_type) >= 5 else None,
+            "samples":  len(same_type),
+        }
+    except:
+        return {"pct": 8.0, "kelly": 8.0, "guide": "📊 표준 비중", "win_rate": None, "samples": 0}
+
+# ============================================================
+# 📐 ③ 손익비 동적 최적화
+# ============================================================
+def calc_dynamic_stop_target(code: str, entry: int) -> tuple:
+    """
+    시장 변동성 + 국면에 따라 손절/목표가 배수 동적 조정.
+    기존 calc_stop_target 대체.
+    반환: (stop, target, stop_pct, target_pct, atr_used)
+    """
+    atr = get_atr(code)
+    if not atr:
+        stop   = int(entry * 0.93 / 10) * 10
+        target = int(entry * 1.15 / 10) * 10
+        return stop, target, 7.0, 15.0, False
+
+    regime_info = get_market_regime()
+    regime  = regime_info.get("mode", "normal")
+    nxt_only = regime_info.get("nxt_only", False)
+    stop_m  = _dynamic.get("atr_stop_mult",   ATR_STOP_MULT)
+    tgt_m   = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
+
+    # 시장 국면 보정
+    if regime == "crash":
+        stop_m  = max(stop_m  * 0.8, 1.0)
+        tgt_m   = max(tgt_m   * 0.7, 2.0)
+    elif regime == "bear":
+        stop_m  = max(stop_m  * 0.9, 1.0)
+        tgt_m   = max(tgt_m   * 0.8, 2.0)
+    elif regime == "bull":
+        tgt_m   = min(tgt_m   * 1.2, 5.0)
+
+    # NXT 단독 시간대 보정: 거래량 얇아 변동성 높음 → 손절 여유 + 목표 축소
+    if nxt_only:
+        stop_m  = max(stop_m  * 0.85, 1.0)   # 손절 더 여유롭게
+        tgt_m   = max(tgt_m   * 0.80, 1.5)   # 목표 보수적
+
+    stop      = int((entry - atr * stop_m)  / 10) * 10
+    target    = int((entry + atr * tgt_m)   / 10) * 10
+    stop_pct  = round((entry - stop)   / entry * 100, 1)
+    tgt_pct   = round((target - entry) / entry * 100, 1)
+    return stop, target, stop_pct, tgt_pct, True
+
+# ============================================================
+# 📅 ④ 실적 발표 전후 필터
+# ============================================================
+_earnings_cache: dict = {}   # {code: {"date": "YYYYMMDD", "ts": float}}
+
+def check_earnings_risk(code: str, name: str) -> dict:
+    """
+    DART에서 최근 실적 발표 일정 확인.
+    발표 3일 전이면 경고, 당일/다음날이면 강경고.
+    반환: {"risk": "none"/"warn"/"high", "desc": str}
+    """
+    if not DART_API_KEY:
+        return {"risk": "none", "desc": ""}
+
+    cached = _earnings_cache.get(code)
+    if cached and time.time() - cached["ts"] < 3600:
+        return cached["result"]
+
+    try:
+        today   = datetime.now()
+        bgn_de  = today.strftime("%Y%m%d")
+        end_de  = (today + timedelta(days=7)).strftime("%Y%m%d")
+
+        url    = "https://opendart.fss.or.kr/api/list.json"
+        params = {
+            "crtfc_key": DART_API_KEY,
+            "bgn_de":    bgn_de,
+            "end_de":    end_de,
+            "pblntf_ty": "A",           # 정기공시 (실적)
+            "corp_name": name[:4],      # 종목명 앞 4글자로 검색
+            "page_count": 10,
+        }
+        resp = _session.get(url, params=params, timeout=10)
+        items = resp.json().get("list", []) if resp.status_code == 200 else []
+
+        result = {"risk": "none", "desc": ""}
+        for item in items:
+            rpt_nm = item.get("report_nm", "")
+            rcept_dt = item.get("rcept_dt", "")
+            if any(kw in rpt_nm for kw in ["사업보고서","분기보고서","반기보고서"]):
+                try:
+                    rpt_date = datetime.strptime(rcept_dt, "%Y%m%d")
+                    diff = (rpt_date - today).days
+                    if diff <= 1:
+                        result = {"risk": "high",
+                                  "desc": f"⚠️ 실적발표 임박! ({rcept_dt}) — 변동성 주의"}
+                    elif diff <= 3:
+                        result = {"risk": "warn",
+                                  "desc": f"📅 실적발표 {diff}일 전 ({rcept_dt}) — 관망 고려"}
+                    break
+                except: pass
+
+        _earnings_cache[code] = {"result": result, "ts": time.time()}
+        return result
+
+    except:
+        return {"risk": "none", "desc": ""}
+
+# ============================================================
+# 🗂️ ⑤ 동시 신호 포트폴리오 관리
+# ============================================================
+def filter_portfolio_signals(alerts: list) -> list:
+    """
+    동시 다발 신호에서 실질 섹터 스코어 기반 중복 제거.
+    - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
+    - 점수 높은 것 1개만 통과 (나머지 제외)
+    - 국면별 총 신호 수 제한
+    """
+    if not alerts:
+        return alerts
+
+    regime    = get_market_regime().get("mode", "normal")
+    max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
+
+    # 점수 내림차순 정렬
+    sorted_alerts = sorted(alerts, key=lambda x: x.get("score", 0), reverse=True)
+
+    passed   = []
+    excluded = set()
+
+    for i, s in enumerate(sorted_alerts):
+        if len(passed) >= max_total:
+            break
+        if s["code"] in excluded:
+            continue
+        passed.append(s)
+        # 아직 통과 안 된 뒤 신호들과 실질 섹터 비교
+        for j in range(i + 1, len(sorted_alerts)):
+            peer = sorted_alerts[j]
+            if peer["code"] in excluded:
+                continue
+            try:
+                rs = calc_real_sector_score(s["code"], peer["code"],
+                                            s["name"], peer["name"])
+                if rs["score"] >= 50:
+                    excluded.add(peer["code"])
+                    print(f"  🗂️ 실질섹터 중복 제외: {peer['name']} ({rs['label']}, {rs['score']}점)")
+            except:
+                pass
+
+    if len(passed) < len(sorted_alerts):
+        skipped = len(sorted_alerts) - len(passed)
+        print(f"  🗂️ 포트폴리오 필터: {skipped}개 제외 ({regime}장, 최대 {max_total}개)")
+
+    return passed
+
 def run_scan():
     # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
     krx_open = is_market_open()
@@ -4792,9 +5714,12 @@ def run_scan():
                     alerts.append(s); seen.add(s["code"])
             for s in check_pullback_signals():
                 if s["code"] not in seen: alerts.append(s); seen.add(s["code"])
+        # ── ⑤ 포트폴리오 필터 ──
+        alerts = filter_portfolio_signals(alerts)
+
         if not alerts: print("  → 조건 충족 없음")
         else:
-            print(f"  → {len(alerts)}개 감지!")
+            print(f"  → {len(alerts)}개 감지! [{regime_label()}]")
             for s in alerts:
                 is_nxt = s.get("market") == "NXT"
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
@@ -4910,3 +5835,4 @@ if __name__ == "__main__":
             schedule.run_pending(); time.sleep(1)
         except Exception as e:
             print(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+# PLACEHOLDER_FOR_NEW_FEATURES
