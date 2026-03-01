@@ -202,7 +202,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v30.0"
+BOT_VERSION = "v30.1"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -5758,18 +5758,38 @@ def run_scan():
 # ============================================================
 # 🚀 실행
 # ============================================================
+def _shutdown(reason: str = "정상 종료"):
+    """봇 자동 종료 — Railway Cron 환경에서 사용"""
+    print(f"\n{'='*55}")
+    print(f"🔴 봇 종료: {reason}  ({datetime.now().strftime('%H:%M')})")
+    print(f"{'='*55}")
+    try:
+        send(f"🔴 <b>봇 자동 종료</b>  {reason}\n"
+             f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    except: pass
+    import os, sys
+    sys.exit(0)
+
 if __name__ == "__main__":
     print("="*55)
     print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
     print(f"   업데이트: {BOT_DATE}")
     print("="*55)
 
+    # ── 공휴일/주말 체크 → 즉시 종료 ──
+    _load_kr_holidays(datetime.now().year)
+    if is_holiday():
+        print(f"📅 오늘은 공휴일/주말 — 봇 즉시 종료")
+        try:
+            send(f"📅 오늘은 공휴일/주말이에요. 봇을 시작하지 않아요.")
+        except: pass
+        import sys; sys.exit(0)
+
     load_carry_stocks()
     load_tracker_feedback()
     load_dynamic_themes()
     refresh_dynamic_candidates()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
-    _load_kr_holidays(datetime.now().year)   # 공휴일 선로드
 
     send(
         f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
@@ -5820,11 +5840,16 @@ if __name__ == "__main__":
             print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() else None
     )
-    # 6시간마다 자동 백업 (Gist 우선, 없으면 텔레그램 파일)
-    schedule.every(BACKUP_INTERVAL_H).hours.do(lambda: run_auto_backup(notify=False))
+    # 평일만 백업 (장 운영일에만)
+    schedule.every(BACKUP_INTERVAL_H).hours.do(
+        lambda: run_auto_backup(notify=False) if not is_holiday() else None
+    )
 
-    # 봇 시작 시 공휴일 미리 로드
-    _load_kr_holidays(datetime.now().year)
+    # NXT 마감 후 자동 종료 (20:10)
+    schedule.every().day.at("20:10").do(
+        lambda: _shutdown("NXT 마감 (20:00) — 오늘 운영 완료")
+        if not is_holiday() else None
+    )
 
     run_scan()
     run_news_scan()
@@ -5835,4 +5860,3 @@ if __name__ == "__main__":
             schedule.run_pending(); time.sleep(1)
         except Exception as e:
             print(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
-# PLACEHOLDER_FOR_NEW_FEATURES
