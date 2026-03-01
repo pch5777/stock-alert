@@ -2,13 +2,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v31.7
+버전: v31.8
 날짜: 2026-03-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v31.7 (2026-03-02)  ← 현재
+v31.8 (2026-03-02)  ← 현재
+  RSS 파서 수정 (xml→html.parser fallback)
+  RSS URL 안정 버전으로 교체
+  모든 소스 실패 시 국내 뉴스 fallback 추가
+  /geo 소스별 수집 현황 표시
+
+v31.7 (2026-03-02)
   공휴일/주말 즉시 종료 → 대기 모드로 변경
   대기 모드: 명령어(/us /geo /stats 등) + 오버나이트 모니터만 동작
 
@@ -119,7 +125,7 @@ v28.0 (2026-03-01)
 
 """
 
-BOT_VERSION = "v31.7"
+BOT_VERSION = "v31.8"
 BOT_DATE    = "2026-03-02"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -4772,10 +4778,25 @@ _geo_cache: dict = {}  # keyword_hash → {result, ts}
 def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
     """RSS 피드에서 헤드라인 수집"""
     try:
-        resp  = requests.get(url, timeout=8, headers=_random_ua())
-        soup  = BeautifulSoup(resp.content, "xml")
-        items = soup.find_all("item")[:max_items]
-        return [i.find("title").get_text(strip=True) for i in items if i.find("title")]
+        resp = requests.get(url, timeout=10, headers=_random_ua())
+        if resp.status_code != 200:
+            return []
+        # xml 파서 없을 수 있으니 html.parser로 fallback
+        try:
+            soup  = BeautifulSoup(resp.content, "xml")
+            items = soup.find_all("item")
+            if not items:  # xml 파싱 실패 시 html로 재시도
+                raise ValueError("no items")
+        except:
+            soup  = BeautifulSoup(resp.content, "html.parser")
+            items = soup.find_all("item")
+        items = items[:max_items]
+        titles = []
+        for i in items:
+            t = i.find("title")
+            if t:
+                titles.append(t.get_text(strip=True))
+        return titles
     except:
         return []
 
@@ -4785,22 +4806,38 @@ def _fetch_multi_source_headlines() -> dict:
     반환: {source_name: [headline, ...]}
     """
     sources = {
-        "연합뉴스":   "https://www.yonhapnewstv.co.kr/category/news/economy/feed/",
-        "한경":       "https://www.hankyung.com/feed/economy",
-        "Reuters":    "https://feeds.reuters.com/reuters/businessNews",
+        "연합뉴스": "https://www.yonhapnews.co.kr/rss/economy.xml",
+        "한경":     "https://www.hankyung.com/feed/economy",
+        "Reuters":  "https://feeds.reuters.com/reuters/topNews",
+        "BBC":      "https://feeds.bbci.co.uk/news/world/rss.xml",
         "Al_Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-        "BBC":        "http://feeds.bbci.co.uk/news/business/rss.xml",
-        "AP":         "https://rsshub.app/apnews/topics/business",
+        "AP":       "https://feeds.apnews.com/apnews/business",
     }
     results = {}
+    errors  = []
     def _fetch_one(name, url):
-        headlines = _fetch_rss_headlines(url, max_items=15)
-        if headlines:
-            results[name] = headlines
+        try:
+            headlines = _fetch_rss_headlines(url, max_items=15)
+            if headlines:
+                results[name] = headlines
+            else:
+                errors.append(f"{name}:0건")
+        except Exception as e:
+            errors.append(f"{name}:{e}")
 
     threads = [threading.Thread(target=_fetch_one, args=(n, u)) for n, u in sources.items()]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=10)
+    for t in threads: t.join(timeout=12)
+
+    if errors:
+        print(f"  ⚠️ RSS 수집 실패: {', '.join(errors)}")
+
+    # 모두 실패 시 기존 fetch_all_news (국내) fallback
+    if not results:
+        domestic = fetch_all_news()
+        if domestic:
+            results["국내뉴스"] = domestic[:20]
+
     return results
 
 def _detect_geo_keywords(headlines_flat: list) -> list:
@@ -5707,10 +5744,10 @@ def poll_telegram_commands():
                     try:
                         headlines_by_src = _fetch_multi_source_headlines()
                         if not headlines_by_src:
-                            send("⚠️ 뉴스 소스 수집 실패")
+                            send("⚠️ 뉴스 소스 수집 실패 — 모든 RSS 접근 불가")
                             return
                         src_summary = "  ".join(f"{k}:{len(v)}건" for k,v in headlines_by_src.items())
-                        send(f"📡 수집 완료: {src_summary}")
+                        send(f"📡 수집 완료 ({len(headlines_by_src)}개 소스)\n{src_summary}")
                         geo = analyze_geopolitical_event(headlines_by_src)
                         if not geo.get("detected"):
                             send("✅ 지정학 이벤트 없음 — 현재 안전 상태")
