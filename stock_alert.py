@@ -2,13 +2,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v30.5
+버전: v30.9
 날짜: 2026-03-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v30.5 (2026-03-01)  ← 현재
+v30.9 (2026-03-01)  ← 현재
+  ① max_same_sector → filter_portfolio_signals 실제 연결
+  ② ATR fallback 손절/목표 → 고정 0.93/1.15 제거, 국면 배수 적용
+
+v30.8 (2026-03-01)
+  ① feat_w_sector → sector_bonus 점수에 실제 적용 (연결 누락 수정)
+  ② feat_w_nxt → nxt_delta 점수에 실제 적용 (연결 누락 수정)
+  ③ REENTRY_BOUNCE_PCT dead constant 제거
+
+v30.7 (2026-03-01)
+  ① ATR 일별 캐시 (종목당 하루 1회만 계산, 불필요한 API 호출 제거)
+
+v30.6 (2026-03-01)
+  ① 트레일링 스탑 ATR+국면 기반 (고정 -3% 제거)
+  ② 상승이탈 기준 ATR+국면 기반 (고정 10% 제거)
+  ③ 진입가 허용범위 ATR+국면 기반 (고정 2% 제거)
+  ④ 재진입 반등 기준 ATR+국면 기반 (고정 3% 제거)
+  ⑤ 분할 청산 트리거 ATR 기반 (고정 3% 제거)
+
+v30.5 (2026-03-01)
   ① /진입 명령어 추가 (실제 진입 확인 → /stats 내 실제 수익 집계)
   ② 트레일링 스탑 (목표가 도달 후 고점 -3% 시 자동 청산)
   ③ 연속 수익 공격 모드 (4회 연속 수익 → 최소점수 완화)
@@ -52,8 +71,8 @@ v28.0 (2026-03-01)
 
 """
 
-BOT_VERSION = "v30.5"
-BOT_DATE    = "2026-02-28"
+BOT_VERSION = "v30.9"
+BOT_DATE    = "2026-03-01"
 
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
@@ -292,7 +311,7 @@ INFO_FLUSH_INTERVAL  = 300        # 600→300초 (5분)
 # code → {name, stop_price, ts, signal_type, entry, stop, target}
 # 만료 기준: 시간 제한 없이 장 마감(on_market_close)에서 일괄 초기화
 _reentry_watch: dict = {}
-REENTRY_BOUNCE_PCT  = 3.0   # 5→3% (V자 반등 빠른 포착)
+# REENTRY_BOUNCE_PCT 제거 — calc_reentry_bounce() ATR 기반으로 대체됨
 REENTRY_VOL_MIN     = 1.5   # 2.0→1.5배 (조건 완화)
 
 # ============================================================
@@ -451,6 +470,7 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 # 📊 일봉 데이터 (공통 사용)
 # ============================================================
 _daily_cache = {}  # code → {items, ts}
+_atr_cache   = {}  # code → {atr, date}  하루 1회 갱신
 
 def get_daily_data(code: str, days: int = 60) -> list:
     """일봉 데이터 조회 (캐시 30분)"""
@@ -693,9 +713,105 @@ def get_real_volume_ratio(code: str, today_vol: int) -> float:
 # ⑧ ATR 기반 동적 손절·목표가
 # ============================================================
 def get_atr(code: str) -> float:
+    today = datetime.now().strftime("%Y%m%d")
+    cached = _atr_cache.get(code)
+    if cached and cached.get("date") == today:
+        return cached["atr"]
     items = get_daily_data(code, 20)
     trs   = [i["high"] - i["low"] for i in items[-ATR_PERIOD:] if i["high"] and i["low"]]
-    return sum(trs) / len(trs) if trs else 0
+    atr   = sum(trs) / len(trs) if trs else 0
+    _atr_cache[code] = {"atr": atr, "date": today}
+    return atr
+
+def get_atr_regime_mult() -> float:
+    """
+    현재 시장 국면에 따른 ATR 배수 반환.
+    트레일링 스탑 / 진입 허용범위 / 재진입 기준 등에 공통 사용.
+      bull  → 0.8  (타이트하게 — 수익 빨리 확보)
+      normal→ 1.2
+      bear  → 1.8  (여유있게 — 노이즈에 안 털림)
+      crash → 2.5
+    NXT 단독 시간대면 추가 × 1.3 (변동성 높음)
+    """
+    regime_info = get_market_regime()
+    regime      = regime_info.get("mode", "normal")
+    nxt_only    = regime_info.get("nxt_only", False)
+    base = {"bull": 0.8, "normal": 1.2, "bear": 1.8, "crash": 2.5}.get(regime, 1.2)
+    return round(base * (1.3 if nxt_only else 1.0), 2)
+
+def calc_atr_pct(code: str, price: int, fallback_pct: float = 2.0) -> float:
+    """
+    종목 ATR을 현재가 대비 %로 반환.
+    ATR 조회 실패 시 fallback_pct 사용.
+    """
+    try:
+        atr = get_atr(code)
+        if atr > 0 and price > 0:
+            return round(atr / price * 100, 2)
+    except: pass
+    return fallback_pct
+
+def calc_trailing_stop(code: str, high_price: int) -> int:
+    """
+    트레일링 스탑 가격 계산.
+    고점 - ATR × 국면배수 (최소 -1.5%, 최대 -8%)
+    """
+    try:
+        atr  = get_atr(code)
+        mult = get_atr_regime_mult()
+        if atr > 0:
+            trail_gap = int(atr * mult)
+            trail_pct = trail_gap / high_price * 100 if high_price else 3.0
+            # 최소 1.5%, 최대 8% 범위 제한
+            trail_pct = max(1.5, min(trail_pct, 8.0))
+            trail_gap = int(high_price * trail_pct / 100)
+            return int((high_price - trail_gap) / 10) * 10
+    except: pass
+    # fallback: 고점 × 0.97
+    return int(high_price * 0.97 / 10) * 10
+
+def calc_entry_tolerance(code: str, price: int) -> float:
+    """
+    진입가 허용범위 (±%) 계산.
+    ATR 기반으로 종목마다 다르게 적용.
+    최소 1.0%, 최대 4.0%
+    """
+    atr_pct = calc_atr_pct(code, price, fallback_pct=2.0)
+    mult    = get_atr_regime_mult()
+    tol     = round(atr_pct * mult * 0.5, 1)
+    return max(1.0, min(tol, 4.0))
+
+def calc_reentry_bounce(code: str, price: int) -> float:
+    """
+    손절 후 재진입 반등 기준 (%) 계산.
+    ATR × 0.5 배수 (최소 1.5%, 최대 6.0%)
+    """
+    atr_pct = calc_atr_pct(code, price, fallback_pct=3.0)
+    mult    = get_atr_regime_mult()
+    bounce  = round(atr_pct * mult * 0.5, 1)
+    return max(1.5, min(bounce, 6.0))
+
+def calc_surge_escape_pct(code: str, price: int) -> float:
+    """
+    진입가 상승이탈 판단 기준 (%) — 진입가보다 이 % 이상 오르면 포기.
+    ATR × 3배 (최소 5%, 최대 15%)
+    """
+    atr_pct = calc_atr_pct(code, price, fallback_pct=3.0)
+    mult    = get_atr_regime_mult()
+    escape  = round(atr_pct * mult * 3.0, 1)
+    return max(5.0, min(escape, 15.0))
+
+def calc_partial_exit_min_pct(code: str, price: int) -> float:
+    """
+    분할 청산 트리거 최소 수익률 (%) — 이 이상 수익일 때만 분할 청산 알림.
+    ATR × 1배 (최소 1.5%, 최대 5.0%)
+    """
+    atr_pct = calc_atr_pct(code, price, fallback_pct=2.0)
+    return max(1.5, min(round(atr_pct, 1), 5.0))
+
+def calc_trailing_stop_price(code: str, price: int) -> int:
+    """고점 기준 트레일링 스탑 — calc_trailing_stop의 별칭"""
+    return calc_trailing_stop(code, price)
 
 def calc_stop_target(code: str, entry: int) -> tuple:
     atr = get_atr(code)
@@ -703,9 +819,13 @@ def calc_stop_target(code: str, entry: int) -> tuple:
         stop   = int((entry - atr * ATR_STOP_MULT)  / 10) * 10
         target = int((entry + atr * ATR_TARGET_MULT) / 10) * 10
         return stop, target, round((entry-stop)/entry*100,1), round((target-entry)/entry*100,1), True
-    stop   = int(entry * 0.93 / 10) * 10
-    target = int(entry * 1.15 / 10) * 10
-    return stop, target, 7.0, 15.0, False
+    # ATR 실패 시 국면 배수 적용 fallback
+    _rm   = get_atr_regime_mult()
+    _stop_pct   = max(0.05, 0.07 * _rm)
+    _target_pct = max(0.08, 0.15 / _rm)
+    stop   = int(entry * (1 - _stop_pct)   / 10) * 10
+    target = int(entry * (1 + _target_pct) / 10) * 10
+    return stop, target, round(_stop_pct*100,1), round(_target_pct*100,1), False
 
 # ============================================================
 # ⑨ 전일 상한가 체크
@@ -844,7 +964,7 @@ def _clear_all_cache():
     global _nxt_cache, _nxt_unavailable, _early_cache, _news_reverse_cache
     global _kospi_cache, _sector_monitor, _pending_info_alerts
     _sector_cache.clear();       _avg_volume_cache.clear()
-    _prev_upper_cache.clear();   _daily_cache.clear()
+    _prev_upper_cache.clear();   _daily_cache.clear();   _atr_cache.clear()
     _nxt_cache.clear();          _nxt_unavailable.clear()
     _early_cache.clear();        _news_reverse_cache.clear()
     _sector_monitor.clear();     _pending_info_alerts.clear()
@@ -1065,7 +1185,8 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     try:
         nxt_delta, nxt_reason = nxt_score_bonus(code)
         if nxt_delta != 0:
-            score += nxt_delta
+            _w_nxt = _dynamic.get("feat_w_nxt", 1.0)
+            score += int(nxt_delta * _w_nxt)
             if nxt_reason: reasons.append(nxt_reason)
     except: pass
 
@@ -1313,7 +1434,8 @@ def run_mid_pullback_scan():
                 result["theme_desc"] = theme_desc
                 sector_info = calc_sector_momentum(code, name)
                 result["sector_info"] = sector_info
-                result["score"] += sector_info.get("bonus", 0)
+                _w_sec = _dynamic.get("feat_w_sector", 1.0)
+                result["score"] += int(sector_info.get("bonus", 0) * _w_sec)
                 signals.append(result)
             time.sleep(0.3)
         except Exception as e:
@@ -2421,9 +2543,10 @@ def track_signal_results():
                 pnl_now  = (price - entry) / entry * 100
                 half_pct = (target - entry) / entry * 100 / 2   # 목표의 절반
                 partial_key = f"{log_key}_partial"
+                _partial_min = calc_partial_exit_min_pct(code, price)
                 if (pnl_now >= half_pct
                         and partial_key not in _tracking_notified
-                        and half_pct > 3.0):
+                        and half_pct > _partial_min):
                     _tracking_notified.add(partial_key)
                     inv_info = ""
                     try:
@@ -2456,8 +2579,8 @@ def track_signal_results():
             if rec.get("trailing_active"):
                 trail_stop = rec.get("trailing_stop", target)
                 if price > rec.get("max_price", price):
-                    # 최고가 갱신 → 트레일링 스탑 끌어올리기
-                    new_trail = int(price * 0.97 / 10) * 10
+                    # 최고가 갱신 → ATR+국면 기반 트레일링 스탑 끌어올리기
+                    new_trail = calc_trailing_stop(code, price)
                     if new_trail > trail_stop:
                         rec["trailing_stop"] = new_trail
                 if price <= rec["trailing_stop"]:
@@ -2485,7 +2608,7 @@ def track_signal_results():
                 # 목표가 도달 → 트레일링 스탑 모드 전환 (바로 청산 안 함)
                 if not rec.get("trailing_active"):
                     rec["trailing_active"] = True
-                    rec["trailing_stop"]   = int(price * 0.97 / 10) * 10
+                    rec["trailing_stop"]   = calc_trailing_stop(code, price)
                     updated = True
                     if trailing_key not in _tracking_notified:
                         _tracking_notified.add(trailing_key)
@@ -2708,7 +2831,8 @@ def check_reentry_watch():
 
             bounce = (price - w["stop_price"]) / w["stop_price"] * 100
             mkt_tag = " 🔵NXT" if not krx_ok and nxt_ok else ""
-            if bounce >= REENTRY_BOUNCE_PCT and vr >= REENTRY_VOL_MIN:
+            _reentry_min = calc_reentry_bounce(code, price)
+            if bounce >= _reentry_min and vr >= REENTRY_VOL_MIN:
                 sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
                               "SURGE":"급등","EARLY_DETECT":"조기포착",
                               "MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목"}
@@ -3557,8 +3681,9 @@ def check_entry_watch():
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
 
-            # ── 상승 이탈: 진입가보다 +10% 이상 올라가버리면 포기 ──
-            if diff_pct >= 10.0:
+            # ── 상승 이탈: ATR×국면 기반 기준 이상 오르면 포기 ──
+            _escape_pct = calc_surge_escape_pct(watch["code"], entry)
+            if diff_pct >= _escape_pct:
                 _record_entry_miss(watch, "상승이탈", price)
                 send_with_chart_buttons(
                     f"📈 <b>[진입가 이탈]</b>\n"
@@ -3570,8 +3695,9 @@ def check_entry_watch():
                 )
                 expired.append(log_key); continue
 
-            # ── 진입가 ±2% 이내 진입 구간 ──
-            if abs(diff_pct) <= ENTRY_TOLERANCE_PCT:
+            # ── 진입가 ATR 기반 허용범위 이내 → 진입 구간 ──
+            _tol_pct = calc_entry_tolerance(watch["code"], entry)
+            if abs(diff_pct) <= _tol_pct:
                 now_ts       = time.time()
                 last_ts      = watch.get("last_notified_ts", 0)
                 notify_count = watch.get("notify_count", 0)
@@ -3955,6 +4081,8 @@ def analyze(stock: dict) -> dict:
 
     # 섹터 모멘텀
     sector_info = calc_sector_momentum(code, stock.get("name",code))
+    _w_sec = _dynamic.get("feat_w_sector", 1.0)
+    sector_info["bonus"] = int(sector_info["bonus"] * _w_sec)
     if sector_info["bonus"]>0:
         score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
         if sector_info.get("rising"):
@@ -3967,7 +4095,8 @@ def analyze(stock: dict) -> dict:
     try:
         nxt_delta, nxt_reason = nxt_score_bonus(code)
         if nxt_delta != 0:
-            score += nxt_delta
+            _w_nxt = _dynamic.get("feat_w_nxt", 1.0)
+            score += int(nxt_delta * _w_nxt)
             if nxt_reason: reasons.append(nxt_reason)
     except: pass
 
@@ -5871,9 +6000,12 @@ def calc_dynamic_stop_target(code: str, entry: int) -> tuple:
     """
     atr = get_atr(code)
     if not atr:
-        stop   = int(entry * 0.93 / 10) * 10
-        target = int(entry * 1.15 / 10) * 10
-        return stop, target, 7.0, 15.0, False
+        _rm   = get_atr_regime_mult()
+        _stop_pct   = max(0.05, 0.07 * _rm)
+        _target_pct = max(0.08, 0.15 / _rm)
+        stop   = int(entry * (1 - _stop_pct)   / 10) * 10
+        target = int(entry * (1 + _target_pct) / 10) * 10
+        return stop, target, round(_stop_pct*100,1), round(_target_pct*100,1), False
 
     regime_info = get_market_regime()
     regime  = regime_info.get("mode", "normal")
@@ -5997,8 +6129,15 @@ def filter_portfolio_signals(alerts: list) -> list:
                 rs = calc_real_sector_score(s["code"], peer["code"],
                                             s["name"], peer["name"])
                 if rs["score"] >= 50:
-                    excluded.add(peer["code"])
-                    print(f"  🗂️ 실질섹터 중복 제외: {peer['name']} ({rs['label']}, {rs['score']}점)")
+                    # 같은 섹터 내 max_same_sector 개수까지는 허용
+                    same_sector_passed = sum(
+                        1 for p in passed
+                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
+                    )
+                    _max_same = _dynamic.get("max_same_sector", 2)
+                    if same_sector_passed >= _max_same:
+                        excluded.add(peer["code"])
+                        print(f"  🗂️ 실질섹터 중복 제외: {peer['name']} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
             except:
                 pass
 
