@@ -202,7 +202,7 @@ v13.0 이하
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-BOT_VERSION = "v30.1"
+BOT_VERSION = "v30.5"
 BOT_DATE    = "2026-02-28"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -359,6 +359,21 @@ _access_token       = None
 _token_expires      = 0
 _session            = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# ⑤ 중앙 에러 로거 (중요 기능 오류 조용히 묻히지 않게)
+_error_counts: dict = {}
+
+def _log_error(func_name: str, e: Exception, critical: bool = False):
+    _error_counts[func_name] = _error_counts.get(func_name, 0) + 1
+    cnt = _error_counts[func_name]
+    print(f"⚠️ [{func_name}] {type(e).__name__}: {e} (누적 {cnt}회)", flush=True)
+    if critical or cnt in (5, 20, 100):
+        try:
+            send(f"🔴 <b>반복 오류 감지</b>\n"
+                 f"함수: <code>{func_name}</code>  누적 {cnt}회\n"
+                 f"오류: {type(e).__name__}: {str(e)[:100]}")
+        except: pass
+
 _alert_history      = {}
 _detected_stocks    = {}
 _pullback_history   = {}
@@ -563,7 +578,7 @@ def get_token(retry: int = 3) -> str:
             print(f"✅ KIS 토큰 발급 ({datetime.now().strftime('%H:%M:%S')})")
             return _access_token
         except Exception as e:
-            print(f"⚠️ 토큰 실패 ({attempt+1}): {e}"); time.sleep(5*(attempt+1))
+            _log_error(f"get_token(attempt={attempt+1})", e, critical=attempt==2); time.sleep(5*(attempt+1))
     raise Exception("❌ KIS 토큰 최종 실패")
 
 def _headers(tr_id: str) -> dict:
@@ -611,8 +626,8 @@ def get_daily_data(code: str, days: int = 60) -> list:
         } for i in items if i.get("stck_bsop_date")], key=lambda x: x["date"])
         _daily_cache[code] = {"items": items, "ts": time.time()}
         return items
-    except:
-        return []
+    except Exception as e:
+        _log_error(f"get_daily_data({code})", e); return []
 
 # ============================================================
 # ⑦-A 보조지표 계산 (RSI / 이동평균 / 볼린저밴드 / 유사패턴)
@@ -2291,6 +2306,19 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # ============================================================
 SIGNAL_LOG_FILE = "signal_log.json"   # 모든 신호 추적 (신규)
 
+def _is_real_trade(rec: dict) -> bool:
+    """
+    실제 진입한 거래만 통계에 포함할지 판단.
+    actual_entry=False(명시적 미진입) 또는 진입미달 상태는 제외.
+    """
+    if rec.get("actual_entry") is False:
+        return False
+    if rec.get("entry_miss") is not None:
+        return False
+    if "진입미달" in str(rec.get("exit_reason", "")):
+        return False
+    return True
+
 def save_signal_log(stock: dict):
     """
     알림 발송된 모든 신호를 로그에 저장
@@ -2343,15 +2371,20 @@ def save_signal_log(stock: dict):
             "target_price": stock.get("target_price", 0),
             "atr_used":     stock.get("atr_used", False),
             "feature_flags": feature_flags,
-            # 추적 결과 (초기값)
-            "status":       "추적중",
-            "exit_price":   0,
-            "exit_date":    "",
-            "exit_time":    "",
-            "pnl_pct":      0.0,
-            "exit_reason":  "",
-            "max_price":    stock["price"],
-            "min_price":    stock["price"],
+            # ── 이론 추적 결과 (봇 자동 계산 → auto_tune 학습용) ──
+            "status":            "추적중",   # 봇 추적 상태
+            "exit_price":        0,
+            "exit_date":         "",
+            "exit_time":         "",
+            "pnl_pct":           0.0,        # 이론 수익률 (봇 학습 기준)
+            "exit_reason":       "",
+            "max_price":         stock["price"],
+            "min_price":         stock["price"],
+            # ── 실제 진입 결과 (사용자 입력 → 내 수익 통계용) ──
+            "actual_entry":      None,       # True=진입함 / False=진입안함 / None=미확인
+            "actual_pnl":        None,       # 실제 수익률 (사용자 /result 입력)
+            "actual_exit_date":  "",
+            "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
         }
         with open(SIGNAL_LOG_FILE, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2567,12 +2600,56 @@ def track_signal_results():
                     )
                     print(f"  💡 분할 청산 가이드: {rec['name']} +{pnl_now:.1f}%")
 
+            # ── ② 트레일링 스탑 ──
+            # 목표가 도달 후 최고가에서 -3% 하락하면 자동 청산 (더 먹기)
+            trailing_key = f"{log_key}_trailing"
+            if rec.get("trailing_active"):
+                trail_stop = rec.get("trailing_stop", target)
+                if price > rec.get("max_price", price):
+                    # 최고가 갱신 → 트레일링 스탑 끌어올리기
+                    new_trail = int(price * 0.97 / 10) * 10
+                    if new_trail > trail_stop:
+                        rec["trailing_stop"] = new_trail
+                if price <= rec["trailing_stop"]:
+                    exit_reason = "트레일링스탑"
+                    exit_price  = price
+                    pnl_pct     = round((exit_price - entry) / entry * 100, 2) if entry else 0
+                    status      = "수익" if pnl_pct > 0 else "본전"
+                    rec["status"]      = status
+                    rec["exit_price"]  = exit_price
+                    rec["exit_date"]   = today
+                    rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
+                    rec["pnl_pct"]     = pnl_pct
+                    rec["exit_reason"] = exit_reason
+                    _tracking_notified.add(log_key)
+                    updated = True
+                    _send_tracking_result(rec)
+                    print(f"  📊 트레일링 청산: {rec['name']} {pnl_pct:+.1f}%")
+                    continue
+
             # ── 결과 판정 ──
             exit_reason = None
             exit_price  = price
 
             if price >= target:
-                exit_reason = "목표가"
+                # 목표가 도달 → 트레일링 스탑 모드 전환 (바로 청산 안 함)
+                if not rec.get("trailing_active"):
+                    rec["trailing_active"] = True
+                    rec["trailing_stop"]   = int(price * 0.97 / 10) * 10
+                    updated = True
+                    if trailing_key not in _tracking_notified:
+                        _tracking_notified.add(trailing_key)
+                        send_with_chart_buttons(
+                            f"🎯 <b>[목표가 도달 → 트레일링 모드]</b>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                            f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"✅ 목표 달성! 추가 상승 시 자동으로 더 먹습니다\n"
+                            f"📉 고점 대비 -3% 하락 시 자동 청산",
+                            code, rec["name"]
+                        )
+                continue   # 트레일링 모드로 계속 추적
             elif price <= stop:
                 exit_reason = "손절가"
             elif elapsed_days >= TRACK_MAX_DAYS:
@@ -2581,33 +2658,53 @@ def track_signal_results():
             if not exit_reason:
                 continue   # 아직 추적 중
 
-            # 수익률 계산
+            # ── 이론 수익률 계산 (봇 학습용) ──
             pnl_pct = round((exit_price - entry) / entry * 100, 2) if entry else 0
             status  = "수익" if pnl_pct > 0 else ("손실" if pnl_pct < 0 else "본전")
 
-            # 로그 업데이트
+            # 이론 결과 저장 (항상)
             rec["status"]      = status
             rec["exit_price"]  = exit_price
             rec["exit_date"]   = today
             rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
-            rec["pnl_pct"]     = pnl_pct
+            rec["pnl_pct"]     = pnl_pct        # 이론 수익률
             rec["exit_reason"] = exit_reason
+
+            # 실제 진입 여부가 None(미확인)인 경우 → 진입 확인 요청 알림
+            if rec.get("actual_entry") is None and exit_reason != TRACK_TIMEOUT_RESULT:
+                _request_actual_entry_confirm(rec)
+
             _tracking_notified.add(log_key)
 
             # ── 결과 알림 ──
             _send_tracking_result(rec)
-            print(f"  📊 추적 완료: {rec['name']} {pnl_pct:+.1f}% ({exit_reason})")
+            print(f"  📊 추적 완료: {rec['name']} {pnl_pct:+.1f}% ({exit_reason}) [이론]")
 
             # 연속 손절 카운터 업데이트 (긴급 튜닝용)
             global _consecutive_loss_count
             if pnl_pct <= 0:
                 _consecutive_loss_count += 1
+                _consecutive_win_count  = 0   # 손실 시 연속 수익 카운터 리셋
                 if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
                     print(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 실행")
                     auto_tune(notify=True)
                     _consecutive_loss_count = 0
             else:
-                _consecutive_loss_count = 0   # 수익 나면 카운터 리셋
+                _consecutive_loss_count = 0
+                _consecutive_win_count  += 1
+                # ③ 연속 수익 공격 모드
+                if _consecutive_win_count >= WIN_STREAK_THRESHOLD:
+                    old_n = _dynamic["min_score_normal"]
+                    old_s = _dynamic["min_score_strict"]
+                    if old_n > 50:
+                        _dynamic["min_score_normal"] = max(old_n - 3, 50)
+                        _dynamic["min_score_strict"] = max(old_s - 3, 60)
+                        print(f"  🔥 연속 수익 {_consecutive_win_count}회 → 공격 모드: 최소점수 {old_n}→{_dynamic['min_score_normal']}")
+                        try:
+                            send(f"🔥 <b>연속 수익 {_consecutive_win_count}회!</b>\n"
+                                 f"신호 기준 완화: {old_n}→{_dynamic['min_score_normal']}점\n"
+                                 f"더 많은 신호를 포착합니다")
+                        except: pass
 
         if updated:
             with open(SIGNAL_LOG_FILE, "w") as f:
@@ -2616,7 +2713,7 @@ def track_signal_results():
             load_tracker_feedback()
 
     except Exception as e:
-        print(f"⚠️ 추적 오류: {e}")
+        _log_error("track_signal_results", e, critical=True)
 
 
 def _send_tracking_result(rec: dict):
@@ -2911,9 +3008,11 @@ _dynamic = {
     "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
 }
 
-# 긴급 튜닝: 연속 손절 카운터
+# 긴급 튜닝: 연속 손절/수익 카운터
 _consecutive_loss_count: int = 0
-EMERGENCY_TUNE_THRESHOLD   = 3   # 연속 손절 N회 → 즉시 조건 강화
+_consecutive_win_count:  int = 0   # ③ 연속 수익 카운터
+EMERGENCY_TUNE_THRESHOLD   = 3     # 연속 손절 N회 → 즉시 조건 강화
+WIN_STREAK_THRESHOLD       = 4     # 연속 수익 N회 → 공격 모드 진입
 
 def _save_dynamic_params():
     """
@@ -3061,6 +3160,7 @@ def auto_tune(notify: bool = True):
             with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
         except: return
 
+        # auto_tune은 이론 데이터 전부 사용 (미진입 포함 — 봇 조건 최적화용)
         completed = [v for v in data.values()
                      if v.get("status") in ["수익", "손실", "본전"]]
         if len(completed) < MIN_SAMPLES:
@@ -3220,6 +3320,73 @@ def auto_tune(notify: bool = True):
                 _dynamic["position_base_pct"] = round(max(old_pos - 1.0, 4.0), 1)
                 changes.append(f"💰 포지션 비중 하향: {old_pos}%→{_dynamic['position_base_pct']}% (승률 저조)")
 
+        # ── ⑪ 스킵 패턴 학습 ──
+        # ── 진입가 미달 패턴 분석 → entry_pullback_ratio 자동 조정 ──
+        # "진입미달_상승이탈": 진입가가 너무 낮게 설정 → 비율 올리기 (더 공격적)
+        # "진입미달_기간만료": 진입가가 너무 높게 설정 → 비율 낮추기 (더 보수적)
+        # "진입가변경": 같은 종목 재포착 반복 → 변동성 큰 상황, 비율 완화
+        miss_recs = [r for r in data.values()
+                     if r.get("status") in ["진입미달", "진입가변경"]
+                     and r.get("detect_date", "") >= (
+                         datetime.now() - timedelta(days=30)
+                     ).strftime("%Y%m%d")]
+
+        if len(miss_recs) >= 5:
+            surge_miss   = sum(1 for r in miss_recs if "상승이탈"   in str(r.get("exit_reason","")))
+            expire_miss  = sum(1 for r in miss_recs if "기간만료"   in str(r.get("exit_reason","")))
+            reentry_miss = sum(1 for r in miss_recs if "진입가변경" in str(r.get("exit_reason","")))
+            total_miss   = len(miss_recs)
+            old_ratio    = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+
+            if surge_miss / total_miss >= 0.5:
+                # 절반 이상이 상승이탈 → 진입가 너무 낮음 → 비율 올리기 (진입가를 현재가에 더 가깝게)
+                new_ratio = round(min(old_ratio + 0.05, 0.7), 2)
+                if new_ratio != old_ratio:
+                    _dynamic["entry_pullback_ratio"] = new_ratio
+                    changes.append(
+                        f"📈 진입가 비율 상향: {old_ratio:.2f}→{new_ratio:.2f} "
+                        f"(상승이탈 {surge_miss}/{total_miss}건 — 진입가 너무 낮았음)"
+                    )
+            elif expire_miss / total_miss >= 0.6:
+                # 60% 이상이 기간만료 → 진입가 너무 높음 → 비율 낮추기 (진입가를 더 눌림목으로)
+                new_ratio = round(max(old_ratio - 0.05, 0.2), 2)
+                if new_ratio != old_ratio:
+                    _dynamic["entry_pullback_ratio"] = new_ratio
+                    changes.append(
+                        f"📉 진입가 비율 하향: {old_ratio:.2f}→{new_ratio:.2f} "
+                        f"(기간만료 {expire_miss}/{total_miss}건 — 진입가 너무 높았음)"
+                    )
+            if reentry_miss >= 3:
+                # 재포착 반복 → 변동성 큰 종목들 → 진입가 범위 완화
+                new_ratio = round(max(old_ratio - 0.03, 0.2), 2)
+                if new_ratio != old_ratio:
+                    _dynamic["entry_pullback_ratio"] = new_ratio
+                    changes.append(
+                        f"🔄 재포착 반복 {reentry_miss}건 → 진입가 비율 완화: {old_ratio:.2f}→{new_ratio:.2f}"
+                    )
+
+        # 자주 스킵하는 이유가 "이미상승"이면 → entry_pullback_ratio 더 완화
+        # 자주 스킵하는 이유가 "시간없음"이면 → ALERT_COOLDOWN 늘리기 (신호 집중)
+        skipped_recs = [r for r in data.values() if r.get("actual_entry") is False]
+        if len(skipped_recs) >= 5:
+            skip_reasons = {}
+            for r in skipped_recs:
+                reason = r.get("skip_reason", "").strip()
+                if reason: skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            top_reason = max(skip_reasons, key=skip_reasons.get) if skip_reasons else ""
+            if "이미상승" in top_reason or "상승" in top_reason:
+                # 진입가가 너무 낮아서 기회를 못 잡는 패턴 → pullback 완화
+                old_ratio = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+                if old_ratio > 0.15:
+                    _dynamic["entry_pullback_ratio"] = round(old_ratio - 0.03, 2)
+                    changes.append(f"📈 스킵패턴 학습: '이미상승' 빈번 → 진입가 비율 완화 {old_ratio:.2f}→{_dynamic['entry_pullback_ratio']:.2f}")
+            # 스킵 기회비용 계산 (놓친 이론 수익 평균)
+            skip_pnls = [r.get("pnl_pct", 0) for r in skipped_recs if r.get("pnl_pct")]
+            if skip_pnls:
+                opp_avg = sum(skip_pnls) / len(skip_pnls)
+                if opp_avg > 5.0:
+                    changes.append(f"💡 스킵 기회비용: 평균 {opp_avg:+.1f}% 놓치는 중 (알림 설정 점검 권장)")
+
         # ── ⑩ 기능별 기여도 분석 + 자동 가중치 조정 ──
         # feature_flags가 기록된 충분한 샘플이 있을 때만 분석
         feat_recs = [r for r in completed if r.get("feature_flags")]
@@ -3304,7 +3471,7 @@ def auto_tune(notify: bool = True):
             print(f"  🧠 자동 조정: 변경 없음 ({len(completed)}건 분석)")
 
     except Exception as e:
-        print(f"⚠️ 자동 조정 오류: {e}")
+        _log_error("auto_tune", e, critical=True)
 
 # ============================================================
 # 📊 차트 기능 (이미지 전송 + 링크)
@@ -3332,7 +3499,13 @@ def start_sector_monitor(code: str, name: str):
             # NXT 포함 실질 장 마감 체크
             if not is_any_market_open():
                 _sector_monitor.pop(code, None); break
-            if (time.time() - info["start_ts"]) / 3600 > SECTOR_MONITOR_MAX_HOURS:
+            # ⑥ 동적 감시 기간: 섹터가 계속 강하면 최대 24시간까지 연장
+            elapsed_h   = (time.time() - info["start_ts"]) / 3600
+            alert_cnt   = info.get("alert_count", 0)
+            # 알림이 많이 발생 = 테마가 살아있음 → 시간 연장
+            max_hours   = min(SECTOR_MONITOR_MAX_HOURS + alert_cnt * 2, 24)
+            if elapsed_h > max_hours:
+                print(f"  📡 섹터 감시 종료: {info.get('name',code)} ({elapsed_h:.1f}h, 알림 {alert_cnt}회)")
                 _sector_monitor.pop(code, None); break
             try:
                 _sector_cache.pop(code, None)
@@ -3424,25 +3597,97 @@ def reset_top_signals_daily():
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry: return
-    log_key = f"{s['code']}_{datetime.now().strftime('%Y%m%d%H%M')}"
+    code = s["code"]
+
+    # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
+    old_keys = [k for k, w in _entry_watch.items() if w["code"] == code]
+    for k in old_keys:
+        old_entry  = _entry_watch[k].get("entry_price", 0)
+        miss_count = _entry_watch[k].get("miss_count", 0)
+        print(f"  🔄 진입가 갱신: {s['name']} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
+        # signal_log의 기존 "추적중" 레코드를 "진입가변경"으로 업데이트
+        try:
+            sig_data = {}
+            try:
+                with open(SIGNAL_LOG_FILE, "r") as f_r: sig_data = json.load(f_r)
+            except: pass
+            for lk, rec in sig_data.items():
+                if (rec.get("code") == code
+                        and rec.get("status") == "추적중"
+                        and rec.get("signal_type") == _entry_watch[k].get("signal_type")):
+                    rec["status"]        = "진입가변경"
+                    rec["exit_reason"]   = "재포착_진입가변경"
+                    rec["old_entry"]     = old_entry
+                    rec["new_entry"]     = entry
+                    rec["pnl_pct"]       = 0.0
+                    break
+            with open(SIGNAL_LOG_FILE, "w") as f_w:
+                json.dump(sig_data, f_w, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ 진입가변경 기록 오류: {e}")
+        del _entry_watch[k]
+
+    log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
     _entry_watch[log_key] = {
-        "code": s["code"], "name": s["name"], "entry_price": entry,
-        "stop_loss": s.get("stop_loss",0), "target_price": s.get("target_price",0),
-        "signal_type": s.get("signal_type",""), "detect_time": datetime.now().strftime("%H:%M"),
-        "last_notified_ts": 0,   # 0 = 아직 미알림, 이후 타임스탬프로 쿨다운 관리
-        "notify_count": 0,       # 알림 횟수 (최대 3회)
+        "code": code, "name": s["name"], "entry_price": entry,
+        "stop_loss":    s.get("stop_loss", 0),
+        "target_price": s.get("target_price", 0),
+        "signal_type":  s.get("signal_type", ""),
+        "detect_time":  datetime.now().strftime("%H:%M"),
+        "last_notified_ts": 0,
+        "notify_count": 0,
+        "miss_count":   len(old_keys),        # 이 종목 누적 재포착 횟수
         "registered_ts": time.time(),
+        "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
+        "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
     }
-    print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원")
+    print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
+
+def _record_entry_miss(watch: dict, reason: str, final_price: int):
+    """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+        entry     = watch.get("entry_price", 0)
+        miss_away = round((final_price - entry) / entry * 100, 1) if entry else 0
+        peak      = watch.get("peak_price", final_price)
+        peak_away = round((peak - entry) / entry * 100, 1) if entry else 0
+        for log_key, rec in data.items():
+            if (rec.get("code") == watch["code"]
+                    and rec.get("status") == "추적중"
+                    and rec.get("signal_type") == watch.get("signal_type")):
+                rec["entry_miss"]      = reason
+                rec["entry_miss_away"] = miss_away
+                rec["entry_peak_away"] = peak_away
+                rec["miss_count"]      = watch.get("miss_count", 0)
+                rec["status"]          = "진입미달"
+                rec["pnl_pct"]         = 0.0
+                rec["exit_reason"]     = f"진입미달_{reason}"
+                break
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
+    except Exception as e:
+        print(f"⚠️ 진입미달 기록 오류: {e}")
 
 def check_entry_watch():
     if not _entry_watch: return
-    # KRX 마감 후 NXT 운영 중이면 NXT 가격으로 진입가 감시 계속
     use_nxt = not is_market_open() and is_nxt_open()
     expired = []
     for log_key, watch in list(_entry_watch.items()):
-        if time.time() - watch["registered_ts"] > 86400 or watch["notified"]:
+        # ── 만료 체크 (3일) ──
+        if time.time() > watch.get("expire_ts", watch["registered_ts"] + 86400):
+            _record_entry_miss(watch, "기간만료", watch.get("peak_price", 0))
+            miss_count = watch.get("miss_count", 0) + 1
+            if miss_count >= 3:
+                old_ratio = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+                if old_ratio > 0.15:
+                    _dynamic["entry_pullback_ratio"] = round(old_ratio - 0.05, 2)
+                    print(f"  🔧 진입가 비율 완화: {old_ratio:.2f}→{_dynamic['entry_pullback_ratio']:.2f} (미도달 {miss_count}회)")
             expired.append(log_key); continue
+
         try:
             if use_nxt:
                 cur   = get_nxt_stock_price(watch["code"])
@@ -3454,31 +3699,45 @@ def check_entry_watch():
                 cur   = get_stock_price(watch["code"])
                 price = cur.get("price", 0)
             if not price: continue
+
+            # 최고가 갱신
+            if price > watch.get("peak_price", 0):
+                watch["peak_price"] = price
+
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
 
-            # 진입가 ±2% 이내 진입 구간
+            # ── 상승 이탈: 진입가보다 +10% 이상 올라가버리면 포기 ──
+            if diff_pct >= 10.0:
+                _record_entry_miss(watch, "상승이탈", price)
+                send_with_chart_buttons(
+                    f"📈 <b>[진입가 이탈]</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"<b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                    f"진입가 {entry:,}원에서 +{diff_pct:.1f}% 상승 이탈\n"
+                    f"진입 기회 없이 상승 → 감시 종료",
+                    watch["code"], watch["name"]
+                )
+                expired.append(log_key); continue
+
+            # ── 진입가 ±2% 이내 진입 구간 ──
             if abs(diff_pct) <= ENTRY_TOLERANCE_PCT:
                 now_ts       = time.time()
                 last_ts      = watch.get("last_notified_ts", 0)
                 notify_count = watch.get("notify_count", 0)
                 cooldown_sec = ENTRY_REWATCH_MINS * 60
-
-                # 최대 3회, 쿨다운 지난 경우만 알림
                 if notify_count >= 3: expired.append(log_key); continue
                 if now_ts - last_ts < cooldown_sec: continue
-
                 watch["last_notified_ts"] = now_ts
                 watch["notify_count"]     = notify_count + 1
-
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
                 }
-                sig        = sig_labels.get(watch["signal_type"], watch["signal_type"])
-                diff_str   = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
-                stop_pct   = round((watch["stop_loss"]   - entry) / entry * 100, 1) if entry else 0
-                tgt_pct    = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
+                sig       = sig_labels.get(watch["signal_type"], watch["signal_type"])
+                diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
+                stop_pct  = round((watch["stop_loss"]    - entry) / entry * 100, 1) if entry else 0
+                tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
                 nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
                 count_tag  = f"  ({notify_count+1}/3회)" if notify_count > 0 else ""
                 send_with_chart_buttons(
@@ -3881,8 +4140,9 @@ def analyze(stock: dict) -> dict:
         score = int(score * 0.85)   # 실적 발표 3일 전 → 점수 15% 감점
         if score < min_score: return {}
 
-    open_est = price/(1+change_rate/100)
-    entry    = int((price-(price-open_est)*ENTRY_PULLBACK_RATIO)/10)*10
+    open_est     = price/(1+change_rate/100)
+    _pullback_r  = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+    entry        = int((price-(price-open_est)*_pullback_r)/10)*10
 
     # ── ③ 손익비 동적 조정 ──
     stop, target, stop_pct, target_pct, atr_used = calc_dynamic_stop_target(code, entry)
@@ -3940,8 +4200,9 @@ def check_early_detection() -> list:
         if cache["count"] < EARLY_CONFIRM_COUNT: continue
         del _early_cache[code]
 
-        open_est = price/(1+change_rate/100)
-        entry = int((price-(price-open_est)*ENTRY_PULLBACK_RATIO)/10)*10
+        open_est     = price/(1+change_rate/100)
+        _pullback_r  = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+        entry        = int((price-(price-open_est)*_pullback_r)/10)*10
         stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
         hoga_text = f"{bid_qty/ask_qty:.1f}배" if ask_qty > 0 else "압도적"
         prev_upper = was_upper_limit_yesterday(code)
@@ -4682,6 +4943,12 @@ def poll_telegram_commands():
             elif text.startswith("/result"):
                 _handle_result_command(raw)
 
+            # ── /skip 종목명 이유 ──
+            elif text.startswith("/진입"):
+                _handle_entry_confirm_command(raw)
+            elif text.startswith("/skip"):
+                _handle_skip_command(raw)
+
             # ── /stats ──
             elif text == "/stats":
                 _send_stats()
@@ -4724,6 +4991,166 @@ def poll_telegram_commands():
     except Exception as e:
         print(f"⚠️ TG 명령어 오류: {e}")
 
+
+
+def _request_actual_entry_confirm(rec: dict):
+    """
+    이론 추적 완료 시 → 실제 진입 여부 확인 요청 알림.
+    사용자가 /result 또는 /skip으로 응답.
+    """
+    name    = rec.get("name", "")
+    code    = rec.get("code", "")
+    pnl     = rec.get("pnl_pct", 0)
+    sig     = rec.get("signal_type", "")
+    pnl_str = f"+{pnl:.1f}%" if pnl >= 0 else f"{pnl:.1f}%"
+    emoji   = "✅" if pnl > 0 else "🔴"
+    msg = (
+        f"❓ <b>[진입 여부 확인]</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{name}</b>  <code>{code}</code>\n"
+        f"이론 결과: <b>{pnl_str}</b>  [{sig}]\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"이 종목에 실제 진입하셨나요?\n\n"
+        f"✅ 진입했다면:\n"
+        f"<code>/result {name} 실제수익률</code>\n"
+        f"예) /result {name} +8.5\n\n"
+        f"⏭ 진입 못 했다면:\n"
+        f"<code>/skip {name} 이유</code>\n"
+        f"예) /skip {name} 시간없음"
+    )
+    send(msg)
+
+
+def _handle_entry_confirm_command(raw: str):
+    """
+    /진입 종목명 [실제진입가]  처리
+    예) /진입 대주산업          ← 봇이 계산한 진입가로 확정
+    예) /진입 대주산업 15300    ← 실제 진입가 직접 입력
+
+    목적: 내가 실제 진입한 종목을 기록해서 /stats의 "내 실제 수익" 에 반영.
+    봇의 이론 추적(signal_log)은 계속 병행 → 봇 조건 학습에 활용됨.
+    즉, 진입 여부와 무관하게 이론 데이터는 항상 쌓임.
+    """
+    try:
+        parts      = raw.strip().split(maxsplit=2)
+        name_input = parts[1] if len(parts) > 1 else ""
+        price_input = parts[2] if len(parts) > 2 else ""
+
+        if not name_input:
+            send("⚠️ 형식: /진입 종목명 [실제진입가]\n"
+                 "예) /진입 대주산업\n"
+                 "예) /진입 대주산업 15300"); return
+
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+
+        matched = []
+        for log_key, rec in data.items():
+            if name_input in rec.get("name", "") and rec.get("actual_entry") is None:
+                matched.append((log_key, rec))
+
+        if not matched:
+            send(f"❓ '{name_input}' 종목을 찾을 수 없어요.\n"
+                 f"추적 중인 종목명을 확인해주세요."); return
+
+        # 가장 최근 신호 선택
+        matched.sort(key=lambda x: x[1].get("detect_date",""), reverse=True)
+        log_key, rec = matched[0]
+
+        # 실제 진입가 처리
+        try:
+            actual_price = int(price_input) if price_input else rec.get("entry_price", 0)
+        except:
+            actual_price = rec.get("entry_price", 0)
+
+        rec["actual_entry"]       = True
+        rec["actual_entry_price"] = actual_price
+        # 실제 진입가로 손절/목표 재계산
+        if actual_price and actual_price != rec.get("entry_price", 0):
+            diff_ratio = actual_price / rec["entry_price"] if rec.get("entry_price") else 1
+            rec["stop_price"]    = int(rec.get("stop_price",  0) * diff_ratio / 10) * 10
+            rec["target_price"]  = int(rec.get("target_price", 0) * diff_ratio / 10) * 10
+
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        entry_p  = actual_price or rec.get("entry_price", 0)
+        stop_p   = rec.get("stop_price", 0)
+        target_p = rec.get("target_price", 0)
+        stop_pct  = round((stop_p   - entry_p) / entry_p * 100, 1) if entry_p else 0
+        tgt_pct   = round((target_p - entry_p) / entry_p * 100, 1) if entry_p else 0
+        send(f"✅ <b>[진입 확정]</b>\n"
+             f"━━━━━━━━━━━━━━━\n"
+             f"🟢 <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
+             f"━━━━━━━━━━━━━━━\n"
+             f"📍 실제 진입가: <b>{entry_p:,}원</b>\n"
+             f"🛡 손절가:  <b>{stop_p:,}원</b>  ({stop_pct:+.1f}%)\n"
+             f"🏆 목표가:  <b>{target_p:,}원</b>  ({tgt_pct:+.1f}%)\n"
+             f"━━━━━━━━━━━━━━━\n"
+             f"이 기준으로 자동 추적을 시작합니다.\n"
+             f"결과는 /result 로 직접 입력하거나\n"
+             f"목표가/손절가 도달 시 자동 확정됩니다.")
+        print(f"  ✅ 진입 확정: {rec['name']} {entry_p:,}원")
+    except Exception as e:
+        _log_error("_handle_entry_confirm_command", e)
+        send(f"⚠️ /진입 처리 오류: {e}")
+
+def _handle_skip_command(raw: str):
+    """
+    /skip 종목명 이유  처리
+    예) /skip 대주산업 시간없음
+    → actual_entry=False, skip_reason 기록
+    → 봇 학습: 어떤 상황에서 진입 기회를 놓치는지 패턴 분석
+    """
+    try:
+        parts      = raw.strip().split(maxsplit=2)
+        name_input = parts[1] if len(parts) > 1 else ""
+        reason     = parts[2] if len(parts) > 2 else "미입력"
+
+        if not name_input:
+            send("⚠️ 형식: /skip 종목명 이유\n예) /skip 대주산업 시간없음\n\n"
+                 "이유 예시: 시간없음 / 조건불일치 / 이미상승 / 분산투자 / 기타"); return
+
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
+        except: pass
+
+        matched_key  = None
+        matched_name = None
+        # 가장 최근 해당 종목 찾기
+        for key in sorted(data.keys(), reverse=True):
+            rec = data[key]
+            if name_input in rec.get("name", ""):
+                matched_key  = key
+                matched_name = rec["name"]
+                break
+
+        if not matched_key:
+            send(f"⚠️ '{name_input}' 종목을 찾을 수 없어요.\n/list 로 감시 중인 종목 확인"); return
+
+        data[matched_key]["actual_entry"]  = False
+        data[matched_key]["skip_reason"]   = reason
+        data[matched_key]["actual_pnl"]    = None
+
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        theo_pnl = data[matched_key].get("pnl_pct", 0)
+        theo_str = f"+{theo_pnl:.1f}%" if theo_pnl >= 0 else f"{theo_pnl:.1f}%"
+        send(
+            f"⏭ <b>진입 스킵 기록 완료</b>\n"
+            f"종목: <b>{matched_name}</b>\n"
+            f"이유: {reason}\n"
+            f"이론 수익률: {theo_str} (봇 학습에 반영됩니다)\n\n"
+            f"💡 스킵 패턴도 쌓이면 봇이 진입 타이밍을 개선해요."
+        )
+        print(f"  ⏭ 스킵 기록: {matched_name} / {reason}")
+
+    except Exception as e:
+        send(f"⚠️ 스킵 기록 오류: {e}")
 
 def _handle_result_command(raw: str):
     """
@@ -4773,13 +5200,19 @@ def _handle_result_command(raw: str):
                 break
 
         if sig_matched_key:
-            sig_data[sig_matched_key].update({
-                "status":      status,
-                "pnl_pct":     pnl,
-                "exit_date":   today,
-                "exit_time":   datetime.now().strftime("%H:%M:%S"),
-                "exit_reason": "수동입력",
-            })
+            rec = sig_data[sig_matched_key]
+            # 이론 수익률이 아직 없으면 함께 기록
+            if not rec.get("pnl_pct"):
+                rec["pnl_pct"]     = pnl
+                rec["status"]      = status
+                rec["exit_date"]   = today
+                rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
+                rec["exit_reason"] = "수동입력"
+            # 실제 진입 결과 기록 (별도 보존)
+            rec["actual_entry"]     = True
+            rec["actual_pnl"]       = pnl
+            rec["actual_exit_date"] = today
+            rec["skip_reason"]      = ""
             with open(SIGNAL_LOG_FILE, "w") as f:
                 json.dump(sig_data, f, ensure_ascii=False, indent=2)
 
@@ -4845,12 +5278,19 @@ def _send_stats():
             with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
         except: pass
 
-        completed = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
-        tracking  = [v for v in data.values() if v.get("status") == "추적중"]
+        # ── 이론 완료 (전체 — 봇 학습 + 신호 품질 평가용) ──
+        completed      = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
+        tracking       = [v for v in data.values() if v.get("status") == "추적중"]
+        # ── 실제 진입 (내 수익 통계용 — /result 또는 /진입 확인분만) ──
+        actual_entered = [v for v in data.values()
+                          if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
+        skipped        = [v for v in data.values() if v.get("actual_entry") is False]
+        unconfirmed    = [v for v in completed     if v.get("actual_entry") is None]
 
         if len(completed) < 3:
-            send(f"📊 아직 결과가 {len(completed)}건뿐이에요. (추적 중: {len(tracking)}건)\n"
+            send(f"📊 아직 이론 결과가 {len(completed)}건뿐이에요. (추적 중: {len(tracking)}건)\n"
                  f"결과가 쌓이면 자동으로 통계가 갱신돼요."); return
+
 
         type_labels = {
             "UPPER_LIMIT":  "🚨 상한가",
@@ -4863,15 +5303,61 @@ def _send_stats():
             "MANUAL":       "✏️ 수동",
         }
 
+        # ── 이론 통계 ──
         total_pnl  = [v["pnl_pct"] for v in completed]
         total_win  = sum(1 for p in total_pnl if p > 0)
         avg_pnl    = sum(total_pnl) / len(total_pnl)
         total_rate = total_win / len(total_pnl) * 100
 
-        msg = (f"📊 <b>자동 추적 성과 통계</b>\n"
-               f"완료 {len(completed)}건  |  추적 중 {len(tracking)}건\n"
-               f"전체 승률 <b>{total_rate:.0f}%</b>  |  평균 <b>{avg_pnl:+.1f}%</b>\n"
-               f"━━━━━━━━━━━━━━━\n")
+        # ── 실제 진입 통계 ──
+        actual_msg = ""
+        if actual_entered:
+            a_pnls = [v["actual_pnl"] for v in actual_entered]
+            a_win  = sum(1 for p in a_pnls if p > 0)
+            a_avg  = sum(a_pnls) / len(a_pnls)
+            a_rate = a_win / len(a_pnls) * 100
+            actual_msg = (f"💰 <b>내 실제 수익</b>  {len(actual_entered)}건\n"
+                          f"  승률 <b>{a_rate:.0f}%</b>  평균 <b>{a_avg:+.1f}%</b>\n")
+        elif unconfirmed:
+            actual_msg = f"❓ 확인 대기 {len(unconfirmed)}건  (/result 또는 /skip 로 기록)\n"
+
+        # ── 스킵 패턴 분석 ──
+        skip_msg = ""
+        if skipped:
+            skip_reasons = {}
+            for v in skipped:
+                r = v.get("skip_reason", "미입력")
+                skip_reasons[r] = skip_reasons.get(r, 0) + 1
+            skip_top = sorted(skip_reasons.items(), key=lambda x: -x[1])[:3]
+            skip_str = "  /  ".join([f"{r}:{n}건" for r, n in skip_top])
+            # 스킵한 신호들의 이론 수익률 평균 (기회비용)
+            skip_pnls = [v.get("pnl_pct", 0) for v in skipped if v.get("pnl_pct")]
+            opp_cost  = sum(skip_pnls) / len(skip_pnls) if skip_pnls else 0
+            skip_msg  = (f"⏭ <b>스킵</b>  {len(skipped)}건  (이론 평균 {opp_cost:+.1f}%)\n"
+                         f"  이유: {skip_str}\n")
+
+        # ── 진입미달 통계 ──
+        miss_all      = [v for v in data.values() if v.get("status") in ["진입미달", "진입가변경"]]
+        miss_surge    = sum(1 for v in miss_all if "상승이탈"   in str(v.get("exit_reason","")))
+        miss_expire   = sum(1 for v in miss_all if "기간만료"   in str(v.get("exit_reason","")))
+        miss_reentry  = sum(1 for v in miss_all if "진입가변경" in str(v.get("exit_reason","")))
+        cur_ratio     = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+
+        miss_msg = ""
+        if miss_all:
+            miss_msg = (f"⚠️ <b>진입 미달</b>  {len(miss_all)}건\n"
+                        f"  상승이탈 {miss_surge}건  기간만료 {miss_expire}건  재포착 {miss_reentry}건\n"
+                        f"  현재 진입가 비율: <b>{cur_ratio:.2f}</b>  (0.2=보수적 ↔ 0.7=공격적)\n")
+
+        msg = (f"📊 <b>신호 성과 통계</b>\n"
+               f"━━━━━━━━━━━━━━━\n"
+               f"🤖 <b>이론 수익률</b> (봇 학습 기준)  {len(completed)}건\n"
+               f"  승률 <b>{total_rate:.0f}%</b>  평균 <b>{avg_pnl:+.1f}%</b>  추적중 {len(tracking)}건\n"
+               f"━━━━━━━━━━━━━━━\n"
+               + actual_msg
+               + skip_msg
+               + miss_msg
+               + f"━━━━━━━━━━━━━━━\n")
 
         # 신호 유형별
         by_type = {}
@@ -5753,13 +6239,19 @@ def run_scan():
         check_entry_watch()     # ★ 진입가 도달 체크
         check_reentry_watch()   # ★ 손절 후 재진입 감시
         track_signal_results()  # ★ 추적 중 신호 결과 체크
-    except Exception as e: print(f"⚠️ 스캔 오류: {e}")
+    except Exception as e: _log_error("run_scan", e, critical=True)
 
 # ============================================================
 # 🚀 실행
 # ============================================================
 def _shutdown(reason: str = "정상 종료"):
-    """봇 자동 종료 — Railway Cron 환경에서 사용"""
+    """
+    봇 자동 종료 — Railway Cron 환경에서 사용.
+    Railway $5 플랜 400시간/월 제한 관리:
+      - 평일 22일 × 12.2시간(08:00~20:10) ≈ 268시간 → 400시간 이내 여유
+      - 공휴일 즉시 종료 (수 분 내) → 낭비 최소화
+      - 주말 Cron 미실행 (0-4 = 일~목 UTC = 월~금 KST)
+    """
     print(f"\n{'='*55}")
     print(f"🔴 봇 종료: {reason}  ({datetime.now().strftime('%H:%M')})")
     print(f"{'='*55}")
