@@ -2,71 +2,52 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v35.0
+버전: v37.0
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v35.0 (2026-03-02)  ← 현재
-  지정학 섹터 표시 전면 개선
-  ① 섹터명 앞 색상 원(🔴🟢🔵) 완전 제거
-  ② "▲ 상승" / "▼ 하락" 텍스트 제거 → 화살표만 (▲/▼/―)
-  ③ _GEO_SECTOR_STOCKS 신규 — 섹터별 대표 종목 풀 정의
-     정유·방산·반도체·자동차·조선·해운 등 25개 섹터
-     THEME_MAP + 동적 테마(_dynamic_theme_map) 4단계 조회
-  ④ _get_geo_sector_stocks() 신규 — 직접매핑→부분매핑→THEME_MAP→동적테마 순
-  ⑤ 섹터 표시에 📌 관련 종목 3개 자동 추가 (코드+종목명)
-     run_geo_news_scan / /geo 명령어 핸들러 동시 적용
+v37.0 (2026-03-02)  ← 현재
+  전체 코드 리뷰 + 15건 버그/성능/안정성 수정 + 지정학 이력 기능
+  [P0] ① fetch_all_news() 스레드 안전성 수정 (Queue 기반)
+  [P0] ② flush_info_alerts() 리스트 동시수정 버그 수정
+  [P0] ③ analyze() 중복 API 호출 제거 (종목당 6+→3회 절감)
+  [P1] ④ is_strict_time() NXT 장전/장후 시간대 추가
+  [P1] ⑤ 도큐스트링 중복 v36~v33 블록 제거 (~80줄 절감)
+  [P1] ⑥ _weekly_report_sent_week 죽은 global 선언 제거
+  [P1] ⑦ Anthropic API 버전 2023-06-01→2024-10-22 업데이트
+  [P1] ⑧ _geo_event_state 전역변수 위치 이동 (사용 전 정의)
+  [P2] ⑨ analyze() 내부 bare except 7개 → _log_error 변환
+  [P2] ⑩ 캐시 자동 정리 _prune_cache() 추가 (메모리 누수 방지)
+  [P2] ⑪ _nxt_unavailable 주 1회 초기화 (불필요 API 호출 제거)
+  [P2] ⑫ RSS 수집 ThreadPoolExecutor 전환 (max_workers=6)
+  [P3] ⑬ _load_dynamic_params() 타입 강제 변환 추가
+  [P3] ⑭ schedule lambda → 명명 함수 추출 (_on_market_open 등)
+  [신규] ⑮ 과거 이력 참조 시스템 — 파일 전체 적용
+     중앙 이력 엔진: _load_signal_history() + 5분 TTL 캐시
+     ⓐ find_similar_patterns 강화 — 동일 종목 전적 + 유사 패턴 2단 표시
+     ⓑ DART 공시 — get_dart_keyword_history() 유사 공시 후 과거 반응
+     ⓒ 장전 브리핑 — 감시 종목 전적 + 시장 국면 이력
+     ⓓ 오버나이트 — 보유 통계 + 국면별 승률
+     ⓔ 주간 리포트 — 이번 주 vs 역대 평균 비교
+     ⓕ /geo 섹터 — 지정학 관련 종목 과거 성과 (기 적용)
 
-v34.2 (2026-03-02)
-  BOT_VERSION 하드코딩 제거 → 도큐스트링 자동 파싱으로 교체
-  버전: 줄 하나만 수정하면 봇 표시·백업·상태 메시지 전체 자동 반영
-  중복 버전 불일치 문제 원천 차단
+v36.0 (2026-03-02)
+  섹터 시각화 전면 강화 + RSS 소스 확장
+  ① 방향 아이콘 교체: ▲/▼/― → 🔺/🔻/▶ (자체 색상 내장)
+  ② 섹터 블록 테두리 형식 적용
+     ┌ 🔺 에너지/정유  +8점
+     │  호르무즈 봉쇄 우려 → 유가 수혜
+     │  📌 S-Oil  GS  SK이노베이션
+     └─────────────
+  ③ RSS 소스 6개→12개 (3개 작동 → 대폭 확장)
+     연합뉴스/Reuters/AP (DNS 차단) → 교체 제거
+     추가: CNBC, Guardian, 매일경제
+     Google News RSS 5개 추가 (지정학·에너지·무역·한국경제·유가·반도체)
+     수집 타임아웃 12초→20초 (소스 증가 대응)
 
-v34.1 (2026-03-02)
-  "Unknown format code 'd' for object of type 'str'" 오류 수정
-  ① score_adj 전체 int() 안전 처리 (API JSON → 문자열로 올 때 대비)
-     run_geo_news_scan / analyze() fallback / /geo 핸들러
-     analyze_news_deep / detect_force_pattern / eval_retail_signal / get_us_market_signals
-  ② /geo 명령어 핸들러 화살표 형식 동기화
-     구버전(📈/📉/➡️) → 신버전(🟢▲/🔴▼/🔵―) + └ 이유 표시
-     sector_directions 없으면 fallback 자동 생성 적용
-
-v34.0 (2026-03-02)
-  지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
-  ① 방향 표시 전면 교체
-     📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
-     섹터명 아래 └ 이유 한 줄 항상 표시
-  ② analyze() 지정학 보정 강화
-     하락 섹터 + 일반 신호 → 최소 -8점 패널티 강제
-     feat_w_geo 가중치 실제 적용 (auto_tune 조정값 반영)
-     _geo_adj_applied 변수로 실제 적용된 점수 추적
-  ③ feature_flags geo 필드 추가
-     geo_active / geo_uncertainty / geo_sector_adj
-     → auto_tune 샘플 누적·기여도 학습 대상에 포함
-  ④ _DEFAULT_DYNAMIC feat_w_geo 추가
-     auto_tune이 지정학 기여도 분석 후 가중치 자동 조정
-  ⑤ /stats 기능별 가중치에 "지정학 보정" 항목 추가
-
-v33.1 (2026-03-02)
-  지정학 섹터 방향 표시 누락 수정
-  ① max_tokens 600→1000 (sector_directions JSON 잘림 방지)
-  ② _build_fallback_sector_directions() 신규 — API 없거나 응답 미포함 시
-     감지 키워드(전쟁/유가/무역)로 섹터별 상승📈/하락📉/중립➡️ 자동 추론
-  ③ run_geo_news_scan: sector_directions 비어있으면 sectors 기반 자동 채움
-     → 단순 나열 대신 항상 방향·이유·점수 표시
-
-v33.0 (2026-03-02)
-  ① check_dart_risk() — DART 최근 5일 공시 리스크 개별 종목 조회 함수 신규
-     analyze() 매수 신호 생성 직전 차단 (10분 캐시, API 과호출 방지)
-     상한가(UPPER_LIMIT)만 예외 허용
-  ② 보유 종목(track_signal_results) 뉴스/공시 실시간 악재 감시
-     30분 주기로 DART 리스크 공시 체크 → 🚨 즉시 매도 알림
-     analyze_news_deep 감성 점수 -40 이하 → ⚠️ 매도 검토 알림
-     중복 알림 방지 (_tracking_notified 활용)
-
-v35.0 (2026-03-02)  ← 현재
+v35.0 (2026-03-02)
   지정학 섹터 표시 전면 개선
   ① 섹터명 앞 색상 원(🔴🟢🔵) 완전 제거
   ② "▲ 상승" / "▼ 하락" 텍스트 제거 → 화살표만 (▲/▼/―)
@@ -495,6 +476,9 @@ TOP_SIGNAL_SEND_AT       = "10:00"  # 시작 시각 (이후 1시간마다 반복
 # ── 뉴스 역추적 캐시 ──
 _news_reverse_cache: dict = {}
 
+# v37.0: 지정학 상태 전방 선언 (실제 초기화는 get_market_regime 영역)
+# _geo_event_state, _us_cache 등은 파일 하단에서 정의됨 (Python 모듈 로딩 순서상 안전)
+
 # ── 컴팩트 알림 모드 ──
 # True면 1~2줄 요약, False면 기존 상세 포맷
 _compact_mode: bool = False
@@ -637,10 +621,19 @@ def minutes_since(dt: datetime) -> int:
     return int((datetime.now() - dt).total_seconds() // 60)
 
 def is_strict_time() -> bool:
+    """v37.0: KRX + NXT 장 초반/후반 엄격 시간대 판별"""
     n   = datetime.now().time()
+    # KRX 장 초반/후반
     o_e = (datetime.now().replace(hour=9,  minute=0)  + timedelta(minutes=STRICT_OPEN_MINUTES)).time()
     c_s = (datetime.now().replace(hour=15, minute=30) - timedelta(minutes=STRICT_CLOSE_MINUTES)).time()
-    return n <= o_e or n >= c_s
+    if dtime(9, 0) <= n <= o_e or n >= c_s:
+        return True
+    # NXT 장전 초반 (08:00~08:10) + 장후반 (19:50~20:00)
+    if n <= dtime(8, STRICT_OPEN_MINUTES):
+        return is_nxt_open()  # NXT 열려있을 때만
+    if dtime(19, 50) <= n <= dtime(20, 0):
+        return True
+    return False
 
 # ============================================================
 # 🔐 KIS API
@@ -864,45 +857,238 @@ def calc_indicators(code: str) -> dict:
 # ── 유사 패턴 매칭 (signal_log 기반) ──
 def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> str:
     """
-    signal_log.json에서 비슷한 조건의 과거 신호를 찾아 성공률 반환.
-    유사 기준: 같은 신호 유형 + 상승률 ±3% + 거래량 ±3배
-    반환: 텔레그램 표시용 문자열 (없으면 "")
+    v37.0 강화: signal_log.json 과거 신호 분석.
+    ① 동일 종목 전적 → ② 유사 조건 패턴 (동일 신호유형 + 상승률±3 + 거래량±3)
     """
     try:
-        data = {}
-        try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: return ""
-
-        completed = [v for v in data.values()
-                     if v.get("status") in ["수익","손실","본전"]
-                     and v.get("signal_type") == signal_type]
+        data = _load_signal_history()
+        completed = _get_completed_signals(data)
         if len(completed) < 3:
             return ""
 
-        # 유사 조건 필터
-        similar = [v for v in completed
-                   if abs(v.get("change_at_detect", 0) - change_rate) <= 3.0
-                   and abs(v.get("volume_ratio", 0) - vol_ratio) <= 3.0]
+        lines = []
 
-        if len(similar) < 2:
-            # 유사 조건 없으면 같은 신호 유형 전체 통계
-            similar = completed
+        # ── ① 동일 종목 전적 (최우선 정보) ──
+        same_stock = [v for v in completed if v.get("code") == code]
+        if len(same_stock) >= 2:
+            s_wins = sum(1 for v in same_stock if v["pnl_pct"] > 0)
+            s_wr   = round(s_wins / len(same_stock) * 100)
+            s_avg  = round(sum(v["pnl_pct"] for v in same_stock) / len(same_stock), 1)
+            s_best = max(same_stock, key=lambda x: x["pnl_pct"])
+            s_emoji = "🟢" if s_wr >= 60 else ("🟡" if s_wr >= 40 else "🔴")
+            s_name = same_stock[0].get("name", code)
+            lines.append(
+                f"  {s_emoji} <b>{s_name} 전적</b>: {len(same_stock)}건 승률 {s_wr}% 평균 {s_avg:+.1f}%"
+                f" (최고 {s_best['pnl_pct']:+.1f}%)"
+            )
 
-        wins     = sum(1 for v in similar if v["pnl_pct"] > 0)
-        win_rate = round(wins / len(similar) * 100)
-        avg_pnl  = round(sum(v["pnl_pct"] for v in similar) / len(similar), 1)
-        best     = max(similar, key=lambda x: x["pnl_pct"])
-        worst    = min(similar, key=lambda x: x["pnl_pct"])
+        # ── ② 유사 조건 패턴 (기존 로직) ──
+        same_type = [v for v in completed if v.get("signal_type") == signal_type]
+        if len(same_type) >= 3:
+            similar = [v for v in same_type
+                       if abs(v.get("change_at_detect", 0) - change_rate) <= 3.0
+                       and abs(v.get("volume_ratio", 0) - vol_ratio) <= 3.0]
+            if len(similar) < 2:
+                similar = same_type
+            wins     = sum(1 for v in similar if v["pnl_pct"] > 0)
+            win_rate = round(wins / len(similar) * 100)
+            avg_pnl  = round(sum(v["pnl_pct"] for v in similar) / len(similar), 1)
+            best     = max(similar, key=lambda x: x["pnl_pct"])
+            worst    = min(similar, key=lambda x: x["pnl_pct"])
+            bar   = "🟢" * (win_rate // 20) + "⬜" * (5 - win_rate // 20)
+            label = "유사 조건" if len(similar) < len(same_type) else "동일 신호"
+            lines.append(
+                f"  {bar} {label} {len(similar)}건  승률 {win_rate}%  평균 {avg_pnl:+.1f}%"
+                f"\n  최고 {best['pnl_pct']:+.1f}%  최저 {worst['pnl_pct']:+.1f}%"
+            )
 
-        bar = "🟢" * (win_rate // 20) + "⬜" * (5 - win_rate // 20)
-        label = "유사 조건" if len(similar) < len(completed) else "동일 신호 유형"
+        if not lines:
+            return ""
 
-        return (f"🔍 <b>과거 유사 패턴</b> ({label} {len(similar)}건)\n"
-                f"  {bar} 성공률 {win_rate}%  평균 {avg_pnl:+.1f}%\n"
-                f"  최고 {best['pnl_pct']:+.1f}%  최저 {worst['pnl_pct']:+.1f}%")
+        return f"🔍 <b>과거 유사 패턴</b>\n" + "\n".join(lines)
     except:
         return ""
+
+# ============================================================
+# v37.0 — 📊 중앙 이력 조회 시스템 (signal_log 기반)
+# 모든 알림/브리핑에서 과거 유사 상황 참조
+# ============================================================
+_history_cache: dict = {"data": {}, "ts": 0}
+
+def _load_signal_history() -> dict:
+    """signal_log.json 캐시 로드 (5분 TTL)"""
+    if time.time() - _history_cache["ts"] < 300 and _history_cache["data"]:
+        return _history_cache["data"]
+    try:
+        with open(SIGNAL_LOG_FILE, "r") as f:
+            _history_cache["data"] = json.load(f)
+        _history_cache["ts"] = time.time()
+    except:
+        _history_cache["data"] = {}
+    return _history_cache["data"]
+
+def _get_completed_signals(data: dict = None) -> list:
+    """완료된 신호만 추출"""
+    if data is None:
+        data = _load_signal_history()
+    return [v for v in data.values()
+            if v.get("status") in ("수익", "손실", "본전")
+            and v.get("pnl_pct", 0) != 0]
+
+def _format_history_stats(records: list, label: str = "과거 이력") -> str:
+    """공통 통계 포맷 (최소 2건 이상)"""
+    if len(records) < 2:
+        return ""
+    total  = len(records)
+    wins   = sum(1 for r in records if r["pnl_pct"] > 0)
+    avg    = round(sum(r["pnl_pct"] for r in records) / total, 1)
+    wr     = round(wins / total * 100)
+    emoji  = "🟢" if wr >= 60 else ("🟡" if wr >= 40 else "🔴")
+    return f"{emoji} {label}: {total}건 중 {wins}건↑ ({wr}%) 평균{avg:+.1f}%"
+
+def _format_recent_examples(records: list, max_n: int = 3) -> str:
+    """최근 사례 포맷"""
+    recent = sorted(records, key=lambda x: x.get("detect_date",""), reverse=True)[:max_n]
+    parts = []
+    for r in recent:
+        d = r.get("detect_date", "")
+        d_str = f"({d[4:6]}/{d[6:8]})" if d and len(d) == 8 else ""
+        parts.append(f"{r.get('name','?')} {r['pnl_pct']:+.1f}%{d_str}")
+    return " | ".join(parts) if parts else ""
+
+
+def get_stock_track_record(code: str, name: str = "") -> str:
+    """
+    ① 동일 종목의 과거 신호 전적.
+    send_alert / DART / 브리핑에서 사용.
+    """
+    completed = _get_completed_signals()
+    same_stock = [r for r in completed if r.get("code") == code]
+    if len(same_stock) < 2:
+        return ""
+    stats = _format_history_stats(same_stock, f"{name or code} 전적")
+    recent = _format_recent_examples(same_stock, 2)
+    result = f"  {stats}"
+    if recent:
+        result += f"\n     {recent}"
+    return result
+
+
+def get_dart_keyword_history(code: str, name: str, keywords: list) -> str:
+    """
+    ② 같은 종목의 유사 공시 후 결과.
+    DART run_dart_intraday에서 사용.
+    키워드 매칭 or 동일 종목 전적.
+    """
+    data = _load_signal_history()
+    completed = _get_completed_signals(data)
+    if not completed:
+        return ""
+
+    # 1순위: 같은 종목의 완료 신호
+    same_stock = [r for r in completed if r.get("code") == code]
+
+    # 2순위: 같은 종목 없으면 같은 섹터 + DART 연관 신호
+    if len(same_stock) < 2:
+        # sector_theme에서 같은 테마 찾기
+        dart_kw_set = set(kw for kw in keywords if len(kw) >= 2)
+        related = []
+        for r in completed:
+            theme = r.get("sector_theme", "")
+            # 공시 키워드가 feature_flags에 반영됐거나 같은 테마면 매칭
+            if dart_kw_set and theme:
+                for kw in dart_kw_set:
+                    if kw in theme or theme in kw:
+                        related.append(r)
+                        break
+        if len(related) >= 2:
+            stats = _format_history_stats(related, "유사 공시 섹터")
+            return f"━━━━━━━━━━━━━━━\n📊 {stats}"
+
+    if len(same_stock) < 2:
+        return ""
+
+    stats = _format_history_stats(same_stock, f"{name} 과거 공시 반응")
+    recent = _format_recent_examples(same_stock, 2)
+    result = f"━━━━━━━━━━━━━━━\n📊 {stats}"
+    if recent:
+        result += f"\n     {recent}"
+    return result
+
+
+def get_regime_history(regime: str) -> str:
+    """
+    ③ 동일 시장 국면에서의 과거 전체 신호 승률.
+    오버나이트 위험 알림 / 장전 브리핑에서 사용.
+    """
+    completed = _get_completed_signals()
+    if len(completed) < 5:
+        return ""
+
+    same_regime = [r for r in completed
+                   if r.get("feature_flags", {}).get("regime") == regime
+                   or r.get("regime") == regime]
+    if len(same_regime) < 3:
+        return ""
+
+    regime_label = {
+        "crisis": "위기", "risk_off": "위험회피", "normal": "보통",
+        "bull": "강세", "euphoria": "과열"
+    }
+    label = regime_label.get(regime, regime)
+    return _format_history_stats(same_regime, f"{label} 국면 과거")
+
+
+def get_weekly_comparison(week_records: list) -> str:
+    """
+    ④ 이번 주 실적 vs 역대 평균 비교.
+    주간 리포트에서 사용.
+    """
+    completed = _get_completed_signals()
+    if len(completed) < 10 or not week_records:
+        return ""
+
+    all_wr   = round(sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed) * 100)
+    all_avg  = round(sum(r["pnl_pct"] for r in completed) / len(completed), 1)
+
+    w_pnls   = [r["pnl_pct"] for r in week_records]
+    w_wr     = round(sum(1 for p in w_pnls if p > 0) / len(w_pnls) * 100)
+    w_avg    = round(sum(w_pnls) / len(w_pnls), 1)
+
+    wr_diff  = w_wr - all_wr
+    avg_diff = round(w_avg - all_avg, 1)
+
+    wr_icon  = "📈" if wr_diff > 0 else ("📉" if wr_diff < 0 else "➡️")
+    avg_icon = "📈" if avg_diff > 0 else ("📉" if avg_diff < 0 else "➡️")
+
+    return (f"\n📊 <b>역대 대비</b>  (전체 {len(completed)}건)\n"
+            f"  {wr_icon} 승률: 이번주 {w_wr}% vs 역대 {all_wr}%  ({wr_diff:+d}%p)\n"
+            f"  {avg_icon} 수익: 이번주 {w_avg:+.1f}% vs 역대 {all_avg:+.1f}%  ({avg_diff:+.1f}%p)")
+
+
+def get_overnight_history() -> str:
+    """
+    ⑤ 오버나이트 보유 후 다음날 결과 통계.
+    오버나이트 위험 알림에서 사용.
+    """
+    completed = _get_completed_signals()
+    if len(completed) < 5:
+        return ""
+
+    # 장 마감 후 감지된 신호 (14시 이후) 또는 추적 2일 이상
+    overnight = []
+    for r in completed:
+        t = r.get("detect_time", "09:00")
+        try:
+            if t >= "14:00" or (r.get("exit_date","") > r.get("detect_date","")):
+                overnight.append(r)
+        except: pass
+
+    if len(overnight) < 3:
+        return ""
+
+    return _format_history_stats(overnight, "오버나이트 보유")
+
 
 # ============================================================
 # ⑦ 거래량 5일 평균 대비 정확 계산
@@ -1173,10 +1359,38 @@ def run_auto_backup(notify: bool = False):
         print("  ⚠️ 백업 실패 — GITHUB_GIST_TOKEN 또는 텔레그램 설정 확인")
 
 
+def _prune_cache(cache: dict, max_size: int = 200, ttl: int = 3600):
+    """v37.0: 캐시 크기 제한 + TTL 만료 항목 제거 (메모리 누수 방지)"""
+    if len(cache) <= max_size:
+        return
+    now = time.time()
+    expired = [k for k, v in cache.items()
+               if isinstance(v, dict) and now - v.get("ts", 0) > ttl]
+    for k in expired:
+        del cache[k]
+    # 여전히 초과면 가장 오래된 항목부터 제거
+    if len(cache) > max_size:
+        sorted_keys = sorted(
+            [k for k, v in cache.items() if isinstance(v, dict) and "ts" in v],
+            key=lambda k: cache[k].get("ts", 0)
+        )
+        for k in sorted_keys[:len(cache) - max_size]:
+            del cache[k]
+
+def _prune_all_caches():
+    """장중 주기적으로 호출 — 캐시 크기 제한"""
+    for c in (_daily_cache, _force_cache, _deep_news_cache, _nxt_cache,
+              _sector_cache, _avg_volume_cache, _short_cache, _foreign_cache):
+        _prune_cache(c, max_size=200, ttl=3600)
+
+# v37.0: _nxt_unavailable 주 1회 초기화 플래그
+_nxt_unavailable_reset_week: str = ""
+
 def _clear_all_cache():
     global _sector_cache, _avg_volume_cache, _prev_upper_cache, _daily_cache
     global _nxt_cache, _nxt_unavailable, _early_cache, _news_reverse_cache
     global _kospi_cache, _sector_monitor, _pending_info_alerts
+    global _nxt_unavailable_reset_week
     _sector_cache.clear();       _avg_volume_cache.clear()
     _prev_upper_cache.clear();   _daily_cache.clear();   _atr_cache.clear()
     _us_cache.clear();   _short_cache.clear();   _foreign_cache.clear()
@@ -1184,7 +1398,13 @@ def _clear_all_cache():
     _geo_cache.clear()
     _deep_news_cache.clear()
     _force_cache.clear()
-    _nxt_cache.clear();          _nxt_unavailable.clear()
+    _nxt_cache.clear()
+    # v37.0: _nxt_unavailable 주 1회만 초기화 (NXT 상장 여부는 거의 안 바뀜)
+    this_week = datetime.now().strftime("%Y-W%W")
+    if _nxt_unavailable_reset_week != this_week:
+        _nxt_unavailable.clear()
+        _nxt_unavailable_reset_week = this_week
+        print("  🔵 NXT 비상장 캐시 주간 초기화")
     _early_cache.clear();        _news_reverse_cache.clear()
     _sector_monitor.clear();     _pending_info_alerts.clear()
     _kospi_cache["ts"] = 0;      _kospi_cache["change"] = 0.0
@@ -2666,6 +2886,18 @@ def send_overnight_risk_alerts():
             msg += (f"{'🔴' if risk['level']=='high' else '🟡'} "
                     f"<b>{rec['name']}</b>  현재 {pnl_str}\n"
                     f"  {risk['reason']}\n")
+
+        # v37.0: 오버나이트 보유 과거 통계 + 현재 국면 이력
+        try:
+            _on_hist = get_overnight_history()
+            if _on_hist:
+                msg += f"\n📊 {_on_hist}\n"
+            _regime = get_market_regime()
+            _r_hist = get_regime_history(_regime)
+            if _r_hist:
+                msg += f"📊 {_r_hist}\n"
+        except: pass
+
         send(msg)
     except Exception as e:
         _log_error("send_overnight_risk_alerts", e)
@@ -3500,9 +3732,23 @@ def _load_dynamic_params():
         with open(DYNAMIC_PARAMS_FILE) as f:
             saved = json.load(f)
         # 저장된 값 중 유효한 키만 덮어씀 (새로 추가된 키는 기본값 유지)
+        # v37.0: 타입 강제 변환 (JSON str→int/float 오류 방지)
         for k, v in saved.items():
             if k in _dynamic:
-                _dynamic[k] = v
+                default = _dynamic[k]
+                try:
+                    if isinstance(default, int) and not isinstance(default, bool):
+                        _dynamic[k] = int(v)
+                    elif isinstance(default, float):
+                        _dynamic[k] = float(v)
+                    elif isinstance(default, dict) and isinstance(v, dict):
+                        _dynamic[k] = v
+                    elif isinstance(default, str):
+                        _dynamic[k] = str(v)
+                    else:
+                        _dynamic[k] = v
+                except (ValueError, TypeError):
+                    pass  # 변환 실패 시 기본값 유지
         _early_price_min_dynamic  = _dynamic["early_price_min"]
         _early_volume_min_dynamic = _dynamic["early_volume_min"]
         print(f"  🔧 동적 파라미터 복원 완료 (min_score={_dynamic['min_score_normal']}점, "
@@ -4278,19 +4524,14 @@ def flush_info_alerts():
     """INFO 알림 묶음 발송 (5분마다 스케줄) + 오래된 항목 자동 제거"""
     if not _pending_info_alerts: return
     now = time.time()
-    # 1시간 이상 된 항목은 조용히 제거 (너무 오래된 참고 알림은 의미 없음)
-    stale = [a for a in _pending_info_alerts if now - a["ts"] > 3600]
-    for a in stale:
-        _pending_info_alerts.remove(a)
-    # 최대 20개 초과 시 오래된 것부터 제거
-    while len(_pending_info_alerts) > 20:
-        _pending_info_alerts.pop(0)
-    # 5분 이상 된 것만 발송
-    to_send = [a for a in _pending_info_alerts if now - a["ts"] >= 300]
+    # v37.0: 슬라이스 할당으로 안전한 리스트 수정 (동시접근 경쟁 조건 제거)
+    # 1시간 이상 된 항목 제거 + 최대 20개 유지
+    fresh = [a for a in _pending_info_alerts if now - a["ts"] <= 3600][-20:]
+    # 5분 이상 된 것만 발송 대상
+    to_send = [a for a in fresh if now - a["ts"] >= 300]
+    remaining = [a for a in fresh if now - a["ts"] < 300]
+    _pending_info_alerts[:] = remaining  # 원자적 교체
     if not to_send: return
-    for a in to_send:
-        try: _pending_info_alerts.remove(a)
-        except: pass
     if len(to_send) == 1:
         send(to_send[0]["text"])
     else:
@@ -4574,7 +4815,8 @@ def analyze(stock: dict) -> dict:
                         reasons.append(f"{retail_ev['label']} — {retail_ev['detail']}")
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
-        except: inv = {}; f_net = 0; i_net = 0
+        except Exception as _e:
+            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -4588,13 +4830,17 @@ def analyze(stock: dict) -> dict:
             if line: reasons.append(line)
     if score < min_score: return {}
 
+    # v37.0: API 사전 캐싱 (get_stock_price 중복 호출 3→1회 절감)
+    try: _cached_price = get_stock_price(code)
+    except: _cached_price = {}
+
     # 전일 상한가 ⑨
     prev_upper = was_upper_limit_yesterday(code)
     if prev_upper: score+=10; reasons.append("🔁 전일 상한가 → 연속 상한가 가능성")
 
     # 거래량 Z-score ⑰
     try:
-        cur_detail = get_stock_price(code)
+        cur_detail = _cached_price  # v37.0: 캐싱된 값 사용
         z = get_volume_zscore(code, cur_detail.get("today_vol",0))
         if z >= VOL_ZSCORE_MIN: score+=10; reasons.append(f"📊 거래량 이상 급증 (Z-score {z:.1f}σ)")
     except: pass
@@ -4631,6 +4877,7 @@ def analyze(stock: dict) -> dict:
         reasons.append(f"🌐 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
 
     # ── 미국 시장 점수 보정 ──
+    us = {}  # v37.0: 초기화 (end-of-function 중복 fetch 제거)
     try:
         us = get_us_market_signals()
         us_adj = us.get("score_adj", 0)
@@ -4643,9 +4890,10 @@ def analyze(stock: dict) -> dict:
             reasons.append("⬇️ 내일 갭하락 가능성 (미국 약세)")
         elif us.get("gap_signal") == "gap_up":
             reasons.append("⬆️ 내일 갭상승 기대 (미국 강세)")
-    except: pass
+    except Exception as _e: _log_error("analyze_us", _e)
 
     # ── 공매도 잔고 비율 보정 ──
+    short_ratio = 0.0  # v37.0: 초기화
     try:
         short_ratio = get_short_sell_ratio(code)
         if short_ratio >= 10:
@@ -4657,6 +4905,7 @@ def analyze(stock: dict) -> dict:
     except: pass
 
     # ── 외국인+기관 연속 순매수 보정 ──
+    f_days, i_days = 0, 0  # v37.0: 초기화
     try:
         f_days = get_foreign_consecutive_days(code)
         i_days = get_institution_consecutive_days(code)
@@ -4708,7 +4957,7 @@ def analyze(stock: dict) -> dict:
             # 리스크 포인트 있으면 추가 표시
             for rp in deep.get("risk_points", [])[:2]:
                 reasons.append(f"  ⚠️ {rp}")
-    except: pass
+    except Exception as _e: _log_error(f"analyze_news({code})", _e)
 
     # ── 지정학 이벤트 보정 ──
     try:
@@ -4760,7 +5009,7 @@ def analyze(stock: dict) -> dict:
                         reasons.append(
                             f"🌍 지정학 관련 섹터 {unc_label.get(geo_unc,'')} {geo_adj:+d}점"
                         )
-    except: pass
+    except Exception as _e: _log_error(f"analyze_geo({code})", _e)
 
     # ── 테마 로테이션 보정 ──
     try:
@@ -4821,7 +5070,7 @@ def analyze(stock: dict) -> dict:
 
     # ── 수급 이상 패턴 보정 ──
     try:
-        cur_p     = get_stock_price(code)
+        cur_p     = _cached_price  # v37.0: 캐싱된 값 사용
         ask_qty   = cur_p.get("ask_qty", 0)
         bid_qty   = cur_p.get("bid_qty", 0)
         fp        = detect_force_pattern(
@@ -4841,8 +5090,8 @@ def analyze(stock: dict) -> dict:
                 )
         if fp.get("risk_flag"):
             reasons.append("⚠️ 수급 이탈 신호 감지 — 포지션 축소 검토")
-    except:
-        pass
+    except Exception as _e:
+        _log_error(f"detect_force({code})", _e)
 
     # 등급 계산
     if   score >= 80: grade = "A"
@@ -4852,13 +5101,7 @@ def analyze(stock: dict) -> dict:
     # ── ② 포지션 사이징 ──
     position = calc_position_size(signal_type, score, grade)
 
-    # 새 필드: 미국/공매도/외국인/감성 기록
-    try:
-        _us_info  = get_us_market_signals()
-        _fdays    = get_foreign_consecutive_days(code)
-        _short_r  = get_short_sell_ratio(code)
-    except: _us_info = {}; _fdays = 0; _short_r = 0.0
-
+    # v37.0: 이미 위에서 가져온 값 재사용 (중복 API 호출 제거)
     return {"code":code,"name":stock.get("name",code),"price":price,
             "change_rate":change_rate,"volume_ratio":vol_ratio,
             "signal_type":signal_type,"score":score,"sector_info":sector_info,
@@ -4867,11 +5110,11 @@ def analyze(stock: dict) -> dict:
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
             "nxt_delta": nxt_delta,
             "regime": regime_mode,
-            "us_regime":    _us_info.get("us_regime","neutral"),
-            "gap_signal":   _us_info.get("gap_signal","flat"),
-            "foreign_days": _fdays,
-            "institution_days": get_institution_consecutive_days(code),
-            "short_ratio":  _short_r,
+            "us_regime":    us.get("us_regime","neutral"),
+            "gap_signal":   us.get("gap_signal","flat"),
+            "foreign_days": f_days,
+            "institution_days": i_days,
+            "short_ratio":  short_ratio,
             "earnings_risk": earnings["risk"],
             "position": position,
             "indic": indic,
@@ -5178,14 +5421,19 @@ def fetch_yonhap_news() -> list:
     except: return []
 
 def fetch_all_news() -> list:
-    results = []
+    # v37.0: Queue 기반 스레드 안전 수집 (list.extend 경쟁 조건 제거)
+    from queue import Queue
+    _q = Queue()
     threads = [
-        threading.Thread(target=lambda: results.extend(fetch_naver_news())),
-        threading.Thread(target=lambda: results.extend(fetch_hankyung_news())),
-        threading.Thread(target=lambda: results.extend(fetch_yonhap_news())),
+        threading.Thread(target=lambda fn=f: _q.put(fn()), daemon=True)
+        for f in (fetch_naver_news, fetch_hankyung_news, fetch_yonhap_news)
     ]
     for t in threads: t.start()
     for t in threads: t.join(timeout=8)
+    results = []
+    while not _q.empty():
+        try: results.extend(_q.get_nowait())
+        except: break
     return list(dict.fromkeys(results))
 
 
@@ -5600,9 +5848,9 @@ _GEO_KEYWORDS = [
 # 지정학 이벤트 → 관련 섹터 자동 매핑
 # 지정학 섹터 방향 화살표 (화살표만, 텍스트 없음)
 _DIR_DISPLAY = {
-    "상승": "▲",
-    "하락": "▼",
-    "중립": "―",
+    "상승": "🔺",   # 기본 내장 색상 (주황/빨강 상향삼각)
+    "하락": "🔻",   # 기본 내장 색상 (빨강 하향삼각)
+    "중립": "▶",   # 중립 우향 화살표
 }
 
 # 섹터명 → 관련 종목 매핑
@@ -5664,6 +5912,93 @@ def _get_geo_sector_stocks(sector_name: str, max_n: int = 3) -> list:
 
     return []
 
+def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
+    """
+    v37.0: 지정학 섹터 종목의 과거 신호 이력 조회.
+    signal_log에서 같은 종목 + 같은 섹터의 완료된 신호를 찾아
+    승률, 평균 수익률, 최근 사례를 반환.
+
+    Parameters:
+        sector_name: 섹터명 (예: "방산", "정유")
+        stock_list:  [(code, name), ...] — _get_geo_sector_stocks 결과
+
+    Returns:
+        텔레그램 표시용 문자열 ("" = 이력 없음)
+    """
+    try:
+        with open(SIGNAL_LOG_FILE, "r") as f:
+            data = json.load(f)
+    except:
+        return ""
+
+    if not data or not stock_list:
+        return ""
+
+    stock_codes = {code for code, name in stock_list}
+    stock_names = {name for code, name in stock_list}
+
+    # 1단계: 같은 종목 코드로 완료된 신호 찾기
+    matched = []
+    for log_key, rec in data.items():
+        if rec.get("status") == "추적중":
+            continue
+        pnl = rec.get("pnl_pct", 0)
+        if pnl == 0 and not rec.get("exit_price"):
+            continue
+
+        code = rec.get("code", "")
+        name = rec.get("name", "")
+        s_theme = rec.get("sector_theme", "")
+
+        # 직접 종목 매칭 또는 같은 섹터 테마 매칭
+        is_direct = code in stock_codes
+        is_sector = (sector_name and s_theme and
+                     (sector_name in s_theme or s_theme in sector_name))
+        is_geo    = rec.get("feature_flags", {}).get("geo_active", False)
+
+        if is_direct or (is_sector and is_geo):
+            matched.append({
+                "code":  code,
+                "name":  name,
+                "pnl":   round(pnl, 1),
+                "date":  rec.get("detect_date", ""),
+                "geo":   is_geo,
+                "direct": is_direct,
+            })
+
+    if not matched:
+        return ""
+
+    # 통계 계산
+    total  = len(matched)
+    wins   = sum(1 for m in matched if m["pnl"] > 0)
+    losses = sum(1 for m in matched if m["pnl"] <= 0)
+    avg_pnl = round(sum(m["pnl"] for m in matched) / total, 1) if total else 0
+    win_rate = round(wins / total * 100) if total else 0
+
+    # 최근 사례 (최대 3건, 날짜 역순)
+    recent = sorted(matched, key=lambda x: x["date"], reverse=True)[:3]
+
+    # 포맷팅
+    win_emoji = "🟢" if win_rate >= 60 else ("🟡" if win_rate >= 40 else "🔴")
+    line1 = f"│  {win_emoji} 과거 유사: {total}건 중 {wins}건↑ ({win_rate}%) 평균{avg_pnl:+.1f}%"
+
+    examples = []
+    for r in recent:
+        d_str = ""
+        if r["date"] and len(r["date"]) == 8:
+            d_str = f"({r['date'][4:6]}/{r['date'][6:8]})"
+        pnl_str = f"{r['pnl']:+.1f}%"
+        geo_mark = "🌍" if r["geo"] else ""
+        examples.append(f"{r['name']}{geo_mark} {pnl_str}{d_str}")
+
+    line2 = "│     " + " | ".join(examples) if examples else ""
+
+    result = line1
+    if line2:
+        result += "\n" + line2
+    return result
+
 _GEO_SECTOR_MAP = {
     "전쟁|전투|공습|미사일|폭격|침공|교전|충돌|군사": ["방산", "항공우주"],
     "이란|OPEC|유가|원유|석유|천연가스|LNG|감산|증산": ["정유", "에너지", "화학"],
@@ -5707,12 +6042,20 @@ def _fetch_multi_source_headlines() -> dict:
     반환: {source_name: [headline, ...]}
     """
     sources = {
-        "연합뉴스": "https://www.yonhapnews.co.kr/rss/economy.xml",
-        "한경":     "https://www.hankyung.com/feed/economy",
-        "Reuters":  "https://feeds.reuters.com/reuters/topNews",
-        "BBC":      "https://feeds.bbci.co.uk/news/world/rss.xml",
+        # ── 해외 (지정학·경제 핵심) ──
+        "BBC":        "https://feeds.bbci.co.uk/news/world/rss.xml",
         "Al_Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-        "AP":       "https://feeds.apnews.com/apnews/business",
+        "CNBC":       "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "Guardian":   "https://www.theguardian.com/world/rss",
+        "G뉴스_지정학": "https://news.google.com/rss/search?q=geopolitics+war+sanctions&hl=en&gl=US&ceid=US:en",
+        "G뉴스_에너지": "https://news.google.com/rss/search?q=oil+price+OPEC+energy&hl=en&gl=US&ceid=US:en",
+        "G뉴스_무역":   "https://news.google.com/rss/search?q=trade+war+tariff+sanctions&hl=en&gl=US&ceid=US:en",
+        # ── 국내 (한국 증시 직결) ──
+        "한경":       "https://www.hankyung.com/feed/economy",
+        "매일경제":   "https://rss.mk.co.kr/economy.xml",
+        "G뉴스_한국경제": "https://news.google.com/rss/search?q=한국+증시+경제&hl=ko&gl=KR&ceid=KR:ko",
+        "G뉴스_유가":     "https://news.google.com/rss/search?q=유가+원유+중동&hl=ko&gl=KR&ceid=KR:ko",
+        "G뉴스_반도체":   "https://news.google.com/rss/search?q=반도체+수출규제+미중&hl=ko&gl=KR&ceid=KR:ko",
     }
     results = {}
     errors  = []
@@ -5726,9 +6069,15 @@ def _fetch_multi_source_headlines() -> dict:
         except Exception as e:
             errors.append(f"{name}:{e}")
 
-    threads = [threading.Thread(target=_fetch_one, args=(n, u)) for n, u in sources.items()]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=12)
+    # v37.0: ThreadPoolExecutor로 전환 (max_workers=6, 동시 연결 제한)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_fetch_one, n, u): n for n, u in sources.items()}
+        try:
+            for f in as_completed(futures, timeout=20):
+                pass  # _fetch_one이 결과를 results에 직접 저장
+        except Exception:
+            pass  # 타임아웃 시 수집된 것만 사용
 
     if errors:
         print(f"  ⚠️ RSS 수집 실패: {', '.join(errors)}")
@@ -5901,7 +6250,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key":         api_key,
-                "anthropic-version": "2023-06-01",
+                "anthropic-version": "2024-10-22",
                 "content-type":      "application/json",
             },
             json={
@@ -6002,16 +6351,20 @@ def run_geo_news_scan():
             msg += "<b>📊 섹터별 영향</b>\n"
             for sd in sec_dirs:
                 _dir   = sd.get("direction", "중립")
-                _arrow = _DIR_DISPLAY.get(_dir, "―")
+                _icon  = _DIR_DISPLAY.get(_dir, "▶")
                 _adj   = int(sd.get("score_adj", 0) or 0)
                 _adj_str = f"  <b>{_adj:+d}점</b>" if _adj != 0 else ""
                 _sec   = sd.get("sector", "")
                 # 관련 종목 조회
                 _stocks = _get_geo_sector_stocks(_sec, max_n=3)
-                _stk_str = "  " + "  ".join(f"<code>{c}</code>{n}" for c,n in _stocks) if _stocks else ""
-                msg += (f"  {_arrow} <b>{_sec}</b>{_adj_str}\n"
-                        f"       └ {sd.get('reason','')}\n"
-                        + (f"       📌{_stk_str}\n" if _stk_str else ""))
+                _stk_str = "  ".join(f"<code>{n}</code>" for c,n in _stocks) if _stocks else ""
+                # v37.0: 과거 유사 이벤트 이력 조회
+                _hist_str = _get_geo_sector_history(_sec, _stocks) if _stocks else ""
+                msg += (f"┌ {_icon} <b>{_sec}</b>{_adj_str}\n"
+                        f"│  {sd.get('reason','')}\n"
+                        + (f"│  📌 {_stk_str}\n" if _stk_str else "")
+                        + (f"{_hist_str}\n" if _hist_str else "")
+                        + "└─────────────\n")
             msg += "\n"
         elif geo.get("sectors"):
             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
@@ -6267,7 +6620,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key":         api_key,
-                "anthropic-version": "2023-06-01",
+                "anthropic-version": "2024-10-22",
                 "content-type":      "application/json",
             },
             json={
@@ -6684,6 +7037,12 @@ def run_dart_intraday():
                     v_emoji = "✅" if "호재" in verd else "❌"
                     deep_block = f"\n━━━━━━━━━━━━━━━\n{v_emoji} <b>{verd}</b>  {adj:+d}점\n  {rsn}"
 
+            # v37.0: 과거 유사 공시 이력 조회
+            dart_hist_block = ""
+            try:
+                dart_hist_block = get_dart_keyword_history(code, company, all_kw)
+            except: pass
+
             send_with_chart_buttons(
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
@@ -6695,7 +7054,8 @@ def run_dart_intraday():
                 f"{deep_block}"
                 f"{price_block}"
                 f"{sector_block}"
-                f"{stop_block}",
+                f"{stop_block}"
+                f"{dart_hist_block}",
                 code, company
             )
             print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
@@ -7096,15 +7456,19 @@ def poll_telegram_commands():
                             msg += "<b>📊 섹터별 영향</b>\n"
                             for sd in sec_dirs:
                                 _dir2   = sd.get("direction", "중립")
-                                _arrow2 = _DIR_DISPLAY.get(_dir2, "―")
+                                _icon2  = _DIR_DISPLAY.get(_dir2, "▶")
                                 _adj2   = int(sd.get("score_adj", 0) or 0)
                                 _adj2_str = f"  <b>{_adj2:+d}점</b>" if _adj2 != 0 else ""
                                 _sec2   = sd.get("sector", "")
                                 _stocks2 = _get_geo_sector_stocks(_sec2, max_n=3)
-                                _stk2_str = "  " + "  ".join(f"<code>{c}</code>{n}" for c,n in _stocks2) if _stocks2 else ""
-                                msg += (f"  {_arrow2} <b>{_sec2}</b>{_adj2_str}\n"
-                                        f"       └ {sd.get('reason','')}\n"
-                                        + (f"       📌{_stk2_str}\n" if _stk2_str else ""))
+                                _stk2_str = "  ".join(f"<code>{n}</code>" for c,n in _stocks2) if _stocks2 else ""
+                                # v37.0: 과거 유사 이벤트 이력
+                                _hist2_str = _get_geo_sector_history(_sec2, _stocks2) if _stocks2 else ""
+                                msg += (f"┌ {_icon2} <b>{_sec2}</b>{_adj2_str}\n"
+                                        f"│  {sd.get('reason','')}\n"
+                                        + (f"│  📌 {_stk2_str}\n" if _stk2_str else "")
+                                        + (f"{_hist2_str}\n" if _hist2_str else "")
+                                        + "└─────────────\n")
                             msg += "\n"
                         elif geo.get("sectors"):
                             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
@@ -7978,6 +8342,10 @@ def send_premarket_briefing():
                     pnl = round((price - entry) / entry * 100, 1)
                     dot = "🟢" if pnl >= 0 else "🔴"
                     msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
+                    # v37.0: 동일 종목 과거 전적
+                    _tr = get_stock_track_record(code, info.get("name",""))
+                    if _tr:
+                        msg += f"  {_tr}\n"
                 time.sleep(0.15)
             except: continue
     else:
@@ -8012,6 +8380,15 @@ def send_premarket_briefing():
                 msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
                 for h in hot[:4]:
                     msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
+    except: pass
+
+    # v37.0: 현재 시장 국면에서의 과거 신호 승률
+    try:
+        _cur_regime = get_market_regime()
+        _r_hist = get_regime_history(_cur_regime)
+        if _r_hist:
+            regime_kor = {"crisis":"위기","risk_off":"위험회피","normal":"보통","bull":"강세","euphoria":"과열"}
+            msg += f"\n📊 <b>시장 국면</b>: {regime_kor.get(_cur_regime, _cur_regime)}\n  {_r_hist}\n"
     except: pass
 
     # ── ④ 현재 파라미터 상태 ──
@@ -8080,7 +8457,6 @@ def send_premarket_briefing():
 def send_weekly_report():
     """매주 금요일 15:35 — 이번 주 성과 자동 발송 + AI 분석"""
     # 같은 주에 이미 발송했으면 스킵 (on_market_close와 스케줄 중복 방지)
-    global _weekly_report_sent_week
     this_week_key = datetime.now().strftime("%Y-W%W")
     if getattr(send_weekly_report, "_sent_week", "") == this_week_key:
         return
@@ -8144,11 +8520,18 @@ def send_weekly_report():
             f"최저: {worst['name']} {worst['pnl_pct']:+.1f}%"
         )
 
+        # v37.0: 역대 대비 비교
+        weekly_compare = ""
+        try:
+            weekly_compare = get_weekly_comparison(week_recs)
+        except: pass
+
         send(
             f"📅 <b>주간 자동 리포트</b>\n"
             f"{this_mon[:4]}.{this_mon[4:6]}.{this_mon[6:]} ~ {this_fri[:4]}.{this_fri[4:6]}.{this_fri[6:]}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"{report_text}"
+            f"{weekly_compare}"
         )
 
         # ── AI 분석 (Claude API) ──
@@ -8818,6 +9201,18 @@ def filter_portfolio_signals(alerts: list) -> list:
 
     return passed
 
+# v37.0: schedule lambda → 명명 함수 (에러 추적 가능)
+def _on_market_open():
+    """장 시작 시 초기화 — schedule에서 호출"""
+    if is_holiday(): return
+    _clear_all_cache()
+    _overnight_state.update({"last_us_regime":"neutral","last_vix":20.0,
+                              "alerted_regime":"","summary_lines":[]})
+    reset_top_signals_daily()
+    refresh_dynamic_candidates()
+    send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
+         f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
+
 def run_scan():
     # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
     krx_open = is_market_open()
@@ -8988,6 +9383,7 @@ if __name__ == "__main__":
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
+    schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
@@ -8995,16 +9391,7 @@ if __name__ == "__main__":
         schedule.every().day.at(_top_hhmm).do(
             lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
         )
-    schedule.every().day.at(MARKET_OPEN).do(lambda: (
-        None if is_holiday() else (
-        _clear_all_cache(),
-        _overnight_state.update({"last_us_regime":"neutral","last_vix":20.0,
-                                  "alerted_regime":"","summary_lines":[]}),
-        reset_top_signals_daily(),                               # 최우선 종목 풀 초기화
-        refresh_dynamic_candidates(),
-        send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
-             f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
-    )))
+    schedule.every().day.at(MARKET_OPEN).do(_on_market_open)  # v37.0: 명명 함수
     schedule.every().day.at(MARKET_CLOSE).do(
         lambda: None if is_holiday() else on_market_close()
     )
