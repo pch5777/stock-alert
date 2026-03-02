@@ -2,13 +2,119 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v31.8
-날짜: 2026-03-01
+버전: v34.0
+날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v31.8 (2026-03-02)  ← 현재
+v34.0 (2026-03-02)  ← 현재
+  지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
+  ① 방향 표시 전면 교체
+     📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
+     섹터명 아래 └ 이유 한 줄 항상 표시
+  ② analyze() 지정학 보정 강화
+     하락 섹터 + 일반 신호 → 최소 -8점 패널티 강제
+     feat_w_geo 가중치 실제 적용 (auto_tune 조정값 반영)
+     _geo_adj_applied 변수로 실제 적용된 점수 추적
+  ③ feature_flags geo 필드 추가
+     geo_active / geo_uncertainty / geo_sector_adj
+     → auto_tune 샘플 누적·기여도 학습 대상에 포함
+  ④ _DEFAULT_DYNAMIC feat_w_geo 추가
+     auto_tune이 지정학 기여도 분석 후 가중치 자동 조정
+  ⑤ /stats 기능별 가중치에 "지정학 보정" 항목 추가
+
+v33.1 (2026-03-02)
+  지정학 섹터 방향 표시 누락 수정
+  ① max_tokens 600→1000 (sector_directions JSON 잘림 방지)
+  ② _build_fallback_sector_directions() 신규 — API 없거나 응답 미포함 시
+     감지 키워드(전쟁/유가/무역)로 섹터별 상승📈/하락📉/중립➡️ 자동 추론
+  ③ run_geo_news_scan: sector_directions 비어있으면 sectors 기반 자동 채움
+     → 단순 나열 대신 항상 방향·이유·점수 표시
+
+v33.0 (2026-03-02)
+  ① check_dart_risk() — DART 최근 5일 공시 리스크 개별 종목 조회 함수 신규
+     analyze() 매수 신호 생성 직전 차단 (10분 캐시, API 과호출 방지)
+     상한가(UPPER_LIMIT)만 예외 허용
+  ② 보유 종목(track_signal_results) 뉴스/공시 실시간 악재 감시
+     30분 주기로 DART 리스크 공시 체크 → 🚨 즉시 매도 알림
+     analyze_news_deep 감성 점수 -40 이하 → ⚠️ 매도 검토 알림
+     중복 알림 방지 (_tracking_notified 활용)
+
+v34.0 (2026-03-02)  ← 현재
+  지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
+  ① 방향 표시 전면 교체
+     📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
+     섹터명 아래 └ 이유 한 줄 항상 표시
+  ② analyze() 지정학 보정 강화
+     하락 섹터 + 일반 신호 → 최소 -8점 패널티 강제
+     feat_w_geo 가중치 실제 적용 (auto_tune 조정값 반영)
+     _geo_adj_applied 변수로 실제 적용된 점수 추적
+  ③ feature_flags geo 필드 추가
+     geo_active / geo_uncertainty / geo_sector_adj
+     → auto_tune 샘플 누적·기여도 학습 대상에 포함
+  ④ _DEFAULT_DYNAMIC feat_w_geo 추가
+     auto_tune이 지정학 기여도 분석 후 가중치 자동 조정
+  ⑤ /stats 기능별 가중치에 "지정학 보정" 항목 추가
+
+v33.1 (2026-03-02)
+  지정학 섹터 방향 표시 누락 수정
+  ① max_tokens 600→1000 (sector_directions JSON 잘림 방지)
+  ② _build_fallback_sector_directions() 신규 — API 없거나 응답 미포함 시
+     감지 키워드(전쟁/유가/무역)로 섹터별 상승📈/하락📉/중립➡️ 자동 추론
+  ③ run_geo_news_scan: sector_directions 비어있으면 sectors 기반 자동 채움
+     → 단순 나열 대신 항상 방향·이유·점수 표시
+
+v33.0 (2026-03-02)
+  ① DART 리스크 실시간 차단 필터 (analyze() 직접 연동)
+     - 매수 신호 생성 직전 최근 5일 DART 공시 종목별 조회
+     - 횡령/배임/상장폐지/거래정지/조사 등 → 신호 완전 차단
+     - 캐시 10분 (API 과호출 방지)
+  ② 보유 종목(carry_stocks) 뉴스/공시 실시간 악재 감시
+     - track_signal_results() 내 30분마다 자동 체크
+     - DART 위험 공시 감지 → 🚨 즉시 매도 알림
+     - analyze_news_deep 부정 판정 → ⚠️ 매도 검토 알림
+     - 중복 방지 (_tracking_notified 활용)
+
+v32.3 (2026-03-02)
+  개인 수급 단순 악재 단정 → 맥락 기반 5단계 판단으로 전면 교체
+  시가총액(cap_size) 대/중/소형 분류 추가
+  CASE1: bull+대형조정 개인매수 → 저점분할 +5점
+  CASE2: bull+소형급등 개인매수 → 고점추격 -5점
+  CASE3: bear/crash 개인매수 → 역방향 경고 -12점
+  CASE4: 하락추세 개인매수 → 주의 -8점
+  CASE5: 그 외 → 0점 판단보류
+  analyze_signal / detect_force_pattern / DART 전체 적용
+
+v32.2 (2026-03-02)
+  면책 문구 제거
+  개인(prsn) 수급 데이터 추가 (기존 외국인+기관 2자 → 3자 구도)
+  💎 외국인+기관 매수+개인 매도 = 최강 수급구도 감지 (+30점)
+  ⚠️ 개인만 매수+기관+외국인 이탈 = 역방향 경고 (-10점)
+  DART 알림 / analyze_signal 모두 적용
+
+v32.1 (2026-03-02)
+  수급 이상 패턴 감지 전면 개선 (총 9가지 패턴)
+  신규: 분봉 일정간격 분할매수 / 분봉 분산(dump) 징후
+  신뢰도 한글 표시 (신뢰높음/참고용)
+  면책 문구 자동 포함
+  단정 표현 제거 (통계적 패턴 강조)
+  추적 중 이탈 경고 패턴별 상세 설명 추가
+
+v32.0 (2026-03-02)
+  뉴스 심층 분석 전면 적용 (본문 크롤링 + Claude API)
+  ① analyze_signal: 헤드라인 키워드 → 본문 기반 실질 호악재 판단
+  ② DART 공시: 무상증자/합병 등 기업이벤트 실질 영향 분석
+  ③ 뉴스 알림: 헤드라인 나열 → 판단근거+리스크포인트 포함
+  표면호재실질악재 / 표면악재실질호재 자동 감지
+  API 없으면 기존 키워드 분석 자동 fallback
+
+v31.9 (2026-03-02)
+  섹터별 주가 방향 예측 추가 (상승📈/하락📉/중립➡️)
+  섹터 이름만 표시 → 방향+이유+점수 보정으로 개선
+  신호 포착 시 섹터별 개별 점수 보정 적용
+
+v31.8 (2026-03-02)
   RSS 파서 수정 (xml→html.parser fallback)
   RSS URL 안정 버전으로 교체
   모든 소스 실패 시 국내 뉴스 fallback 추가
@@ -125,7 +231,7 @@ v28.0 (2026-03-01)
 
 """
 
-BOT_VERSION = "v31.8"
+BOT_VERSION = "v33.0"
 BOT_DATE    = "2026-03-02"
 
 import os, requests, time, schedule, json, random, threading, math
@@ -1022,6 +1128,8 @@ def _clear_all_cache():
     _us_cache.clear();   _short_cache.clear();   _foreign_cache.clear()
     _vp_cache.clear();   _pre_dart_cache.clear();   _theme_rotation_cache.clear()
     _geo_cache.clear()
+    _deep_news_cache.clear()
+    _force_cache.clear()
     _nxt_cache.clear();          _nxt_unavailable.clear()
     _early_cache.clear();        _news_reverse_cache.clear()
     _sector_monitor.clear();     _pending_info_alerts.clear()
@@ -1590,6 +1698,7 @@ def get_stock_price(code: str) -> dict:
     price  = int(o.get("stck_prpr", 0))
     if not price: return {}
     today_vol = int(o.get("acml_vol", 0))
+    mktcap_raw = int(o.get("hts_avls", 0) or 0)  # 시가총액 (억원)
     return {
         "code": code, "name": o.get("hts_kor_isnm",""),
         "price": price, "change_rate": float(o.get("prdy_ctrt",0)),
@@ -1600,6 +1709,10 @@ def get_stock_price(code: str) -> dict:
         "bid_qty": int(o.get("bidp_rsqn1",0)),
         "prev_close": int(o.get("stck_sdpr",0)),
         "bstp_code": o.get("bstp_cls_code",""),
+        "mktcap":    mktcap_raw,       # 억원 단위
+        "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
+                      else "mid" if mktcap_raw >= 1000  # 1000억 이상
+                      else "small"),
     }
 
 def get_upper_limit_stocks() -> list:
@@ -1784,8 +1897,11 @@ def get_investor_trend(code: str) -> dict:
                        "FHKST01010900", {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code})
     output = data.get("output",[])
     if not output: return {}
-    return {"foreign_net":   int(output[0].get("frgn_ntby_qty",0)),
-            "institution_net": int(output[0].get("orgn_ntby_qty",0))}
+    return {
+        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
+        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+        "retail_net":      int(output[0].get("prsn_ntby_qty", 0)),  # 개인 순매수
+    }
 
 # ============================================================
 # 섹터 모멘텀
@@ -2368,6 +2484,7 @@ def save_signal_log(stock: dict):
         # 신호 발생 시 활성화된 기능 플래그 기록
         indic    = stock.get("indic", {})
         position = stock.get("position", {})
+        _geo_st = _geo_event_state if _geo_event_state.get("active") else {}
         feature_flags = {
             "rsi":              indic.get("rsi", 50),
             "ma_aligned":       indic.get("ma", {}).get("aligned"),
@@ -2378,6 +2495,10 @@ def save_signal_log(stock: dict):
             "position_pct":     position.get("pct", 8.0),
             "nxt_delta":        stock.get("nxt_delta", 0),
             "indic_score_adj":  indic.get("score_adj", 0),
+            # ── 지정학 이벤트 기여도 (auto_tune 학습용) ──
+            "geo_active":       bool(_geo_st),
+            "geo_uncertainty":  _geo_st.get("uncertainty", ""),
+            "geo_sector_adj":   locals().get("_geo_adj_applied", 0),
         }
 
         data[log_key] = {
@@ -2727,6 +2848,71 @@ def track_signal_results():
             rec["min_price"] = min(rec.get("min_price", price), price)
             updated = True
 
+            # ── ★ 보유 종목 뉴스/공시 실시간 악재 감시 ──
+            _now_ts = time.time()
+            _last_check = _carry_news_watch.get(code, 0)
+            if _now_ts - _last_check >= 1800:  # 30분마다 체크
+                _carry_news_watch[code] = _now_ts
+                _rec_name = rec.get("name", code)
+                pnl_now   = round((price - entry) / entry * 100, 2) if entry else 0
+
+                # DART 위험 공시 체크
+                try:
+                    _d = check_dart_risk(code)
+                    if _d["is_risk"]:
+                        _dk = f"{log_key}_dart_exit"
+                        if _dk not in _tracking_notified:
+                            _tracking_notified.add(_dk)
+                            _msg = (
+                                "🚨 <b>[보유 종목 악재 공시 감지]</b>\n"
+                                "━━━━━━━━━━━━━━━\n"
+                                f"🔴 <b>{_rec_name}</b>  <code>{code}</code>\n"
+                                "━━━━━━━━━━━━━━━\n"
+                                f"📋 공시: {_d['title']}\n"
+                                "━━━━━━━━━━━━━━━\n"
+                                f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
+                                "━━━━━━━━━━━━━━━\n"
+                                "⚡ <b>즉시 매도 검토 권장</b>\n"
+                                f"💡 /result {code} 로 결과 기록"
+                            )
+                            send_with_chart_buttons(_msg, code, _rec_name)
+                            print(f"  🚨 보유종목 공시악재: {_rec_name} — {_d['title']}")
+                except Exception as _e:
+                    print(f"  ⚠️ 보유종목 DART체크오류: {_e}")
+
+                # 뉴스 심층 감성 체크 (analyze_news_deep 활용)
+                try:
+                    _articles = fetch_news_for_stock(code, _rec_name)
+                    if _articles:
+                        _deep = analyze_news_deep(_articles, _rec_name, code)
+                        _nadj = _deep.get("score_adj", 0)
+                        _verd = _deep.get("verdict", "중립")
+                        if _nadj <= -40:
+                            _nk = f"{log_key}_news_exit"
+                            if _nk not in _tracking_notified:
+                                _tracking_notified.add(_nk)
+                                _rps = "\n".join(
+                                    f"  ⚠️ {rp}"
+                                    for rp in _deep.get("risk_points", [])[:3]
+                                )
+                                _msg2 = (
+                                    "⚠️ <b>[보유 종목 부정 뉴스 감지]</b>\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"🟡 <b>{_rec_name}</b>  <code>{code}</code>\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"📰 뉴스 판단: {_verd}  ({_nadj:+d}점)\n"
+                                    f"{_rps}\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    "💡 손절가 재확인 후 매도 판단 권장\n"
+                                    f"/result {code} 로 결과 기록"
+                                )
+                                send_with_chart_buttons(_msg2, code, _rec_name)
+                                print(f"  ⚠️ 보유종목 부정뉴스: {_rec_name} 감성점수={_nadj}")
+                except Exception as _e:
+                    print(f"  ⚠️ 보유종목 뉴스체크오류: {_e}")
+
             # ── 분할 청산 가이드 (목표가 도달 전 중간 알림) ──
             if entry and target:
                 pnl_now  = (price - entry) / entry * 100
@@ -2773,7 +2959,32 @@ def track_signal_results():
                     if new_trail > trail_stop:
                         rec["trailing_stop"] = new_trail
 
-                # ── 테마 약세 전환 경고 (추적 중) ──
+                # ── 수급 이탈 경고 (추적 중) ──
+                try:
+                    fp_key = f"force_warn_{code}"
+                    if fp_key not in _tracking_notified:
+                        fp = detect_force_pattern(code, name)
+                        if fp.get("risk_flag"):
+                            _tracking_notified.add(fp_key)
+                            out_patterns = [p for p in fp.get("patterns", [])
+                                            if p.get("score_adj", 0) < 0]
+                            lines = ""
+                            for op in out_patterns[:3]:
+                                ce = {"high":"🔴","mid":"🟡","low":"⬜"}.get(op.get("confidence","low"),"⬜")
+                                ck = {"high":"신뢰높음","mid":"참고용"}.get(op.get("confidence",""),"참고용")
+                                lines += f"  {ce} {op['label']} [{ck}]\n  └ {op['detail']}\n"
+                            send(
+                                f"🔴 <b>[수급 이탈 경고]  {name}</b>\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"{lines}"
+                                f"현재가: {cur_price:,}원  ({pnl_pct:+.1f}%)\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"⚠️ 통계적 패턴 감지 — 확증 아님, 익절/손절 직접 판단 필요"
+                            )
+                except:
+                    pass
+
+        # ── 테마 약세 전환 경고 (추적 중) ──
                 try:
                     _rot      = detect_theme_rotation()
                     _si       = rec.get("sector_info") or {}
@@ -3195,6 +3406,7 @@ _dynamic = {
     "feat_w_bb":        1.0,    # 볼린저밴드 가중치
     "feat_w_sector":    1.0,    # 섹터 모멘텀 가중치
     "feat_w_nxt":       1.0,    # NXT 보정 가중치
+    "feat_w_geo":       1.0,    # 지정학 이벤트 섹터 보정 가중치
     # ── 시장 국면 판단 ──
     "regime_mode":         "normal",   # "bull" / "normal" / "bear" / "crash"
     "regime_score_mult":   1.0,        # 신호 점수 배율 (하락장 0.7, 상승장 1.2)
@@ -3596,6 +3808,7 @@ def auto_tune(notify: bool = True):
                 "feat_w_bb":     ("bb_breakout", lambda r: r.get("feature_flags",{}).get("bb_breakout") is True),
                 "feat_w_sector": ("sector",      lambda r: r.get("feature_flags",{}).get("sector_bonus",0) > 0),
                 "feat_w_nxt":    ("nxt",         lambda r: r.get("feature_flags",{}).get("nxt_delta",0) != 0),
+                "feat_w_geo":    ("geo",         lambda r: r.get("feature_flags",{}).get("geo_active", False)),
             }
             for feat_key, (feat_name, feat_filter) in feat_analyses.items():
                 with_feat    = [r for r in feat_recs if feat_filter(r)]
@@ -4273,12 +4486,40 @@ def analyze(stock: dict) -> dict:
 
     if score >= 25:
         try:
-            inv = get_investor_trend(code)
-            f_net, i_net = inv.get("foreign_net",0), inv.get("institution_net",0)
-            if f_net>0 and i_net>0: score+=25; signal_type="STRONG_BUY"; reasons.append("✅ 외국인+기관 동시 순매수")
-            elif f_net>0: score+=10; reasons.append(f"🟡 외국인 순매수 ({f_net:+,}주)")
-            elif i_net>0: score+=10; reasons.append(f"🟡 기관 순매수 ({i_net:+,}주)")
-            elif f_net<0 and i_net<0: reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
+            inv   = get_investor_trend(code)
+            f_net = inv.get("foreign_net",     0)
+            i_net = inv.get("institution_net", 0)
+            r_net = inv.get("retail_net",      0)
+            # 3자 구도 우선 체크
+            if f_net > 0 and i_net > 0 and r_net < 0:
+                score += 30; signal_type = "STRONG_BUY"
+                reasons.append(f"💎 외국인+기관 매수 / 개인 매도 (최강 수급구도) +30점")
+            elif f_net > 0 and i_net > 0:
+                score += 25; signal_type = "STRONG_BUY"
+                reasons.append(f"✅ 외국인+기관 동시 순매수 +25점")
+            elif f_net > 0:
+                score += 10; reasons.append(f"🟡 외국인 순매수 ({f_net:+,}주) +10점")
+            elif i_net > 0:
+                score += 10; reasons.append(f"🟡 기관 순매수 ({i_net:+,}주) +10점")
+            # 개인 수급 맥락 분석 (단순 악재 단정 X)
+            if r_net > 0 and f_net < 0 and i_net < 0:
+                cap_size = stock.get("cap_size") or "unknown"
+                if cap_size == "unknown":
+                    try:
+                        _cp = get_stock_price(code)
+                        cap_size = _cp.get("cap_size", "unknown")
+                    except: pass
+                retail_ev = eval_retail_signal(code, f_net, i_net, r_net, cap_size)
+                if retail_ev:
+                    score += retail_ev["score_adj"]
+                    if retail_ev["score_adj"] != 0:
+                        reasons.append(
+                            f"{retail_ev['label']} {retail_ev['score_adj']:+d}점 — {retail_ev['detail']}"
+                        )
+                    else:
+                        reasons.append(f"{retail_ev['label']} — {retail_ev['detail']}")
+            elif f_net < 0 and i_net < 0:
+                reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except: inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
@@ -4388,40 +4629,85 @@ def analyze(stock: dict) -> dict:
             reasons.append(f"🔴 기관 {abs(i_days)}일 연속 순매도 (-{adj}점)")
     except: pass
 
-    # ── 뉴스 감성 보정 ──
+    # ── 뉴스 심층 분석 (본문 + Claude API) ──
     try:
-        _headlines = fetch_news_for_stock(code, stock.get("name", code))
-        if _headlines:
-            _titles = [a.get("title","") for a in _headlines]
-            sent = analyze_news_sentiment(_titles, stock.get("name", code))
-            if sent["score"] >= 10:
-                score += 8
-                reasons.append(f"📰 뉴스 매우 긍정 ({sent['score']:+d}점) +8점")
-            elif sent["score"] >= 4:
-                score += 4
-                reasons.append(f"📰 뉴스 긍정 ({sent['score']:+d}점) +4점")
-            elif sent["score"] <= -10:
-                score -= 10
-                reasons.append(f"📰 뉴스 매우 부정 ({sent['score']:+d}점) -10점")
-            elif sent["score"] <= -4:
-                score -= 5
-                reasons.append(f"📰 뉴스 부정 ({sent['score']:+d}점) -5점")
+        _articles = fetch_news_for_stock(code, stock.get("name", code))
+        if _articles:
+            deep = analyze_news_deep(_articles, stock.get("name", code), code)
+            adj  = deep.get("score_adj", 0)
+            verd = deep.get("verdict", "중립")
+            conf = deep.get("confidence", "low")
+            conf_emoji = {"high":"🔍","mid":"📰","low":"📰"}.get(conf,"📰")
+
+            if adj != 0:
+                score += adj
+                # 표면호재실질악재 특별 경고
+                if verd == "표면호재실질악재":
+                    reasons.append(f"⚠️ 표면호재실질악재 주의 ({deep.get('reason','')}) {adj:+d}점")
+                elif verd == "표면악재실질호재":
+                    reasons.append(f"💡 표면악재실질호재 ({deep.get('reason','')}) {adj:+d}점")
+                elif adj > 0:
+                    reasons.append(f"{conf_emoji} 뉴스 {verd} ({deep.get('reason','')}) {adj:+d}점")
+                else:
+                    reasons.append(f"{conf_emoji} 뉴스 {verd} ({deep.get('reason','')}) {adj:+d}점")
+
+            # 리스크 포인트 있으면 추가 표시
+            for rp in deep.get("risk_points", [])[:2]:
+                reasons.append(f"  ⚠️ {rp}")
     except: pass
 
     # ── 지정학 이벤트 보정 ──
     try:
         if _geo_event_state.get("active") and time.time() - _geo_event_state.get("ts",0) < 3600:
-            geo_sectors  = _geo_event_state.get("sectors", [])
-            geo_adj      = _geo_event_state.get("score_adj", 0)
-            geo_unc      = _geo_event_state.get("uncertainty", "low")
             si           = stock.get("sector_info") or {}
             stock_sector = si.get("theme", "") or si.get("sector", "")
-            # 관련 섹터면 지정학 보정 적용
-            if any(s in stock_sector for s in geo_sectors) or any(stock_sector in s for s in geo_sectors):
-                if geo_adj != 0:
-                    score += geo_adj
-                    unc_label = {"high":"🔴 불확실성 높음","mid":"🟠 불확실성 중간","low":"🟢 불확실성 낮음"}
-                    reasons.append(f"🌍 지정학 이벤트 관련 섹터 ({unc_label.get(geo_unc,'')}) {geo_adj:+d}점")
+            geo_unc      = _geo_event_state.get("uncertainty", "low")
+            unc_label    = {"high":"🔴","mid":"🟠","low":"🟢"}
+
+            # sector_directions 있으면 섹터별 개별 보정
+            sec_dirs = _geo_event_state.get("sector_directions", [])
+            matched  = False
+            _geo_adj_applied = 0  # feature_flags 기록용
+            if sec_dirs and stock_sector:
+                for sd in sec_dirs:
+                    sec_name = sd.get("sector", "")
+                    if sec_name in stock_sector or stock_sector in sec_name:
+                        adj = max(-15, min(sd.get("score_adj", 0), 15))
+                        _dir = sd.get("direction", "중립")
+                        _arrow = _DIR_DISPLAY.get(_dir, "― 중립")
+                        _col   = _DIR_EMOJI.get(_dir, "🔵")
+                        # 하락 섹터 + 상한가 아닌 신호 → 강한 패널티
+                        if _dir == "하락" and signal_type not in ("UPPER_LIMIT", "STRONG_BUY"):
+                            adj = min(adj, -8)  # 하락 방향이면 최소 -8점
+                        if adj != 0:
+                            _w_geo = _dynamic.get("feat_w_geo", 1.0)
+                            adj_weighted = int(adj * _w_geo)
+                            score += adj_weighted
+                            _geo_adj_applied = adj_weighted
+                            reasons.append(
+                                f"🌍 [{sec_name}] {_col} {_arrow}  "
+                                f"({sd.get('reason','')}) {adj_weighted:+d}점"
+                            )
+                        elif _dir != "중립":
+                            # 점수 보정 없어도 방향 표시
+                            reasons.append(
+                                f"🌍 [{sec_name}] {_col} {_arrow}  ({sd.get('reason','')})"
+                            )
+                        matched = True
+                        break
+
+            # sector_directions 없으면 전체 score_adj fallback
+            if not matched:
+                geo_sectors = _geo_event_state.get("sectors", [])
+                geo_adj     = _geo_event_state.get("score_adj", 0)
+                if stock_sector and (any(s in stock_sector for s in geo_sectors)
+                                     or any(stock_sector in s for s in geo_sectors)):
+                    if geo_adj != 0:
+                        score += geo_adj
+                        _geo_adj_applied = geo_adj
+                        reasons.append(
+                            f"🌍 지정학 관련 섹터 {unc_label.get(geo_unc,'')} {geo_adj:+d}점"
+                        )
     except: pass
 
     # ── 테마 로테이션 보정 ──
@@ -4451,6 +4737,13 @@ def analyze(stock: dict) -> dict:
         score = int(score * 0.85)   # 실적 발표 3일 전 → 점수 15% 감점
         if score < min_score: return {}
 
+    # ── ⑤ DART 리스크 차단 필터 ──
+    # 상한가(UPPER_LIMIT)는 이미 장중 확인된 종목이므로 예외
+    _dart_r = check_dart_risk(code)
+    if _dart_r["is_risk"] and signal_type not in ("UPPER_LIMIT",):
+        print(f"  🚫 DART리스크차단 [{stock.get('name', code)}]: {_dart_r['title']}")
+        return {}
+
     open_est     = price/(1+change_rate/100)
     _pullback_r  = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
     entry        = int((price-(price-open_est)*_pullback_r)/10)*10
@@ -4473,6 +4766,31 @@ def analyze(stock: dict) -> dict:
             score += pre_dart["score_adj"]
             reasons.append(pre_dart["reason"])
     except: pass
+
+    # ── 수급 이상 패턴 보정 ──
+    try:
+        cur_p     = get_stock_price(code)
+        ask_qty   = cur_p.get("ask_qty", 0)
+        bid_qty   = cur_p.get("bid_qty", 0)
+        fp        = detect_force_pattern(
+            code, stock.get("name", code),
+            price=price, change_rate=change_rate, vol_ratio=vol_ratio,
+            ask_qty=ask_qty, bid_qty=bid_qty
+        )
+        fp_adj = fp.get("total_adj", 0)
+        if fp_adj != 0:
+            score += fp_adj
+        for p in fp.get("patterns", []):
+            if p.get("score_adj", 0) != 0 or p.get("confidence") == "high":
+                conf_emoji = {"high":"🔴","mid":"🟡","low":"⬜"}.get(p["confidence"],"⬜")
+                reasons.append(
+                    f"{conf_emoji} [{p['confidence'].upper()}] {p['label']} "
+                    f"{p['score_adj']:+d}점 — {p['detail']}"
+                )
+        if fp.get("risk_flag"):
+            reasons.append("⚠️ 수급 이탈 신호 감지 — 포지션 축소 검토")
+    except:
+        pass
 
     # 등급 계산
     if   score >= 80: grade = "A"
@@ -4505,7 +4823,8 @@ def analyze(stock: dict) -> dict:
             "earnings_risk": earnings["risk"],
             "position": position,
             "indic": indic,
-            "grade": grade}
+            "grade": grade,
+            "dart_risk": _dart_r["is_risk"]}
 
 # ============================================================
 # 조기 포착
@@ -4677,17 +4996,68 @@ def fetch_news_for_stock(code: str, name: str) -> list:
             title_el = row.select_one("td.title a")
             time_el  = row.select_one("td.date")
             if not title_el: continue
-            title = title_el.get_text(strip=True)
-            t     = time_el.get_text(strip=True) if time_el else ""
-            # 종목명 또는 관련 키워드 포함 여부 필터
+            title    = title_el.get_text(strip=True)
+            t        = time_el.get_text(strip=True) if time_el else ""
+            href     = title_el.get("href", "")
+            # 절대 URL 변환
+            if href and href.startswith("/"):
+                href = "https://finance.naver.com" + href
             if len(title) > 5:
-                news.append({"title": title[:40], "time": t})
+                news.append({"title": title, "time": t, "url": href})
             if len(news) >= 3: break
     except: pass
     _news_reverse_cache[code] = {"news": news, "ts": time.time()}
     return news
 
 _news_alert_sent: dict = {}   # code → ts (뉴스 알림 쿨다운, 30분)
+
+# ============================================================
+# 🚨 DART 리스크 차단 + 보유 종목 뉴스 감시 (v33.0)
+# ============================================================
+_dart_risk_cache: dict = {}   # code → {is_risk, title, ts}  (10분 캐시)
+_carry_news_watch: dict = {}  # code → last_check_ts          (30분 쿨다운)
+
+
+def check_dart_risk(code: str) -> dict:
+    """
+    종목별 최근 5일 DART 공시 → 리스크 키워드 있으면 True 반환
+    analyze() 내 매수 신호 최종 차단 판단에 사용
+    returns: {"is_risk": bool, "title": str}
+    """
+    if not DART_API_KEY:
+        return {"is_risk": False, "title": ""}
+
+    now = time.time()
+    cached = _dart_risk_cache.get(code)
+    if cached and now - cached.get("ts", 0) < 600:   # 10분 캐시
+        return cached
+
+    result = {"is_risk": False, "title": "", "ts": now}
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        bgn   = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
+        resp  = requests.get(
+            "https://opendart.fss.or.kr/api/list.json",
+            params={
+                "crtfc_key":  DART_API_KEY,
+                "bgn_de":     bgn,
+                "end_de":     today,
+                "stock_code": code,
+                "page_count": 20,
+            },
+            timeout=8
+        )
+        for item in resp.json().get("list", []):
+            title = item.get("report_nm", "")
+            if any(kw in title for kw in DART_RISK_KEYWORDS):
+                result["is_risk"] = True
+                result["title"]   = title
+                break
+    except Exception as e:
+        print(f"  ⚠️ DART리스크체크오류 [{code}]: {e}")
+
+    _dart_risk_cache[code] = result
+    return result
 
 def news_block_for_alert(code: str, name: str) -> str:
     """알림 직후 백그라운드로 뉴스 역추적 — 30분 쿨다운으로 중복 크롤링 방지"""
@@ -4698,13 +5068,36 @@ def news_block_for_alert(code: str, name: str) -> str:
         try:
             articles = fetch_news_for_stock(code, name)
             if not articles: return
+
+            # 심층 분석
+            deep  = analyze_news_deep(articles, name, code)
+            verd  = deep.get("verdict","중립")
+            adj   = deep.get("score_adj",0)
+            rsn   = deep.get("reason","")
+            rps   = deep.get("risk_points",[])
+
+            verd_emoji = {
+                "실질호재":       "✅",
+                "실질악재":       "❌",
+                "표면호재실질악재":"⚠️",
+                "표면악재실질호재":"💡",
+                "불확실":         "❓",
+                "중립":           "📰",
+            }.get(verd, "📰")
+
             lines = "\n".join(f"  📰 {a['title']}  <i>{a['time']}</i>" for a in articles)
+
+            risk_text = ""
+            if rps:
+                risk_text = "\n⚠️ 주의사항:\n" + "\n".join(f"  🔸 {r}" for r in rps[:3])
+
             send_with_chart_buttons(
-                f"📰 <b>[{name} 관련 뉴스]</b>\n"
+                f"{verd_emoji} <b>[{name} 뉴스 분석]</b>  {verd}  {adj:+d}점\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"{lines}\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"💡 뉴스 있음 — 재료 확인 후 진입 판단",
+                f"💡 {rsn}"
+                f"{risk_text}",
                 code, name
             )
         except: pass
@@ -4745,6 +5138,396 @@ def fetch_all_news() -> list:
 
 
 
+
+# ============================================================
+
+# 🕵️ 수급 이상 패턴 감지 (세력 흔적 추적)
+# ============================================================
+# ※ 주의: 아래 감지 신호는 통계적 이상 패턴이며,
+#         실제 세력 존재를 확증하지 않습니다.
+#         투자 판단의 보조 지표로만 활용하세요.
+# ============================================================
+
+_force_cache: dict = {}   # code → {result, ts}
+
+def _get_minute_data(code: str, count: int = 30) -> list:
+    """
+    KIS 분봉 데이터 조회 (최근 count개).
+    반환: [{"time": str, "open": int, "close": int, "volume": int}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            "FHKST03010200",
+            {
+                "FID_ETC_CLS_CODE":    "",
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD":      code,
+                "FID_INPUT_HOUR_1":    datetime.now().strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "N",
+            }
+        )
+        items = data.get("output2", [])
+        result = []
+        for i in items[:count]:
+            t   = i.get("stck_cntg_hour", "")
+            c   = int(i.get("stck_prpr",   0) or 0)
+            v   = int(i.get("cntg_vol",     0) or 0)
+            o   = int(i.get("stck_oprc",    0) or 0)
+            if c and v:
+                result.append({"time": t, "open": o, "close": c, "volume": v})
+        return result
+    except:
+        return []
+
+def detect_force_pattern(code: str, name: str,
+                         price: float = 0,
+                         change_rate: float = 0,
+                         vol_ratio: float = 0,
+                         ask_qty: int = 0,
+                         bid_qty: int = 0) -> dict:
+    """
+    수급 이상 패턴 종합 감지.
+
+    반환: {
+        patterns: [
+            {
+                type: str,          # 패턴 유형
+                label: str,         # 표시 레이블
+                confidence: str,    # "high"/"mid"/"low"
+                score_adj: int,     # 점수 보정
+                detail: str,        # 상세 설명
+            }
+        ],
+        total_adj: int,         # 합산 점수 보정
+        summary: str,           # 텔레그램 요약
+        risk_flag: bool,        # 세력 이탈(dump) 의심
+    }
+    """
+    cached = _force_cache.get(code)
+    if cached and time.time() - cached.get("ts", 0) < 600:  # 10분 캐시
+        return cached
+
+    patterns  = []
+    total_adj = 0
+    risk_flag = False
+
+    # ─────────────────────────────────────────────
+    # 패턴 1: 호가 비대칭 (매수벽/매도벽)
+    # ─────────────────────────────────────────────
+    try:
+        if ask_qty > 0 and bid_qty > 0:
+            ratio = bid_qty / ask_qty  # >1 → 매수 우위
+            if ratio >= 3.0:
+                patterns.append({
+                    "type":       "bid_wall",
+                    "label":      "📊 매수벽 형성",
+                    "confidence": "mid",
+                    "score_adj":  +8,
+                    "detail":     f"매수잔량 {ratio:.1f}배 우위 (매수:{bid_qty:,} vs 매도:{ask_qty:,}) — 단기 지지 가능",
+                })
+                total_adj += 8
+            elif ratio >= 2.0:
+                patterns.append({
+                    "type":       "bid_wall",
+                    "label":      "📊 매수 우위",
+                    "confidence": "low",
+                    "score_adj":  +4,
+                    "detail":     f"매수잔량 {ratio:.1f}배 우위 — 참고용",
+                })
+                total_adj += 4
+            elif ratio <= 0.3:
+                # 매도잔량 압도적 → 매도벽 (세력 이탈 가능성)
+                patterns.append({
+                    "type":       "ask_wall",
+                    "label":      "⚠️ 매도벽 감지",
+                    "confidence": "mid",
+                    "score_adj":  -8,
+                    "detail":     f"매도잔량 {1/ratio:.1f}배 우위 — 상승 저항 또는 세력 이탈 가능성",
+                })
+                total_adj -= 8
+                risk_flag = True
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 패턴 2: 일봉 매집 패턴 (거래량↑ + 가격 횡보)
+    # ─────────────────────────────────────────────
+    try:
+        daily = get_daily_data(code, 30)
+        if len(daily) >= 10:
+            closes  = [int(d.get("stck_clpr", 0)) for d in daily if d.get("stck_clpr")]
+            volumes = [int(d.get("acml_vol",  0)) for d in daily if d.get("acml_vol")]
+
+            if len(closes) >= 10 and len(volumes) >= 10:
+                # 최근 5일 vs 이전 20일 비교
+                recent_vol = sum(volumes[-5:]) / 5
+                base_vol   = sum(volumes[-25:-5]) / 20 if len(volumes) >= 25 else sum(volumes[:-5]) / max(len(volumes)-5, 1)
+
+                recent_hi  = max(closes[-5:])
+                recent_lo  = min(closes[-5:])
+                price_range_pct = (recent_hi - recent_lo) / recent_lo * 100 if recent_lo else 0
+
+                vol_surge   = recent_vol / base_vol if base_vol else 1
+                is_sideways = price_range_pct <= 4.0   # 최근 5일 가격 횡보 ±2%
+
+                if vol_surge >= 2.5 and is_sideways:
+                    conf = "high" if vol_surge >= 4.0 else "mid"
+                    adj  = +12 if conf == "high" else +8
+                    patterns.append({
+                        "type":       "accumulation",
+                        "label":      "🔍 매집 패턴 의심",
+                        "confidence": conf,
+                        "score_adj":  adj,
+                        "detail":     (f"거래량 {vol_surge:.1f}배 급증 + 가격 횡보 {price_range_pct:.1f}% "
+                                       f"(5일) — 통계적 이상, 확증 아님"),
+                    })
+                    total_adj += adj
+
+                # 주가↓ + 거래량↑ → 저점 매집 가능성
+                price_5d_chg = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] else 0
+                if price_5d_chg <= -3.0 and vol_surge >= 2.0:
+                    patterns.append({
+                        "type":       "bottom_accumulation",
+                        "label":      "💡 하락 중 거래량 역행",
+                        "confidence": "mid",
+                        "score_adj":  +6,
+                        "detail":     (f"주가 {price_5d_chg:.1f}% 하락에도 거래량 {vol_surge:.1f}배 "
+                                       f"— 저점 매집 가능성 (역발상 신호)"),
+                    })
+                    total_adj += 6
+
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 패턴 3: 스마트머니 역방향 (외국인↓+기관↑)
+    # ─────────────────────────────────────────────
+    try:
+        inv    = get_investor_trend(code)
+        f_net  = inv.get("foreign_net",     0)
+        i_net  = inv.get("institution_net", 0)
+        r_net  = inv.get("retail_net",      0)  # 개인
+
+        # 기관 대규모 매수 + 외국인 매도 → 기관 주도 수급
+        if i_net >= 50000 and f_net < 0:
+            patterns.append({
+                "type":       "smart_money_in",
+                "label":      "🏦 기관 주도 매수",
+                "confidence": "high",
+                "score_adj":  +10,
+                "detail":     (f"기관 +{i_net:,}주 / 외국인 {f_net:,}주 — "
+                               f"기관이 외국인 매물 흡수"),
+            })
+            total_adj += 10
+
+        # 외국인 대규모 매수 + 기관 매도 → 외국인 주도
+        elif f_net >= 50000 and i_net < 0:
+            patterns.append({
+                "type":       "foreign_smart_money",
+                "label":      "🌐 외국인 주도 매수",
+                "confidence": "high",
+                "score_adj":  +10,
+                "detail":     (f"외국인 +{f_net:,}주 / 기관 {i_net:,}주 — "
+                               f"외국인 단독 수급"),
+            })
+            total_adj += 10
+
+        # 외국인+기관 동시 매수 + 개인 매도 → 가장 강한 신호
+        if f_net >= 30000 and i_net >= 30000 and r_net < 0:
+            patterns.append({
+                "type":       "institutional_vs_retail",
+                "label":      "💎 기관+외국인 동시 매수 / 개인 매도",
+                "confidence": "high",
+                "score_adj":  +12,
+                "detail":     (f"외국인 +{f_net:,}주 + 기관 +{i_net:,}주 매수 "
+                               f"/ 개인 {r_net:,}주 매도 — "
+                               f"개인 물량을 기관+외국인이 흡수하는 구도"),
+            })
+            total_adj += 12
+
+        # 개인만 대량 매수 → 맥락 분석 후 판단
+        if r_net >= 100000 and f_net < 0 and i_net < 0:
+            cap_size = "unknown"
+            try:
+                _cp = get_stock_price(code)
+                cap_size = _cp.get("cap_size", "unknown")
+            except: pass
+            retail_ev = eval_retail_signal(code, f_net, i_net, r_net, cap_size)
+            if retail_ev:
+                adj = retail_ev.get("score_adj", 0)
+                patterns.append({
+                    "type":       "retail_buying_context",
+                    "label":      retail_ev["label"],
+                    "confidence": retail_ev["confidence"],
+                    "score_adj":  adj,
+                    "detail":     retail_ev["detail"],
+                })
+                total_adj += adj
+                if adj < 0:
+                    risk_flag = True
+
+        # 외국인+기관 동시 대규모 매도 → 이탈 가능성
+        elif f_net <= -50000 and i_net <= -50000:
+            patterns.append({
+                "type":       "smart_money_out",
+                "label":      "🔴 외국인+기관 동시 이탈",
+                "confidence": "high",
+                "score_adj":  -12,
+                "detail":     (f"외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도"),
+            })
+            total_adj -= 12
+            risk_flag = True
+
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 패턴 4: 장 막판 대량 체결 (다음날 갭상승 예측)
+    # ─────────────────────────────────────────────
+    try:
+        now_h = datetime.now().hour
+        now_m = datetime.now().minute
+        # 14:50~15:20 사이에만 체크
+        if (now_h == 14 and now_m >= 50) or (now_h == 15 and now_m <= 20):
+            mins = _get_minute_data(code, count=30)
+            if len(mins) >= 10:
+                # 전체 평균 분당 거래량
+                avg_vol = sum(m["volume"] for m in mins) / len(mins)
+                # 마지막 5분 거래량
+                last5_vol = sum(m["volume"] for m in mins[:5]) / 5  # 최신순
+                surge_ratio = last5_vol / avg_vol if avg_vol else 1
+
+                if surge_ratio >= 3.0:
+                    conf = "high" if surge_ratio >= 5.0 else "mid"
+                    adj  = +10 if conf == "high" else +6
+                    patterns.append({
+                        "type":       "closing_surge",
+                        "label":      "⏰ 장 막판 대량체결",
+                        "confidence": conf,
+                        "score_adj":  adj,
+                        "detail":     (f"마감 직전 분당 거래량 {surge_ratio:.1f}배 급증 — "
+                                       f"다음날 갭상승 가능성 (확증 아님)"),
+                    })
+                    total_adj += adj
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 패턴 5: 연속 양봉 + 거래량 계단식 증가
+    # ─────────────────────────────────────────────
+    try:
+        daily = get_daily_data(code, 15)
+        if len(daily) >= 7:
+            closes  = [int(d.get("stck_clpr", 0)) for d in daily[-7:] if d.get("stck_clpr")]
+            opens   = [int(d.get("stck_oprc", 0)) for d in daily[-7:] if d.get("stck_oprc")]
+            volumes = [int(d.get("acml_vol",  0)) for d in daily[-7:] if d.get("acml_vol")]
+
+            if len(closes) >= 5 and len(volumes) >= 5:
+                # 최근 3일 연속 양봉 여부
+                bull_days = sum(1 for i in range(min(3, len(closes)))
+                                if i < len(opens) and closes[-(i+1)] > opens[-(i+1)])
+                # 거래량 계단식 증가 (매일 전날보다 많음)
+                vol_staircase = all(volumes[-(i+1)] > volumes[-(i+2)]
+                                    for i in range(min(3, len(volumes)-1)))
+
+                if bull_days >= 3 and vol_staircase:
+                    patterns.append({
+                        "type":       "staircase_volume",
+                        "label":      "📶 거래량 계단식 증가",
+                        "confidence": "mid",
+                        "score_adj":  +8,
+                        "detail":     (f"연속 {bull_days}일 양봉 + 거래량 매일 증가 — "
+                                       f"상승 탄력 유지 (통계적 강세 패턴)"),
+                    })
+                    total_adj += 8
+
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 패턴 6: 분봉 일정 간격 매수 (자동 분할매수 의심)
+    # ─────────────────────────────────────────────
+    try:
+        if is_market_open():
+            mins = _get_minute_data(code, count=60)
+            if len(mins) >= 20:
+                # 분당 거래량 목록 (최신→과거 순)
+                vols = [m["volume"] for m in mins]
+                avg  = sum(vols) / len(vols)
+                # 일정 간격(5분마다) 거래량 급등 패턴
+                spike_intervals = []
+                for i in range(0, len(vols)-5, 5):
+                    window = vols[i:i+5]
+                    if max(window) >= avg * 2.5:
+                        spike_intervals.append(i)
+                # 3개 이상 간격에서 스파이크 → 분할매수 패턴
+                if len(spike_intervals) >= 3:
+                    patterns.append({
+                        "type":       "interval_buying",
+                        "label":      "🤖 일정 간격 분할매수 패턴",
+                        "confidence": "mid",
+                        "score_adj":  +7,
+                        "detail":     (f"5분 간격으로 {len(spike_intervals)}회 거래량 급등 감지 — "
+                                       f"알고리즘 또는 세력 분할매수 패턴 의심 (확증 아님)"),
+                    })
+                    total_adj += 7
+
+                # 분봉 고점 낮아짐 + 거래량 증가 → dump 징후
+                closes_min = [m["close"] for m in mins[:20]]
+                vols_min   = [m["volume"] for m in mins[:20]]
+                if len(closes_min) >= 10 and len(vols_min) >= 10:
+                    # 최근 10분 고점이 이전 10분 고점보다 낮음
+                    recent_hi = max(closes_min[:10])
+                    prev_hi   = max(closes_min[10:])
+                    recent_vol = sum(vols_min[:10]) / 10
+                    prev_vol   = sum(vols_min[10:]) / 10
+                    if recent_hi < prev_hi * 0.99 and recent_vol > prev_vol * 1.5:
+                        patterns.append({
+                            "type":       "distribution",
+                            "label":      "🔻 고점 낮아짐 + 거래량 증가",
+                            "confidence": "mid",
+                            "score_adj":  -8,
+                            "detail":     (f"분봉 고점 {(recent_hi/prev_hi-1)*100:.1f}% 하락에도 "
+                                           f"거래량 {recent_vol/prev_vol:.1f}배 증가 — "
+                                           f"분산(dump) 초기 징후 가능성"),
+                        })
+                        total_adj -= 8
+                        risk_flag  = True
+    except:
+        pass
+
+    # ─────────────────────────────────────────────
+    # 결과 종합
+    # ─────────────────────────────────────────────
+    total_adj = max(-20, min(total_adj, 20))  # -20~+20 범위 제한
+
+    # 신뢰도별 이모지 및 설명
+    CONF_EMOJI = {"high": "🔴", "mid": "🟡", "low": "⬜"}
+    CONF_KOR   = {"high": "신뢰높음", "mid": "참고용", "low": "참고용"}
+
+    summary_lines = []
+    for p in patterns:
+        ce  = CONF_EMOJI.get(p["confidence"], "⬜")
+        ck  = CONF_KOR.get(p["confidence"], "참고용")
+        adj = f"{p['score_adj']:+d}점" if p["score_adj"] != 0 else ""
+        summary_lines.append(
+            f"{ce} {p['label']} {adj} [{ck}]\n"
+            f"     └ {p['detail']}"
+        )
+
+    summary = "\n".join(summary_lines) if summary_lines else ""
+
+    result = {
+        "patterns":  patterns,
+        "total_adj": total_adj,
+        "summary":   summary,
+        "risk_flag": risk_flag,
+        "ts":        time.time(),
+    }
+    _force_cache[code] = result
+    return result
+
 # ============================================================
 # 🌍 지정학 이벤트 다중 주체 분석 (Claude API)
 # ============================================================
@@ -4763,6 +5546,18 @@ _GEO_KEYWORDS = [
 ]
 
 # 지정학 이벤트 → 관련 섹터 자동 매핑
+# 지정학 섹터 방향 화살표 (텍스트+이모지 조합으로 명확하게)
+_DIR_DISPLAY = {
+    "상승": "▲ 상승",
+    "하락": "▼ 하락",
+    "중립": "― 중립",
+}
+_DIR_EMOJI = {
+    "상승": "🟢",
+    "하락": "🔴",
+    "중립": "🔵",
+}
+
 _GEO_SECTOR_MAP = {
     "전쟁|전투|공습|미사일|폭격|침공|교전|충돌|군사": ["방산", "항공우주"],
     "이란|OPEC|유가|원유|석유|천연가스|LNG|감산|증산": ["정유", "에너지", "화학"],
@@ -4861,6 +5656,62 @@ def _map_geo_sectors(detected_kws: list) -> list:
                         sectors.append(s)
     return sectors
 
+def _build_fallback_sector_directions(detected_kws: list, sectors: list) -> list:
+    """
+    API 없을 때 감지 키워드 + 섹터 기반으로 기본 방향/이유 생성.
+    전쟁/군사 → 방산 상승 / 정유·에너지 상승 / 나머지 하락 기본값.
+    """
+    # 키워드 패턴으로 이벤트 유형 추론
+    war_kws    = {"전쟁","전투","공습","미사일","폭격","침공","교전","충돌","군사"}
+    oil_kws    = {"이란","OPEC","유가","원유","석유","천연가스","LNG","감산","증산"}
+    trade_kws  = {"제재","관세","무역전쟁","금수","봉쇄","수출통제"}
+    kw_set     = set(detected_kws)
+
+    is_war   = bool(kw_set & war_kws)
+    is_oil   = bool(kw_set & oil_kws)
+    is_trade = bool(kw_set & trade_kws)
+
+    # 섹터별 기본 방향 규칙
+    SECTOR_RULES = {
+        "방산":      ("상승",  "군사 긴장 → 방위산업 수혜",          +8),
+        "항공우주":  ("상승",  "지정학 위기 → 방산·항공 수요 증가",   +6),
+        "정유":      ("상승",  "지정학 위기 → 유가 상승 수혜",        +6) if is_oil or is_war else ("중립", "유가 변동 제한적", 0),
+        "에너지":    ("상승",  "원유·가스 가격 상승 기대",             +5) if is_oil or is_war else ("중립", "유가 변동 제한적", 0),
+        "화학":      ("하락",  "원자재 비용 증가 → 마진 악화",        -5),
+        "항공":      ("하락",  "유가 상승 → 연료비 부담",             -6),
+        "자동차":    ("하락",  "원자재 비용 상승 + 소비심리 위축",    -4),
+        "조선":      ("상승",  "방위산업 수주 기대",                   +4) if is_war else ("중립", "직접 영향 제한적", 0),
+        "반도체":    ("하락",  "수출통제·공급망 불확실성",            -5) if is_trade else ("중립", "직접 영향 제한적", 0),
+        "IT":        ("하락",  "무역제재 → 글로벌 수요 위축",        -4) if is_trade else ("중립", "직접 영향 제한적", 0),
+        "수출주":    ("하락",  "무역전쟁 → 수출 타격",               -6) if is_trade else ("중립", "제한적", 0),
+        "금융·보험": ("하락",  "불확실성 → 투자심리 위축",           -4),
+        "철강":      ("하락",  "원자재 수급 불안 + 수요 둔화",       -3),
+        "곡물":      ("상승",  "공급망 차질 → 식품 가격 상승",        +5),
+        "건설":      ("중립",  "국내 수요 변화 제한적",               0),
+    }
+
+    result = []
+    for sec in sectors:
+        # 섹터명 부분 매칭 (예: "에너지·정유" → "정유" 규칙 사용)
+        matched_rule = None
+        for key, rule in SECTOR_RULES.items():
+            if key in sec or sec in key:
+                matched_rule = rule
+                break
+        if matched_rule:
+            direction, reason, score_adj = matched_rule
+        else:
+            direction, reason, score_adj = "중립", "영향 분석 중", 0
+
+        result.append({
+            "sector":    sec,
+            "direction": direction,
+            "reason":    reason,
+            "score_adj": score_adj,
+        })
+    return result
+
+
 def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
     """
     Claude API로 다중 소스 주체별 입장 분석.
@@ -4891,10 +5742,13 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
     # Claude API 호출
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        # API 키 없으면 키워드 기반 fallback
+        # API 키 없으면 키워드 기반 fallback (sector_directions도 생성)
         sectors   = _map_geo_sectors(detected_kws)
         score_adj = -5 if len(detected_kws) >= 3 else 0
+        # 키워드로 기본 섹터 방향 추론
+        sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
+                "sector_directions": sec_dirs_fb,
                 "score_adj": score_adj, "summary": f"⚠️ 지정학 이벤트 감지: {', '.join(detected_kws[:3])}",
                 "entities": [], "ts": time.time()}
 
@@ -4919,12 +5773,23 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
   ],
   "uncertainty": "high/mid/low",
   "uncertainty_reason": "소스 간 입장 충돌 여부",
-  "sectors": ["관련 한국 주식 섹터명"],
-  "score_adj": -15~+10 사이 정수 (불확실성 높으면 음수),
+  "sector_directions": [
+    {{
+      "sector": "한국 주식 섹터명",
+      "direction": "상승/하락/중립",
+      "reason": "한 줄 이유",
+      "score_adj": -10~+10 사이 정수
+    }}
+  ],
+  "score_adj": -15~+10 사이 정수 (전체 시장 불확실성 기준),
   "summary": "한국 투자자용 한 줄 요약"
 }}
 
-주의: uncertainty는 소스들이 서로 다른 입장을 보이면 high, 비슷하면 low."""
+주의:
+- uncertainty는 소스들이 서로 다른 입장을 보이면 high, 비슷하면 low
+- sector_directions는 이 이슈로 인해 직접 영향받는 한국 섹터만 포함 (3~6개)
+- direction은 해당 섹터 주가 방향 예측 (상승/하락/중립)
+- score_adj는 섹터별 점수 보정값 (상승이면 양수, 하락이면 음수)"""
 
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -4935,7 +5800,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 600,
+                "max_tokens": 1000,
                 "messages":   [{"role": "user", "content": prompt}],
             },
             timeout=15
@@ -4945,15 +5810,20 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
+        # sector_directions → sectors 리스트도 같이 추출
+        sec_dirs = data.get("sector_directions", [])
+        sectors  = [s["sector"] for s in sec_dirs] if sec_dirs else _map_geo_sectors(detected_kws)
+
         result = {
-            "detected":    True,
-            "entities":    data.get("entities", []),
-            "uncertainty": data.get("uncertainty", "mid"),
-            "sectors":     data.get("sectors", _map_geo_sectors(detected_kws)),
-            "score_adj":   max(-15, min(data.get("score_adj", 0), 10)),
-            "summary":     data.get("summary", ""),
-            "kws":         detected_kws[:5],
-            "ts":          time.time(),
+            "detected":          True,
+            "entities":          data.get("entities", []),
+            "uncertainty":       data.get("uncertainty", "mid"),
+            "sectors":           sectors,
+            "sector_directions": sec_dirs,   # [{sector, direction, reason, score_adj}]
+            "score_adj":         max(-15, min(data.get("score_adj", 0), 10)),
+            "summary":           data.get("summary", ""),
+            "kws":               detected_kws[:5],
+            "ts":                time.time(),
         }
         _geo_cache[cache_key] = result
         print(f"  🌍 지정학 분석: {result['uncertainty']} 불확실성 / 섹터: {result['sectors']}")
@@ -4963,7 +5833,9 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         _log_error("analyze_geopolitical_event", e)
         # fallback
         sectors = _map_geo_sectors(detected_kws)
+        sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
+                "sector_directions": sec_dirs_fb,
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
                 "entities": [], "ts": time.time()}
 
@@ -4983,13 +5855,14 @@ def run_geo_news_scan():
 
         # 결과를 전역에 저장 (신호 포착 시 참조)
         _geo_event_state.update({
-            "active":      True,
-            "uncertainty": geo["uncertainty"],
-            "sectors":     geo["sectors"],
-            "score_adj":   geo["score_adj"],
-            "summary":     geo["summary"],
-            "entities":    geo["entities"],
-            "ts":          time.time(),
+            "active":           True,
+            "uncertainty":      geo["uncertainty"],
+            "sectors":          geo["sectors"],
+            "sector_directions":geo.get("sector_directions", []),
+            "score_adj":        geo["score_adj"],
+            "summary":          geo["summary"],
+            "entities":         geo["entities"],
+            "ts":               time.time(),
         })
 
         # 텔레그램 알림 (1시간 쿨다운)
@@ -5010,7 +5883,27 @@ def run_geo_news_scan():
                 msg += f"  {stance_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
             msg += "\n"
 
-        if geo.get("sectors"):
+        sec_dirs = geo.get("sector_directions", [])
+        # sector_directions 없으면 sectors 기반으로 자동 생성 (fallback)
+        if not sec_dirs and geo.get("sectors"):
+            sec_dirs = _build_fallback_sector_directions(
+                geo.get("kws", []) or _detect_geo_keywords(
+                    [h for hl in headlines_by_source.values() for h in hl]
+                ),
+                geo["sectors"]
+            )
+        if sec_dirs:
+            msg += "<b>📊 섹터별 영향</b>\n"
+            for sd in sec_dirs:
+                _dir  = sd.get("direction", "중립")
+                _col  = _DIR_EMOJI.get(_dir, "🔵")
+                _arrow = _DIR_DISPLAY.get(_dir, "― 중립")
+                _adj   = sd.get("score_adj", 0)
+                _adj_str = f"  <b>{_adj:+d}점</b>" if _adj != 0 else ""
+                msg += (f"  {_col} <b>{sd.get('sector','')}</b>  {_arrow}{_adj_str}\n"
+                        f"       └ {sd.get('reason','')}\n")
+            msg += "\n"
+        elif geo.get("sectors"):
             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
 
         if geo.get("summary"):
@@ -5020,6 +5913,284 @@ def run_geo_news_scan():
 
     except Exception as e:
         _log_error("run_geo_news_scan", e)
+
+
+
+# ============================================================
+# 👤 개인 수급 맥락 분석
+# ============================================================
+def eval_retail_signal(code: str,
+                       f_net: int, i_net: int, r_net: int,
+                       cap_size: str = "unknown") -> dict:
+    """
+    "개인만 매수" 신호를 맥락에 따라 다르게 해석.
+
+    고려 요소:
+      ① 시장 국면 (bull/normal/bear/crash)
+      ② 종목 5일 추세 (상승조정 vs 하락전환)
+      ③ 종목 규모 (대형/중형/소형)
+
+    반환:
+      score_adj: int
+      label: str
+      detail: str
+      confidence: str
+    """
+    # 개인 매수 + 기관/외국인 이탈 아니면 해당 없음
+    if not (r_net > 0 and f_net < 0 and i_net < 0):
+        return {}
+
+    regime    = get_market_regime().get("mode", "normal")
+    r_abs     = abs(r_net)
+
+    # ─── 종목 5일 추세 계산 ───
+    stock_trend = "unknown"
+    try:
+        daily  = get_daily_data(code, 10)
+        closes = [int(d.get("stck_clpr", 0)) for d in daily if d.get("stck_clpr")]
+        if len(closes) >= 6:
+            chg_5d = (closes[-1] - closes[-6]) / closes[-6] * 100
+            if   chg_5d >= 5.0:   stock_trend = "rally"      # 급등 후 조정
+            elif chg_5d >= 1.0:   stock_trend = "uptrend"    # 상승 추세 중 조정
+            elif chg_5d >= -3.0:  stock_trend = "sideways"   # 횡보/소폭 조정
+            elif chg_5d >= -7.0:  stock_trend = "pullback"   # 의미 있는 조정
+            else:                 stock_trend = "downtrend"   # 하락 추세
+    except:
+        pass
+
+    # ─── 맥락 조합 판단 ───
+    # CASE 1: bull/normal국면 + 대형/중형주 + 조정/횡보/급등후조정 중 개인 매수
+    #         → 저점 분할매수일 가능성 높음 (삼성전자, SK하이닉스 사례)
+    if (regime in ("bull", "normal")
+            and cap_size in ("large", "mid")
+            and stock_trend in ("uptrend", "pullback", "sideways", "rally")):
+        label = ("💡 개인 저점 매수 (대/중형 조정)"
+                 if stock_trend != "rally" else
+                 "💡 개인 급등 후 조정 매수 (대/중형)")
+        return {
+            "score_adj":  +5,
+            "label":      label,
+            "detail":     (f"bull/normal 국면 + {cap_size}cap 조정 중 개인 +{r_abs:,}주 — "
+                           f"기관 리밸런싱 매도 가능성, 단기 지지 효과 기대"),
+            "confidence": "mid",
+        }
+
+    # CASE 2: bull국면 + 소형주 + 급등 후 개인 매수
+    #         → 고점 추격 매수 (기관 물량 받아내는 개미)
+    if (regime in ("bull", "normal")
+            and cap_size == "small"
+            and stock_trend in ("rally", "uptrend")):
+        return {
+            "score_adj":  -5,
+            "label":      "⚠️ 개인 고점 추격 (소형 급등)",
+            "detail":     (f"소형주 급등 후 개인 +{r_abs:,}주 — "
+                           f"기관 차익실현 물량 받아내는 구도 가능성"),
+            "confidence": "mid",
+        }
+
+    # CASE 2b: bull/normal국면 + 소형주 + 조정/횡보 중 → 판단 보류
+    if (regime in ("bull", "normal")
+            and cap_size == "small"
+            and stock_trend in ("sideways", "pullback")):
+        return {
+            "score_adj":  0,
+            "label":      "📊 소형주 개인 매수 (조정중, 판단 보류)",
+            "detail":     (f"소형주 조정 구간 개인 +{r_abs:,}주 — "
+                           f"기관+외국인 이탈 지속 여부 확인 필요"),
+            "confidence": "low",
+        }
+
+    # CASE 3: bear/crash 국면 + 대형/중형주 → 낙폭과대 저점 가능성
+    if regime in ("bear", "crash") and cap_size in ("large", "mid"):
+        return {
+            "score_adj":  0,
+            "label":      "❓ 하락장 대형/중형주 개인 매수 (낙폭과대 판단 보류)",
+            "detail":     (f"약세장에도 {cap_size}cap 개인 +{r_abs:,}주 — "
+                           f"낙폭과대 저점 가능성 vs 추가하락 위험 공존 (판단 보류)"),
+            "confidence": "low",
+        }
+
+    # CASE 4: bear/crash 국면 + 소형주 → 역방향 위험
+    if regime in ("bear", "crash") and cap_size == "small":
+        return {
+            "score_adj":  -12,
+            "label":      "🔴 개인만 매수 / 기관+외국인 이탈 (약세장+소형주)",
+            "detail":     (f"약세장 소형주 + 외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도 — "
+                           f"개인 역방향 수급, 추가 하락 위험"),
+            "confidence": "high",
+        }
+
+    # CASE 5: 하락 추세 중 개인 매수 (국면/규모 무관)
+    if stock_trend == "downtrend":
+        return {
+            "score_adj":  -8,
+            "label":      "⚠️ 하락추세 중 개인 역방향 매수",
+            "detail":     (f"5일 추세 하락 중 개인 +{r_abs:,}주 — "
+                           f"기관+외국인 이탈 지속 시 지지력 약화 우려"),
+            "confidence": "mid",
+        }
+
+    # CASE 6: 그 외 (판단 보류)
+    return {
+        "score_adj":  0,
+        "label":      "📊 개인 매수 (맥락 불분명)",
+        "detail":     (f"개인 +{r_abs:,}주 / 기관+외국인 이탈 — "
+                       f"국면:{regime}, 추세:{stock_trend}, 규모:{cap_size} — 판단 보류"),
+        "confidence": "low",
+    }
+
+# ============================================================
+# 📰 뉴스 심층 분석 (본문 크롤링 + Claude API)
+# ============================================================
+_deep_news_cache: dict = {}   # code → {result, ts}
+
+# 심층 분석이 필요한 기업 이벤트 키워드
+_CORP_EVENT_KEYWORDS = [
+    "무상증자","유상증자","합병","분할","인수","자사주","배당",
+    "실적","영업이익","순이익","매출","흑자","적자","전환",
+    "상장폐지","거래정지","불성실공시","횡령","배임",
+    "공급계약","수주","MOU","협약","허가","승인","임상","FDA",
+]
+
+def _fetch_article_body(url: str) -> str:
+    """
+    네이버 금융 뉴스 본문 크롤링.
+    최대 600자 반환 (토큰 절약).
+    """
+    if not url:
+        return ""
+    try:
+        resp = requests.get(url, headers=_random_ua(), timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # 네이버 뉴스 본문 셀렉터
+        body_el = (soup.select_one("div#news_read") or
+                   soup.select_one("div.news_end") or
+                   soup.select_one("div._article_body") or
+                   soup.select_one("article"))
+        if body_el:
+            text = body_el.get_text(separator=" ", strip=True)
+            # 광고/불필요 문구 제거
+            text = text.replace("© 무단전재 및 재배포 금지","").strip()
+            return text[:600]
+    except:
+        pass
+    return ""
+
+def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
+    """
+    뉴스 기사 심층 분석 (Claude API).
+    헤드라인 + 본문 기반으로 실질 호재/악재 판단.
+
+    반환: {
+      verdict: "실질호재" / "실질악재" / "표면호재실질악재" / "불확실" / "중립",
+      score_adj: int (-15 ~ +15),
+      reason: str,
+      risk_points: [str],   # 본문에서 발견된 리스크
+      key_event: str,       # 핵심 이벤트 유형
+      confidence: "high"/"mid"/"low"
+    }
+    """
+    if not articles:
+        return {"verdict": "중립", "score_adj": 0, "reason": "", "risk_points": [],
+                "key_event": "", "confidence": "low"}
+
+    # 캐시 확인
+    cache_key = f"{code}_{articles[0].get('title','')[:20]}"
+    cached = _deep_news_cache.get(cache_key)
+    if cached and time.time() - cached.get("ts", 0) < 3600:
+        return cached
+
+    # 기업 이벤트 키워드 감지 여부 확인
+    all_titles = " ".join(a.get("title","") for a in articles)
+    has_event  = any(kw in all_titles for kw in _CORP_EVENT_KEYWORDS)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    # API 키 없거나 이벤트 없으면 → 기존 키워드 분석 fallback
+    if not api_key or not has_event:
+        sent = analyze_news_sentiment([a.get("title","") for a in articles], stock_name)
+        if   sent["score"] >= 10: adj, verdict = +8,  "실질호재"
+        elif sent["score"] >= 4:  adj, verdict = +4,  "실질호재"
+        elif sent["score"] <= -10:adj, verdict = -10, "실질악재"
+        elif sent["score"] <= -4: adj, verdict = -5,  "실질악재"
+        else:                     adj, verdict = 0,   "중립"
+        return {"verdict": verdict, "score_adj": adj, "reason": "키워드 분석",
+                "risk_points": [], "key_event": "", "confidence": "low",
+                "ts": time.time()}
+
+    # 본문 크롤링 (최대 2건)
+    articles_with_body = []
+    for a in articles[:2]:
+        body = _fetch_article_body(a.get("url",""))
+        articles_with_body.append({
+            "title": a.get("title",""),
+            "body":  body or "(본문 없음)"
+        })
+
+    # Claude API 심층 분석
+    try:
+        article_text = ""
+        for i, a in enumerate(articles_with_body, 1):
+            article_text += f"[기사{i}] 제목: {a['title']}\n본문: {a['body']}\n\n"
+
+        prompt = f"""다음은 한국 주식 종목 [{stock_name}]의 최신 뉴스 기사입니다.
+
+{article_text}
+
+투자자 관점에서 이 뉴스가 주가에 미치는 실질적 영향을 분석하고 JSON으로만 답하세요:
+
+{{
+  "verdict": "실질호재/실질악재/표면호재실질악재/표면악재실질호재/불확실/중립",
+  "score_adj": -15~+15 사이 정수,
+  "key_event": "핵심 이벤트 한 단어 (무상증자/유상증자/합병/수주/실적/등)",
+  "reason": "판단 근거 한 줄",
+  "risk_points": ["본문에서 발견된 리스크나 주의사항 (없으면 빈 배열)"],
+  "confidence": "high/mid/low"
+}}
+
+판단 기준:
+- 표면호재실질악재 예시: 무상증자(호재처럼 보이나 재원/재무상태 불량), 합병(합병비율 불리), 유상증자(대규모 희석)
+- 표면악재실질호재 예시: 단기 실적 부진이나 구조조정 완료, 악재 선반영 후 저점
+- score_adj는 실질 영향 기준 (표면호재실질악재면 음수)"""
+
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 400,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=15
+        )
+        raw  = resp.json()["content"][0]["text"].strip()
+        raw  = raw.replace("```json","").replace("```","").strip()
+        data = json.loads(raw)
+
+        result = {
+            "verdict":     data.get("verdict", "중립"),
+            "score_adj":   max(-15, min(data.get("score_adj", 0), 15)),
+            "key_event":   data.get("key_event", ""),
+            "reason":      data.get("reason", ""),
+            "risk_points": data.get("risk_points", []),
+            "confidence":  data.get("confidence", "mid"),
+            "ts":          time.time(),
+        }
+        _deep_news_cache[cache_key] = result
+        print(f"  📰 심층분석 [{stock_name}]: {result['verdict']} {result['score_adj']:+d}점")
+        return result
+
+    except Exception as e:
+        _log_error(f"analyze_news_deep({stock_name})", e)
+        # fallback
+        sent = analyze_news_sentiment([a.get("title","") for a in articles], stock_name)
+        adj  = 8 if sent["score"]>=10 else 4 if sent["score"]>=4 else -10 if sent["score"]<=-10 else -5 if sent["score"]<=-4 else 0
+        return {"verdict": "중립", "score_adj": adj, "reason": "API 오류 — 키워드 fallback",
+                "risk_points": [], "key_event": "", "confidence": "low", "ts": time.time()}
 
 # ============================================================
 # 📰 뉴스 감성 분석
@@ -5238,6 +6409,16 @@ def run_dart_intraday():
             _dart_seen_ids.add(rcept_no)
             is_risk = any(kw in title for kw in DART_RISK_KEYWORDS)
 
+            # ── DART 공시 심층 분석 (기업 이벤트인 경우) ──
+            dart_deep = None
+            try:
+                event_kws = ["무상증자","유상증자","합병","분할","인수","자사주","배당",
+                             "흑자전환","적자전환","실적","수주","계약"]
+                if any(kw in title for kw in event_kws):
+                    fake_article = [{"title": title, "url": "", "time": ""}]
+                    dart_deep = analyze_news_deep(fake_article, company, code)
+            except: pass
+
             # ── 주가 상세 조회 (실패해도 최대한 표시) ──
             cur         = {}
             price       = 0
@@ -5274,16 +6455,32 @@ def run_dart_intraday():
             try: prev_upper = was_upper_limit_yesterday(code)
             except: pass
 
-            # 외국인·기관 수급
+            # 외국인·기관·개인 수급
             inv_text = ""
             try:
                 inv   = get_investor_trend(code)
-                f_net = inv.get("foreign_net", 0)
+                f_net = inv.get("foreign_net",     0)
                 i_net = inv.get("institution_net", 0)
-                if   f_net > 0 and i_net > 0: inv_text = "\n✅ 외국인+기관 동시 순매수"
-                elif f_net > 0:               inv_text = "\n🟡 외국인 순매수"
-                elif i_net > 0:               inv_text = "\n🟡 기관 순매수"
-                elif f_net < 0 and i_net < 0: inv_text = "\n🔴 외국인+기관 동시 순매도"
+                r_net = inv.get("retail_net",      0)
+                # 3자 구도 표시
+                if   f_net > 0 and i_net > 0 and r_net < 0:
+                    inv_text = "\n💎 외국인+기관 매수 / 개인 매도 (최강 수급)"
+                elif f_net > 0 and i_net > 0:
+                    inv_text = "\n✅ 외국인+기관 동시 순매수"
+                elif f_net > 0:
+                    inv_text = "\n🟡 외국인 순매수"
+                elif i_net > 0:
+                    inv_text = "\n🟡 기관 순매수"
+                elif r_net > 0 and f_net < 0 and i_net < 0:
+                    # 맥락 분석
+                    _re = eval_retail_signal(code, f_net, i_net, r_net,
+                                            inv.get("cap_size","unknown") if hasattr(inv,"get") else "unknown")
+                    if _re and _re.get("score_adj",0) >= 0:
+                        inv_text = f"\n{_re['label']}"
+                    else:
+                        inv_text = "\n⚠️ 개인만 매수 / 기관+외국인 이탈 (맥락 주의)"
+                elif f_net < 0 and i_net < 0:
+                    inv_text = "\n🔴 외국인+기관 동시 순매도"
             except: pass
 
             # ATR 손절·목표가
@@ -5360,6 +6557,23 @@ def run_dart_intraday():
             elif theme:
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
 
+            # 심층 분석 블록
+            deep_block = ""
+            if dart_deep:
+                verd = dart_deep.get("verdict","")
+                adj  = dart_deep.get("score_adj", 0)
+                rsn  = dart_deep.get("reason","")
+                rps  = dart_deep.get("risk_points",[])
+                if verd == "표면호재실질악재":
+                    deep_block = f"\n━━━━━━━━━━━━━━━\n⚠️ <b>표면호재실질악재 경고</b>\n  {rsn}"
+                    for rp in rps[:2]:
+                        deep_block += f"\n  🔸 {rp}"
+                elif verd == "표면악재실질호재":
+                    deep_block = f"\n━━━━━━━━━━━━━━━\n💡 <b>역발상 매수 검토</b>\n  {rsn}"
+                elif verd in ("실질호재","실질악재") and rsn:
+                    v_emoji = "✅" if "호재" in verd else "❌"
+                    deep_block = f"\n━━━━━━━━━━━━━━━\n{v_emoji} <b>{verd}</b>  {adj:+d}점\n  {rsn}"
+
             send_with_chart_buttons(
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
@@ -5368,6 +6582,7 @@ def run_dart_intraday():
                 f"━━━━━━━━━━━━━━━\n"
                 f"📌 {title}\n"
                 f"🔑 키워드: {', '.join(all_kw)}"
+                f"{deep_block}"
                 f"{price_block}"
                 f"{sector_block}"
                 f"{stop_block}",
@@ -5762,11 +6977,20 @@ def poll_telegram_commands():
                                 s_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
                                 msg += f"  {s_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
                             msg += "\n"
-                        if geo.get("sectors"):
+                        sec_dirs = geo.get("sector_directions", [])
+                        if sec_dirs:
+                            msg += "<b>섹터별 영향</b>\n"
+                            for sd in sec_dirs:
+                                d_emoji = {"상승":"📈","하락":"📉","중립":"➡️"}.get(sd.get("direction","중립"),"➡️")
+                                adj_str = f"{sd.get('score_adj',0):+d}점" if sd.get("score_adj") else ""
+                                msg += (f"  {d_emoji} <b>{sd.get('sector','')}</b> {sd.get('direction','')} "
+                                        f"{adj_str}  {sd.get('reason','')}\n")
+                            msg += "\n"
+                        elif geo.get("sectors"):
                             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
                         if geo.get("summary"):
                             msg += f"\n💡 {geo['summary']}"
-                        msg += f"\n\n점수 보정: {geo.get('score_adj',0):+d}점"
+                        msg += f"\n\n전체 점수 보정: {geo.get('score_adj',0):+d}점"
                         send(msg)
                     except Exception as e:
                         send(f"❌ 오류: {e}")
@@ -6435,6 +7659,7 @@ def _send_stats():
             "feat_w_bb":     "볼린저밴드",
             "feat_w_sector": "섹터모멘텀",
             "feat_w_nxt":    "NXT 보정",
+            "feat_w_geo":    "지정학 보정",
         }
         msg += f"\n━━━━━━━━━━━━━━━\n🔧 <b>기능별 가중치</b> (auto_tune 자동 조정)\n"
         for fk, flabel in feat_labels.items():
