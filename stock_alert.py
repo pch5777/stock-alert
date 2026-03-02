@@ -2,13 +2,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v34.0
+버전: v34.1
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v34.0 (2026-03-02)  ← 현재
+v34.1 (2026-03-02)  ← 현재
+  "Unknown format code 'd' for object of type 'str'" 오류 수정
+  ① score_adj 전체 int() 안전 처리 (API JSON → 문자열로 올 때 대비)
+     run_geo_news_scan / analyze() fallback / /geo 핸들러
+     analyze_news_deep / detect_force_pattern / eval_retail_signal / get_us_market_signals
+  ② /geo 명령어 핸들러 화살표 형식 동기화
+     구버전(📈/📉/➡️) → 신버전(🟢▲/🔴▼/🔵―) + └ 이유 표시
+     sector_directions 없으면 fallback 자동 생성 적용
+
+v34.0 (2026-03-02)
   지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
   ① 방향 표시 전면 교체
      📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
@@ -41,7 +50,16 @@ v33.0 (2026-03-02)
      analyze_news_deep 감성 점수 -40 이하 → ⚠️ 매도 검토 알림
      중복 알림 방지 (_tracking_notified 활용)
 
-v34.0 (2026-03-02)  ← 현재
+v34.1 (2026-03-02)  ← 현재
+  "Unknown format code 'd' for object of type 'str'" 오류 수정
+  ① score_adj 전체 int() 안전 처리 (API JSON → 문자열로 올 때 대비)
+     run_geo_news_scan / analyze() fallback / /geo 핸들러
+     analyze_news_deep / detect_force_pattern / eval_retail_signal / get_us_market_signals
+  ② /geo 명령어 핸들러 화살표 형식 동기화
+     구버전(📈/📉/➡️) → 신버전(🟢▲/🔴▼/🔵―) + └ 이유 표시
+     sector_directions 없으면 fallback 자동 생성 적용
+
+v34.0 (2026-03-02)
   지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
   ① 방향 표시 전면 교체
      📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
@@ -2885,7 +2903,7 @@ def track_signal_results():
                     _articles = fetch_news_for_stock(code, _rec_name)
                     if _articles:
                         _deep = analyze_news_deep(_articles, _rec_name, code)
-                        _nadj = _deep.get("score_adj", 0)
+                        _nadj = int(_deep.get("score_adj", 0) or 0)
                         _verd = _deep.get("verdict", "중립")
                         if _nadj <= -40:
                             _nk = f"{log_key}_news_exit"
@@ -4514,7 +4532,7 @@ def analyze(stock: dict) -> dict:
                     score += retail_ev["score_adj"]
                     if retail_ev["score_adj"] != 0:
                         reasons.append(
-                            f"{retail_ev['label']} {retail_ev['score_adj']:+d}점 — {retail_ev['detail']}"
+                            f"{retail_ev['label']} {int(retail_ev['score_adj'] or 0):+d}점 — {retail_ev['detail']}"
                         )
                     else:
                         reasons.append(f"{retail_ev['label']} — {retail_ev['detail']}")
@@ -4634,7 +4652,7 @@ def analyze(stock: dict) -> dict:
         _articles = fetch_news_for_stock(code, stock.get("name", code))
         if _articles:
             deep = analyze_news_deep(_articles, stock.get("name", code), code)
-            adj  = deep.get("score_adj", 0)
+            adj  = int(deep.get("score_adj", 0) or 0)
             verd = deep.get("verdict", "중립")
             conf = deep.get("confidence", "low")
             conf_emoji = {"high":"🔍","mid":"📰","low":"📰"}.get(conf,"📰")
@@ -4699,7 +4717,7 @@ def analyze(stock: dict) -> dict:
             # sector_directions 없으면 전체 score_adj fallback
             if not matched:
                 geo_sectors = _geo_event_state.get("sectors", [])
-                geo_adj     = _geo_event_state.get("score_adj", 0)
+                geo_adj     = int(_geo_event_state.get("score_adj", 0) or 0)
                 if stock_sector and (any(s in stock_sector for s in geo_sectors)
                                      or any(stock_sector in s for s in geo_sectors)):
                     if geo_adj != 0:
@@ -4785,7 +4803,7 @@ def analyze(stock: dict) -> dict:
                 conf_emoji = {"high":"🔴","mid":"🟡","low":"⬜"}.get(p["confidence"],"⬜")
                 reasons.append(
                     f"{conf_emoji} [{p['confidence'].upper()}] {p['label']} "
-                    f"{p['score_adj']:+d}점 — {p['detail']}"
+                    f"{int(p['score_adj'] or 0):+d}점 — {p['detail']}"
                 )
         if fp.get("risk_flag"):
             reasons.append("⚠️ 수급 이탈 신호 감지 — 포지션 축소 검토")
@@ -5510,7 +5528,7 @@ def detect_force_pattern(code: str, name: str,
     for p in patterns:
         ce  = CONF_EMOJI.get(p["confidence"], "⬜")
         ck  = CONF_KOR.get(p["confidence"], "참고용")
-        adj = f"{p['score_adj']:+d}점" if p["score_adj"] != 0 else ""
+        adj = f"{int(p['score_adj'] or 0):+d}점" if p["score_adj"] != 0 else ""
         summary_lines.append(
             f"{ce} {p['label']} {adj} [{ck}]\n"
             f"     └ {p['detail']}"
@@ -5898,7 +5916,7 @@ def run_geo_news_scan():
                 _dir  = sd.get("direction", "중립")
                 _col  = _DIR_EMOJI.get(_dir, "🔵")
                 _arrow = _DIR_DISPLAY.get(_dir, "― 중립")
-                _adj   = sd.get("score_adj", 0)
+                _adj   = int(sd.get("score_adj", 0) or 0)
                 _adj_str = f"  <b>{_adj:+d}점</b>" if _adj != 0 else ""
                 msg += (f"  {_col} <b>{sd.get('sector','')}</b>  {_arrow}{_adj_str}\n"
                         f"       └ {sd.get('reason','')}\n")
@@ -6181,7 +6199,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             "ts":          time.time(),
         }
         _deep_news_cache[cache_key] = result
-        print(f"  📰 심층분석 [{stock_name}]: {result['verdict']} {result['score_adj']:+d}점")
+        print(f"  📰 심층분석 [{stock_name}]: {result['verdict']} {int(result['score_adj'] or 0):+d}점")
         return result
 
     except Exception as e:
@@ -6977,20 +6995,28 @@ def poll_telegram_commands():
                                 s_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
                                 msg += f"  {s_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
                             msg += "\n"
+                        # /geo 핸들러 — sector_directions 없으면 fallback 생성
                         sec_dirs = geo.get("sector_directions", [])
+                        if not sec_dirs and geo.get("sectors"):
+                            _kws_fb = geo.get("kws", [])
+                            sec_dirs = _build_fallback_sector_directions(_kws_fb, geo["sectors"])
                         if sec_dirs:
-                            msg += "<b>섹터별 영향</b>\n"
+                            msg += "<b>📊 섹터별 영향</b>\n"
                             for sd in sec_dirs:
-                                d_emoji = {"상승":"📈","하락":"📉","중립":"➡️"}.get(sd.get("direction","중립"),"➡️")
-                                adj_str = f"{sd.get('score_adj',0):+d}점" if sd.get("score_adj") else ""
-                                msg += (f"  {d_emoji} <b>{sd.get('sector','')}</b> {sd.get('direction','')} "
-                                        f"{adj_str}  {sd.get('reason','')}\n")
+                                _dir2   = sd.get("direction", "중립")
+                                _col2   = _DIR_EMOJI.get(_dir2, "🔵")
+                                _arrow2 = _DIR_DISPLAY.get(_dir2, "― 중립")
+                                _adj2   = int(sd.get("score_adj", 0) or 0)
+                                _adj2_str = f"  <b>{_adj2:+d}점</b>" if _adj2 != 0 else ""
+                                msg += (f"  {_col2} <b>{sd.get('sector','')}</b>  {_arrow2}{_adj2_str}\n"
+                                        f"       └ {sd.get('reason','')}\n")
                             msg += "\n"
                         elif geo.get("sectors"):
                             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
                         if geo.get("summary"):
                             msg += f"\n💡 {geo['summary']}"
-                        msg += f"\n\n전체 점수 보정: {geo.get('score_adj',0):+d}점"
+                        _gadj = int(geo.get("score_adj", 0) or 0)
+                        msg += f"\n\n전체 점수 보정: {_gadj:+d}점"
                         send(msg)
                     except Exception as e:
                         send(f"❌ 오류: {e}")
@@ -7010,7 +7036,7 @@ def poll_telegram_commands():
                            f"달러인덱스: {us.get('dxy',0):.2f}\n"
                            f"시장 국면: {regime_kor.get(us.get('us_regime','neutral'),'🔵 중립')}\n"
                            f"갭 예측: {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n"
-                           f"점수 보정: {us.get('score_adj',0):+d}점")
+                           f"점수 보정: {int(us.get('score_adj',0) or 0):+d}점")
                     send(msg)
                 except Exception as e:
                     send(f"❌ 미국 시장 조회 오류: {e}")
