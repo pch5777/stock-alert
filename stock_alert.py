@@ -9436,3 +9436,71 @@ if __name__ == "__main__":
             schedule.run_pending(); time.sleep(1)
         except Exception as e:
             print(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+
+
+
+# ===============================
+# 🔧 vNext Stability & Summary Update Block
+# ===============================
+
+from collections import defaultdict
+from datetime import datetime, time
+import json
+
+_error_counter = defaultdict(int)
+overnight_buffer = []
+geo_buffer = []
+
+def log_error_once(key, msg, limit=5):
+    _error_counter[key] += 1
+    if _error_counter[key] <= limit:
+        try:
+            send_telegram(f"⚠ {key} : {msg}")
+        except:
+            pass
+
+def safe_get_text(item):
+    try:
+        content = item.get("content") or ""
+        title = item.get("title") or ""
+        text = f"{title} {content}".strip()
+        return text
+    except Exception as e:
+        log_error_once("geo_event_error", str(e))
+        return ""
+
+def is_after_market_close():
+    now = datetime.now().time()
+    return now > time(15, 30)
+
+def is_market_open_day():
+    return datetime.now().weekday() < 5
+
+def buffer_overnight_message(message):
+    if is_after_market_close():
+        overnight_buffer.append(message)
+    else:
+        send_telegram(message)
+
+def send_overnight_summary():
+    if not overnight_buffer:
+        return
+    summary = "\n".join(overnight_buffer)
+    send_telegram(f"🌙 오버나이트 요약\n\n{summary}")
+    overnight_buffer.clear()
+
+def buffer_geo_event(event_summary):
+    geo_buffer.append(event_summary)
+
+def send_geo_summary():
+    if not geo_buffer:
+        return
+    summary = "\n".join(geo_buffer)
+    send_telegram(f"🌍 지정학 이벤트 요약\n\n{summary}")
+    geo_buffer.clear()
+
+# ⚠ IMPORTANT:
+# All future NXT-related data processing MUST be included in analysis and logging.
+# Ensure NXT info is appended to signal logs and summaries where applicable.
+
+# ===============================
