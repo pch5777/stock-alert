@@ -297,7 +297,7 @@ _top_signals = []  # v5.1: initialized for DB state load
 from typing import Any, Dict, Optional
 from datetime import time as _time
 
-VERSION = "5.1"
+VERSION = "5.2"
 BUILD_TS = "2026-03-03 12:16:55"
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -444,21 +444,27 @@ def db_load_state():
         ew = _dbkv.get("entry_watch", {}) or {}
         rw = _dbkv.get("reentry_watch", {}) or {}
         ds = _dbkv.get("detected_stocks", {}) or {}
-        ts = _dbkv.get("top_signals", {}) or {}
-        if isinstance(ew, dict): 
+        ts = _dbkv.get("top_signals", []) or []
+
+        if isinstance(ew, dict):
             _entry_watch.clear(); _entry_watch.update(ew)
-        if isinstance(rw, dict): 
+        if isinstance(rw, dict):
             _reentry_watch.clear(); _reentry_watch.update(rw)
-        if isinstance(ds, dict): 
+        if isinstance(ds, dict):
             _detected_stocks.clear(); _detected_stocks.update(ds)
-        if isinstance(ts, dict): 
-            _top_signals.clear(); _top_signals.update(ts)
+
+        # top_signals is a LIST (not dict). Backward compatible handling:
+        if isinstance(ts, list):
+            _top_signals.clear(); _top_signals.extend(ts)
+        elif isinstance(ts, dict):
+            _top_signals.clear(); _top_signals.extend(list(ts.values()))
     except Exception as e:
         try: _log_error("db_load_state", e)
-        except Exception: 
+        except Exception:
             pass
 
 def db_save_state():
+
     try:
         _dbkv.set("entry_watch", _entry_watch)
         _dbkv.set("reentry_watch", _reentry_watch)
