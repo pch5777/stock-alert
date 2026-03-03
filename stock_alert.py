@@ -1,7 +1,7 @@
 # ============================================================
 # Stock Alert Bot
-# Version: v5.4
-# Build: 2026-03-03 12:16:55
+# Version: v5.7
+# Build: 2026-03-03 16:32:51
 #
 # CHANGELOG
 # ------------------------------------------------------------
@@ -15,6 +15,21 @@
 # v5.4
 # - Geo alerts: suppress duplicates when content fingerprint unchanged (even if cron runs every 3 min)
 # - Geo alerts: persist last fingerprint in DBKV
+#
+# v5.5
+# - Overnight alerts: send twice (20:00 and 07:45 KST), each once per day
+# - Deploy notification: notify on version/commit change via Telegram (stores last seen in DBKV)
+#
+# v5.6
+# - Paper fill state: record virtual entry when price reaches entry_target; partial-exit only after paper/actual entry
+# - Alert dedup: NEAR_UPPER/UPPER_LIMIT suppress repeats (cooldown + change threshold; upper-limit once-per-day by default)
+# - Tracking: store paper_entry fields in signal_log for dataset accumulation even without real trades
+#
+# v5.7
+# - Theme engine: theme activation (2+ stocks +5%), 3-level strength scoring, duration decay
+# - Leader/laggard: add bonus when laggard correlates with leader (>=0.6) under active theme
+# - Overheat suppression: RSI>85 penalty; block new-entry signals when daily change > +25%
+# - Early momentum prefilter: trade value + volume-vs-yesterday + theme relax mode (scored, not strict)
 #
 # v5.1
 # - Fix: _top_signals initialization for DB state load
@@ -308,7 +323,7 @@ _top_signals = []  # v5.1: initialized for DB state load
 from typing import Any, Dict, Optional
 from datetime import time as _time
 
-VERSION = "5.4"
+VERSION = "5.6"
 BUILD_TS = "2026-03-03 12:16:55"
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -464,6 +479,17 @@ class DBKV:
 _dbkv = DBKV()
 
 
+
+
+def get_commit_sha() -> str:
+    """Best-effort commit SHA for deploy notification."""
+    import os as _os
+    for k in ("RAILWAY_GIT_COMMIT_SHA", "RAILWAY_GIT_COMMIT", "GIT_COMMIT", "GITHUB_SHA", "COMMIT_SHA"):
+        v = _os.getenv(k)
+        if v:
+            return v[:12]
+    return "unknown"
+
 def db_load_state():
     """Load in-memory bot state from DB KV store."""
     global _top_signals
@@ -472,6 +498,7 @@ def db_load_state():
         rw = _dbkv.get("reentry_watch", {}) or {}
         ds = _dbkv.get("detected_stocks", {}) or {}
         ts = _dbkv.get("top_signals", [])
+        th = _dbkv.get("theme_state", {}) or {}
 
         if isinstance(ew, dict):
             _entry_watch.clear(); _entry_watch.update(ew)
@@ -483,6 +510,8 @@ def db_load_state():
         # _top_signals is a list. Handle legacy dict storage gracefully.
         if isinstance(ts, list):
             _top_signals = ts
+        if isinstance(th, dict):
+            _theme_state.clear(); _theme_state.update(th)
         elif isinstance(ts, dict):
             # Convert dict -> list (stable order by key)
             try:
@@ -503,6 +532,7 @@ def db_save_state():
         _dbkv.set("reentry_watch", _reentry_watch)
         _dbkv.set("detected_stocks", _detected_stocks)
         _dbkv.set("top_signals", _top_signals)
+        _dbkv.set("theme_state", _theme_state)
         _dbkv.set("meta", {"version": VERSION, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
         return True
     except Exception as e:
@@ -545,6 +575,27 @@ def _meta_set(k: str, v: Any):
 
 def should_send_once_per_day(tag: str, today: str) -> bool:
     return _meta_get(tag, "") != today
+
+
+
+def maybe_send_deploy_notice():
+    """Send Telegram notice when version/commit changes (stores last seen in DBKV)."""
+    try:
+        cur_ver = VERSION
+        cur_sha = get_commit_sha()
+        last_ver = _dbkv.get("deploy_last_version", "")
+        last_sha = _dbkv.get("deploy_last_sha", "")
+        if cur_ver != last_ver or cur_sha != last_sha:
+            try:
+                msg = f"🚀 [봇 업데이트 감지]\nVersion: {last_ver or 'N/A'} → {cur_ver}\nCommit: {last_sha or 'N/A'} → {cur_sha}"
+                send_telegram_message(msg)
+            except Exception:
+                pass
+            _dbkv.set("deploy_last_version", cur_ver)
+            _dbkv.set("deploy_last_sha", cur_sha)
+    except Exception as e:
+        try: _log_error("deploy_notice", e)
+        except Exception: pass
 
 def mark_sent(tag: str, today: str):
     _meta_set(tag, today)
@@ -737,6 +788,10 @@ NEWS_COOCCUR_FILE   = "news_cooccur.json"
 
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
+
+# ── 테마 활성/지속 상태 ──
+_theme_state: dict  = {}  # theme_name -> {'start_ts': float, 'level': int, 'last_seen_ts': float}
+
 SECTOR_MONITOR_INTERVAL  = 180   # 600→180초 (3분)
 SECTOR_MONITOR_MAX_HOURS = 6
 
@@ -1095,6 +1150,10 @@ def calc_indicators(code: str) -> dict:
                 score_adj   -= int(15 * w_rsi)
                 filter_pass  = w_rsi < 0.5   # 가중치 낮으면 차단 안 함
                 reasons.append(f"⛔ RSI {rsi} 과매수 (w={w_rsi})")
+                # v5.7 overheat suppression
+                if rsi >= 85:
+                    score_adj -= 20
+                    reasons.append(f"⛔ RSI {rsi} 과열(-20)")
             elif rsi <= rsi_oversell:
                 score_adj += int(10 * w_rsi)
                 reasons.append(f"🎯 RSI {rsi} 과매도 +{int(10*w_rsi)}점")
@@ -1495,7 +1554,7 @@ def calc_stop_target(code: str, entry: int) -> tuple:
     if atr > 0:
         stop   = int((entry - atr * ATR_STOP_MULT)  / 10) * 10
         target = int((entry + atr * ATR_TARGET_MULT) / 10) * 10
-        return stop, target, round((entry-stop)/entry*100,1), round((target-entry)/entry*100,1), True
+        return stop, target, round((entry-stop)/entry*100,1), round((target-entry_for_pnl)/entry_for_pnl*100,1), True
     # ATR 실패 시 국면 배수 적용 fallback
     _rm   = get_atr_regime_mult()
     _stop_pct   = max(0.05, 0.07 * _rm)
@@ -2936,6 +2995,89 @@ def get_theme_sector_stocks(code: str) -> tuple:
     peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
     return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
 
+# ============================================================
+# 🎛 Theme engine helpers (v5.7)
+# ============================================================
+_yday_vol_cache = {}  # code -> {'vol': int, 'ts': float}
+
+def get_trade_value_eok(price: int, today_vol: int) -> float:
+    """Approx trade value in 억원 using price * volume."""
+    try:
+        return (price * today_vol) / 1e8
+    except Exception:
+        return 0.0
+
+def get_yesterday_volume(code: str) -> int:
+    """Best-effort yesterday volume from daily data (cached 30m)."""
+    now_ts = time.time()
+    c = _yday_vol_cache.get(code)
+    if c and now_ts - c["ts"] < 1800:
+        return int(c["vol"] or 0)
+    try:
+        items = get_daily_data(code, days=10) or []
+        # items are newest-first in KIS. We want yesterday (index 1) if today included, else index 0.
+        vols = []
+        for it in items[:3]:
+            v = it.get("acml_vol") or it.get("vol") or it.get("volume")
+            if v is not None:
+                try:
+                    vols.append(int(v))
+                except Exception:
+                    pass
+        yv = vols[1] if len(vols) >= 2 else (vols[0] if vols else 0)
+        _yday_vol_cache[code] = {"vol": yv, "ts": now_ts}
+        return int(yv or 0)
+    except Exception:
+        return 0
+
+def pearson_corr(a: list, b: list) -> float:
+    try:
+        n = min(len(a), len(b))
+        if n < 8:
+            return 0.0
+        a = a[-n:]; b = b[-n:]
+        ma = sum(a)/n; mb = sum(b)/n
+        num = sum((x-ma)*(y-mb) for x,y in zip(a,b))
+        da = sum((x-ma)**2 for x in a)
+        db = sum((y-mb)**2 for y in b)
+        den = (da*db) ** 0.5
+        return float(num/den) if den else 0.0
+    except Exception:
+        return 0.0
+
+def calc_leader_laggard_corr(code: str, leader_code: str) -> float:
+    """Correlation of daily closes over CORR_LOOKBACK."""
+    try:
+        a = get_daily_data(code, days=CORR_LOOKBACK+10) or []
+        b = get_daily_data(leader_code, days=CORR_LOOKBACK+10) or []
+        ca = [int(it.get("stck_clpr", it.get("close", 0)) or 0) for it in a if int(it.get("stck_clpr", it.get("close", 0)) or 0) > 0]
+        cb = [int(it.get("stck_clpr", it.get("close", 0)) or 0) for it in b if int(it.get("stck_clpr", it.get("close", 0)) or 0) > 0]
+        return pearson_corr(ca[-CORR_LOOKBACK:], cb[-CORR_LOOKBACK:])
+    except Exception:
+        return 0.0
+
+def update_theme_state(theme: str, level: int):
+    """Track theme activation start time and current level."""
+    try:
+        now_ts = time.time()
+        st = _theme_state.get(theme)
+        if st is None:
+            _theme_state[theme] = {"start_ts": now_ts, "level": int(level), "last_seen_ts": now_ts}
+        else:
+            st["last_seen_ts"] = now_ts
+            st["level"] = max(int(st.get("level", 0)), int(level))
+    except Exception:
+        pass
+
+def get_theme_age_minutes(theme: str) -> float:
+    try:
+        st = _theme_state.get(theme)
+        if not st:
+            return 0.0
+        return max(0.0, (time.time() - float(st.get("start_ts", time.time()))) / 60.0)
+    except Exception:
+        return 0.0
+
 def calc_sector_momentum(code: str, name: str) -> dict:
     theme_name, peers, peers_all = get_theme_sector_stocks(code)
     if not peers:
@@ -2965,6 +3107,64 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     elif react_ratio >= 1.0:  summary = f"🔥 섹터 전체 동반 상승! ({theme_name}: {react_cnt}/{total})"
     elif react_ratio >= 0.5:  summary = f"✅ 섹터 절반 이상 반응 ({theme_name}: {react_cnt}/{total})"
     else:                     summary = f"🟡 섹터 일부 반응 ({theme_name}: {react_cnt}/{total})"
+
+
+    # ── Theme activation & strength (v5.7) ──
+    # Activation: same theme 2+ stocks >= +5% (user fixed)
+    movers_5 = sum(1 for r in results if r["change_rate"] >= 5.0)
+    movers_7 = sum(1 for r in results if r["change_rate"] >= 7.0)
+    upper_like = sum(1 for r in results if r["change_rate"] >= 29.0)
+
+    theme_level = 0
+    leader_code = ""
+    leader_name = ""
+    laggard_corr = 0.0
+
+    theme_bonus = 0
+    if movers_5 >= 2:
+        theme_level = 1
+        theme_bonus = 20
+        if movers_7 >= 3:
+            theme_level = 2
+            theme_bonus = 30
+        if upper_like >= 1:
+            theme_level = 3
+            theme_bonus = 40
+
+        update_theme_state(theme_name, theme_level)
+        age_min = get_theme_age_minutes(theme_name)
+
+        # duration decay: after 90m -10, after 180m -20
+        decay = 0
+        if age_min > 180:
+            decay = 20
+        elif age_min > 90:
+            decay = 10
+
+        theme_bonus = max(0, theme_bonus - decay)
+        if theme_bonus > 0:
+            bonus += theme_bonus
+            if decay:
+                summary += f" ⏳ 지속 {int(age_min)}m(-{decay})"
+            else:
+                summary += f" ✅ 테마활성 L{theme_level}(+{theme_bonus})"
+
+    # ── Leader/Laggard: correlate laggard with leader under active theme ──
+    try:
+        leader = sorted(results, key=lambda x: (x.get("change_rate",0), x.get("volume_ratio",0)), reverse=True)[0]
+        leader_code = leader.get("code","")
+        leader_name = leader.get("name","")
+    except Exception:
+        pass
+
+    if theme_level >= 1 and leader_code and leader_code != code:
+        try:
+            laggard_corr = calc_leader_laggard_corr(code, leader_code)
+            if laggard_corr >= 0.60:
+                bonus += 15
+                summary += f" 🔗 후발상관 {laggard_corr:.2f}(+15)"
+        except Exception:
+            pass
 
     # ── NXT 섹터 동향 보정 ──
     # 섹터 내 종목들의 NXT 외인 동향이 일치할수록 신뢰도 ↑
@@ -3323,7 +3523,7 @@ def _send_pending_result_reminder():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
         for v in pending:
@@ -3406,6 +3606,26 @@ def track_signal_results():
             except:
                 continue
 
+            # ── Paper Fill (가상 체결): 진입가(목표진입) 도달 시점 기록 ──
+            # 실제 매수를 하지 않아도 "진입가 도달"을 기준으로 이후 성과(분할청산/손절/목표)를 데이터로 축적
+            try:
+                if entry and price and not rec.get("paper_entered"):
+                    tol = 0.0
+                    try:
+                        tol = calc_entry_tolerance(code, entry)
+                    except Exception:
+                        tol = 0.0
+                    if price <= entry * (1 + tol / 100):
+                        rec["paper_entered"] = True
+                        rec["paper_entry_price"] = entry
+                        rec["paper_entry_at"] = datetime.now().strftime("%Y%m%d%H%M%S")
+            except Exception as _e:
+                try:
+                    _log_error("paper_fill", _e)
+                except Exception:
+                    pass
+
+
             # 최고가·최저가 업데이트 (MDD 계산용)
             rec["max_price"] = max(rec.get("max_price", price), price)
             rec["min_price"] = min(rec.get("min_price", price), price)
@@ -3476,10 +3696,12 @@ def track_signal_results():
                 except Exception as _e:
                     print(f"  ⚠️ 보유종목 뉴스체크오류: {_e}")
 
-            # ── 분할 청산 가이드 (목표가 도달 전 중간 알림) ──
-            if entry and target:
-                pnl_now  = (price - entry) / entry * 100
-                half_pct = (target - entry) / entry * 100 / 2   # 목표의 절반
+            # ── 분할 청산 가이드 (목표가 도달 전 중간 알림)
+            # 조건: 실제 진입(/진입) 또는 가상진입(paper_entered) 이후에만 동작 ──
+            entry_for_pnl = rec.get("actual_entry") or (rec.get("paper_entry_price") if rec.get("paper_entered") else 0)
+            if entry_for_pnl and target:
+                pnl_now  = (price - entry_for_pnl) / entry_for_pnl * 100
+                half_pct = (target - entry_for_pnl) / entry_for_pnl * 100 / 2   # 목표의 절반
                 partial_key = f"{log_key}_partial"
                 _partial_min = calc_partial_exit_min_pct(code, price)
                 if (pnl_now >= half_pct
@@ -3501,9 +3723,9 @@ def track_signal_results():
                         f"━━━━━━━━━━━━━━━\n"
                         f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {pnl_now/((target-entry)/entry*100)*100:.0f}%)\n"
+                        f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {pnl_now/((target-entry_for_pnl)/entry_for_pnl*100)*100:.0f}%)\n"
                         f"📍 현재가: <b>{price:,}원</b>\n"
-                        f"🏆 목표가: <b>{target:,}원</b>  (+{(target-entry)/entry*100:.1f}%)\n"
+                        f"🏆 목표가: <b>{target:,}원</b>  (+{(target-entry_for_pnl)/entry_for_pnl*100:.1f}%)\n"
                         f"{inv_info}\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"💡 절반 익절 후 나머지 홀딩 전략 고려",
@@ -3714,7 +3936,7 @@ def _send_tracking_result(rec: dict):
     pnl_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
     sig_labels = {
         "UPPER_LIMIT":"상한가", "NEAR_UPPER":"상한가근접",
-        "SURGE":"급등", "EARLY_DETECT":"조기포착",
+        "SURGE":"급등", "EARLY_MOMENTUM":"초입포착",
         "MID_PULLBACK":"중기눌림목", "ENTRY_POINT":"단기눌림목",
         "STRONG_BUY":"강력매수",
     }
@@ -3833,7 +4055,7 @@ def check_reentry_watch():
             _reentry_min = calc_reentry_bounce(code, price)
             if bounce >= _reentry_min and vr >= REENTRY_VOL_MIN:
                 sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
-                              "SURGE":"급등","EARLY_DETECT":"조기포착",
+                              "SURGE":"급등","EARLY_MOMENTUM":"초입포착",
                               "MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목"}
                 sig = sig_labels.get(w["signal_type"], w["signal_type"])
                 stop_new, target_new, sp, tp, atr = calc_stop_target(code, price)
@@ -4113,7 +4335,7 @@ def analyze_loss_pattern(completed: list) -> str:
     worst_type = max(type_counts, key=type_counts.get) if type_counts else None
     if worst_type:
         type_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+                       "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목",
                        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수"}
         lines.append(f"  손실 많은 신호: {type_labels.get(worst_type, worst_type)} ({type_counts[worst_type]}건)")
 
@@ -4555,7 +4777,7 @@ def send_top_signals():
 
     sig_labels = {
         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+        "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목",
         "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
     }
     top5  = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:5]
@@ -4723,7 +4945,7 @@ def check_entry_watch():
                 watch["notify_count"]     = notify_count + 1
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
+                    "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
                 }
                 sig       = sig_labels.get(watch["signal_type"], watch["signal_type"])
                 diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
@@ -4881,6 +5103,43 @@ def send_alert(s: dict):
              "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
 
     level    = get_alert_level(s["signal_type"], s.get("score",0), s.get("nxt_delta",0))
+
+    # ------------------------------------------------------------
+    # Alert de-duplication (reduce noise on frequent cron runs)
+    # - NEAR_UPPER: 30min cooldown unless meaningful change (pct +2.0 or score +10)
+    # - UPPER_LIMIT: once per day per stock (re-hit same day suppressed by default)
+    # ------------------------------------------------------------
+    try:
+        code_ = s.get("code","")
+        sig_type = s.get("signal_type","")
+        now_ts = time.time()
+        today_ = _kst_now().strftime("%Y%m%d")
+        if sig_type in ("NEAR_UPPER", "UPPER_LIMIT") and code_:
+            if sig_type == "UPPER_LIMIT":
+                k = f"upper_sent_{today_}_{code_}"
+                if _dbkv.get(k, False):
+                    return
+                _dbkv.set(k, True)
+            else:
+                k_ts  = f"near_last_ts_{code_}"
+                k_pct = f"near_last_pct_{code_}"
+                k_sc  = f"near_last_score_{code_}"
+                last_ts = float(_dbkv.get(k_ts, 0) or 0)
+                last_pct = float(_dbkv.get(k_pct, 0) or 0)
+                last_sc  = float(_dbkv.get(k_sc, 0) or 0)
+                cur_pct = float(s.get("pct", 0) or 0)
+                cur_sc  = float(s.get("score", 0) or 0)
+                if (now_ts - last_ts) < 1800 and (abs(cur_pct - last_pct) < 2.0) and (abs(cur_sc - last_sc) < 10.0):
+                    return
+                _dbkv.set(k_ts, now_ts)
+                _dbkv.set(k_pct, cur_pct)
+                _dbkv.set(k_sc, cur_sc)
+    except Exception as _e:
+        try:
+            _log_error("alert_dedup", _e)
+        except Exception:
+            pass
+
     nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
     lvl_icon  = {"CRITICAL":"🔴","NORMAL":"🟡","INFO":"🔵"}.get(level,"🟡")
 
@@ -5045,6 +5304,13 @@ def analyze(stock: dict) -> dict:
     elif change_rate >= PRICE_SURGE_MIN:
         score+=15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type="SURGE"
     else: return {}
+    
+
+    # ── v5.7 overheat entry guard ──
+    # 신규 진입성 신호(급등/조기/초입)는 +25% 이상이면 막차 위험 → 신규 알림/진입 차단
+    if change_rate >= 25.0 and signal_type in ("SURGE", "EARLY_MOMENTUM"):
+        return {}
+
 
     if vol_ratio >= VOLUME_SURGE_RATIO*2:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (5일 평균 대비)")
@@ -5417,6 +5683,38 @@ def check_early_detection() -> list:
             if ask_qty > 0 and bid_qty/ask_qty < EARLY_HOGA_RATIO: continue
         except: continue
 
+
+        # ── v5.7 EARLY_MOMENTUM prefilter scoring (video-inspired) ──
+        # Hard filters (minimal): price range + trade value + theme relax
+        tv_eok = get_trade_value_eok(price, detail.get("today_vol", 0))
+        yv = get_yesterday_volume(code)
+        vol_vs_yday = (detail.get("today_vol", 0) / yv) if yv else 0.0
+
+        # theme relax: if theme recently active, loosen floors
+        theme_name, _, _ = get_theme_sector_stocks(code)
+        theme_active = False
+        try:
+            st = _theme_state.get(theme_name, {})
+            theme_active = bool(st) and (time.time() - float(st.get("last_seen_ts", 0)) < 3600)
+        except Exception:
+            theme_active = False
+
+        tv_min = 10.0 if theme_active else 20.0
+        if price < (800 if theme_active else 1000) or price > (600000 if theme_active else 400000):
+            continue
+        if tv_eok < tv_min:
+            continue
+
+        # score bonus (not strict)
+        extra_score = 0
+        extra_reasons = []
+        if vol_vs_yday >= 1.8:
+            extra_score += 15
+            extra_reasons.append(f"📈 전일대비 거래량 {vol_vs_yday:.1f}배(+15)")
+        if change_rate >= 2.0:
+            extra_score += 10
+            extra_reasons.append("📌 초입 상승(+10)")
+
         now = datetime.now()
         cache = _early_cache.get(code)
         if cache is None:
@@ -5436,11 +5734,13 @@ def check_early_detection() -> list:
         stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
         hoga_text = f"{bid_qty/ask_qty:.1f}배" if ask_qty > 0 else "압도적"
         prev_upper = was_upper_limit_yesterday(code)
-        early_score = 85 + (10 if prev_upper else 0)
+        early_score = 85 + (10 if prev_upper else 0) + extra_score
         reasons = [f"🔍 조기 포착!",f"📈 현재 +{change_rate:.1f}%",
                    f"💥 거래량 {vol_ratio:.1f}배 (5일 평균 대비)",
                    f"📊 매수/매도 잔량 {hoga_text}",f"✅ 2분 연속 상승 확인"]
         if prev_upper: reasons.append("🔁 전일 상한가 → 연속 상한가 가능성")
+        for _r in extra_reasons:
+            reasons.append(_r)
         # 코스피 상대강도
         rs = get_relative_strength(change_rate)
         if rs >= RS_MIN: early_score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
@@ -5465,7 +5765,7 @@ def check_early_detection() -> list:
 
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
-                        "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
+                        "signal_type":"EARLY_MOMENTUM","score":early_score,"sector_info":sector_info,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":prev_upper,"reasons":reasons,"detected_at":now})
@@ -5503,7 +5803,7 @@ def check_early_detection() -> list:
 
             signals.append({"code":code,"name":stock.get("name",code),"price":price,
                             "change_rate":cr,"volume_ratio":vr,
-                            "signal_type":"EARLY_DETECT","score":pre_score,
+                            "signal_type":"EARLY_MOMENTUM","score":pre_score,
                             "sector_info":{},"market":"NXT",
                             "entry_price":entry,"stop_loss":stop,"target_price":target,
                             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
@@ -7327,7 +7627,7 @@ def on_market_close():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
 
@@ -7625,7 +7925,7 @@ def send_weekly_report():
 
         type_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_MOMENTUM":"초입포착","MID_PULLBACK":"중기눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
         type_lines = ""
@@ -8478,18 +8778,33 @@ def main_single_run():
     # 실행 허용 시간:
     # - 기본: NXT 운영시간(08:00~20:00 KST)
     # - 예외: 거래일 지정학 요약(07:30 KST)
+    
     allow_early_geo = (is_trading_day_kst(now) and now.hour == 7 and 25 <= now.minute <= 35)
-    if not is_nxt_window_kst(now) and not allow_early_geo:
+    allow_early_overnight_open = (now.hour == 7 and 40 <= now.minute <= 50)
+    if not is_nxt_window_kst(now) and not (allow_early_geo or allow_early_overnight_open):
         return
 
-    # (1) 오버나이트 알림: NXT 마감(20:00)대 1회
-    if now.hour == 20 and 0 <= now.minute <= 5 and should_send_once_per_day("overnight_sent", today):
+    
+    # (1) 오버나이트 알림
+    # - 20:00(±5분): 하루 마감 점검 1회
+    if now.hour == 20 and 0 <= now.minute <= 5 and should_send_once_per_day("overnight_close_sent", today):
         try:
             send_overnight_risk_alerts()
-            mark_sent("overnight_sent", today)
+            mark_sent("overnight_close_sent", today)
         except Exception as e:
             try:
-                _log_error("overnight_once", e)
+                _log_error("overnight_2000", e)
+            except Exception:
+                pass
+
+    # - 07:45(±5분): 장 시작 전 대응용 1회
+    if now.hour == 7 and 40 <= now.minute <= 50 and should_send_once_per_day("overnight_open_sent", today):
+        try:
+            send_overnight_risk_alerts()
+            mark_sent("overnight_open_sent", today)
+        except Exception as e:
+            try:
+                _log_error("overnight_0745", e)
             except Exception:
                 pass
 
