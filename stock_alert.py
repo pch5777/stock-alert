@@ -5,7 +5,7 @@
 #
 # CHANGELOG
 # ------------------------------------------------------------
-# v5.1
+# v5.2
 # - Fix: _top_signals initialization for DB state load
 # - Fix: DB connect fallback (Railway private host vs public proxy)
 # - Added: clear error hints for DATABASE_URL selection
@@ -289,7 +289,7 @@ from bs4 import BeautifulSoup
 import socket
 import urllib.parse
 
-_top_signals = []  # v5.1: initialized for DB state load
+_top_signals = []  # v5.2: initialized for DB state load
 
 # ===============================
 # 🧱 v5.0 DB Persistence Layer (PostgreSQL)
@@ -352,7 +352,7 @@ class DBKV:
 
     def connect(self):
 
-        # v5.1: DB URL selection
+        # v5.2: DB URL selection
         # Prefer private DATABASE_URL inside Railway. If running outside Railway (e.g. GitHub Actions),
         # postgres.railway.internal won't resolve; in that case fall back to DATABASE_PUBLIC_URL if provided.
         db_url = os.getenv("DATABASE_URL") or ""
@@ -375,7 +375,7 @@ class DBKV:
             raise RuntimeError("DATABASE_URL not set (or empty). Set DATABASE_URL to the PRIVATE URL inside Railway, "
                                "or set DATABASE_PUBLIC_URL when running outside Railway.")
         
-        # v5.1: apply selected url
+        # v5.2: apply selected url
         self.url = db_url.strip()
         self.enabled = True
         if self._conn is not None:
@@ -440,6 +440,10 @@ class DBKV:
 _dbkv = DBKV()
 
 def db_load_state():
+    """DB(bot_kv)에서 상태를 복원한다.
+    - entry_watch/reentry_watch/detected_stocks: dict
+    - top_signals: list (구버전 dict 저장값도 호환)
+    """
     try:
         ew = _dbkv.get("entry_watch", {}) or {}
         rw = _dbkv.get("reentry_watch", {}) or {}
@@ -453,18 +457,31 @@ def db_load_state():
         if isinstance(ds, dict):
             _detected_stocks.clear(); _detected_stocks.update(ds)
 
-        # top_signals is a LIST (not dict). Backward compatible handling:
+        # top_signals는 list로 유지 (dict로 저장돼 있던 과거 데이터 호환)
+        _top_signals.clear()
         if isinstance(ts, list):
-            _top_signals.clear(); _top_signals.extend(ts)
+            _top_signals.extend(ts)
         elif isinstance(ts, dict):
-            _top_signals.clear(); _top_signals.extend(list(ts.values()))
+            # {items:[...]} 형태
+            items = ts.get("items") if isinstance(ts.get("items", None), list) else None
+            if items is not None:
+                _top_signals.extend(items)
+            else:
+                # {code: {...}} 형태면 value들을 list로
+                if ts and all(isinstance(v, (dict, list, str, int, float, bool, type(None))) for v in ts.values()):
+                    _top_signals.extend(list(ts.values()))
+                else:
+                    _top_signals.extend(list(ts.items()))
+        else:
+            # 알 수 없는 타입이면 빈 리스트로 초기화
+            pass
+
     except Exception as e:
         try: _log_error("db_load_state", e)
         except Exception:
             pass
 
 def db_save_state():
-
     try:
         _dbkv.set("entry_watch", _entry_watch)
         _dbkv.set("reentry_watch", _reentry_watch)
