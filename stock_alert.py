@@ -1,3 +1,16 @@
+# ============================================================
+# Stock Alert Bot
+# Version: v5.1
+# Build: 2026-03-03 12:16:55
+#
+# CHANGELOG
+# ------------------------------------------------------------
+# v5.1
+# - Fix: _top_signals initialization for DB state load
+# - Fix: DB connect fallback (Railway private host vs public proxy)
+# - Added: clear error hints for DATABASE_URL selection
+# ============================================================
+
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
@@ -273,14 +286,19 @@ import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
 
+import socket
+import urllib.parse
+
+_top_signals = []  # v5.1: initialized for DB state load
+
 # ===============================
 # 🧱 v5.0 DB Persistence Layer (PostgreSQL)
 # ===============================
 from typing import Any, Dict, Optional
 from datetime import time as _time
 
-VERSION = "5.0"
-BUILD_TS = "2026-03-03 11:19:08"
+VERSION = "5.1"
+BUILD_TS = "2026-03-03 12:16:55"
 
 def safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -333,8 +351,33 @@ class DBKV:
         self._conn = None
 
     def connect(self):
-        if not self.enabled:
-            return False
+
+        # v5.1: DB URL selection
+        # Prefer private DATABASE_URL inside Railway. If running outside Railway (e.g. GitHub Actions),
+        # postgres.railway.internal won't resolve; in that case fall back to DATABASE_PUBLIC_URL if provided.
+        db_url = os.getenv("DATABASE_URL") or ""
+        public_url = os.getenv("DATABASE_PUBLIC_URL") or os.getenv("DATABASE_URL_PUBLIC") or ""
+        try:
+            if db_url:
+                host = urllib.parse.urlparse(db_url).hostname or ""
+                if host.endswith(".railway.internal") or host == "postgres.railway.internal":
+                    # If DNS fails, fallback
+                    try:
+                        socket.getaddrinfo(host, None)
+                    except Exception:
+                        if public_url:
+                            db_url = public_url
+            elif public_url:
+                db_url = public_url
+        except Exception:
+            pass
+        if not db_url:
+            raise RuntimeError("DATABASE_URL not set (or empty). Set DATABASE_URL to the PRIVATE URL inside Railway, "
+                               "or set DATABASE_PUBLIC_URL when running outside Railway.")
+        
+        # v5.1: apply selected url
+        self.url = db_url.strip()
+        self.enabled = True
         if self._conn is not None:
             return True
         try:
