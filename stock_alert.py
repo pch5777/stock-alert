@@ -1,11 +1,22 @@
 # ============================================================
 # Stock Alert Bot
-# Version: v5.1
+# Version: v5.4
 # Build: 2026-03-03 12:16:55
 #
 # CHANGELOG
 # ------------------------------------------------------------
-# v5.2
+# v5.3
+# - Fix: db_load_state top_signals type (list) + backward compatibility
+# - Update: Geopolitical daily summary at 07:30 (KST) on trading days
+# - Update: Overnight summary moved to 20:00 (KST) once per day
+# - Update: Geopolitical alerts during NXT window can notify sooner (shorter cooldown)
+# - Update: Open healthcheck aligned to NXT start (08:00 KST)
+#
+# v5.4
+# - Geo alerts: suppress duplicates when content fingerprint unchanged (even if cron runs every 3 min)
+# - Geo alerts: persist last fingerprint in DBKV
+#
+# v5.1
 # - Fix: _top_signals initialization for DB state load
 # - Fix: DB connect fallback (Railway private host vs public proxy)
 # - Added: clear error hints for DATABASE_URL selection
@@ -289,7 +300,7 @@ from bs4 import BeautifulSoup
 import socket
 import urllib.parse
 
-_top_signals = []  # v5.2: initialized for DB state load
+_top_signals = []  # v5.1: initialized for DB state load
 
 # ===============================
 # 🧱 v5.0 DB Persistence Layer (PostgreSQL)
@@ -297,7 +308,7 @@ _top_signals = []  # v5.2: initialized for DB state load
 from typing import Any, Dict, Optional
 from datetime import time as _time
 
-VERSION = "5.2"
+VERSION = "5.4"
 BUILD_TS = "2026-03-03 12:16:55"
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -330,6 +341,19 @@ def extract_claude_text(resp_json: Dict[str, Any]) -> str:
         pass
     return ""
 
+
+
+def geo_fingerprint(payload: str) -> str:
+    """Compute stable fingerprint for geo alert payload to suppress duplicates."""
+    try:
+        import re as _re
+        s = (payload or "").strip().lower()
+        # normalize whitespace and digits formatting
+        s = _re.sub(r"\s+", " ", s)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
 def _kst_now():
     return datetime.now()
 
@@ -352,7 +376,7 @@ class DBKV:
 
     def connect(self):
 
-        # v5.2: DB URL selection
+        # v5.1: DB URL selection
         # Prefer private DATABASE_URL inside Railway. If running outside Railway (e.g. GitHub Actions),
         # postgres.railway.internal won't resolve; in that case fall back to DATABASE_PUBLIC_URL if provided.
         db_url = os.getenv("DATABASE_URL") or ""
@@ -375,7 +399,7 @@ class DBKV:
             raise RuntimeError("DATABASE_URL not set (or empty). Set DATABASE_URL to the PRIVATE URL inside Railway, "
                                "or set DATABASE_PUBLIC_URL when running outside Railway.")
         
-        # v5.2: apply selected url
+        # v5.1: apply selected url
         self.url = db_url.strip()
         self.enabled = True
         if self._conn is not None:
@@ -439,16 +463,15 @@ class DBKV:
 
 _dbkv = DBKV()
 
+
 def db_load_state():
-    """DB(bot_kv)에서 상태를 복원한다.
-    - entry_watch/reentry_watch/detected_stocks: dict
-    - top_signals: list (구버전 dict 저장값도 호환)
-    """
+    """Load in-memory bot state from DB KV store."""
+    global _top_signals
     try:
         ew = _dbkv.get("entry_watch", {}) or {}
         rw = _dbkv.get("reentry_watch", {}) or {}
         ds = _dbkv.get("detected_stocks", {}) or {}
-        ts = _dbkv.get("top_signals", []) or []
+        ts = _dbkv.get("top_signals", [])
 
         if isinstance(ew, dict):
             _entry_watch.clear(); _entry_watch.update(ew)
@@ -457,27 +480,20 @@ def db_load_state():
         if isinstance(ds, dict):
             _detected_stocks.clear(); _detected_stocks.update(ds)
 
-        # top_signals는 list로 유지 (dict로 저장돼 있던 과거 데이터 호환)
-        _top_signals.clear()
+        # _top_signals is a list. Handle legacy dict storage gracefully.
         if isinstance(ts, list):
-            _top_signals.extend(ts)
+            _top_signals = ts
         elif isinstance(ts, dict):
-            # {items:[...]} 형태
-            items = ts.get("items") if isinstance(ts.get("items", None), list) else None
-            if items is not None:
-                _top_signals.extend(items)
-            else:
-                # {code: {...}} 형태면 value들을 list로
-                if ts and all(isinstance(v, (dict, list, str, int, float, bool, type(None))) for v in ts.values()):
-                    _top_signals.extend(list(ts.values()))
-                else:
-                    _top_signals.extend(list(ts.items()))
+            # Convert dict -> list (stable order by key)
+            try:
+                _top_signals = [ts[k] for k in sorted(ts.keys())]
+            except Exception:
+                _top_signals = list(ts.values())
         else:
-            # 알 수 없는 타입이면 빈 리스트로 초기화
-            pass
-
+            _top_signals = []
     except Exception as e:
-        try: _log_error("db_load_state", e)
+        try:
+            _log_error("db_load_state", e)
         except Exception:
             pass
 
@@ -6558,10 +6574,12 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
                 "entities": [], "ts": time.time()}
 
-def run_geo_news_scan():
+
+def run_geo_news_scan(force_send: bool = False):
     """
-    지정학 뉴스 스캔 (1시간마다).
-    이벤트 감지 시 관련 섹터 알림 + 신호 점수 자동 보정 등록.
+    지정학 뉴스 스캔.
+    - force_send=True: 07:30/휴장일 08:00 요약용(쿨다운 무시)
+    - force_send=False: 장운영시간(NXT 08~20)에는 더 짧은 쿨다운으로 이슈 발생 시 빠르게 알림
     """
     try:
         headlines_by_source = _fetch_multi_source_headlines()
@@ -6572,28 +6590,36 @@ def run_geo_news_scan():
         if not geo.get("detected"):
             return
 
-        # 결과를 전역에 저장 (신호 포착 시 참조)
         _geo_event_state.update({
             "active":           True,
-            "uncertainty":      geo["uncertainty"],
-            "sectors":          geo["sectors"],
+            "uncertainty":      geo.get("uncertainty", "mid"),
+            "sectors":          geo.get("sectors", []),
             "sector_directions":geo.get("sector_directions", []),
-            "score_adj":        geo["score_adj"],
-            "summary":          geo["summary"],
-            "entities":         geo["entities"],
+            "score_adj":        geo.get("score_adj", 0),
+            "summary":          geo.get("summary", ""),
+            "entities":         geo.get("entities", []),
             "ts":               time.time(),
         })
 
-        # 텔레그램 알림 (1시간 쿨다운)
-        last_sent = _geo_event_state.get("last_sent_ts", 0)
-        if time.time() - last_sent < 3600:
-            return
+        if not force_send:
+            cooldown = 3600
+            try:
+                _now = _kst_now()
+                if is_nxt_window_kst(_now) and is_any_market_open():
+                    cooldown = 600  # 10분
+            except Exception:
+                pass
+
+            last_sent = _geo_event_state.get("last_sent_ts", 0)
+            if time.time() - last_sent < cooldown:
+                return
+
         _geo_event_state["last_sent_ts"] = time.time()
 
         unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
         msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"{unc_emoji.get(geo['uncertainty'],'🟠')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
+                f"{unc_emoji.get(geo.get('uncertainty','mid'),'🟠')} 불확실성: <b>{str(geo.get('uncertainty','mid')).upper()}</b>\n\n")
 
         if geo.get("entities"):
             msg += "<b>주체별 입장</b>\n"
@@ -6603,7 +6629,6 @@ def run_geo_news_scan():
             msg += "\n"
 
         sec_dirs = geo.get("sector_directions", [])
-        # sector_directions 없으면 sectors 기반으로 자동 생성 (fallback)
         if not sec_dirs and geo.get("sectors"):
             sec_dirs = _build_fallback_sector_directions(
                 geo.get("kws", []) or _detect_geo_keywords(
@@ -6615,21 +6640,17 @@ def run_geo_news_scan():
             msg += "<b>📊 섹터별 영향</b>\n"
             for sd in sec_dirs:
                 _dir   = sd.get("direction", "중립")
-                _icon  = _DIR_DISPLAY.get(_dir, "▶")
-                _adj   = int(sd.get("score_adj", 0) or 0)
-                _adj_str = f"  <b>{_adj:+d}점</b>" if _adj != 0 else ""
-                _sec   = sd.get("sector", "")
-                # 관련 종목 조회
-                _stocks = _get_geo_sector_stocks(_sec, max_n=3)
-                _stk_str = "  ".join(f"<code>{n}</code>" for c,n in _stocks) if _stocks else ""
-                # v37.0: 과거 유사 이벤트 이력 조회
-                _hist_str = _get_geo_sector_history(_sec, _stocks) if _stocks else ""
-                msg += (f"┌ {_icon} <b>{_sec}</b>{_adj_str}\n"
-                        f"│  {sd.get('reason','')}\n"
-                        + (f"│  📌 {_stk_str}\n" if _stk_str else "")
-                        + (f"{_hist_str}\n" if _hist_str else "")
-                        + "└─────────────\n")
-            msg += "\n"
+                _icon  = _DIR_ICON.get(_dir, "▶")
+                _delta = sd.get("delta", 0)
+                _name  = sd.get("sector", "")
+                _reason= sd.get("reason", "")
+                _stocks= sd.get("stocks", [])
+                msg += f"┌ {_icon} <b>{_name}</b>  {('+' if _delta>0 else '')}{_delta}점\n"
+                if _reason:
+                    msg += f"│  {_reason}\n"
+                if _stocks:
+                    msg += f"│  📌 {'  '.join(_stocks[:4])}\n"
+                msg += "└─────────────\n"
         elif geo.get("sectors"):
             msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
 
@@ -6640,1164 +6661,6 @@ def run_geo_news_scan():
 
     except Exception as e:
         _log_error("run_geo_news_scan", e)
-
-
-
-# ============================================================
-# 👤 개인 수급 맥락 분석
-# ============================================================
-def eval_retail_signal(code: str,
-                       f_net: int, i_net: int, r_net: int,
-                       cap_size: str = "unknown") -> dict:
-    """
-    "개인만 매수" 신호를 맥락에 따라 다르게 해석.
-
-    고려 요소:
-      ① 시장 국면 (bull/normal/bear/crash)
-      ② 종목 5일 추세 (상승조정 vs 하락전환)
-      ③ 종목 규모 (대형/중형/소형)
-
-    반환:
-      score_adj: int
-      label: str
-      detail: str
-      confidence: str
-    """
-    # 개인 매수 + 기관/외국인 이탈 아니면 해당 없음
-    if not (r_net > 0 and f_net < 0 and i_net < 0):
-        return {}
-
-    regime    = get_market_regime().get("mode", "normal")
-    r_abs     = abs(r_net)
-
-    # ─── 종목 5일 추세 계산 ───
-    stock_trend = "unknown"
-    try:
-        daily  = get_daily_data(code, 10)
-        closes = [int(d.get("stck_clpr", 0)) for d in daily if d.get("stck_clpr")]
-        if len(closes) >= 6:
-            chg_5d = (closes[-1] - closes[-6]) / closes[-6] * 100
-            if   chg_5d >= 5.0:   stock_trend = "rally"      # 급등 후 조정
-            elif chg_5d >= 1.0:   stock_trend = "uptrend"    # 상승 추세 중 조정
-            elif chg_5d >= -3.0:  stock_trend = "sideways"   # 횡보/소폭 조정
-            elif chg_5d >= -7.0:  stock_trend = "pullback"   # 의미 있는 조정
-            else:                 stock_trend = "downtrend"   # 하락 추세
-    except:
-        pass
-
-    # ─── 맥락 조합 판단 ───
-    # CASE 1: bull/normal국면 + 대형/중형주 + 조정/횡보/급등후조정 중 개인 매수
-    #         → 저점 분할매수일 가능성 높음 (삼성전자, SK하이닉스 사례)
-    if (regime in ("bull", "normal")
-            and cap_size in ("large", "mid")
-            and stock_trend in ("uptrend", "pullback", "sideways", "rally")):
-        label = ("💡 개인 저점 매수 (대/중형 조정)"
-                 if stock_trend != "rally" else
-                 "💡 개인 급등 후 조정 매수 (대/중형)")
-        return {
-            "score_adj":  +5,
-            "label":      label,
-            "detail":     (f"bull/normal 국면 + {cap_size}cap 조정 중 개인 +{r_abs:,}주 — "
-                           f"기관 리밸런싱 매도 가능성, 단기 지지 효과 기대"),
-            "confidence": "mid",
-        }
-
-    # CASE 2: bull국면 + 소형주 + 급등 후 개인 매수
-    #         → 고점 추격 매수 (기관 물량 받아내는 개미)
-    if (regime in ("bull", "normal")
-            and cap_size == "small"
-            and stock_trend in ("rally", "uptrend")):
-        return {
-            "score_adj":  -5,
-            "label":      "⚠️ 개인 고점 추격 (소형 급등)",
-            "detail":     (f"소형주 급등 후 개인 +{r_abs:,}주 — "
-                           f"기관 차익실현 물량 받아내는 구도 가능성"),
-            "confidence": "mid",
-        }
-
-    # CASE 2b: bull/normal국면 + 소형주 + 조정/횡보 중 → 판단 보류
-    if (regime in ("bull", "normal")
-            and cap_size == "small"
-            and stock_trend in ("sideways", "pullback")):
-        return {
-            "score_adj":  0,
-            "label":      "📊 소형주 개인 매수 (조정중, 판단 보류)",
-            "detail":     (f"소형주 조정 구간 개인 +{r_abs:,}주 — "
-                           f"기관+외국인 이탈 지속 여부 확인 필요"),
-            "confidence": "low",
-        }
-
-    # CASE 3: bear/crash 국면 + 대형/중형주 → 낙폭과대 저점 가능성
-    if regime in ("bear", "crash") and cap_size in ("large", "mid"):
-        return {
-            "score_adj":  0,
-            "label":      "❓ 하락장 대형/중형주 개인 매수 (낙폭과대 판단 보류)",
-            "detail":     (f"약세장에도 {cap_size}cap 개인 +{r_abs:,}주 — "
-                           f"낙폭과대 저점 가능성 vs 추가하락 위험 공존 (판단 보류)"),
-            "confidence": "low",
-        }
-
-    # CASE 4: bear/crash 국면 + 소형주 → 역방향 위험
-    if regime in ("bear", "crash") and cap_size == "small":
-        return {
-            "score_adj":  -12,
-            "label":      "🔴 개인만 매수 / 기관+외국인 이탈 (약세장+소형주)",
-            "detail":     (f"약세장 소형주 + 외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도 — "
-                           f"개인 역방향 수급, 추가 하락 위험"),
-            "confidence": "high",
-        }
-
-    # CASE 5: 하락 추세 중 개인 매수 (국면/규모 무관)
-    if stock_trend == "downtrend":
-        return {
-            "score_adj":  -8,
-            "label":      "⚠️ 하락추세 중 개인 역방향 매수",
-            "detail":     (f"5일 추세 하락 중 개인 +{r_abs:,}주 — "
-                           f"기관+외국인 이탈 지속 시 지지력 약화 우려"),
-            "confidence": "mid",
-        }
-
-    # CASE 6: 그 외 (판단 보류)
-    return {
-        "score_adj":  0,
-        "label":      "📊 개인 매수 (맥락 불분명)",
-        "detail":     (f"개인 +{r_abs:,}주 / 기관+외국인 이탈 — "
-                       f"국면:{regime}, 추세:{stock_trend}, 규모:{cap_size} — 판단 보류"),
-        "confidence": "low",
-    }
-
-# ============================================================
-# 📰 뉴스 심층 분석 (본문 크롤링 + Claude API)
-# ============================================================
-_deep_news_cache: dict = {}   # code → {result, ts}
-
-# 심층 분석이 필요한 기업 이벤트 키워드
-_CORP_EVENT_KEYWORDS = [
-    "무상증자","유상증자","합병","분할","인수","자사주","배당",
-    "실적","영업이익","순이익","매출","흑자","적자","전환",
-    "상장폐지","거래정지","불성실공시","횡령","배임",
-    "공급계약","수주","MOU","협약","허가","승인","임상","FDA",
-]
-
-def _fetch_article_body(url: str) -> str:
-    """
-    네이버 금융 뉴스 본문 크롤링.
-    최대 600자 반환 (토큰 절약).
-    """
-    if not url:
-        return ""
-    try:
-        resp = requests.get(url, headers=_random_ua(), timeout=8)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # 네이버 뉴스 본문 셀렉터
-        body_el = (soup.select_one("div#news_read") or
-                   soup.select_one("div.news_end") or
-                   soup.select_one("div._article_body") or
-                   soup.select_one("article"))
-        if body_el:
-            text = body_el.get_text(separator=" ", strip=True)
-            # 광고/불필요 문구 제거
-            text = text.replace("© 무단전재 및 재배포 금지","").strip()
-            return text[:600]
-    except:
-        pass
-    return ""
-
-def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
-    """
-    뉴스 기사 심층 분석 (Claude API).
-    헤드라인 + 본문 기반으로 실질 호재/악재 판단.
-
-    반환: {
-      verdict: "실질호재" / "실질악재" / "표면호재실질악재" / "불확실" / "중립",
-      score_adj: int (-15 ~ +15),
-      reason: str,
-      risk_points: [str],   # 본문에서 발견된 리스크
-      key_event: str,       # 핵심 이벤트 유형
-      confidence: "high"/"mid"/"low"
-    }
-    """
-    if not articles:
-        return {"verdict": "중립", "score_adj": 0, "reason": "", "risk_points": [],
-                "key_event": "", "confidence": "low"}
-
-    # 캐시 확인
-    cache_key = f"{code}_{articles[0].get('title','')[:20]}"
-    cached = _deep_news_cache.get(cache_key)
-    if cached and time.time() - cached.get("ts", 0) < 3600:
-        return cached
-
-    # 기업 이벤트 키워드 감지 여부 확인
-    all_titles = " ".join(a.get("title","") for a in articles)
-    has_event  = any(kw in all_titles for kw in _CORP_EVENT_KEYWORDS)
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-    # API 키 없거나 이벤트 없으면 → 기존 키워드 분석 fallback
-    if not api_key or not has_event:
-        sent = analyze_news_sentiment([a.get("title","") for a in articles], stock_name)
-        if   sent["score"] >= 10: adj, verdict = +8,  "실질호재"
-        elif sent["score"] >= 4:  adj, verdict = +4,  "실질호재"
-        elif sent["score"] <= -10:adj, verdict = -10, "실질악재"
-        elif sent["score"] <= -4: adj, verdict = -5,  "실질악재"
-        else:                     adj, verdict = 0,   "중립"
-        return {"verdict": verdict, "score_adj": adj, "reason": "키워드 분석",
-                "risk_points": [], "key_event": "", "confidence": "low",
-                "ts": time.time()}
-
-    # 본문 크롤링 (최대 2건)
-    articles_with_body = []
-    for a in articles[:2]:
-        body = _fetch_article_body(a.get("url",""))
-        articles_with_body.append({
-            "title": a.get("title",""),
-            "body":  body or "(본문 없음)"
-        })
-
-    # Claude API 심층 분석
-    try:
-        article_text = ""
-        for i, a in enumerate(articles_with_body, 1):
-            article_text += f"[기사{i}] 제목: {a['title']}\n본문: {a['body']}\n\n"
-
-        prompt = f"""다음은 한국 주식 종목 [{stock_name}]의 최신 뉴스 기사입니다.
-
-{article_text}
-
-투자자 관점에서 이 뉴스가 주가에 미치는 실질적 영향을 분석하고 JSON으로만 답하세요:
-
-{{
-  "verdict": "실질호재/실질악재/표면호재실질악재/표면악재실질호재/불확실/중립",
-  "score_adj": -15~+15 사이 정수,
-  "key_event": "핵심 이벤트 한 단어 (무상증자/유상증자/합병/수주/실적/등)",
-  "reason": "판단 근거 한 줄",
-  "risk_points": ["본문에서 발견된 리스크나 주의사항 (없으면 빈 배열)"],
-  "confidence": "high/mid/low"
-}}
-
-판단 기준:
-- 표면호재실질악재 예시: 무상증자(호재처럼 보이나 재원/재무상태 불량), 합병(합병비율 불리), 유상증자(대규모 희석)
-- 표면악재실질호재 예시: 단기 실적 부진이나 구조조정 완료, 악재 선반영 후 저점
-- score_adj는 실질 영향 기준 (표면호재실질악재면 음수)"""
-
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         api_key,
-                "anthropic-version": "2024-10-22",
-                "content-type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 400,
-                "messages":   [{"role": "user", "content": prompt}],
-            },
-            timeout=15
-        )
-        raw  = extract_claude_text(resp.json())
-        if not raw:
-            raise KeyError("content")
-        raw  = raw.strip()
-        raw  = raw.replace("```json","").replace("```","").strip()
-        data = json.loads(raw)
-
-        result = {
-            "verdict":     data.get("verdict", "중립"),
-            "score_adj":   max(-15, min(data.get("score_adj", 0), 15)),
-            "key_event":   data.get("key_event", ""),
-            "reason":      data.get("reason", ""),
-            "risk_points": data.get("risk_points", []),
-            "confidence":  data.get("confidence", "mid"),
-            "ts":          time.time(),
-        }
-        _deep_news_cache[cache_key] = result
-        print(f"  📰 심층분석 [{stock_name}]: {result['verdict']} {int(result['score_adj'] or 0):+d}점")
-        return result
-
-    except Exception as e:
-        _log_error(f"analyze_news_deep({stock_name})", e)
-        # fallback
-        sent = analyze_news_sentiment([a.get("title","") for a in articles], stock_name)
-        adj  = 8 if sent["score"]>=10 else 4 if sent["score"]>=4 else -10 if sent["score"]<=-10 else -5 if sent["score"]<=-4 else 0
-        return {"verdict": "중립", "score_adj": adj, "reason": "API 오류 — 키워드 fallback",
-                "risk_points": [], "key_event": "", "confidence": "low", "ts": time.time()}
-
-# ============================================================
-# 📰 뉴스 감성 분석
-# ============================================================
-_POSITIVE_KEYWORDS = [
-    "급등","상한가","신고가","돌파","수주","흑자","호실적","매수","상향","성장",
-    "수출","계약","협약","투자유치","증가","개선","재개","허가","승인","선정",
-    "외국인매수","기관매수","강세","반등","회복","수혜","테마"
-]
-_NEGATIVE_KEYWORDS = [
-    "급락","하한가","신저가","하락","적자","손실","매도","하향","감소","악화",
-    "소송","조사","제재","리콜","부도","파산","매물","공매도","외국인매도",
-    "약세","폭락","위기","경고","주의","실망","불확실"
-]
-
-
-# ============================================================
-# 📊 매물대/지지저항선 자동 계산 (Volume Profile)
-# ============================================================
-_vp_cache: dict = {}  # code → {levels, ts}
-
-def calc_volume_profile(code: str, entry: int) -> dict:
-    """
-    일봉 데이터로 가격별 거래량 집계 → 매물대/지지저항선 계산.
-    진입가 근처에 강한 저항선 있으면 감점, 지지선 위면 가중.
-    반환: {score_adj: int, reason: str, support: int, resistance: int}
-    """
-    cached = _vp_cache.get(code)
-    if cached and time.time() - cached.get("ts", 0) < 3600:
-        return cached
-
-    result = {"score_adj": 0, "reason": "", "support": 0, "resistance": 0, "ts": time.time()}
-    try:
-        items = get_daily_data(code, 60)
-        if len(items) < 20 or not entry:
-            return result
-
-        # 가격 구간별 거래량 집계 (50개 구간)
-        prices = [i["close"] for i in items if i.get("close")]
-        vols   = [i["vol"]   for i in items if i.get("vol")]
-        if not prices: return result
-
-        price_min, price_max = min(prices), max(prices)
-        if price_max == price_min: return result
-
-        bucket_size = (price_max - price_min) / 50
-        buckets     = {}
-        for i, item in enumerate(items):
-            if not item.get("close") or not item.get("vol"): continue
-            bucket = int((item["close"] - price_min) / bucket_size)
-            bucket = max(0, min(bucket, 49))
-            buckets[bucket] = buckets.get(bucket, 0) + item["vol"]
-
-        # 상위 10% 거래량 구간 → 매물대
-        sorted_buckets = sorted(buckets.items(), key=lambda x: -x[1])
-        top_n          = max(1, len(sorted_buckets) // 10)
-        heavy_buckets  = [b for b, v in sorted_buckets[:top_n]]
-
-        # 매물대 가격 계산
-        heavy_prices = [price_min + (b + 0.5) * bucket_size for b in heavy_buckets]
-
-        # 진입가 기준 ±10% 범위 내 매물대 찾기
-        near_range    = entry * 0.10
-        above_levels  = sorted([p for p in heavy_prices if entry < p <= entry + near_range])
-        below_levels  = sorted([p for p in heavy_prices if entry - near_range <= p < entry], reverse=True)
-
-        resistance = int(above_levels[0])  if above_levels else 0
-        support    = int(below_levels[0])  if below_levels else 0
-
-        score_adj = 0
-        reasons   = []
-
-        if resistance:
-            gap_pct = (resistance - entry) / entry * 100
-            if gap_pct < 3.0:
-                score_adj -= 8
-                reasons.append(f"🧱 진입가 +{gap_pct:.1f}%에 강한 저항선 ({resistance:,}원) -8점")
-            elif gap_pct < 6.0:
-                score_adj -= 3
-                reasons.append(f"⚠️ 진입가 +{gap_pct:.1f}%에 저항선 ({resistance:,}원) -3점")
-
-        if support:
-            gap_pct = (entry - support) / entry * 100
-            if gap_pct < 3.0:
-                score_adj += 5
-                reasons.append(f"✅ 진입가 -{gap_pct:.1f}%에 강한 지지선 ({support:,}원) +5점")
-
-        result.update({
-            "score_adj":  score_adj,
-            "reason":     "  ".join(reasons),
-            "support":    support,
-            "resistance": resistance,
-        })
-        _vp_cache[code] = result
-    except Exception as e:
-        _log_error(f"calc_volume_profile({code})", e)
-
-    return result
-
-def analyze_news_sentiment(headlines: list, stock_name: str = "") -> dict:
-    """
-    뉴스 헤드라인 목록에서 감성 점수 계산.
-    stock_name이 있으면 해당 종목 관련 헤드라인만 필터.
-    반환: {score: -20~+20, label: str, pos: int, neg: int, matched: list}
-    """
-    if not headlines:
-        return {"score": 0, "label": "중립", "pos": 0, "neg": 0, "matched": []}
-
-    # 종목명 필터
-    targets = [h for h in headlines if not stock_name or stock_name in h] if stock_name else headlines
-
-    pos = sum(1 for h in targets for kw in _POSITIVE_KEYWORDS if kw in h)
-    neg = sum(1 for h in targets for kw in _NEGATIVE_KEYWORDS if kw in h)
-
-    # 정규화 (-20 ~ +20)
-    total = pos + neg
-    if total == 0:
-        raw_score = 0
-    else:
-        raw_score = int((pos - neg) / total * 20)
-
-    raw_score = max(-20, min(raw_score, 20))
-
-    if   raw_score >= 10: label = "매우 긍정"
-    elif raw_score >= 4:  label = "긍정"
-    elif raw_score <= -10: label = "매우 부정"
-    elif raw_score <= -4:  label = "부정"
-    else:                  label = "중립"
-
-    matched = [h for h in targets if
-               any(kw in h for kw in _POSITIVE_KEYWORDS + _NEGATIVE_KEYWORDS)][:3]
-
-    return {"score": raw_score, "label": label, "pos": pos, "neg": neg, "matched": matched}
-
-def analyze_news_theme(headlines: list = None) -> list:
-    signals = []
-    if headlines is None:                      # 직접 호출 시에만 크롤링
-        headlines = fetch_all_news()
-    if not headlines: return []
-    print(f"  📰 뉴스 {len(headlines)}건 (3개 소스)")
-    for theme_key, theme_info in THEME_MAP.items():
-        if time.time() - _news_alert_history.get(theme_key,0) < 14400: continue
-        matched = [h for h in headlines if theme_key in h or any(s in h for s in theme_info.get("sectors",[]))]
-        if not matched: continue
-        stock_status = []
-        for code, name in theme_info["stocks"]:
-            try:
-                cur = get_stock_price(code)
-                if not cur: continue
-                cr, vr = cur.get("change_rate",0), cur.get("volume_ratio",0)
-                stock_status.append({"code":code,"name":name,"price":cur["price"],
-                                     "change_rate":cr,"volume_ratio":vr,
-                                     "rising":cr>=2.0,"surging":cr>=5.0,"vol_on":vr>=2.0,"not_yet":cr<2.0})
-                time.sleep(0.2)
-            except: continue
-        if not stock_status: continue
-        rising_stocks = [s for s in stock_status if s["rising"]]
-        if not rising_stocks:
-            print(f"  ⏭ [{theme_key}] 뉴스 있지만 주가 반응 없음 → 스킵"); continue
-        total = len(stock_status); react_ratio = len(rising_stocks)/total
-        sector_bonus = (15 if react_ratio>=1.0 else 10 if react_ratio>=0.5 else 5)
-        if sum(1 for s in rising_stocks if s["vol_on"]) >= 2: sector_bonus+=5
-        strength = ("매우강함" if [s for s in stock_status if s["surging"]] and react_ratio>=0.5
-                    else "강함" if react_ratio>=0.5 else "보통")
-        _news_alert_history[theme_key] = time.time()
-        signals.append({"theme_key":theme_key,"theme_desc":theme_info["desc"],
-                         "headline":matched[0][:60],"rising":rising_stocks,
-                         "surging":[s for s in stock_status if s["surging"]],
-                         "not_yet":[s for s in stock_status if s["not_yet"]][:4],
-                         "react_ratio":react_ratio,"sector_bonus":sector_bonus,
-                         "signal_strength":strength,"total":total})
-    return signals
-
-def send_news_theme_alert(signal: dict):
-    emoji = {"매우강함":"🔥","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"📢")
-    react_pct = int(signal["react_ratio"]*100)
-    rising_block = "".join([f"  📈 <b>{s['name']}</b> {s['change_rate']:+.1f}%"
-                             +(f" 🔊{s['volume_ratio']:.0f}x" if s["vol_on"] else "")
-                             +(" 🚀" if s["surging"] else "")+"\n" for s in signal["rising"]])
-    not_yet_block = "".join([f"  ⏳ {s['name']} {s['change_rate']:+.1f}%\n" for s in signal["not_yet"]])
-    send(f"{emoji} <b>[뉴스+주가 연동]</b>  {signal['signal_strength']}\n"
-         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-         f"📰 <b>{signal['theme_desc']}</b>\n💬 {signal['headline']}...\n\n"
-         f"━━━━━━━━━━━━━━━\n"
-         f"🏭 섹터 반응: <b>{len(signal['rising'])}/{signal['total']}개</b> ({react_pct}%)  +{signal['sector_bonus']}점\n\n"
-         +(f"🔥 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
-         +(f"🎯 <b>아직 안 오른 종목 (추격 기회)</b>\n{not_yet_block}\n" if not_yet_block else "")
-         +"━━━━━━━━━━━━━━━")
-
-# ============================================================
-# DART
-# ============================================================
-def _fetch_dart_list(today: str) -> list:
-    items = []
-    for ptype in ["A","B","D"]:
-        try:
-            resp = requests.get("https://opendart.fss.or.kr/api/list.json",
-                                params={"crtfc_key":DART_API_KEY,"bgn_de":today,"end_de":today,
-                                        "pblntf_ty":ptype,"page_count":100},timeout=15)
-            items += resp.json().get("list",[])
-        except: pass
-    return items
-
-def run_dart_intraday():
-    if not DART_API_KEY or not is_market_open(): return
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        for item in _fetch_dart_list(today):
-            rcept_no = item.get("rcept_no","")
-            if not rcept_no or rcept_no in _dart_seen_ids: continue
-            title,company,code = item.get("report_nm",""),item.get("corp_name",""),item.get("stock_code","")
-            if not code: continue
-            matched_urgent = [kw for kw in DART_URGENT_KEYWORDS if kw in title]
-            matched_pos    = [kw for level,kws in DART_KEYWORDS.items() for kw in kws if kw in title]
-            if not matched_urgent and not matched_pos: continue
-            _dart_seen_ids.add(rcept_no)
-            is_risk = any(kw in title for kw in DART_RISK_KEYWORDS)
-
-            # ── DART 공시 심층 분석 (기업 이벤트인 경우) ──
-            dart_deep = None
-            try:
-                event_kws = ["무상증자","유상증자","합병","분할","인수","자사주","배당",
-                             "흑자전환","적자전환","실적","수주","계약"]
-                if any(kw in title for kw in event_kws):
-                    fake_article = [{"title": title, "url": "", "time": ""}]
-                    dart_deep = analyze_news_deep(fake_article, company, code)
-            except: pass
-
-            # ── 주가 상세 조회 (실패해도 최대한 표시) ──
-            cur         = {}
-            price       = 0
-            change_rate = 0
-            vol_ratio   = 0
-            today_vol   = 0
-            for _attempt in range(2):
-                try:
-                    cur         = get_stock_price(code)
-                    price       = cur.get("price", 0)
-                    change_rate = cur.get("change_rate", 0)
-                    vol_ratio   = cur.get("volume_ratio", 0)
-                    today_vol   = cur.get("today_vol", 0)
-                    if price: break
-                except: time.sleep(1)
-
-            if not (change_rate >= 1.0) and not is_risk:
-                print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵"); continue
-
-            # ── 추가 지표 (각각 독립적으로 실패 허용) ──
-            z = 0
-            try: z = get_volume_zscore(code, today_vol) if today_vol else 0
-            except: pass
-
-            rs = 0
-            try: rs = get_relative_strength(change_rate)
-            except: pass
-
-            ma20_dev = 0.0
-            try: ma20_dev = get_ma20_deviation(code)
-            except: pass
-
-            prev_upper = False
-            try: prev_upper = was_upper_limit_yesterday(code)
-            except: pass
-
-            # 외국인·기관·개인 수급
-            inv_text = ""
-            try:
-                inv   = get_investor_trend(code)
-                f_net = inv.get("foreign_net",     0)
-                i_net = inv.get("institution_net", 0)
-                r_net = inv.get("retail_net",      0)
-                # 3자 구도 표시
-                if   f_net > 0 and i_net > 0 and r_net < 0:
-                    inv_text = "\n💎 외국인+기관 매수 / 개인 매도 (최강 수급)"
-                elif f_net > 0 and i_net > 0:
-                    inv_text = "\n✅ 외국인+기관 동시 순매수"
-                elif f_net > 0:
-                    inv_text = "\n🟡 외국인 순매수"
-                elif i_net > 0:
-                    inv_text = "\n🟡 기관 순매수"
-                elif r_net > 0 and f_net < 0 and i_net < 0:
-                    # 맥락 분석
-                    _re = eval_retail_signal(code, f_net, i_net, r_net,
-                                            inv.get("cap_size","unknown") if hasattr(inv,"get") else "unknown")
-                    if _re and _re.get("score_adj",0) >= 0:
-                        inv_text = f"\n{_re['label']}"
-                    else:
-                        inv_text = "\n⚠️ 개인만 매수 / 기관+외국인 이탈 (맥락 주의)"
-                elif f_net < 0 and i_net < 0:
-                    inv_text = "\n🔴 외국인+기관 동시 순매도"
-            except: pass
-
-            # ATR 손절·목표가
-            entry = price or 0
-            stop = target = stop_pct = target_pct = 0
-            atr_used = False
-            if price:
-                try:
-                    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
-                except: pass
-            atr_tag = " (ATR)" if atr_used else " (고정)"
-
-            # 섹터 모멘텀 (실패 시 백그라운드 재시도)
-            sector_info = {"bonus":0,"detail":[],"rising":[],"flat":[],"theme":"","summary":""}
-            try:
-                if price:
-                    sector_info = calc_sector_momentum(code, company)
-            except: pass
-
-            # 섹터 지속 모니터링 + 진입가 감시 등록 (공시 발생 종목)
-            if price:
-                start_sector_monitor(code, company)
-
-            # ── 이모지 및 등급 ──
-            emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
-            tag   = "⚠️ 위험 공시" if is_risk else "✅ 주요 공시"
-            all_kw = list(dict.fromkeys(matched_urgent + matched_pos))
-
-            # ── 주가 블록 (항상 표시, 조회 실패 시 안내) ──
-            if price:
-                vol_str    = f"<b>{vol_ratio:.1f}배</b> (5일 평균 대비)" if vol_ratio else "조회 중"
-                zscore_str = f"  📊 Z={z:.1f}σ" if z >= VOL_ZSCORE_MIN else ""
-                rs_str     = f"  💪 RS={rs:.1f}x" if rs >= RS_MIN else ""
-                ma_str     = f"  📐 20일선 {ma20_dev:+.1f}%" if ma20_dev else ""
-                prev_str   = "\n🔁 전일 상한가 종목" if prev_upper else ""
-                price_block = (
-                    f"\n━━━━━━━━━━━━━━━\n"
-                    f"💰 현재가: <b>{price:,}원</b>  (<b>{change_rate:+.1f}%</b>)\n"
-                    f"📊 거래량: {vol_str}{zscore_str}\n"
-                    f"📈 코스피 상대강도: {rs_str if rs_str else '—'}{ma_str}"
-                    f"{inv_text}{prev_str}"
-                )
-            else:
-                price_block = "\n━━━━━━━━━━━━━━━\n💰 현재가: 조회 실패 (장 중 API 지연)"
-
-            # ── 손절·목표가 블록 ──
-            if price and stop and target:
-                stop_block = (
-                    f"\n━━━━━━━━━━━━━━━\n"
-                    f"🎯 진입가: <b>{entry:,}원</b>\n"
-                    f"🛡 손절가: <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
-                    f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
-                )
-            else:
-                stop_block = ""
-
-            # ── 섹터 블록 ──
-            sector_block = ""
-            rising = sector_info.get("rising", [])
-            flat   = sector_info.get("flat", [])
-            detail = sector_info.get("detail", [])
-            theme  = sector_info.get("theme", "")
-            if detail:
-                react_cnt    = len(rising)
-                total_cnt    = len(detail)
-                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
-                sector_block += "".join([
-                    f"  📈 {r['name']} {r['change_rate']:+.1f}%"
-                    + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
-                    for r in rising[:4]
-                ])
-                for r in flat[:2]:
-                    sector_block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
-            elif theme:
-                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
-
-            # 심층 분석 블록
-            deep_block = ""
-            if dart_deep:
-                verd = dart_deep.get("verdict","")
-                adj  = dart_deep.get("score_adj", 0)
-                rsn  = dart_deep.get("reason","")
-                rps  = dart_deep.get("risk_points",[])
-                if verd == "표면호재실질악재":
-                    deep_block = f"\n━━━━━━━━━━━━━━━\n⚠️ <b>표면호재실질악재 경고</b>\n  {rsn}"
-                    for rp in rps[:2]:
-                        deep_block += f"\n  🔸 {rp}"
-                elif verd == "표면악재실질호재":
-                    deep_block = f"\n━━━━━━━━━━━━━━━\n💡 <b>역발상 매수 검토</b>\n  {rsn}"
-                elif verd in ("실질호재","실질악재") and rsn:
-                    v_emoji = "✅" if "호재" in verd else "❌"
-                    deep_block = f"\n━━━━━━━━━━━━━━━\n{v_emoji} <b>{verd}</b>  {adj:+d}점\n  {rsn}"
-
-            # v37.0: 과거 유사 공시 이력 조회
-            dart_hist_block = ""
-            try:
-                dart_hist_block = get_dart_keyword_history(code, company, all_kw)
-            except: pass
-
-            send_with_chart_buttons(
-                f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
-                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"{'🔴' if is_risk else '🟡'} <b>{company}</b>  <code>{code}</code>\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"📌 {title}\n"
-                f"🔑 키워드: {', '.join(all_kw)}"
-                f"{deep_block}"
-                f"{price_block}"
-                f"{sector_block}"
-                f"{stop_block}"
-                f"{dart_hist_block}",
-                code, company
-            )
-            print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
-    except Exception as e: print(f"⚠️ DART 오류: {e}")
-
-def analyze_dart_disclosures():
-    if not DART_API_KEY: return
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        scored = []
-        for item in _fetch_dart_list(today):
-            title,company,code = item.get("report_nm",""),item.get("corp_name",""),item.get("stock_code","")
-            if not code: continue
-            score,matched,strength = 0,[],""
-            for level,keywords in DART_KEYWORDS.items():
-                for kw in keywords:
-                    if kw in title:
-                        score+={"매우강함":30,"강함":20,"보통":10}[level]; matched.append(kw); strength=level
-            if score>=30 and matched:
-                scored.append({"code":code,"company":company,"title":title,"score":score,"matched":matched,"strength":strength})
-        scored.sort(key=lambda x:x["score"],reverse=True)
-        if not scored[:5]: send("📋 <b>오늘 주목할 공시 없음</b>"); return
-        msg = f"📋 <b>내일 주목 종목 - DART 분석</b>\n🗓 {today[:4]}.{today[4:6]}.{today[6:]}\n━━━━━━━━━━━━━━━\n\n"
-        for i,item in enumerate(scored[:5],1):
-            e = {"매우강함":"🔴","강함":"🟡","보통":"🟢"}.get(item["strength"],"⚪")
-            msg += f"{i}. {e} <b>{item['company']}</b> ({item['code']})\n   📌 {item['title']}\n   🔑 {', '.join(item['matched'])}\n   ⭐ {item['score']}점\n\n"
-        send(msg+"━━━━━━━━━━━━━━━\n⚠️ 내일 장 시작 전 확인 후 진입 판단")
-    except Exception as e: print(f"⚠️ DART 분석 오류: {e}")
-
-# ============================================================
-# 텔레그램 명령어
-# ============================================================
-_tg_offset = 0
-
-def _send_menu(title: str = ""):
-    """
-    인라인 버튼 메뉴 발송
-    버튼을 누르면 해당 명령어 텍스트가 채팅창에 입력됨
-    (텔레그램 callback_query 방식 대신 switch_inline_query_current_chat 사용)
-    """
-    menu_title = title or "📌 <b>명령어 메뉴</b>  — 버튼을 눌러 실행하세요"
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "🤖 봇 상태",        "callback_data": "cmd_status"},
-                {"text": "📋 감시 종목",       "callback_data": "cmd_list"},
-                {"text": "🏆 오늘 TOP 5",      "callback_data": "cmd_top"},
-            ],
-            [
-                {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
-                {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
-                {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
-            ],
-            [
-                {"text": "🔵 NXT 현황",        "callback_data": "cmd_nxt"},
-                {"text": "⏸ 알림 정지",        "callback_data": "cmd_stop"},
-                {"text": "▶️ 알림 재개",        "callback_data": "cmd_resume"},
-            ],
-            [
-                {"text": "🗜 컴팩트 전환",      "callback_data": "cmd_compact"},
-                {"text": "⚙️ BotFather 설정법", "callback_data": "cmd_setup"},
-            ],
-        ]
-    }
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       menu_title,
-                "parse_mode": "HTML",
-                "reply_markup": keyboard,
-            },
-            timeout=10
-        )
-    except Exception as e:
-        print(f"⚠️ 메뉴 발송 오류: {e}")
-        send(menu_title)   # 버튼 실패 시 텍스트로 폴백
-
-def _handle_callback(callback_id: str, data: str):
-    """인라인 버튼 콜백 처리"""
-    # 버튼 누름 확인 응답 (텔레그램 필수)
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=5
-        )
-    except: pass
-
-    cmd_map = {
-        "cmd_status":  "/status",
-        "cmd_list":    "/list",
-        "cmd_top":     "/top",
-        "cmd_daily":   "/daily",
-        "cmd_nxt":     "/nxt",
-        "cmd_week":    "/week",
-        "cmd_stats":   "/stats",
-        "cmd_stop":    "/stop",
-        "cmd_resume":  "/resume",
-        "cmd_compact": "/compact",
-        "cmd_setup":   "/설정",
-    }
-    return cmd_map.get(data, "")
-
-
-def poll_telegram_commands():
-    global _tg_offset, _bot_paused
-    try:
-        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                            params={"offset":_tg_offset,"timeout":5},timeout=10)
-        for update in resp.json().get("result",[]):
-            _tg_offset = update["update_id"]+1
-
-            # ── 인라인 버튼 콜백 처리 ──
-            cb = update.get("callback_query")
-            if cb:
-                text = _handle_callback(cb["id"], cb.get("data",""))
-                if not text: continue
-                raw = text
-            else:
-                raw  = update.get("message",{}).get("text","").strip()
-                if not raw: continue
-
-            text = raw.lower()
-            if not text.startswith("/"): continue
-
-            # ── /status ──
-            if text == "/status":
-                rate_str = (f"\n📊 EARLY 성공률: {_early_feedback['success']}/{_early_feedback['total']} "
-                            f"({_early_feedback.get('rate',0)*100:.0f}%)") if _early_feedback.get("total",0)>=5 else ""
-                nxt_str  = f"\n🔵 NXT: {'운영 중' if is_nxt_open() else '마감'}"
-                send(f"🤖 <b>봇 상태</b>  {BOT_VERSION}  {'⏸ 일시정지' if _bot_paused else '▶️ 실행 중'}\n"
-                     f"🕐 {datetime.now().strftime('%H:%M:%S')}  📅 {BOT_DATE}\n"
-                     f"📡 장 {'열림' if is_market_open() else '닫힘'}{nxt_str}\n"
-                     f"👁 감시: {len(_detected_stocks)}개  |  동적테마: {len(_dynamic_theme_map)}개\n"
-                     f"⚙️ EARLY 조건: >{_early_price_min_dynamic}%, >{_early_volume_min_dynamic}배{rate_str}\n\n"
-                     f"💬 /result 종목명 수익률  로 결과 기록\n"
-                     f"예) /result 대주산업 +12.5")
-
-            # ── /list ──
-            elif text == "/list":
-                if not _detected_stocks:
-                    send("📋 감시 중인 종목 없음")
-                else:
-                    send("📋 <b>감시 중인 종목</b>\n" +
-                         "\n".join([f"• <b>{v['name']}</b> ({k}) — {v.get('carry_day',0)}일차"
-                                    for k, v in _detected_stocks.items()]))
-
-            # ── /stop / /resume ──
-            elif text == "/stop":
-                _bot_paused = True;  send("⏸ <b>봇 일시정지</b>  /resume 으로 재개")
-            elif text == "/resume":
-                _bot_paused = False; send("▶️ <b>봇 재개</b>")
-
-            # ── /compact — 컴팩트 모드 토글 ──
-            elif text in ("/compact", "/컴팩트"):
-                global _compact_mode
-                _compact_mode = not _compact_mode
-                _save_compact_mode()
-                mode_str = "🗜 <b>컴팩트 모드 ON</b>\n알림이 1~2줄 요약으로 발송됩니다" \
-                           if _compact_mode else \
-                           "📋 <b>상세 모드 ON</b>\n알림이 기존 상세 포맷으로 발송됩니다"
-                send(mode_str)
-
-            # ── /백업 — 즉시 수동 백업 ──
-            elif text in ("/백업", "/backup"):
-                send("💾 <b>수동 백업 시작...</b>")
-                ok_gist = backup_to_gist()
-                ok_tg   = False
-                if not ok_gist:
-                    ok_tg = backup_to_telegram()
-                if ok_gist:
-                    send(f"✅ <b>GitHub Gist 백업 완료</b>  {BOT_VERSION}\n"
-                         f"Gist ID: <code>{_gist_id_runtime}</code>")
-                elif ok_tg:
-                    send(f"✅ <b>텔레그램 파일 백업 완료</b>  {BOT_VERSION}")
-                else:
-                    send("❌ 백업 실패\n"
-                         "Railway Variables에 <b>GITHUB_GIST_TOKEN</b> 설정 필요\n"
-                         "또는 텔레그램 봇 설정 확인")
-
-            # ── /top — 오늘의 최우선 종목 즉시 조회 ──
-            elif text == "/top":
-                if not _today_top_signals:
-                    send("📊 오늘 포착된 신호 없음 (장 시작 후 신호 누적 중)")
-                else:
-                    send_top_signals()
-
-            # ── /nxt — NXT 현재 동향 즉시 조회 ──
-            elif text == "/nxt":
-                if not is_nxt_open():
-                    send("🔵 NXT 현재 마감 중 (08:00~20:00 운영)")
-                else:
-                    try:
-                        stocks = get_nxt_surge_stocks()
-                        if not stocks:
-                            send("🔵 NXT 현재 급등 종목 없음")
-                        else:
-                            top = sorted(stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:7]
-                            lines = "\n".join(
-                                f"  {'📈' if s['change_rate']>0 else '📉'} {s['name']} "
-                                f"<b>{s['change_rate']:+.1f}%</b>  🔊{s.get('volume_ratio',0):.0f}x"
-                                for s in top
-                            )
-                            send(f"🔵 <b>NXT 실시간 동향</b>  {datetime.now().strftime('%H:%M')}\n"
-                                 f"━━━━━━━━━━━━━━━\n{lines}")
-                    except Exception as e:
-                        send(f"⚠️ NXT 조회 오류: {e}")
-
-            # ── /week — 이번 주 잠정 성과 즉시 조회 ──
-            elif text == "/week":
-                try:
-                    data = {}
-                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
-                    today    = datetime.now()
-                    this_mon = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
-                    this_fri = today.strftime("%Y%m%d")
-                    week_done    = [v for v in data.values()
-                                    if this_mon <= v.get("detect_date","") <= this_fri
-                                    and v.get("status") in ["수익","손실","본전"]]
-                    week_tracking = [v for v in data.values()
-                                     if this_mon <= v.get("detect_date","") <= this_fri
-                                     and v.get("status") == "추적중"]
-                    if not week_done and not week_tracking:
-                        send("📅 이번 주 신호 없음"); continue
-                    msg = f"📅 <b>이번 주 잠정 성과</b>  {this_mon[4:6]}/{this_mon[6:]} ~ {this_fri[4:6]}/{this_fri[6:]}\n━━━━━━━━━━━━━━━\n"
-                    if week_done:
-                        pnls    = [v["pnl_pct"] for v in week_done]
-                        wins    = sum(1 for p in pnls if p > 0)
-                        avg_pnl = sum(pnls) / len(pnls)
-                        msg += (f"\n✅ <b>확정</b>  {len(week_done)}건\n"
-                                f"  승률 {wins/len(week_done)*100:.0f}%  평균 {avg_pnl:+.1f}%\n")
-                        for v in sorted(week_done, key=lambda x: x.get("pnl_pct",0), reverse=True)[:5]:
-                            dot = "✅" if v["pnl_pct"]>0 else "🔴"
-                            msg += f"  {dot} {v['name']} {v['pnl_pct']:+.1f}%\n"
-                    if week_tracking:
-                        msg += f"\n⏳ <b>추적 중</b>  {len(week_tracking)}건\n"
-                        for v in week_tracking[:4]:
-                            try:
-                                cur   = get_stock_price(v["code"])
-                                price = cur.get("price",0)
-                                entry = v.get("entry_price",0)
-                                if price and entry:
-                                    pnl = (price-entry)/entry*100
-                                    dot = "🟢" if pnl>=0 else "🟠"
-                                    msg += f"  {dot} {v['name']} {pnl:+.1f}% (잠정)\n"
-                            except: continue
-                    send(msg)
-                except Exception as e:
-                    send(f"⚠️ 주간 조회 오류: {e}")
-
-            # ── /daily — 오늘 일일 성과 즉시 조회 ──
-            elif text in ("/daily", "/오늘"):
-                try:
-                    data = {}
-                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
-                    today     = datetime.now().strftime("%Y%m%d")
-                    today_str = datetime.now().strftime("%m/%d")
-                    sig_labels = {
-                        "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-                        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
-                    }
-                    today_recs   = [v for v in data.values() if v.get("detect_date") == today]
-                    done_today   = [v for v in today_recs if v.get("status") != "추적중"]
-                    tracking_today = [v for v in today_recs if v.get("status") == "추적중"]
-                    # 이월 추적 중 포함
-                    all_tracking = [v for v in data.values() if v.get("status") == "추적중"]
-
-                    if not today_recs and not all_tracking:
-                        send(f"📊 {today_str} 오늘 신호 없음"); continue
-
-                    msg = f"📊 <b>일일 성과</b>  {today_str}  {datetime.now().strftime('%H:%M')}\n━━━━━━━━━━━━━━━\n"
-
-                    # ── 오늘 확정 결과 ──
-                    if done_today:
-                        pnls     = [v.get("pnl_pct",0) for v in done_today]
-                        wins     = sum(1 for p in pnls if p > 0)
-                        losses   = sum(1 for p in pnls if p < 0)
-                        avg_pnl  = sum(pnls) / len(pnls)
-                        win_rate = round(wins / len(done_today) * 100)
-                        msg += (f"\n✅ <b>오늘 확정  {len(done_today)}건</b>\n"
-                                f"  승률 <b>{win_rate}%</b>  평균 <b>{avg_pnl:+.1f}%</b>"
-                                f"  수익 {wins}건  손실 {losses}건\n")
-                        for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
-                            pnl  = v.get("pnl_pct", 0)
-                            dot  = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
-                            sig  = sig_labels.get(v.get("signal_type",""), "")
-                            msg += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {sig}\n"
-                    else:
-                        msg += "\n📭 오늘 확정된 신호 없음\n"
-
-                    # ── 추적 중 잠정 수익률 ──
-                    if all_tracking:
-                        msg += f"\n⏳ <b>추적 중  {len(all_tracking)}건</b>  (잠정)\n"
-                        rows = []
-                        for v in all_tracking:
-                            try:
-                                price = 0
-                                if is_nxt_open() and is_nxt_listed(v.get("code","")):
-                                    price = get_nxt_stock_price(v["code"]).get("price", 0)
-                                if not price:
-                                    price = get_stock_price(v["code"]).get("price", 0)
-                                entry = v.get("entry_price", 0)
-                                if price and entry:
-                                    pnl = (price - entry) / entry * 100
-                                    nxt_tag = " 🔵" if is_nxt_open() and is_nxt_listed(v.get("code","")) else ""
-                                    rows.append((pnl, v["name"], nxt_tag))
-                            except: continue
-                        for pnl, name, nxt_tag in sorted(rows, key=lambda x: x[0], reverse=True):
-                            dot = "🟢" if pnl >= 0 else "🟠"
-                            msg += f"  {dot} {name} <b>{pnl:+.1f}%</b>{nxt_tag}\n"
-
-                    send(msg)
-                except Exception as e:
-                    send(f"⚠️ 일일 성과 조회 오류: {e}")
-
-            # ── /result 종목명 수익률 ──
-            elif text.startswith("/result"):
-                _handle_result_command(raw)
-
-            # ── /skip 종목명 이유 ──
-            elif text.startswith("/진입"):
-                _handle_entry_confirm_command(raw)
-            elif text.startswith("/skip"):
-                _handle_skip_command(raw)
-
-            # ── /stats ──
-            elif text == "/stats":
-                _send_stats()
-
-            # ── /menu 또는 /도움 — 버튼 메뉴 ──
-            elif text in ("/menu", "/도움", "/help"):
-                _send_menu()
-
-            # ── /설정 — BotFather 명령어 등록 가이드 ──
-            elif text in ("/설정", "/setup"):
-                send(
-                    "⚙️ <b>BotFather 명령어 등록 방법</b>\n"
-                    "텔레그램에서 / 입력 시 한글 설명이 자동완성으로 뜨게 됩니다\n\n"
-                    "<b>① @BotFather 에게 아래 명령어 전송</b>\n"
-                    "<code>/setcommands</code>\n\n"
-                    "<b>② 봇 선택 후 아래 내용 그대로 복붙</b>\n"
-                    "━━━━━━━━━━━━━━━\n"
-                    "<code>"
-                    "status - 🤖 봇 상태 및 버전 확인\n"
-                    "list - 📋 현재 감시 중인 종목 목록\n"
-                    "top - 🏆 오늘의 최우선 종목 TOP 5\n"
-                    "daily - 📊 오늘 일일 성과 즉시 조회\n"
-                    "nxt - 🔵 NXT 넥스트레이드 실시간 동향\n"
-                    "week - 📅 이번 주 잠정 성과 조회\n"
-                    "stats - 📈 신호 유형별 승률 통계\n"
-                    "compact - 🗜 컴팩트·상세 알림 모드 전환\n"
-                    "stop - ⏸ 알림 일시 정지\n"
-                    "resume - ▶️ 알림 재개\n"
-                    "menu - 📌 버튼 메뉴 열기\n"
-                    "result - ✍️ 수익률 수동 기록 (예: result 대주산업 +12.5)"
-                    "</code>\n"
-                    "━━━━━━━━━━━━━━━\n"
-                    "③ 등록 완료 후 채팅창에서 / 입력하면\n"
-                    "   한글 설명과 함께 자동완성이 나타납니다"
-                )
-
-            # ── 알 수 없는 명령어 → 메뉴 표시 ──
-
-            # ── /geo — 지정학 분석 수동 실행 ──
-            elif text == "/geo":
-                send("🌍 지정학 뉴스 분석 중... (10~20초 소요)")
-                def _run_geo():
-                    try:
-                        headlines_by_src = _fetch_multi_source_headlines()
-                        if not headlines_by_src:
-                            send("⚠️ 뉴스 소스 수집 실패 — 모든 RSS 접근 불가")
-                            return
-                        src_summary = "  ".join(f"{k}:{len(v)}건" for k,v in headlines_by_src.items())
-                        send(f"📡 수집 완료 ({len(headlines_by_src)}개 소스)\n{src_summary}")
-                        geo = analyze_geopolitical_event(headlines_by_src)
-                        if not geo.get("detected"):
-                            send("✅ 지정학 이벤트 없음 — 현재 안전 상태")
-                            return
-                        unc_emoji = {"high":"🔴","mid":"🟠","low":"🟢"}.get(geo.get("uncertainty","mid"),"🟠")
-                        msg = (f"🌍 <b>지정학 분석 결과</b>\n"
-                               f"━━━━━━━━━━━━━━━\n"
-                               f"{unc_emoji} 불확실성: <b>{geo.get('uncertainty','?').upper()}</b>\n\n")
-                        if geo.get("entities"):
-                            msg += "<b>주체별 입장</b>\n"
-                            for e in geo["entities"][:6]:
-                                s_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
-                                msg += f"  {s_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
-                            msg += "\n"
-                        # /geo 핸들러 — sector_directions 없으면 fallback 생성
-                        sec_dirs = geo.get("sector_directions", [])
-                        if not sec_dirs and geo.get("sectors"):
-                            _kws_fb = geo.get("kws", [])
-                            sec_dirs = _build_fallback_sector_directions(_kws_fb, geo["sectors"])
-                        if sec_dirs:
-                            msg += "<b>📊 섹터별 영향</b>\n"
-                            for sd in sec_dirs:
-                                _dir2   = sd.get("direction", "중립")
-                                _icon2  = _DIR_DISPLAY.get(_dir2, "▶")
-                                _adj2   = int(sd.get("score_adj", 0) or 0)
-                                _adj2_str = f"  <b>{_adj2:+d}점</b>" if _adj2 != 0 else ""
-                                _sec2   = sd.get("sector", "")
-                                _stocks2 = _get_geo_sector_stocks(_sec2, max_n=3)
-                                _stk2_str = "  ".join(f"<code>{n}</code>" for c,n in _stocks2) if _stocks2 else ""
-                                # v37.0: 과거 유사 이벤트 이력
-                                _hist2_str = _get_geo_sector_history(_sec2, _stocks2) if _stocks2 else ""
-                                msg += (f"┌ {_icon2} <b>{_sec2}</b>{_adj2_str}\n"
-                                        f"│  {sd.get('reason','')}\n"
-                                        + (f"│  📌 {_stk2_str}\n" if _stk2_str else "")
-                                        + (f"{_hist2_str}\n" if _hist2_str else "")
-                                        + "└─────────────\n")
-                            msg += "\n"
-                        elif geo.get("sectors"):
-                            msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
-                        if geo.get("summary"):
-                            msg += f"\n💡 {geo['summary']}"
-                        _gadj = int(geo.get("score_adj", 0) or 0)
-                        msg += f"\n\n전체 점수 보정: {_gadj:+d}점"
-                        send(msg)
-                    except Exception as e:
-                        send(f"❌ 오류: {e}")
-                threading.Thread(target=_run_geo, daemon=True).start()
-
-            # ── /us — 미국 시장 현황 수동 조회 ──
-            elif text == "/us":
-                try:
-                    _us_cache.clear()  # 캐시 무효화 → 강제 갱신
-                    us = get_us_market_signals()
-                    gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
-                    regime_kor = {"panic":"🔴 패닉","risk_off":"🟠 위험회피","neutral":"🔵 중립","risk_on":"🟢 위험선호"}
-                    msg = (f"🌐 <b>미국 시장 현황</b>\n"
-                           f"━━━━━━━━━━━━━━━\n"
-                           f"나스닥선물: {us.get('nasdaq_chg',0):+.2f}%\n"
-                           f"VIX 공포지수: {us.get('vix',0):.1f}\n"
-                           f"달러인덱스: {us.get('dxy',0):.2f}\n"
-                           f"시장 국면: {regime_kor.get(us.get('us_regime','neutral'),'🔵 중립')}\n"
-                           f"갭 예측: {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n"
-                           f"점수 보정: {int(us.get('score_adj',0) or 0):+d}점")
-                    send(msg)
-                except Exception as e:
-                    send(f"❌ 미국 시장 조회 오류: {e}")
-
-            # ── /overnight — 오버나이트 모니터 수동 실행 ──
-            elif text == "/overnight":
-                send("🌙 오버나이트 모니터 수동 실행 중...")
-                def _run_overnight():
-                    try:
-                        run_overnight_monitor()
-                        # 추적 중 종목 위험도도 체크
-                        send_overnight_risk_alerts()
-                    except Exception as e:
-                        send(f"❌ 오류: {e}")
-                threading.Thread(target=_run_overnight, daemon=True).start()
-
-            elif text.startswith("/test"):
-                # /test — 봇 전체 기능 빠른 점검
-                send(
-                    f"🧪 <b>기능 점검</b>  {BOT_VERSION}\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"/us — 미국 시장 현황\n"
-                    f"/geo — 지정학 뉴스 분석\n"
-                    f"/overnight — 오버나이트 위험도\n"
-                    f"/stats — 신호 통계\n"
-                    f"/top — 오늘 TOP 5\n"
-                    f"/nxt — NXT 동향"
-                )
-
-            else:
-                _send_menu(f"❓ <b>'{raw}'</b> 는 알 수 없는 명령어예요\n아래 버튼으로 실행해보세요")
-    except Exception as e:
-        print(f"⚠️ TG 명령어 오류: {e}")
-
-
 
 def _request_actual_entry_confirm(rec: dict):
     """
@@ -9589,62 +8452,91 @@ def _shutdown(reason: str = "정상 종료"):
 # ===============================
 # v5.0 Single-run Entrypoint (Cron)
 # ===============================
+
 def main_single_run():
-    """Run one cycle and exit. Recommended with GitHub Actions cron."""
+    """Run one cycle and exit. Recommended with cron."""
     now = _kst_now()
+    today = now.strftime("%Y-%m-%d")
 
     # Restore state from DB, and mirror legacy JSON files so existing code keeps working
     try:
         db_load_state()
-        try: db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
-        except Exception: pass
-        try: db_mirror_json_file(PARAM_FILE, "param_file")
-        except Exception: pass
+        try:
+            db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
+        except Exception:
+            pass
+        try:
+            db_mirror_json_file(PARAM_FILE, "param_file")
+        except Exception:
+            pass
     except Exception as _e:
-        try: _log_error("startup_state_restore", _e)
-        except Exception: pass
+        try:
+            _log_error("startup_state_restore", _e)
+        except Exception:
+            pass
 
-    # NXT 운영시간 밖이면 아무것도 하지 않음 (Railway/GHA 스케줄이 넓게 잡혀도 안전)
-    if not is_nxt_window_kst(now):
+    # 실행 허용 시간:
+    # - 기본: NXT 운영시간(08:00~20:00 KST)
+    # - 예외: 거래일 지정학 요약(07:30 KST)
+    allow_early_geo = (is_trading_day_kst(now) and now.hour == 7 and 25 <= now.minute <= 35)
+    if not is_nxt_window_kst(now) and not allow_early_geo:
         return
 
-    today = now.strftime("%Y-%m-%d")
-
-    # (1) 오버나이트 알림: 08:00대 1회 요약
-    if now.hour == 8 and 0 <= now.minute <= 5 and should_send_once_per_day("overnight_sent", today):
+    # (1) 오버나이트 알림: NXT 마감(20:00)대 1회
+    if now.hour == 20 and 0 <= now.minute <= 5 and should_send_once_per_day("overnight_sent", today):
         try:
             send_overnight_risk_alerts()
             mark_sent("overnight_sent", today)
         except Exception as e:
-            try: _log_error("overnight_once", e)
-            except Exception: pass
-
-    # (2) 지정학 이벤트 감지 요약: 거래일 08:30 1회 / 휴장일 08:00 1회
-    if is_trading_day_kst(now):
-        if now.hour == 8 and 30 <= now.minute <= 40 and should_send_once_per_day("geo_sent", today):
             try:
-                run_geo_news_scan()
+                _log_error("overnight_once", e)
+            except Exception:
+                pass
+
+    # (2) 지정학 이벤트 감지
+    # - 거래일: 07:30 요약 1회 (NXT 시작 30분 전)
+    # - 휴장일: 08:00 요약 1회
+    # - 장운영시간(08~20)에는 이슈 발생 시 빠르게 알림(쿨다운 단축)
+    if is_trading_day_kst(now):
+        if now.hour == 7 and 25 <= now.minute <= 35 and should_send_once_per_day("geo_sent", today):
+            try:
+                run_geo_news_scan(force_send=True)
                 mark_sent("geo_sent", today)
             except Exception as e:
-                try: _log_error("geo_once", e)
-                except Exception: pass
+                try:
+                    _log_error("geo_once_0730", e)
+                except Exception:
+                    pass
+
+        if is_nxt_window_kst(now) and is_any_market_open():
+            try:
+                run_geo_news_scan(force_send=False)
+            except Exception as e:
+                try:
+                    _log_error("geo_intraday", e)
+                except Exception:
+                    pass
     else:
         if now.hour == 8 and 0 <= now.minute <= 5 and should_send_once_per_day("geo_sent", today):
             try:
-                run_geo_news_scan()
+                run_geo_news_scan(force_send=True)
                 mark_sent("geo_sent", today)
             except Exception as e:
-                try: _log_error("geo_once_holiday", e)
-                except Exception: pass
+                try:
+                    _log_error("geo_once_holiday_0800", e)
+                except Exception:
+                    pass
 
-    # (3) 장 시작 헬스체크(거래일 09:00대 1회)
-    if is_trading_day_kst(now) and now.hour == 9 and 0 <= now.minute <= 10 and should_send_once_per_day("open_health_sent", today):
+    # (3) 장 시작 헬스체크: 거래일 NXT 시작 08:00대 1회
+    if is_trading_day_kst(now) and now.hour == 8 and 0 <= now.minute <= 10 and should_send_once_per_day("open_healthcheck", today):
         try:
-            send(f"✅ <b>봇 정상 작동</b>\n버전 v{VERSION}\n시간: {now.strftime('%H:%M:%S')}")
-            mark_sent("open_health_sent", today)
+            open_healthcheck()
+            mark_sent("open_healthcheck", today)
         except Exception as e:
-            try: _log_error("open_healthcheck", e)
-            except Exception: pass
+            try:
+                _log_error("open_healthcheck", e)
+            except Exception:
+                pass
 
     # (4) 장중 스캔( KRX 또는 NXT 열려 있을 때만 )
     try:
@@ -9655,20 +8547,27 @@ def main_single_run():
             except Exception:
                 pass
     except Exception as e:
-        try: _log_error("scan_cycle", e)
-        except Exception: pass
+        try:
+            _log_error("scan_cycle", e)
+        except Exception:
+            pass
 
     # Persist state + mirror legacy json to DB
     try:
         db_save_state()
-        try: db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
-        except Exception: pass
-        try: db_mirror_json_file(PARAM_FILE, "param_file")
-        except Exception: pass
+        try:
+            db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
+        except Exception:
+            pass
+        try:
+            db_mirror_json_file(PARAM_FILE, "param_file")
+        except Exception:
+            pass
     except Exception as e:
-        try: _log_error("shutdown_persist", e)
-        except Exception: pass
-
+        try:
+            _log_error("shutdown_persist", e)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main_single_run()
