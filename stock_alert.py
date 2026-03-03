@@ -274,13 +274,14 @@ from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
 
 # ===============================
-# 🛡 v4.0 Reliability Layer
+# 🧱 v5.0 DB Persistence Layer (PostgreSQL)
 # ===============================
-from typing import Any, Dict, Optional, Tuple
-from collections import defaultdict
-import hashlib
+from typing import Any, Dict, Optional
+from datetime import time as _time
 
-# ---- 숫자/코드 안전 처리 ----
+VERSION = "5.0"
+BUILD_TS = "2026-03-03 11:19:08"
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -288,195 +289,183 @@ def safe_int(value: Any, default: int = 0) -> int:
         s = str(value).replace(",", "").strip()
         if s in ("", "-", "None", "null", "NULL"):
             return default
-        # some APIs return floats as strings
         return int(float(s))
     except Exception:
         return default
 
-def normalize_stock_code(code: Any) -> Optional[str]:
-    if code is None:
-        return None
-    s = str(code).strip()
-    if len(s) != 6 or not s.isdigit():
-        return None
-    return s
-
-# ---- 반복오류 격리(종목/기능) ----
-_ERROR_COUNT: Dict[str, int] = defaultdict(int)
-_QUARANTINE_UNTIL: Dict[str, float] = {}  # key -> epoch seconds
-
-def is_quarantined(key: str, now_ts: Optional[float] = None) -> bool:
-    import time as _time
-    if now_ts is None:
-        now_ts = _time.time()
-    until = _QUARANTINE_UNTIL.get(key, 0)
-    return until > now_ts
-
-def quarantine(key: str, seconds: int = 600):
-    import time as _time
-    _QUARANTINE_UNTIL[key] = _time.time() + seconds
-
-def bump_error(key: str, limit: int = 3, quarantine_seconds: int = 600) -> int:
-    c = _ERROR_COUNT[key] + 1
-    _ERROR_COUNT[key] = c
-    if c >= limit:
-        quarantine(key, quarantine_seconds)
-    return c
-
-# ---- Claude 응답 안전 파서 ----
 def extract_claude_text(resp_json: Dict[str, Any]) -> str:
     # expected: {"content":[{"text":"..."}]}
     try:
         content = resp_json.get("content")
         if isinstance(content, list) and content:
-            t = content[0].get("text", "")
+            t = (content[0] or {}).get("text", "")
             return (t or "").strip()
     except Exception:
         pass
-    # fallback: some providers use "choices"
+    # fallback
     try:
         choices = resp_json.get("choices")
         if isinstance(choices, list) and choices:
-            msg = choices[0].get("message", {}) or {}
+            msg = (choices[0] or {}).get("message", {}) or {}
             return (msg.get("content", "") or "").strip()
     except Exception:
         pass
     return ""
 
-# ---- 지정학 확장 테마(2차 파급) ----
-_GEO_THEME_RULES = [
-    # keywords -> (sector, direction, score_adj, reason, sample_stocks)
-    (("해협","봉쇄","운임","물류","컨테이너","항로","해운"), ("해운", "up", 7, "해협/봉쇄/물류 차질 → 운임 상승 기대", ["흥아해운","대한해운","팬오션"])),
-    (("LNG","가스","천연가스","가스관","공급","중단"), ("가스/LNG", "up", 6, "가스 공급 불안 → LNG/가스 밸류체인 수혜", ["한국가스공사","포스코인터내셔널","SK가스"])),
-    (("비료","곡물","수출제한","식량","밀","옥수수"), ("비료/농업", "up", 6, "식량/원자재 불확실성 → 비료/농업 테마 부각", ["남해화학","조비","효성오앤비"])),
-    (("보험금","피해","재보험","보상"), ("보험", "down", 4, "대규모 피해/위험 증가 → 보험 손해율 부담", ["삼성화재","DB손해보험","현대해상"])),
-    (("공급망","제재","무역","통제","관세"), ("물류/유통", "down", 4, "무역/제재 → 공급망 비용 증가", ["CJ대한통운","한진","롯데글로벌로지스"])),
-]
+def _kst_now():
+    return datetime.now()
 
-def expand_geo_themes(text: str) -> list:
-    text = (text or "")
-    hits = []
-    for keys, pack in _GEO_THEME_RULES:
-        if any(k in text for k in keys):
-            sector, direction, score_adj, reason, stocks = pack
-            hits.append({
-                "sector": sector,
-                "direction": "상승" if direction == "up" else "하락",
-                "score_adj": score_adj if direction == "up" else -score_adj,
-                "reason": reason,
-                "samples": stocks
-            })
-    # de-dup by sector
-    out = []
-    seen = set()
-    for h in hits:
-        if h["sector"] in seen: 
-            continue
-        seen.add(h["sector"]); out.append(h)
-    return out
+def is_trading_day_kst(now=None) -> bool:
+    if now is None:
+        now = _kst_now()
+    return now.weekday() < 5 and (not is_holiday())
 
-# ---- 상태 영구 저장/복구 ----
-STATE_DIR = os.environ.get("BOT_STATE_DIR", ".state")
-os.makedirs(STATE_DIR, exist_ok=True)
+def is_nxt_window_kst(now=None) -> bool:
+    if now is None:
+        now = _kst_now()
+    t = now.time()
+    return _time(8, 0) <= t <= _time(20, 0)
 
-STATE_FILES = {
-    "entry_watch": os.path.join(STATE_DIR, "entry_watch.json"),
-    "reentry_watch": os.path.join(STATE_DIR, "reentry_watch.json"),
-    "detected": os.path.join(STATE_DIR, "detected_stocks.json"),
-    "top_signals": os.path.join(STATE_DIR, "top_signals.json"),
-    "meta": os.path.join(STATE_DIR, "meta.json"),
-}
+class DBKV:
+    def __init__(self):
+        self.url = os.environ.get("DATABASE_URL", "").strip()
+        self.enabled = bool(self.url)
+        self._conn = None
 
-_STATE_DIRTY = False
-_LAST_SAVE_TS = 0.0
+    def connect(self):
+        if not self.enabled:
+            return False
+        if self._conn is not None:
+            return True
+        try:
+            import psycopg2
+            self._conn = psycopg2.connect(self.url, connect_timeout=10)
+            self._conn.autocommit = True
+            self._ensure_schema()
+            return True
+        except Exception as e:
+            try: _log_error("DBKV.connect", e)
+            except Exception: 
+                pass
+            self.enabled = False
+            return False
 
-def _json_safe(obj: Any) -> Any:
-    # ensure datetimes etc are stringified
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k,v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_safe(x) for x in obj]
-    if isinstance(obj, (int,float,str,bool)) or obj is None:
-        return obj
-    return str(obj)
+    def _ensure_schema(self):
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS bot_kv (
+                k TEXT PRIMARY KEY,
+                v JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );"""
+        )
+        cur.close()
 
-def mark_state_dirty():
-    global _STATE_DIRTY
-    _STATE_DIRTY = True
+    def get(self, k: str, default=None):
+        if not self.connect():
+            return default
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT v FROM bot_kv WHERE k=%s", (k,))
+            row = cur.fetchone()
+            cur.close()
+            return row[0] if row else default
+        except Exception as e:
+            try: _log_error(f"DBKV.get({k})", e)
+            except Exception: 
+                pass
+            return default
 
-def save_bot_state():
-    global _STATE_DIRTY, _LAST_SAVE_TS
-    import time as _time
+    def set(self, k: str, v: Any):
+        if not self.connect():
+            return False
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO bot_kv (k,v) VALUES (%s,%s) "
+                "ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()",
+                (k, json.dumps(v, ensure_ascii=False)),
+            )
+            cur.close()
+            return True
+        except Exception as e:
+            try: _log_error(f"DBKV.set({k})", e)
+            except Exception: 
+                pass
+            return False
+
+_dbkv = DBKV()
+
+def db_load_state():
     try:
-        # Pull from globals if they exist
-        g = globals()
-        payloads = {}
-        for k, path in STATE_FILES.items():
-            if k == "meta":
-                continue
-            if f"_{k}" in g:
-                payloads[k] = g.get(f"_{k}", {})
-        # fallback to known names
-        if "entry_watch" not in payloads and "_entry_watch" in g:
-            payloads["entry_watch"] = g.get("_entry_watch", {})
-        if "reentry_watch" not in payloads and "_reentry_watch" in g:
-            payloads["reentry_watch"] = g.get("_reentry_watch", {})
-        if "detected" not in payloads and "_detected_stocks" in g:
-            payloads["detected"] = g.get("_detected_stocks", {})
-        if "top_signals" not in payloads and "_top_signals" in g:
-            payloads["top_signals"] = g.get("_top_signals", {})
-        # write atomically
-        for key, data in payloads.items():
-            path = STATE_FILES.get(key)
-            if not path: 
-                continue
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(_json_safe(data), f, ensure_ascii=False)
-            os.replace(tmp, path)
-        with open(STATE_FILES["meta"], "w", encoding="utf-8") as f:
-            json.dump({"saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False)
-        _STATE_DIRTY = False
-        _LAST_SAVE_TS = _time.time()
+        ew = _dbkv.get("entry_watch", {}) or {}
+        rw = _dbkv.get("reentry_watch", {}) or {}
+        ds = _dbkv.get("detected_stocks", {}) or {}
+        ts = _dbkv.get("top_signals", {}) or {}
+        if isinstance(ew, dict): 
+            _entry_watch.clear(); _entry_watch.update(ew)
+        if isinstance(rw, dict): 
+            _reentry_watch.clear(); _reentry_watch.update(rw)
+        if isinstance(ds, dict): 
+            _detected_stocks.clear(); _detected_stocks.update(ds)
+        if isinstance(ts, dict): 
+            _top_signals.clear(); _top_signals.update(ts)
+    except Exception as e:
+        try: _log_error("db_load_state", e)
+        except Exception: 
+            pass
+
+def db_save_state():
+    try:
+        _dbkv.set("entry_watch", _entry_watch)
+        _dbkv.set("reentry_watch", _reentry_watch)
+        _dbkv.set("detected_stocks", _detected_stocks)
+        _dbkv.set("top_signals", _top_signals)
+        _dbkv.set("meta", {"version": VERSION, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
         return True
     except Exception as e:
-        try:
-            _log_error("save_bot_state", e)
-        except Exception:
+        try: _log_error("db_save_state", e)
+        except Exception: 
             pass
         return False
 
-def load_bot_state():
-    g = globals()
-    def _load(path):
-        try:
-            if os.path.exists(path):
+def db_mirror_json_file(path: str, key: str):
+    """Persist legacy JSON files to DB and restore on fresh deploy."""
+    try:
+        if os.path.exists(path):
+            try:
                 with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            return {}
-        return {}
-    # restore
-    if "_entry_watch" in g:
-        g["_entry_watch"].update(_load(STATE_FILES["entry_watch"]) or {})
-    if "_reentry_watch" in g:
-        g["_reentry_watch"].update(_load(STATE_FILES["reentry_watch"]) or {})
-    if "_detected_stocks" in g:
-        g["_detected_stocks"].update(_load(STATE_FILES["detected"]) or {})
-    if "_top_signals" in g:
-        g["_top_signals"].update(_load(STATE_FILES["top_signals"]) or {})
-    return True
+                    data = json.load(f)
+                _dbkv.set(key, data)
+            except Exception:
+                pass
+        else:
+            data = _dbkv.get(key)
+            if data:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        try: _log_error(f"db_mirror_json_file({key})", e)
+        except Exception: 
+            pass
 
-def periodic_state_save(interval_sec: int = 60):
-    import time as _time
-    global _LAST_SAVE_TS
-    if not _STATE_DIRTY:
-        return
-    now = _time.time()
-    if now - _LAST_SAVE_TS >= interval_sec:
-        save_bot_state()
+def _meta_get(k: str, default=None):
+    meta = _dbkv.get("runtime_meta", {}) or {}
+    return meta.get(k, default) if isinstance(meta, dict) else default
 
-# ===============================
+def _meta_set(k: str, v: Any):
+    meta = _dbkv.get("runtime_meta", {}) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta[k] = v
+    _dbkv.set("runtime_meta", meta)
+
+def should_send_once_per_day(tag: str, today: str) -> bool:
+    return _meta_get(tag, "") != today
+
+def mark_sent(tag: str, today: str):
+    _meta_set(tag, today)
 
 
 # .env 파일 자동 로드 (python-dotenv 없어도 직접 파싱)
@@ -2274,8 +2263,8 @@ def get_nxt_investor_trend(code: str) -> dict:
     output = data.get("output", [])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+        "foreign_net":     safe_int(output[0].get("frgn_ntby_qty", 0)),
+        "institution_net": safe_int(output[0].get("orgn_ntby_qty", 0)),
     }
 
 # NXT 데이터 캐시 (종목별 5분 유효)
@@ -3023,88 +3012,47 @@ def save_signal_log(stock: dict):
         print(f"⚠️ 신호 저장 오류: {e}")
 
 # 하위 호환성 유지 (기존 EARLY_LOG_FILE도 동시에 저장)
-
-
 def save_early_detect(stock: dict):
-
     save_signal_log(stock)
-
     try:
-
         data = {}
-
         try:
-
             with open(EARLY_LOG_FILE, "r") as f: data = json.load(f)
-
         except: pass
-
         code = stock["code"]
-
         if code not in data:
-
             data[code] = {
-
                 "code": code, "name": stock["name"],
-
                 "detect_time":  datetime.now().strftime("%H:%M"),
-
                 "detect_date":  datetime.now().strftime("%Y%m%d"),
-
                 "detect_price": stock["price"],
-
                 "change_at_detect": stock["change_rate"],
-
                 "volume_ratio": stock["volume_ratio"],
-
                 "entry_price":  stock["entry_price"],
-
                 "stop_price":   stock["stop_loss"],
-
                 "target_price": stock["target_price"],
-
                 "signal_type":  stock.get("signal_type", "EARLY_DETECT"),
-
                 "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
-
                 "status": "추적중", "pnl_pct": 0, "exit_price": 0, "exit_date": "",
-
             }
-
             with open(EARLY_LOG_FILE, "w") as f:
-
                 json.dump(data, f, ensure_ascii=False, indent=2)
-
     except Exception as e:
-
         print(f"⚠️ EARLY 저장 오류: {e}")
 
-
 # ============================================================
-
 # 📡 신호 결과 자동 추적 (매 스캔마다 호출)
-
 # ============================================================
-
 # 추적 제한 시간: 신호 발생 후 최대 N일
-
 TRACK_MAX_DAYS   = 5
-
 # 시간 초과 시 당일 종가 기준으로 결과 기록
-
 TRACK_TIMEOUT_RESULT = "시간초과"
-
 
 _tracking_notified = set()   # 이미 결과 알림 보낸 log_key
 
-
 # ============================================================
-
 # ✍️ 수동 매도 결과 입력 보조
-
 # ============================================================
-
-
 def send_overnight_risk_alerts():
     """장 마감 후 추적 중 종목 오버나이트 위험도 알림"""
     try:
@@ -4501,41 +4449,23 @@ def start_sector_monitor(code: str, name: str):
 # 🎯 진입가 감지
 # ============================================================
 def register_top_signal(s: dict):
-
     """신호 발생마다 오늘의 최우선 종목 풀에 추가 (점수 높은 종목 유지)"""
-
     code  = s.get("code","")
-
     score = s.get("score", 0)
-
     if not code: return
-
     existing = _today_top_signals.get(code, {})
-
     if score > existing.get("score", 0):
-
         _today_top_signals[code] = {
-
             "score":       score,
-
             "name":        s.get("name", code),
-
             "signal_type": s.get("signal_type",""),
-
             "entry_price": s.get("entry_price", 0),
-
             "stop_loss":   s.get("stop_loss", 0),
-
             "target_price":s.get("target_price", 0),
-
             "reasons":     s.get("reasons", []),
-
             "detected_at": datetime.now().strftime("%H:%M"),
-
             "nxt_delta":   s.get("nxt_delta", 0),
-
         }
-
 
 def send_top_signals():
     """10:00~장마감까지 1시간마다 — 최우선 종목 TOP 5 발송"""
@@ -4572,99 +4502,53 @@ def reset_top_signals_daily():
 
 
 def register_entry_watch(s: dict):
-
     entry = s.get("entry_price", 0)
-
     if not entry: return
-
     code = s["code"]
 
-
     # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
-
     old_keys = [k for k, w in _entry_watch.items() if w["code"] == code]
-
     for k in old_keys:
-
         old_entry  = _entry_watch[k].get("entry_price", 0)
-
         miss_count = _entry_watch[k].get("miss_count", 0)
-
         print(f"  🔄 진입가 갱신: {s['name']} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
-
         # signal_log의 기존 "추적중" 레코드를 "진입가변경"으로 업데이트
-
         try:
-
             sig_data = {}
-
             try:
-
                 with open(SIGNAL_LOG_FILE, "r") as f_r: sig_data = json.load(f_r)
-
             except: pass
-
             for lk, rec in sig_data.items():
-
                 if (rec.get("code") == code
-
                         and rec.get("status") == "추적중"
-
                         and rec.get("signal_type") == _entry_watch[k].get("signal_type")):
-
                     rec["status"]        = "진입가변경"
-
                     rec["exit_reason"]   = "재포착_진입가변경"
-
                     rec["old_entry"]     = old_entry
-
                     rec["new_entry"]     = entry
-
                     rec["pnl_pct"]       = 0.0
-
                     break
-
             with open(SIGNAL_LOG_FILE, "w") as f_w:
-
                 json.dump(sig_data, f_w, ensure_ascii=False, indent=2)
-
         except Exception as e:
-
             print(f"⚠️ 진입가변경 기록 오류: {e}")
-
         del _entry_watch[k]
 
-
     log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
-
     _entry_watch[log_key] = {
-
         "code": code, "name": s["name"], "entry_price": entry,
-
         "stop_loss":    s.get("stop_loss", 0),
-
         "target_price": s.get("target_price", 0),
-
         "signal_type":  s.get("signal_type", ""),
-
         "detect_time":  datetime.now().strftime("%H:%M"),
-
         "last_notified_ts": 0,
-
         "notify_count": 0,
-
         "miss_count":   len(old_keys),        # 이 종목 누적 재포착 횟수
-
         "registered_ts": time.time(),
-
         "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
-
         "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
-
     }
-
     print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
-
 
 def _record_entry_miss(watch: dict, reason: str, final_price: int):
     """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
@@ -5127,7 +5011,7 @@ def analyze(stock: dict) -> dict:
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
-            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
+            _log_error(f"analyze_investor({stock_code})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -9547,15 +9431,11 @@ def run_scan():
         if krx_open:
             for stock in get_upper_limit_stocks():
                 if stock["code"] in seen: continue
-                stock['code'] = normalize_stock_code(stock.get('code')) or stock.get('code')
-                if not normalize_stock_code(stock.get('code')): continue
                 r = analyze(stock)
                 if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
                     alerts.append(r); seen.add(r["code"])
             for stock in get_volume_surge_stocks():
                 if stock["code"] in seen: continue
-                stock['code'] = normalize_stock_code(stock.get('code')) or stock.get('code')
-                if not normalize_stock_code(stock.get('code')): continue
                 r = analyze(stock)
                 if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
                     alerts.append(r); seen.add(r["code"])
@@ -9564,8 +9444,6 @@ def run_scan():
         if nxt_open:
             for stock in get_nxt_surge_stocks():
                 if stock["code"] in seen: continue
-                stock['code'] = normalize_stock_code(stock.get('code')) or stock.get('code')
-                if not normalize_stock_code(stock.get('code')): continue
                 r = analyze(stock)
                 if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>ALERT_COOLDOWN:
                     r["market"] = "NXT"
@@ -9640,123 +9518,91 @@ def _shutdown(reason: str = "정상 종료"):
     import os, sys
     sys.exit(0)
 
-if __name__ == "__main__":
-    print("="*55)
-    print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
-    print(f"   업데이트: {BOT_DATE}")
-    print("="*55)
 
-    _load_kr_holidays(datetime.now().year)
 
-    # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
-    if is_holiday():
-        print(f"📅 오늘은 공휴일/주말 — 대기 모드로 실행")
+# ===============================
+# v5.0 Single-run Entrypoint (Cron)
+# ===============================
+def main_single_run():
+    """Run one cycle and exit. Recommended with GitHub Actions cron."""
+    now = _kst_now()
+
+    # Restore state from DB, and mirror legacy JSON files so existing code keeps working
+    try:
+        db_load_state()
+        try: db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
+        except Exception: pass
+        try: db_mirror_json_file(PARAM_FILE, "param_file")
+        except Exception: pass
+    except Exception as _e:
+        try: _log_error("startup_state_restore", _e)
+        except Exception: pass
+
+    # NXT 운영시간 밖이면 아무것도 하지 않음 (Railway/GHA 스케줄이 넓게 잡혀도 안전)
+    if not is_nxt_window_kst(now):
+        return
+
+    today = now.strftime("%Y-%m-%d")
+
+    # (1) 오버나이트 알림: 08:00대 1회 요약
+    if now.hour == 8 and 0 <= now.minute <= 5 and should_send_once_per_day("overnight_sent", today):
         try:
-            send(
-                f"😴 <b>주말/공휴일 대기 모드</b>  {BOT_VERSION}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"📡 스캔은 멈추고 명령어만 응답해요\n\n"
-                f"사용 가능한 명령어:\n"
-                f"/us — 미국 시장 현황\n"
-                f"/geo — 지정학 뉴스 분석\n"
-                f"/stats — 신호 통계\n"
-                f"/list — 감시 종목 목록\n"
-                f"/overnight — 오버나이트 위험도"
-            )
-        except: pass
-
-        # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
-        load_carry_stocks()
-        _load_dynamic_params()
-        schedule.every(10).seconds.do(poll_telegram_commands)
-        schedule.every(30).minutes.do(run_overnight_monitor)
-        schedule.every(60).minutes.do(run_geo_news_scan)
-
-        print("✅ 대기 모드 스케줄 등록 완료")
-        while True:
-            schedule.run_pending()
-            periodic_state_save(60)
-            time.sleep(1)
-
-    load_carry_stocks()
-    load_tracker_feedback()
-    load_dynamic_themes()
-    refresh_dynamic_candidates()
-    _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
-
-    send(
-        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
-        f"📅 {BOT_DATE}\n\n"
-        "✅ 한국투자증권 API 연결\n"
-        "🔵 NXT(넥스트레이드) 연동 활성\n\n"
-        "<b>📡 스캔 주기</b>\n"
-        "• 급등/상한가 스캔: <b>20초</b>\n"
-        "• 중기 눌림목: <b>90초</b>\n"
-        "• 뉴스 (3개 소스): <b>45초</b>\n"
-        "• DART 공시: <b>60초</b>\n"
-        "• 텔레그램 명령어: <b>10초</b>\n"
-        "• NXT 장전 선포착: 08:00~09:00\n"
-        "• NXT 마감 후 추적: 15:30~20:00\n\n"
-        "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
-        "⚙️ <b>/설정</b> — BotFather 명령어 자동완성 등록법"
-    )
-
-    schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
-    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(run_news_scan)
-    schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
-    schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
-    schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
-    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
-    schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("08:50").do(send_premarket_briefing)
-    # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
-    # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
-    for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
-        schedule.every().day.at(_top_hhmm).do(
-            lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
-        )
-    schedule.every().day.at(MARKET_OPEN).do(_on_market_open)  # v37.0: 명명 함수
-    schedule.every().day.at(MARKET_CLOSE).do(
-        lambda: None if is_holiday() else on_market_close()
-    )
-    # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전, 매도 가능 시간)
-    schedule.every().day.at("15:10").do(
-        lambda: None if is_holiday() else send_overnight_risk_alerts()
-    )
-    # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전, 매도 가능 시간)
-    schedule.every().day.at("19:40").do(
-        lambda: None if is_holiday() else send_overnight_risk_alerts()
-    )
-    # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
-    schedule.every().day.at("20:05").do(
-        lambda: (
-            _reentry_watch.clear(),
-            _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
-            print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
-        ) if not is_holiday() else None
-    )
-    # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
-    schedule.every(30).minutes.do(run_overnight_monitor)
-    # 지정학 뉴스 스캔 (1시간마다)
-    schedule.every(60).minutes.do(run_geo_news_scan)
-
-    # 평일만 백업 (장 운영일에만)
-    schedule.every(BACKUP_INTERVAL_H).hours.do(
-        lambda: run_auto_backup(notify=False) if not is_holiday() else None
-    )
-
-    # NXT 마감 후 자동 종료 (20:10)
-    schedule.every().day.at("20:10").do(
-        lambda: _shutdown("NXT 마감 (20:00) — 오늘 운영 완료")
-        if not is_holiday() else None
-    )
-
-    run_scan()
-    run_news_scan()
-    run_mid_pullback_scan()
-
-    while True:
-        try:
-            schedule.run_pending(); time.sleep(1)
+            send_overnight_risk_alerts()
+            mark_sent("overnight_sent", today)
         except Exception as e:
-            print(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+            try: _log_error("overnight_once", e)
+            except Exception: pass
+
+    # (2) 지정학 이벤트 감지 요약: 거래일 08:30 1회 / 휴장일 08:00 1회
+    if is_trading_day_kst(now):
+        if now.hour == 8 and 30 <= now.minute <= 40 and should_send_once_per_day("geo_sent", today):
+            try:
+                run_geo_news_scan()
+                mark_sent("geo_sent", today)
+            except Exception as e:
+                try: _log_error("geo_once", e)
+                except Exception: pass
+    else:
+        if now.hour == 8 and 0 <= now.minute <= 5 and should_send_once_per_day("geo_sent", today):
+            try:
+                run_geo_news_scan()
+                mark_sent("geo_sent", today)
+            except Exception as e:
+                try: _log_error("geo_once_holiday", e)
+                except Exception: pass
+
+    # (3) 장 시작 헬스체크(거래일 09:00대 1회)
+    if is_trading_day_kst(now) and now.hour == 9 and 0 <= now.minute <= 10 and should_send_once_per_day("open_health_sent", today):
+        try:
+            send(f"✅ <b>봇 정상 작동</b>\n버전 v{VERSION}\n시간: {now.strftime('%H:%M:%S')}")
+            mark_sent("open_health_sent", today)
+        except Exception as e:
+            try: _log_error("open_healthcheck", e)
+            except Exception: pass
+
+    # (4) 장중 스캔( KRX 또는 NXT 열려 있을 때만 )
+    try:
+        if is_any_market_open():
+            run_scan()
+            try:
+                check_entry_watch()
+            except Exception:
+                pass
+    except Exception as e:
+        try: _log_error("scan_cycle", e)
+        except Exception: pass
+
+    # Persist state + mirror legacy json to DB
+    try:
+        db_save_state()
+        try: db_mirror_json_file(SIGNAL_LOG_FILE, "signal_log_file")
+        except Exception: pass
+        try: db_mirror_json_file(PARAM_FILE, "param_file")
+        except Exception: pass
+    except Exception as e:
+        try: _log_error("shutdown_persist", e)
+        except Exception: pass
+
+
+if __name__ == "__main__":
+    main_single_run()
