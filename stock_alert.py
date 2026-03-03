@@ -6839,11 +6839,35 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         )
         raw  = extract_claude_text(resp.json())
         if not raw:
-            raise KeyError("content")
+            # Claude 응답이 비었거나 형태가 다를 때도 전체 스캔이 죽지 않게 폴백
+            return {
+                "detected": True,
+                "entities": [],
+                "uncertainty": "high",
+                "uncertainty_reason": "요약 API 응답 누락",
+                "sectors": _map_geo_sectors(detected_kws),
+                "sector_directions": [],
+                "score_adj": 0,
+                "summary": f"(요약 실패) 키워드 기반: {', '.join(detected_kws[:8])}",
+                "kws": detected_kws[:5],
+            }
         raw  = raw.strip()
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {
+                "detected": True,
+                "entities": [],
+                "uncertainty": "high",
+                "uncertainty_reason": "요약 JSON 파싱 실패",
+                "sectors": _map_geo_sectors(detected_kws),
+                "sector_directions": [],
+                "score_adj": 0,
+                "summary": f"(요약 파싱 실패) 키워드 기반: {', '.join(detected_kws[:8])}",
+                "kws": detected_kws[:5],
+            }
 
         # sector_directions → sectors 리스트도 같이 추출
         sec_dirs = data.get("sector_directions", [])
@@ -6874,6 +6898,19 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
                 "entities": [], "ts": time.time()}
 
+
+
+# 방향 아이콘(지정학 섹터 방향 표시용)
+_DIR_ICON = {
+    "상승": "🟢",
+    "하락": "🔴",
+    "중립": "⚪",
+    "강세": "🟢",
+    "약세": "🔴",
+    "positive": "🟢",
+    "negative": "🔴",
+    "neutral": "⚪",
+}
 
 def run_geo_news_scan(force_send: bool = False):
     """
