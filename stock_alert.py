@@ -270,15 +270,15 @@ v28.0 (2026-03-01)
 import re as _re
 
 
-# --- HOTFIX: safe JSON parsing (prevents JSONDecodeError on empty/HTML responses) ---
-def safe_json(resp):
-    """Return resp.json() safely. If invalid JSON or empty response, return {}."""
+# --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
+def safe_json_response(resp):
+    """Return resp.json() safely; if invalid/empty/HTML, return {}."""
     try:
-        # If server returned HTML / empty, resp.json() will raise
-        ct = (resp.headers.get("Content-Type") or "").lower()
-        txt = (resp.text or "")
+        txt = (getattr(resp, "text", "") or "")
         if not txt.strip():
             return {}
+        ct = (getattr(resp, "headers", {}) or {}).get("Content-Type", "")
+        ct = (ct or "").lower()
         if "json" not in ct and txt.lstrip().startswith("<"):
             return {}
         return resp.json()
@@ -731,15 +731,30 @@ def _headers(tr_id: str) -> dict:
             "appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET,
             "tr_id":tr_id,"custtype":"P"}
 
+
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    try:
-        resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-        if resp.status_code == 403:
-            global _access_token; _access_token = None
+    """KIS GET with retry/backoff. Never raises."""
+    last_err = None
+    for attempt in range(3):
+        try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-        return resp.json() if resp.status_code == 200 else {}
-    except Exception as e:
-        print(f"⚠️ API 오류 ({tr_id}): {e}"); return {}
+            if resp.status_code == 403:
+                global _access_token
+                _access_token = None
+                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+            if resp.status_code == 200:
+                return safe_json_response(resp)
+        except Exception as e:
+            last_err = e
+        try:
+            time.sleep(0.8 * (2 ** attempt))
+        except Exception:
+            pass
+    try:
+        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
+    except Exception:
+        pass
+    return {}
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -759,8 +774,8 @@ def get_daily_data(code: str, days: int = 60) -> list:
         params = {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code,
                   "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
                   "FID_PERIOD_DIV_CODE":"D","FID_ORG_ADJ_PRC":"0"}
-        resp  = _session.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
-        items = resp.json().get("output2",[]) if resp.status_code == 200 else []
+        resp_json = _safe_get(url, "FHKST03010100", params)
+        items = resp_json.get("output2", []) if isinstance(resp_json, dict) else []
         items = sorted([{
             "date":  i.get("stck_bsop_date",""),
             "open":  int(i.get("stck_oprc",0)),
@@ -6698,9 +6713,12 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(safe_json(resp))
+        raw  = extract_ai_text(safe_json_response(resp))
         raw  = raw.replace("```json","").replace("```","").strip()
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {'verdict':'중립','score_adj':0,'reason':'(요약 실패)','risk_points':[],'key_event':'','confidence':'low'}
 
         result = {
             "verdict":     data.get("verdict", "중립"),
