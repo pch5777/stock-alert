@@ -18,6 +18,9 @@ v37.0 (2026-03-02)  ← 현재
   [P1] ⑥ _weekly_report_sent_week 죽은 global 선언 제거
   [P1] ⑦ Anthropic API 버전 2023-06-01→2024-10-22 업데이트
   [P1] ⑧ _geo_event_state 전역변수 위치 이동 (사용 전 정의)
+# --- PATCH: prevent NameError for stray f-strings using {code} in error paths ---
+code = ""  # do not remove: used as safe fallback for logging
+
   [P2] ⑨ analyze() 내부 bare except 7개 → _log_error 변환
   [P2] ⑩ 캐시 자동 정리 _prune_cache() 추가 (메모리 누수 방지)
   [P2] ⑪ _nxt_unavailable 주 1회 초기화 (불필요 API 호출 제거)
@@ -4816,7 +4819,7 @@ def analyze(stock: dict) -> dict:
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
-            _log_error(f"analyze_investor({stock.get('code','')})", _e); inv = {}; f_net = 0; i_net = 0
+            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -4957,7 +4960,7 @@ def analyze(stock: dict) -> dict:
             # 리스크 포인트 있으면 추가 표시
             for rp in deep.get("risk_points", [])[:2]:
                 reasons.append(f"  ⚠️ {rp}")
-    except Exception as _e: _log_error(f"analyze_news({stock.get('code','')})", _e)
+    except Exception as _e: _log_error(f"analyze_news({code})", _e)
 
     # ── 지정학 이벤트 보정 ──
     try:
@@ -5009,7 +5012,7 @@ def analyze(stock: dict) -> dict:
                         reasons.append(
                             f"🌍 지정학 관련 섹터 {unc_label.get(geo_unc,'')} {geo_adj:+d}점"
                         )
-    except Exception as _e: _log_error(f"analyze_geo({stock.get('code','')})", _e)
+    except Exception as _e: _log_error(f"analyze_geo({code})", _e)
 
     # ── 테마 로테이션 보정 ──
     try:
@@ -5091,7 +5094,7 @@ def analyze(stock: dict) -> dict:
         if fp.get("risk_flag"):
             reasons.append("⚠️ 수급 이탈 신호 감지 — 포지션 축소 검토")
     except Exception as _e:
-        _log_error(f"detect_force({stock.get('code','')})", _e)
+        _log_error(f"detect_force({code})", _e)
 
     # 등급 계산
     if   score >= 80: grade = "A"
