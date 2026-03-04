@@ -6,7 +6,7 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.0-hotfix2b+sbkv
+버전: v37.0-hotfix2b+sbkv+sbkv
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -268,10 +268,92 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
+import pathlib
 import atexit
 import hashlib
 import base64
 
+
+
+# =========================
+# Supabase KV persistence
+# =========================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+
+_KV_TABLE = "bot_kv"
+_KV_FILES = [
+    "signal_log.json",
+    "early_detect_log.json",
+    "auto_tune_log.json",
+    "carry_stocks.json",
+    "dynamic_params.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "compact_mode.json",
+]
+
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+
+def kv_put(key: str, raw_bytes: bytes):
+    """Upsert a blob into public.bot_kv. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return False
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        sha1 = hashlib.sha1(raw_bytes).hexdigest()
+        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_KV_TABLE}?on_conflict=key"
+        payload = {"key": key, "b64": b64, "sha1": sha1}
+        requests.post(url, headers=_sb_headers(), json=payload, timeout=(2, 6))
+        return True
+    except Exception:
+        return False
+
+def kv_get(key: str):
+    """Get blob from public.bot_kv. Returns bytes or None. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return None
+        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_KV_TABLE}?key=eq.{key}&select=b64"
+        r = requests.get(url, headers=_sb_headers(), timeout=(2, 6))
+        if r.status_code != 200:
+            return None
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            return None
+        b64 = arr[0].get("b64") or ""
+        if not b64:
+            return None
+        return base64.b64decode(b64.encode("ascii"))
+    except Exception:
+        return None
+
+def kv_restore_files():
+    """Restore known json files from Supabase into local working directory."""
+    for fn in _KV_FILES:
+        key = f"file:{fn}"
+        blob = kv_get(key)
+        if blob:
+            try:
+                pathlib.Path(fn).write_bytes(blob)
+            except Exception:
+                pass
+
+def kv_backup_files():
+    """Backup known json files to Supabase."""
+    for fn in _KV_FILES:
+        p = pathlib.Path(fn)
+        if p.exists():
+            try:
+                kv_put(f"file:{fn}", p.read_bytes())
+            except Exception:
+                pass
 
 # --- PATCH: Supabase KV persistence (prevents data loss on redeploy) ---
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
