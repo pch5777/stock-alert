@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.8-fixbaseurl3
+버전: v37.9-universe2
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+v37.9-universe2 (2026-03-05)
+- 장 종료(비장중)에는 '급등 상위' 후보군 생성 스킵 → 익개장 워치리스트 생성/저장
+- 익개장 07:55 워치리스트 요약 알림(야간 무알림)
+
+v37.9-universe1 (2026-03-05)
+- KIS 랭킹 API(chgrate-pcls-100) 404 시 유니버스 기반 후보군 생성으로 자동 대체
+- 유니버스(최대 200) 구성: carry/signal_log 기반 + 파일(universe.json) 지원
+- 후보군 계산 캐시(45초)로 API 호출 부담 완화
 
 v37.8-fixbaseurl3 (2026-03-05)  ← 현재
   [Fix] KIS API 오류 시 응답 진단 강화(url/status/content-type/body snippet) + JSON 에러 필드 파싱
@@ -692,6 +701,53 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
     except Exception:
         pass
     return {}
+
+
+
+def _safe_get_meta(url: str, tr_id: str, params: dict):
+    """_safe_get + (status, content_type, body_snippet) 를 함께 반환."""
+    last_exc = None
+    last_status = None
+    last_ct = ""
+    last_body_snip = ""
+    last_url = url
+
+    for attempt in range(3):
+        try:
+            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+            last_status = getattr(resp, "status_code", None)
+            last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
+
+            if last_status != 200:
+                try:
+                    txt = getattr(resp, "text", "") or ""
+                    last_body_snip = (txt[:200] + ("…" if len(txt) > 200 else "")).replace("\n", " ").replace("\r", " ")
+                except:
+                    last_body_snip = ""
+                break
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                last_exc = e
+                try:
+                    txt = getattr(resp, "text", "") or ""
+                    last_body_snip = (txt[:200] + ("…" if len(txt) > 200 else "")).replace("\n", " ").replace("\r", " ")
+                except:
+                    last_body_snip = ""
+                break
+
+            return data or {}, last_status, last_ct, last_body_snip
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.8 * (attempt + 1))
+
+    try:
+        print(f"⚠️ API 오류 ({tr_id}): url={last_url} status={last_status} ct={last_ct} err={last_exc} body={last_body_snip}")
+    except:
+        pass
+
+    return {}, last_status, last_ct, last_body_snip
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -1692,12 +1748,107 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
 # ============================================================
 _dynamic_candidates = {}   # code → {name, desc, added_ts}
 
+
+# ============================================================
+# 🔭 Next-open Watchlist (장 종료 후 후보군 대체)
+#   - 장이 닫혀 있을 때는 '급등 상위' 후보군 산출을 스킵하고
+#     익개장 전 확인용 워치리스트를 저장/요약 전송한다.
+# ============================================================
+WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
+_UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
+
+def _read_json_safe(path: str, default):
+    try:
+        if not os.path.isfile(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def build_next_open_watchlist(max_codes: int = 30) -> dict:
+    """장 종료 후: 내일 감시할 워치리스트를 생성해서 파일로 저장."""
+    # 우선순위: carry_stocks → 최근 signal_log 종목 → (있으면) universe.json
+    carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
+    siglog = _read_json_safe(os.path.join(DATA_DIR, "signal_log.json"), [])
+    universe = _read_json_safe(os.path.join(DATA_DIR, "universe.json"), {})
+
+    codes = []
+    seen = set()
+
+    # carry_stocks 구조가 dict/list 어떤 형태든 대응
+    if isinstance(carry, dict):
+        for k in list(carry.keys()):
+            c = normalize_stock_code(k)
+            if c and c not in seen:
+                seen.add(c); codes.append(c)
+    elif isinstance(carry, list):
+        for item in carry:
+            c = normalize_stock_code(item.get("code") if isinstance(item, dict) else item)
+            if c and c not in seen:
+                seen.add(c); codes.append(c)
+
+    # 최근 신호/추적 종목
+    if isinstance(siglog, list):
+        # 최근 것부터
+        for rec in reversed(siglog[-500:]):  # 너무 오래는 보지 않음
+            if not isinstance(rec, dict):
+                continue
+            c = normalize_stock_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
+            if c and c not in seen:
+                seen.add(c); codes.append(c)
+            if len(codes) >= max_codes:
+                break
+
+    # universe.json (사용자 지정 유니버스가 있으면 보충)
+    if isinstance(universe, dict):
+        ulist = universe.get("codes") or universe.get("universe") or universe.get("tickers") or []
+        if isinstance(ulist, list):
+            for u in ulist:
+                c = normalize_stock_code(u)
+                if c and c not in seen:
+                    seen.add(c); codes.append(c)
+                if len(codes) >= max_codes:
+                    break
+
+    payload = {
+        "ts": time.time(),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "max_codes": max_codes,
+        "codes": codes[:max_codes],
+    }
+    try:
+        _ensure_dir(DATA_DIR)
+        _write_json_atomic(WATCHLIST_NEXT_OPEN_FILE, payload, indent=2)
+    except Exception as e:
+        print(f"⚠️ 워치리스트 저장 실패: {e}")
+    return payload
+
+def send_preopen_watchlist():
+    """익개장 전(07:55) 워치리스트 요약 전송"""
+    try:
+        data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
+        codes = data.get("codes") if isinstance(data, dict) else None
+        if not codes:
+            return
+        # 너무 길면 상위 15개만 표시
+        show = codes[:15]
+        msg = "⏰ 익개장 전 워치리스트\n" + " / ".join(show)
+        send_by_level(msg, level=ALERT_LEVEL_NORMAL)
+    except Exception as e:
+        print(f"⚠️ send_preopen_watchlist 오류: {e}")
+
 def refresh_dynamic_candidates():
     """
     거래량 상위 50종목을 자동으로 후보군에 편입
     → THEME_MAP에 없는 종목(아주IB투자, 국전약품 등)도 포착 가능
     매일 장 시작 시 + 1시간마다 갱신
     """
+    if not is_any_market_open():
+        build_next_open_watchlist(max_codes=30)
+        print("  💤 비장중: 동적 후보군 갱신 스킵 → 익개장 워치리스트 저장")
+        return
+
     try:
         # 거래량 급증 상위 종목
         vol_stocks = get_volume_surge_stocks()
@@ -2009,19 +2160,156 @@ def get_stock_price(code: str) -> dict:
                       else "small"),
     }
 
+
+
+# ============================================================
+# 후보군 생성 fallback (랭킹 API 404 대비)
+# ============================================================
+UNIVERSE_FILE = os.path.join(DATA_DIR, "universe.json")
+_UNIVERSE_CACHE = {"ts": 0.0, "codes": []}
+_UNIVERSE_RANK_CACHE = {"ts": 0.0, "items": []}
+
+UNIVERSE_MAX = int(os.getenv("UNIVERSE_MAX", "200") or "200")
+UNIVERSE_CACHE_TTL_SEC = int(os.getenv("UNIVERSE_CACHE_TTL_SEC", "3600") or "3600")
+UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")
+
+UNIVERSE_MIN_PRICE = int(os.getenv("UNIVERSE_MIN_PRICE", "1000") or "1000")
+UNIVERSE_MIN_VOL = int(os.getenv("UNIVERSE_MIN_VOL", "100000") or "100000")
+UNIVERSE_MIN_RSFL = float(os.getenv("UNIVERSE_MIN_RSFL", "5") or "5")
+
+def _extract_codes_recursive(obj, out: set, limit: int = 5000):
+    if len(out) >= limit:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if len(s) == 6 and s.isdigit():
+            out.add(s)
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _extract_codes_recursive(k, out, limit)
+            _extract_codes_recursive(v, out, limit)
+        return
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            _extract_codes_recursive(v, out, limit)
+        return
+
+def _load_universe_codes() -> list:
+    now = time.time()
+    if now - _UNIVERSE_CACHE["ts"] < UNIVERSE_CACHE_TTL_SEC and _UNIVERSE_CACHE["codes"]:
+        return _UNIVERSE_CACHE["codes"]
+
+    codes = []
+
+    # user-provided universe.json
+    try:
+        if os.path.exists(UNIVERSE_FILE):
+            with open(UNIVERSE_FILE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            arr = j.get("codes") if isinstance(j, dict) else j
+            for c in (arr or []):
+                s = str(c).strip()
+                if len(s) == 6 and s.isdigit():
+                    codes.append(s)
+    except Exception as e:
+        print(f"⚠️ universe.json 로드 실패: {e}")
+
+    # carry_stocks.json
+    try:
+        carry_path = os.path.join(DATA_DIR, "carry_stocks.json")
+        if os.path.exists(carry_path):
+            with open(carry_path, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            found = set()
+            _extract_codes_recursive(j, found, limit=2000)
+            codes.extend(sorted(found))
+    except:
+        pass
+
+    # signal_log.json
+    try:
+        if os.path.exists(SIGNAL_LOG_FILE):
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            found = set()
+            _extract_codes_recursive(j, found, limit=5000)
+            codes.extend(sorted(found))
+    except:
+        pass
+
+    seen = set()
+    uniq = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+
+    _UNIVERSE_CACHE["ts"] = now
+    _UNIVERSE_CACHE["codes"] = uniq[: max(UNIVERSE_MAX, 50)]
+    return _UNIVERSE_CACHE["codes"]
+
+def _rank_from_universe() -> list:
+    now = time.time()
+    if now - _UNIVERSE_RANK_CACHE["ts"] < UNIVERSE_RANK_TTL_SEC and _UNIVERSE_RANK_CACHE["items"]:
+        return _UNIVERSE_RANK_CACHE["items"]
+
+    codes = _load_universe_codes()[:UNIVERSE_MAX]
+    items = []
+    for code in codes:
+        info = get_stock_price(code)
+        if not info:
+            continue
+        if info.get("price", 0) < UNIVERSE_MIN_PRICE:
+            continue
+        if info.get("today_vol", 0) < UNIVERSE_MIN_VOL:
+            continue
+        if float(info.get("change_rate", 0) or 0) < UNIVERSE_MIN_RSFL:
+            continue
+
+        items.append({
+            "code": info.get("code",""),
+            "name": info.get("name",""),
+            "price": int(info.get("price",0) or 0),
+            "change_rate": float(info.get("change_rate",0) or 0),
+            "volume_ratio": float(info.get("volume_ratio",0) or 0),
+            "market": "KRX",
+        })
+
+    items.sort(key=lambda x: (x.get("change_rate",0), x.get("volume_ratio",0), x.get("price",0)), reverse=True)
+    items = items[:30]
+
+    _UNIVERSE_RANK_CACHE["ts"] = now
+    _UNIVERSE_RANK_CACHE["items"] = items
+    return items
+
 def get_upper_limit_stocks() -> list:
-    data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
-                     "FHPST01700000", {
+    url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
+    params = {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
         "FID_RANK_SORT_CLS_CODE":"0","FID_INPUT_CNT_1":"30","FID_PRC_CLS_CODE":"0",
         "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"","FID_VOL_CNT":"100000",
         "FID_TRGT_CLS_CODE":"0","FID_TRGT_EXLS_CLS_CODE":"0","FID_DIV_CLS_CODE":"0",
         "FID_RSFL_RATE1":"5","FID_RSFL_RATE2":"",
-    })
-    return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
-             "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-             "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"KRX"}
-            for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+    }
+
+    data, status, ct, body = _safe_get_meta(url, "FHPST01700000", params)
+
+    if status == 404:
+        print("⚠️ [KIS] chgrate-pcls-100 404 → 유니버스 기반 후보군으로 대체")
+        return _rank_from_universe()
+
+    items = [{
+        "code": i.get("mksc_shrn_iscd",""), "name": i.get("hts_kor_isnm",""),
+        "price": int(i.get("stck_prpr",0)), "change_rate": float(i.get("prdy_ctrt",0)),
+        "volume_ratio": float(i.get("vol_inrt",0) or 0), "market":"KRX"
+    } for i in (data.get("output", []) if isinstance(data, dict) else [])]
+
+    if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
+        print(f"⚠️ [KIS] 랭킹 응답 비어있음(status={status}, ct={ct}) → 유니버스 후보군으로 대체")
+        return _rank_from_universe()
+
+    return items
 
 def get_volume_surge_stocks() -> list:
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
@@ -9728,6 +10016,7 @@ if __name__ == "__main__":
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
+    schedule.every().day.at("07:55").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
