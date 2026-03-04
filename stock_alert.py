@@ -1,4 +1,4 @@
-print("BOOT_VERSION = FILE_PERSIST_V1C", flush=True)
+
 # --- HOTFIX: prevent NameError for stray f-strings using {code} ---
 code = ""
 
@@ -311,6 +311,19 @@ _SB_KV_FILES = [
     "geo_history.json",
     "geo_fingerprint.json",
 ]
+
+def supabase_write_files_snapshot() -> None:
+    """Write a snapshot of existing state files into bot_kv key 'files_snapshot'. Never raises."""
+    try:
+        existing = []
+        for fn in _SB_KV_FILES:
+            if pathlib.Path(fn).exists():
+                existing.append(fn)
+        # Always write (even if empty) so we can verify the code path executed.
+        supabase_kv_put("files_snapshot", ",".join(existing)[:950])
+    except Exception:
+        return
+
 
 def supabase_kv_put_blob(key: str, raw: bytes) -> None:
     """Upsert bytes into public.bot_kv as base64. Never raises."""
