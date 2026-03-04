@@ -268,6 +268,9 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
+import hashlib
+import base64
+import pathlib
 import time
 import requests
 import os
@@ -293,6 +296,84 @@ def supabase_kv_put(key: str, value: str) -> None:
         requests.post(url, headers=headers, json=payload, timeout=(2, 4))
     except Exception:
         return
+
+
+# --- SAFE PATCH: Supabase file persistence (best-effort, non-fatal) ---
+_SB_KV_FILES = [
+    "signal_log.json",
+    "early_detect_log.json",
+    "auto_tune_log.json",
+    "carry_stocks.json",
+    "dynamic_params.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "compact_mode.json",
+    "geo_history.json",
+    "geo_fingerprint.json",
+]
+
+def supabase_kv_put_blob(key: str, raw: bytes) -> None:
+    """Upsert bytes into public.bot_kv as base64. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return
+        url = SUPABASE_URL.rstrip("/") + "/rest/v1/bot_kv?on_conflict=key"
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        b64 = base64.b64encode(raw).decode("ascii")
+        sha1 = hashlib.sha1(raw).hexdigest()
+        payload = {"key": key, "b64": b64, "sha1": sha1}
+        requests.post(url, headers=headers, json=payload, timeout=(2, 6))
+    except Exception:
+        return
+
+def supabase_kv_get_blob(key: str):
+    """Get bytes from public.bot_kv. Returns bytes or None. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return None
+        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/bot_kv?key=eq.{key}&select=b64"
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        }
+        r = requests.get(url, headers=headers, timeout=(2, 6))
+        if r.status_code != 200:
+            return None
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            return None
+        b64 = arr[0].get("b64") or ""
+        if not b64:
+            return None
+        return base64.b64decode(b64.encode("ascii"))
+    except Exception:
+        return None
+
+def supabase_restore_files() -> None:
+    """Restore known json state files from Supabase into local directory."""
+    for fn in _SB_KV_FILES:
+        blob = supabase_kv_get_blob(f"file:{fn}")
+        if blob:
+            try:
+                pathlib.Path(fn).write_bytes(blob)
+            except Exception:
+                pass
+
+def supabase_backup_files() -> None:
+    """Backup known json state files into Supabase."""
+    for fn in _SB_KV_FILES:
+        p = pathlib.Path(fn)
+        if p.exists():
+            try:
+                supabase_kv_put_blob(f"file:{fn}", p.read_bytes())
+            except Exception:
+                pass
 
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
@@ -1426,6 +1507,11 @@ def run_auto_backup(notify: bool = False):
     ok_tg   = False
     if not ok_gist:
         ok_tg = backup_to_telegram()
+
+    try:
+        supabase_backup_files()
+    except Exception:
+        pass
 
     if notify and (ok_gist or ok_tg):
         method = "GitHub Gist" if ok_gist else "텔레그램 파일"
