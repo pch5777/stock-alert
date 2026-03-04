@@ -3,11 +3,14 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.9-universe2
+버전: v37.9-universe3
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+v37.9-universe3 (2026-03-05)
+- 오버나이트 위험 알림: 20:00~07:55 야간에는 즉시 발송 금지(저장만) → 07:55 워치리스트 요약에 함께 재알림
 
 v37.9-universe2 (2026-03-05)
 - 장 종료(비장중)에는 '급등 상위' 후보군 생성 스킵 → 익개장 워치리스트 생성/저장
@@ -76,6 +79,18 @@ BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo
+
+# Timezone helpers (always Asia/Seoul for scheduling gates)
+_KST = ZoneInfo("Asia/Seoul")
+def _now_kst() -> datetime:
+    return datetime.now(_KST)
+
+def _is_quiet_night(now: datetime | None = None) -> bool:
+    """Quiet night window: 20:00~07:55 (no push; store only)."""
+    now = now or _now_kst()
+    t = now.time()
+    return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
 
 # ============================================================
@@ -1755,6 +1770,7 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 #     익개장 전 확인용 워치리스트를 저장/요약 전송한다.
 # ============================================================
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
+OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
 
 def _read_json_safe(path: str, default):
@@ -1834,6 +1850,19 @@ def send_preopen_watchlist():
         # 너무 길면 상위 15개만 표시
         show = codes[:15]
         msg = "⏰ 익개장 전 워치리스트\n" + " / ".join(show)
+
+        # Include overnight risk recap (saved during night / last run)
+        try:
+            _ov = _read_json_safe(OVERNIGHT_RISK_LAST_FILE, {})
+            _ov_msg = _ov.get("msg") if isinstance(_ov, dict) else None
+            if _ov_msg:
+                # Keep it short: top 6 lines max
+                _lines = [ln for ln in str(_ov_msg).splitlines() if ln.strip()]
+                if len(_lines) > 6:
+                    _lines = _lines[:6] + ["…(생략)"]
+                msg += "\n\n" + "\n".join(_lines)
+        except Exception:
+            pass
         send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
@@ -3392,6 +3421,19 @@ def send_overnight_risk_alerts():
             if _r_hist:
                 msg += f"📊 {_r_hist}\n"
         except: pass
+        # Save latest overnight risk message (for pre-open recap)
+        try:
+            _write_json_atomic(OVERNIGHT_RISK_LAST_FILE, {
+                "ts": _now_kst().isoformat(timespec="seconds"),
+                "msg": msg,
+            })
+        except Exception:
+            pass
+
+        # Quiet night: do not push; only store
+        if _is_quiet_night():
+            print("💤 야간(20:00~07:55): 오버나이트 위험 알림 저장만 수행")
+            return
 
         send(msg)
     except Exception as e:
