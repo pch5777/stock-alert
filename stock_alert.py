@@ -6,13 +6,20 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.0-hotfix2b
-날짜: 2026-03-02
+버전: v37.1-storage1
+날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.0 (2026-03-02)  ← 현재
+v37.1-storage1 (2026-03-04)  ← 현재
+  [보호] STOCK_ALERT_DATA_DIR 기반 영구 저장소(DATA_DIR) 도입 (/data 마운트 대응)
+  [보호] 레거시 JSON 자동 이관(최초 1회) + 시작 시 스토리지 진단 로그 출력
+  [안정] JSON 저장 atomic write(tmp→fsync→replace) + 백업 스냅샷(backups/, 최근 N개 유지)
+  [운영] Railway Variables로 데이터 경로/백업 개수 제어: STOCK_ALERT_DATA_DIR, MAX_STATE_BACKUPS
+
+
+v37.0 (2026-03-02)
   전체 코드 리뷰 + 15건 버그/성능/안정성 수정 + 지정학 이력 기능
   [P0] ① fetch_all_news() 스레드 안전성 수정 (Queue 기반)
   [P0] ② flush_info_alerts() 리스트 동시수정 버그 수정
@@ -316,6 +323,135 @@ import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
 
+# ============================================================
+# 💾 Persistent Storage (코드 교체/배포에도 데이터 보존)
+#   - Railway Volume(/data) + 환경변수 STOCK_ALERT_DATA_DIR 지원
+#   - 파일은 모두 DATA_DIR 아래로 강제
+#   - JSON 저장은 atomic write + 백업 스냅샷(최근 N개)로 보호
+# ============================================================
+DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
+    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
+)
+DATA_DIR = os.path.abspath(DATA_DIR)
+
+MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
+_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+
+_PERSIST_FILES = [
+    "signal_log.json",
+    "dynamic_params.json",
+    "carry_stocks.json",
+    "early_detect_log.json",
+    "auto_tune_log.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "compact_mode.json",
+]
+
+def _ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ DATA_DIR 생성 실패: {path} ({e})")
+
+def _snapshot_backup(file_path: str):
+    """기존 파일이 있으면 backups로 스냅샷 백업(최근 N개 유지)"""
+    try:
+        if not os.path.isfile(file_path):
+            return
+        _ensure_dir(_BACKUP_DIR)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.basename(file_path)
+        backup_path = os.path.join(_BACKUP_DIR, f"{base}.{ts}.bak")
+        # copy (binary safe)
+        with open(file_path, "rb") as rf, open(backup_path, "wb") as wf:
+            wf.write(rf.read())
+
+        # prune old backups
+        backups = sorted(
+            [p for p in os.listdir(_BACKUP_DIR) if p.startswith(base + ".")],
+            reverse=True,
+        )
+        for old in backups[MAX_STATE_BACKUPS:]:
+            try:
+                os.remove(os.path.join(_BACKUP_DIR, old))
+            except:
+                pass
+    except Exception as e:
+        print(f"⚠️ 백업 스냅샷 실패: {os.path.basename(file_path)} ({e})")
+
+def _atomic_write_bytes(file_path: str, data: bytes):
+    """tmp → fsync → os.replace 로 원자적 저장"""
+    _ensure_dir(os.path.dirname(file_path))
+    tmp_path = file_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, file_path)
+
+def _write_json_atomic(file_path: str, obj, indent: int = 2):
+    try:
+        _snapshot_backup(file_path)
+        payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
+        _atomic_write_bytes(file_path, payload)
+    except Exception as e:
+        print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+
+def _migrate_legacy_files():
+    """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
+    try:
+        cwd = os.getcwd()
+        for fn in _PERSIST_FILES:
+            legacy = os.path.join(cwd, fn)
+            target = os.path.join(DATA_DIR, fn)
+            if os.path.isfile(legacy) and not os.path.isfile(target):
+                _ensure_dir(DATA_DIR)
+                try:
+                    with open(legacy, "rb") as rf, open(target, "wb") as wf:
+                        wf.write(rf.read())
+                    print(f"✅ 레거시 파일 이관: {fn} → {target}")
+                except Exception as e:
+                    print(f"⚠️ 레거시 이관 실패: {fn} ({e})")
+    except Exception as e:
+        print(f"⚠️ 레거시 이관 로직 오류: {e}")
+
+def _storage_diagnostics_once():
+    """시작 시 1회: DATA_DIR/볼륨/쓰기 가능 여부/파일 목록 출력"""
+    try:
+        _ensure_dir(DATA_DIR)
+        _ensure_dir(_BACKUP_DIR)
+        rp = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
+        print("=======================================================")
+        print("💾 Persistent Storage Check")
+        print(f"   DATA_DIR: {DATA_DIR}")
+        if rp:
+            print(f"   RAILWAY_VOLUME_MOUNT_PATH: {rp}")
+        # writable test
+        test_path = os.path.join(DATA_DIR, ".write_test")
+        try:
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+            os.remove(test_path)
+            print("   Writable: ✅ OK")
+        except Exception as e:
+            print(f"   Writable: ❌ FAIL ({e})")
+        # list key files
+        existing = []
+        for fn in _PERSIST_FILES:
+            fp = os.path.join(DATA_DIR, fn)
+            if os.path.isfile(fp):
+                try:
+                    size = os.path.getsize(fp)
+                    existing.append(f"{fn}({size}B)")
+                except:
+                    existing.append(fn)
+        print("   Files:", ", ".join(existing) if existing else "(none)")
+        print("=======================================================")
+    except Exception as e:
+        print(f"⚠️ 스토리지 진단 실패: {e}")
+
+
 # --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
 def extract_ai_text(resp_json):
     """Safely extract analysis text from AI provider response."""
@@ -396,8 +532,8 @@ MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
 MAX_CARRY_DAYS        = 3
-CARRY_FILE            = "carry_stocks.json"
-EARLY_LOG_FILE        = "early_detect_log.json"
+CARRY_FILE            = os.path.join(DATA_DIR, "carry_stocks.json")
+EARLY_LOG_FILE        = os.path.join(DATA_DIR, "early_detect_log.json")
 
 # ATR
 ATR_PERIOD       = 5
@@ -521,10 +657,10 @@ _early_volume_min_dynamic = EARLY_VOLUME_MIN
 
 # ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
 _dynamic_theme_map  = {}
-DYNAMIC_THEME_FILE  = "dynamic_themes.json"
+DYNAMIC_THEME_FILE  = os.path.join(DATA_DIR, "dynamic_themes.json")
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
-NEWS_COOCCUR_FILE   = "news_cooccur.json"
+NEWS_COOCCUR_FILE   = os.path.join(DATA_DIR, "news_cooccur.json")
 
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -550,7 +686,7 @@ _news_reverse_cache: dict = {}
 # ── 컴팩트 알림 모드 ──
 # True면 1~2줄 요약, False면 기존 상세 포맷
 _compact_mode: bool = False
-COMPACT_MODE_FILE   = "compact_mode.json"
+COMPACT_MODE_FILE   = os.path.join(DATA_DIR, "compact_mode.json")
 
 def _load_compact_mode():
     global _compact_mode
@@ -2453,8 +2589,7 @@ def update_news_cooccur(headlines: list):
 
     # 파일 저장 (장 마감 후 분석용)
     try:
-        with open(NEWS_COOCCUR_FILE, "w") as f:
-            json.dump(_news_cooccur, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(NEWS_COOCCUR_FILE, _news_cooccur, indent=2)
     except: pass
 
 def get_news_cooccur_peers(code: str) -> list:
@@ -2806,7 +2941,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # ============================================================
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
-SIGNAL_LOG_FILE = "signal_log.json"   # 모든 신호 추적 (신규)
+SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 추적 (신규)
 
 def _is_real_trade(rec: dict) -> bool:
     """
@@ -2893,8 +3028,7 @@ def save_signal_log(stock: dict):
             "actual_exit_date":  "",
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
         }
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
         print(f"⚠️ 신호 저장 오류: {e}")
@@ -2923,8 +3057,7 @@ def save_early_detect(stock: dict):
                 "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
                 "status": "추적중", "pnl_pct": 0, "exit_price": 0, "exit_date": "",
             }
-            with open(EARLY_LOG_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(EARLY_LOG_FILE, data, indent=2)
     except Exception as e:
         print(f"⚠️ EARLY 저장 오류: {e}")
 
@@ -3485,8 +3618,7 @@ def track_signal_results():
                         except: pass
 
         if updated:
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
             # tracker 피드백 즉시 갱신
             load_tracker_feedback()
 
@@ -3738,8 +3870,8 @@ def load_carry_stocks():
 # ============================================================
 # 🧠 자동 조건 조정 엔진
 # ============================================================
-AUTO_TUNE_FILE   = "auto_tune_log.json"   # 조정 이력 저장
-DYNAMIC_PARAMS_FILE = "dynamic_params.json"  # 조정된 파라미터 영구 저장
+AUTO_TUNE_FILE   = os.path.join(DATA_DIR, "auto_tune_log.json")   # 조정 이력 저장
+DYNAMIC_PARAMS_FILE = os.path.join(DATA_DIR, "dynamic_params.json")  # 조정된 파라미터 영구 저장
 MIN_SAMPLES      = 5    # 20→5: 더 빠르게 반응 (적은 샘플로도 조정)
 
 # 동적 조정 변수 (기본값 = 파라미터 원본값)
@@ -3800,8 +3932,7 @@ def _save_dynamic_params():
     → Railway 재시작 후에도 조정값 유지
     """
     try:
-        with open(DYNAMIC_PARAMS_FILE, "w") as f:
-            json.dump(_dynamic, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(DYNAMIC_PARAMS_FILE, _dynamic, indent=2)
     except Exception as e:
         print(f"⚠️ dynamic_params 저장 실패: {e}")
 
@@ -4250,8 +4381,7 @@ def auto_tune(notify: bool = True):
                 "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
                 "samples":  len(completed),
             }
-            with open(AUTO_TUNE_FILE, "w") as f:
-                json.dump(tune_log, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(AUTO_TUNE_FILE, tune_log, indent=2)
 
             if notify:
                 change_text = "\n".join(changes)
@@ -4416,8 +4546,7 @@ def register_entry_watch(s: dict):
                     rec["new_entry"]     = entry
                     rec["pnl_pct"]       = 0.0
                     break
-            with open(SIGNAL_LOG_FILE, "w") as f_w:
-                json.dump(sig_data, f_w, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
         except Exception as e:
             print(f"⚠️ 진입가변경 기록 오류: {e}")
         del _entry_watch[k]
@@ -4461,8 +4590,7 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
                 rec["pnl_pct"]         = 0.0
                 rec["exit_reason"]     = f"진입미달_{reason}"
                 break
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
     except Exception as e:
         print(f"⚠️ 진입미달 기록 오류: {e}")
@@ -7698,8 +7826,7 @@ def _handle_entry_confirm_command(raw: str):
             rec["stop_price"]    = int(rec.get("stop_price",  0) * diff_ratio / 10) * 10
             rec["target_price"]  = int(rec.get("target_price", 0) * diff_ratio / 10) * 10
 
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
 
         entry_p  = actual_price or rec.get("entry_price", 0)
         stop_p   = rec.get("stop_price", 0)
@@ -7760,8 +7887,7 @@ def _handle_skip_command(raw: str):
         data[matched_key]["skip_reason"]   = reason
         data[matched_key]["actual_pnl"]    = None
 
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
 
         theo_pnl = data[matched_key].get("pnl_pct", 0)
         theo_str = f"+{theo_pnl:.1f}%" if theo_pnl >= 0 else f"{theo_pnl:.1f}%"
@@ -7838,8 +7964,7 @@ def _handle_result_command(raw: str):
             rec["actual_pnl"]       = pnl
             rec["actual_exit_date"] = today
             rec["skip_reason"]      = ""
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
 
         # ── ② early_detect_log.json 도 동시 업데이트 (하위 호환) ──
         early_data = {}
@@ -7871,13 +7996,11 @@ def _handle_result_command(raw: str):
                 "exit_reason": "수동입력",
                 "score": 0, "sector_bonus": 0, "sector_theme": "",
             }
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
             matched_name = name_input
 
         if early_matched:
-            with open(EARLY_LOG_FILE, "w") as f:
-                json.dump(early_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(EARLY_LOG_FILE, early_data, indent=2)
 
         display_name = matched_name or name_input
         send(f"{result_emoji} <b>결과 기록 완료</b>\n"
@@ -9409,6 +9532,10 @@ if __name__ == "__main__":
     print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
     print(f"   업데이트: {BOT_DATE}")
     print("="*55)
+
+    # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
+    _migrate_legacy_files()
+    _storage_diagnostics_once()
 
     _load_kr_holidays(datetime.now().year)
 
