@@ -6,13 +6,19 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.2-optimize1
+버전: v37.3-geo1
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.2-optimize1 (2026-03-04)
+v37.3-geo1 (2026-03-04)
+  [지정학] 뉴스 내용(요약/description)까지 반영해 키워드 감지 정확도 개선
+  [지정학] 다중 매체 소스 확장: DW, DefenseNews(Global), 추가 Google News 쿼리 + (옵션)GDELT DOC API
+  [지정학] 섹터 분류 다변화(에너지/정유/가스, 방산/항공우주, 해운/물류, 원전/전력, 곡물/비료, 금/귀금속, 환율/달러, 여행/항공 등)
+  [UI] 하락 예상 섹터 아이콘을 파란색 화살표(🔽)로 변경 (Telegram 색상 제한 → 이모지로 구현)
+
+v37.3-geo1 (2026-03-04)
   [최적화] 신호 저장 시 params_snapshot + feature_snapshot(지표/국면/시간대/NXT) 기록
   [최적화] 결과 확정 시 MFE/MAE/보유기간/라벨 저장 → 튜닝 데이터 품질 상승
   [튜닝] params_snapshot 기반 성능 비교(최근 30일) → 승률/평균/드로우다운 점수로 파라미터 업데이트(완만한 스무딩)
@@ -6320,9 +6326,9 @@ _GEO_KEYWORDS = [
 # 지정학 이벤트 → 관련 섹터 자동 매핑
 # 지정학 섹터 방향 화살표 (화살표만, 텍스트 없음)
 _DIR_DISPLAY = {
-    "상승": "🔺",   # 기본 내장 색상 (주황/빨강 상향삼각)
-    "하락": "🔻",   # 기본 내장 색상 (빨강 하향삼각)
-    "중립": "▶",   # 중립 우향 화살표
+    "상승": "🔺",   # 상향 (기존)
+    "하락": "🔽",   # 하락(파란색) - Telegram은 글자 색상 불가, 이모지로 구현
+    "중립": "▶",   # 중립
 }
 
 # 섹터명 → 관련 종목 매핑
@@ -6483,29 +6489,84 @@ _GEO_SECTOR_MAP = {
 
 _geo_cache: dict = {}  # keyword_hash → {result, ts}
 
-def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
-    """RSS 피드에서 헤드라인 수집"""
+def _strip_html(text: str) -> str:
     try:
-        resp = requests.get(url, timeout=10, headers=_random_ua())
+        # 매우 단순한 HTML 제거 (RSS description에 종종 포함)
+        import re as _re
+        text = _re.sub(r"<[^>]+>", " ", text or "")
+        text = _re.sub(r"\s+", " ", text).strip()
+        return text
+    except Exception:
+        return (text or "").strip()
+
+def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
+    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)"""
+    try:
+        resp = requests.get(url, timeout=12, headers=_random_ua())
         if resp.status_code != 200:
             return []
         # xml 파서 없을 수 있으니 html.parser로 fallback
         try:
-            soup  = BeautifulSoup(resp.content, "xml")
+            soup = BeautifulSoup(resp.text, "xml")
             items = soup.find_all("item")
-            if not items:  # xml 파싱 실패 시 html로 재시도
-                raise ValueError("no items")
-        except:
-            soup  = BeautifulSoup(resp.content, "html.parser")
+        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
             items = soup.find_all("item")
-        items = items[:max_items]
+
         titles = []
-        for i in items:
+        for i in items[:max_items]:
             t = i.find("title")
-            if t:
-                titles.append(t.get_text(strip=True))
+            d = i.find("description")
+            title = _strip_html(t.get_text(strip=True)) if t else ""
+            desc  = _strip_html(d.get_text(strip=True)) if d else ""
+            if not title:
+                continue
+            # 내용도 참고: title — desc (너무 길면 축약)
+            if desc and desc != title:
+                desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                titles.append(f"{title} — {desc}")
+            else:
+                titles.append(title)
         return titles
     except:
+        return []
+def _fetch_gdelt_headlines(max_items: int = 25) -> list:
+    """(옵션) GDELT DOC API에서 지정학/공급망 관련 헤드라인+요약 수집"""
+    try:
+        # GDELT DOC 2.0 API: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
+        base = "https://api.gdeltproject.org/api/v2/doc/doc"
+        q = (
+            '(geopolitics OR war OR missile OR sanctions OR tariff OR "trade war" OR '
+            '"Middle East" OR Iran OR Israel OR Gaza OR Ukraine OR Russia OR "South China Sea" OR '
+            '"North Korea" OR "shipping" OR "Red Sea" OR "Hormuz")'
+        )
+        params = {
+            "query": q,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": str(max_items),
+            # 한국 투자에 유리하게 최근성 강화
+            "sort": "HybridRel",
+        }
+        resp = requests.get(base, params=params, timeout=12, headers=_random_ua())
+        if resp.status_code != 200:
+            return []
+        js = resp.json()
+        arts = js.get("articles") or []
+        out = []
+        for a in arts[:max_items]:
+            title = (a.get("title") or "").strip()
+            se = (a.get("seendate") or "")[:10]
+            src = (a.get("sourceCountry") or a.get("source") or "").strip()
+            sn  = (a.get("snippet") or "").strip()
+            sn  = _strip_html(sn)[:140] + ("…" if len(_strip_html(sn)) > 140 else "")
+            if title:
+                tail = " — " + sn if sn else ""
+                prefix = f"[{src}] " if src else ""
+                datep = f"{se} " if se else ""
+                out.append(f"{datep}{prefix}{title}{tail}")
+        return out
+    except Exception:
         return []
 
 def _fetch_multi_source_headlines() -> dict:
@@ -6519,6 +6580,13 @@ def _fetch_multi_source_headlines() -> dict:
         "Al_Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
         "CNBC":       "https://www.cnbc.com/id/100003114/device/rss/rss.html",
         "Guardian":   "https://www.theguardian.com/world/rss",
+
+        "DW_World":    "https://rss.dw.com/rdf/rss-en-world",
+        "DefenseNews_Global": "https://www.defensenews.com/arc/outboundfeeds/rss/category/global/?outputType=xml",
+        "NPR_World":   "https://feeds.npr.org/1004/rss.xml",
+        "G뉴스_해운":   "https://news.google.com/rss/search?q=shipping+Red+Sea+Hormuz+freight&hl=en&gl=US&ceid=US:en",
+        "G뉴스_원자재": "https://news.google.com/rss/search?q=gold+safe+haven+commodities&hl=en&gl=US&ceid=US:en",
+        "G뉴스_환율":   "https://news.google.com/rss/search?q=dollar+yen+won+fx+geopolitics&hl=en&gl=US&ceid=US:en",
         "G뉴스_지정학": "https://news.google.com/rss/search?q=geopolitics+war+sanctions&hl=en&gl=US&ceid=US:en",
         "G뉴스_에너지": "https://news.google.com/rss/search?q=oil+price+OPEC+energy&hl=en&gl=US&ceid=US:en",
         "G뉴스_무역":   "https://news.google.com/rss/search?q=trade+war+tariff+sanctions&hl=en&gl=US&ceid=US:en",
@@ -6589,14 +6657,26 @@ def _build_fallback_sector_directions(detected_kws: list, sectors: list) -> list
     전쟁/군사 → 방산 상승 / 정유·에너지 상승 / 나머지 하락 기본값.
     """
     # 키워드 패턴으로 이벤트 유형 추론
-    war_kws    = {"전쟁","전투","공습","미사일","폭격","침공","교전","충돌","군사"}
-    oil_kws    = {"이란","OPEC","유가","원유","석유","천연가스","LNG","감산","증산"}
-    trade_kws  = {"제재","관세","무역전쟁","금수","봉쇄","수출통제"}
+    war_kws    = {"전쟁","전투","공습","미사일","폭격","침공","교전","충돌","군사","핵","대피","동원","군비","방공"}
+    oil_kws    = {"이란","OPEC","유가","원유","석유","천연가스","LNG","감산","증산","호르무즈","홍해","수에즈","해협"}
+    trade_kws  = {"제재","관세","무역전쟁","금수","봉쇄","수출통제","블랙리스트","덤핑","규제","칩","반도체규제"}
+    ship_kws   = {"홍해","수에즈","호르무즈","해운","운임","선박","컨테이너","항만","물류","해협","보험료"}
+    fx_kws     = {"달러","환율","원달러","엔화","위안","통화","금리","채권","리스크오프"}
+    metal_kws  = {"금","은","구리","니켈","리튬","원자재","귀금속"}
+    grain_kws  = {"곡물","밀","옥수수","대두","비료","식량","흉작","수출금지"}
+    power_kws  = {"전력","원전","원자력","우라늄","전기요금","가스발전","발전"}
+    cyber_kws  = {"사이버","해킹","랜섬웨어","공격","통신","위성","GPS","전파교란"}
     kw_set     = set(detected_kws)
 
     is_war   = bool(kw_set & war_kws)
     is_oil   = bool(kw_set & oil_kws)
     is_trade = bool(kw_set & trade_kws)
+    is_ship  = bool(kw_set & ship_kws)
+    is_fx    = bool(kw_set & fx_kws)
+    is_metal = bool(kw_set & metal_kws)
+    is_grain = bool(kw_set & grain_kws)
+    is_power = bool(kw_set & power_kws)
+    is_cyber = bool(kw_set & cyber_kws)
 
     # 섹터별 기본 방향 규칙
     SECTOR_RULES = {
@@ -6614,6 +6694,18 @@ def _build_fallback_sector_directions(detected_kws: list, sectors: list) -> list
         "금융·보험": ("하락",  "불확실성 → 투자심리 위축",           -4),
         "철강":      ("하락",  "원자재 수급 불안 + 수요 둔화",       -3),
         "곡물":      ("상승",  "공급망 차질 → 식품 가격 상승",        +5),
+
+        "해운·물류": ("상승",  "해상 리스크/우회운항 → 운임 상승 수혜",    +6) if is_ship else ("중립", "직접 영향 제한적", 0),
+        "물류":      ("상승",  "공급망 차질 → 운임/창고 수요 증가",        +4) if is_ship else ("중립", "직접 영향 제한적", 0),
+        "보험":      ("하락",  "사고/리스크 확대 → 손해율 악화 우려",      -3) if is_ship or is_war else ("중립","제한적",0),
+        "원전·전력": ("상승",  "에너지 안보 이슈 → 원전/전력 투자 확대",    +5) if is_power or is_oil else ("중립", "제한적", 0),
+        "우라늄":    ("상승",  "원전 확대 기대 → 우라늄 수요",            +5) if is_power else ("중립","제한적",0),
+        "금·귀금속": ("상승",  "리스크오프 → 안전자산 선호",              +5) if (is_war or is_fx or is_metal) else ("중립","제한적",0),
+        "달러·환율": ("상승",  "달러 강세/변동성 확대",                    +3) if is_fx else ("중립","제한적",0),
+        "여행":      ("하락",  "불확실성/유가 상승 → 수요 둔화",          -4) if (is_war or is_oil) else ("중립","제한적",0),
+        "통신·위성": ("상승",  "통신/위성 인프라 수요",                    +3) if is_cyber else ("중립","제한적",0),
+        "사이버보안": ("상승",  "사이버 공격 증가 → 보안 수요 확대",       +6) if is_cyber else ("중립","제한적",0),
+
         "건설":      ("중립",  "국내 수요 변화 제한적",               0),
     }
 
