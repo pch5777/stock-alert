@@ -679,6 +679,22 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 _daily_cache = {}  # code → {items, ts}
 _atr_cache   = {}  # code → {atr, date}  하루 1회 갱신
 
+
+
+# ----------------------------
+# 숫자 파싱 안전 처리
+# ----------------------------
+def safe_int(value, default: int = 0) -> int:
+    """KIS/DART 응답의 '', '-', None 같은 값을 안전하게 int로 변환."""
+    try:
+        if value is None:
+            return default
+        s = str(value).replace(",", "").strip()
+        if s in ("", "-", "None", "null", "NULL"):
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 def get_daily_data(code: str, days: int = 60) -> list:
     """일봉 데이터 조회 (캐시 30분)"""
     cached = _daily_cache.get(code)
@@ -2068,8 +2084,8 @@ def get_nxt_investor_trend(code: str) -> dict:
     output = data.get("output", [])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+        "foreign_net":     safe_int(output[0].get("frgn_ntby_qty", 0)),
+        "institution_net": safe_int(output[0].get("orgn_ntby_qty", 0)),
     }
 
 # NXT 데이터 캐시 (종목별 5분 유효)
@@ -2172,9 +2188,9 @@ def get_investor_trend(code: str) -> dict:
     output = data.get("output",[])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
-        "retail_net":      int(output[0].get("prsn_ntby_qty", 0)),  # 개인 순매수
+        "foreign_net":     safe_int(output[0].get("frgn_ntby_qty", 0)),
+        "institution_net": safe_int(output[0].get("orgn_ntby_qty", 0)),
+        "retail_net":      safe_int(output[0].get("prsn_ntby_qty", 0)),  # 개인 순매수
     }
 
 # ============================================================
@@ -4816,7 +4832,7 @@ def analyze(stock: dict) -> dict:
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
-            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
+            _log_error(f"analyze_investor({stock.get('code','?')})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
