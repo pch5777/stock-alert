@@ -1,12 +1,8 @@
-
-# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
-code = ""
-
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.6-meta1
+버전: v37.3-geo1
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -292,6 +288,9 @@ v28.0 (2026-03-01)
   ⑥ 알림 메시지에 보조지표 요약 표시
 
 """
+# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
+code = ""
+
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
