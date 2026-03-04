@@ -5242,6 +5242,58 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
         pass
     return None
 
+# =======================================================
+# Crash guard (Step 1): unhandled exception hook
+# =======================================================
+_CRASH_NOTIFY_COOLDOWN_SEC = int(os.getenv("CRASH_NOTIFY_COOLDOWN_SEC", "1800") or "1800")
+_last_crash_sig: str | None = None
+_last_crash_ts: float = 0.0
+
+def install_excepthook() -> None:
+    """Unhandled 예외를 파일로 저장하고(영구저장), 텔레그램 알림을 쿨다운(기본 30분)으로 제한."""
+    import sys, time, traceback as _tb
+    from pathlib import Path
+
+    def _handler(exc_type, exc, tb):
+        global _last_crash_sig, _last_crash_ts
+        try:
+            # 1) crash log file
+            data_dir = DATA_DIR  # already resolved earlier
+            crash_dir = Path(data_dir) / "crash_logs"
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"crash_{ts}.txt"
+            fpath = crash_dir / fname
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(_tb.format_exc())
+            print(f"🚨 Unhandled exception saved: {fpath}", flush=True)
+
+            # 2) cooldown notify
+            sig = f"{exc_type.__name__}:{str(exc)[:200]}"
+            now = time.time()
+            if (_last_crash_sig != sig) or (now - _last_crash_ts > _CRASH_NOTIFY_COOLDOWN_SEC):
+                _last_crash_sig, _last_crash_ts = sig, now
+                try:
+                    send(
+                        f"🚨 봇 오류 감지\n"
+                        f"- type: <b>{exc_type.__name__}</b>\n"
+                        f"- msg: <code>{str(exc)[:250]}</code>\n"
+                        f"- crash log: <code>{fname}</code>\n"
+                        f"(같은 오류는 {_CRASH_NOTIFY_COOLDOWN_SEC//60}분에 1회만 알림)"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # keep default printing
+        try:
+            sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _handler
+
 def edit_message(message_id: int, text: str, *, reply_markup: dict | None = None) -> bool:
     payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
