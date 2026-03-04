@@ -375,6 +375,16 @@ def supabase_backup_files() -> None:
             except Exception:
                 pass
 
+def _sb_files_snapshot_key():
+    try:
+        existing = []
+        for fn in _SB_KV_FILES:
+            if pathlib.Path(fn).exists():
+                existing.append(fn)
+        supabase_kv_put("files_snapshot", ",".join(existing)[:950])
+    except Exception:
+        return
+
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
