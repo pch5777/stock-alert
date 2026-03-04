@@ -6,11 +6,15 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.5-reminder1
+버전: v37.6-meta1
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+v37.6-meta1 (2026-03-04)
+  [표시] 시작 배너 버전/날짜 파싱 개선(접미사 포함) + Git 커밋 fallback로 unknown 방지
+  [표시] 시작 메시지에 BOT_VERSION_DISPLAY(커밋 short 포함) 사용
 
 v37.3-geo1 (2026-03-04)
   [지정학] 뉴스 내용(요약/description)까지 반영해 키워드 감지 정확도 개선
@@ -330,10 +334,51 @@ def normalize_stock_code(value):
         return s
     return None
 
-_ver_match = _re.search(r"버전:\s*(v[\d.]+)", __doc__ or "")
-BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
-_date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
-BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
+import os
+from datetime import datetime
+# ── 봇 메타(버전/날짜) 자동 표시 ──
+# 1) docstring(파일 상단)에서 파싱 (가장 우선)
+# 2) 없으면 환경변수/커밋정보로 fallback (unknown 방지)
+import re as _re2
+
+def _parse_doc_meta(doc: str):
+    doc = doc or ""
+    # 예: "버전: v37.3-geo1"
+    m_ver = _re2.search(r"버전:\s*(v[0-9][0-9A-Za-z._\-]+)", doc)
+    m_date = _re2.search(r"날짜:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", doc)
+    ver = m_ver.group(1).strip() if m_ver else ""
+    dt  = m_date.group(1).strip() if m_date else ""
+    return ver, dt
+
+def _get_commit_short():
+    # Railway/GitHub 환경에서 흔한 변수들
+    for k in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "COMMIT_SHA", "SOURCE_VERSION", "VERCEL_GIT_COMMIT_SHA"):
+        v = os.getenv(k, "")
+        if v and isinstance(v, str):
+            v = v.strip()
+            if len(v) >= 7:
+                return v[:7]
+    # git CLI fallback (리포지토리가 포함된 런타임에서만 동작)
+    try:
+        import subprocess
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True)
+        out = (out or "").strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    return ""
+
+_doc_ver, _doc_date = _parse_doc_meta(__doc__ or "")
+
+BOT_VERSION = _doc_ver or os.getenv("BOT_VERSION", "") or "unknown"
+# docstring 날짜가 없으면 "오늘"을 기본값으로 (unknown 방지)
+BOT_DATE    = _doc_date or os.getenv("BOT_DATE", "") or datetime.now().strftime("%Y-%m-%d")
+
+# 표시용 빌드 태그(선택): 커밋 short가 있으면 버전에 덧붙임
+_GIT_SHORT = _get_commit_short()
+BOT_VERSION_DISPLAY = f"{BOT_VERSION}+g{_GIT_SHORT}" if (_GIT_SHORT and BOT_VERSION != "unknown") else BOT_VERSION
+
 
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
@@ -10180,7 +10225,7 @@ if __name__ == "__main__":
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
 
     send(
-        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
+        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION_DISPLAY})</b>\n"
         f"📅 {BOT_DATE}\n\n"
         "✅ 한국투자증권 API 연결\n"
         "🔵 NXT(넥스트레이드) 연동 활성\n\n"
