@@ -300,6 +300,31 @@ import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
 
+# --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
+def extract_ai_text(resp_json):
+    """Safely extract analysis text from AI provider response."""
+    try:
+        # Anthropic-style: {"content":[{"text":"..."}]}
+        content = resp_json.get("content")
+        if isinstance(content, list) and content:
+            t = content[0].get("text", "")
+            if t:
+                return str(t).strip()
+    except Exception:
+        pass
+    try:
+        # OpenAI-style: {"choices":[{"message":{"content":"..."}}]}
+        choices = resp_json.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = (choices[0].get("message") or {})
+            t = msg.get("content", "")
+            if t:
+                return str(t).strip()
+    except Exception:
+        pass
+    return ""
+
+
 # .env 파일 자동 로드 (python-dotenv 없어도 직접 파싱)
 def _load_dotenv(path: str = ".env"):
     try:
@@ -6287,7 +6312,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             },
             timeout=15
         )
-        raw  = resp.json()["content"][0]["text"].strip()
+        raw  = extract_ai_text(resp.json())
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
@@ -6657,7 +6682,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = resp.json()["content"][0]["text"].strip()
+        raw  = extract_ai_text(resp.json())
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
