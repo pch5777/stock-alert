@@ -6,11 +6,16 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.1-storage1
+버전: v37.1-storage2
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+
+v37.1-storage2 (2026-03-04)
+  [검증] 부팅 시 /data/stock_alert에 .storage_ok 프로브 파일 생성/갱신(로그로 저장 확정)
+  [보호] dynamic_params.json 없을 때 기본값을 즉시 저장하여 다음 재시작부터 복원 가능
 
 v37.1-storage1 (2026-03-04)  ← 현재
   [보호] STOCK_ALERT_DATA_DIR 기반 영구 저장소(DATA_DIR) 도입 (/data 마운트 대응)
@@ -434,6 +439,14 @@ def _storage_diagnostics_once():
                 f.write(datetime.now().isoformat())
             os.remove(test_path)
             print("   Writable: ✅ OK")
+            # persistent probe file (kept) to prove writes survive redeploys
+            probe_path = os.path.join(DATA_DIR, ".storage_ok")
+            try:
+                with open(probe_path, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().isoformat())
+                print(f"   Probe file: {probe_path} ✅ wrote")
+            except Exception as pe:
+                print(f"   Probe file: ❌ FAIL ({pe})")
         except Exception as e:
             print(f"   Writable: ❌ FAIL ({e})")
         # list key files
@@ -3969,6 +3982,12 @@ def _load_dynamic_params():
               f"atr_stop={_dynamic['atr_stop_mult']})")
     except FileNotFoundError:
         print("  🔧 dynamic_params.json 없음 → 기본값 사용")
+        # 저장 파일이 없으면 기본값을 즉시 저장해 다음 재시작부터 복원되도록 한다
+        try:
+            _save_dynamic_params()
+            print("  💾 dynamic_params.json 기본값 저장 완료")
+        except Exception as se:
+            print(f"  ⚠️ dynamic_params 기본값 저장 실패: {se}")
     except Exception as e:
         print(f"  ⚠️ dynamic_params 복원 실패: {e}")
 
