@@ -3,11 +3,14 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.9-universe3
+버전: v37.10-all5
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+v37.10-all5 (2026-03-05)
+- [ALL] 5개 개선 일괄 적용: (1) 크래시가드+에러로그/1회알림 (2) 레짐피처 저장+리포트 (3) 유니버스 자동확장/축소+다양성 제한 (4) 텔레그램 대시보드(편집 업데이트) (5) 지정학/뉴스 점수보정 통합+소스 자동차단
 
 v37.9-universe3 (2026-03-05)
 - 오버나이트 위험 알림: 20:00~07:55 야간에는 즉시 발송 금지(저장만) → 07:55 워치리스트 요약에 함께 재알림
@@ -32,6 +35,9 @@ v37.8-fixbaseurl2 (2026-03-05)
 """
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
+import sys
+import hashlib
+import traceback
 import re as _re
 
 
@@ -2278,6 +2284,101 @@ def _load_universe_codes() -> list:
     _UNIVERSE_CACHE["codes"] = uniq[: max(UNIVERSE_MAX, 50)]
     return _UNIVERSE_CACHE["codes"]
 
+def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> None:
+    """
+    최근 성과 기반으로 universe.json을 자동 갱신.
+    - 목적: '최적 조건 만들기'에 유리한 종목을 유니버스에 더 많이 포함
+    - 안전장치: 데이터가 부족하면 갱신하지 않음
+    """
+    try:
+        # signal_log 로드
+        log = {}
+        try:
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                log = json.load(f) or {}
+        except Exception:
+            return
+
+        if not isinstance(log, dict) or not log:
+            return
+
+        cutoff = datetime.now() - timedelta(days=days)
+        stats = {}  # code -> {"n":..,"win":..,"avg":..}
+        for k, v in log.items():
+            if not isinstance(v, dict):
+                continue
+            code = v.get("code")
+            if not code:
+                continue
+            # 시간 추정: detected_at 있으면 사용, 없으면 log_key prefix로 날짜 파싱
+            dt = None
+            if isinstance(v.get("detected_at"), str):
+                try:
+                    dt = datetime.fromisoformat(v["detected_at"])
+                except Exception:
+                    dt = None
+            if dt is None and isinstance(v.get("log_key"), str):
+                m = re.search(r"(\d{8})(\d{4})", v["log_key"])
+                if m:
+                    try:
+                        dt = datetime.strptime(m.group(1)+m.group(2), "%Y%m%d%H%M")
+                    except Exception:
+                        dt = None
+            if dt is None:
+                continue
+            if dt < cutoff:
+                continue
+
+            outcome = v.get("outcome")  # "win"/"loss"/"flat" 등
+            ret = v.get("ret_pct")  # 있으면
+            st = stats.setdefault(code, {"n": 0, "win": 0, "sum": 0.0})
+            st["n"] += 1
+            if outcome == "win":
+                st["win"] += 1
+            if isinstance(ret, (int, float)):
+                st["sum"] += float(ret)
+
+        # 최소 샘플 확보
+        if len(stats) < 30:
+            return
+
+        scored = []
+        for code, st in stats.items():
+            n = st["n"]
+            winrate = st["win"] / n if n else 0.0
+            avg = st["sum"] / n if n else 0.0
+            # 간단 점수: winrate 중심 + 수익 보너스
+            score = winrate * 100 + avg
+            scored.append((score, winrate, avg, n, code))
+
+        scored.sort(reverse=True)
+        top_codes = [c for *_rest, c in scored[:max_codes]]
+
+        # carry_stocks 우선 유지
+        carry_codes = []
+        try:
+            if os.path.exists(CARRY_STOCKS_FILE):
+                with open(CARRY_STOCKS_FILE, "r", encoding="utf-8") as f:
+                    j = json.load(f) or {}
+                carry_codes = list((j.get("codes") or j.get("watch") or j.get("carry") or []))
+        except Exception:
+            carry_codes = []
+        merged = []
+        for c in (carry_codes + top_codes):
+            if c and c not in merged:
+                merged.append(c)
+
+        # 너무 적으면 갱신하지 않음
+        if len(merged) < 50:
+            return
+
+        _atomic_write_json(UNIVERSE_FILE, {"codes": merged[:max_codes]})
+        # cache reset
+        _UNIVERSE_CACHE["ts"] = 0.0
+        print(f"🧠 universe.json 자동 갱신: {len(merged[:max_codes])}종목 (최근 {days}일 성과 기반)")
+    except Exception as e:
+        _log_error("update_universe_from_performance", e)
+
 def _rank_from_universe() -> list:
     now = time.time()
     if now - _UNIVERSE_RANK_CACHE["ts"] < UNIVERSE_RANK_TTL_SEC and _UNIVERSE_RANK_CACHE["items"]:
@@ -2307,6 +2408,23 @@ def _rank_from_universe() -> list:
 
     items.sort(key=lambda x: (x.get("change_rate",0), x.get("volume_ratio",0), x.get("price",0)), reverse=True)
     items = items[:30]
+
+    # [v37.10-all5] 다양성 제한(테마/섹터 쏠림 완화)
+    max_per_theme = int(os.getenv("UNIVERSE_MAX_PER_THEME", "6") or "6")
+    if max_per_theme > 0:
+        bucket = {}
+        diversified = []
+        for it in items:
+            key = it.get("theme") or it.get("sector") or ""
+            if not key:
+                diversified.append(it)
+                continue
+            cnt = bucket.get(key, 0)
+            if cnt >= max_per_theme:
+                continue
+            bucket[key] = cnt + 1
+            diversified.append(it)
+        items = diversified[:30]
 
     _UNIVERSE_RANK_CACHE["ts"] = now
     _UNIVERSE_RANK_CACHE["items"] = items
@@ -2997,6 +3115,12 @@ def get_theme_sector_stocks(code: str) -> tuple:
 
 def calc_sector_momentum(code: str, name: str) -> dict:
     theme_name, peers, peers_all = get_theme_sector_stocks(code)
+    # [v37.10-all5] 지정학/뉴스 섹터 바이어스(점수 보정)
+    geo_bias = 0
+    try:
+        geo_bias = int(GEO_SECTOR_BIAS.get(theme_name, 0) or 0)
+    except Exception:
+        geo_bias = 0
     if not peers:
         return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
     results = []
@@ -3050,6 +3174,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
         src = r.get("source","업종코드")
         sources.setdefault(src, []).append(r["name"])
 
+    bonus = int(bonus + geo_bias)
     return {"bonus":bonus,"theme":theme_name,"summary":summary,
             "rising":rising,"flat":flat,"detail":results,"sources":sources}
 
@@ -3305,6 +3430,9 @@ def save_signal_log(stock: dict):
             "signal_type":  sig_type,
             "score":        stock.get("score", 0),
             "grade":        stock.get("grade", "B"),
+            "market_regime": MARKET_REGIME.get("label","unknown"),
+            "market_regime_det": MARKET_REGIME.get("details",{}),
+            "geo_sector_bias": GEO_SECTOR_BIAS,
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "detect_date":  datetime.now().strftime("%Y%m%d"),
@@ -5084,11 +5212,112 @@ def send_with_chart_buttons(text: str, code: str, name: str):
     except Exception as e:
         print(f"⚠️ 텔레그램 오류: {e}")
 
-def send(text: str):
+def _tg_request(method: str, payload: dict, timeout: int = 10) -> dict | None:
+    """Telegram Bot API 요청. 성공 시 response json 반환, 실패 시 None."""
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                      json={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML"},timeout=10)
-    except Exception as e: print(f"⚠️ 텔레그램 오류: {e}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+            json=payload,
+            timeout=timeout,
+        )
+        # Telegram은 실패 시에도 JSON을 주는 경우가 많음
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception as e:
+        print(f"⚠️ 텔레그램 오류: {e}")
+        return None
+
+def send(text: str, *, reply_markup: dict | None = None) -> int | None:
+    """메시지 전송. 성공 시 message_id 반환."""
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = _tg_request("sendMessage", payload)
+    try:
+        if res and res.get("ok") and "result" in res:
+            return res["result"].get("message_id")
+    except Exception:
+        pass
+    return None
+
+def edit_message(message_id: int, text: str, *, reply_markup: dict | None = None) -> bool:
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    res = _tg_request("editMessageText", payload)
+    return bool(res and res.get("ok"))
+
+def _load_dashboard_state() -> dict:
+    try:
+        with open(DASHBOARD_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_dashboard_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(DASHBOARD_STATE_FILE), exist_ok=True)
+        _atomic_write_json(DASHBOARD_STATE_FILE, state)
+    except Exception:
+        pass
+
+def update_dashboard(force: bool = False) -> None:
+    """대시보드 메시지(1개)를 편집 업데이트해서 메시지량 감소."""
+    global _LAST_DASHBOARD_TS
+    now = time.time()
+    if (not force) and (now - _LAST_DASHBOARD_TS) < DASHBOARD_UPDATE_EVERY_SEC:
+        return
+    _LAST_DASHBOARD_TS = now
+
+    tracked_n = 0
+    try:
+        tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
+    except Exception:
+        tracked_n = 0
+
+    regime = MARKET_REGIME.get("label", "unknown")
+    det = MARKET_REGIME.get("details", {}) or {}
+    det_txt = ""
+    try:
+        fut = det.get("nasdaq_fut_pct")
+        vix = det.get("vix")
+        dxy = det.get("dxy")
+        if fut is not None:
+            det_txt = f" (FUT {float(fut):+.1f}% / VIX {vix} / DXY {dxy})"
+    except Exception:
+        det_txt = ""
+
+    perf = ""
+    try:
+        perf = get_today_performance_summary()  # 있으면 사용
+    except Exception:
+        perf = ""
+
+    text = (
+        "📌 <b>운영 대시보드</b>\n"
+        f"• 레짐: <b>{regime}</b>{det_txt}\n"
+        f"• 진입 감시: <b>{tracked_n}</b> 종목\n"
+    )
+    if perf:
+        text += f"• 오늘 성과: {perf}\n"
+    text += f"• 업데이트: {datetime.now().strftime('%m-%d %H:%M')}\n"
+
+    state = _load_dashboard_state()
+    mid = state.get("message_id")
+    if isinstance(mid, int):
+        ok = edit_message(mid, text)
+        if not ok:
+            mid2 = send(text)
+            if mid2:
+                state["message_id"] = mid2
+                _save_dashboard_state(state)
+    else:
+        mid2 = send(text)
+        if mid2:
+            state["message_id"] = mid2
+            _save_dashboard_state(state)
 
 def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
                   code: str = "", name: str = ""):
@@ -6952,6 +7181,23 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             "ts":                time.time(),
         }
         _geo_cache[cache_key] = result
+        # [v37.10-all5] 섹터 방향을 점수 보정용 전역 상태로 반영
+        try:
+            bias = {}
+            for sd in (sec_dirs or []):
+                sec = sd.get("sector")
+                d = sd.get("direction")
+                if not sec or not d:
+                    continue
+                if d in ("up","bull","positive","상승"):
+                    bias[sec] = int(sd.get("score_adj", 3) or 3)
+                elif d in ("down","bear","negative","하락"):
+                    bias[sec] = int(sd.get("score_adj", -3) or -3)
+            # score_adj가 없는 섹터는 기본 +/-2
+            GEO_SECTOR_BIAS.clear()
+            GEO_SECTOR_BIAS.update(bias)
+        except Exception:
+            pass
         print(f"  🌍 지정학 분석: {result['uncertainty']} 불확실성 / 섹터: {result['sectors']}")
         return result
 
@@ -8833,6 +9079,8 @@ def _send_stats():
 # 장 마감
 # ============================================================
 def on_market_close():
+    # [v37.10-all5] 성과 기반 유니버스 자동 갱신(장 마감)
+    update_universe_from_performance(days=int(os.getenv('UNIVERSE_PERF_DAYS','30') or '30'), max_codes=int(os.getenv('UNIVERSE_PERF_MAX','300') or '300'))
     # 재진입 감시 — KRX only 종목만 초기화, NXT 상장 종목은 20:00까지 유지
     nxt_remain = {c: w for c, w in _reentry_watch.items() if is_nxt_listed(c)}
     krx_only   = {c: w for c, w in _reentry_watch.items() if not is_nxt_listed(c)}
@@ -9640,6 +9888,7 @@ def get_us_market_signals() -> dict:
             "dxy": dxy, "us_regime": us_regime, "gap_signal": gap_signal,
             "score_adj": score_adj, "summary": summary
         })
+        MARKET_REGIME.update(compute_market_regime(nasdaq_fut_pct, vix, dxy))
         _us_cache.update(result)
         print(f"  🌐 미국 시장: {summary}")
 
@@ -9993,6 +10242,9 @@ if __name__ == "__main__":
     print(f"   업데이트: {BOT_DATE}")
     print("="*55)
 
+    install_excepthook()
+    update_dashboard(force=True)
+
     # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
     _migrate_legacy_files()
     _storage_diagnostics_once()
@@ -10060,6 +10312,7 @@ if __name__ == "__main__":
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:55").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("08:50").do(send_premarket_briefing)
+    schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
     for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
