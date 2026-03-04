@@ -1,16 +1,22 @@
+
+# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
+code = ""
+
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.3-geo1
+버전: v37.6-netfix1
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.6-meta1 (2026-03-04)
-  [표시] 시작 배너 버전/날짜 파싱 개선(접미사 포함) + Git 커밋 fallback로 unknown 방지
-  [표시] 시작 메시지에 BOT_VERSION_DISPLAY(커밋 short 포함) 사용
+v37.6-netfix1 (2026-03-04)
+  [네트워크] 배포/재시작 직후 KIS 연결 끊김(RemoteDisconnected) 자동 복구 강화
+    - requests.Session에 Retry 어댑터 장착(연결/읽기/상태코드 재시도)
+    - get_token/_safe_get 재시도 횟수/백오프/지터 강화 + 세션 리셋
+    - 부팅 직후 KIS 호출 워밍업 지터(짧은 랜덤 지연)
 
 v37.3-geo1 (2026-03-04)
   [지정학] 뉴스 내용(요약/description)까지 반영해 키워드 감지 정확도 개선
@@ -288,9 +294,6 @@ v28.0 (2026-03-01)
   ⑥ 알림 메시지에 보조지표 요약 표시
 
 """
-# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
-code = ""
-
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
@@ -333,54 +336,15 @@ def normalize_stock_code(value):
         return s
     return None
 
-import os
-from datetime import datetime
-# ── 봇 메타(버전/날짜) 자동 표시 ──
-# 1) docstring(파일 상단)에서 파싱 (가장 우선)
-# 2) 없으면 환경변수/커밋정보로 fallback (unknown 방지)
-import re as _re2
-
-def _parse_doc_meta(doc: str):
-    doc = doc or ""
-    # 예: "버전: v37.3-geo1"
-    m_ver = _re2.search(r"버전:\s*(v[0-9][0-9A-Za-z._\-]+)", doc)
-    m_date = _re2.search(r"날짜:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", doc)
-    ver = m_ver.group(1).strip() if m_ver else ""
-    dt  = m_date.group(1).strip() if m_date else ""
-    return ver, dt
-
-def _get_commit_short():
-    # Railway/GitHub 환경에서 흔한 변수들
-    for k in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "COMMIT_SHA", "SOURCE_VERSION", "VERCEL_GIT_COMMIT_SHA"):
-        v = os.getenv(k, "")
-        if v and isinstance(v, str):
-            v = v.strip()
-            if len(v) >= 7:
-                return v[:7]
-    # git CLI fallback (리포지토리가 포함된 런타임에서만 동작)
-    try:
-        import subprocess
-        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True)
-        out = (out or "").strip()
-        if out:
-            return out
-    except Exception:
-        pass
-    return ""
-
-_doc_ver, _doc_date = _parse_doc_meta(__doc__ or "")
-
-BOT_VERSION = _doc_ver or os.getenv("BOT_VERSION", "") or "unknown"
-# docstring 날짜가 없으면 "오늘"을 기본값으로 (unknown 방지)
-BOT_DATE    = _doc_date or os.getenv("BOT_DATE", "") or datetime.now().strftime("%Y-%m-%d")
-
-# 표시용 빌드 태그(선택): 커밋 short가 있으면 버전에 덧붙임
-_GIT_SHORT = _get_commit_short()
-BOT_VERSION_DISPLAY = f"{BOT_VERSION}+g{_GIT_SHORT}" if (_GIT_SHORT and BOT_VERSION != "unknown") else BOT_VERSION
-
+_ver_match = _re.search(r"버전:\s*(v[\d.]+)", __doc__ or "")
+BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
+_date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
+BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
+import time
+import random
 from bs4 import BeautifulSoup
 
 # ============================================================
@@ -693,8 +657,45 @@ def _random_ua() -> dict:
 # ============================================================
 _access_token       = None
 _token_expires      = 0
-_session            = requests.Session()
-_session.headers.update({"User-Agent": "Mozilla/5.0"})
+# --- HTTP Session Resilience (deploy cold-start / transient disconnect) ---
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:  # urllib3 might not be available in some runtimes
+    Retry = None
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    if Retry is not None:
+        retry = Retry(
+            total=int(os.environ.get("KIS_HTTP_RETRIES", "5")),
+            connect=5, read=5, status=5,
+            backoff_factor=float(os.environ.get("KIS_HTTP_BACKOFF", "0.9")),
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+    return s
+
+def _reset_session(reason: str = "") -> None:
+    global _session
+    try:
+        _session.close()
+    except Exception:
+        pass
+    _session = _make_session()
+    if reason:
+        try:
+            print(f"  🔄 HTTP 세션 리셋: {reason}")
+        except Exception:
+            pass
+
+_session            = _make_session()
 
 # ⑤ 중앙 에러 로거 (중요 기능 오류 조용히 묻히지 않게)
 _error_counts: dict = {}
@@ -929,25 +930,53 @@ def is_strict_time() -> bool:
 # ============================================================
 # 🔐 KIS API
 # ============================================================
-def get_token(retry: int = 3) -> str:
+def get_token(retry: int = None) -> str:
+    """Get KIS access token with robust retry/backoff.
+
+    Deploy/restart 직후에는 네트워크가 불안정하거나 원격이 연결을 끊는(RemoteDisconnected) 경우가 있어
+    '짧은 지터 + 지수 백오프'로 흡수한다.
+    """
     global _access_token, _token_expires
     if _access_token and time.time() < _token_expires:
         return _access_token
+
+    if retry is None:
+        retry = int(os.environ.get("KIS_TOKEN_RETRIES", "6"))
+
+    last_err = None
     for attempt in range(retry):
         try:
-            resp = _session.post(f"{KIS_BASE_URL}/oauth2/tokenP",
-                json={"grant_type":"client_credentials","appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET},
-                timeout=15)
+            # small jitter to avoid thundering herd right after deploy
+            if attempt == 0:
+                time.sleep(float(os.environ.get("KIS_STARTUP_JITTER", "1.5")) * random.random())
+
+            resp = _session.post(
+                f"{KIS_BASE_URL}/oauth2/tokenP",
+                json={
+                    "grant_type": "client_credentials",
+                    "appkey": KIS_APP_KEY,
+                    "appsecret": KIS_APP_SECRET,
+                },
+                timeout=15,
+            )
             resp.raise_for_status()
             d = resp.json()
-            _access_token  = d["access_token"]
+            _access_token = d["access_token"]
             _token_expires = time.time() + int(d.get("expires_in", 86400)) - 300
             print(f"✅ KIS 토큰 발급 ({datetime.now().strftime('%H:%M:%S')})")
             return _access_token
         except Exception as e:
-            _log_error(f"get_token(attempt={attempt+1})", e, critical=attempt==2); time.sleep(5*(attempt+1))
-    raise Exception("❌ KIS 토큰 최종 실패")
+            last_err = e
+            # broken keep-alive pool recovery
+            if attempt in (1, 3):
+                _reset_session(reason=f"token retry {attempt+1}")
+            _log_error(f"get_token(attempt={attempt+1})", e, critical=False)
+            # exponential backoff with jitter
+            backoff = min(25.0, (1.2 * (2 ** attempt))) * (0.6 + random.random() * 0.8)
+            time.sleep(backoff)
 
+    _log_error("get_token(final)", last_err or Exception("token fail"), critical=True)
+    raise Exception("❌ KIS 토큰 최종 실패")
 def _headers(tr_id: str) -> dict:
     return {"Content-Type":"application/json; charset=utf-8",
             "Authorization":f"Bearer {get_token()}",
@@ -956,29 +985,48 @@ def _headers(tr_id: str) -> dict:
 
 
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises."""
+    """KIS GET with robust retry/backoff. Never raises.
+
+    - 배포 직후/간헐적 RemoteDisconnected는 재시도로 대부분 회복됨
+    - 403(토큰) 발생 시 토큰 리셋 후 1회 즉시 재시도
+    """
     last_err = None
-    for attempt in range(3):
+    retries = int(os.environ.get("KIS_GET_RETRIES", "6"))
+    base = float(os.environ.get("KIS_GET_BACKOFF", "0.9"))
+
+    for attempt in range(retries):
         try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+
+            # 토큰/권한 이슈: 토큰 재발급 후 즉시 재시도 1회
             if resp.status_code == 403:
                 global _access_token
                 _access_token = None
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+
             if resp.status_code == 200:
                 return safe_json_response(resp)
+
+            # 429/5xx는 어댑터가 재시도했을 수 있지만, 여기서도 한 번 더 흡수
+            last_err = Exception(f"HTTP {resp.status_code}")
         except Exception as e:
             last_err = e
+            # broken keep-alive / connection pool issue recovery
+            if attempt in (1, 3):
+                _reset_session(reason=f"{tr_id} retry {attempt+1}")
+
+        # exponential backoff with jitter
+        backoff = min(25.0, base * (2 ** attempt)) * (0.6 + random.random() * 0.8)
         try:
-            time.sleep(0.8 * (2 ** attempt))
+            time.sleep(backoff)
         except Exception:
             pass
+
     try:
         print(f"⚠️ API 오류 ({tr_id}): {last_err}")
     except Exception:
         pass
     return {}
-
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
 # ============================================================
@@ -10188,6 +10236,13 @@ if __name__ == "__main__":
 
     _load_kr_holidays(datetime.now().year)
 
+    # ── Deploy/재시작 직후 네트워크 워밍업 지터(첫 호출 RemoteDisconnected 완화) ──
+    try:
+        warm = float(os.environ.get("KIS_STARTUP_WARMUP", "2.5"))
+        time.sleep(warm * (0.5 + random.random()))
+    except Exception:
+        pass
+
     # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
     if is_holiday():
         print(f"📅 오늘은 공휴일/주말 — 대기 모드로 실행")
@@ -10224,7 +10279,7 @@ if __name__ == "__main__":
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
 
     send(
-        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION_DISPLAY})</b>\n"
+        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
         f"📅 {BOT_DATE}\n\n"
         "✅ 한국투자증권 API 연결\n"
         "🔵 NXT(넥스트레이드) 연동 활성\n\n"
