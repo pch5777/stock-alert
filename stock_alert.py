@@ -6,12 +6,17 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.1-storage2
+버전: v37.2-optimize1
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+v37.2-optimize1 (2026-03-04)
+  [최적화] 신호 저장 시 params_snapshot + feature_snapshot(지표/국면/시간대/NXT) 기록
+  [최적화] 결과 확정 시 MFE/MAE/보유기간/라벨 저장 → 튜닝 데이터 품질 상승
+  [튜닝] params_snapshot 기반 성능 비교(최근 30일) → 승률/평균/드로우다운 점수로 파라미터 업데이트(완만한 스무딩)
+  [운영] signal_log.json 최대 50000건 유지(오래된 기록 자동 정리)
 
 v37.1-storage2 (2026-03-04)
   [검증] 부팅 시 /data/stock_alert에 .storage_ok 프로브 파일 생성/갱신(로그로 저장 확정)
@@ -2956,6 +2961,173 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # ============================================================
 SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 추적 (신규)
 
+# ============================================================
+# 🎯 최적조건 만들기용 데이터/튜닝 설정
+#   - signal_log는 최대 N건만 유지 (너무 커지면 튜닝 품질/속도 저하)
+#   - params_snapshot(신호 당시 파라미터) + feature_snapshot(상황/지표) 저장
+#   - params_snapshot 성과 비교로 점진적(auto) 튜닝
+# ============================================================
+SIGNAL_LOG_MAX_RECORDS = int(os.getenv("SIGNAL_LOG_MAX_RECORDS", "50000") or "50000")
+
+TUNE_LOOKBACK_DAYS = int(os.getenv("TUNE_LOOKBACK_DAYS", "30") or "30")
+TUNE_MIN_SAMPLES   = int(os.getenv("TUNE_MIN_SAMPLES", "30") or "30")
+TUNE_ALPHA         = float(os.getenv("TUNE_ALPHA", "0.35") or "0.35")  # 0~1, 클수록 빠르게 반영
+
+def _safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _prune_signal_log(data: dict) -> dict:
+    """signal_log.json이 너무 커지면 오래된 기록부터 정리."""
+    try:
+        if not isinstance(data, dict):
+            return data
+        if len(data) <= SIGNAL_LOG_MAX_RECORDS:
+            return data
+        # detect_date+time → 정렬 키(없으면 key 자체)
+        def _k(item):
+            k, v = item
+            d = str(v.get("detect_date", ""))
+            t = str(v.get("detect_time", ""))
+            if len(d) == 8 and len(t) >= 5:
+                return d + t.replace(":", "")[:6]
+            return k
+        items = sorted(data.items(), key=_k)
+        keep = dict(items[-SIGNAL_LOG_MAX_RECORDS:])
+        return keep
+    except Exception:
+        return data
+
+def _get_params_snapshot() -> dict:
+    """신호 당시 '조건'을 최소 핵심만 스냅샷(최적화용)."""
+    try:
+        # 너무 많은 키를 저장하면 튜닝 데이터가 지저분해짐 → 핵심만
+        keys = [
+            "min_score_normal", "min_score_strict",
+            "atr_stop_mult", "atr_target_mult",
+            "early_price_min", "early_volume_min",
+            "mid_surge_min_pct", "mid_pullback_min", "mid_pullback_max",
+            "themed_score_bonus",
+            # 가중치(기여도 튜닝용)
+            "feat_w_rsi", "feat_w_ma", "feat_w_bb", "feat_w_sector", "feat_w_nxt", "feat_w_geo",
+        ]
+        snap = {k: _dynamic.get(k) for k in keys if k in _dynamic}
+        snap["_v"] = BOT_VERSION
+        return snap
+    except Exception:
+        return {"_v": BOT_VERSION}
+
+def _tune_score(records: list) -> float:
+    """
+    파라미터 후보의 성능 점수.
+    - 평균 수익률(+)을 중심으로, 손실/드로우다운(MAE)을 페널티로 반영.
+    """
+    if not records:
+        return -1e9
+    pnls = [_safe_float(r.get("pnl_pct"), 0.0) for r in records]
+    maes = [_safe_float(r.get("mae_pct"), 0.0) for r in records]  # 음수(손실폭)
+    # MAE는 보통 음수이므로 abs로 페널티
+    avg = sum(pnls) / len(pnls)
+    win = sum(1 for p in pnls if p > 0)
+    wr  = win / len(pnls)
+    avg_abs_mae = (sum(abs(x) for x in maes) / len(maes)) if maes else 0.0
+    # 점수: 평균수익 + (승률-0.5)*2 보너스 - MAE 페널티
+    return avg + (wr - 0.5) * 2.0 - avg_abs_mae * 0.35
+
+def _select_best_params(completed: list) -> dict:
+    """최근 lookback 구간에서 params_snapshot별 성능 비교 → best snapshot 반환."""
+    if not completed:
+        return {}
+    # lookback filter
+    try:
+        cutoff = datetime.now() - timedelta(days=TUNE_LOOKBACK_DAYS)
+        filtered = []
+        for r in completed:
+            d = r.get("exit_date") or r.get("detect_date")
+            t = r.get("exit_time") or r.get("detect_time") or "00:00:00"
+            if d and len(str(d)) == 8:
+                try:
+                    dt = datetime.strptime(str(d) + str(t)[:8], "%Y%m%d%H:%M:%S")
+                except Exception:
+                    try:
+                        dt = datetime.strptime(str(d), "%Y%m%d")
+                    except Exception:
+                        dt = None
+                if dt and dt >= cutoff:
+                    filtered.append(r)
+            else:
+                filtered.append(r)
+    except Exception:
+        filtered = completed
+
+    groups = {}
+    for r in filtered:
+        snap = r.get("params_snapshot")
+        if not isinstance(snap, dict):
+            continue
+        # signature (핵심 값만)
+        sig = (
+            snap.get("min_score_normal"),
+            snap.get("min_score_strict"),
+            snap.get("atr_stop_mult"),
+            snap.get("atr_target_mult"),
+        )
+        groups.setdefault(sig, []).append(r)
+
+    # 충분한 샘플만
+    scored = []
+    for sig, recs in groups.items():
+        if len(recs) < TUNE_MIN_SAMPLES:
+            continue
+        scored.append((_tune_score(recs), sig, recs))
+
+    if not scored:
+        return {}
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_sig, best_recs = scored[0]
+    # best snapshot은 대표 1개를 사용
+    best_snap = dict(best_recs[0].get("params_snapshot", {}))
+    best_snap["_score"] = round(best_score, 4)
+    best_snap["_n"] = len(best_recs)
+    return best_snap
+
+def _apply_result_labels(rec: dict):
+    """추적 결과를 최적화/튜닝에 쓰기 좋게 라벨링(MFE/MAE/보유기간 등)."""
+    try:
+        entry = _safe_float(rec.get("entry_price"), 0.0)
+        if entry <= 0:
+            return
+        max_p = _safe_float(rec.get("max_price"), entry)
+        min_p = _safe_float(rec.get("min_price"), entry)
+        rec["mfe_pct"] = round((max_p - entry) / entry * 100, 2)
+        rec["mae_pct"] = round((min_p - entry) / entry * 100, 2)  # 보통 음수
+        # 보유 기간(분) — detect_date/time 또는 log_key 기반
+        try:
+            d = str(rec.get("detect_date", ""))
+            t = str(rec.get("detect_time", "00:00:00"))
+            dt0 = datetime.strptime(d + t[:8], "%Y%m%d%H:%M:%S")
+            d2 = str(rec.get("exit_date", ""))
+            t2 = str(rec.get("exit_time", "00:00:00"))
+            dt1 = datetime.strptime(d2 + t2[:8], "%Y%m%d%H:%M:%S")
+            rec["hold_minutes"] = int((dt1 - dt0).total_seconds() // 60)
+        except Exception:
+            pass
+        pnl = _safe_float(rec.get("pnl_pct"), 0.0)
+        if pnl > 0:
+            rec["outcome"] = "win"
+        elif pnl < 0:
+            rec["outcome"] = "loss"
+        else:
+            rec["outcome"] = "flat"
+    except Exception:
+        pass
+
+
+
 def _is_real_trade(rec: dict) -> bool:
     """
     실제 진입한 거래만 통계에 포함할지 판단.
@@ -3006,6 +3178,26 @@ def save_signal_log(stock: dict):
             "geo_sector_adj":   locals().get("_geo_adj_applied", 0),
         }
 
+
+        # ── 최적화용 스냅샷 (신호 당시 조건/상황) ──
+        params_snapshot = _get_params_snapshot()
+        feature_snapshot = {
+            "regime": stock.get("regime", "normal"),
+            "nxt_open": bool(is_nxt_open()),
+            "krx_open": bool(is_market_open()),
+            "strict_time": bool(is_strict_time()),
+            "timeslot": _get_timeslot(datetime.now().strftime("%H:%M:%S")),
+            "price": stock.get("price"),
+            "change_rate": stock.get("change_rate", 0),
+            "volume_ratio": stock.get("volume_ratio", 0),
+            "rsi": indic.get("rsi", 50),
+            "ma_aligned": indic.get("ma", {}).get("aligned"),
+            "bb_pct_b": indic.get("bb", {}).get("pct_b", 0.5),
+            "bb_breakout": indic.get("bb", {}).get("breakout", False),
+            "sector_theme": stock.get("sector_info", {}).get("theme", ""),
+            "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
+        }
+
         data[log_key] = {
             "log_key":      log_key,
             "code":         code,
@@ -3026,6 +3218,8 @@ def save_signal_log(stock: dict):
             "target_price": stock.get("target_price", 0),
             "atr_used":     stock.get("atr_used", False),
             "feature_flags": feature_flags,
+            "params_snapshot":   params_snapshot,
+            "feature_snapshot":  feature_snapshot,
             # ── 이론 추적 결과 (봇 자동 계산 → auto_tune 학습용) ──
             "status":            "추적중",   # 봇 추적 상태
             "exit_price":        0,
@@ -3041,6 +3235,7 @@ def save_signal_log(stock: dict):
             "actual_exit_date":  "",
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
         }
+        data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
@@ -3545,6 +3740,7 @@ def track_signal_results():
                     rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
                     rec["pnl_pct"]     = pnl_pct
                     rec["exit_reason"] = exit_reason
+                    _apply_result_labels(rec)
                     _tracking_notified.add(log_key)
                     updated = True
                     _send_tracking_result(rec)
@@ -3631,6 +3827,7 @@ def track_signal_results():
                         except: pass
 
         if updated:
+            data = _prune_signal_log(data)
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
             # tracker 피드백 즉시 갱신
             load_tracker_feedback()
@@ -4111,6 +4308,51 @@ def auto_tune(notify: bool = True):
             return
 
         changes = []
+
+        # ── 0) params_snapshot 기반 성능 튜닝 (최적조건 만들기 핵심) ──
+        best = _select_best_params(completed)
+        if best:
+            try:
+                # 현재값
+                cur_min_n = int(_dynamic.get("min_score_normal", 60))
+                cur_min_s = int(_dynamic.get("min_score_strict", 70))
+                cur_atr_s = _safe_float(_dynamic.get("atr_stop_mult", 1.5), 1.5)
+                cur_atr_t = _safe_float(_dynamic.get("atr_target_mult", 3.0), 3.0)
+
+                # 후보값
+                cand_min_n = int(best.get("min_score_normal", cur_min_n))
+                cand_min_s = int(best.get("min_score_strict", cur_min_s))
+                cand_atr_s = _safe_float(best.get("atr_stop_mult", cur_atr_s), cur_atr_s)
+                cand_atr_t = _safe_float(best.get("atr_target_mult", cur_atr_t), cur_atr_t)
+
+                # 스무딩(완만하게)
+                new_min_n = int(round(cur_min_n * (1 - TUNE_ALPHA) + cand_min_n * TUNE_ALPHA))
+                new_min_s = int(round(cur_min_s * (1 - TUNE_ALPHA) + cand_min_s * TUNE_ALPHA))
+                new_atr_s = round(cur_atr_s * (1 - TUNE_ALPHA) + cand_atr_s * TUNE_ALPHA, 2)
+                new_atr_t = round(cur_atr_t * (1 - TUNE_ALPHA) + cand_atr_t * TUNE_ALPHA, 2)
+
+                # 가드레일
+                new_min_n = max(45, min(new_min_n, 80))
+                new_min_s = max(55, min(new_min_s, 90))
+                new_atr_s = max(0.8, min(new_atr_s, 3.5))
+                new_atr_t = max(1.5, min(new_atr_t, 6.0))
+
+                # 반영
+                if (new_min_n, new_min_s, new_atr_s, new_atr_t) != (cur_min_n, cur_min_s, cur_atr_s, cur_atr_t):
+                    _dynamic["min_score_normal"] = new_min_n
+                    _dynamic["min_score_strict"] = new_min_s
+                    _dynamic["atr_stop_mult"]    = new_atr_s
+                    _dynamic["atr_target_mult"]  = new_atr_t
+
+                    changes.append(
+                        f"🧠 <b>성능 기반 튜닝</b> (최근 {TUNE_LOOKBACK_DAYS}일 / n={best.get('_n','?')})\n"
+                        f"- score {best.get('_score','?')} 기준 best params로 스무딩 적용\n"
+                        f"- min_score: {cur_min_n}/{cur_min_s} → {new_min_n}/{new_min_s}\n"
+                        f"- atr_stop/target: {cur_atr_s} / {cur_atr_t} → {new_atr_s} / {new_atr_t}"
+                    )
+            except Exception as te:
+                _log_error("auto_tune.params_snapshot", te)
+
 
         # ── 신호 유형별 승률 계산 ──
         by_type = {}
