@@ -3,13 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.8-fixbaseurl2
+버전: v37.8-fixbaseurl3
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.8-fixbaseurl2 (2026-03-05)  ← 현재
+v37.8-fixbaseurl3 (2026-03-05)  ← 현재
+  [Fix] KIS API 오류 시 응답 진단 강화(url/status/content-type/body snippet) + JSON 에러 필드 파싱
+  [Keep] KIS_BASE_URL 환경변수 우선 + 실전 기본값(9443) 유지, VTS 자동 스왑 차단
+
+v37.8-fixbaseurl2 (2026-03-05)
   [Fix] 모듈 도큐스트링이 파일 첫 문장이 되도록 정리 → 버전/날짜 파싱 unknown 방지
   [Keep] KIS_BASE_URL 환경변수 우선 + 실전 기본값(9443) 유지, VTS 자동 스왑 차단
 
@@ -625,25 +629,66 @@ def _headers(tr_id: str) -> dict:
 
 
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises."""
-    last_err = None
+    """KIS GET with retry/backoff. Never raises.
+
+    On failure, prints a compact diagnostic (url/status/content-type/body-snippet).
+    """
+    last_exc = None
+    last_status = None
+    last_ct = ""
+    last_body_snip = ""
+    last_url = url
+
     for attempt in range(3):
         try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 403:
+            last_status = getattr(resp, "status_code", None)
+            last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
+            last_url = getattr(resp, "url", url) or url
+
+            # If token expired, refresh once then retry.
+            if last_status == 403:
                 global _access_token
                 _access_token = None
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 200:
+                last_status = getattr(resp, "status_code", None)
+                last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
+                last_url = getattr(resp, "url", url) or url
+
+            if last_status == 200:
                 return safe_json_response(resp)
+
+            # Capture a small, safe snippet for debugging.
+            try:
+                raw = (getattr(resp, "text", "") or "").strip()
+                raw = " ".join(raw.split())  # collapse whitespace
+                last_body_snip = raw[:200]
+            except Exception:
+                last_body_snip = ""
+
+            # If server returned JSON error, prefer its fields.
+            j = safe_json_response(resp)
+            if isinstance(j, dict) and j:
+                msg_cd = j.get("msg_cd") or j.get("error_code") or j.get("code")
+                msg1 = j.get("msg1") or j.get("message") or j.get("error_description") or j.get("error")
+                rt_cd = j.get("rt_cd")
+                last_exc = f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg1}"
+            else:
+                last_exc = None
+
         except Exception as e:
-            last_err = e
+            last_exc = e
+
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
+
     try:
-        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
+        print(
+            f"⚠️ API 오류 ({tr_id}): url={last_url} status={last_status} ct={last_ct} "
+            f"err={last_exc} body={last_body_snip}"
+        )
     except Exception:
         pass
     return {}
