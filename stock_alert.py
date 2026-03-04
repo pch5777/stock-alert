@@ -1,4 +1,4 @@
-
+print("BOOT_VERSION = FILE_PERSIST_V1C", flush=True)
 # --- HOTFIX: prevent NameError for stray f-strings using {code} ---
 code = ""
 
