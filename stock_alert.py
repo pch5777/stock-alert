@@ -1,18 +1,14 @@
-
-# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
-code = ""
-
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.6-netfix1
+버전: v37.6-netfix2
 날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.6-netfix1 (2026-03-04)
+v37.6-netfix2 (2026-03-04)
   [네트워크] 배포/재시작 직후 KIS 연결 끊김(RemoteDisconnected) 자동 복구 강화
     - requests.Session에 Retry 어댑터 장착(연결/읽기/상태코드 재시도)
     - get_token/_safe_get 재시도 횟수/백오프/지터 강화 + 세션 리셋
@@ -294,6 +290,9 @@ v28.0 (2026-03-01)
   ⑥ 알림 메시지에 보조지표 요약 표시
 
 """
+
+# --- hotfix: keep 'code' defined for f-strings ---
+code = ""
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
