@@ -268,6 +268,31 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
+import time
+import requests
+import os
+
+
+# --- SAFE PATCH: Supabase healthcheck (non-fatal) ---
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+
+def supabase_kv_put(key: str, value: str) -> None:
+    """Best-effort upsert into public.bot_kv. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return
+        url = SUPABASE_URL.rstrip("/") + "/rest/v1/bot_kv?on_conflict=key"
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        payload = {"key": key, "b64": value, "sha1": "healthcheck"}
+        requests.post(url, headers=headers, json=payload, timeout=(2, 4))
+    except Exception:
+        return
 
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
@@ -9371,6 +9396,10 @@ def _shutdown(reason: str = "정상 종료"):
     sys.exit(0)
 
 if __name__ == "__main__":
+    try:
+        supabase_kv_put('healthcheck', 'boot_' + str(int(time.time())))
+    except Exception:
+        pass
     print("="*55)
     print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
     print(f"   업데이트: {BOT_DATE}")
