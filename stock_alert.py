@@ -684,7 +684,6 @@ _dynamic_theme_map  = {}
 DYNAMIC_THEME_FILE  = os.path.join(DATA_DIR, "dynamic_themes.json")
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
-\1
 # ── (v37.5) Night buffers / premarket reminders ──
 DART_WATCHLIST_FILE   = os.path.join(DATA_DIR, "dart_watchlist.json")
 GEO_NIGHT_FILE        = os.path.join(DATA_DIR, "geo_night_events.json")
@@ -6952,7 +6951,7 @@ def run_geo_news_scan():
             _geo_event_state["last_sig"] = sig
             return
 
-        unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"} = {"high": "🔴", "mid": "🟠", "low": "🟢"}
+        unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
         msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"{unc_emoji.get(geo['uncertainty'],'🟠')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
@@ -7001,6 +7000,7 @@ def run_geo_news_scan():
         send(msg)
 
     except Exception as e:
+        pass
 
 # ============================================================
 # 🌙 장 종료 후 요약 + 익개장 직전 재알림 (v37.5)
