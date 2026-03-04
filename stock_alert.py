@@ -269,96 +269,6 @@ v28.0 (2026-03-01)
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
 
-
-
-# =========================
-# PATCH: Optional Supabase persistence for state files
-# - Keeps stock-related data across code swaps/redeploys
-# - Activates only when SUPABASE_URL and SUPABASE_ANON_KEY are set
-# - Never raises (bot stability first)
-# =========================
-import os, base64, hashlib, pathlib
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
-_SB_TABLE = "bot_kv"
-_SB_STATE_FILES = [
-    "signal_log.json",
-    "early_detect_log.json",
-    "carry_stocks.json",
-    "dynamic_params.json",
-    "dynamic_themes.json",
-    "news_cooccur.json",
-    "geo_history.json",
-    "geo_fingerprint.json",
-]
-
-def _sb_headers(merge: bool = True):
-    h = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json",
-    }
-    if merge:
-        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
-    return h
-
-def sb_kv_put_blob(key: str, raw: bytes) -> None:
-    try:
-        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-            return
-        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_SB_TABLE}?on_conflict=key"
-        b64 = base64.b64encode(raw).decode("ascii")
-        sha1 = hashlib.sha1(raw).hexdigest()
-        payload = {"key": key, "b64": b64, "sha1": sha1}
-        requests.post(url, headers=_sb_headers(True), json=payload, timeout=(2, 8))
-    except Exception:
-        return
-
-def sb_kv_get_blob(key: str):
-    try:
-        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-            return None
-        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_SB_TABLE}?key=eq.{key}&select=b64"
-        r = requests.get(url, headers=_sb_headers(False), timeout=(2, 8))
-        if r.status_code != 200:
-            return None
-        arr = r.json()
-        if not isinstance(arr, list) or not arr:
-            return None
-        b64 = arr[0].get("b64") or ""
-        if not b64:
-            return None
-        return base64.b64decode(b64.encode("ascii"))
-    except Exception:
-        return None
-
-def sb_restore_state_files() -> None:
-    for fn in _SB_STATE_FILES:
-        blob = sb_kv_get_blob(f"file:{fn}")
-        if blob:
-            try:
-                pathlib.Path(fn).write_bytes(blob)
-            except Exception:
-                pass
-
-def sb_backup_state_files() -> None:
-    for fn in _SB_STATE_FILES:
-        p = pathlib.Path(fn)
-        if p.exists():
-            try:
-                sb_kv_put_blob(f"file:{fn}", p.read_bytes())
-            except Exception:
-                pass
-
-# --- PATCH: safe JSON parsing (prevents JSONDecodeError on empty/HTML responses) ---
-def safe_json(resp):
-    """Return resp.json() safely. If invalid JSON, return {}."""
-    try:
-        return resp.json()
-    except Exception:
-        return {}
-
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
@@ -426,6 +336,19 @@ def _load_dotenv(path: str = ".env"):
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError: pass
 _load_dotenv()
+
+
+def _to_int(x, default=0):
+    """Safe int conversion for '', None, etc."""
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
 # ============================================================
 # ⚙️ 환경변수
@@ -805,15 +728,41 @@ def _headers(tr_id: str) -> dict:
             "appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET,
             "tr_id":tr_id,"custtype":"P"}
 
-def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    try:
-        resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-        if resp.status_code == 403:
-            global _access_token; _access_token = None
-            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-        return resp.json() if resp.status_code == 200 else {}
-    except Exception as e:
-        print(f"⚠️ API 오류 ({tr_id}): {e}"); return {}
+def _safe_get(url: str, tr_id: str, params: dict, timeout: int = 15, retries: int = 3) -> dict:
+    """KIS GET with retry/backoff. Never raises. Returns dict (or {})."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
+            if resp.status_code == 403:
+                global _access_token
+                _access_token = None
+                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
+
+            if resp.status_code != 200:
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                    time.sleep(0.8 * (2 ** attempt))
+                    continue
+                return {}
+
+            try:
+                return resp.json() or {}
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    time.sleep(0.8 * (2 ** attempt))
+                    continue
+                return {}
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.8 * (2 ** attempt))
+                continue
+            print(f"⚠️ API 오류 ({tr_id}): {e}")
+            return {}
+    if last_err:
+        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
+    return {}
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -833,15 +782,15 @@ def get_daily_data(code: str, days: int = 60) -> list:
         params = {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code,
                   "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
                   "FID_PERIOD_DIV_CODE":"D","FID_ORG_ADJ_PRC":"0"}
-        resp  = _session.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
-        items = resp.json().get("output2",[]) if resp.status_code == 200 else []
+        data  = _safe_get(url, "FHKST03010100", params)
+        items = data.get("output2", []) if isinstance(data, dict) else []
         items = sorted([{
             "date":  i.get("stck_bsop_date",""),
-            "open":  int(i.get("stck_oprc",0)),
-            "high":  int(i.get("stck_hgpr",0)),
-            "low":   int(i.get("stck_lwpr",0)),
-            "close": int(i.get("stck_clpr",0)),
-            "vol":   int(i.get("acml_vol",0)),
+            "open":  _to_int(i.get("stck_oprc",0)),
+            "high":  _to_int(i.get("stck_hgpr",0)),
+            "low":   _to_int(i.get("stck_lwpr",0)),
+            "close": _to_int(i.get("stck_clpr",0)),
+            "vol":   _to_int(i.get("acml_vol",0)),
         } for i in items if i.get("stck_bsop_date")], key=lambda x: x["date"])
         _daily_cache[code] = {"items": items, "ts": time.time()}
         return items
@@ -6772,7 +6721,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(safe_json(resp))
+        raw  = extract_ai_text(resp.json())
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
