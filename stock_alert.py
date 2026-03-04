@@ -6,7 +6,7 @@ code = ""
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.0-hotfix2b
+버전: v37.0-hotfix2b+sbkv
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -268,6 +268,122 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
+import atexit
+import hashlib
+import base64
+
+
+# --- PATCH: Supabase KV persistence (prevents data loss on redeploy) ---
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+
+PERSIST_FILES = [
+    "signal_log.json",
+    "early_detect_log.json",
+    "auto_tune_log.json",
+    "carry_stocks.json",
+    "dynamic_params.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "compact_mode.json",
+]
+
+_PERSIST_RESTORED = False
+
+def _sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def sb_kv_get(key: str):
+    """Return dict row from bot_kv or None. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return None
+        url = SUPABASE_URL.rstrip("/") + "/rest/v1/bot_kv"
+        params = {"select": "key,b64,sha1,updated_at", "key": f"eq.{key}"}
+        r = requests.get(url, headers=_sb_headers(), params=params, timeout=(2, 6))
+        if r.status_code != 200:
+            return None
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+    except Exception:
+        return None
+    return None
+
+def sb_kv_upsert(key: str, raw_bytes: bytes):
+    """Upsert into bot_kv. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return False
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        sha1 = _sha1_bytes(raw_bytes)
+        url = SUPABASE_URL.rstrip("/") + "/rest/v1/bot_kv"
+        headers = _sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        body = {"key": key, "b64": b64, "sha1": sha1}
+        r = requests.post(url, headers=headers, json=body, timeout=(2, 10))
+        return (200 <= r.status_code < 300)
+    except Exception:
+        return False
+
+def restore_persisted_files():
+    """Restore JSON state files from Supabase if local is missing. Never raises."""
+    global _PERSIST_RESTORED
+    if _PERSIST_RESTORED:
+        return
+    _PERSIST_RESTORED = True
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return
+        for fn in PERSIST_FILES:
+            if os.path.exists(fn) and os.path.getsize(fn) > 0:
+                continue
+            row = sb_kv_get(fn)
+            if not row:
+                continue
+            b64 = row.get("b64") or ""
+            if not b64:
+                continue
+            raw = base64.b64decode(b64.encode("ascii"))
+            # basic sanity
+            if not raw:
+                continue
+            with open(fn, "wb") as f:
+                f.write(raw)
+    except Exception:
+        return
+
+    persist_files()
+    """Upload JSON state files to Supabase if changed. Never raises."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return
+        for fn in PERSIST_FILES:
+            if not os.path.exists(fn):
+                continue
+            raw = open(fn, "rb").read()
+            if not raw:
+                continue
+            local_sha = _sha1_bytes(raw)
+            row = sb_kv_get(fn)
+            if row and (row.get("sha1") == local_sha):
+                continue
+            sb_kv_upsert(fn, raw)
+    except Exception:
+        return
+
+# Ensure we try to persist at process exit (best-effort)
+try:
+    atexit.register(persist_files)
+except Exception:
+    pass
 
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
@@ -299,31 +415,6 @@ BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
-
-# --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
-def extract_ai_text(resp_json):
-    """Safely extract analysis text from AI provider response."""
-    try:
-        # Anthropic-style: {"content":[{"text":"..."}]}
-        content = resp_json.get("content")
-        if isinstance(content, list) and content:
-            t = content[0].get("text", "")
-            if t:
-                return str(t).strip()
-    except Exception:
-        pass
-    try:
-        # OpenAI-style: {"choices":[{"message":{"content":"..."}}]}
-        choices = resp_json.get("choices")
-        if isinstance(choices, list) and choices:
-            msg = (choices[0].get("message") or {})
-            t = msg.get("content", "")
-            if t:
-                return str(t).strip()
-    except Exception:
-        pass
-    return ""
-
 
 # .env 파일 자동 로드 (python-dotenv 없어도 직접 파싱)
 def _load_dotenv(path: str = ".env"):
@@ -6312,7 +6403,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(resp.json())
+        raw  = resp.json()["content"][0]["text"].strip()
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
@@ -6682,7 +6773,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(resp.json())
+        raw  = resp.json()["content"][0]["text"].strip()
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
@@ -9266,6 +9357,7 @@ def _on_market_open():
          f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
 
 def run_scan():
+    restore_persisted_files()
     code = ""  # HOTFIX: prevent NameError in exception paths
     # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
     krx_open = is_market_open()
@@ -9352,6 +9444,8 @@ def run_scan():
 # ============================================================
 # 🚀 실행
 # ============================================================
+    persist_files()
+
 def _shutdown(reason: str = "정상 종료"):
     """
     봇 자동 종료 — Railway Cron 환경에서 사용.
