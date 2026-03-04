@@ -269,6 +269,22 @@ v28.0 (2026-03-01)
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
 
+
+# --- HOTFIX: safe JSON parsing (prevents JSONDecodeError on empty/HTML responses) ---
+def safe_json(resp):
+    """Return resp.json() safely. If invalid JSON or empty response, return {}."""
+    try:
+        # If server returned HTML / empty, resp.json() will raise
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        txt = (resp.text or "")
+        if not txt.strip():
+            return {}
+        if "json" not in ct and txt.lstrip().startswith("<"):
+            return {}
+        return resp.json()
+    except Exception:
+        return {}
+
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
@@ -336,19 +352,6 @@ def _load_dotenv(path: str = ".env"):
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except FileNotFoundError: pass
 _load_dotenv()
-
-
-def _to_int(x, default=0):
-    """Safe int conversion for '', None, etc."""
-    try:
-        if x is None:
-            return default
-        s = str(x).strip()
-        if s == "":
-            return default
-        return int(float(s))
-    except Exception:
-        return default
 
 # ============================================================
 # ⚙️ 환경변수
@@ -728,41 +731,15 @@ def _headers(tr_id: str) -> dict:
             "appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET,
             "tr_id":tr_id,"custtype":"P"}
 
-def _safe_get(url: str, tr_id: str, params: dict, timeout: int = 15, retries: int = 3) -> dict:
-    """KIS GET with retry/backoff. Never raises. Returns dict (or {})."""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
-            if resp.status_code == 403:
-                global _access_token
-                _access_token = None
-                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
-
-            if resp.status_code != 200:
-                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                    time.sleep(0.8 * (2 ** attempt))
-                    continue
-                return {}
-
-            try:
-                return resp.json() or {}
-            except Exception as e:
-                last_err = e
-                if attempt < retries - 1:
-                    time.sleep(0.8 * (2 ** attempt))
-                    continue
-                return {}
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(0.8 * (2 ** attempt))
-                continue
-            print(f"⚠️ API 오류 ({tr_id}): {e}")
-            return {}
-    if last_err:
-        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
-    return {}
+def _safe_get(url: str, tr_id: str, params: dict) -> dict:
+    try:
+        resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+        if resp.status_code == 403:
+            global _access_token; _access_token = None
+            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+        return resp.json() if resp.status_code == 200 else {}
+    except Exception as e:
+        print(f"⚠️ API 오류 ({tr_id}): {e}"); return {}
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -782,15 +759,15 @@ def get_daily_data(code: str, days: int = 60) -> list:
         params = {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code,
                   "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
                   "FID_PERIOD_DIV_CODE":"D","FID_ORG_ADJ_PRC":"0"}
-        data  = _safe_get(url, "FHKST03010100", params)
-        items = data.get("output2", []) if isinstance(data, dict) else []
+        resp  = _session.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
+        items = resp.json().get("output2",[]) if resp.status_code == 200 else []
         items = sorted([{
             "date":  i.get("stck_bsop_date",""),
-            "open":  _to_int(i.get("stck_oprc",0)),
-            "high":  _to_int(i.get("stck_hgpr",0)),
-            "low":   _to_int(i.get("stck_lwpr",0)),
-            "close": _to_int(i.get("stck_clpr",0)),
-            "vol":   _to_int(i.get("acml_vol",0)),
+            "open":  int(i.get("stck_oprc",0)),
+            "high":  int(i.get("stck_hgpr",0)),
+            "low":   int(i.get("stck_lwpr",0)),
+            "close": int(i.get("stck_clpr",0)),
+            "vol":   int(i.get("acml_vol",0)),
         } for i in items if i.get("stck_bsop_date")], key=lambda x: x["date"])
         _daily_cache[code] = {"items": items, "ts": time.time()}
         return items
@@ -6721,7 +6698,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(resp.json())
+        raw  = extract_ai_text(safe_json(resp))
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
