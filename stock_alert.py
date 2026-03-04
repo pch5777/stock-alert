@@ -1,8 +1,12 @@
+
+# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
+code = ""
+
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.0
+버전: v37.0-hotfix2b
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -18,9 +22,6 @@ v37.0 (2026-03-02)  ← 현재
   [P1] ⑥ _weekly_report_sent_week 죽은 global 선언 제거
   [P1] ⑦ Anthropic API 버전 2023-06-01→2024-10-22 업데이트
   [P1] ⑧ _geo_event_state 전역변수 위치 이동 (사용 전 정의)
-# --- PATCH: prevent NameError for stray f-strings using {code} in error paths ---
-code = ""  # do not remove: used as safe fallback for logging
-
   [P2] ⑨ analyze() 내부 bare except 7개 → _log_error 변환
   [P2] ⑩ 캐시 자동 정리 _prune_cache() 추가 (메모리 누수 방지)
   [P2] ⑪ _nxt_unavailable 주 1회 초기화 (불필요 API 호출 제거)
@@ -267,6 +268,29 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
+
+# --- HOTFIX: safe parsing helpers ---
+def safe_int(value, default=0):
+    """Convert value to int safely. Handles '', '-', None, commas, floats."""
+    try:
+        if value is None:
+            return default
+        s = str(value).replace(",", "").strip()
+        if s in ("", "-", "None", "null", "NULL"):
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+def normalize_stock_code(value):
+    """Return 6-digit numeric stock code or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if len(s) == 6 and s.isdigit():
+        return s
+    return None
+
 _ver_match = _re.search(r"버전:\s*(v[\d.]+)", __doc__ or "")
 BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
 _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
@@ -2071,8 +2095,8 @@ def get_nxt_investor_trend(code: str) -> dict:
     output = data.get("output", [])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+        "foreign_net":     safe_int(output[0].get('frgn_ntby_qty', 0)),
+        "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
     }
 
 # NXT 데이터 캐시 (종목별 5분 유효)
@@ -2175,9 +2199,9 @@ def get_investor_trend(code: str) -> dict:
     output = data.get("output",[])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
-        "retail_net":      int(output[0].get("prsn_ntby_qty", 0)),  # 개인 순매수
+        "foreign_net":     safe_int(output[0].get('frgn_ntby_qty', 0)),
+        "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
+        "retail_net":      safe_int(output[0].get('prsn_ntby_qty', 0)),  # 개인 순매수
     }
 
 # ============================================================
@@ -4819,7 +4843,7 @@ def analyze(stock: dict) -> dict:
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
-            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
+            _log_error(f"analyze_investor({stock.get('code', '')})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -9217,6 +9241,7 @@ def _on_market_open():
          f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
 
 def run_scan():
+    code = ""  # HOTFIX: prevent NameError in exception paths
     # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
     krx_open = is_market_open()
     nxt_open = is_nxt_open()
