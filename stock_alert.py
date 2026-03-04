@@ -269,6 +269,96 @@ v28.0 (2026-03-01)
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
 
+
+
+# =========================
+# PATCH: Optional Supabase persistence for state files
+# - Keeps stock-related data across code swaps/redeploys
+# - Activates only when SUPABASE_URL and SUPABASE_ANON_KEY are set
+# - Never raises (bot stability first)
+# =========================
+import os, base64, hashlib, pathlib
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+_SB_TABLE = "bot_kv"
+_SB_STATE_FILES = [
+    "signal_log.json",
+    "early_detect_log.json",
+    "carry_stocks.json",
+    "dynamic_params.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "geo_history.json",
+    "geo_fingerprint.json",
+]
+
+def _sb_headers(merge: bool = True):
+    h = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+    if merge:
+        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    return h
+
+def sb_kv_put_blob(key: str, raw: bytes) -> None:
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return
+        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_SB_TABLE}?on_conflict=key"
+        b64 = base64.b64encode(raw).decode("ascii")
+        sha1 = hashlib.sha1(raw).hexdigest()
+        payload = {"key": key, "b64": b64, "sha1": sha1}
+        requests.post(url, headers=_sb_headers(True), json=payload, timeout=(2, 8))
+    except Exception:
+        return
+
+def sb_kv_get_blob(key: str):
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            return None
+        url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{_SB_TABLE}?key=eq.{key}&select=b64"
+        r = requests.get(url, headers=_sb_headers(False), timeout=(2, 8))
+        if r.status_code != 200:
+            return None
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            return None
+        b64 = arr[0].get("b64") or ""
+        if not b64:
+            return None
+        return base64.b64decode(b64.encode("ascii"))
+    except Exception:
+        return None
+
+def sb_restore_state_files() -> None:
+    for fn in _SB_STATE_FILES:
+        blob = sb_kv_get_blob(f"file:{fn}")
+        if blob:
+            try:
+                pathlib.Path(fn).write_bytes(blob)
+            except Exception:
+                pass
+
+def sb_backup_state_files() -> None:
+    for fn in _SB_STATE_FILES:
+        p = pathlib.Path(fn)
+        if p.exists():
+            try:
+                sb_kv_put_blob(f"file:{fn}", p.read_bytes())
+            except Exception:
+                pass
+
+# --- PATCH: safe JSON parsing (prevents JSONDecodeError on empty/HTML responses) ---
+def safe_json(resp):
+    """Return resp.json() safely. If invalid JSON, return {}."""
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
@@ -6682,7 +6772,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(resp.json())
+        raw  = extract_ai_text(safe_json(resp))
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
