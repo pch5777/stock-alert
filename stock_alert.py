@@ -1,8 +1,12 @@
+
+# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
+code = ""
+
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.0
+버전: v37.0-hotfix2b
 날짜: 2026-03-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -264,7 +268,29 @@ v28.0 (2026-03-01)
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import re as _re
-import random
+
+# --- HOTFIX: safe parsing helpers ---
+def safe_int(value, default=0):
+    """Convert value to int safely. Handles '', '-', None, commas, floats."""
+    try:
+        if value is None:
+            return default
+        s = str(value).replace(",", "").strip()
+        if s in ("", "-", "None", "null", "NULL"):
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+def normalize_stock_code(value):
+    """Return 6-digit numeric stock code or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if len(s) == 6 and s.isdigit():
+        return s
+    return None
+
 _ver_match = _re.search(r"버전:\s*(v[\d.]+)", __doc__ or "")
 BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
 _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
@@ -273,6 +299,31 @@ BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
+
+# --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
+def extract_ai_text(resp_json):
+    """Safely extract analysis text from AI provider response."""
+    try:
+        # Anthropic-style: {"content":[{"text":"..."}]}
+        content = resp_json.get("content")
+        if isinstance(content, list) and content:
+            t = content[0].get("text", "")
+            if t:
+                return str(t).strip()
+    except Exception:
+        pass
+    try:
+        # OpenAI-style: {"choices":[{"message":{"content":"..."}}]}
+        choices = resp_json.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = (choices[0].get("message") or {})
+            t = msg.get("content", "")
+            if t:
+                return str(t).strip()
+    except Exception:
+        pass
+    return ""
+
 
 # .env 파일 자동 로드 (python-dotenv 없어도 직접 파싱)
 def _load_dotenv(path: str = ".env"):
@@ -664,49 +715,15 @@ def _headers(tr_id: str) -> dict:
             "appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET,
             "tr_id":tr_id,"custtype":"P"}
 
-def _safe_get(url: str, tr_id: str, params: dict, timeout: int = 15, max_retries: int = 3) -> dict:
-    """KIS GET 호출 공통 래퍼.
-    - 네트워크 끊김/서버 응답없음(RemoteDisconnected) 등은 재시도
-    - 403이면 토큰 초기화 후 1회 재시도
-    - 429/5xx는 지수 백오프 후 재시도
-    - 실패 시 {} 반환 (봇이 멈추지 않게)
-    """
-    last_err = None
-    for attempt in range(max_retries + 1):
-        try:
-            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
-            # 토큰 만료/권한 문제 → 토큰 초기화 후 즉시 재시도
-            if resp.status_code == 403:
-                global _access_token
-                _access_token = None
-                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout)
-
-            # 과부하/일시 장애 → 재시도
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {resp.status_code}"
-                raise Exception(last_err)
-
-            if resp.status_code != 200:
-                return {}
-
-            try:
-                return resp.json() or {}
-            except Exception as je:
-                last_err = je
-                raise
-
-        except Exception as e:
-            last_err = e
-            # 마지막 시도면 종료
-            if attempt >= max_retries:
-                print(f"⚠️ API 오류 ({tr_id}): {e}"); 
-                return {}
-            # 지수 백오프 (+약간의 지터)
-            sleep_s = min(12, (2 ** attempt)) + random.uniform(0, 0.6)
-            time.sleep(sleep_s)
-            continue
-    print(f"⚠️ API 오류 ({tr_id}): {last_err}")
-    return {}
+def _safe_get(url: str, tr_id: str, params: dict) -> dict:
+    try:
+        resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+        if resp.status_code == 403:
+            global _access_token; _access_token = None
+            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+        return resp.json() if resp.status_code == 200 else {}
+    except Exception as e:
+        print(f"⚠️ API 오류 ({tr_id}): {e}"); return {}
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -726,8 +743,8 @@ def get_daily_data(code: str, days: int = 60) -> list:
         params = {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code,
                   "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
                   "FID_PERIOD_DIV_CODE":"D","FID_ORG_ADJ_PRC":"0"}
-        data  = _safe_get(url, "FHKST03010100", params, timeout=15, max_retries=3)
-        items = data.get("output2", []) if isinstance(data, dict) else []
+        resp  = _session.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
+        items = resp.json().get("output2",[]) if resp.status_code == 200 else []
         items = sorted([{
             "date":  i.get("stck_bsop_date",""),
             "open":  int(i.get("stck_oprc",0)),
@@ -2103,8 +2120,8 @@ def get_nxt_investor_trend(code: str) -> dict:
     output = data.get("output", [])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
+        "foreign_net":     safe_int(output[0].get('frgn_ntby_qty', 0)),
+        "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
     }
 
 # NXT 데이터 캐시 (종목별 5분 유효)
@@ -2207,9 +2224,9 @@ def get_investor_trend(code: str) -> dict:
     output = data.get("output",[])
     if not output: return {}
     return {
-        "foreign_net":     int(output[0].get("frgn_ntby_qty", 0)),
-        "institution_net": int(output[0].get("orgn_ntby_qty", 0)),
-        "retail_net":      int(output[0].get("prsn_ntby_qty", 0)),  # 개인 순매수
+        "foreign_net":     safe_int(output[0].get('frgn_ntby_qty', 0)),
+        "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
+        "retail_net":      safe_int(output[0].get('prsn_ntby_qty', 0)),  # 개인 순매수
     }
 
 # ============================================================
@@ -4851,7 +4868,7 @@ def analyze(stock: dict) -> dict:
             elif f_net < 0 and i_net < 0:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
-            _log_error(f"analyze_investor({code})", _e); inv = {}; f_net = 0; i_net = 0
+            _log_error(f"analyze_investor({stock.get('code', '')})", _e); inv = {}; f_net = 0; i_net = 0
 
     if score < min_score: return {}
 
@@ -6295,7 +6312,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             },
             timeout=15
         )
-        raw  = resp.json()["content"][0]["text"].strip()
+        raw  = extract_ai_text(resp.json())
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
@@ -6665,7 +6682,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             },
             timeout=15
         )
-        raw  = resp.json()["content"][0]["text"].strip()
+        raw  = extract_ai_text(resp.json())
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
 
@@ -9249,6 +9266,7 @@ def _on_market_open():
          f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
 
 def run_scan():
+    code = ""  # HOTFIX: prevent NameError in exception paths
     # KRX 마감 후에도 NXT 운영 중이면 NXT 스캔 + 추적 체크 계속
     krx_open = is_market_open()
     nxt_open = is_nxt_open()
