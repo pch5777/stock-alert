@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.12-hotfix4
+버전: v37.12-hotfix5
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -556,14 +556,15 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 
     for attempt in range(3):
         try:
-            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+            timeout_sec = 25 if "inquire-daily-itemchartprice" in url else 15
+            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout_sec)
             last_status = getattr(resp, "status_code", None)
             last_ct = (resp.headers.get("Content-Type", "") if getattr(resp, "headers", None) else "")
             if last_status == 403:
                 # token refresh
                 global _access_token
                 _access_token = None
-                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=timeout_sec)
                 last_status = getattr(resp, "status_code", None)
                 last_ct = (resp.headers.get("Content-Type", "") if getattr(resp, "headers", None) else "")
 
@@ -584,6 +585,15 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 
         except Exception as e:
             last_exc = e
+            # Network-level aborts can repeat rapidly; disable endpoint for today to avoid log spam.
+            try:
+                es = repr(e)
+                if ("RemoteDisconnected" in es) or ("Connection aborted" in es) or ("Read timed out" in es):
+                    if attempt >= 1:
+                        _disable_endpoint_today(ep_key, "conn_abort")
+                        break
+            except Exception:
+                pass
 
         try:
             time.sleep(0.8 * (2 ** attempt))
@@ -8795,6 +8805,12 @@ def _get_daily_investor_data(code: str) -> list:
     KIS API: 일별 외국인/기관 순매수 데이터 (최근 20일).
     반환: [{date, foreign_net, institution_net}, ...]
     """
+    # NOTE: KIS 'inquire-daily-trade' 경로는 계정/문서에 따라 404가 자주 발생.
+    # 수익 신호 핵심(급등/상한가/눌림목)에는 필수가 아니라서 기본 비활성화.
+    # 필요 시 Railway 환경변수 ENABLE_DAILY_TRADE=1 로 켜세요.
+    if os.getenv("ENABLE_DAILY_TRADE", "0") != "1":
+        return []
+
     try:
         end   = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
