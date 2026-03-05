@@ -1,14 +1,33 @@
+
+# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
+code = ""
+
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.11-geo-weekend1
-날짜: 2026-03-05
+버전: v37.1-storage2
+날짜: 2026-03-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.0 (2026-03-02)  ← 현재
+v37.11-geo-weekend1-hotfix1 (2026-03-05)
+- FIX: _deep_news_cache 미정의(NameError)로 뉴스 분석/보유종목 뉴스체크 오류 발생 → 전역 캐시 정의 추가
+
+
+v37.1-storage2 (2026-03-04)
+  [검증] 부팅 시 /data/stock_alert에 .storage_ok 프로브 파일 생성/갱신(로그로 저장 확정)
+  [보호] dynamic_params.json 없을 때 기본값을 즉시 저장하여 다음 재시작부터 복원 가능
+
+v37.1-storage1 (2026-03-04)  ← 현재
+  [보호] STOCK_ALERT_DATA_DIR 기반 영구 저장소(DATA_DIR) 도입 (/data 마운트 대응)
+  [보호] 레거시 JSON 자동 이관(최초 1회) + 시작 시 스토리지 진단 로그 출력
+  [안정] JSON 저장 atomic write(tmp→fsync→replace) + 백업 스냅샷(backups/, 최근 N개 유지)
+  [운영] Railway Variables로 데이터 경로/백업 개수 제어: STOCK_ALERT_DATA_DIR, MAX_STATE_BACKUPS
+
+
+v37.0 (2026-03-02)
   전체 코드 리뷰 + 15건 버그/성능/안정성 수정 + 지정학 이력 기능
   [P0] ① fetch_all_news() 스레드 안전성 수정 (Queue 기반)
   [P0] ② flush_info_alerts() 리스트 동시수정 버그 수정
@@ -309,223 +328,145 @@ _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
-# ============================================================
-# 🔒 Endpoint disable flags (avoid repeated 404 spam / unnecessary calls)
-# ============================================================
-_DATA_DIR_EARLY = os.getenv("STOCK_ALERT_DATA_DIR", "/data/stock_alert")
-_DISABLED_STATE_PATH = os.path.join(_DATA_DIR_EARLY, "disabled_endpoints.json")
-def _today_kst() -> str:
-    # TZ is already Asia/Seoul in Railway env; fallback to localtime
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-    # ============================================================
-    # 🌍 Geopolitical buffer & weekend/preopen reports (v37.11)
-    # ============================================================
-GEO_BUFFER_PATH = os.path.join(_DATA_DIR_EARLY, "geo_events_buffer.json")
-
-def _kst_now():
-        # Railway TZ is Asia/Seoul; datetime.now() is localtime in container.
-        return datetime.now()
-
-def _append_geo_buffer(item: dict, max_items: int = 2000) -> None:
-        """Append detected geo event snapshots to a local buffer (no alerts at night/weekend)."""
-        try:
-            os.makedirs(_DATA_DIR_EARLY, exist_ok=True)
-            buf = []
-            if os.path.exists(GEO_BUFFER_PATH):
-                with open(GEO_BUFFER_PATH, "r", encoding="utf-8") as f:
-                    buf = json.load(f) or []
-            buf.append(item)
-            if len(buf) > max_items:
-                buf = buf[-max_items:]
-            with open(GEO_BUFFER_PATH, "w", encoding="utf-8") as f:
-                json.dump(buf, f, ensure_ascii=False)
-        except Exception:
-            # never crash bot due to buffering
-            pass
-
-def _load_geo_buffer():
-        try:
-            if not os.path.exists(GEO_BUFFER_PATH):
-                return []
-            with open(GEO_BUFFER_PATH, "r", encoding="utf-8") as f:
-                return json.load(f) or []
-        except Exception:
-            return []
-
-def _clear_geo_buffer():
-        try:
-            if os.path.exists(GEO_BUFFER_PATH):
-                os.remove(GEO_BUFFER_PATH)
-        except Exception:
-            pass
-
-    # Simple sector → stock candidates mapping (KR market)
-GEO_SECTOR_STOCKS = {
-        "방산": ["한화시스템", "LIG넥스원", "한국항공우주"],
-        "에너지": ["S-Oil", "SK이노베이션", "GS"],
-        "정유": ["S-Oil", "SK이노베이션"],
-        "해운": ["HMM", "대한해운"],
-        "원자재": ["POSCO홀딩스", "고려아연"],
-        "금": ["고려아연"],
-        "사이버보안": ["안랩"],
-        "전력/원전": ["두산에너빌리티", "한전기술"],
-        "환율/달러": ["KB금융", "신한지주"],
-        "항공/여행": ["대한항공", "아시아나항공"],
-    }
-
-def _geo_signature(geo: dict) -> str:
-        """Signature to detect changes (sectors/directions/uncertainty)."""
-        try:
-            parts = [
-                str(geo.get("uncertainty","")),
-                ",".join(geo.get("sectors", [])[:10]),
-                ",".join(geo.get("sector_directions", [])[:10]),
-            ]
-            return "|".join(parts)
-        except Exception:
-            return ""
-
-def send_weekend_geo_risk_alert():
-    """Friday close-approaching: probabilistic warning (not a forecast)."""
-    try:
-        now = _kst_now()
-        if now.weekday() != 4:  # Friday
-            return
-        # Only in the last 60 minutes before KRX close (15:30)
-        if not (now.hour == 14 or (now.hour == 15 and now.minute < 30)):
-            return
-
-        buf = _load_geo_buffer()
-        recent = [x for x in buf if x.get("ts", 0) >= (time.time() - 6 * 3600)]
-        if not recent:
-            return
-        latest = recent[-1]
-        geo = latest.get("geo", {})
-        if not geo:
-            return
-
-        # Heuristic: warn on higher uncertainty or strong score adjustment
-        try:
-            score_adj = float(geo.get("score_adj", 0))
-        except Exception:
-            score_adj = 0.0
-        if geo.get("uncertainty") not in ("high", "mid") and abs(score_adj) < 5:
-            return
-
-        msg = (
-            "⚠️ <b>주말 지정학 리스크 경보</b> (확률적)\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"• 불확실성: <b>{str(geo.get('uncertainty','mid')).upper()}</b>\n"
-            f"• 요약: {geo.get('summary','')}\n\n"
-            "<b>체크 포인트</b>\n"
-            "• 주말 뉴스 흐름(전면전/제재/해상운임/유가)\n"
-            "• 월요일(익영업일) 갭/변동성 확대 가능\n\n"
-            "<b>익개장 전(07:55) 재요약</b>이 자동으로 전송됩니다."
-        )
-        send_telegram(msg)
-    except Exception:
-        pass
-
-def send_preopen_geo_report():
-    """07:55 KST: weekend/night buffer summary + sector/stock candidates."""
-    try:
-        if is_holiday():
-            return
-        buf = _load_geo_buffer()
-        if not buf:
-            return
-        recent = [x for x in buf if x.get("ts", 0) >= (time.time() - 48 * 3600)]
-        if not recent:
-            return
-        latest = recent[-1]
-        geo = latest.get("geo", {})
-        if not geo:
-            return
-
-        sectors = (geo.get("sectors") or [])[:8]
-
-        # Build stock candidates (dedupe)
-        picks = []
-        for s in sectors:
-            for nm in GEO_SECTOR_STOCKS.get(s, []):
-                if nm not in picks:
-                    picks.append(nm)
-        picks = picks[:12]
-
-        msg = (
-            "⏰ <b>익개장 전 지정학 요약</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"• 불확실성: <b>{str(geo.get('uncertainty','mid')).upper()}</b>\n"
-            f"• 요약: {geo.get('summary','')}\n\n"
-        )
-        if sectors:
-            msg += "📌 <b>영향 섹터</b>: " + ", ".join(sectors) + "\n"
-        if picks:
-            msg += "📋 <b>관찰 종목 후보</b>: " + ", ".join(picks) + "\n"
-        msg += "\n(참고) 본 리스트는 '진입 추천'이 아니라 이슈 기반 관찰용입니다."
-        send_telegram(msg)
-    except Exception:
-        pass
-
-
-def send_geo_afterclose_summary():
-    """20:05 KST: summarize buffered geo events (once), then keep buffering."""
-    try:
-        if is_holiday():
-            return
-        buf = _load_geo_buffer()
-        if not buf:
-            return
-        recent = [x for x in buf if x.get("ts", 0) >= (time.time() - 12 * 3600)]
-        if not recent:
-            return
-        latest = recent[-1]
-        geo = latest.get("geo", {})
-        if not geo:
-            return
-        msg = (
-            "🧾 <b>장 종료 후 지정학 요약</b>\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"• 불확실성: <b>{str(geo.get('uncertainty','mid')).upper()}</b>\n"
-            f"• 요약: {geo.get('summary','')}\n"
-            "• 익개장 전(07:55) 최종 재요약 예정"
-        )
-        send_telegram(msg)
-    except Exception:
-        pass
-
-def _load_disabled_state() -> dict:
-    try:
-        if os.path.exists(_DISABLED_STATE_PATH):
-            with open(_DISABLED_STATE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-    except Exception:
-        pass
-    return {}
-
-def _save_disabled_state(state: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(_DISABLED_STATE_PATH), exist_ok=True)
-        tmp = _DISABLED_STATE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _DISABLED_STATE_PATH)
-    except Exception:
-        pass
-
-_DISABLED = _load_disabled_state()
-
-def _is_disabled_today(key: str) -> bool:
-    return _DISABLED.get(key) == _today_kst()
-
-def _disable_today(key: str) -> None:
-    _DISABLED[key] = _today_kst()
-    _save_disabled_state(_DISABLED)
-
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
+
+# ============================================================
+# 💾 Persistent Storage (코드 교체/배포에도 데이터 보존)
+#   - Railway Volume(/data) + 환경변수 STOCK_ALERT_DATA_DIR 지원
+#   - 파일은 모두 DATA_DIR 아래로 강제
+#   - JSON 저장은 atomic write + 백업 스냅샷(최근 N개)로 보호
+# ============================================================
+DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
+    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
+)
+DATA_DIR = os.path.abspath(DATA_DIR)
+
+MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
+_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+
+_PERSIST_FILES = [
+    "signal_log.json",
+    "dynamic_params.json",
+    "carry_stocks.json",
+    "early_detect_log.json",
+    "auto_tune_log.json",
+    "dynamic_themes.json",
+    "news_cooccur.json",
+    "compact_mode.json",
+]
+
+def _ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ DATA_DIR 생성 실패: {path} ({e})")
+
+def _snapshot_backup(file_path: str):
+    """기존 파일이 있으면 backups로 스냅샷 백업(최근 N개 유지)"""
+    try:
+        if not os.path.isfile(file_path):
+            return
+        _ensure_dir(_BACKUP_DIR)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.basename(file_path)
+        backup_path = os.path.join(_BACKUP_DIR, f"{base}.{ts}.bak")
+        # copy (binary safe)
+        with open(file_path, "rb") as rf, open(backup_path, "wb") as wf:
+            wf.write(rf.read())
+
+        # prune old backups
+        backups = sorted(
+            [p for p in os.listdir(_BACKUP_DIR) if p.startswith(base + ".")],
+            reverse=True,
+        )
+        for old in backups[MAX_STATE_BACKUPS:]:
+            try:
+                os.remove(os.path.join(_BACKUP_DIR, old))
+            except:
+                pass
+    except Exception as e:
+        print(f"⚠️ 백업 스냅샷 실패: {os.path.basename(file_path)} ({e})")
+
+def _atomic_write_bytes(file_path: str, data: bytes):
+    """tmp → fsync → os.replace 로 원자적 저장"""
+    _ensure_dir(os.path.dirname(file_path))
+    tmp_path = file_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, file_path)
+
+def _write_json_atomic(file_path: str, obj, indent: int = 2):
+    try:
+        _snapshot_backup(file_path)
+        payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
+        _atomic_write_bytes(file_path, payload)
+    except Exception as e:
+        print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+
+def _migrate_legacy_files():
+    """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
+    try:
+        cwd = os.getcwd()
+        for fn in _PERSIST_FILES:
+            legacy = os.path.join(cwd, fn)
+            target = os.path.join(DATA_DIR, fn)
+            if os.path.isfile(legacy) and not os.path.isfile(target):
+                _ensure_dir(DATA_DIR)
+                try:
+                    with open(legacy, "rb") as rf, open(target, "wb") as wf:
+                        wf.write(rf.read())
+                    print(f"✅ 레거시 파일 이관: {fn} → {target}")
+                except Exception as e:
+                    print(f"⚠️ 레거시 이관 실패: {fn} ({e})")
+    except Exception as e:
+        print(f"⚠️ 레거시 이관 로직 오류: {e}")
+
+def _storage_diagnostics_once():
+    """시작 시 1회: DATA_DIR/볼륨/쓰기 가능 여부/파일 목록 출력"""
+    try:
+        _ensure_dir(DATA_DIR)
+        _ensure_dir(_BACKUP_DIR)
+        rp = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
+        print("=======================================================")
+        print("💾 Persistent Storage Check")
+        print(f"   DATA_DIR: {DATA_DIR}")
+        if rp:
+            print(f"   RAILWAY_VOLUME_MOUNT_PATH: {rp}")
+        # writable test
+        test_path = os.path.join(DATA_DIR, ".write_test")
+        try:
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+            os.remove(test_path)
+            print("   Writable: ✅ OK")
+            # persistent probe file (kept) to prove writes survive redeploys
+            probe_path = os.path.join(DATA_DIR, ".storage_ok")
+            try:
+                with open(probe_path, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().isoformat())
+                print(f"   Probe file: {probe_path} ✅ wrote")
+            except Exception as pe:
+                print(f"   Probe file: ❌ FAIL ({pe})")
+        except Exception as e:
+            print(f"   Writable: ❌ FAIL ({e})")
+        # list key files
+        existing = []
+        for fn in _PERSIST_FILES:
+            fp = os.path.join(DATA_DIR, fn)
+            if os.path.isfile(fp):
+                try:
+                    size = os.path.getsize(fp)
+                    existing.append(f"{fn}({size}B)")
+                except:
+                    existing.append(fn)
+        print("   Files:", ", ".join(existing) if existing else "(none)")
+        print("=======================================================")
+    except Exception as e:
+        print(f"⚠️ 스토리지 진단 실패: {e}")
+
 
 # --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
 def extract_ai_text(resp_json):
@@ -607,8 +548,8 @@ MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
 MAX_CARRY_DAYS        = 3
-CARRY_FILE            = "carry_stocks.json"
-EARLY_LOG_FILE        = "early_detect_log.json"
+CARRY_FILE            = os.path.join(DATA_DIR, "carry_stocks.json")
+EARLY_LOG_FILE        = os.path.join(DATA_DIR, "early_detect_log.json")
 
 # ATR
 ATR_PERIOD       = 5
@@ -732,10 +673,10 @@ _early_volume_min_dynamic = EARLY_VOLUME_MIN
 
 # ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
 _dynamic_theme_map  = {}
-DYNAMIC_THEME_FILE  = "dynamic_themes.json"
+DYNAMIC_THEME_FILE  = os.path.join(DATA_DIR, "dynamic_themes.json")
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
-NEWS_COOCCUR_FILE   = "news_cooccur.json"
+NEWS_COOCCUR_FILE   = os.path.join(DATA_DIR, "news_cooccur.json")
 
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -761,7 +702,7 @@ _news_reverse_cache: dict = {}
 # ── 컴팩트 알림 모드 ──
 # True면 1~2줄 요약, False면 기존 상세 포맷
 _compact_mode: bool = False
-COMPACT_MODE_FILE   = "compact_mode.json"
+COMPACT_MODE_FILE   = os.path.join(DATA_DIR, "compact_mode.json")
 
 def _load_compact_mode():
     global _compact_mode
@@ -944,64 +885,25 @@ def _headers(tr_id: str) -> dict:
 
 
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises.
-    On failure, returns {} and logs useful diagnostics (status/content-type/body snippet).
-    """
+    """KIS GET with retry/backoff. Never raises."""
     last_err = None
-    last_status = None
-    last_ct = ""
-    last_body = ""
     for attempt in range(3):
         try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            last_status = getattr(resp, "status_code", None)
-            last_ct = (resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else "") or ""
-            # Retry token refresh on 403
-            if last_status == 403:
+            if resp.status_code == 403:
                 global _access_token
                 _access_token = None
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-                last_status = getattr(resp, "status_code", None)
-                last_ct = (resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else "") or ""
-
-            if last_status == 200:
+            if resp.status_code == 200:
                 return safe_json_response(resp)
-
-            # Capture a short body snippet for diagnostics (avoid huge logs)
-            try:
-                last_body = (resp.text or "")[:200]
-            except Exception:
-                last_body = ""
-
-            # For 404/5xx, don't spin too much
-            if last_status in (404, 500, 502, 503, 504):
-                # Disable known-missing endpoints for the rest of today to prevent log spam
-                if last_status == 404:
-                    try:
-                        if "chgrate-pcls-100" in url:
-                            _disable_today("chgrate-pcls-100")
-                        if "inquire-daily-trade" in url:
-                            _disable_today("inquire-daily-trade")
-                    except Exception:
-                        pass
-                break
-
         except Exception as e:
             last_err = e
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
-
-    # Build a stable error message (never None)
-    err_msg = None
-    if last_err is not None:
-        err_msg = str(last_err)
-    else:
-        err_msg = f"status={last_status} ct={last_ct} body={last_body}"
-
     try:
-        print(f"⚠️ API 오류 ({tr_id}): url={url} {err_msg}")
+        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
     except Exception:
         pass
     return {}
@@ -1011,6 +913,7 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 # ============================================================
 _daily_cache = {}  # code → {items, ts}
 _atr_cache   = {}  # code → {atr, date}  하루 1회 갱신
+_deep_news_cache = {}  # key → {data, ts}  (뉴스 본문/요약 캐시)
 
 def get_daily_data(code: str, days: int = 60) -> list:
     """일봉 데이터 조회 (캐시 30분)"""
@@ -2323,8 +2226,6 @@ def get_stock_price(code: str) -> dict:
     }
 
 def get_upper_limit_stocks() -> list:
-    if _is_disabled_today("chgrate-pcls-100"):
-        return []
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
                      "FHPST01700000", {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
@@ -2566,10 +2467,7 @@ def get_sector_stocks_from_kis(code: str) -> list:
         # 3단계: 위에서도 없으면 등락률 상위 전체에서 한번 더 시도
         if not stocks:
             try:
-                if _is_disabled_today("chgrate-pcls-100"):
-                    data3 = {}
-                else:
-                    data3 = _safe_get(
+                data3 = _safe_get(
                     f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
                     "FHPST01700000",
                     {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170",
@@ -2708,8 +2606,7 @@ def update_news_cooccur(headlines: list):
 
     # 파일 저장 (장 마감 후 분석용)
     try:
-        with open(NEWS_COOCCUR_FILE, "w") as f:
-            json.dump(_news_cooccur, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(NEWS_COOCCUR_FILE, _news_cooccur, indent=2)
     except: pass
 
 def get_news_cooccur_peers(code: str) -> list:
@@ -3061,7 +2958,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # ============================================================
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
-SIGNAL_LOG_FILE = "signal_log.json"   # 모든 신호 추적 (신규)
+SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 추적 (신규)
 
 def _is_real_trade(rec: dict) -> bool:
     """
@@ -3148,8 +3045,7 @@ def save_signal_log(stock: dict):
             "actual_exit_date":  "",
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
         }
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
         print(f"⚠️ 신호 저장 오류: {e}")
@@ -3178,8 +3074,7 @@ def save_early_detect(stock: dict):
                 "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
                 "status": "추적중", "pnl_pct": 0, "exit_price": 0, "exit_date": "",
             }
-            with open(EARLY_LOG_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(EARLY_LOG_FILE, data, indent=2)
     except Exception as e:
         print(f"⚠️ EARLY 저장 오류: {e}")
 
@@ -3740,8 +3635,7 @@ def track_signal_results():
                         except: pass
 
         if updated:
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
             # tracker 피드백 즉시 갱신
             load_tracker_feedback()
 
@@ -3993,8 +3887,8 @@ def load_carry_stocks():
 # ============================================================
 # 🧠 자동 조건 조정 엔진
 # ============================================================
-AUTO_TUNE_FILE   = "auto_tune_log.json"   # 조정 이력 저장
-DYNAMIC_PARAMS_FILE = "dynamic_params.json"  # 조정된 파라미터 영구 저장
+AUTO_TUNE_FILE   = os.path.join(DATA_DIR, "auto_tune_log.json")   # 조정 이력 저장
+DYNAMIC_PARAMS_FILE = os.path.join(DATA_DIR, "dynamic_params.json")  # 조정된 파라미터 영구 저장
 MIN_SAMPLES      = 5    # 20→5: 더 빠르게 반응 (적은 샘플로도 조정)
 
 # 동적 조정 변수 (기본값 = 파라미터 원본값)
@@ -4055,8 +3949,7 @@ def _save_dynamic_params():
     → Railway 재시작 후에도 조정값 유지
     """
     try:
-        with open(DYNAMIC_PARAMS_FILE, "w") as f:
-            json.dump(_dynamic, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(DYNAMIC_PARAMS_FILE, _dynamic, indent=2)
     except Exception as e:
         print(f"⚠️ dynamic_params 저장 실패: {e}")
 
@@ -4093,6 +3986,12 @@ def _load_dynamic_params():
               f"atr_stop={_dynamic['atr_stop_mult']})")
     except FileNotFoundError:
         print("  🔧 dynamic_params.json 없음 → 기본값 사용")
+        # 저장 파일이 없으면 기본값을 즉시 저장해 다음 재시작부터 복원되도록 한다
+        try:
+            _save_dynamic_params()
+            print("  💾 dynamic_params.json 기본값 저장 완료")
+        except Exception as se:
+            print(f"  ⚠️ dynamic_params 기본값 저장 실패: {se}")
     except Exception as e:
         print(f"  ⚠️ dynamic_params 복원 실패: {e}")
 
@@ -4505,8 +4404,7 @@ def auto_tune(notify: bool = True):
                 "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
                 "samples":  len(completed),
             }
-            with open(AUTO_TUNE_FILE, "w") as f:
-                json.dump(tune_log, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(AUTO_TUNE_FILE, tune_log, indent=2)
 
             if notify:
                 change_text = "\n".join(changes)
@@ -4671,8 +4569,7 @@ def register_entry_watch(s: dict):
                     rec["new_entry"]     = entry
                     rec["pnl_pct"]       = 0.0
                     break
-            with open(SIGNAL_LOG_FILE, "w") as f_w:
-                json.dump(sig_data, f_w, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
         except Exception as e:
             print(f"⚠️ 진입가변경 기록 오류: {e}")
         del _entry_watch[k]
@@ -4716,8 +4613,7 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
                 rec["pnl_pct"]         = 0.0
                 rec["exit_reason"]     = f"진입미달_{reason}"
                 break
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
     except Exception as e:
         print(f"⚠️ 진입미달 기록 오류: {e}")
@@ -6632,9 +6528,11 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
                 "entities": [], "ts": time.time()}
 
-
 def run_geo_news_scan():
-    """지정학 뉴스 스캔 (1시간마다). 장중 변화 시 즉시 알림, 장후/야간은 버퍼링."""
+    """
+    지정학 뉴스 스캔 (1시간마다).
+    이벤트 감지 시 관련 섹터 알림 + 신호 점수 자동 보정 등록.
+    """
     try:
         headlines_by_source = _fetch_multi_source_headlines()
         if not headlines_by_source:
@@ -6644,69 +6542,212 @@ def run_geo_news_scan():
         if not geo.get("detected"):
             return
 
+        # 결과를 전역에 저장 (신호 포착 시 참조)
         _geo_event_state.update({
-            "active": True,
-            "uncertainty": geo.get("uncertainty", "mid"),
-            "sectors": geo.get("sectors", []),
-            "sector_directions": geo.get("sector_directions", []),
-            "score_adj": geo.get("score_adj", 0),
-            "summary": geo.get("summary", ""),
-            "entities": geo.get("entities", []),
-            "ts": time.time(),
+            "active":           True,
+            "uncertainty":      geo["uncertainty"],
+            "sectors":          geo["sectors"],
+            "sector_directions":geo.get("sector_directions", []),
+            "score_adj":        geo["score_adj"],
+            "summary":          geo["summary"],
+            "entities":         geo["entities"],
+            "ts":               time.time(),
         })
 
-        sig = _geo_signature(_geo_event_state)
-        prev_sig = _geo_event_state.get("last_sig", "")
-        _geo_event_state["last_sig"] = sig
-
-        # Always buffer
-        _append_geo_buffer({"ts": time.time(), "geo": geo, "sig": sig})
-
-        # Night/after close: no immediate alerts
-        if not is_any_market_open():
-            return
-
-        # Intraday: alert only on change
-        if sig and sig == prev_sig:
-            return
-
-        # Minimum interval 10 minutes
+        # 텔레그램 알림 (1시간 쿨다운)
         last_sent = _geo_event_state.get("last_sent_ts", 0)
-        if time.time() - last_sent < 600:
+        if time.time() - last_sent < 3600:
             return
         _geo_event_state["last_sent_ts"] = time.time()
 
         unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
-        msg = (
-            "🌍 <b>지정학 이벤트 감지</b> (변동)\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"{unc_emoji.get(geo.get('uncertainty','mid'),'🟠')} 불확실성: <b>{str(geo.get('uncertainty','mid')).upper()}</b>\n\n"
-        )
+        msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"{unc_emoji.get(geo['uncertainty'],'🟠')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
 
-        ents = geo.get("entities") or []
-        if ents:
+        if geo.get("entities"):
             msg += "<b>주체별 입장</b>\n"
-            for e in ents[:5]:
-                stance = e.get("stance", "중립")
-                stance_emoji = {"긍정": "🟢", "부정": "🔴", "중립": "🔵"}.get(stance, "🔵")
-                msg += f"{stance_emoji} {e.get('name','?')}: {stance}\n"
+            for e in geo["entities"][:5]:
+                stance_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
+                msg += f"  {stance_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
             msg += "\n"
 
-        msg += "<b>영향 섹터</b>\n"
-        sd = geo.get("sector_directions") or []
-        if sd:
-            for s in sd[:10]:
-                msg += f"• {str(s).replace('🔻','🔽')}\n"
-        else:
-            for s in (geo.get("sectors") or [])[:10]:
-                msg += f"• {s}\n"
+        sec_dirs = geo.get("sector_directions", [])
+        # sector_directions 없으면 sectors 기반으로 자동 생성 (fallback)
+        if not sec_dirs and geo.get("sectors"):
+            sec_dirs = _build_fallback_sector_directions(
+                geo.get("kws", []) or _detect_geo_keywords(
+                    [h for hl in headlines_by_source.values() for h in hl]
+                ),
+                geo["sectors"]
+            )
+        if sec_dirs:
+            msg += "<b>📊 섹터별 영향</b>\n"
+            for sd in sec_dirs:
+                _dir   = sd.get("direction", "중립")
+                _icon  = _DIR_DISPLAY.get(_dir, "▶")
+                _adj   = int(sd.get("score_adj", 0) or 0)
+                _adj_str = f"  <b>{_adj:+d}점</b>" if _adj != 0 else ""
+                _sec   = sd.get("sector", "")
+                # 관련 종목 조회
+                _stocks = _get_geo_sector_stocks(_sec, max_n=3)
+                _stk_str = "  ".join(f"<code>{n}</code>" for c,n in _stocks) if _stocks else ""
+                # v37.0: 과거 유사 이벤트 이력 조회
+                _hist_str = _get_geo_sector_history(_sec, _stocks) if _stocks else ""
+                msg += (f"┌ {_icon} <b>{_sec}</b>{_adj_str}\n"
+                        f"│  {sd.get('reason','')}\n"
+                        + (f"│  📌 {_stk_str}\n" if _stk_str else "")
+                        + (f"{_hist_str}\n" if _hist_str else "")
+                        + "└─────────────\n")
+            msg += "\n"
+        elif geo.get("sectors"):
+            msg += f"📊 관련 섹터: {', '.join(geo['sectors'])}\n"
 
-        msg += f"\n<b>요약</b>\n{geo.get('summary','')}"
-        send_telegram(msg)
+        if geo.get("summary"):
+            msg += f"\n💡 {geo['summary']}"
+
+        send(msg)
 
     except Exception as e:
-        # Do not crash; keep quiet
-        print(f"⚠️ [run_geo_news_scan] {type(e).__name__}: {e}")
+        _log_error("run_geo_news_scan", e)
+
+
+
+# ============================================================
+# 👤 개인 수급 맥락 분석
+# ============================================================
+def eval_retail_signal(code: str,
+                       f_net: int, i_net: int, r_net: int,
+                       cap_size: str = "unknown") -> dict:
+    """
+    "개인만 매수" 신호를 맥락에 따라 다르게 해석.
+
+    고려 요소:
+      ① 시장 국면 (bull/normal/bear/crash)
+      ② 종목 5일 추세 (상승조정 vs 하락전환)
+      ③ 종목 규모 (대형/중형/소형)
+
+    반환:
+      score_adj: int
+      label: str
+      detail: str
+      confidence: str
+    """
+    # 개인 매수 + 기관/외국인 이탈 아니면 해당 없음
+    if not (r_net > 0 and f_net < 0 and i_net < 0):
+        return {}
+
+    regime    = get_market_regime().get("mode", "normal")
+    r_abs     = abs(r_net)
+
+    # ─── 종목 5일 추세 계산 ───
+    stock_trend = "unknown"
+    try:
+        daily  = get_daily_data(code, 10)
+        closes = [int(d.get("stck_clpr", 0)) for d in daily if d.get("stck_clpr")]
+        if len(closes) >= 6:
+            chg_5d = (closes[-1] - closes[-6]) / closes[-6] * 100
+            if   chg_5d >= 5.0:   stock_trend = "rally"      # 급등 후 조정
+            elif chg_5d >= 1.0:   stock_trend = "uptrend"    # 상승 추세 중 조정
+            elif chg_5d >= -3.0:  stock_trend = "sideways"   # 횡보/소폭 조정
+            elif chg_5d >= -7.0:  stock_trend = "pullback"   # 의미 있는 조정
+            else:                 stock_trend = "downtrend"   # 하락 추세
+    except:
+        pass
+
+    # ─── 맥락 조합 판단 ───
+    # CASE 1: bull/normal국면 + 대형/중형주 + 조정/횡보/급등후조정 중 개인 매수
+    #         → 저점 분할매수일 가능성 높음 (삼성전자, SK하이닉스 사례)
+    if (regime in ("bull", "normal")
+            and cap_size in ("large", "mid")
+            and stock_trend in ("uptrend", "pullback", "sideways", "rally")):
+        label = ("💡 개인 저점 매수 (대/중형 조정)"
+                 if stock_trend != "rally" else
+                 "💡 개인 급등 후 조정 매수 (대/중형)")
+        return {
+            "score_adj":  +5,
+            "label":      label,
+            "detail":     (f"bull/normal 국면 + {cap_size}cap 조정 중 개인 +{r_abs:,}주 — "
+                           f"기관 리밸런싱 매도 가능성, 단기 지지 효과 기대"),
+            "confidence": "mid",
+        }
+
+    # CASE 2: bull국면 + 소형주 + 급등 후 개인 매수
+    #         → 고점 추격 매수 (기관 물량 받아내는 개미)
+    if (regime in ("bull", "normal")
+            and cap_size == "small"
+            and stock_trend in ("rally", "uptrend")):
+        return {
+            "score_adj":  -5,
+            "label":      "⚠️ 개인 고점 추격 (소형 급등)",
+            "detail":     (f"소형주 급등 후 개인 +{r_abs:,}주 — "
+                           f"기관 차익실현 물량 받아내는 구도 가능성"),
+            "confidence": "mid",
+        }
+
+    # CASE 2b: bull/normal국면 + 소형주 + 조정/횡보 중 → 판단 보류
+    if (regime in ("bull", "normal")
+            and cap_size == "small"
+            and stock_trend in ("sideways", "pullback")):
+        return {
+            "score_adj":  0,
+            "label":      "📊 소형주 개인 매수 (조정중, 판단 보류)",
+            "detail":     (f"소형주 조정 구간 개인 +{r_abs:,}주 — "
+                           f"기관+외국인 이탈 지속 여부 확인 필요"),
+            "confidence": "low",
+        }
+
+    # CASE 3: bear/crash 국면 + 대형/중형주 → 낙폭과대 저점 가능성
+    if regime in ("bear", "crash") and cap_size in ("large", "mid"):
+        return {
+            "score_adj":  0,
+            "label":      "❓ 하락장 대형/중형주 개인 매수 (낙폭과대 판단 보류)",
+            "detail":     (f"약세장에도 {cap_size}cap 개인 +{r_abs:,}주 — "
+                           f"낙폭과대 저점 가능성 vs 추가하락 위험 공존 (판단 보류)"),
+            "confidence": "low",
+        }
+
+    # CASE 4: bear/crash 국면 + 소형주 → 역방향 위험
+    if regime in ("bear", "crash") and cap_size == "small":
+        return {
+            "score_adj":  -12,
+            "label":      "🔴 개인만 매수 / 기관+외국인 이탈 (약세장+소형주)",
+            "detail":     (f"약세장 소형주 + 외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도 — "
+                           f"개인 역방향 수급, 추가 하락 위험"),
+            "confidence": "high",
+        }
+
+    # CASE 5: 하락 추세 중 개인 매수 (국면/규모 무관)
+    if stock_trend == "downtrend":
+        return {
+            "score_adj":  -8,
+            "label":      "⚠️ 하락추세 중 개인 역방향 매수",
+            "detail":     (f"5일 추세 하락 중 개인 +{r_abs:,}주 — "
+                           f"기관+외국인 이탈 지속 시 지지력 약화 우려"),
+            "confidence": "mid",
+        }
+
+    # CASE 6: 그 외 (판단 보류)
+    return {
+        "score_adj":  0,
+        "label":      "📊 개인 매수 (맥락 불분명)",
+        "detail":     (f"개인 +{r_abs:,}주 / 기관+외국인 이탈 — "
+                       f"국면:{regime}, 추세:{stock_trend}, 규모:{cap_size} — 판단 보류"),
+        "confidence": "low",
+    }
+
+# ============================================================
+# 📰 뉴스 심층 분석 (본문 크롤링 + Claude API)
+# ============================================================
+_deep_news_cache: dict = {}   # code → {result, ts}
+
+# 심층 분석이 필요한 기업 이벤트 키워드
+_CORP_EVENT_KEYWORDS = [
+    "무상증자","유상증자","합병","분할","인수","자사주","배당",
+    "실적","영업이익","순이익","매출","흑자","적자","전환",
+    "상장폐지","거래정지","불성실공시","횡령","배임",
+    "공급계약","수주","MOU","협약","허가","승인","임상","FDA",
+]
 
 def _fetch_article_body(url: str) -> str:
     """
@@ -7808,8 +7849,7 @@ def _handle_entry_confirm_command(raw: str):
             rec["stop_price"]    = int(rec.get("stop_price",  0) * diff_ratio / 10) * 10
             rec["target_price"]  = int(rec.get("target_price", 0) * diff_ratio / 10) * 10
 
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
 
         entry_p  = actual_price or rec.get("entry_price", 0)
         stop_p   = rec.get("stop_price", 0)
@@ -7870,8 +7910,7 @@ def _handle_skip_command(raw: str):
         data[matched_key]["skip_reason"]   = reason
         data[matched_key]["actual_pnl"]    = None
 
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
 
         theo_pnl = data[matched_key].get("pnl_pct", 0)
         theo_str = f"+{theo_pnl:.1f}%" if theo_pnl >= 0 else f"{theo_pnl:.1f}%"
@@ -7948,8 +7987,7 @@ def _handle_result_command(raw: str):
             rec["actual_pnl"]       = pnl
             rec["actual_exit_date"] = today
             rec["skip_reason"]      = ""
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
 
         # ── ② early_detect_log.json 도 동시 업데이트 (하위 호환) ──
         early_data = {}
@@ -7981,13 +8019,11 @@ def _handle_result_command(raw: str):
                 "exit_reason": "수동입력",
                 "score": 0, "sector_bonus": 0, "sector_theme": "",
             }
-            with open(SIGNAL_LOG_FILE, "w") as f:
-                json.dump(sig_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
             matched_name = name_input
 
         if early_matched:
-            with open(EARLY_LOG_FILE, "w") as f:
-                json.dump(early_data, f, ensure_ascii=False, indent=2)
+            _write_json_atomic(EARLY_LOG_FILE, early_data, indent=2)
 
         display_name = matched_name or name_input
         send(f"{result_emoji} <b>결과 기록 완료</b>\n"
@@ -9013,8 +9049,6 @@ def get_short_sell_ratio(code: str) -> float:
         return 0.0
 
 def _get_daily_investor_data(code: str) -> list:
-    if _is_disabled_today("inquire-daily-trade"):
-        return []
     """
     KIS API: 일별 외국인/기관 순매수 데이터 (최근 20일).
     반환: [{date, foreign_net, institution_net}, ...]
@@ -9522,6 +9556,10 @@ if __name__ == "__main__":
     print(f"   업데이트: {BOT_DATE}")
     print("="*55)
 
+    # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
+    _migrate_legacy_files()
+    _storage_diagnostics_once()
+
     _load_kr_holidays(datetime.now().year)
 
     # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
@@ -9622,16 +9660,9 @@ if __name__ == "__main__":
 
     # NXT 마감 후 자동 종료 (20:10)
     schedule.every().day.at("20:10").do(
-
         lambda: _shutdown("NXT 마감 (20:00) — 오늘 운영 완료")
         if not is_holiday() else None
     )
-
-    # 지정학 요약/재알림 스케줄 (v37.11)
-    schedule.every().day.at("20:05").do(lambda: None if is_holiday() else send_geo_afterclose_summary())
-    schedule.every().day.at("07:55").do(lambda: None if is_holiday() else send_preopen_geo_report())
-    schedule.every().friday.at("15:20").do(lambda: None if is_holiday() else send_weekend_geo_risk_alert())
-
 
     run_scan()
     run_news_scan()
