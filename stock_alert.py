@@ -2,7 +2,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-hotfix-errors
+버전: v37.10-hotfix-errors2
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -309,6 +309,43 @@ _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
+# ============================================================
+# 🔒 Endpoint disable flags (avoid repeated 404 spam / unnecessary calls)
+# ============================================================
+_DATA_DIR_EARLY = os.getenv("STOCK_ALERT_DATA_DIR", "/data/stock_alert")
+_DISABLED_STATE_PATH = os.path.join(_DATA_DIR_EARLY, "disabled_endpoints.json")
+def _today_kst() -> str:
+    # TZ is already Asia/Seoul in Railway env; fallback to localtime
+    return datetime.now().strftime("%Y-%m-%d")
+
+def _load_disabled_state() -> dict:
+    try:
+        if os.path.exists(_DISABLED_STATE_PATH):
+            with open(_DISABLED_STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def _save_disabled_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_DISABLED_STATE_PATH), exist_ok=True)
+        tmp = _DISABLED_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _DISABLED_STATE_PATH)
+    except Exception:
+        pass
+
+_DISABLED = _load_disabled_state()
+
+def _is_disabled_today(key: str) -> bool:
+    return _DISABLED.get(key) == _today_kst()
+
+def _disable_today(key: str) -> None:
+    _DISABLED[key] = _today_kst()
+    _save_disabled_state(_DISABLED)
+
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
 
@@ -760,6 +797,15 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
 
             # For 404/5xx, don't spin too much
             if last_status in (404, 500, 502, 503, 504):
+                # Disable known-missing endpoints for the rest of today to prevent log spam
+                if last_status == 404:
+                    try:
+                        if "chgrate-pcls-100" in url:
+                            _disable_today("chgrate-pcls-100")
+                        if "inquire-daily-trade" in url:
+                            _disable_today("inquire-daily-trade")
+                    except Exception:
+                        pass
                 break
 
         except Exception as e:
@@ -2099,6 +2145,8 @@ def get_stock_price(code: str) -> dict:
     }
 
 def get_upper_limit_stocks() -> list:
+    if _is_disabled_today("chgrate-pcls-100"):
+        return []
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
                      "FHPST01700000", {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
@@ -2340,7 +2388,10 @@ def get_sector_stocks_from_kis(code: str) -> list:
         # 3단계: 위에서도 없으면 등락률 상위 전체에서 한번 더 시도
         if not stocks:
             try:
-                data3 = _safe_get(
+                if _is_disabled_today("chgrate-pcls-100"):
+                    data3 = {}
+                else:
+                    data3 = _safe_get(
                     f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
                     "FHPST01700000",
                     {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170",
@@ -8929,6 +8980,8 @@ def get_short_sell_ratio(code: str) -> float:
         return 0.0
 
 def _get_daily_investor_data(code: str) -> list:
+    if _is_disabled_today("inquire-daily-trade"):
+        return []
     """
     KIS API: 일별 외국인/기관 순매수 데이터 (최근 20일).
     반환: [{date, foreign_net, institution_net}, ...]
