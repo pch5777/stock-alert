@@ -1,13 +1,9 @@
-
-# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
-code = ""
-
 #!/usr/bin/env python3
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-newsdescA
-P26-03-05
+버전: v37.10-all5-hotfix-errors
+날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
@@ -733,25 +729,55 @@ def _headers(tr_id: str) -> dict:
 
 
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises."""
+    """KIS GET with retry/backoff. Never raises.
+    On failure, returns {} and logs useful diagnostics (status/content-type/body snippet).
+    """
     last_err = None
+    last_status = None
+    last_ct = ""
+    last_body = ""
     for attempt in range(3):
         try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 403:
+            last_status = getattr(resp, "status_code", None)
+            last_ct = (resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else "") or ""
+            # Retry token refresh on 403
+            if last_status == 403:
                 global _access_token
                 _access_token = None
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 200:
+                last_status = getattr(resp, "status_code", None)
+                last_ct = (resp.headers.get("Content-Type", "") if hasattr(resp, "headers") else "") or ""
+
+            if last_status == 200:
                 return safe_json_response(resp)
+
+            # Capture a short body snippet for diagnostics (avoid huge logs)
+            try:
+                last_body = (resp.text or "")[:200]
+            except Exception:
+                last_body = ""
+
+            # For 404/5xx, don't spin too much
+            if last_status in (404, 500, 502, 503, 504):
+                break
+
         except Exception as e:
             last_err = e
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
+
+    # Build a stable error message (never None)
+    err_msg = None
+    if last_err is not None:
+        err_msg = str(last_err)
+    else:
+        err_msg = f"status={last_status} ct={last_ct} body={last_body}"
+
     try:
-        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
+        print(f"⚠️ API 오류 ({tr_id}): url={url} {err_msg}")
     except Exception:
         pass
     return {}
@@ -6095,41 +6121,29 @@ _GEO_SECTOR_MAP = {
 _geo_cache: dict = {}  # keyword_hash → {result, ts}
 
 def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
-    """RSS 피드에서 헤드라인+요약(description/summary)을 결합해 수집"""
+    """RSS 피드에서 헤드라인 수집"""
     try:
         resp = requests.get(url, timeout=10, headers=_random_ua())
         if resp.status_code != 200:
             return []
         # xml 파서 없을 수 있으니 html.parser로 fallback
         try:
-            soup = BeautifulSoup(resp.content, "xml")
+            soup  = BeautifulSoup(resp.content, "xml")
             items = soup.find_all("item")
-            if not items:
+            if not items:  # xml 파싱 실패 시 html로 재시도
                 raise ValueError("no items")
-        except Exception:
-            soup = BeautifulSoup(resp.content, "html.parser")
+        except:
+            soup  = BeautifulSoup(resp.content, "html.parser")
             items = soup.find_all("item")
-
         items = items[:max_items]
-        texts: list[str] = []
-        for it in items:
-            title_tag = it.find("title")
-            desc_tag  = it.find("description") or it.find("summary") or it.find("content:encoded")
-            title = title_tag.get_text(" ", strip=True) if title_tag else ""
-            desc  = desc_tag.get_text(" ", strip=True) if desc_tag else ""
-
-            # 너무 길면 잘라서 노이즈/텔레그램 메시지 폭주 방지
-            desc = re.sub(r"\s+", " ", desc).strip()
-            if len(desc) > 220:
-                desc = desc[:220] + "…"
-
-            merged = (title + " " + desc).strip() if desc else title.strip()
-            if merged:
-                texts.append(merged)
-        return texts
-    except Exception:
+        titles = []
+        for i in items:
+            t = i.find("title")
+            if t:
+                titles.append(t.get_text(strip=True))
+        return titles
+    except:
         return []
-
 
 def _fetch_multi_source_headlines() -> dict:
     """
