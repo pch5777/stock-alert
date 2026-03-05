@@ -3,12 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5
+버전: v37.10-all5-fix3
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+v37.10-all5-fix3 (2026-03-05)
+- [Fix] chgrate-pcls-100 404 발생 시 오늘은 랭킹 API 호출 중단(재시도 스팸/지연 제거) → 유니버스 후보군만 사용
 v37.10-all5 (2026-03-05)
 - [ALL] 5개 개선 일괄 적용: (1) 크래시가드+에러로그/1회알림 (2) 레짐피처 저장+리포트 (3) 유니버스 자동확장/축소+다양성 제한 (4) 텔레그램 대시보드(편집 업데이트) (5) 지정학/뉴스 점수보정 통합+소스 자동차단
 
@@ -2434,7 +2437,42 @@ def _rank_from_universe() -> list:
     _UNIVERSE_RANK_CACHE["items"] = items
     return items
 
+
+# --- Rank API disable guard (avoid repeated 404 spam) ---
+_RANK_API_DISABLE_FILE = os.path.join(DATA_DIR, "rank_api_disable.json")
+_rank_api_disable_notified = False
+
+def _rank_api_disabled_today() -> bool:
+    try:
+        if not os.path.exists(_RANK_API_DISABLE_FILE):
+            return False
+        with open(_RANK_API_DISABLE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        disabled_date = str(obj.get("disabled_date", ""))
+        return disabled_date == date.today().isoformat()
+    except Exception:
+        return False
+
+def _disable_rank_api_for_today(reason: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_RANK_API_DISABLE_FILE), exist_ok=True)
+        with open(_RANK_API_DISABLE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"disabled_date": date.today().isoformat(), "reason": reason}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _rank_api_fallback(reason: str) -> list:
+    global _rank_api_disable_notified
+    if not _rank_api_disable_notified:
+        print(f"⚠️ [KIS] chgrate-pcls-100 비활성(오늘) → 유니버스 후보군 사용 ({reason})")
+        _rank_api_disable_notified = True
+    return _rank_from_universe()
+
+
 def get_upper_limit_stocks() -> list:
+    if _rank_api_disabled_today():
+        return _rank_api_fallback('disabled_today')
+
     url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
     params = {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
@@ -2447,8 +2485,8 @@ def get_upper_limit_stocks() -> list:
     data, status, ct, body = _safe_get_meta(url, "FHPST01700000", params)
 
     if status == 404:
-        print("⚠️ [KIS] chgrate-pcls-100 404 → 유니버스 기반 후보군으로 대체")
-        return _rank_from_universe()
+        _disable_rank_api_for_today("404")
+        return _rank_api_fallback("404")
 
     items = [{
         "code": i.get("mksc_shrn_iscd",""), "name": i.get("hts_kor_isnm",""),
@@ -2689,9 +2727,13 @@ def get_sector_stocks_from_kis(code: str) -> list:
 
         # 3단계: 위에서도 없으면 등락률 상위 전체에서 한번 더 시도
         if not stocks:
+            if _rank_api_disabled_today():
+                # 오늘 랭킹 API 비활성화 상태이면 3단계 시도하지 않음
+                return stocks
             try:
-                data3 = _safe_get(
-                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
+                url3 = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
+                data3, status3, ct3, body3 = _safe_get_meta(
+                    url3,
                     "FHPST01700000",
                     {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170",
                      "FID_INPUT_ISCD":"0000","FID_RANK_SORT_CLS_CODE":"0",
@@ -2701,6 +2743,9 @@ def get_sector_stocks_from_kis(code: str) -> list:
                      "FID_TRGT_EXLS_CLS_CODE":"0","FID_DIV_CLS_CODE":"0",
                      "FID_RSFL_RATE1":"-30","FID_RSFL_RATE2":"30"}
                 )
+                if status3 == 404:
+                    _disable_rank_api_for_today("404")
+                    return stocks
                 for i in data3.get("output",[]):
                     peer_code = i.get("mksc_shrn_iscd","")
                     if not peer_code or peer_code == code: continue
