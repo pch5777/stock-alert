@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.11-hotfix3
+버전: v37.11-hotfix4
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+v37.11-hotfix4 (2026-03-05)
+  - Railway 시작 즉시 크래시: datetime.date.today() 호출 오류 수정 (datetime.now().date() 사용)
+  - (유지) 404/장애 엔드포인트 일일 자동 비활성 로딩 로직 정상화
+
+v37.11-hotfix3 (2026-03-05)
+  - SyntaxError(unterminated string literal) 방지: response body 요약 시 줄바꿈 치환을 이스케이프("\\n", "\\r")로 고정
 
 v37.11-hotfix2 (2026-03-05)
   - __doc__ 파싱 실패로 봇/업데이트 unknown 뜨던 문제 수정(도큐스트링을 파일 최상단 첫 문장으로 고정)
@@ -511,13 +518,13 @@ def _save_disabled_endpoints(obj: dict) -> None:
         pass
 
 _DISABLED_ENDPOINTS = _load_disabled_endpoints()
-_DISABLED_TODAY = _DISABLED_ENDPOINTS.get(datetime.date.today().isoformat(), {})
+_DISABLED_TODAY = _DISABLED_ENDPOINTS.get(datetime.now().date().isoformat(), {})
 
 def _disable_endpoint_today(key: str, reason: str) -> None:
     """Disable an endpoint key for the rest of today (persisted)."""
     try:
         _DISABLED_TODAY[key] = {"reason": reason, "ts": datetime.datetime.now().isoformat(timespec="seconds")}
-        _DISABLED_ENDPOINTS[datetime.date.today().isoformat()] = _DISABLED_TODAY
+        _DISABLED_ENDPOINTS[datetime.now().date().isoformat()] = _DISABLED_TODAY
         _save_disabled_endpoints(_DISABLED_ENDPOINTS)
     except Exception:
         pass
