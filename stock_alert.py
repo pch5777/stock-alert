@@ -3,12 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix6
-날짜: 2026-03-05
+버전: v37.10-all5-fix7
+P26-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+v37.10-all5-fix7 (2026-03-05)
+- [Fix] GEO_SECTOR_BIAS 전역 기본값을 실제 코드에 선언하여 신호 저장 오류 제거
 
 v37.10-all5-fix6 (2026-03-05)
 - [Fix] get_us_market_signals: compute_market_regime 호출 시 nasdaq_fut_pct NameError 제거(nasdaq_chg 사용)
@@ -51,6 +54,11 @@ import hashlib
 import traceback
 import re as _re
 
+
+
+# --- Global state defaults (to prevent NameError at runtime) ---
+GEO_SECTOR_BIAS: dict = {}
+MARKET_REGIME: dict = {"label": "unknown", "details": {}}
 
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
@@ -3264,7 +3272,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     # [v37.10-all5] 지정학/뉴스 섹터 바이어스(점수 보정)
     geo_bias = 0
     try:
-        geo_bias = int(GEO_SECTOR_BIAS.get(theme_name, 0) or 0)
+        geo_bias = int(globals().get('GEO_SECTOR_BIAS', {}).get(theme_name, 0) or 0)
     except Exception:
         geo_bias = 0
     if not peers:
@@ -3578,7 +3586,7 @@ def save_signal_log(stock: dict):
             "grade":        stock.get("grade", "B"),
             "market_regime": MARKET_REGIME.get("label","unknown"),
             "market_regime_det": MARKET_REGIME.get("details",{}),
-            "geo_sector_bias": GEO_SECTOR_BIAS,
+            "geo_sector_bias": globals().get('GEO_SECTOR_BIAS', {}),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "detect_date":  datetime.now().strftime("%Y%m%d"),
