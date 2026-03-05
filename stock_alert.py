@@ -3,12 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix4
+버전: v37.10-all5-fix6
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+v37.10-all5-fix6 (2026-03-05)
+- [Fix] get_us_market_signals: compute_market_regime 호출 시 nasdaq_fut_pct NameError 제거(nasdaq_chg 사용)
+- [Fix] GEO_SECTOR_BIAS 기본값 정의로 신호 저장 오류 제거
 
 v37.10-all5-fix4 (2026-03-05)
 - [Fix] MARKET_REGIME 기본값/compute_market_regime 추가(NameError 제거)
@@ -10084,7 +10088,7 @@ def get_us_market_signals() -> dict:
             "dxy": dxy, "us_regime": us_regime, "gap_signal": gap_signal,
             "score_adj": score_adj, "summary": summary
         })
-        MARKET_REGIME.update(compute_market_regime(nasdaq_fut_pct, vix, dxy))
+        MARKET_REGIME.update(compute_market_regime(nasdaq_chg, vix, dxy))
         _us_cache.update(result)
         print(f"  🌐 미국 시장: {summary}")
 
