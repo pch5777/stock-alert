@@ -88,6 +88,7 @@ import re as _re
 # --- Global state defaults (to prevent NameError at runtime) ---
 GEO_SECTOR_BIAS: dict = {}
 MARKET_REGIME: dict = {"label": "unknown", "details": {}}
+LAST_SCAN_STATS: dict = {"candidates": 0, "excluded": 0, "detected_last": 0, "detected_today": 0, "date": ""}
 
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
@@ -2018,6 +2019,9 @@ def refresh_dynamic_candidates():
         for code, name in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
+        LAST_SCAN_STATS["candidates"] = len(_dynamic_candidates)
+        LAST_SCAN_STATS["excluded"] = excluded_cnt
+        LAST_SCAN_STATS["date"] = datetime.now().strftime("%Y-%m-%d")
         print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -5534,6 +5538,8 @@ def update_dashboard(force: bool = False) -> None:
     except Exception:
         tracked_n = 0
     regime = (MARKET_REGIME.get("label") or "neutral")
+    regime_ko_map = {"risk_on": "강세장", "neutral": "보통장", "risk_off": "약세장", "panic": "패닉장", "unknown": "보통장"}
+    regime_ko = regime_ko_map.get(str(regime), str(regime))
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -5553,8 +5559,9 @@ def update_dashboard(force: bool = False) -> None:
 
     text = (
         "📌 <b>운영 대시보드</b>\n"
-        f"• 레짐: <b>{regime}</b>{det_txt}\n"
+        f"• 레짐: <b>{regime_ko}</b>{det_txt}\n"
         f"• 진입 감시: <b>{tracked_n}</b> 종목\n"
+        f"• 오늘: 후보군 <b>{LAST_SCAN_STATS.get('candidates',0)}</b> / 제외 <b>{LAST_SCAN_STATS.get('excluded',0)}</b> / 포착 <b>{LAST_SCAN_STATS.get('detected_today',0)}</b>\n"
     )
     if perf:
         text += f"• 오늘 성과: {perf}\n"
@@ -10447,6 +10454,13 @@ def run_scan():
 
         if not alerts: print("  → 조건 충족 없음")
         else:
+            LAST_SCAN_STATS["detected_last"] = len(alerts)
+            # reset day if changed
+            today = datetime.now().strftime("%Y-%m-%d")
+            if LAST_SCAN_STATS.get("date") != today:
+                LAST_SCAN_STATS["detected_today"] = 0
+                LAST_SCAN_STATS["date"] = today
+            LAST_SCAN_STATS["detected_today"] = int(LAST_SCAN_STATS.get("detected_today", 0)) + len(alerts)
             print(f"  → {len(alerts)}개 감지! [{regime_label()}]")
             for s in alerts:
                 is_nxt = s.get("market") == "NXT"
