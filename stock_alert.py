@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix7
+버전: v37.10-all5-fix9d
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -117,6 +117,17 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     t = now.time()
     return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
+# ── Simple throttles to reduce Telegram spam ────────────────────────────────
+_LAST_ALERT_TS: dict[str, int] = {}
+
+def _throttle_ok(store: dict, key: str, cooldown_sec: int) -> bool:
+    now = int(time.time())
+    last = int(store.get(key, 0) or 0)
+    if now - last < cooldown_sec:
+        return False
+    store[key] = now
+    return True
+
 
 # Market regime snapshot (updated periodically; safe default)
 MARKET_REGIME: dict = {"label": "unknown", "detail": {}}
@@ -5470,6 +5481,14 @@ def _save_dashboard_state(state: dict) -> None:
         pass
 
 def update_dashboard(force: bool = False) -> None:
+    # ensure MARKET_REGIME is populated; fall back to US signals if needed
+    try:
+        us = get_us_market_signals()
+        if isinstance(us, dict) and us.get('us_regime'):
+            MARKET_REGIME['label'] = us.get('us_regime') or MARKET_REGIME.get('label','neutral')
+    except Exception:
+        pass
+
     """대시보드 메시지(1개)를 편집 업데이트해서 메시지량 감소."""
     global _LAST_DASHBOARD_TS
     now = time.time()
@@ -5482,8 +5501,7 @@ def update_dashboard(force: bool = False) -> None:
         tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
     except Exception:
         tracked_n = 0
-
-    regime = MARKET_REGIME.get("label", "unknown")
+    regime = (MARKET_REGIME.get("label") or "neutral")
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -5617,6 +5635,16 @@ def _sector_block(s: dict) -> str:
     return block + "━━━━━━━━━━━━━━━\n\n"
 
 def send_alert(s: dict):
+    # throttle repetitive alerts (reduce spam)
+    try:
+        st = s.get('signal_type','')
+        if st in ('UPPER_LIMIT','NEAR_UPPER'):
+            key = f"{st}:{s.get('code','')}"
+            if not _throttle_ok(_LAST_ALERT_TS, key, 3600):
+                return
+    except Exception:
+        pass
+
     emoji = {"UPPER_LIMIT":"🚨","NEAR_UPPER":"🔥","STRONG_BUY":"💎",
              "SURGE":"📈","ENTRY_POINT":"🎯","EARLY_DETECT":"🔍"}.get(s["signal_type"],"📊")
     title = {"UPPER_LIMIT":"상한가 감지","NEAR_UPPER":"상한가 근접","STRONG_BUY":"강력 매수 신호",
