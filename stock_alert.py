@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.12-hotfix-news7
+버전: v37.13-hotfix-ui1
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.13-hotfix-ui1 (2026-03-05): 운영 대시보드 레짐(label) 표시를 한글화(regime_label_ko 적용)하고 레짐 매핑을 확장.
 
 - v37.12-hotfix-news7 (2026-03-05): RSS/XML 파싱을 표준 XML 파서(ElementTree) 우선으로 변경하여 XMLParsedAsHTMLWarning 제거 및 뉴스 스캔 안정성 개선.
 
@@ -93,12 +95,23 @@ import re as _re
 
 # === Regime label localization (Korean) ===
 REGIME_KO_MAP = {
+    # common
     "risk_on": "강세장",
     "neutral": "보통장",
     "risk_off": "약세장",
     "panic": "패닉장",
     "unknown": "보통장",
+
+    # extra aliases (in case upstream labels differ)
+    "bullish": "강세장",
+    "bearish": "약세장",
+    "flat": "보통장",
+    "sideways": "보통장",
+    "volatile": "변동성장",
+    "high_vol": "변동성장",
+    "low_vol": "안정장",
 }
+
 
 def regime_label_ko(label: str) -> str:
     try:
@@ -5588,7 +5601,8 @@ def update_dashboard(force: bool = False) -> None:
         tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
     except Exception:
         tracked_n = 0
-    regime = (MARKET_REGIME.get("label") or "neutral")
+    raw_regime = (MARKET_REGIME.get("label") or "neutral")
+    regime = regime_label_ko(raw_regime)
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
