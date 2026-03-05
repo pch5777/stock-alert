@@ -3,19 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.19-watch-labels1
-날짜: 2026-03-05
+버전: v37.21-stable1
+날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.19-watch-labels1 (2026-03-05): 섹터 모니터링 및 '뉴스+주가 연동' 알림의 종목 리스트에서 포착/진입감시 상태 표기(진입가 도달 시 평가손익 %, 미도달 표시) 추가. (진입가 대비 현재가 기준)
-
-- v37.16-profit-guard2-ui2 (2026-03-05): 장전 워치리스트 발송 시간을 07:55 → 07:30으로 변경(비장중 이슈 반영 포함). 야간 무알림 구간도 20:00~07:30으로 조정.
-
-- v37.14-profit-guard1 (2026-03-05): (1) 장마감 전/후 '진입가 도달(entry_hit)' 감시 종목에 대해 지정학/뉴스/DART/지표 리스크 감지 시 손익 방어 가이드 자동 알림(쿨다운 포함). (2) 비장중(장종료/휴장) 이슈(지정학 섹터영향 + DART 강재료)를 07:30 익개장 워치리스트에 반영하여 섹터·종목 후보 알림.
-
-- v37.12-hotfix-news7 (2026-03-05): RSS/XML 파싱을 표준 XML 파서(ElementTree) 우선으로 변경하여 XMLParsedAsHTMLWarning 제거 및 뉴스 스캔 안정성 개선.
+- v37.21-stable1 (2026-03-06): [Fix] DASHBOARD_UPDATE_EVERY_SEC/DASHBOARD_STATE_FILE/_LAST_DASHBOARD_TS 기본값 정의로 메인루프 NameError 방지. [Fix] 장전 워치리스트 스케줄 07:55 잔존분을 07:30으로 통일. [Fix] 야간 무알림 구간 20:00~07:30 정합성 복구.
 
 - v37.11-hotfix-news6 (2026-03-05): 뉴스 소스 3→6 확장(타이틀+description 사용), 시작 배너 문구 갱신. 상품(B) 제외/상한가 쿨다운/404 비활성화는 유지.
 
@@ -39,11 +33,11 @@ v37.10-all5 (2026-03-05)
 - [ALL] 5개 개선 일괄 적용: (1) 크래시가드+에러로그/1회알림 (2) 레짐피처 저장+리포트 (3) 유니버스 자동확장/축소+다양성 제한 (4) 텔레그램 대시보드(편집 업데이트) (5) 지정학/뉴스 점수보정 통합+소스 자동차단
 
 v37.9-universe3 (2026-03-05)
-- 오버나이트 위험 알림: 20:00~07:30 야간에는 즉시 발송 금지(저장만) → 07:30 워치리스트 요약에 함께 재알림
+- 오버나이트 위험 알림: 20:00~07:55 야간에는 즉시 발송 금지(저장만) → 07:55 워치리스트 요약에 함께 재알림
 
 v37.9-universe2 (2026-03-05)
 - 장 종료(비장중)에는 '급등 상위' 후보군 생성 스킵 → 익개장 워치리스트 생성/저장
-- 익개장 07:30 워치리스트 요약 알림(야간 무알림)
+- 익개장 07:55 워치리스트 요약 알림(야간 무알림)
 
 v37.9-universe1 (2026-03-05)
 - KIS 랭킹 API(chgrate-pcls-100) 404 시 유니버스 기반 후보군 생성으로 자동 대체
@@ -161,7 +155,6 @@ _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
-import xml.etree.ElementTree as ET
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -174,7 +167,7 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     """Quiet night window: 20:00~07:30 (no push; store only)."""
     now = now or _now_kst()
     t = now.time()
-    return (t >= dtime(20, 0)) or (t < dtime(7, 55))
+    return (t >= dtime(20, 0)) or (t < dtime(7, 30))
 from bs4 import BeautifulSoup
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
@@ -253,6 +246,13 @@ DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
 )
 DATA_DIR = os.path.abspath(DATA_DIR)
+
+# ============================================================
+# 🧾 Dashboard runtime settings (prevent NameError)
+# ============================================================
+DASHBOARD_UPDATE_EVERY_SEC = int(os.getenv('DASHBOARD_UPDATE_EVERY_SEC', '600') or '600')
+DASHBOARD_STATE_FILE = os.path.join(DATA_DIR, 'dashboard_state.json')
+_LAST_DASHBOARD_TS = 0.0
 
 MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
 _BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -603,32 +603,6 @@ SECTOR_MONITOR_MAX_HOURS = 6
 
 # ── 진입가 감지 ──
 _entry_watch        = {}
-
-def _watch_status_suffix(code: str, current_price: int) -> str:
-    """감시 종목이면 상태/수익률을 짧게 표기한다. (진입가 대비 현재가 기준 평가손익)
-    - 진입가 도달: ✅ (+x.x%)
-    - 진입가 미도달: ⏳ (미도달)
-    """
-    try:
-        if not code or not _entry_watch:
-            return ""
-        # 같은 코드가 여러 감시로 있을 수 있어 최신 등록을 사용
-        cand = [w for w in _entry_watch.values() if w.get("code") == code]
-        if not cand:
-            return ""
-        w = max(cand, key=lambda x: x.get("registered_ts", 0))
-        entry_price = safe_int(w.get("entry_price", 0))
-        if entry_price <= 0:
-            return " ⏳ (미도달)"
-        if not w.get("entry_hit", False):
-            return " ⏳ (미도달)"
-        cur = safe_int(current_price)
-        if cur <= 0:
-            return " ✅"
-        pnl = (cur / entry_price - 1.0) * 100.0
-        return f" ✅ ({pnl:+.1f}%)"
-    except Exception:
-        return ""
 ENTRY_TOLERANCE_PCT  = 2.0   # 진입가 ±2% 이내 → 진입 구간
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
@@ -2031,99 +2005,8 @@ def build_next_open_watchlist(max_codes: int = 30) -> dict:
         print(f"⚠️ 워치리스트 저장 실패: {e}")
     return payload
 
-def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
-    """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
-    반환: [{code,name,title,grade}, ...]
-    """
-    if not DART_API_KEY:
-        return []
-    out = []
-    try:
-        today = datetime.now().strftime("%Y%m%d")
-        dates = [today]
-        if days_back >= 1:
-            yday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-            dates.append(yday)
-
-        # 키워드 우선순위
-        strong = DART_KEYWORDS.get("매우강함", []) + DART_KEYWORDS.get("강함", [])
-        strong = [k for k in strong if k]
-
-        seen = set()
-        for d in dates:
-            dart_list = _fetch_dart_list(d) if DART_API_KEY else []
-            for it in (dart_list or []):
-                title = (it.get("report_nm") or it.get("title") or "").strip()
-                code  = normalize_stock_code(it.get("stock_code") or it.get("stock_code") or it.get("stock_code"))
-                if not title or not code:
-                    continue
-                # 리스크 공시는 제외 (손익 방어 쪽에서 따로 처리)
-                if any(rk in title for rk in DART_RISK_KEYWORDS):
-                    continue
-                hit_kw = next((k for k in strong if k in title), None)
-                if not hit_kw:
-                    continue
-                key = (code, title)
-                if key in seen:
-                    continue
-                seen.add(key)
-                name = _lookup_name_by_code(code)
-                grade = "매우강함" if any(k in title for k in DART_KEYWORDS.get("매우강함", [])) else "강함"
-                out.append({"code": code, "name": name, "title": title, "grade": grade})
-                if len(out) >= max_items:
-                    return out
-    except Exception as e:
-        _log_error("_scan_recent_dart_materials", e)
-    return out
-
-def _build_preopen_issue_section(max_lines: int = 12) -> str:
-    """장전(07:30) 워치리스트에 붙일 '이슈 기반 섹터/종목' 섹션 생성."""
-    lines = []
-    try:
-        # 1) 지정학/거시 이슈(섹터 방향)
-        geo = _geo_event_state or {}
-        if geo.get("active") and time.time() - float(geo.get("ts", 0) or 0) < 3600 * 12:
-            sec_dirs = geo.get("sector_directions", []) or []
-            if not sec_dirs and geo.get("sectors"):
-                # sector_directions가 없으면 fallback 생성
-                sec_dirs = _build_fallback_sector_directions(geo.get("kws", []) or [], geo.get("sectors") or [])
-            # 상승 섹터만 상위 3개
-            ups = [sd for sd in sec_dirs if str(sd.get("direction","")) in ("상승","up","positive","bull")]
-            if ups:
-                lines.append("🌍 이슈(지정학) 기반 유리 섹터")
-                for sd in ups[:3]:
-                    sec = sd.get("sector","")
-                    reason = (sd.get("reason","") or "").strip()
-                    stocks = _get_geo_sector_stocks(sec, max_n=3) if sec else []
-                    stk = " / ".join([n for c,n in stocks]) if stocks else ""
-                    if stk:
-                        lines.append(f" • {sec}: {stk}")
-                    else:
-                        lines.append(f" • {sec}")
-                    if reason:
-                        lines.append(f"   - {reason}")
-        # 2) DART 강재료(전일~금일)
-        darts = _scan_recent_dart_materials(days_back=1, max_items=5)
-        if darts:
-            lines.append("📢 공시(DART) 강재료 후보")
-            for d in darts[:5]:
-                nm = d.get("name") or d.get("code")
-                title = d.get("title","")
-                grade = d.get("grade","")
-                lines.append(f" • {nm}: {grade} — {title}")
-    except Exception:
-        pass
-
-    # 길이 제한
-    lines = [ln for ln in lines if ln.strip()]
-    if not lines:
-        return ""
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + ["…(생략)"]
-    return "\n".join(lines)
-
 def send_preopen_watchlist():
-    """익개장 전(07:30) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
+    """익개장 전(07:30) 워치리스트 요약 전송"""
     try:
         data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
         codes = data.get("codes") if isinstance(data, dict) else None
@@ -2145,15 +2028,6 @@ def send_preopen_watchlist():
                 msg += "\n\n" + "\n".join(_lines)
         except Exception:
             pass
-
-        # NEW: off-hours issues (geo sectors + DART strong materials)
-        try:
-            issue_sec = _build_preopen_issue_section()
-            if issue_sec:
-                msg += "\n\n" + issue_sec
-        except Exception:
-            pass
-
         send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
@@ -3918,7 +3792,7 @@ def send_overnight_risk_alerts():
 
         # Quiet night: do not push; only store
         if _is_quiet_night():
-            print("💤 야간(20:00~07:30): 오버나이트 위험 알림 저장만 수행")
+            print("💤 야간(20:00~07:55): 오버나이트 위험 알림 저장만 수행")
             return
 
         send(msg)
@@ -5571,180 +5445,6 @@ def check_entry_watch():
     for k in expired:
         _entry_watch.pop(k, None)
 
-# ============================================================
-# 🛡 장마감 전/후 손익 방어 가이드 (entry_hit 감시 종목)
-#   - '진입가 도달' 후 모니터링 중인 종목에
-#     지정학/뉴스/DART/지표 리스크가 생기면 손익 방어 안내를 자동 발송
-# ============================================================
-DEFENSE_KRX_CLOSE_WINDOW_MIN = int(os.getenv("DEFENSE_KRX_CLOSE_WINDOW_MIN", "25") or "25")  # 15:05~15:30
-DEFENSE_NXT_CLOSE_WINDOW_MIN = int(os.getenv("DEFENSE_NXT_CLOSE_WINDOW_MIN", "25") or "25")  # 19:35~20:00
-DEFENSE_ALERT_COOLDOWN_SEC   = int(os.getenv("DEFENSE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 30분
-DEFENSE_LOSS_WARN_PCT        = float(os.getenv("DEFENSE_LOSS_WARN_PCT", "1.2") or "1.2")  # -1.2% 이하면 경고 강화
-DEFENSE_PROFIT_LOCK_PCT      = float(os.getenv("DEFENSE_PROFIT_LOCK_PCT", "2.0") or "2.0")  # +2% 이상이면 익절 방어 권고
-
-_NEG_NEWS_KWS = [
-    "급락","하락","쇼크","우려","불확실","리스크","제재","관세","전쟁","공습","미사일","충돌","봉쇄",
-    "압수수색","검찰","조사","횡령","배임","파산","회생","워크아웃","상장폐지","거래정지","관리종목",
-    "하향","경고","부정","적자전환","실적부진","리콜","사고","해킹",
-]
-
-def _is_close_defense_window(now: datetime | None = None) -> bool:
-    now = now or _now_kst()
-    t = now.time()
-    # KRX: 15:30 마감 기준
-    krx_start = (datetime.combine(now.date(), dtime(15,30), tzinfo=_KST) - timedelta(minutes=DEFENSE_KRX_CLOSE_WINDOW_MIN)).time()
-    krx_end   = dtime(15,30)
-    # NXT: 20:00 마감 기준 (NXT만 열릴 수도 있음)
-    nxt_start = (datetime.combine(now.date(), dtime(20,0), tzinfo=_KST) - timedelta(minutes=DEFENSE_NXT_CLOSE_WINDOW_MIN)).time()
-    nxt_end   = dtime(20,0)
-    in_krx = (t >= krx_start and t <= krx_end)
-    in_nxt = (t >= nxt_start and t <= nxt_end)
-    return in_krx or in_nxt
-
-def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> tuple[int, list[str]]:
-    """리스크 점수(0~100)와 사유 리스트 반환."""
-    score = 0
-    reasons = []
-    try:
-        # 1) DART 리스크
-        try:
-            dr = check_dart_risk(code, name)
-            if isinstance(dr, dict) and dr.get("is_risk"):
-                score += 60
-                reasons.append(f"⚠️ DART 리스크: {dr.get('title','')}".strip())
-        except Exception:
-            pass
-
-        # 2) 지정학/거시 리스크(시장)
-        try:
-            geo = _geo_event_state or {}
-            if geo.get("active") and time.time() - float(geo.get("ts",0) or 0) < 3600*12:
-                unc = str(geo.get("uncertainty","mid"))
-                adj = int(geo.get("score_adj",0) or 0)
-                if unc == "high" and adj <= -5:
-                    score += 20
-                    reasons.append("🌍 지정학 불확실성(HIGH) — 시장 리스크오프 가능")
-                elif adj <= -8:
-                    score += 15
-                    reasons.append("🌍 지정학 이벤트 — 변동성 확대 가능")
-        except Exception:
-            pass
-
-        # 3) 최근 뉴스(타이틀 기반 간단 필터)
-        try:
-            news = fetch_news_for_stock(code, name) or []
-            hits = []
-            for n in news[:10]:
-                for kw in _NEG_NEWS_KWS:
-                    if kw in n and kw not in hits:
-                        hits.append(kw)
-            if hits:
-                score += 15
-                reasons.append(f"📰 부정 키워드 감지: {', '.join(hits[:4])}")
-        except Exception:
-            pass
-
-        # 4) 가격/손익 상태
-        try:
-            cur = get_stock_price(code) or {}
-            price = int(cur.get("price") or 0)
-            if price and entry:
-                pnl = (price - entry) / entry * 100
-                if pnl <= -DEFENSE_LOSS_WARN_PCT:
-                    score += 20
-                    reasons.append(f"📉 진입가 대비 {pnl:.1f}% (방어 필요)")
-                elif pnl >= DEFENSE_PROFIT_LOCK_PCT:
-                    score += 10
-                    reasons.append(f"📈 진입가 대비 +{pnl:.1f}% (익절 방어 권장)")
-                # 손절선 근접
-                if stop_loss and price <= stop_loss * 1.01:
-                    score += 20
-                    reasons.append("🛡 손절선 근접(1% 이내)")
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-    score = max(0, min(score, 100))
-    return score, reasons
-
-def run_entry_defense_monitor():
-    """run_scan 루프에서 호출: 마감 구간에 entry_hit 종목의 리스크를 감지해 손익 방어 가이드 발송."""
-    try:
-        if not _entry_watch:
-            return
-        # 마감 구간이 아니면 불필요한 API 호출 줄이기
-        if not _is_close_defense_window():
-            return
-
-        now_ts = time.time()
-        use_nxt = (not is_market_open()) and is_nxt_open()
-
-        for _k, w in list(_entry_watch.items()):
-            if not isinstance(w, dict):
-                continue
-            if not w.get("entry_hit"):
-                continue
-
-            # 쿨다운(종목별)
-            last = float(w.get("defense_last_ts", 0) or 0)
-            if now_ts - last < DEFENSE_ALERT_COOLDOWN_SEC:
-                continue
-
-            code = w.get("code")
-            name = w.get("name") or code
-            entry = int(w.get("entry_price") or 0)
-            stop  = int(w.get("stop_loss") or 0)
-            if not code or not entry:
-                continue
-
-            # 현재가
-            cur = get_nxt_stock_price(code) if use_nxt else get_stock_price(code)
-            price = int((cur or {}).get("price") or 0)
-            if not price:
-                continue
-
-            risk_score, reasons = _detect_defense_issues(code, name, entry, stop)
-            if risk_score < 35 or not reasons:
-                continue
-
-            pnl = (price - entry) / entry * 100 if entry else 0.0
-
-            # 가이드 구성(실전 수익 방어 중심)
-            guide = []
-            if pnl >= DEFENSE_PROFIT_LOCK_PCT:
-                guide.append("✅ <b>수익 방어</b>: 1차 분할익절(예: 30~50%) + 잔량은 <b>진입가/단기저점 이탈 시 정리</b>")
-                guide.append("✅ <b>트레일링</b>: 전일저가 또는 5분 저점 기준으로 손절선을 끌어올리기")
-            else:
-                guide.append("🛡 <b>손실 방어</b>: 손절선 엄수(이탈 시 기계적으로 정리) + 무리한 물타기 금지")
-                guide.append("🛡 <b>리스크 발생</b>: 변동성 확대 구간이므로 진입/추가매수는 보수적으로")
-
-            # 마감 임박 추가 코멘트
-            if is_nxt_open() and not is_market_open():
-                guide.append("🔵 <b>NXT 단독 시간</b>: 유동성 얇음 → 슬리피지/급변 가능, 보수적 대응 권장")
-            else:
-                guide.append("⏳ <b>장마감 임박</b>: 뉴스/공시 충격은 익일 갭으로 이어질 수 있어 방어 우선")
-            parts = [
-                f"🛡 <b>[손익 방어 알림]</b> (리스크 {risk_score}/100)",
-                "━━━━━━━━━━━━━━━",
-                f"<b>{name}</b>  <code>{code}</code>",
-                f"현재가 <b>{price:,}</b> / 진입 {entry:,}  ({pnl:+.1f}%)",
-                (f"손절 {stop:,}" if stop else ""),
-                "━━━━━━━━━━━━━━━",
-                *reasons[:4],
-                "━━━━━━━━━━━━━━━",
-                *guide[:4],
-            ]
-            msg = "\n".join([p for p in parts if p])
-            send_with_chart_buttons(msg, code, name)
-
-            # 기록
-            w["defense_last_ts"] = now_ts
-
-    except Exception as e:
-        _log_error("run_entry_defense_monitor", e)
-
 def send_with_chart_buttons(text: str, code: str, name: str):
     """
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
@@ -5894,8 +5594,7 @@ def update_dashboard(force: bool = False) -> None:
         tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
     except Exception:
         tracked_n = 0
-    raw_regime = (MARKET_REGIME.get("label") or "neutral")
-    regime = regime_label_ko(raw_regime)
+    regime = (MARKET_REGIME.get("label") or "neutral")
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -6020,13 +5719,11 @@ def _sector_block(s: dict) -> str:
     for r in rising[:5]:
         src_tag  = " 🔗" if r.get("source") == "동적테마" else ""
         vol_tag  = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
-        suffix = _watch_status_suffix(r.get('code',''), r.get('price', 0))
-        block   += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}{suffix}\n"
+        block   += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
 
     for r in flat[:3]:
         src_tag = " 🔗" if r.get("source") == "동적테마" else ""
-        suffix = _watch_status_suffix(r.get('code',''), r.get('price', 0))
-        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%{src_tag}{suffix}\n"
+        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%{src_tag}\n"
 
     return block + "━━━━━━━━━━━━━━━\n\n"
 
@@ -7493,71 +7190,34 @@ def _strip_html(text: str) -> str:
         return (text or "").strip()
 
 def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
-    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)
-
-    - RSS/Atom은 대개 XML이므로 HTML 파서로 파싱하면 bs4가 XMLParsedAsHTMLWarning 경고를 띄울 수 있음.
-    - 운영 로그 노이즈를 줄이고 파싱 신뢰성을 올리기 위해 표준 XML 파서(ElementTree)를 우선 사용.
-    - XML이 깨진(비정상) 소스는 최후에만 BeautifulSoup(html.parser)로 fallback.
-    """
+    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)"""
     try:
         resp = requests.get(url, timeout=12, headers=_random_ua())
         if resp.status_code != 200:
             return []
-
-        xml_text = (resp.text or "").strip()
-        if not xml_text:
-            return []
-
-        # 1) XML 우선 파싱 (경고/의존성 없이 안정적)
+        # xml 파서 없을 수 있으니 html.parser로 fallback
         try:
-            root = ET.fromstring(xml_text)
-
-            # RSS: <item>, Atom: <entry>
-            items = root.findall(".//{*}item")
-            if not items:
-                items = root.findall(".//{*}entry")
-
-            titles = []
-            for it in items[:max_items]:
-                # RSS
-                t = it.find(".//{*}title")
-                d = it.find(".//{*}description")
-
-                # Atom (summary/content)
-                if d is None:
-                    d = it.find(".//{*}summary") or it.find(".//{*}content")
-
-                title = _strip_html((t.text or "").strip()) if t is not None else ""
-                desc  = _strip_html((d.text or "").strip()) if d is not None else ""
-                if not title:
-                    continue
-
-                if desc and desc != title:
-                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
-                    titles.append(f"{title} — {desc}")
-                else:
-                    titles.append(title)
-            return titles
-
-        except Exception:
-            # 2) 최후 fallback: BS4 html parser (경고 가능)
-            soup = BeautifulSoup(xml_text, "html.parser")
+            soup = BeautifulSoup(resp.text, "xml")
             items = soup.find_all("item")
-            titles = []
-            for i in items[:max_items]:
-                tt = i.find("title")
-                dd = i.find("description")
-                title = _strip_html(tt.get_text(strip=True)) if tt else ""
-                desc  = _strip_html(dd.get_text(strip=True)) if dd else ""
-                if not title:
-                    continue
-                if desc and desc != title:
-                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
-                    titles.append(f"{title} — {desc}")
-                else:
-                    titles.append(title)
-            return titles
+        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            items = soup.find_all("item")
 
+        titles = []
+        for i in items[:max_items]:
+            t = i.find("title")
+            d = i.find("description")
+            title = _strip_html(t.get_text(strip=True)) if t else ""
+            desc  = _strip_html(d.get_text(strip=True)) if d else ""
+            if not title:
+                continue
+            # 내용도 참고: title — desc (너무 길면 축약)
+            if desc and desc != title:
+                desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                titles.append(f"{title} — {desc}")
+            else:
+                titles.append(title)
+        return titles
     except:
         return []
 def _fetch_gdelt_headlines(max_items: int = 25) -> list:
@@ -8444,22 +8104,10 @@ def analyze_news_theme(headlines: list = None) -> list:
 def send_news_theme_alert(signal: dict):
     emoji = {"매우강함":"🔥","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"📢")
     react_pct = int(signal["react_ratio"]*100)
-    rising_lines = []
-    for s in signal["rising"]:
-        suffix = _watch_status_suffix(s.get("code",""), s.get("price", 0))
-        rising_lines.append(
-            f"  📈 <b>{s['name']}</b> {s['change_rate']:+.1f}%"
-            +(f" 🔊{s['volume_ratio']:.0f}x" if s.get("vol_on") else "")
-            +(" 🚀" if s.get("surging") else "")
-            +f"{suffix}\n"
-        )
-    rising_block = "".join(rising_lines)
-
-    not_yet_lines = []
-    for s in signal["not_yet"]:
-        suffix = _watch_status_suffix(s.get("code",""), s.get("price", 0))
-        not_yet_lines.append(f"  ⏳ {s['name']} {s['change_rate']:+.1f}%{suffix}\n")
-    not_yet_block = "".join(not_yet_lines)
+    rising_block = "".join([f"  📈 <b>{s['name']}</b> {s['change_rate']:+.1f}%"
+                             +(f" 🔊{s['volume_ratio']:.0f}x" if s["vol_on"] else "")
+                             +(" 🚀" if s["surging"] else "")+"\n" for s in signal["rising"]])
+    not_yet_block = "".join([f"  ⏳ {s['name']} {s['change_rate']:+.1f}%\n" for s in signal["not_yet"]])
     send(f"{emoji} <b>[뉴스+주가 연동]</b>  {signal['signal_strength']}\n"
          f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
          f"📰 <b>{signal['theme_desc']}</b>\n💬 {signal['headline']}...\n\n"
@@ -10919,7 +10567,6 @@ def run_scan():
                 # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
         check_entry_watch()     # ★ 진입가 도달 체크
-        run_entry_defense_monitor()  # 🛡 장마감 손익 방어 가이드
         check_reentry_watch()   # ★ 손절 후 재진입 감시
         track_signal_results()  # ★ 추적 중 신호 결과 체크
     except Exception as e: _log_error("run_scan", e, critical=True)
