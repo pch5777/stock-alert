@@ -87,6 +87,22 @@ import traceback
 import re as _re
 
 
+# === Regime label localization (Korean) ===
+REGIME_KO_MAP = {
+    "risk_on": "강세장",
+    "neutral": "보통장",
+    "risk_off": "약세장",
+    "panic": "패닉장",
+    "unknown": "보통장",
+}
+
+def regime_label_ko(label: str) -> str:
+    try:
+        return REGIME_KO_MAP.get((label or "").strip().lower(), "보통장")
+    except Exception:
+        return "보통장"
+
+
 
 # --- Global state defaults (to prevent NameError at runtime) ---
 GEO_SECTOR_BIAS: dict = {}
