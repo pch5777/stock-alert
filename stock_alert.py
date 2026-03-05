@@ -3,13 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.14-profit-guard1
+버전: v37.16-profit-guard2-ui2
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.14-profit-guard1 (2026-03-05): (1) 장마감 전/후 '진입가 도달(entry_hit)' 감시 종목에 대해 지정학/뉴스/DART/지표 리스크 감지 시 손익 방어 가이드 자동 알림(쿨다운 포함). (2) 비장중(장종료/휴장) 이슈(지정학 섹터영향 + DART 강재료)를 07:55 익개장 워치리스트에 반영하여 섹터·종목 후보 알림.
+- v37.16-profit-guard2-ui2 (2026-03-05): 장전 워치리스트 발송 시간을 07:55 → 07:30으로 변경(비장중 이슈 반영 포함). 야간 무알림 구간도 20:00~07:30으로 조정.
+
+- v37.14-profit-guard1 (2026-03-05): (1) 장마감 전/후 '진입가 도달(entry_hit)' 감시 종목에 대해 지정학/뉴스/DART/지표 리스크 감지 시 손익 방어 가이드 자동 알림(쿨다운 포함). (2) 비장중(장종료/휴장) 이슈(지정학 섹터영향 + DART 강재료)를 07:30 익개장 워치리스트에 반영하여 섹터·종목 후보 알림.
 
 - v37.12-hotfix-news7 (2026-03-05): RSS/XML 파싱을 표준 XML 파서(ElementTree) 우선으로 변경하여 XMLParsedAsHTMLWarning 제거 및 뉴스 스캔 안정성 개선.
 
@@ -35,11 +37,11 @@ v37.10-all5 (2026-03-05)
 - [ALL] 5개 개선 일괄 적용: (1) 크래시가드+에러로그/1회알림 (2) 레짐피처 저장+리포트 (3) 유니버스 자동확장/축소+다양성 제한 (4) 텔레그램 대시보드(편집 업데이트) (5) 지정학/뉴스 점수보정 통합+소스 자동차단
 
 v37.9-universe3 (2026-03-05)
-- 오버나이트 위험 알림: 20:00~07:55 야간에는 즉시 발송 금지(저장만) → 07:55 워치리스트 요약에 함께 재알림
+- 오버나이트 위험 알림: 20:00~07:30 야간에는 즉시 발송 금지(저장만) → 07:30 워치리스트 요약에 함께 재알림
 
 v37.9-universe2 (2026-03-05)
 - 장 종료(비장중)에는 '급등 상위' 후보군 생성 스킵 → 익개장 워치리스트 생성/저장
-- 익개장 07:55 워치리스트 요약 알림(야간 무알림)
+- 익개장 07:30 워치리스트 요약 알림(야간 무알림)
 
 v37.9-universe1 (2026-03-05)
 - KIS 랭킹 API(chgrate-pcls-100) 404 시 유니버스 기반 후보군 생성으로 자동 대체
@@ -167,7 +169,7 @@ def _now_kst() -> datetime:
     return datetime.now(_KST)
 
 def _is_quiet_night(now: datetime | None = None) -> bool:
-    """Quiet night window: 20:00~07:55 (no push; store only)."""
+    """Quiet night window: 20:00~07:30 (no push; store only)."""
     now = now or _now_kst()
     t = now.time()
     return (t >= dtime(20, 0)) or (t < dtime(7, 55))
@@ -2047,7 +2049,7 @@ def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
     return out
 
 def _build_preopen_issue_section(max_lines: int = 12) -> str:
-    """장전(07:55) 워치리스트에 붙일 '이슈 기반 섹터/종목' 섹션 생성."""
+    """장전(07:30) 워치리스트에 붙일 '이슈 기반 섹터/종목' 섹션 생성."""
     lines = []
     try:
         # 1) 지정학/거시 이슈(섹터 방향)
@@ -2093,7 +2095,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
     return "\n".join(lines)
 
 def send_preopen_watchlist():
-    """익개장 전(07:55) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
+    """익개장 전(07:30) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
     try:
         data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
         codes = data.get("codes") if isinstance(data, dict) else None
@@ -3888,7 +3890,7 @@ def send_overnight_risk_alerts():
 
         # Quiet night: do not push; only store
         if _is_quiet_night():
-            print("💤 야간(20:00~07:55): 오버나이트 위험 알림 저장만 수행")
+            print("💤 야간(20:00~07:30): 오버나이트 위험 알림 저장만 수행")
             return
 
         send(msg)
@@ -5864,7 +5866,8 @@ def update_dashboard(force: bool = False) -> None:
         tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
     except Exception:
         tracked_n = 0
-    regime = (MARKET_REGIME.get("label") or "neutral")
+    raw_regime = (MARKET_REGIME.get("label") or "neutral")
+    regime = regime_label_ko(raw_regime)
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -10974,7 +10977,7 @@ if __name__ == "__main__":
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:55").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
