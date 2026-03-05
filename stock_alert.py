@@ -3983,7 +3983,7 @@ def track_signal_results():
             if log_key in _tracking_notified:  continue
 
             code         = rec["code"]
-            entry        = rec.get("entry_price", 0)
+            entry        = rec.get("virtual_entry_price", rec.get("entry_price", 0))
             stop         = rec.get("stop_price",  0)
             target       = rec.get("target_price", 0)
             detect_date  = rec.get("detect_date", today)
@@ -5335,6 +5335,9 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str) -> None:
             if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
                 rec['entry_hit'] = True
                 rec['entry_hit_time'] = now_s
+                # 가상 진입 기준 고정 (실진입 여부와 무관하게 HIT를 기준으로 학습)
+                rec['virtual_entry_price'] = rec.get('entry_price', rec.get('virtual_entry_price'))
+                rec['virtual_entry_time'] = now_s
                 break
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
     except Exception as e:
@@ -5425,6 +5428,9 @@ def check_entry_watch():
                     watch["code"], watch["name"]
                 )
                 watch['entry_hit'] = True
+                # 가상 진입 기준 고정 (진입가 도달 시점부터)
+                watch['virtual_entry_price'] = watch.get('entry_price', watch.get('virtual_entry_price'))
+                watch['virtual_entry_ts'] = time.time()
                 try:
                     _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''))
                 except Exception:
@@ -5584,10 +5590,18 @@ def update_dashboard(force: bool = False) -> None:
     except Exception:
         tracked_n = 0
     regime = (MARKET_REGIME.get("label") or "neutral")
+    _REGIME_KO = {
+        "risk_on": "강세장",
+        "neutral": "보통장",
+        "risk_off": "약세장",
+        "panic": "패닉장",
+        "unknown": "보통장",
+    }
+    regime = _REGIME_KO.get(str(regime), str(regime))
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
-        fut = det.get("nasdaq_fut_pct")
+        fut = det.get("nasdaq_fut_pct", det.get("nasdaq_chg"))
         vix = det.get("vix")
         dxy = det.get("dxy")
         if fut is not None:
