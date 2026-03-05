@@ -1,287 +1,23 @@
-
-# --- HOTFIX: prevent NameError for stray f-strings using {code} ---
-code = ""
-
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.1-storage2
-날짜: 2026-03-04
+버전: v37.11-hotfix2
+날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.11-geo-weekend1-hotfix1 (2026-03-05)
-- FIX: _deep_news_cache 미정의(NameError)로 뉴스 분석/보유종목 뉴스체크 오류 발생 → 전역 캐시 정의 추가
-
-
-v37.1-storage2 (2026-03-04)
-  [검증] 부팅 시 /data/stock_alert에 .storage_ok 프로브 파일 생성/갱신(로그로 저장 확정)
-  [보호] dynamic_params.json 없을 때 기본값을 즉시 저장하여 다음 재시작부터 복원 가능
-
-v37.1-storage1 (2026-03-04)  ← 현재
-  [보호] STOCK_ALERT_DATA_DIR 기반 영구 저장소(DATA_DIR) 도입 (/data 마운트 대응)
-  [보호] 레거시 JSON 자동 이관(최초 1회) + 시작 시 스토리지 진단 로그 출력
-  [안정] JSON 저장 atomic write(tmp→fsync→replace) + 백업 스냅샷(backups/, 최근 N개 유지)
-  [운영] Railway Variables로 데이터 경로/백업 개수 제어: STOCK_ALERT_DATA_DIR, MAX_STATE_BACKUPS
-
-
-v37.0 (2026-03-02)
-  전체 코드 리뷰 + 15건 버그/성능/안정성 수정 + 지정학 이력 기능
-  [P0] ① fetch_all_news() 스레드 안전성 수정 (Queue 기반)
-  [P0] ② flush_info_alerts() 리스트 동시수정 버그 수정
-  [P0] ③ analyze() 중복 API 호출 제거 (종목당 6+→3회 절감)
-  [P1] ④ is_strict_time() NXT 장전/장후 시간대 추가
-  [P1] ⑤ 도큐스트링 중복 v36~v33 블록 제거 (~80줄 절감)
-  [P1] ⑥ _weekly_report_sent_week 죽은 global 선언 제거
-  [P1] ⑦ Anthropic API 버전 2023-06-01→2024-10-22 업데이트
-  [P1] ⑧ _geo_event_state 전역변수 위치 이동 (사용 전 정의)
-  [P2] ⑨ analyze() 내부 bare except 7개 → _log_error 변환
-  [P2] ⑩ 캐시 자동 정리 _prune_cache() 추가 (메모리 누수 방지)
-  [P2] ⑪ _nxt_unavailable 주 1회 초기화 (불필요 API 호출 제거)
-  [P2] ⑫ RSS 수집 ThreadPoolExecutor 전환 (max_workers=6)
-  [P3] ⑬ _load_dynamic_params() 타입 강제 변환 추가
-  [P3] ⑭ schedule lambda → 명명 함수 추출 (_on_market_open 등)
-  [신규] ⑮ 과거 이력 참조 시스템 — 파일 전체 적용
-     중앙 이력 엔진: _load_signal_history() + 5분 TTL 캐시
-     ⓐ find_similar_patterns 강화 — 동일 종목 전적 + 유사 패턴 2단 표시
-     ⓑ DART 공시 — get_dart_keyword_history() 유사 공시 후 과거 반응
-     ⓒ 장전 브리핑 — 감시 종목 전적 + 시장 국면 이력
-     ⓓ 오버나이트 — 보유 통계 + 국면별 승률
-     ⓔ 주간 리포트 — 이번 주 vs 역대 평균 비교
-     ⓕ /geo 섹터 — 지정학 관련 종목 과거 성과 (기 적용)
-
-v36.0 (2026-03-02)
-  섹터 시각화 전면 강화 + RSS 소스 확장
-  ① 방향 아이콘 교체: ▲/▼/― → 🔺/🔻/▶ (자체 색상 내장)
-  ② 섹터 블록 테두리 형식 적용
-     ┌ 🔺 에너지/정유  +8점
-     │  호르무즈 봉쇄 우려 → 유가 수혜
-     │  📌 S-Oil  GS  SK이노베이션
-     └─────────────
-  ③ RSS 소스 6개→12개 (3개 작동 → 대폭 확장)
-     연합뉴스/Reuters/AP (DNS 차단) → 교체 제거
-     추가: CNBC, Guardian, 매일경제
-     Google News RSS 5개 추가 (지정학·에너지·무역·한국경제·유가·반도체)
-     수집 타임아웃 12초→20초 (소스 증가 대응)
-
-v35.0 (2026-03-02)
-  지정학 섹터 표시 전면 개선
-  ① 섹터명 앞 색상 원(🔴🟢🔵) 완전 제거
-  ② "▲ 상승" / "▼ 하락" 텍스트 제거 → 화살표만 (▲/▼/―)
-  ③ _GEO_SECTOR_STOCKS 신규 — 섹터별 대표 종목 풀 정의
-     정유·방산·반도체·자동차·조선·해운 등 25개 섹터
-     THEME_MAP + 동적 테마(_dynamic_theme_map) 4단계 조회
-  ④ _get_geo_sector_stocks() 신규 — 직접매핑→부분매핑→THEME_MAP→동적테마 순
-  ⑤ 섹터 표시에 📌 관련 종목 3개 자동 추가 (코드+종목명)
-     run_geo_news_scan / /geo 명령어 핸들러 동시 적용
-
-v34.2 (2026-03-02)
-  BOT_VERSION 하드코딩 제거 → 도큐스트링 자동 파싱으로 교체
-  버전: 줄 하나만 수정하면 봇 표시·백업·상태 메시지 전체 자동 반영
-  중복 버전 불일치 문제 원천 차단
-
-v34.1 (2026-03-02)
-  "Unknown format code 'd' for object of type 'str'" 오류 수정
-  ① score_adj 전체 int() 안전 처리 (API JSON → 문자열로 올 때 대비)
-     run_geo_news_scan / analyze() fallback / /geo 핸들러
-     analyze_news_deep / detect_force_pattern / eval_retail_signal / get_us_market_signals
-  ② /geo 명령어 핸들러 화살표 형식 동기화
-     구버전(📈/📉/➡️) → 신버전(🟢▲/🔴▼/🔵―) + └ 이유 표시
-     sector_directions 없으면 fallback 자동 생성 적용
-
-v34.0 (2026-03-02)
-  지정학 섹터 방향 화살표 시각화 + auto_tune 샘플 누적 연동
-  ① 방향 표시 전면 교체
-     📈/📉/➡️ → 🟢 ▲ 상승 / 🔴 ▼ 하락 / 🔵 ― 중립
-     섹터명 아래 └ 이유 한 줄 항상 표시
-  ② analyze() 지정학 보정 강화
-     하락 섹터 + 일반 신호 → 최소 -8점 패널티 강제
-     feat_w_geo 가중치 실제 적용 (auto_tune 조정값 반영)
-     _geo_adj_applied 변수로 실제 적용된 점수 추적
-  ③ feature_flags geo 필드 추가
-     geo_active / geo_uncertainty / geo_sector_adj
-     → auto_tune 샘플 누적·기여도 학습 대상에 포함
-  ④ _DEFAULT_DYNAMIC feat_w_geo 추가
-     auto_tune이 지정학 기여도 분석 후 가중치 자동 조정
-  ⑤ /stats 기능별 가중치에 "지정학 보정" 항목 추가
-
-v33.1 (2026-03-02)
-  지정학 섹터 방향 표시 누락 수정
-  ① max_tokens 600→1000 (sector_directions JSON 잘림 방지)
-  ② _build_fallback_sector_directions() 신규 — API 없거나 응답 미포함 시
-     감지 키워드(전쟁/유가/무역)로 섹터별 상승📈/하락📉/중립➡️ 자동 추론
-  ③ run_geo_news_scan: sector_directions 비어있으면 sectors 기반 자동 채움
-     → 단순 나열 대신 항상 방향·이유·점수 표시
-
-v33.0 (2026-03-02)
-  ① DART 리스크 실시간 차단 필터 (analyze() 직접 연동)
-     - 매수 신호 생성 직전 최근 5일 DART 공시 종목별 조회
-     - 횡령/배임/상장폐지/거래정지/조사 등 → 신호 완전 차단
-     - 캐시 10분 (API 과호출 방지)
-  ② 보유 종목(carry_stocks) 뉴스/공시 실시간 악재 감시
-     - track_signal_results() 내 30분마다 자동 체크
-     - DART 위험 공시 감지 → 🚨 즉시 매도 알림
-     - analyze_news_deep 부정 판정 → ⚠️ 매도 검토 알림
-     - 중복 방지 (_tracking_notified 활용)
-
-v32.3 (2026-03-02)
-  개인 수급 단순 악재 단정 → 맥락 기반 5단계 판단으로 전면 교체
-  시가총액(cap_size) 대/중/소형 분류 추가
-  CASE1: bull+대형조정 개인매수 → 저점분할 +5점
-  CASE2: bull+소형급등 개인매수 → 고점추격 -5점
-  CASE3: bear/crash 개인매수 → 역방향 경고 -12점
-  CASE4: 하락추세 개인매수 → 주의 -8점
-  CASE5: 그 외 → 0점 판단보류
-  analyze_signal / detect_force_pattern / DART 전체 적용
-
-v32.2 (2026-03-02)
-  면책 문구 제거
-  개인(prsn) 수급 데이터 추가 (기존 외국인+기관 2자 → 3자 구도)
-  💎 외국인+기관 매수+개인 매도 = 최강 수급구도 감지 (+30점)
-  ⚠️ 개인만 매수+기관+외국인 이탈 = 역방향 경고 (-10점)
-  DART 알림 / analyze_signal 모두 적용
-
-v32.1 (2026-03-02)
-  수급 이상 패턴 감지 전면 개선 (총 9가지 패턴)
-  신규: 분봉 일정간격 분할매수 / 분봉 분산(dump) 징후
-  신뢰도 한글 표시 (신뢰높음/참고용)
-  면책 문구 자동 포함
-  단정 표현 제거 (통계적 패턴 강조)
-  추적 중 이탈 경고 패턴별 상세 설명 추가
-
-v32.0 (2026-03-02)
-  뉴스 심층 분석 전면 적용 (본문 크롤링 + Claude API)
-  ① analyze_signal: 헤드라인 키워드 → 본문 기반 실질 호악재 판단
-  ② DART 공시: 무상증자/합병 등 기업이벤트 실질 영향 분석
-  ③ 뉴스 알림: 헤드라인 나열 → 판단근거+리스크포인트 포함
-  표면호재실질악재 / 표면악재실질호재 자동 감지
-  API 없으면 기존 키워드 분석 자동 fallback
-
-v31.9 (2026-03-02)
-  섹터별 주가 방향 예측 추가 (상승📈/하락📉/중립➡️)
-  섹터 이름만 표시 → 방향+이유+점수 보정으로 개선
-  신호 포착 시 섹터별 개별 점수 보정 적용
-
-v31.8 (2026-03-02)
-  RSS 파서 수정 (xml→html.parser fallback)
-  RSS URL 안정 버전으로 교체
-  모든 소스 실패 시 국내 뉴스 fallback 추가
-  /geo 소스별 수집 현황 표시
-
-v31.7 (2026-03-02)
-  공휴일/주말 즉시 종료 → 대기 모드로 변경
-  대기 모드: 명령어(/us /geo /stats 등) + 오버나이트 모니터만 동작
-
-v31.6 (2026-03-02)
-  ① /geo — 지정학 분석 수동 실행
-  ② /us — 미국 시장 현황 즉시 조회
-  ③ /overnight — 오버나이트 위험도 수동 실행
-  ④ /test — 전체 기능 점검 가이드
-
-v31.5 (2026-03-02)
-  ① 지정학 이벤트 다중 주체 분석 (Claude API)
-     Reuters/AlJazeera/BBC/AP/연합/한경 RSS 6개 소스
-     주체별 입장 자동 추출 → 불확실성 지수 계산
-     관련 섹터 자동 매핑 → 신호 점수 보정
-  ② 오버나이트 모니터 + 브리핑 지정학 이벤트 연동
-  ③ ANTHROPIC_API_KEY 없으면 키워드 fallback 자동 전환
-
-v31.4 (2026-03-02)
-  ① 오버나이트 모니터링 (20:10~08:40, 30분 주기)
-     나스닥/VIX 국면 변화 감지 → 즉시 텔레그램 알림
-  ② 08:50 브리핑에 오버나이트 이벤트 요약 포함
-  ③ 장 시작 시 오버나이트 상태 자동 초기화
-
-v31.3 (2026-03-02)
-  ① 오버나이트 위험 알림: 마감 후→마감 전으로 타이밍 수정
-     KRX 15:10 / NXT 19:40 (매도 가능 시간)
-  ② 추적 중 위험도 급등 시 실시간 즉시 알림 추가
-
-v31.2 (2026-03-02)
-  ① 오버나이트 위험: NXT 시간대 반영 + 20:05 NXT 마감 후 알림 추가
-  ② 테마 로테이션: 브리핑 외 포착 시 점수 보정 + 추적 중 약세 전환 경고 추가
-
-v31.1 (2026-03-02)
-  ① 기관 연속 순매수 (외국인 버그 수정 + 기관 추가, 동시 매수 시너지)
-  ② 공시 전 이상 거래량 감지 (선매수 세력 포착)
-  ③ 매물대/지지저항선 자동 계산 (Volume Profile)
-  ④ 오버나이트 위험도 알림 (15:35 자동 발송)
-  ⑤ 테마 로테이션 감지 (08:50 브리핑 포함)
-  ⑥ 놓친 수익 추적 (/stats 포함)
-
-v31.0 (2026-03-02)
-  ① 미국 시장 선행 지표 연동 (나스닥선물/VIX/달러인덱스 → 국면 자동 보정)
-  ② 갭 예측 (미국 마감 기반 → 08:50 브리핑 포함)
-  ③ 공매도 잔고 비율 (5%↑ 감점, 10%↑ 추가 감점)
-  ④ 외국인 연속 순매수/도일 (3일↑ 가중/감점)
-  ⑤ 뉴스 감성 분석 (긍정/부정 키워드 → 점수 자동 보정)
-
-v30.9 (2026-03-01)
-  ① max_same_sector → filter_portfolio_signals 실제 연결
-  ② ATR fallback 손절/목표 → 고정 0.93/1.15 제거, 국면 배수 적용
-
-v30.8 (2026-03-01)
-  ① feat_w_sector → sector_bonus 점수에 실제 적용 (연결 누락 수정)
-  ② feat_w_nxt → nxt_delta 점수에 실제 적용 (연결 누락 수정)
-  ③ REENTRY_BOUNCE_PCT dead constant 제거
-
-v30.7 (2026-03-01)
-  ① ATR 일별 캐시 (종목당 하루 1회만 계산, 불필요한 API 호출 제거)
-
-v30.6 (2026-03-01)
-  ① 트레일링 스탑 ATR+국면 기반 (고정 -3% 제거)
-  ② 상승이탈 기준 ATR+국면 기반 (고정 10% 제거)
-  ③ 진입가 허용범위 ATR+국면 기반 (고정 2% 제거)
-  ④ 재진입 반등 기준 ATR+국면 기반 (고정 3% 제거)
-  ⑤ 분할 청산 트리거 ATR 기반 (고정 3% 제거)
-
-v30.5 (2026-03-01)
-  ① /진입 명령어 추가 (실제 진입 확인 → /stats 내 실제 수익 집계)
-  ② 트레일링 스탑 (목표가 도달 후 고점 -3% 시 자동 청산)
-  ③ 연속 수익 공격 모드 (4회 연속 수익 → 최소점수 완화)
-  ④ 이론/실제 수익 분리 (auto_tune=이론 전체, /stats=이론+내실제 분리)
-  ⑤ 중앙 에러 로거 _log_error() (반복 오류 텔레그램 경고)
-  ⑥ 섹터 감시 기간 동적 확장 (최대 24시간)
-  ⑦ entry_pullback_ratio → 실제 진입가 계산에 연결
-  ⑧ 재포착 시 signal_log "진입가변경" 자동 기록
-  ⑨ auto_tune 진입미달 패턴 분석 (상승이탈/기간만료/재포착별 비율 자동조정)
-  ⑩ /stats 진입미달 통계 블록 추가
-
-v30.4 (2026-03-01)
-  ① /진입 명령어 + Railway 400시간 주석
-  ② 공휴일 즉시 종료 + 20:10 자동 종료
-  ③ NXT 단독 시간대 국면/손익비/포지션 보정
-
-v30.3 (2026-03-01)
-  ① 실질 섹터 분류 4레이어 (상관계수+동반상승+DART지분+뉴스)
-  ② NXT 시간대 국면 보수적 적용
-  ③ 기능별 가중치 auto_tune 자동 조정
-
-v30.0 (2026-03-01)
-  ① 실질 섹터 스코어 기반 포트폴리오 중복 제거
-  ② DART 지분 관계 함수 추가
-  ③ 기능 기여도 추적 + 가중치 자동 조정
-
-v29.0 (2026-03-01)
-  ① 시장 국면 판단 (bull/normal/bear/crash)
-  ② Kelly 기반 포지션 사이징
-  ③ 손익비 동적 최적화 (국면별 ATR 배수)
-  ④ 실적 발표 필터 (DART API)
-  ⑤ 포트폴리오 관리 (동시 신호 중복 섹터 제거)
-
-v28.0 (2026-03-01)
-  ① RSI 보조지표 추가 (과매수 신호 차단, 과매도 눌림목 우대)
-  ② 이동평균 정배열 필터 (역배열 시 신호 차단)
-  ③ 볼린저밴드 돌파 가중 (+15점)
-  ④ 유사패턴 매칭 (signal_log 기반 과거 성공률 표시)
-  ⑤ 모든 파라미터 auto_tune 자동 최적화 연동
-  ⑥ 알림 메시지에 보조지표 요약 표시
+v37.11-hotfix2 (2026-03-05)
+  - __doc__ 파싱 실패로 봇/업데이트 unknown 뜨던 문제 수정(도큐스트링을 파일 최상단 첫 문장으로 고정)
+  - _safe_get()가 status!=200일 때 None만 찍던 문제 수정: status/content-type/body 일부까지 출력
+  - 404 엔드포인트는 오늘 1회만 시도 후 자동 비활성(재시작해도 유지)
 
 """
 
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
+import json
 import re as _re
 
 
@@ -330,143 +66,6 @@ BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 import os, requests, time, schedule, json, random, threading, math
 from datetime import datetime, time as dtime, timedelta
 from bs4 import BeautifulSoup
-
-# ============================================================
-# 💾 Persistent Storage (코드 교체/배포에도 데이터 보존)
-#   - Railway Volume(/data) + 환경변수 STOCK_ALERT_DATA_DIR 지원
-#   - 파일은 모두 DATA_DIR 아래로 강제
-#   - JSON 저장은 atomic write + 백업 스냅샷(최근 N개)로 보호
-# ============================================================
-DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
-    os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
-)
-DATA_DIR = os.path.abspath(DATA_DIR)
-
-MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
-_BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-
-_PERSIST_FILES = [
-    "signal_log.json",
-    "dynamic_params.json",
-    "carry_stocks.json",
-    "early_detect_log.json",
-    "auto_tune_log.json",
-    "dynamic_themes.json",
-    "news_cooccur.json",
-    "compact_mode.json",
-]
-
-def _ensure_dir(path: str):
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception as e:
-        print(f"⚠️ DATA_DIR 생성 실패: {path} ({e})")
-
-def _snapshot_backup(file_path: str):
-    """기존 파일이 있으면 backups로 스냅샷 백업(최근 N개 유지)"""
-    try:
-        if not os.path.isfile(file_path):
-            return
-        _ensure_dir(_BACKUP_DIR)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = os.path.basename(file_path)
-        backup_path = os.path.join(_BACKUP_DIR, f"{base}.{ts}.bak")
-        # copy (binary safe)
-        with open(file_path, "rb") as rf, open(backup_path, "wb") as wf:
-            wf.write(rf.read())
-
-        # prune old backups
-        backups = sorted(
-            [p for p in os.listdir(_BACKUP_DIR) if p.startswith(base + ".")],
-            reverse=True,
-        )
-        for old in backups[MAX_STATE_BACKUPS:]:
-            try:
-                os.remove(os.path.join(_BACKUP_DIR, old))
-            except:
-                pass
-    except Exception as e:
-        print(f"⚠️ 백업 스냅샷 실패: {os.path.basename(file_path)} ({e})")
-
-def _atomic_write_bytes(file_path: str, data: bytes):
-    """tmp → fsync → os.replace 로 원자적 저장"""
-    _ensure_dir(os.path.dirname(file_path))
-    tmp_path = file_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, file_path)
-
-def _write_json_atomic(file_path: str, obj, indent: int = 2):
-    try:
-        _snapshot_backup(file_path)
-        payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
-        _atomic_write_bytes(file_path, payload)
-    except Exception as e:
-        print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
-
-def _migrate_legacy_files():
-    """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
-    try:
-        cwd = os.getcwd()
-        for fn in _PERSIST_FILES:
-            legacy = os.path.join(cwd, fn)
-            target = os.path.join(DATA_DIR, fn)
-            if os.path.isfile(legacy) and not os.path.isfile(target):
-                _ensure_dir(DATA_DIR)
-                try:
-                    with open(legacy, "rb") as rf, open(target, "wb") as wf:
-                        wf.write(rf.read())
-                    print(f"✅ 레거시 파일 이관: {fn} → {target}")
-                except Exception as e:
-                    print(f"⚠️ 레거시 이관 실패: {fn} ({e})")
-    except Exception as e:
-        print(f"⚠️ 레거시 이관 로직 오류: {e}")
-
-def _storage_diagnostics_once():
-    """시작 시 1회: DATA_DIR/볼륨/쓰기 가능 여부/파일 목록 출력"""
-    try:
-        _ensure_dir(DATA_DIR)
-        _ensure_dir(_BACKUP_DIR)
-        rp = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
-        print("=======================================================")
-        print("💾 Persistent Storage Check")
-        print(f"   DATA_DIR: {DATA_DIR}")
-        if rp:
-            print(f"   RAILWAY_VOLUME_MOUNT_PATH: {rp}")
-        # writable test
-        test_path = os.path.join(DATA_DIR, ".write_test")
-        try:
-            with open(test_path, "w", encoding="utf-8") as f:
-                f.write(datetime.now().isoformat())
-            os.remove(test_path)
-            print("   Writable: ✅ OK")
-            # persistent probe file (kept) to prove writes survive redeploys
-            probe_path = os.path.join(DATA_DIR, ".storage_ok")
-            try:
-                with open(probe_path, "w", encoding="utf-8") as f:
-                    f.write(datetime.now().isoformat())
-                print(f"   Probe file: {probe_path} ✅ wrote")
-            except Exception as pe:
-                print(f"   Probe file: ❌ FAIL ({pe})")
-        except Exception as e:
-            print(f"   Writable: ❌ FAIL ({e})")
-        # list key files
-        existing = []
-        for fn in _PERSIST_FILES:
-            fp = os.path.join(DATA_DIR, fn)
-            if os.path.isfile(fp):
-                try:
-                    size = os.path.getsize(fp)
-                    existing.append(f"{fn}({size}B)")
-                except:
-                    existing.append(fn)
-        print("   Files:", ", ".join(existing) if existing else "(none)")
-        print("=======================================================")
-    except Exception as e:
-        print(f"⚠️ 스토리지 진단 실패: {e}")
-
 
 # --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
 def extract_ai_text(resp_json):
@@ -548,8 +147,8 @@ MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
 MAX_CARRY_DAYS        = 3
-CARRY_FILE            = os.path.join(DATA_DIR, "carry_stocks.json")
-EARLY_LOG_FILE        = os.path.join(DATA_DIR, "early_detect_log.json")
+CARRY_FILE            = "carry_stocks.json"
+EARLY_LOG_FILE        = "early_detect_log.json"
 
 # ATR
 ATR_PERIOD       = 5
@@ -673,10 +272,10 @@ _early_volume_min_dynamic = EARLY_VOLUME_MIN
 
 # ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
 _dynamic_theme_map  = {}
-DYNAMIC_THEME_FILE  = os.path.join(DATA_DIR, "dynamic_themes.json")
+DYNAMIC_THEME_FILE  = "dynamic_themes.json"
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
-NEWS_COOCCUR_FILE   = os.path.join(DATA_DIR, "news_cooccur.json")
+NEWS_COOCCUR_FILE   = "news_cooccur.json"
 
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -702,7 +301,7 @@ _news_reverse_cache: dict = {}
 # ── 컴팩트 알림 모드 ──
 # True면 1~2줄 요약, False면 기존 상세 포맷
 _compact_mode: bool = False
-COMPACT_MODE_FILE   = os.path.join(DATA_DIR, "compact_mode.json")
+COMPACT_MODE_FILE   = "compact_mode.json"
 
 def _load_compact_mode():
     global _compact_mode
@@ -884,36 +483,122 @@ def _headers(tr_id: str) -> dict:
             "tr_id":tr_id,"custtype":"P"}
 
 
+def _load_disabled_endpoints() -> dict:
+    """Load per-endpoint disable flags persisted on the /data volume."""
+    try:
+        data_dir = os.getenv("STOCK_ALERT_DATA_DIR", "/data/stock_alert")
+        p = os.path.join(data_dir, "disabled_endpoints.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _save_disabled_endpoints(obj: dict) -> None:
+    try:
+        data_dir = os.getenv("STOCK_ALERT_DATA_DIR", "/data/stock_alert")
+        os.makedirs(data_dir, exist_ok=True)
+        p = os.path.join(data_dir, "disabled_endpoints.json")
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+_DISABLED_ENDPOINTS = _load_disabled_endpoints()
+_DISABLED_TODAY = _DISABLED_ENDPOINTS.get(datetime.date.today().isoformat(), {})
+
+def _disable_endpoint_today(key: str, reason: str) -> None:
+    """Disable an endpoint key for the rest of today (persisted)."""
+    try:
+        _DISABLED_TODAY[key] = {"reason": reason, "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+        _DISABLED_ENDPOINTS[datetime.date.today().isoformat()] = _DISABLED_TODAY
+        _save_disabled_endpoints(_DISABLED_ENDPOINTS)
+    except Exception:
+        pass
+
+def _is_disabled_today(key: str) -> bool:
+    try:
+        return key in _DISABLED_TODAY
+    except Exception:
+        return False
+
 def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises."""
-    last_err = None
+    """KIS GET with retry/backoff. Never raises. Logs status/body on failure."""
+    # Endpoint key: path without query + tr_id
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path
+    except Exception:
+        path = url
+    ep_key = f"{tr_id}:{path}"
+
+    if _is_disabled_today(ep_key):
+        # Avoid spamming logs; caller should handle empty dict.
+        return {}
+
+    last_exc = None
+    last_status = None
+    last_ct = ""
+    last_body = ""
+
     for attempt in range(3):
         try:
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 403:
+            last_status = getattr(resp, "status_code", None)
+            last_ct = (resp.headers.get("Content-Type", "") if getattr(resp, "headers", None) else "")
+            if last_status == 403:
+                # token refresh
                 global _access_token
                 _access_token = None
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            if resp.status_code == 200:
+                last_status = getattr(resp, "status_code", None)
+                last_ct = (resp.headers.get("Content-Type", "") if getattr(resp, "headers", None) else "")
+
+            if last_status == 200:
                 return safe_json_response(resp)
+
+            # For non-200, capture small snippet for diagnosis
+            try:
+                txt = resp.text or ""
+                last_body = txt[:200].replace("
+", " ").replace("", " ")
+            except Exception:
+                last_body = ""
+
+            # 404: endpoint likely not available → disable for today
+            if last_status == 404:
+                _disable_endpoint_today(ep_key, "404")
+                break
+
         except Exception as e:
-            last_err = e
+            last_exc = e
+
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
+
     try:
-        print(f"⚠️ API 오류 ({tr_id}): {last_err}")
+        if last_status is not None:
+            print(f"⚠️ API 오류 ({tr_id}): url={url} status={last_status} ct={last_ct} err={last_exc} body={last_body}")
+        else:
+            print(f"⚠️ API 오류 ({tr_id}): url={url} err={last_exc}")
     except Exception:
         pass
     return {}
+
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
 # ============================================================
 _daily_cache = {}  # code → {items, ts}
 _atr_cache   = {}  # code → {atr, date}  하루 1회 갱신
-_deep_news_cache = {}  # key → {data, ts}  (뉴스 본문/요약 캐시)
 
 def get_daily_data(code: str, days: int = 60) -> list:
     """일봉 데이터 조회 (캐시 30분)"""
@@ -2606,7 +2291,8 @@ def update_news_cooccur(headlines: list):
 
     # 파일 저장 (장 마감 후 분석용)
     try:
-        _write_json_atomic(NEWS_COOCCUR_FILE, _news_cooccur, indent=2)
+        with open(NEWS_COOCCUR_FILE, "w") as f:
+            json.dump(_news_cooccur, f, ensure_ascii=False, indent=2)
     except: pass
 
 def get_news_cooccur_peers(code: str) -> list:
@@ -2958,7 +2644,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # ============================================================
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
-SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 추적 (신규)
+SIGNAL_LOG_FILE = "signal_log.json"   # 모든 신호 추적 (신규)
 
 def _is_real_trade(rec: dict) -> bool:
     """
@@ -3045,7 +2731,8 @@ def save_signal_log(stock: dict):
             "actual_exit_date":  "",
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
         }
-        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
         print(f"⚠️ 신호 저장 오류: {e}")
@@ -3074,7 +2761,8 @@ def save_early_detect(stock: dict):
                 "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
                 "status": "추적중", "pnl_pct": 0, "exit_price": 0, "exit_date": "",
             }
-            _write_json_atomic(EARLY_LOG_FILE, data, indent=2)
+            with open(EARLY_LOG_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ EARLY 저장 오류: {e}")
 
@@ -3635,7 +3323,8 @@ def track_signal_results():
                         except: pass
 
         if updated:
-            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
             # tracker 피드백 즉시 갱신
             load_tracker_feedback()
 
@@ -3887,8 +3576,8 @@ def load_carry_stocks():
 # ============================================================
 # 🧠 자동 조건 조정 엔진
 # ============================================================
-AUTO_TUNE_FILE   = os.path.join(DATA_DIR, "auto_tune_log.json")   # 조정 이력 저장
-DYNAMIC_PARAMS_FILE = os.path.join(DATA_DIR, "dynamic_params.json")  # 조정된 파라미터 영구 저장
+AUTO_TUNE_FILE   = "auto_tune_log.json"   # 조정 이력 저장
+DYNAMIC_PARAMS_FILE = "dynamic_params.json"  # 조정된 파라미터 영구 저장
 MIN_SAMPLES      = 5    # 20→5: 더 빠르게 반응 (적은 샘플로도 조정)
 
 # 동적 조정 변수 (기본값 = 파라미터 원본값)
@@ -3949,7 +3638,8 @@ def _save_dynamic_params():
     → Railway 재시작 후에도 조정값 유지
     """
     try:
-        _write_json_atomic(DYNAMIC_PARAMS_FILE, _dynamic, indent=2)
+        with open(DYNAMIC_PARAMS_FILE, "w") as f:
+            json.dump(_dynamic, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ dynamic_params 저장 실패: {e}")
 
@@ -3986,12 +3676,6 @@ def _load_dynamic_params():
               f"atr_stop={_dynamic['atr_stop_mult']})")
     except FileNotFoundError:
         print("  🔧 dynamic_params.json 없음 → 기본값 사용")
-        # 저장 파일이 없으면 기본값을 즉시 저장해 다음 재시작부터 복원되도록 한다
-        try:
-            _save_dynamic_params()
-            print("  💾 dynamic_params.json 기본값 저장 완료")
-        except Exception as se:
-            print(f"  ⚠️ dynamic_params 기본값 저장 실패: {se}")
     except Exception as e:
         print(f"  ⚠️ dynamic_params 복원 실패: {e}")
 
@@ -4404,7 +4088,8 @@ def auto_tune(notify: bool = True):
                 "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
                 "samples":  len(completed),
             }
-            _write_json_atomic(AUTO_TUNE_FILE, tune_log, indent=2)
+            with open(AUTO_TUNE_FILE, "w") as f:
+                json.dump(tune_log, f, ensure_ascii=False, indent=2)
 
             if notify:
                 change_text = "\n".join(changes)
@@ -4569,7 +4254,8 @@ def register_entry_watch(s: dict):
                     rec["new_entry"]     = entry
                     rec["pnl_pct"]       = 0.0
                     break
-            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
+            with open(SIGNAL_LOG_FILE, "w") as f_w:
+                json.dump(sig_data, f_w, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"⚠️ 진입가변경 기록 오류: {e}")
         del _entry_watch[k]
@@ -4613,7 +4299,8 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
                 rec["pnl_pct"]         = 0.0
                 rec["exit_reason"]     = f"진입미달_{reason}"
                 break
-        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
         print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
     except Exception as e:
         print(f"⚠️ 진입미달 기록 오류: {e}")
@@ -7849,7 +7536,8 @@ def _handle_entry_confirm_command(raw: str):
             rec["stop_price"]    = int(rec.get("stop_price",  0) * diff_ratio / 10) * 10
             rec["target_price"]  = int(rec.get("target_price", 0) * diff_ratio / 10) * 10
 
-        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
         entry_p  = actual_price or rec.get("entry_price", 0)
         stop_p   = rec.get("stop_price", 0)
@@ -7910,7 +7598,8 @@ def _handle_skip_command(raw: str):
         data[matched_key]["skip_reason"]   = reason
         data[matched_key]["actual_pnl"]    = None
 
-        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        with open(SIGNAL_LOG_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
         theo_pnl = data[matched_key].get("pnl_pct", 0)
         theo_str = f"+{theo_pnl:.1f}%" if theo_pnl >= 0 else f"{theo_pnl:.1f}%"
@@ -7987,7 +7676,8 @@ def _handle_result_command(raw: str):
             rec["actual_pnl"]       = pnl
             rec["actual_exit_date"] = today
             rec["skip_reason"]      = ""
-            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(sig_data, f, ensure_ascii=False, indent=2)
 
         # ── ② early_detect_log.json 도 동시 업데이트 (하위 호환) ──
         early_data = {}
@@ -8019,11 +7709,13 @@ def _handle_result_command(raw: str):
                 "exit_reason": "수동입력",
                 "score": 0, "sector_bonus": 0, "sector_theme": "",
             }
-            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
+            with open(SIGNAL_LOG_FILE, "w") as f:
+                json.dump(sig_data, f, ensure_ascii=False, indent=2)
             matched_name = name_input
 
         if early_matched:
-            _write_json_atomic(EARLY_LOG_FILE, early_data, indent=2)
+            with open(EARLY_LOG_FILE, "w") as f:
+                json.dump(early_data, f, ensure_ascii=False, indent=2)
 
         display_name = matched_name or name_input
         send(f"{result_emoji} <b>결과 기록 완료</b>\n"
@@ -9555,10 +9247,6 @@ if __name__ == "__main__":
     print(f"📈 KIS 주식 급등 알림 봇 {BOT_VERSION} 시작")
     print(f"   업데이트: {BOT_DATE}")
     print("="*55)
-
-    # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
-    _migrate_legacy_files()
-    _storage_diagnostics_once()
 
     _load_kr_holidays(datetime.now().year)
 
