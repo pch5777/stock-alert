@@ -3,13 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix3
+버전: v37.10-all5-fix4
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
 
+v37.10-all5-fix4 (2026-03-05)
+- [Fix] MARKET_REGIME 기본값/compute_market_regime 추가(NameError 제거)
+- [Fix] 랭킹 API 404 발생 시 실제로 '오늘 비활성' 파일 기록(재시도 완전 차단)
+- [Fix] inquire-daily-trade 404 시 오늘 비활성 처리(로그/호출 스팸 방지)
 v37.10-all5-fix3 (2026-03-05)
 - [Fix] chgrate-pcls-100 404 발생 시 오늘은 랭킹 API 호출 중단(재시도 스팸/지연 제거) → 유니버스 후보군만 사용
 v37.10-all5 (2026-03-05)
@@ -104,6 +108,57 @@ from bs4 import BeautifulSoup
 
 # Market regime snapshot (updated periodically; safe default)
 MARKET_REGIME: dict = {"label": "unknown", "detail": {}}
+
+def compute_market_regime(nasdaq_fut_pct: float | None, vix: float | None, dxy: float | None) -> dict:
+    """Return a simple market regime label for feature/logging.
+
+    - risk_off: futures down and/or VIX/DXY elevated
+    - risk_on:  futures up and VIX contained
+    - neutral:  otherwise
+
+    This is intentionally conservative; it is used for *conditioning* signals, not trading directly.
+    """
+    try:
+        fut = float(nasdaq_fut_pct) if nasdaq_fut_pct is not None else 0.0
+    except Exception:
+        fut = 0.0
+    try:
+        v = float(vix) if vix is not None else None
+    except Exception:
+        v = None
+    try:
+        d = float(dxy) if dxy is not None else None
+    except Exception:
+        d = None
+
+    # Heuristics (tunable later)
+    risk_off = False
+    risk_on = False
+
+    if fut <= -0.6:
+        risk_off = True
+    if fut >= 0.6:
+        risk_on = True
+
+    if v is not None:
+        if v >= 25:
+            risk_off = True
+        elif v <= 18 and fut >= 0.2:
+            risk_on = True
+
+    if d is not None:
+        if d >= 103:
+            risk_off = True
+        elif d <= 100 and fut >= 0.2:
+            risk_on = True
+
+    label = "neutral"
+    if risk_off and not risk_on:
+        label = "risk_off"
+    elif risk_on and not risk_off:
+        label = "risk_on"
+
+    return {"label": label, "detail": {"nasdaq_fut_pct": fut, "vix": v, "dxy": d}}
 
 
 # ============================================================
@@ -720,6 +775,16 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
+
+    # Auto-disable unsupported endpoints for the rest of the day (to avoid noisy retries)
+    try:
+        if last_status == 404 and isinstance(last_url, str):
+            if "chgrate-pcls-100" in last_url:
+                _disable_rank_api_for_today("404")
+            if "inquire-daily-trade" in last_url:
+                _disable_daily_trade_api_for_today("404")
+    except Exception:
+        pass
 
     try:
         print(
@@ -2442,6 +2507,30 @@ def _rank_from_universe() -> list:
 _RANK_API_DISABLE_FILE = os.path.join(DATA_DIR, "rank_api_disable.json")
 _rank_api_disable_notified = False
 
+# Daily trade (history) endpoint availability (some accounts/envs may not support certain paths)
+_DAILY_TRADE_DISABLE_FILE = os.path.join(DATA_DIR, "daily_trade_api_disable.json")
+_daily_trade_disable_notified = False
+
+def _daily_trade_api_disabled_today() -> bool:
+    try:
+        if not os.path.exists(_DAILY_TRADE_DISABLE_FILE):
+            return False
+        with open(_DAILY_TRADE_DISABLE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        disabled_date = str(obj.get("disabled_date", ""))
+        return disabled_date == _now_kst().date().isoformat()
+    except Exception:
+        return False
+
+def _disable_daily_trade_api_for_today(reason: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_DAILY_TRADE_DISABLE_FILE), exist_ok=True)
+        with open(_DAILY_TRADE_DISABLE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"disabled_date": _now_kst().date().isoformat(), "reason": str(reason)}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _rank_api_disabled_today() -> bool:
     try:
         if not os.path.exists(_RANK_API_DISABLE_FILE):
@@ -2449,7 +2538,7 @@ def _rank_api_disabled_today() -> bool:
         with open(_RANK_API_DISABLE_FILE, "r", encoding="utf-8") as f:
             obj = json.load(f)
         disabled_date = str(obj.get("disabled_date", ""))
-        return disabled_date == date.today().isoformat()
+        return disabled_date == _now_kst().date().isoformat()
     except Exception:
         return False
 
@@ -2457,12 +2546,16 @@ def _disable_rank_api_for_today(reason: str) -> None:
     try:
         os.makedirs(os.path.dirname(_RANK_API_DISABLE_FILE), exist_ok=True)
         with open(_RANK_API_DISABLE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"disabled_date": date.today().isoformat(), "reason": reason}, f, ensure_ascii=False)
+            json.dump({"disabled_date": _now_kst().date().isoformat(), "reason": reason}, f, ensure_ascii=False)
     except Exception:
         pass
 
 def _rank_api_fallback(reason: str) -> list:
+    """Fallback to universe ranking and (optionally) disable rank API for the rest of the day."""
     global _rank_api_disable_notified
+    # Mark disabled for today unless this is already the disabled_today path
+    if reason != "disabled_today":
+        _disable_rank_api_for_today(str(reason))
     if not _rank_api_disable_notified:
         print(f"⚠️ [KIS] chgrate-pcls-100 비활성(오늘) → 유니버스 후보군 사용 ({reason})")
         _rank_api_disable_notified = True
@@ -9842,6 +9935,8 @@ def _get_daily_investor_data(code: str) -> list:
     try:
         end   = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        if _daily_trade_api_disabled_today():
+            return None
         url   = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-trade"
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
