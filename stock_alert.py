@@ -1,15 +1,44 @@
+
+# ============================================================
+# 후보군(포착/진입감시) 제외 규칙  (B 옵션)
+# - 커버드콜/타겟위클리/월배당/채권/리츠 + 인버스/레버리지 상품은
+#   "실전 진입 대상"에서 제외하되, 레짐/조건 조정 센서로는 활용 가능.
+# ============================================================
+EXCLUDE_TRADE_KEYWORDS = [
+    # Income / covered-call / weekly products
+    "커버드콜", "Covered Call", "coveredcall",
+    "타겟위클리", "Target Weekly", "타겟 위클리",
+    "월배당", "Monthly", "월지급", "인컴", "Income",
+    # Bonds / REITs
+    "채권", "Bond", "채권형",
+    "리츠", "REIT",
+    # Inverse / Leveraged
+    "인버스", "Inverse", "inverse",
+    "레버리지", "Leveraged", "leverage", "레버",
+]
+
+def is_trade_candidate_name(name: str) -> bool:
+    """실전 진입(포착/진입감시) 대상인지 판단"""
+    if not name:
+        return True
+    for kw in EXCLUDE_TRADE_KEYWORDS:
+        if kw and kw in name:
+            return False
+    return True
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix9d
+버전: v37.10-all5-fix10B
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
 
+- v37.10-all5-fix10B (2026-03-05): 후보군(포착/진입감시)에서 커버드콜/타겟위클리/월배당/채권/리츠 + 인버스/레버리지 상품 제외(B), 레짐/점수조정 센서로만 활용.
 v37.10-all5-fix7 (2026-03-05)
 - [Fix] GEO_SECTOR_BIAS 전역 기본값을 실제 코드에 선언하여 신호 저장 오류 제거
 
@@ -1984,11 +2013,12 @@ def refresh_dynamic_candidates():
         vol_stocks = get_volume_surge_stocks()
         # 상한가 근접 상위 종목
         upper_stocks = get_upper_limit_stocks()
-        candidates = {s["code"]: s["name"] for s in vol_stocks + upper_stocks if s.get("code")}
+        candidates = {s["code"]: s["name"] for s in vol_stocks + upper_stocks if s.get("code") and is_trade_candidate_name(s.get("name",""))}
+        excluded_cnt = sum(1 for s in vol_stocks + upper_stocks if s.get("code") and not is_trade_candidate_name(s.get("name","")))
         for code, name in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
-        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목")
+        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
 
@@ -2003,11 +2033,13 @@ def get_all_scan_candidates() -> list:
     for theme_info in THEME_MAP.values():
         for c, n in theme_info["stocks"]:
             if c not in seen:
-                seen.add(c); result.append((c, n, theme_info["desc"]))
+                if is_trade_candidate_name(n):
+                    seen.add(c); result.append((c, n, theme_info["desc"]))
     # 동적 후보군 추가 (THEME_MAP에 없는 종목만)
     for code, info in _dynamic_candidates.items():
         if code not in seen:
-            seen.add(code); result.append((code, info["name"], info["desc"]))
+            if is_trade_candidate_name(info.get("name","")):
+                seen.add(code); result.append((code, info["name"], info["desc"]))
     return result
 
 # ============================================================
