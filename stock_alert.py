@@ -99,6 +99,10 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
 
+# Market regime snapshot (updated periodically; safe default)
+MARKET_REGIME: dict = {"label": "unknown", "detail": {}}
+
+
 # ============================================================
 # 💾 Persistent Storage (코드 교체/배포에도 데이터 보존)
 #   - Railway Volume(/data) + 환경변수 STOCK_ALERT_DATA_DIR 지원
