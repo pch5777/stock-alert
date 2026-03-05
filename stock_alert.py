@@ -3,20 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.11-hotfix4
+버전: v37.12-hotfix4
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-v37.11-hotfix4 (2026-03-05)
+v37.12-hotfix4 (2026-03-05)
   - Railway 시작 즉시 크래시: datetime.date.today() 호출 오류 수정 (datetime.now().date() 사용)
   - (유지) 404/장애 엔드포인트 일일 자동 비활성 로딩 로직 정상화
 
-v37.11-hotfix3 (2026-03-05)
+v37.12-hotfix3 (2026-03-05)
   - SyntaxError(unterminated string literal) 방지: response body 요약 시 줄바꿈 치환을 이스케이프("\\n", "\\r")로 고정
 
-v37.11-hotfix2 (2026-03-05)
+v37.12-hotfix2 (2026-03-05)
   - __doc__ 파싱 실패로 봇/업데이트 unknown 뜨던 문제 수정(도큐스트링을 파일 최상단 첫 문장으로 고정)
   - _safe_get()가 status!=200일 때 None만 찍던 문제 수정: status/content-type/body 일부까지 출력
   - 404 엔드포인트는 오늘 1회만 시도 후 자동 비활성(재시작해도 유지)
@@ -523,7 +523,7 @@ _DISABLED_TODAY = _DISABLED_ENDPOINTS.get(datetime.now().date().isoformat(), {})
 def _disable_endpoint_today(key: str, reason: str) -> None:
     """Disable an endpoint key for the rest of today (persisted)."""
     try:
-        _DISABLED_TODAY[key] = {"reason": reason, "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+        _DISABLED_TODAY[key] = {"reason": reason, "ts": datetime.now().isoformat(timespec="seconds")}
         _DISABLED_ENDPOINTS[datetime.now().date().isoformat()] = _DISABLED_TODAY
         _save_disabled_endpoints(_DISABLED_ENDPOINTS)
     except Exception:
@@ -1917,18 +1917,62 @@ def get_stock_price(code: str) -> dict:
     }
 
 def get_upper_limit_stocks() -> list:
-    data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100",
-                     "FHPST01700000", {
-        "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
-        "FID_RANK_SORT_CLS_CODE":"0","FID_INPUT_CNT_1":"30","FID_PRC_CLS_CODE":"0",
-        "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"","FID_VOL_CNT":"100000",
-        "FID_TRGT_CLS_CODE":"0","FID_TRGT_EXLS_CLS_CODE":"0","FID_DIV_CLS_CODE":"0",
-        "FID_RSFL_RATE1":"5","FID_RSFL_RATE2":"",
-    })
-    return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
-             "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-             "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"KRX"}
-            for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+    """
+    (대체 구현) 상한가/급등 후보군을 만들기 위한 '순위' 데이터 소스.
+
+    기존 코드의 /quotations/chgrate-pcls-100 엔드포인트가 404(미존재/변경)로 떨어지는 케이스가 있어,
+    KIS 문서에 존재하는 '거래량순위'(/quotations/volume-rank)를 사용해 후보군을 구성합니다.
+    - 실제 상한가 포착은 이후 로직(등락률/체결강도/거래대금 등)에서 재필터링됩니다.
+    """
+    data = _safe_get(
+        f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+        "FHPST01700000",
+        {
+            # 문서/샘플 기준으로 많이 쓰이는 기본 파라미터 세트.
+            # 일부 계정/환경에서 필드명이 다를 수 있어 서버에서 무시되는 값이 있어도 동작하도록 설계.
+            "FID_COND_MRKT_DIV_CODE": "J",     # 주식
+            "FID_COND_SCR_DIV_CODE": "20171",  # 거래량순위 화면(HTS) 계열 코드 (환경별로 무시될 수 있음)
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",          # 0: 전체(일반)
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "0",
+            "FID_TRGT_EXLS_CLS_CODE": "0",
+            "FID_INPUT_CNT_1": "30",
+        },
+    )
+
+    items = []
+    if isinstance(data, dict):
+        # KIS는 output / output1 / output2 등 케이스가 섞여 있어서 넓게 커버
+        for k in ("output", "output1", "output2", "output3"):
+            v = data.get(k)
+            if isinstance(v, list) and v:
+                items = v
+                break
+
+    result = []
+    for i in items or []:
+        code = (i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or i.get("stck_code") or "").strip()
+        if not code:
+            continue
+
+        # 등락률 키 후보: prdy_ctrt(전일대비율), stck_prdy_ctrt 등
+        pct_raw = i.get("prdy_ctrt") or i.get("stck_prdy_ctrt") or i.get("prdy_vrss_rate") or ""
+        try:
+            pct = float(str(pct_raw).replace("%", "").strip() or 0.0)
+        except:
+            pct = 0.0
+
+        name = (i.get("hts_kor_isnm") or i.get("stck_name") or i.get("kor_isnm") or "").strip()
+
+        result.append({
+            "code": code,
+            "name": name,
+            "pct": pct,   # 이후 로직에서 상한가(약 29%대) 등 조건에 활용
+        })
+
+    return result
+
 
 def get_volume_surge_stocks() -> list:
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
