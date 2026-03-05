@@ -481,6 +481,11 @@ def get_token(retry: int = 3) -> str:
             _access_token  = d["access_token"]
             _token_expires = time.time() + int(d.get("expires_in", 86400)) - 300
             print(f"✅ KIS 토큰 발급 ({datetime.now().strftime('%H:%M:%S')})")
+            try:
+                if os.getenv('TG_SELF_TEST','0') == '1':
+                    _tg_send_text('✅ 봇 기동 확인: KIS 토큰 발급 완료', reply_markup=None, parse_mode=None)
+            except Exception as _e:
+                print(f'⚠️ TG_SELF_TEST 실패: {_e}')
             return _access_token
         except Exception as e:
             _log_error(f"get_token(attempt={attempt+1})", e, critical=attempt==2); time.sleep(5*(attempt+1))
@@ -4518,76 +4523,98 @@ def _tg_post_sendmessage(payload: dict, timeout: int = 12):
         print(f"⚠️ 텔레그램 전송 예외: {e}", flush=True)
         return None
 
+
+def _tg_post_send_message(payload: dict, timeout: int = 15):
+    """Telegram sendMessage wrapper with hard logging."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json=payload,
+            timeout=timeout
+        )
+        ok = (r.status_code == 200)
+        if not ok:
+            body = (r.text or "")[:500].replace("\n", " ").replace("\r", " ")
+            print(f"⚠️ 텔레그램 전송 실패: status={r.status_code} body={body}")
+        return ok, r
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 예외: {e}")
+        return False, None
+
+
+def _tg_split_text(text: str, limit: int = 3900):
+    """
+    Telegram text hard limit is 4096. Keep margin for HTML tags / emojis.
+    Split by newline when possible, otherwise hard cut.
+    """
+    if not text:
+        return [""]
+    chunks = []
+    buf = ""
+    for line in text.split("\n"):
+        if len(buf) + len(line) + 1 <= limit:
+            buf = (buf + "\n" + line) if buf else line
+        else:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            while len(line) > limit:
+                chunks.append(line[:limit])
+                line = line[limit:]
+            buf = line
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _tg_send_text(text: str, reply_markup=None, parse_mode="HTML"):
+    """
+    Robust telegram send:
+    - Splits long messages
+    - On HTML parse error (400 can't parse entities), fallback to plain text
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ 텔레그램 설정 누락: TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID")
+        return False
+
+    chunks = _tg_split_text(text, limit=3900)
+    ok_all = True
+
+    for i, chunk in enumerate(chunks):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup and i == 0:
+            payload["reply_markup"] = reply_markup
+
+        ok, r = _tg_post_send_message(payload, timeout=15)
+        if (not ok) and (r is not None) and (r.status_code == 400):
+            body = (r.text or "").lower()
+            if ("can't parse entities" in body) or ("parse entities" in body) or ("entity" in body):
+                payload.pop("parse_mode", None)
+                ok2, _ = _tg_post_send_message(payload, timeout=15)
+                ok = ok2
+
+        ok_all = ok_all and ok
+
+        if len(chunks) > 1:
+            time.sleep(0.15)
+
+    return ok_all
+
+
 def send_with_chart_buttons(text: str, code: str, name: str):
     """
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
     - 메시지가 길면 1번째 청크에만 버튼을 붙이고, 나머지는 텍스트로 추가 발송
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 텔레그램 미설정(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) — 메시지 발송 생략", flush=True)
-        return
-
     naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
     keyboard = {"inline_keyboard": [[{"text": f"📈 {name} 차트 보기 (네이버)", "url": naver}]]}
+    _tg_send_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-    chunks = _split_tg_chunks(text)
-    if not chunks:
-        return
-
-    # 1) 첫 청크: HTML + 버튼
-    first = chunks[0]
-    resp = _tg_post_sendmessage({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": first,
-        "parse_mode": "HTML",
-        "reply_markup": keyboard,
-        "disable_web_page_preview": True,
-    })
-
-    # HTML 파싱 실패 등 400이면 일반 텍스트로 폴백
-    if resp is not None and resp.status_code == 400:
-        plain = _strip_html_tags(first)
-        _tg_post_sendmessage({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": plain,
-            "disable_web_page_preview": True,
-        })
-
-    # 2) 나머지 청크: 텍스트(버튼 없이)
-    for extra in chunks[1:]:
-        resp2 = _tg_post_sendmessage({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": extra,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        })
-        if resp2 is not None and resp2.status_code == 400:
-            _tg_post_sendmessage({
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": _strip_html_tags(extra),
-                "disable_web_page_preview": True,
-            })
 
 def send(text: str):
-    """기본 텔레그램 메시지 발송 (길이/HTML 실패 안전 처리)"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 텔레그램 미설정(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) — 메시지 발송 생략", flush=True)
-        return
-
-    for chunk in _split_tg_chunks(text):
-        resp = _tg_post_sendmessage({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        })
-        if resp is not None and resp.status_code == 400:
-            _tg_post_sendmessage({
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": _strip_html_tags(chunk),
-                "disable_web_page_preview": True,
-            })
-
+    _tg_send_text(text, reply_markup=None, parse_mode="HTML")
 def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
                   code: str = "", name: str = ""):
     """
