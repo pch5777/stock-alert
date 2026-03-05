@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.16-profit-guard2-ui2
+버전: v37.17-sector-watch1
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.17-sector-watch1 (2026-03-05): 섹터 모니터링 메시지에 '포착/진입감시 종목' 상태를 표기(진입가 도달 시 진입가 대비 현재가 수익률, 미도달 시 '미도달' 표시). 섹터 스냅샷에 현재가(price) 포함.
 
 - v37.16-profit-guard2-ui2 (2026-03-05): 장전 워치리스트 발송 시간을 07:55 → 07:30으로 변경(비장중 이슈 반영 포함). 야간 무알림 구간도 20:00~07:30으로 조정.
 
@@ -3460,7 +3462,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
             if not cur: continue
             cr, vr = cur.get("change_rate",0), cur.get("volume_ratio",0)
             src, rsn = peers_all.get(peer_code, (peer_name, "업종코드", ""))[1:]
-            results.append({"code":peer_code,"name":peer_name,"change_rate":cr,"volume_ratio":vr,
+            results.append({"code":peer_code,"name":peer_name,"price":cur.get("price",0),"change_rate":cr,"volume_ratio":vr,
                              "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0,
                              "source":src, "reason":rsn})
             time.sleep(0.15)
@@ -5278,12 +5280,34 @@ def start_sector_monitor(code: str, name: str):
                     bonus   = si.get("bonus",0); summary = si.get("summary","")
                     new_set = {x["code"] for x in new_rising}
                     tag     = f"🆕 {len(new_rising)}종목 추가" if new_rising and info["alert_count"]>1 else f"#{info['alert_count']}회 업데이트"
+                    def _watch_suffix(peer_code: str, peer_price: int) -> str:
+                        """섹터 라인에 감시 상태/수익률 표기 (진입가 대비 현재가 기준)"""
+                        try:
+                            if not _entry_watch:
+                                return ""
+                            cand = [w for w in _entry_watch.values() if w.get('code') == peer_code]
+                            if not cand:
+                                return ""
+                            w = max(cand, key=lambda x: x.get('registered_ts', 0))
+                            entry = safe_int(w.get('entry_price', 0))
+                            if not entry:
+                                return ""
+                            if w.get('entry_hit'):
+                                if peer_price:
+                                    pnl = (peer_price / entry - 1.0) * 100.0
+                                    return f" ✅ <b>({pnl:+.1f}%)</b>"
+                                return " ✅"
+                            return " ⏳ <b>(미도달)</b>"
+                        except Exception:
+                            return ""
+
                     lines   = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
                     lines  += f"  {summary}\n" if summary else ""
                     for r in rising[:5]:
                         vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
-                        lines += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}\n"
+                        wsuf  = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
+                        lines += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
                     for r in flat[:2]:
                         lines += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
                     if bonus > 0:
