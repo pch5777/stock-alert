@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.11-hotfix-news6
+버전: v37.12-hotfix-news7
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.12-hotfix-news7 (2026-03-05): RSS/XML 파싱을 표준 XML 파서(ElementTree) 우선으로 변경하여 XMLParsedAsHTMLWarning 제거 및 뉴스 스캔 안정성 개선.
 
 - v37.11-hotfix-news6 (2026-03-05): 뉴스 소스 3→6 확장(타이틀+description 사용), 시작 배너 문구 갱신. 상품(B) 제외/상한가 쿨다운/404 비활성화는 유지.
 
@@ -153,6 +155,7 @@ _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
+import xml.etree.ElementTree as ET
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -7181,34 +7184,71 @@ def _strip_html(text: str) -> str:
         return (text or "").strip()
 
 def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
-    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)"""
+    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)
+
+    - RSS/Atom은 대개 XML이므로 HTML 파서로 파싱하면 bs4가 XMLParsedAsHTMLWarning 경고를 띄울 수 있음.
+    - 운영 로그 노이즈를 줄이고 파싱 신뢰성을 올리기 위해 표준 XML 파서(ElementTree)를 우선 사용.
+    - XML이 깨진(비정상) 소스는 최후에만 BeautifulSoup(html.parser)로 fallback.
+    """
     try:
         resp = requests.get(url, timeout=12, headers=_random_ua())
         if resp.status_code != 200:
             return []
-        # xml 파서 없을 수 있으니 html.parser로 fallback
-        try:
-            soup = BeautifulSoup(resp.text, "xml")
-            items = soup.find_all("item")
-        except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            items = soup.find_all("item")
 
-        titles = []
-        for i in items[:max_items]:
-            t = i.find("title")
-            d = i.find("description")
-            title = _strip_html(t.get_text(strip=True)) if t else ""
-            desc  = _strip_html(d.get_text(strip=True)) if d else ""
-            if not title:
-                continue
-            # 내용도 참고: title — desc (너무 길면 축약)
-            if desc and desc != title:
-                desc = desc[:140] + ("…" if len(desc) > 140 else "")
-                titles.append(f"{title} — {desc}")
-            else:
-                titles.append(title)
-        return titles
+        xml_text = (resp.text or "").strip()
+        if not xml_text:
+            return []
+
+        # 1) XML 우선 파싱 (경고/의존성 없이 안정적)
+        try:
+            root = ET.fromstring(xml_text)
+
+            # RSS: <item>, Atom: <entry>
+            items = root.findall(".//{*}item")
+            if not items:
+                items = root.findall(".//{*}entry")
+
+            titles = []
+            for it in items[:max_items]:
+                # RSS
+                t = it.find(".//{*}title")
+                d = it.find(".//{*}description")
+
+                # Atom (summary/content)
+                if d is None:
+                    d = it.find(".//{*}summary") or it.find(".//{*}content")
+
+                title = _strip_html((t.text or "").strip()) if t is not None else ""
+                desc  = _strip_html((d.text or "").strip()) if d is not None else ""
+                if not title:
+                    continue
+
+                if desc and desc != title:
+                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                    titles.append(f"{title} — {desc}")
+                else:
+                    titles.append(title)
+            return titles
+
+        except Exception:
+            # 2) 최후 fallback: BS4 html parser (경고 가능)
+            soup = BeautifulSoup(xml_text, "html.parser")
+            items = soup.find_all("item")
+            titles = []
+            for i in items[:max_items]:
+                tt = i.find("title")
+                dd = i.find("description")
+                title = _strip_html(tt.get_text(strip=True)) if tt else ""
+                desc  = _strip_html(dd.get_text(strip=True)) if dd else ""
+                if not title:
+                    continue
+                if desc and desc != title:
+                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                    titles.append(f"{title} — {desc}")
+                else:
+                    titles.append(title)
+            return titles
+
     except:
         return []
 def _fetch_gdelt_headlines(max_items: int = 25) -> list:
