@@ -1,37 +1,9 @@
-
-# ============================================================
-# 후보군(포착/진입감시) 제외 규칙  (B 옵션)
-# - 커버드콜/타겟위클리/월배당/채권/리츠 + 인버스/레버리지 상품은
-#   "실전 진입 대상"에서 제외하되, 레짐/조건 조정 센서로는 활용 가능.
-# ============================================================
-EXCLUDE_TRADE_KEYWORDS = [
-    # Income / covered-call / weekly products
-    "커버드콜", "Covered Call", "coveredcall",
-    "타겟위클리", "Target Weekly", "타겟 위클리",
-    "월배당", "Monthly", "월지급", "인컴", "Income",
-    # Bonds / REITs
-    "채권", "Bond", "채권형",
-    "리츠", "REIT",
-    # Inverse / Leveraged
-    "인버스", "Inverse", "inverse",
-    "레버리지", "Leveraged", "leverage", "레버",
-]
-
-def is_trade_candidate_name(name: str) -> bool:
-    """실전 진입(포착/진입감시) 대상인지 판단"""
-    if not name:
-        return True
-    for kw in EXCLUDE_TRADE_KEYWORDS:
-        if kw and kw in name:
-            return False
-    return True
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.10-all5-fix10B
+버전: v37.10-all5-fix13-exitvirtual
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -39,6 +11,7 @@ def is_trade_candidate_name(name: str) -> bool:
 
 
 - v37.10-all5-fix10B (2026-03-05): 후보군(포착/진입감시)에서 커버드콜/타겟위클리/월배당/채권/리츠 + 인버스/레버리지 상품 제외(B), 레짐/점수조정 센서로만 활용.
+- v37.10-all5-fix13-exitvirtual (2026-03-05): 분할 청산 가이드 기본을 '가상 진입(진입가 도달 entry_hit=True)' 기준으로 변경. 필요 시 ALLOW_VIRTUAL_EXIT_GUIDE=0으로 '실진입(actual_entry=True)'만 허용. 종목별 30분 쿨다운 유지.
 v37.10-all5-fix7 (2026-03-05)
 - [Fix] GEO_SECTOR_BIAS 전역 기본값을 실제 코드에 선언하여 신호 저장 오류 제거
 
@@ -77,6 +50,36 @@ v37.8-fixbaseurl2 (2026-03-05)
 
 """
 
+
+# ============================================================
+# 후보군(포착/진입감시) 제외 규칙  (B 옵션)
+# - 커버드콜/타겟위클리/월배당/채권/리츠 + 인버스/레버리지 상품은
+#   "실전 진입 대상"에서 제외하되, 레짐/조건 조정 센서로는 활용 가능.
+# ============================================================
+EXCLUDE_TRADE_KEYWORDS = [
+    # Income / covered-call / weekly products
+    "커버드콜", "Covered Call", "coveredcall",
+    "타겟위클리", "Target Weekly", "타겟 위클리",
+    "월배당", "Monthly", "월지급", "인컴", "Income",
+    # Bonds / REITs
+    "채권", "Bond", "채권형",
+    "리츠", "REIT",
+    # Inverse / Leveraged
+    "인버스", "Inverse", "inverse",
+    "레버리지", "Leveraged", "leverage", "레버",
+]
+
+def is_trade_candidate_name(name: str) -> bool:
+    """실전 진입(포착/진입감시) 대상인지 판단"""
+    if not name:
+        return True
+    for kw in EXCLUDE_TRADE_KEYWORDS:
+        if kw and kw in name:
+            return False
+    return True
+
+
+
 # 버전을 도큐스트링에서 자동 파싱 → 한 곳(docstring)만 수정하면 모든 표시에 반영
 import sys
 import hashlib
@@ -88,7 +91,6 @@ import re as _re
 # --- Global state defaults (to prevent NameError at runtime) ---
 GEO_SECTOR_BIAS: dict = {}
 MARKET_REGIME: dict = {"label": "unknown", "details": {}}
-LAST_SCAN_STATS: dict = {"candidates": 0, "excluded": 0, "detected_last": 0, "detected_today": 0, "date": ""}
 
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
@@ -577,6 +579,11 @@ _entry_watch        = {}
 ENTRY_TOLERANCE_PCT  = 2.0   # 진입가 ±2% 이내 → 진입 구간
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
+
+# ── 분할 청산 가이드(메시지 스팸 방지) ──
+ALLOW_VIRTUAL_EXIT_GUIDE = os.getenv('ALLOW_VIRTUAL_EXIT_GUIDE', '1') == '1'  # 1이면 '진입가 도달'만으로도 가이드 허용
+PARTIAL_EXIT_GUIDE_COOLDOWN_MIN = int(os.getenv('PARTIAL_EXIT_GUIDE_COOLDOWN_MIN', '30') or '30')
+_partial_exit_last_ts: dict[str, float] = {}  # code -> last sent ts
 
 # ── 오늘의 최우선 종목 ──
 _today_top_signals: dict = {}
@@ -2019,9 +2026,6 @@ def refresh_dynamic_candidates():
         for code, name in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
-        LAST_SCAN_STATS["candidates"] = len(_dynamic_candidates)
-        LAST_SCAN_STATS["excluded"] = excluded_cnt
-        LAST_SCAN_STATS["date"] = datetime.now().strftime("%Y-%m-%d")
         print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -4066,15 +4070,17 @@ def track_signal_results():
                     print(f"  ⚠️ 보유종목 뉴스체크오류: {_e}")
 
             # ── 분할 청산 가이드 (목표가 도달 전 중간 알림) ──
-            if entry and target:
+            if entry and target and ((rec.get('actual_entry') is True) or (ALLOW_VIRTUAL_EXIT_GUIDE and rec.get('entry_hit') is True)):
                 pnl_now  = (price - entry) / entry * 100
                 half_pct = (target - entry) / entry * 100 / 2   # 목표의 절반
                 partial_key = f"{log_key}_partial"
                 _partial_min = calc_partial_exit_min_pct(code, price)
                 if (pnl_now >= half_pct
                         and partial_key not in _tracking_notified
-                        and half_pct > _partial_min):
+                        and half_pct > _partial_min
+                        and (time.time() - _partial_exit_last_ts.get(code, 0) >= PARTIAL_EXIT_GUIDE_COOLDOWN_MIN * 60)):
                     _tracking_notified.add(partial_key)
+                    _partial_exit_last_ts[code] = time.time()
                     inv_info = ""
                     try:
                         inv   = get_investor_trend(code)
@@ -5298,6 +5304,25 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
     except Exception as e:
         print(f"⚠️ 진입미달 기록 오류: {e}")
 
+
+def _mark_entry_hit_in_signal_log(code: str, signal_type: str) -> None:
+    """진입가 도달(HIT) 이벤트를 signal_log에 기록. (가상진입/학습용)"""
+    try:
+        data = {}
+        try:
+            with open(SIGNAL_LOG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            return
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for _k, rec in data.items():
+            if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
+                rec['entry_hit'] = True
+                rec['entry_hit_time'] = now_s
+                break
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+    except Exception as e:
+        print(f"⚠️ entry_hit 기록 오류: {e}")
 def check_entry_watch():
     if not _entry_watch: return
     use_nxt = not is_market_open() and is_nxt_open()
@@ -5383,6 +5408,11 @@ def check_entry_watch():
                     f"└─────────────────────",
                     watch["code"], watch["name"]
                 )
+                watch['entry_hit'] = True
+                try:
+                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''))
+                except Exception:
+                    pass
                 print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
         except: continue
     for k in expired:
@@ -5538,8 +5568,6 @@ def update_dashboard(force: bool = False) -> None:
     except Exception:
         tracked_n = 0
     regime = (MARKET_REGIME.get("label") or "neutral")
-    regime_ko_map = {"risk_on": "강세장", "neutral": "보통장", "risk_off": "약세장", "panic": "패닉장", "unknown": "보통장"}
-    regime_ko = regime_ko_map.get(str(regime), str(regime))
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -5559,9 +5587,8 @@ def update_dashboard(force: bool = False) -> None:
 
     text = (
         "📌 <b>운영 대시보드</b>\n"
-        f"• 레짐: <b>{regime_ko}</b>{det_txt}\n"
+        f"• 레짐: <b>{regime}</b>{det_txt}\n"
         f"• 진입 감시: <b>{tracked_n}</b> 종목\n"
-        f"• 오늘: 후보군 <b>{LAST_SCAN_STATS.get('candidates',0)}</b> / 제외 <b>{LAST_SCAN_STATS.get('excluded',0)}</b> / 포착 <b>{LAST_SCAN_STATS.get('detected_today',0)}</b>\n"
     )
     if perf:
         text += f"• 오늘 성과: {perf}\n"
@@ -10454,13 +10481,6 @@ def run_scan():
 
         if not alerts: print("  → 조건 충족 없음")
         else:
-            LAST_SCAN_STATS["detected_last"] = len(alerts)
-            # reset day if changed
-            today = datetime.now().strftime("%Y-%m-%d")
-            if LAST_SCAN_STATS.get("date") != today:
-                LAST_SCAN_STATS["detected_today"] = 0
-                LAST_SCAN_STATS["date"] = today
-            LAST_SCAN_STATS["detected_today"] = int(LAST_SCAN_STATS.get("detected_today", 0)) + len(alerts)
             print(f"  → {len(alerts)}개 감지! [{regime_label()}]")
             for s in alerts:
                 is_nxt = s.get("market") == "NXT"
