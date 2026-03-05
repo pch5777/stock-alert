@@ -3,13 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.13-hotfix-ui1
+버전: v37.14-profit-guard1
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.13-hotfix-ui1 (2026-03-05): 운영 대시보드 레짐(label) 표시를 한글화(regime_label_ko 적용)하고 레짐 매핑을 확장.
+- v37.14-profit-guard1 (2026-03-05): (1) 장마감 전/후 '진입가 도달(entry_hit)' 감시 종목에 대해 지정학/뉴스/DART/지표 리스크 감지 시 손익 방어 가이드 자동 알림(쿨다운 포함). (2) 비장중(장종료/휴장) 이슈(지정학 섹터영향 + DART 강재료)를 07:55 익개장 워치리스트에 반영하여 섹터·종목 후보 알림.
 
 - v37.12-hotfix-news7 (2026-03-05): RSS/XML 파싱을 표준 XML 파서(ElementTree) 우선으로 변경하여 XMLParsedAsHTMLWarning 제거 및 뉴스 스캔 안정성 개선.
 
@@ -95,23 +95,12 @@ import re as _re
 
 # === Regime label localization (Korean) ===
 REGIME_KO_MAP = {
-    # common
     "risk_on": "강세장",
     "neutral": "보통장",
     "risk_off": "약세장",
     "panic": "패닉장",
     "unknown": "보통장",
-
-    # extra aliases (in case upstream labels differ)
-    "bullish": "강세장",
-    "bearish": "약세장",
-    "flat": "보통장",
-    "sideways": "보통장",
-    "volatile": "변동성장",
-    "high_vol": "변동성장",
-    "low_vol": "안정장",
 }
-
 
 def regime_label_ko(label: str) -> str:
     try:
@@ -2012,8 +2001,99 @@ def build_next_open_watchlist(max_codes: int = 30) -> dict:
         print(f"⚠️ 워치리스트 저장 실패: {e}")
     return payload
 
+def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
+    """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
+    반환: [{code,name,title,grade}, ...]
+    """
+    if not DART_API_KEY:
+        return []
+    out = []
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        dates = [today]
+        if days_back >= 1:
+            yday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+            dates.append(yday)
+
+        # 키워드 우선순위
+        strong = DART_KEYWORDS.get("매우강함", []) + DART_KEYWORDS.get("강함", [])
+        strong = [k for k in strong if k]
+
+        seen = set()
+        for d in dates:
+            dart_list = _fetch_dart_list(d) if DART_API_KEY else []
+            for it in (dart_list or []):
+                title = (it.get("report_nm") or it.get("title") or "").strip()
+                code  = normalize_stock_code(it.get("stock_code") or it.get("stock_code") or it.get("stock_code"))
+                if not title or not code:
+                    continue
+                # 리스크 공시는 제외 (손익 방어 쪽에서 따로 처리)
+                if any(rk in title for rk in DART_RISK_KEYWORDS):
+                    continue
+                hit_kw = next((k for k in strong if k in title), None)
+                if not hit_kw:
+                    continue
+                key = (code, title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                name = _lookup_name_by_code(code)
+                grade = "매우강함" if any(k in title for k in DART_KEYWORDS.get("매우강함", [])) else "강함"
+                out.append({"code": code, "name": name, "title": title, "grade": grade})
+                if len(out) >= max_items:
+                    return out
+    except Exception as e:
+        _log_error("_scan_recent_dart_materials", e)
+    return out
+
+def _build_preopen_issue_section(max_lines: int = 12) -> str:
+    """장전(07:55) 워치리스트에 붙일 '이슈 기반 섹터/종목' 섹션 생성."""
+    lines = []
+    try:
+        # 1) 지정학/거시 이슈(섹터 방향)
+        geo = _geo_event_state or {}
+        if geo.get("active") and time.time() - float(geo.get("ts", 0) or 0) < 3600 * 12:
+            sec_dirs = geo.get("sector_directions", []) or []
+            if not sec_dirs and geo.get("sectors"):
+                # sector_directions가 없으면 fallback 생성
+                sec_dirs = _build_fallback_sector_directions(geo.get("kws", []) or [], geo.get("sectors") or [])
+            # 상승 섹터만 상위 3개
+            ups = [sd for sd in sec_dirs if str(sd.get("direction","")) in ("상승","up","positive","bull")]
+            if ups:
+                lines.append("🌍 이슈(지정학) 기반 유리 섹터")
+                for sd in ups[:3]:
+                    sec = sd.get("sector","")
+                    reason = (sd.get("reason","") or "").strip()
+                    stocks = _get_geo_sector_stocks(sec, max_n=3) if sec else []
+                    stk = " / ".join([n for c,n in stocks]) if stocks else ""
+                    if stk:
+                        lines.append(f" • {sec}: {stk}")
+                    else:
+                        lines.append(f" • {sec}")
+                    if reason:
+                        lines.append(f"   - {reason}")
+        # 2) DART 강재료(전일~금일)
+        darts = _scan_recent_dart_materials(days_back=1, max_items=5)
+        if darts:
+            lines.append("📢 공시(DART) 강재료 후보")
+            for d in darts[:5]:
+                nm = d.get("name") or d.get("code")
+                title = d.get("title","")
+                grade = d.get("grade","")
+                lines.append(f" • {nm}: {grade} — {title}")
+    except Exception:
+        pass
+
+    # 길이 제한
+    lines = [ln for ln in lines if ln.strip()]
+    if not lines:
+        return ""
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["…(생략)"]
+    return "\n".join(lines)
+
 def send_preopen_watchlist():
-    """익개장 전(07:55) 워치리스트 요약 전송"""
+    """익개장 전(07:55) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
     try:
         data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
         codes = data.get("codes") if isinstance(data, dict) else None
@@ -2035,6 +2115,15 @@ def send_preopen_watchlist():
                 msg += "\n\n" + "\n".join(_lines)
         except Exception:
             pass
+
+        # NEW: off-hours issues (geo sectors + DART strong materials)
+        try:
+            issue_sec = _build_preopen_issue_section()
+            if issue_sec:
+                msg += "\n\n" + issue_sec
+        except Exception:
+            pass
+
         send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
@@ -5452,6 +5541,180 @@ def check_entry_watch():
     for k in expired:
         _entry_watch.pop(k, None)
 
+# ============================================================
+# 🛡 장마감 전/후 손익 방어 가이드 (entry_hit 감시 종목)
+#   - '진입가 도달' 후 모니터링 중인 종목에
+#     지정학/뉴스/DART/지표 리스크가 생기면 손익 방어 안내를 자동 발송
+# ============================================================
+DEFENSE_KRX_CLOSE_WINDOW_MIN = int(os.getenv("DEFENSE_KRX_CLOSE_WINDOW_MIN", "25") or "25")  # 15:05~15:30
+DEFENSE_NXT_CLOSE_WINDOW_MIN = int(os.getenv("DEFENSE_NXT_CLOSE_WINDOW_MIN", "25") or "25")  # 19:35~20:00
+DEFENSE_ALERT_COOLDOWN_SEC   = int(os.getenv("DEFENSE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 30분
+DEFENSE_LOSS_WARN_PCT        = float(os.getenv("DEFENSE_LOSS_WARN_PCT", "1.2") or "1.2")  # -1.2% 이하면 경고 강화
+DEFENSE_PROFIT_LOCK_PCT      = float(os.getenv("DEFENSE_PROFIT_LOCK_PCT", "2.0") or "2.0")  # +2% 이상이면 익절 방어 권고
+
+_NEG_NEWS_KWS = [
+    "급락","하락","쇼크","우려","불확실","리스크","제재","관세","전쟁","공습","미사일","충돌","봉쇄",
+    "압수수색","검찰","조사","횡령","배임","파산","회생","워크아웃","상장폐지","거래정지","관리종목",
+    "하향","경고","부정","적자전환","실적부진","리콜","사고","해킹",
+]
+
+def _is_close_defense_window(now: datetime | None = None) -> bool:
+    now = now or _now_kst()
+    t = now.time()
+    # KRX: 15:30 마감 기준
+    krx_start = (datetime.combine(now.date(), dtime(15,30), tzinfo=_KST) - timedelta(minutes=DEFENSE_KRX_CLOSE_WINDOW_MIN)).time()
+    krx_end   = dtime(15,30)
+    # NXT: 20:00 마감 기준 (NXT만 열릴 수도 있음)
+    nxt_start = (datetime.combine(now.date(), dtime(20,0), tzinfo=_KST) - timedelta(minutes=DEFENSE_NXT_CLOSE_WINDOW_MIN)).time()
+    nxt_end   = dtime(20,0)
+    in_krx = (t >= krx_start and t <= krx_end)
+    in_nxt = (t >= nxt_start and t <= nxt_end)
+    return in_krx or in_nxt
+
+def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> tuple[int, list[str]]:
+    """리스크 점수(0~100)와 사유 리스트 반환."""
+    score = 0
+    reasons = []
+    try:
+        # 1) DART 리스크
+        try:
+            dr = check_dart_risk(code, name)
+            if isinstance(dr, dict) and dr.get("is_risk"):
+                score += 60
+                reasons.append(f"⚠️ DART 리스크: {dr.get('title','')}".strip())
+        except Exception:
+            pass
+
+        # 2) 지정학/거시 리스크(시장)
+        try:
+            geo = _geo_event_state or {}
+            if geo.get("active") and time.time() - float(geo.get("ts",0) or 0) < 3600*12:
+                unc = str(geo.get("uncertainty","mid"))
+                adj = int(geo.get("score_adj",0) or 0)
+                if unc == "high" and adj <= -5:
+                    score += 20
+                    reasons.append("🌍 지정학 불확실성(HIGH) — 시장 리스크오프 가능")
+                elif adj <= -8:
+                    score += 15
+                    reasons.append("🌍 지정학 이벤트 — 변동성 확대 가능")
+        except Exception:
+            pass
+
+        # 3) 최근 뉴스(타이틀 기반 간단 필터)
+        try:
+            news = fetch_news_for_stock(code, name) or []
+            hits = []
+            for n in news[:10]:
+                for kw in _NEG_NEWS_KWS:
+                    if kw in n and kw not in hits:
+                        hits.append(kw)
+            if hits:
+                score += 15
+                reasons.append(f"📰 부정 키워드 감지: {', '.join(hits[:4])}")
+        except Exception:
+            pass
+
+        # 4) 가격/손익 상태
+        try:
+            cur = get_stock_price(code) or {}
+            price = int(cur.get("price") or 0)
+            if price and entry:
+                pnl = (price - entry) / entry * 100
+                if pnl <= -DEFENSE_LOSS_WARN_PCT:
+                    score += 20
+                    reasons.append(f"📉 진입가 대비 {pnl:.1f}% (방어 필요)")
+                elif pnl >= DEFENSE_PROFIT_LOCK_PCT:
+                    score += 10
+                    reasons.append(f"📈 진입가 대비 +{pnl:.1f}% (익절 방어 권장)")
+                # 손절선 근접
+                if stop_loss and price <= stop_loss * 1.01:
+                    score += 20
+                    reasons.append("🛡 손절선 근접(1% 이내)")
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    score = max(0, min(score, 100))
+    return score, reasons
+
+def run_entry_defense_monitor():
+    """run_scan 루프에서 호출: 마감 구간에 entry_hit 종목의 리스크를 감지해 손익 방어 가이드 발송."""
+    try:
+        if not _entry_watch:
+            return
+        # 마감 구간이 아니면 불필요한 API 호출 줄이기
+        if not _is_close_defense_window():
+            return
+
+        now_ts = time.time()
+        use_nxt = (not is_market_open()) and is_nxt_open()
+
+        for _k, w in list(_entry_watch.items()):
+            if not isinstance(w, dict):
+                continue
+            if not w.get("entry_hit"):
+                continue
+
+            # 쿨다운(종목별)
+            last = float(w.get("defense_last_ts", 0) or 0)
+            if now_ts - last < DEFENSE_ALERT_COOLDOWN_SEC:
+                continue
+
+            code = w.get("code")
+            name = w.get("name") or code
+            entry = int(w.get("entry_price") or 0)
+            stop  = int(w.get("stop_loss") or 0)
+            if not code or not entry:
+                continue
+
+            # 현재가
+            cur = get_nxt_stock_price(code) if use_nxt else get_stock_price(code)
+            price = int((cur or {}).get("price") or 0)
+            if not price:
+                continue
+
+            risk_score, reasons = _detect_defense_issues(code, name, entry, stop)
+            if risk_score < 35 or not reasons:
+                continue
+
+            pnl = (price - entry) / entry * 100 if entry else 0.0
+
+            # 가이드 구성(실전 수익 방어 중심)
+            guide = []
+            if pnl >= DEFENSE_PROFIT_LOCK_PCT:
+                guide.append("✅ <b>수익 방어</b>: 1차 분할익절(예: 30~50%) + 잔량은 <b>진입가/단기저점 이탈 시 정리</b>")
+                guide.append("✅ <b>트레일링</b>: 전일저가 또는 5분 저점 기준으로 손절선을 끌어올리기")
+            else:
+                guide.append("🛡 <b>손실 방어</b>: 손절선 엄수(이탈 시 기계적으로 정리) + 무리한 물타기 금지")
+                guide.append("🛡 <b>리스크 발생</b>: 변동성 확대 구간이므로 진입/추가매수는 보수적으로")
+
+            # 마감 임박 추가 코멘트
+            if is_nxt_open() and not is_market_open():
+                guide.append("🔵 <b>NXT 단독 시간</b>: 유동성 얇음 → 슬리피지/급변 가능, 보수적 대응 권장")
+            else:
+                guide.append("⏳ <b>장마감 임박</b>: 뉴스/공시 충격은 익일 갭으로 이어질 수 있어 방어 우선")
+            parts = [
+                f"🛡 <b>[손익 방어 알림]</b> (리스크 {risk_score}/100)",
+                "━━━━━━━━━━━━━━━",
+                f"<b>{name}</b>  <code>{code}</code>",
+                f"현재가 <b>{price:,}</b> / 진입 {entry:,}  ({pnl:+.1f}%)",
+                (f"손절 {stop:,}" if stop else ""),
+                "━━━━━━━━━━━━━━━",
+                *reasons[:4],
+                "━━━━━━━━━━━━━━━",
+                *guide[:4],
+            ]
+            msg = "\n".join([p for p in parts if p])
+            send_with_chart_buttons(msg, code, name)
+
+            # 기록
+            w["defense_last_ts"] = now_ts
+
+    except Exception as e:
+        _log_error("run_entry_defense_monitor", e)
+
 def send_with_chart_buttons(text: str, code: str, name: str):
     """
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
@@ -5601,8 +5864,7 @@ def update_dashboard(force: bool = False) -> None:
         tracked_n = len(_entry_watch.get("watch", {})) if isinstance(_entry_watch, dict) else 0
     except Exception:
         tracked_n = 0
-    raw_regime = (MARKET_REGIME.get("label") or "neutral")
-    regime = regime_label_ko(raw_regime)
+    regime = (MARKET_REGIME.get("label") or "neutral")
     det = MARKET_REGIME.get("details", {}) or {}
     det_txt = ""
     try:
@@ -10612,6 +10874,7 @@ def run_scan():
                 # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
         check_entry_watch()     # ★ 진입가 도달 체크
+        run_entry_defense_monitor()  # 🛡 장마감 손익 방어 가이드
         check_reentry_watch()   # ★ 손절 후 재진입 감시
         track_signal_results()  # ★ 추적 중 신호 결과 체크
     except Exception as e: _log_error("run_scan", e, critical=True)
