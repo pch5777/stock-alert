@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.11-hotfix2
+버전: v37.11-hotfix3
 날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -566,8 +566,7 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
             # For non-200, capture small snippet for diagnosis
             try:
                 txt = resp.text or ""
-                last_body = txt[:200].replace("
-", " ").replace("", " ")
+                last_body = txt[:200].replace("\\n", " ").replace("\\r", " ")
             except Exception:
                 last_body = ""
 
