@@ -3,13 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.21-stable1
-날짜: 2026-03-06
+버전: v37.11-hotfix-news6-rss1
+날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.21-stable1 (2026-03-06): [Fix] DASHBOARD_UPDATE_EVERY_SEC/DASHBOARD_STATE_FILE/_LAST_DASHBOARD_TS 기본값 정의로 메인루프 NameError 방지. [Fix] 장전 워치리스트 스케줄 07:55 잔존분을 07:30으로 통일. [Fix] 야간 무알림 구간 20:00~07:30 정합성 복구.
+- v37.11-hotfix-news6-rss1 (2026-03-06): [Fix] RSS/XML 파싱을 ElementTree 우선 + 정규식 백업으로 변경하여 XMLParsedAsHTMLWarning 제거(로그 노이즈↓, 안정성↑).
 
 - v37.11-hotfix-news6 (2026-03-05): 뉴스 소스 3→6 확장(타이틀+description 사용), 시작 배너 문구 갱신. 상품(B) 제외/상한가 쿨다운/404 비활성화는 유지.
 
@@ -164,11 +164,12 @@ def _now_kst() -> datetime:
     return datetime.now(_KST)
 
 def _is_quiet_night(now: datetime | None = None) -> bool:
-    """Quiet night window: 20:00~07:30 (no push; store only)."""
+    """Quiet night window: 20:00~07:55 (no push; store only)."""
     now = now or _now_kst()
     t = now.time()
-    return (t >= dtime(20, 0)) or (t < dtime(7, 30))
+    return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
 
@@ -246,13 +247,6 @@ DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
 )
 DATA_DIR = os.path.abspath(DATA_DIR)
-
-# ============================================================
-# 🧾 Dashboard runtime settings (prevent NameError)
-# ============================================================
-DASHBOARD_UPDATE_EVERY_SEC = int(os.getenv('DASHBOARD_UPDATE_EVERY_SEC', '600') or '600')
-DASHBOARD_STATE_FILE = os.path.join(DATA_DIR, 'dashboard_state.json')
-_LAST_DASHBOARD_TS = 0.0
 
 MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
 _BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -2006,7 +2000,7 @@ def build_next_open_watchlist(max_codes: int = 30) -> dict:
     return payload
 
 def send_preopen_watchlist():
-    """익개장 전(07:30) 워치리스트 요약 전송"""
+    """익개장 전(07:55) 워치리스트 요약 전송"""
     try:
         data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
         codes = data.get("codes") if isinstance(data, dict) else None
@@ -7190,36 +7184,71 @@ def _strip_html(text: str) -> str:
         return (text or "").strip()
 
 def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
-    """RSS 피드에서 헤드라인 수집 (title + description 요약 포함)"""
+    """RSS/Atom 피드에서 헤드라인 수집 (title + description/summary 요약 포함)
+
+    ⚠️ bs4의 XMLParsedAsHTMLWarning(HTML 파서로 XML 파싱) 방지를 위해
+    표준 XML 파서(ElementTree)를 우선 사용한다.
+    """
     try:
         resp = requests.get(url, timeout=12, headers=_random_ua())
         if resp.status_code != 200:
             return []
-        # xml 파서 없을 수 있으니 html.parser로 fallback
-        try:
-            soup = BeautifulSoup(resp.text, "xml")
-            items = soup.find_all("item")
-        except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            items = soup.find_all("item")
 
-        titles = []
-        for i in items[:max_items]:
-            t = i.find("title")
-            d = i.find("description")
-            title = _strip_html(t.get_text(strip=True)) if t else ""
-            desc  = _strip_html(d.get_text(strip=True)) if d else ""
-            if not title:
-                continue
-            # 내용도 참고: title — desc (너무 길면 축약)
-            if desc and desc != title:
-                desc = desc[:140] + ("…" if len(desc) > 140 else "")
-                titles.append(f"{title} — {desc}")
-            else:
+        xml_text = (resp.text or "").strip()
+        if not xml_text:
+            return []
+
+        titles: list[str] = []
+
+        # 1) XML 우선 (RSS/Atom 공통)
+        try:
+            root = ET.fromstring(xml_text)
+
+            # RSS: <item>, Atom: <entry>
+            items = root.findall(".//{*}item")
+            if not items:
+                items = root.findall(".//{*}entry")
+
+            for it in items[:max_items]:
+                # RSS/Atom 공통 title
+                t = it.find(".//{*}title")
+                # RSS description / Atom summary
+                d = it.find(".//{*}description")
+                if d is None:
+                    d = it.find(".//{*}summary")
+
+                title = _strip_html((t.text or "").strip()) if t is not None else ""
+                desc  = _strip_html((d.text or "").strip()) if d is not None else ""
+                if not title:
+                    continue
+
+                if desc and desc != title:
+                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                    titles.append(f"{title} — {desc}")
+                else:
+                    titles.append(title)
+
+            if titles:
+                return titles
+
+        except Exception:
+            # XML이 깨졌거나(드물게) HTML로 오는 경우 대비하여 2) 정규식 백업
+            pass
+
+        # 2) 백업: <item><title>...</title> 추출 (bs4 사용 안 함 → 경고 원천 차단)
+        # title이 너무 많아도 max_items까지만
+        raw_titles = re.findall(r"<title>(.*?)</title>", xml_text, flags=re.IGNORECASE | re.DOTALL)
+        for rt in raw_titles:
+            title = _strip_html(rt.strip())
+            if title:
                 titles.append(title)
-        return titles
-    except:
+            if len(titles) >= max_items:
+                break
+        return titles[:max_items]
+
+    except Exception:
         return []
+
 def _fetch_gdelt_headlines(max_items: int = 25) -> list:
     """(옵션) GDELT DOC API에서 지정학/공급망 관련 헤드라인+요약 수집"""
     try:
@@ -10666,7 +10695,7 @@ if __name__ == "__main__":
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("07:55").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
