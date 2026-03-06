@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.33-newsopt1
+버전: v37.34-sectororiginfix1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -5466,6 +5466,7 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                             return ""
 
                     lines   = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
+                    lines  += _sector_origin_line(code, info)
                     lines  += f"  {summary}\n" if summary else ""
                     for r in rising[:5]:
                         vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
@@ -5499,6 +5500,39 @@ def is_scoring_only_instrument(code: str, name: str = "") -> bool:
         return any(m in nm for m in SCORING_ONLY_NAME_MARKERS)
     except Exception:
         return False
+
+def _sector_origin_line(code: str, info: dict | None = None) -> str:
+    """섹터 모니터링 기준 종목의 출처/원신호/포착시각/현재상태를 한 줄로 요약."""
+    try:
+        info = info or {}
+        from_alert = bool(info.get("from_alert", False))
+        origin_signal = str(info.get("origin_signal", "") or "").strip()
+        detect_time = str(info.get("detect_time", "") or "").strip()
+
+        if is_scoring_only_instrument(code, info.get("name", "")):
+            origin_label = "참고·점수 종목"
+            status_label = "점수만 반영"
+        else:
+            origin_label = "포착 종목" if from_alert else "참고·점수 종목"
+            status_label = "점수만 반영"
+            if _entry_watch:
+                cand = [w for w in _entry_watch.values() if w.get("code") == code]
+                if cand:
+                    w = max(cand, key=lambda x: x.get("registered_ts", 0))
+                    status_label = "진입가 도달" if w.get("entry_hit") else "진입 감시중"
+                elif from_alert:
+                    status_label = "포착 후 감시 대기"
+        parts = [f"  🎯 기준 종목: {origin_label}"]
+        if origin_signal:
+            parts.append(f"원신호 {origin_signal}")
+        if detect_time:
+            parts.append(f"포착 {detect_time[:5]}")
+        if status_label:
+            parts.append(f"상태 {status_label}")
+        return "  |  ".join(parts) + "\n"
+    except Exception:
+        return ""
+
 
 def _watch_suffix(peer_code: str, peer_price: int) -> str:
     """감시 상태/수익률 표기 (진입가 대비 현재가 기준)."""
