@@ -3,13 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.28-etfstrict-exitmsg1
+버전: v37.28b-etfscore-exitentry-sectoricon1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.28-etfstrict-exitmsg1 (2026-03-06): (1) ETF/ETN/지수형 종목은 포착·진입감시·분할청산 대상에서 제외하고 점수/참고용으로만 사용하도록 scoring-only 필터 추가. (2) 분할 청산 타이밍 메시지에 진입가를 함께 표기. (3) 섹터 모니터링 하위 종목 표시에서 기존 📈/➖ 이모티콘을 제거하고 상승/보합/하락을 🟢/⚪/🔴 부호형으로 통일.
+- v37.28b-etfscore-exitentry-sectoricon1 (2026-03-06): ETF/ETN/지수형 종목을 점수용 전용으로 분리해 포착/진입감시/분할청산/섹터모니터 대상에서 제외. 분할 청산 메시지에 진입가 추가. 섹터 모니터링/뉴스+주가 연동 하위 종목 표기를 이모티콘 대신 부호형(🟩/⬜/🟥)으로 정리.
 
 - v37.27-sector-namefix1 (2026-03-06): 섹터 모니터링 하위 종목 리스트에서 종목명이 비어 보이던 문제를 보완. calc_sector_momentum() 단계에서 peer 종목명을 즉시 복구하고, 섹터 모멘텀 메시지/요약 생성 직전에도 _resolve_stock_name() fallback을 적용해 하단 섹터 종목명 누락을 줄임.
 
@@ -2422,8 +2422,8 @@ def run_mid_pullback_scan():
 
     signals.sort(key=lambda x: x["score"], reverse=True)
     for s in signals[:3]:
-        if is_scoring_only_instrument(s.get("code",""), s.get("name","")):
-            print(f"  ⏭️ 중기 눌림목 점수전용 제외: {s['name']} [{s['grade']}등급] {s['score']}점")
+        if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
+            print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
             continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
@@ -2435,8 +2435,6 @@ def run_mid_pullback_scan():
 
 def send_mid_pullback_alert(s: dict):
     stock_name  = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
-    if is_scoring_only_instrument(s.get("code", ""), stock_name):
-        return
     s["name"] = stock_name
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
@@ -5374,6 +5372,8 @@ def _chart_links(code: str, name: str) -> str:
 # 📡 섹터 지속 모니터링
 # ============================================================
 def start_sector_monitor(code: str, name: str):
+    if is_scoring_only_instrument(code, name):
+        return
     if code in _sector_monitor:
         return
     _sector_monitor[code] = {
@@ -5435,9 +5435,11 @@ def start_sector_monitor(code: str, name: str):
                         vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
                         wsuf  = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
-                        lines += f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
+                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '⬜')
+                        lines += f"  {marker} {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
                     for r in flat[:2]:
-                        lines += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
+                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '⬜')
+                        lines += f"  {marker} {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
                     if bonus > 0:
                         lines += f"  💡 섹터 가산점: +{bonus}점\n"
                     send_with_chart_buttons(
@@ -5452,6 +5454,37 @@ def start_sector_monitor(code: str, name: str):
 # ============================================================
 # 🎯 진입가 감지
 # ============================================================
+SCORING_ONLY_NAME_MARKERS = ("KODEX", "TIGER", "KOSEF", "KBSTAR", "ARIRANG", "HANARO", "ACE", "SOL", "ETF", "ETN")
+
+def is_scoring_only_instrument(code: str, name: str = "") -> bool:
+    """ETF/ETN/지수형 종목은 점수 참고용으로만 사용하고 실제 포착/감시 대상에서는 제외."""
+    try:
+        nm = str(name or "").upper()
+        return any(m in nm for m in SCORING_ONLY_NAME_MARKERS)
+    except Exception:
+        return False
+
+def _watch_suffix(peer_code: str, peer_price: int) -> str:
+    """감시 상태/수익률 표기 (진입가 대비 현재가 기준)."""
+    try:
+        if not _entry_watch:
+            return ""
+        cand = [w for w in _entry_watch.values() if w.get('code') == peer_code]
+        if not cand:
+            return ""
+        w = max(cand, key=lambda x: x.get('registered_ts', 0))
+        entry = safe_int(w.get('entry_price', 0))
+        if not entry:
+            return ""
+        if w.get('entry_hit'):
+            if peer_price:
+                pnl = (peer_price / entry - 1.0) * 100.0
+                return f" ✅ <b>({pnl:+.1f}%)</b>"
+            return " ✅"
+        return " ⏳ <b>(미도달)</b>"
+    except Exception:
+        return ""
+
 def register_top_signal(s: dict):
     """신호 발생마다 오늘의 최우선 종목 풀에 추가 (점수 높은 종목 유지)"""
     code  = s.get("code","")
@@ -5513,7 +5546,6 @@ def register_entry_watch(s: dict):
     code = s["code"]
     stock_name = _resolve_stock_name(code, s.get("name", ""))
     if is_scoring_only_instrument(code, stock_name):
-        print(f"  ⏭️ 점수전용 종목 제외(진입감시 미등록): {stock_name} {code}")
         return
     s["name"] = stock_name
 
@@ -8597,8 +8629,9 @@ def send_news_theme_alert(signal: dict):
     rising_lines = []
     for s in signal.get("rising", []):
         wsuf = _watch_suffix(s.get("code",""), safe_int(s.get("price", 0)))
+        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '⬜')
         rising_lines.append(
-            f"  📈 <b>{s['name']}</b> {s['change_rate']:+.1f}%"
+            f"  {marker} <b>{s['name']}</b> {s['change_rate']:+.1f}%"
             + (f" 🔊{s['volume_ratio']:.0f}x" if s.get("vol_on") else "")
             + (" 🚀" if s.get("surging") else "")
             + wsuf
@@ -8608,7 +8641,8 @@ def send_news_theme_alert(signal: dict):
     not_yet_lines = []
     for s in signal.get("not_yet", []):
         wsuf = _watch_suffix(s.get("code",""), safe_int(s.get("price", 0)))
-        not_yet_lines.append(f"  ⏳ {s['name']} {s['change_rate']:+.1f}%{wsuf}")
+        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '⬜')
+        not_yet_lines.append(f"  {marker} {s['name']} {s['change_rate']:+.1f}%{wsuf}")
     not_yet_block = ("\n".join(not_yet_lines) + ("\n" if not_yet_lines else ""))
     send(f"{emoji} <b>[뉴스+주가 연동]</b>  {signal['signal_strength']}\n"
          f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
@@ -11039,12 +11073,12 @@ def run_scan():
         else:
             print(f"  → {len(alerts)}개 감지! [{regime_label()}]")
             for s in alerts:
+                if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
+                    print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
+                    continue
                 is_nxt = s.get("market") == "NXT"
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
                 mkt_tag  = " 🔵NXT" if is_nxt else ""
-                if is_scoring_only_instrument(s.get("code",""), s.get("name","")):
-                    print(f"  ⏭️ 점수전용 제외: {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
-                    continue
                 print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
