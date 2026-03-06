@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.30-partialbasis1
+버전: v37.31-sectororigin1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.31-sectororigin1 (2026-03-06): 섹터 모니터링 메시지에 기준 종목의 출처를 표시하도록 개선. 기준 종목이 실제 포착 종목인지, 어떤 원신호/포착시각에서 시작된 감시인지 상단에 함께 표기해 섹터 알림의 의미를 바로 판단할 수 있게 정리.
 
 - v37.30-partialbasis1 (2026-03-06): 분할 청산 타이밍 메시지에 분할 청산 기준 정보를 추가. 현재 수익률, 절반 익절 기준 수익률, 목표 도달률, 현재가-진입가-목표가를 함께 표시해 지금 분할 청산이 왜 정당한지 즉시 판단 가능하게 개선.
 - v37.29-partialentryfix1 (2026-03-06): 분할 청산 타이밍 메시지에 진입가가 누락되던 문제 수정. 일반 분기와 외국인/기관 매매 코멘트 분기 모두에서 현재가-진입가-목표가가 함께 표시되도록 정합화.
@@ -2431,7 +2433,7 @@ def run_mid_pullback_scan():
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
-        start_sector_monitor(s["code"], s["name"])  # ★ 섹터 지속 모니터링
+        start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True)  # ★ 섹터 지속 모니터링
         _mid_pullback_alert_history[s["code"]] = time.time()
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
@@ -5380,15 +5382,31 @@ def _chart_links(code: str, name: str) -> str:
 # ============================================================
 # 📡 섹터 지속 모니터링
 # ============================================================
-def start_sector_monitor(code: str, name: str):
+def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_time: str = "", from_alert: bool = False):
     if is_scoring_only_instrument(code, name):
         return
-    if code in _sector_monitor:
-        return
-    _sector_monitor[code] = {
-        "name": name, "known_codes": set(),
-        "last_update": time.time(), "alert_count": 0, "start_ts": time.time(),
+    monitor_meta = {
+        "name": name,
+        "known_codes": set(),
+        "last_update": time.time(),
+        "alert_count": 0,
+        "start_ts": time.time(),
+        "origin_signal": origin_signal or "",
+        "detect_time": detect_time or "",
+        "from_alert": bool(from_alert),
     }
+    if code in _sector_monitor:
+        info = _sector_monitor.get(code, {})
+        info.setdefault("known_codes", set())
+        info.update({
+            "name": name or info.get("name", code),
+            "last_update": time.time(),
+            "origin_signal": origin_signal or info.get("origin_signal", ""),
+            "detect_time": detect_time or info.get("detect_time", ""),
+            "from_alert": bool(from_alert or info.get("from_alert", False)),
+        })
+        return
+    _sector_monitor[code] = monitor_meta
     def _monitor_loop(code=code, name=name):
         while True:
             time.sleep(SECTOR_MONITOR_INTERVAL)
@@ -8784,7 +8802,7 @@ def run_dart_intraday():
 
             # 섹터 지속 모니터링 + 진입가 감시 등록 (공시 발생 종목)
             if price:
-                start_sector_monitor(code, company)
+                start_sector_monitor(code, company, "DISCLOSURE", now_hhmmss(), False)
 
             # ── 이모지 및 등급 ──
             emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
@@ -11096,7 +11114,7 @@ def run_scan():
                 register_top_signal(s)
                 # 섹터 모니터: 동시 최대 8개 스레드 제한
                 if len(_sector_monitor) < 8:
-                    start_sector_monitor(s["code"], s["name"])
+                    start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True)
                 news_block_for_alert(s["code"], s["name"])
                 try:
                     threading.Thread(
