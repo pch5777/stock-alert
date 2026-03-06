@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.31-sectororigin1
+버전: v37.32-koreaetf-advanced1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1896,7 +1896,16 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     if MA20_DISCOUNT_MAX <= ma20_dev <= MA20_DISCOUNT_MIN:
         score += 5; reasons.append(f"📐 20일선 저점 근접 ({ma20_dev:+.1f}%)")
 
-    # ━━━ 4-4: NXT 신뢰도 보정 ━━━
+    # ━━━ 4-4: 해외 한국 ETF(EWY/FLKR) 장전 심리 + 섹터 차등 보정 ━━━
+    try:
+        kr_adj, kr_reason = calc_korea_etf_score_adj(code, name, "MID_PULLBACK", "")
+        if kr_adj != 0:
+            score += kr_adj
+            reasons.append(kr_reason)
+    except Exception as _e:
+        _log_error(f"mid_pullback_korea_etf({code})", _e)
+
+    # ━━━ 4-5: NXT 신뢰도 보정 ━━━
     nxt_delta, nxt_reason = 0, ""
     try:
         nxt_delta, nxt_reason = nxt_score_bonus(code)
@@ -6525,6 +6534,15 @@ def analyze(stock: dict) -> dict:
             reasons.append("⬆️ 내일 갭상승 기대 (미국 강세)")
     except Exception as _e: _log_error("analyze_us", _e)
 
+    # ── 해외 한국 ETF(EWY/FLKR) 장전 심리 + 편입비중 섹터 보정 ──
+    try:
+        kr_adj, kr_reason = calc_korea_etf_score_adj(code, stock.get("name", code), signal_type, sector_info.get("theme", ""))
+        if kr_adj != 0:
+            score = max(0, score + kr_adj)
+            reasons.append(kr_reason)
+    except Exception as _e:
+        _log_error("analyze_korea_etf", _e)
+
     # ── 공매도 잔고 비율 보정 ──
     short_ratio = 0.0  # v37.0: 초기화
     try:
@@ -10535,6 +10553,7 @@ def get_market_regime() -> dict:
             _regime_cache["us_regime"]   = us_regime
             _regime_cache["us_summary"]  = us.get("summary", "")
             _regime_cache["gap_signal"]  = us.get("gap_signal", "flat")
+            _regime_cache["korea_etf_summary"] = get_korea_etf_signals().get("summary", "")
         except: pass
 
         _dynamic["regime_mode"]       = mode
@@ -10556,6 +10575,26 @@ def regime_label() -> str:
 # 🌐 미국 시장 선행 지표 (Yahoo Finance — 인증 불필요)
 # ============================================================
 _us_cache: dict = {"ts": 0}  # 1시간 캐시
+_korea_etf_cache: dict = {"ts": 0}  # 90분 캐시
+
+USE_GLOBAL_KOREA_ETF_SCORE = True
+USE_HOLDINGS_WEIGHTED_SECTOR_BONUS = True
+KOREA_ETF_MARKET_WEIGHT = 1.0
+KOREA_ETF_SMALLCAP_DAMPING = 0.35
+KOREA_ETF_MAX_ABS_ADJ = 10
+KOREA_ETF_TICKERS = {"EWY": "ewy", "FLKR": "flkr"}
+KOREA_ETF_BUCKET_WEIGHTS = {
+    "semiconductor": 1.00,
+    "financial":     0.70,
+    "industrial":    0.60,
+    "defense":       0.55,
+    "nuclear":       0.55,
+    "auto":          0.45,
+    "internet":      0.40,
+    "bio":           0.28,
+    "battery":       0.22,
+    "smallcap":      0.35,
+}
 _geo_event_state: dict = {
     "active":        False,
     "uncertainty":   "low",
@@ -10721,6 +10760,152 @@ def get_institution_consecutive_days(code: str) -> int:
         return cached.get("inst_days", 0)
     get_foreign_consecutive_days(code)  # 캐시 갱신
     return _foreign_cache.get(code, {}).get("inst_days", 0)
+
+
+def _korea_etf_time_weight(now: datetime | None = None) -> float:
+    now = now or _now_kst()
+    t = now.time()
+    if dtime(8, 0) <= t < dtime(9, 0):
+        return 1.00
+    if dtime(9, 0) <= t < dtime(10, 0):
+        return 0.70
+    if dtime(10, 0) <= t < dtime(11, 0):
+        return 0.40
+    if dtime(11, 0) <= t < dtime(15, 30):
+        return 0.20
+    return 0.0
+
+
+def _classify_korea_etf_bucket(name: str = "", theme_name: str = "", signal_type: str = "") -> tuple[str, float, str]:
+    txt = f"{name or ''} {theme_name or ''} {signal_type or ''}"
+
+    bucket_rules = [
+        ("semiconductor", "반도체/IT", ["반도체", "메모리", "hbm", "패키징", "기판", "ai", "칩", "fab", "파운드리", "하이닉스", "삼성전자", "이수페타", "한미반도체"]),
+        ("financial", "금융", ["증권", "금융", "은행", "지주", "보험", "미래에셋", "kb", "신한", "하나금융", "우리금융"]),
+        ("industrial", "산업재", ["중공업", "조선", "기계", "인프라", "전력기기", "전선", "건설", "플랜트", "두산에너빌리티"]),
+        ("defense", "방산", ["방산", "우주항공", "한화에어로", "현대로템", "l ig넥스", "lig넥스", "빅텍"]),
+        ("nuclear", "원전", ["원전", "원자력", "두산에너빌리티", "비에이치아이", "한전기술"]),
+        ("auto", "자동차", ["자동차", "현대차", "기아", "모비스", "자율주행", "차부품"]),
+        ("internet", "인터넷/플랫폼", ["인터넷", "플랫폼", "소프트웨어", "게임", "naver", "카카오", "엔터"]),
+        ("bio", "바이오", ["바이오", "제약", "헬스", "의료", "셀트리온", "삼성바이오"]),
+        ("battery", "2차전지", ["2차전지", "배터리", "양극재", "음극재", "리튬", "전해질", "에코프로", "lg에너지솔루션", "포스코퓨처엠"]),
+    ]
+
+    lower = txt.lower()
+    for bucket, label, keywords in bucket_rules:
+        if any(k.lower() in lower for k in keywords):
+            return bucket, float(KOREA_ETF_BUCKET_WEIGHTS.get(bucket, 0.35) or 0.35), label
+
+    return "smallcap", float(KOREA_ETF_SMALLCAP_DAMPING), "소형/테마"
+
+
+def get_korea_etf_signals() -> dict:
+    if time.time() - _korea_etf_cache.get("ts", 0) < 5400:
+        return _korea_etf_cache
+
+    result = {
+        "ts": time.time(),
+        "ewy_chg": 0.0,
+        "flkr_chg": 0.0,
+        "avg_chg": 0.0,
+        "market_adj": 0,
+        "tone": "neutral",
+        "summary": "",
+    }
+    try:
+        values = {}
+        for sym, key in KOREA_ETF_TICKERS.items():
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
+                resp = requests.get(url, timeout=8, headers=_random_ua())
+                data = resp.json()
+                meta = data["chart"]["result"][0]["meta"]
+                prev = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                prev_close = [c for c in prev if c is not None]
+                cur_price = float(meta.get("regularMarketPrice", 0) or 0)
+                if cur_price and prev_close:
+                    values[f"{key}_chg"] = round((cur_price - prev_close[-1]) / prev_close[-1] * 100, 2)
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+        ewy = float(values.get("ewy_chg", 0.0) or 0.0)
+        flkr = float(values.get("flkr_chg", 0.0) or 0.0)
+        avg = round((ewy + flkr) / 2.0, 2)
+
+        if ewy >= 1.5 and flkr >= 1.5:
+            tone, market_adj = "strong_up", 8
+        elif ewy >= 0.8 and flkr >= 0.8:
+            tone, market_adj = "up", 5
+        elif avg >= 0.3 and min(ewy, flkr) >= 0:
+            tone, market_adj = "slight_up", 2
+        elif ewy <= -1.5 and flkr <= -1.5:
+            tone, market_adj = "strong_down", -8
+        elif ewy <= -0.8 and flkr <= -0.8:
+            tone, market_adj = "down", -5
+        elif avg <= -0.3 and max(ewy, flkr) <= 0:
+            tone, market_adj = "slight_down", -2
+        else:
+            tone, market_adj = "neutral", 0
+
+        tone_map = {"strong_up":"🟢 강세", "up":"🟢 우호", "slight_up":"🟩 소폭 우호",
+                    "neutral":"⚪ 중립", "slight_down":"🟧 소폭 경계", "down":"🟠 경계", "strong_down":"🔴 약세"}
+        summary = f"{tone_map.get(tone, '⚪ 중립')} EWY {ewy:+.1f}% / FLKR {flkr:+.1f}%"
+        result.update({
+            "ts": time.time(),
+            "ewy_chg": ewy,
+            "flkr_chg": flkr,
+            "avg_chg": avg,
+            "market_adj": market_adj,
+            "tone": tone,
+            "summary": summary,
+        })
+        _korea_etf_cache.update(result)
+        print(f"  🇰🇷 해외 한국 ETF: {summary}")
+    except Exception as e:
+        _log_error("get_korea_etf_signals", e)
+
+    return result
+
+
+def calc_korea_etf_score_adj(code: str, name: str, signal_type: str = "", theme_name: str = "") -> tuple[int, str]:
+    if not USE_GLOBAL_KOREA_ETF_SCORE:
+        return 0, ""
+
+    weight = _korea_etf_time_weight()
+    if weight <= 0:
+        return 0, ""
+
+    try:
+        etf = get_korea_etf_signals()
+        market_adj = int(round(float(etf.get("market_adj", 0) or 0) * KOREA_ETF_MARKET_WEIGHT * weight))
+        bucket, bucket_weight, bucket_label = _classify_korea_etf_bucket(name, theme_name, signal_type)
+
+        avg_chg = float(etf.get("avg_chg", 0.0) or 0.0)
+        sector_unit = 0
+        if avg_chg >= 1.0:
+            sector_unit = 4
+        elif avg_chg >= 0.5:
+            sector_unit = 2
+        elif avg_chg <= -1.0:
+            sector_unit = -4
+        elif avg_chg <= -0.5:
+            sector_unit = -2
+
+        sector_adj = 0
+        if USE_HOLDINGS_WEIGHTED_SECTOR_BONUS and sector_unit != 0:
+            sector_adj = int(round(sector_unit * bucket_weight * weight))
+
+        total = max(-KOREA_ETF_MAX_ABS_ADJ, min(KOREA_ETF_MAX_ABS_ADJ, market_adj + sector_adj))
+        if total == 0:
+            return 0, ""
+
+        reason = (f"🇰🇷 해외 한국 ETF {etf.get('summary','')} / "
+                  f"{bucket_label} 연동 {total:+d}점")
+        return total, reason
+    except Exception as e:
+        _log_error(f"calc_korea_etf_score_adj({code})", e)
+        return 0, ""
 
 
 def get_us_market_signals() -> dict:
