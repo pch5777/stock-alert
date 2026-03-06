@@ -3,12 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.29-partialentryfix1
+버전: v37.30-partialbasis1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+- v37.30-partialbasis1 (2026-03-06): 분할 청산 타이밍 메시지에 분할 청산 기준 정보를 추가. 현재 수익률, 절반 익절 기준 수익률, 목표 도달률, 현재가-진입가-목표가를 함께 표시해 지금 분할 청산이 왜 정당한지 즉시 판단 가능하게 개선.
 - v37.29-partialentryfix1 (2026-03-06): 분할 청산 타이밍 메시지에 진입가가 누락되던 문제 수정. 일반 분기와 외국인/기관 매매 코멘트 분기 모두에서 현재가-진입가-목표가가 함께 표시되도록 정합화.
 
 - v37.28b-etfscore-exitentry-sectoricon1 (2026-03-06): ETF/ETN/지수형 종목을 점수용 전용으로 분리해 포착/진입감시/분할청산/섹터모니터 대상에서 제외. 분할 청산 메시지에 진입가 추가. 섹터 모니터링/뉴스+주가 연동 하위 종목 표기를 이모티콘 대신 부호형(🟩/⬜/🟥)으로 정리.
@@ -4346,15 +4347,20 @@ def track_signal_results():
                         elif f_net < 0 or i_net < 0:
                             inv_info = "\n  ⚠️ 외국인/기관 매도 전환 — 익절 고려"
                     except: pass
+                    target_pct = ((target - entry) / entry * 100) if entry else 0
+                    target_progress_pct = (pnl_now / target_pct * 100) if target_pct else 0
+                    basis_gap_pct = ((price - entry) / entry * 100) if entry else 0
                     send_with_chart_buttons(
                         f"💡 <b>[분할 청산 타이밍]</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {pnl_now/((target-entry)/entry*100)*100:.0f}%)\n"
+                        f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {target_progress_pct:.0f}%)\n"
+                        f"📌 분할 기준: <b>+{half_pct:.1f}% 이상</b> 달성 시 1차 익절 검토\n"
+                        f"✅ 현재 상태: 기준 대비 <b>{pnl_now-half_pct:+.1f}%p</b>\n"
                         f"📍 현재가: <b>{price:,}원</b>\n"
-                        f"🎯 진입가: <b>{entry:,}원</b>\n"
-                        f"🏆 목표가: <b>{target:,}원</b>  (+{(target-entry)/entry*100:.1f}%)\n"
+                        f"🎯 진입가: <b>{entry:,}원</b>  ({basis_gap_pct:+.1f}%)\n"
+                        f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%)\n"
                         f"{inv_info}\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"💡 절반 익절 후 나머지 홀딩 전략 고려",
