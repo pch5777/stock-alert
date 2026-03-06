@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.32-koreaetf-advanced1
+버전: v37.33-newsopt1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -7049,6 +7049,41 @@ def news_block_for_alert(code: str, name: str) -> str:
         except: pass
     threading.Thread(target=_fetch, daemon=True).start()
 
+def _normalize_news_headline(title: str) -> str:
+    try:
+        import re as _re
+        t = html.unescape((title or '').strip())
+        # RSS description 결합부 정리
+        t = t.replace('—', ' ').replace('–', ' ').replace('|', ' ')
+        t = _re.sub(r"\[[^\]]+\]", ' ', t)
+        t = _re.sub(r"\([^\)]*사진[^\)]*\)", ' ', t)
+        t = _re.sub(r"[\"'`]+", '', t)
+        t = _re.sub(r"\s+", ' ', t).strip().lower()
+        return t
+    except Exception:
+        return (title or '').strip().lower()
+
+
+def fetch_sedaily_news() -> list:
+    """서울경제 RSS (증권/금융)"""
+    url_candidates = [
+        'https://m.sedaily.com/rss/finance',
+        'https://www.sedaily.com/rss/finance',
+    ]
+    for url in url_candidates:
+        items = _fetch_rss_headlines(url, max_items=15)
+        if items:
+            return items
+    return []
+
+
+def fetch_google_news_kr_policy_rates() -> list:
+    """Google News RSS (한국 정책/금리/환율)"""
+    q = '한국은행 OR 금리 OR 환율 OR 원달러 OR 정책 OR 재정 OR 증권'
+    url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
+    return _fetch_rss_headlines(url, max_items=12)
+
+
 def fetch_naver_news() -> list:
     try:
         resp = requests.get("https://finance.naver.com/news/news_list.naver?mode=LSS2D&section_id=101&section_id2=258",
@@ -7098,21 +7133,58 @@ def fetch_google_news_semicon_export() -> list:
     return _fetch_rss_headlines(url, max_items=10)
 
 
+DOMESTIC_NEWS_SOURCE_FUNCS = (
+    fetch_naver_news,
+    fetch_hankyung_news,
+    fetch_yonhap_news,
+    fetch_maekyung_news,
+    fetch_sedaily_news,
+    fetch_google_news_kr_market,
+    fetch_google_news_semicon_export,
+    fetch_google_news_kr_policy_rates,
+)
+
+
 def fetch_all_news() -> list:
-    # v37.0: Queue 기반 스레드 안전 수집 (list.extend 경쟁 조건 제거)
+    # v37.33: Queue 기반 스레드 수집 + 정규화 중복 제거 + 다중 소스 중복 기사 우선 정렬
     from queue import Queue
     _q = Queue()
     threads = [
         threading.Thread(target=lambda fn=f: _q.put(fn()), daemon=True)
-        for f in (fetch_naver_news, fetch_hankyung_news, fetch_yonhap_news, fetch_maekyung_news, fetch_google_news_kr_market, fetch_google_news_semicon_export)
+        for f in DOMESTIC_NEWS_SOURCE_FUNCS
     ]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=8)
-    results = []
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8)
+
+    raw_results = []
     while not _q.empty():
-        try: results.extend(_q.get_nowait())
-        except: break
-    return list(dict.fromkeys(results))
+        try:
+            raw_results.extend(_q.get_nowait())
+        except Exception:
+            break
+
+    scored = {}
+    order = 0
+    for title in raw_results:
+        if not title:
+            continue
+        norm = _normalize_news_headline(title)
+        if not norm:
+            continue
+        rec = scored.get(norm)
+        if rec is None:
+            scored[norm] = {'title': title, 'count': 1, 'order': order}
+            order += 1
+        else:
+            rec['count'] += 1
+            # 더 짧고 깔끔한 제목 우선 유지
+            if len(title) < len(rec['title']):
+                rec['title'] = title
+
+    ordered = sorted(scored.values(), key=lambda x: (-x['count'], x['order']))
+    return [x['title'] for x in ordered]
 
 
 
@@ -8633,7 +8705,7 @@ def analyze_news_theme(headlines: list = None) -> list:
     if headlines is None:                      # 직접 호출 시에만 크롤링
         headlines = fetch_all_news()
     if not headlines: return []
-    print(f"  📰 뉴스 {len(headlines)}건 (3개 소스)")
+    print(f"  📰 뉴스 {len(headlines)}건 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스)")
     for theme_key, theme_info in THEME_MAP.items():
         if time.time() - _news_alert_history.get(theme_key,0) < 14400: continue
         matched = [h for h in headlines if theme_key in h or any(s in h for s in theme_info.get("sectors",[]))]
@@ -8662,7 +8734,7 @@ def analyze_news_theme(headlines: list = None) -> list:
         signals.append({"theme_key":theme_key,"theme_desc":theme_info["desc"],
                          "headline":matched[0][:60],"rising":rising_stocks,
                          "surging":[s for s in stock_status if s["surging"]],
-                         "not_yet":[s for s in stock_status if s["not_yet"]][:4],
+                         "not_yet":[s for s in stock_status if s["not_yet"]][:6],
                          "react_ratio":react_ratio,"sector_bonus":sector_bonus,
                          "signal_strength":strength,"total":total})
     return signals
@@ -11404,7 +11476,7 @@ if __name__ == "__main__":
         "<b>📡 스캔 주기</b>\n"
         "• 급등/상한가 스캔: <b>20초</b>\n"
         "• 중기 눌림목: <b>90초</b>\n"
-        "• 뉴스 (6개 소스): <b>45초</b>\n"
+        f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
         "• DART 공시: <b>60초</b>\n"
         "• 텔레그램 명령어: <b>10초</b>\n"
         "• NXT 장전 선포착: 08:00~09:00\n"
