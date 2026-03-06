@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.25-strict-cleanup1
+버전: v37.26-strict-namefix1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.26-strict-namefix1 (2026-03-06): 포착/중기 눌림목/진입감시 알림에서 종목명이 비어 보이던 문제를 수정. 후보군 편입, 신호 생성, 로그 저장, 진입 감시 등록, 차트 버튼 발송 단계에 종목명 복구 fallback을 추가하여 코드만 보이던 현상을 방지.
 
 - v37.25-strict-cleanup1 (2026-03-06): 엄격 진입가 도달 체계로 전환하기 위해 과거 signal_log의 비실진입(actual_entry!=True) 자동 entry_hit 기록을 1회성으로 초기화하는 마이그레이션 추가. 실행 전 원본 signal_log 백업 생성, cleanup 마커 파일로 재실행 방지.
 - v37.24-strict-entryhit1 (2026-03-06): 진입가 도달(entry_hit) 판정을 ATR 허용오차 기반에서 엄격형으로 변경. 이제 현재가가 진입가 이하(price <= entry)일 때만 [진입가 도달!] 알림과 entry_hit 기록이 발생하도록 수정. 허용오차만으로 진입가 도달로 처리되던 오인식을 방지.
@@ -2142,6 +2144,43 @@ def send_preopen_watchlist():
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
 
+def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None) -> str:
+    """종목명이 비어 있을 때 현재가 응답 / signal_log / 코드 순으로 복구."""
+    try:
+        nm = str(name_hint or "").strip()
+        if nm:
+            return nm
+
+        if isinstance(cur, dict):
+            nm = str(cur.get("name", "") or "").strip()
+            if nm:
+                return nm
+
+        try:
+            info = get_stock_price(code)
+            nm = str((info or {}).get("name", "") or "").strip()
+            if nm:
+                return nm
+        except Exception:
+            pass
+
+        try:
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            for _k, rec in sorted(data.items(), reverse=True):
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("code", "")) == str(code):
+                    nm = str(rec.get("name", "") or "").strip()
+                    if nm:
+                        return nm
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return str(code or "").strip()
+
+
 def refresh_dynamic_candidates():
     """
     거래량 상위 50종목을 자동으로 후보군에 편입
@@ -2158,11 +2197,22 @@ def refresh_dynamic_candidates():
         vol_stocks = get_volume_surge_stocks()
         # 상한가 근접 상위 종목
         upper_stocks = get_upper_limit_stocks()
-        candidates = {s["code"]: s["name"] for s in vol_stocks + upper_stocks if s.get("code") and is_trade_candidate_name(s.get("name",""))}
-        excluded_cnt = sum(1 for s in vol_stocks + upper_stocks if s.get("code") and not is_trade_candidate_name(s.get("name","")))
+        candidates = {}
+        excluded_cnt = 0
+        for s in vol_stocks + upper_stocks:
+            code = s.get("code")
+            if not code:
+                continue
+            name = _resolve_stock_name(code, s.get("name", ""))
+            if not is_trade_candidate_name(name):
+                excluded_cnt += 1
+                continue
+            candidates[code] = name
         for code, name in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
+            else:
+                _dynamic_candidates[code]["name"] = name
         print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -2178,13 +2228,15 @@ def get_all_scan_candidates() -> list:
     for theme_info in THEME_MAP.values():
         for c, n in theme_info["stocks"]:
             if c not in seen:
-                if is_trade_candidate_name(n):
-                    seen.add(c); result.append((c, n, theme_info["desc"]))
+                resolved_name = _resolve_stock_name(c, n)
+                if is_trade_candidate_name(resolved_name):
+                    seen.add(c); result.append((c, resolved_name, theme_info["desc"]))
     # 동적 후보군 추가 (THEME_MAP에 없는 종목만)
     for code, info in _dynamic_candidates.items():
         if code not in seen:
-            if is_trade_candidate_name(info.get("name","")):
-                seen.add(code); result.append((code, info["name"], info["desc"]))
+            resolved_name = _resolve_stock_name(code, info.get("name", ""))
+            if is_trade_candidate_name(resolved_name):
+                seen.add(code); result.append((code, resolved_name, info["desc"]))
     return result
 
 # ============================================================
@@ -2302,7 +2354,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
 
     return {
-        "code": code, "name": name, "price": today_price, "change_rate": today_chg,
+        "code": code, "name": _resolve_stock_name(code, name, cur), "price": today_price, "change_rate": today_chg,
         "volume_ratio": vol_ratio, "signal_type": "MID_PULLBACK",
         "is_intraday": True,   # 장중 돌파 표시
         "grade": grade, "score": score,
@@ -2339,6 +2391,7 @@ def run_mid_pullback_scan():
     signals = []
 
     for code, name, theme_desc in all_candidates:
+        name = _resolve_stock_name(code, name)
         if time.time() - _mid_pullback_alert_history.get(code, 0) < MID_ALERT_COOLDOWN:
             continue
         try:
@@ -2374,6 +2427,8 @@ def run_mid_pullback_scan():
         print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
 
 def send_mid_pullback_alert(s: dict):
+    stock_name  = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
+    s["name"] = stock_name
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
     now_str     = datetime.now().strftime("%H:%M:%S")
@@ -2421,7 +2476,7 @@ def send_mid_pullback_alert(s: dict):
         f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🟣 <b>{s['name']}</b>  <code>{s['code']}</code>\n"
+        f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>패턴 요약</b>\n"
         f"  1차 급등: <b>+{s['surge_pct']:.0f}%</b>\n"
@@ -2436,7 +2491,7 @@ def send_mid_pullback_alert(s: dict):
         f"{sector_block}\n"
         f"💰 현재가: <b>{s['price']:,}원</b>  ({s['change_rate']:+.1f}%)\n"
         f"\n{entry_block}",
-        s["code"], s["name"]
+        s["code"], stock_name
     )
 
 # ============================================================
@@ -3772,6 +3827,8 @@ def save_signal_log(stock: dict):
         except: pass
 
         code     = stock["code"]
+        stock_name = _resolve_stock_name(code, stock.get("name", ""))
+        stock["name"] = stock_name
         sig_type = stock.get("signal_type", "UNKNOWN")
         # 같은 종목이 이미 추적 중이면 업데이트하지 않음 (중복 방지)
         log_key  = f"{code}_{stock.get('detected_at', datetime.now()).strftime('%Y%m%d%H%M')}"
@@ -3819,7 +3876,7 @@ def save_signal_log(stock: dict):
         data[log_key] = {
             "log_key":      log_key,
             "code":         code,
-            "name":         stock["name"],
+            "name":         stock_name,
             "signal_type":  sig_type,
             "score":        stock.get("score", 0),
             "grade":        stock.get("grade", "B"),
@@ -5442,13 +5499,15 @@ def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry: return
     code = s["code"]
+    stock_name = _resolve_stock_name(code, s.get("name", ""))
+    s["name"] = stock_name
 
     # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
     old_keys = [k for k, w in _entry_watch.items() if w["code"] == code]
     for k in old_keys:
         old_entry  = _entry_watch[k].get("entry_price", 0)
         miss_count = _entry_watch[k].get("miss_count", 0)
-        print(f"  🔄 진입가 갱신: {s['name']} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
+        print(f"  🔄 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
         # signal_log의 기존 "추적중" 레코드를 "진입가변경"으로 업데이트
         try:
             sig_data = {}
@@ -5472,7 +5531,7 @@ def register_entry_watch(s: dict):
 
     log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
     _entry_watch[log_key] = {
-        "code": code, "name": s["name"], "entry_price": entry,
+        "code": code, "name": stock_name, "entry_price": entry,
         "stop_loss":    s.get("stop_loss", 0),
         "target_price": s.get("target_price", 0),
         "signal_type":  s.get("signal_type", ""),
@@ -5484,7 +5543,7 @@ def register_entry_watch(s: dict):
         "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
         "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
     }
-    print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
+    print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
 def _record_entry_miss(watch: dict, reason: str, final_price: int):
     """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
@@ -5806,10 +5865,11 @@ def send_with_chart_buttons(text: str, code: str, name: str):
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
     버튼은 기기 기본 브라우저(외부)로 열림
     """
+    safe_name = _resolve_stock_name(code, name)
     naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
     keyboard = {
         "inline_keyboard": [[
-            {"text": f"📈 {name} 차트 보기 (네이버)", "url": naver},
+            {"text": f"📈 {safe_name} 차트 보기 (네이버)", "url": naver},
         ]]
     }
     try:
@@ -6085,6 +6145,7 @@ def _sector_block(s: dict) -> str:
     return block + "━━━━━━━━━━━━━━━\n\n"
 
 def send_alert(s: dict):
+    s["name"] = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     # throttle repetitive alerts (reduce spam)
     try:
         st = s.get('signal_type','')
