@@ -3,14 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.24-hotfix-quiet730
-날짜: 2026-03-06
+버전: v37.26-hotfix-nameorigin1
+날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.24-hotfix-quiet730 (2026-03-06): 야간 무알림 판정 함수(_is_quiet_night)의 실제 종료 시각을 07:55에서 07:30으로 수정하여 주석/정책/변경이력과 코드 동작을 일치시킴.
-
+- v37.26-hotfix-nameorigin1 (2026-03-06): 종목명 누락의 상위 원인을 보완. 랭킹/거래량 후보군에서 이름이 빈 상태로 _dynamic_candidates에 저장되던 흐름을 차단하고, 후보군 편입·신호 저장·진입감시 등록 시 종목명을 현재가 조회/기존 로그 기반으로 재보정하도록 수정.
 - v37.23-allin1 (2026-03-06): v37.18 기능(섹터/뉴스연동 감시상태 표기, 손익 방어, 07:30 장전 워치리스트, 레짐 한글화)을 유지하면서 대시보드 상수 누락(NameError) 안정화 및 RSS XML 파싱 경고(XMLParsedAsHTMLWarning) 제거(BeautifulSoup html.parser fallback 제거).
 - v37.18-newslink-watch1 (2026-03-05): '뉴스+주가 연동' 알림의 종목 리스트에도 포착/진입감시 종목 상태를 표기(진입가 도달 시 진입가 대비 현재가 수익률, 미도달 시 '미도달' 표시).
 
@@ -179,7 +178,7 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     """Quiet night window: 20:00~07:30 (no push; store only)."""
     now = now or _now_kst()
     t = now.time()
-    return (t >= dtime(20, 0)) or (t < dtime(7, 30))
+    return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
@@ -2141,6 +2140,41 @@ def send_preopen_watchlist():
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
 
+def _resolve_stock_name(code: str, name_hint: str = "") -> str:
+    """종목명이 비어 있으면 KIS 현재가/기존 캐시/로그 기준으로 복구."""
+    try:
+        nm = str(name_hint or "").strip()
+        if nm:
+            return nm
+
+        info = get_stock_price(code) if code else {}
+        nm = str((info or {}).get("name", "") or "").strip()
+        if nm:
+            return nm
+
+        try:
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            for _k, rec in sorted(data.items(), reverse=True):
+                if isinstance(rec, dict) and str(rec.get("code", "")) == str(code):
+                    nm = str(rec.get("name", "") or "").strip()
+                    if nm:
+                        return nm
+        except Exception:
+            pass
+
+        try:
+            info = _dynamic_candidates.get(code, {})
+            nm = str((info or {}).get("name", "") or "").strip()
+            if nm:
+                return nm
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return str(code or "").strip()
+
+
 def refresh_dynamic_candidates():
     """
     거래량 상위 50종목을 자동으로 후보군에 편입
@@ -2157,11 +2191,25 @@ def refresh_dynamic_candidates():
         vol_stocks = get_volume_surge_stocks()
         # 상한가 근접 상위 종목
         upper_stocks = get_upper_limit_stocks()
-        candidates = {s["code"]: s["name"] for s in vol_stocks + upper_stocks if s.get("code") and is_trade_candidate_name(s.get("name",""))}
-        excluded_cnt = sum(1 for s in vol_stocks + upper_stocks if s.get("code") and not is_trade_candidate_name(s.get("name","")))
+        candidates = {}
+        excluded_cnt = 0
+        for item in vol_stocks + upper_stocks:
+            code = str(item.get("code", "") or "").strip()
+            if not code:
+                continue
+            raw_name = str(item.get("name", "") or "").strip()
+            safe_name = _resolve_stock_name(code, raw_name)
+            if not is_trade_candidate_name(safe_name):
+                excluded_cnt += 1
+                continue
+            candidates[code] = safe_name
+
         for code, name in candidates.items():
+            safe_name = _resolve_stock_name(code, name)
             if code not in _dynamic_candidates:
-                _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
+                _dynamic_candidates[code] = {"name": safe_name, "desc": "자동편입", "added_ts": time.time()}
+            else:
+                _dynamic_candidates[code]["name"] = safe_name
         print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -2183,7 +2231,9 @@ def get_all_scan_candidates() -> list:
     for code, info in _dynamic_candidates.items():
         if code not in seen:
             if is_trade_candidate_name(info.get("name","")):
-                seen.add(code); result.append((code, info["name"], info["desc"]))
+                safe_name = _resolve_stock_name(code, info.get("name", ""))
+                _dynamic_candidates[code]["name"] = safe_name
+                seen.add(code); result.append((code, safe_name, info["desc"]))
     return result
 
 # ============================================================
@@ -3720,6 +3770,8 @@ def save_signal_log(stock: dict):
         except: pass
 
         code     = stock["code"]
+        stock_name = _resolve_stock_name(code, stock.get("name", ""))
+        stock["name"] = stock_name
         sig_type = stock.get("signal_type", "UNKNOWN")
         # 같은 종목이 이미 추적 중이면 업데이트하지 않음 (중복 방지)
         log_key  = f"{code}_{stock.get('detected_at', datetime.now()).strftime('%Y%m%d%H%M')}"
@@ -3767,7 +3819,7 @@ def save_signal_log(stock: dict):
         data[log_key] = {
             "log_key":      log_key,
             "code":         code,
-            "name":         stock["name"],
+            "name":         stock_name,
             "signal_type":  sig_type,
             "score":        stock.get("score", 0),
             "grade":        stock.get("grade", "B"),
@@ -3806,7 +3858,7 @@ def save_signal_log(stock: dict):
         }
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
+        print(f"  💾 신호 저장: {stock_name} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
         print(f"⚠️ 신호 저장 오류: {e}")
 
@@ -5390,13 +5442,15 @@ def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry: return
     code = s["code"]
+    stock_name = _resolve_stock_name(code, s.get("name", ""))
+    s["name"] = stock_name
 
     # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
     old_keys = [k for k, w in _entry_watch.items() if w["code"] == code]
     for k in old_keys:
         old_entry  = _entry_watch[k].get("entry_price", 0)
         miss_count = _entry_watch[k].get("miss_count", 0)
-        print(f"  🔄 진입가 갱신: {s['name']} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
+        print(f"  🔄 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
         # signal_log의 기존 "추적중" 레코드를 "진입가변경"으로 업데이트
         try:
             sig_data = {}
@@ -5420,7 +5474,7 @@ def register_entry_watch(s: dict):
 
     log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
     _entry_watch[log_key] = {
-        "code": code, "name": s["name"], "entry_price": entry,
+        "code": code, "name": stock_name, "entry_price": entry,
         "stop_loss":    s.get("stop_loss", 0),
         "target_price": s.get("target_price", 0),
         "signal_type":  s.get("signal_type", ""),
@@ -5432,7 +5486,7 @@ def register_entry_watch(s: dict):
         "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
         "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
     }
-    print(f"  🎯 진입가 감시 등록: {s['name']} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
+    print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
 def _record_entry_miss(watch: dict, reason: str, final_price: int):
     """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
@@ -5755,10 +5809,11 @@ def send_with_chart_buttons(text: str, code: str, name: str):
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
     버튼은 기기 기본 브라우저(외부)로 열림
     """
+    safe_name = _resolve_stock_name(code, name)
     naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
     keyboard = {
         "inline_keyboard": [[
-            {"text": f"📈 {name} 차트 보기 (네이버)", "url": naver},
+            {"text": f"📈 {safe_name} 차트 보기 (네이버)", "url": naver},
         ]]
     }
     try:
