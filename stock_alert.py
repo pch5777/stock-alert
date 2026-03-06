@@ -3,14 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.22-newslink-watch1-dash1
-날짜: 2026-03-06
+버전: v37.23-allin1
+날짜: 2026-03-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v37.22-newslink-watch1-dash1 (2026-03-06): '뉴스+주가 연동' 상태표기(v37.18) 유지 + 대시보드 상수(DASHBOARD_UPDATE_EVERY_SEC, DASHBOARD_STATE_FILE, _LAST_DASHBOARD_TS) 누락 정의 추가로 메인 루프 NameError 방지.
-
+- v37.23-allin1 (2026-03-06): v37.18 기능(섹터/뉴스연동 감시상태 표기, 손익 방어, 07:30 장전 워치리스트, 레짐 한글화)을 유지하면서 대시보드 상수 누락(NameError) 안정화 및 RSS XML 파싱 경고(XMLParsedAsHTMLWarning) 제거(BeautifulSoup html.parser fallback 제거).
 - v37.18-newslink-watch1 (2026-03-05): '뉴스+주가 연동' 알림의 종목 리스트에도 포착/진입감시 종목 상태를 표기(진입가 도달 시 진입가 대비 현재가 수익률, 미도달 시 '미도달' 표시).
 
 - v37.17-sector-watch1 (2026-03-05): 섹터 모니터링 메시지에 '포착/진입감시 종목' 상태를 표기(진입가 도달 시 진입가 대비 현재가 수익률, 미도달 시 '미도달' 표시). 섹터 스냅샷에 현재가(price) 포함.
@@ -257,6 +256,10 @@ DATA_DIR = os.getenv("STOCK_ALERT_DATA_DIR") or os.path.join(
     os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "."), "stock_alert"
 )
 DATA_DIR = os.path.abspath(DATA_DIR)
+# --- Dashboard scheduling/state (prevent NameError & allow env overrides) ---
+DASHBOARD_UPDATE_EVERY_SEC = int(os.getenv("DASHBOARD_UPDATE_EVERY_SEC", "30"))
+DASHBOARD_STATE_FILE = os.getenv("DASHBOARD_STATE_FILE") or os.path.join(DATA_DIR, "dashboard_state.json")
+_LAST_DASHBOARD_TS = 0.0
 
 MAX_STATE_BACKUPS = int(os.getenv("MAX_STATE_BACKUPS", "30") or "30")
 _BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -7536,25 +7539,44 @@ def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
                 else:
                     titles.append(title)
             return titles
-
         except Exception:
-            # 2) 최후 fallback: BS4 html parser (경고 가능)
-            soup = BeautifulSoup(xml_text, "html.parser")
-            items = soup.find_all("item")
-            titles = []
-            for i in items[:max_items]:
-                tt = i.find("title")
-                dd = i.find("description")
-                title = _strip_html(tt.get_text(strip=True)) if tt else ""
-                desc  = _strip_html(dd.get_text(strip=True)) if dd else ""
-                if not title:
-                    continue
-                if desc and desc != title:
-                    desc = desc[:140] + ("…" if len(desc) > 140 else "")
-                    titles.append(f"{title} — {desc}")
-                else:
-                    titles.append(title)
-            return titles
+            # 2) 최후 fallback: 정규식 기반 RSS 추출 (BeautifulSoup 사용 안 함)
+            try:
+                import re as _re
+                items = _re.findall(r"<item[^>]*>.*?</item>", xml_text, flags=_re.I | _re.S)
+                if not items:
+                    # Atom <entry>
+                    items = _re.findall(r"<entry[^>]*>.*?</entry>", xml_text, flags=_re.I | _re.S)
+
+                titles = []
+                for blk in items[:max_items]:
+                    # title
+                    mt = _re.search(r"<title[^>]*>(.*?)</title>", blk, flags=_re.I | _re.S)
+                    md = _re.search(r"<description[^>]*>(.*?)</description>", blk, flags=_re.I | _re.S)
+                    if md is None:
+                        md = _re.search(r"<summary[^>]*>(.*?)</summary>", blk, flags=_re.I | _re.S)
+                    if md is None:
+                        md = _re.search(r"<content[^>]*>(.*?)</content>", blk, flags=_re.I | _re.S)
+
+                    title_raw = (mt.group(1) if mt else "").strip()
+                    desc_raw  = (md.group(1) if md else "").strip()
+                    # CDATA 제거
+                    title_raw = _re.sub(r"^<!\[CDATA\[|\]\]>$", "", title_raw).strip()
+                    desc_raw  = _re.sub(r"^<!\[CDATA\[|\]\]>$", "", desc_raw).strip()
+
+                    title = _strip_html(title_raw)
+                    desc  = _strip_html(desc_raw)
+                    if not title:
+                        continue
+                    if desc and desc != title:
+                        desc = desc[:140] + ("…" if len(desc) > 140 else "")
+                        titles.append(f"{title} — {desc}")
+                    else:
+                        titles.append(title)
+
+                return titles
+            except Exception:
+                return []
 
     except:
         return []
