@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.26-strict-namefix1
+버전: v37.27-sector-namefix1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.27-sector-namefix1 (2026-03-06): 섹터 모니터링 하위 종목 리스트에서 종목명이 비어 보이던 문제를 보완. calc_sector_momentum() 단계에서 peer 종목명을 즉시 복구하고, 섹터 모멘텀 메시지/요약 생성 직전에도 _resolve_stock_name() fallback을 적용해 하단 섹터 종목명 누락을 줄임.
 
 - v37.26-strict-namefix1 (2026-03-06): 포착/중기 눌림목/진입감시 알림에서 종목명이 비어 보이던 문제를 수정. 후보군 편입, 신호 생성, 로그 저장, 진입 감시 등록, 차트 버튼 발송 단계에 종목명 복구 fallback을 추가하여 코드만 보이던 현상을 방지.
 
@@ -2465,7 +2467,7 @@ def send_mid_pullback_alert(s: dict):
             vol_tag       = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
             sector_block += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}\n"
         for r in flat[:3]:
-            sector_block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+            sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
     elif theme:
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
     else:
@@ -3525,9 +3527,10 @@ def calc_sector_momentum(code: str, name: str) -> dict:
         try:
             cur = get_stock_price(peer_code)
             if not cur: continue
+            safe_peer_name = _resolve_stock_name(peer_code, peer_name, cur)
             cr, vr = cur.get("change_rate",0), cur.get("volume_ratio",0)
-            src, rsn = peers_all.get(peer_code, (peer_name, "업종코드", ""))[1:]
-            results.append({"code":peer_code,"name":peer_name,"price":cur.get("price",0),"change_rate":cr,"volume_ratio":vr,
+            src, rsn = peers_all.get(peer_code, (safe_peer_name, "업종코드", ""))[1:]
+            results.append({"code":peer_code,"name":safe_peer_name,"price":cur.get("price",0),"change_rate":cr,"volume_ratio":vr,
                              "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0,
                              "source":src, "reason":rsn})
             time.sleep(0.15)
@@ -5425,9 +5428,9 @@ def start_sector_monitor(code: str, name: str):
                         vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
                         wsuf  = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
-                        lines += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
+                        lines += f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
                     for r in flat[:2]:
-                        lines += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+                        lines += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
                     if bonus > 0:
                         lines += f"  💡 섹터 가산점: +{bonus}점\n"
                     send_with_chart_buttons(
@@ -6136,11 +6139,11 @@ def _sector_block(s: dict) -> str:
     for r in rising[:5]:
         src_tag  = " 🔗" if r.get("source") == "동적테마" else ""
         vol_tag  = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
-        block   += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
+        block   += f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
 
     for r in flat[:3]:
         src_tag = " 🔗" if r.get("source") == "동적테마" else ""
-        block  += f"  ➖ {r['name']} {r['change_rate']:+.1f}%{src_tag}\n"
+        block  += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%{src_tag}\n"
 
     return block + "━━━━━━━━━━━━━━━\n\n"
 
@@ -6411,7 +6414,7 @@ def analyze(stock: dict) -> dict:
     if sector_info["bonus"]>0:
         score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
         if sector_info.get("rising"):
-            reasons.append("📌 동반 상승: " + ", ".join([f"{r['name']} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
+            reasons.append("📌 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
     elif sector_info.get("summary"):
         reasons.append(sector_info["summary"])
 
@@ -6735,7 +6738,7 @@ def check_early_detection() -> list:
         if sector_info["bonus"]>0:
             early_score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
             if sector_info.get("rising"):
-                reasons.append("📌 동반 상승: "+"".join([f"{r['name']} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
+                reasons.append("📌 동반 상승: "+"".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
         elif sector_info.get("summary"): reasons.append(sector_info["summary"])
 
         # NXT 보정
@@ -7576,7 +7579,7 @@ def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
             d_str = f"({r['date'][4:6]}/{r['date'][6:8]})"
         pnl_str = f"{r['pnl']:+.1f}%"
         geo_mark = "🌍" if r["geo"] else ""
-        examples.append(f"{r['name']}{geo_mark} {pnl_str}{d_str}")
+        examples.append(f"{_resolve_stock_name(r['code'], r.get('name',''))}{geo_mark} {pnl_str}{d_str}")
 
     line2 = "│     " + " | ".join(examples) if examples else ""
 
@@ -8772,12 +8775,12 @@ def run_dart_intraday():
                 total_cnt    = len(detail)
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
                 sector_block += "".join([
-                    f"  📈 {r['name']} {r['change_rate']:+.1f}%"
+                    f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
                     + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
                     for r in rising[:4]
                 ])
                 for r in flat[:2]:
-                    sector_block += f"  ➖ {r['name']} {r['change_rate']:+.1f}%\n"
+                    sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
             elif theme:
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
 
@@ -10952,7 +10955,7 @@ def filter_portfolio_signals(alerts: list) -> list:
                     _max_same = _dynamic.get("max_same_sector", 2)
                     if same_sector_passed >= _max_same:
                         excluded.add(peer["code"])
-                        print(f"  🗂️ 실질섹터 중복 제외: {peer['name']} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
+                        print(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
             except:
                 pass
 
