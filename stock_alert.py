@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.27-sector-namefix1
+버전: v37.28-etfstrict-exitmsg1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.28-etfstrict-exitmsg1 (2026-03-06): (1) ETF/ETN/지수형 종목은 포착·진입감시·분할청산 대상에서 제외하고 점수/참고용으로만 사용하도록 scoring-only 필터 추가. (2) 분할 청산 타이밍 메시지에 진입가를 함께 표기. (3) 섹터 모니터링 하위 종목 표시에서 기존 📈/➖ 이모티콘을 제거하고 상승/보합/하락을 🟢/⚪/🔴 부호형으로 통일.
 
 - v37.27-sector-namefix1 (2026-03-06): 섹터 모니터링 하위 종목 리스트에서 종목명이 비어 보이던 문제를 보완. calc_sector_momentum() 단계에서 peer 종목명을 즉시 복구하고, 섹터 모멘텀 메시지/요약 생성 직전에도 _resolve_stock_name() fallback을 적용해 하단 섹터 종목명 누락을 줄임.
 
@@ -2420,6 +2422,9 @@ def run_mid_pullback_scan():
 
     signals.sort(key=lambda x: x["score"], reverse=True)
     for s in signals[:3]:
+        if is_scoring_only_instrument(s.get("code",""), s.get("name","")):
+            print(f"  ⏭️ 중기 눌림목 점수전용 제외: {s['name']} [{s['grade']}등급] {s['score']}점")
+            continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
@@ -2430,6 +2435,8 @@ def run_mid_pullback_scan():
 
 def send_mid_pullback_alert(s: dict):
     stock_name  = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
+    if is_scoring_only_instrument(s.get("code", ""), stock_name):
+        return
     s["name"] = stock_name
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
@@ -5450,6 +5457,8 @@ def register_top_signal(s: dict):
     code  = s.get("code","")
     score = s.get("score", 0)
     if not code: return
+    if is_scoring_only_instrument(code, s.get("name", "")):
+        return
     existing = _today_top_signals.get(code, {})
     if score > existing.get("score", 0):
         _today_top_signals[code] = {
@@ -5503,6 +5512,9 @@ def register_entry_watch(s: dict):
     if not entry: return
     code = s["code"]
     stock_name = _resolve_stock_name(code, s.get("name", ""))
+    if is_scoring_only_instrument(code, stock_name):
+        print(f"  ⏭️ 점수전용 종목 제외(진입감시 미등록): {stock_name} {code}")
+        return
     s["name"] = stock_name
 
     # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
@@ -11030,6 +11042,9 @@ def run_scan():
                 is_nxt = s.get("market") == "NXT"
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
                 mkt_tag  = " 🔵NXT" if is_nxt else ""
+                if is_scoring_only_instrument(s.get("code",""), s.get("name","")):
+                    print(f"  ⏭️ 점수전용 제외: {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
+                    continue
                 print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
