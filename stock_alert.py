@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.23-allin1
-날짜: 2026-03-05
+버전: v37.24-hotfix-quiet730
+날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.24-hotfix-quiet730 (2026-03-06): 야간 무알림 판정 함수(_is_quiet_night)의 실제 종료 시각을 07:55에서 07:30으로 수정하여 주석/정책/변경이력과 코드 동작을 일치시킴.
 
 - v37.23-allin1 (2026-03-06): v37.18 기능(섹터/뉴스연동 감시상태 표기, 손익 방어, 07:30 장전 워치리스트, 레짐 한글화)을 유지하면서 대시보드 상수 누락(NameError) 안정화 및 RSS XML 파싱 경고(XMLParsedAsHTMLWarning) 제거(BeautifulSoup html.parser fallback 제거).
 - v37.18-newslink-watch1 (2026-03-05): '뉴스+주가 연동' 알림의 종목 리스트에도 포착/진입감시 종목 상태를 표기(진입가 도달 시 진입가 대비 현재가 수익률, 미도달 시 '미도달' 표시).
@@ -177,7 +179,7 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     """Quiet night window: 20:00~07:30 (no push; store only)."""
     now = now or _now_kst()
     t = now.time()
-    return (t >= dtime(20, 0)) or (t < dtime(7, 55))
+    return (t >= dtime(20, 0)) or (t < dtime(7, 30))
 from bs4 import BeautifulSoup
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
