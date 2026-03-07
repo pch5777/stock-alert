@@ -3,11 +3,14 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.38-marketregime1
+버전: v37.39-briefing-riskopt1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.39-briefing-riskopt1 (2026-03-07): 사용자 저장 수정사항 1~5 반영. (1) 07:30 메시지를 '장 시작 전 진입/리스크 브리핑'으로 개편하고 섹터 아래 후보 종목을 통합 표기. (2) 장 마감 전 리스크 안내를 entry_hit 종목 중심으로 정규장/NXT 타이틀 분리. (3) 야간/장전 리스크 판단에 DART·지정학·해외 한국 ETF(EWY/FLKR) 요약을 추가. (4) '중기 눌림목' 사용자 라벨을 '눌림목' 계열로 정리. (5) 반복되던 신호 라벨 문자열을 공용 helper로 통합해 중복/충돌 위험을 줄임.
+
 
 - v37.38-marketregime1 (2026-03-07): Market Regime 필터를 실제 점수 엔진과 텔레그램 UI에 반영. 시장 상태(상승장/보통장/하락장/급락장)에 따라 신호 점수 배율/최소점수 보정을 적용하고, 주요 신호/눌림목/진입가 도달 알림 상단에 시장 상태를 함께 표시하도록 개선.
 
@@ -85,6 +88,34 @@ v37.8-fixbaseurl2 (2026-03-05)
 
 """
 
+
+
+# 공용 신호 라벨/표현 (중복 dict 축소용)
+SIG_LABELS = {
+    "UPPER_LIMIT": "상한가",
+    "NEAR_UPPER": "상한가근접",
+    "SURGE": "급등",
+    "EARLY_DETECT": "조기포착",
+    "MID_PULLBACK": "눌림목",
+    "ENTRY_POINT": "단기눌림목",
+    "STRONG_BUY": "강력매수",
+}
+
+SIG_TITLES = {
+    "UPPER_LIMIT": "상한가 감지",
+    "NEAR_UPPER": "상한가 근접",
+    "SURGE": "급등 감지",
+    "EARLY_DETECT": "★ 조기 포착 - 선진입 기회 ★",
+    "MID_PULLBACK": "눌림목 진입 신호",
+    "ENTRY_POINT": "★ 눌림목 진입 시점 ★",
+    "STRONG_BUY": "강력 매수 신호",
+}
+
+def get_signal_label(signal_type: str, default: str = "") -> str:
+    return SIG_LABELS.get(str(signal_type or ""), default or str(signal_type or ""))
+
+def get_signal_title(signal_type: str, default: str = "급등 감지") -> str:
+    return SIG_TITLES.get(str(signal_type or ""), default)
 
 # ============================================================
 # 후보군(포착/진입감시) 제외 규칙  (B 옵션)
@@ -2520,7 +2551,7 @@ def send_mid_pullback_alert(s: dict):
 
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     send_with_chart_buttons(
-        f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
+        f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
@@ -4210,7 +4241,7 @@ def _send_pending_result_reminder():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
         for v in pending:
@@ -4227,7 +4258,7 @@ def _send_pending_result_reminder():
                 cur_str = f"  현재 {cur_p:,}원  {pnl_emoji}{cur_pnl:+.1f}%"
             except:
                 cur_str = ""
-            sig = sig_labels.get(v.get("signal_type",""), "")
+            sig = get_signal_label(v.get("signal_type",""), "")
             msg += (f"• <b>{v['name']}</b>  {sig}\n"
                     f"  진입 {entry:,}원  손절 {v.get('stop_price',0):,}  목표 {v.get('target_price',0):,}\n"
                     f"{cur_str}\n"
@@ -4611,10 +4642,10 @@ def _send_tracking_result(rec: dict):
     sig_labels = {
         "UPPER_LIMIT":"상한가", "NEAR_UPPER":"상한가근접",
         "SURGE":"급등", "EARLY_DETECT":"조기포착",
-        "MID_PULLBACK":"중기눌림목", "ENTRY_POINT":"단기눌림목",
+        "MID_PULLBACK":"눌림목", "ENTRY_POINT":"단기눌림목",
         "STRONG_BUY":"강력매수",
     }
-    sig_label = sig_labels.get(sig_type, sig_type)
+    sig_label = get_signal_label(sig_type, sig_type)
     theme_tag = f"\n🏭 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
     mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
 
@@ -4730,8 +4761,8 @@ def check_reentry_watch():
             if bounce >= _reentry_min and vr >= REENTRY_VOL_MIN:
                 sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
                               "SURGE":"급등","EARLY_DETECT":"조기포착",
-                              "MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목"}
-                sig = sig_labels.get(w["signal_type"], w["signal_type"])
+                              "MID_PULLBACK":"눌림목","ENTRY_POINT":"단기눌림목"}
+                sig = get_signal_label(w["signal_type"], w["signal_type"])
                 stop_new, target_new, sp, tp, atr = calc_stop_target(code, price)
                 rr = round((target_new - price) / (price - stop_new), 1) if price > stop_new else 0
                 send_with_chart_buttons(
@@ -5073,7 +5104,7 @@ def analyze_loss_pattern(completed: list) -> str:
     worst_type = max(type_counts, key=type_counts.get) if type_counts else None
     if worst_type:
         type_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
                        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수"}
         lines.append(f"  손실 많은 신호: {type_labels.get(worst_type, worst_type)} ({type_counts[worst_type]}건)")
 
@@ -5765,7 +5796,7 @@ def send_top_signals():
 
     sig_labels = {
         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+        "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
         "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
     }
     top5  = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:5]
@@ -5773,7 +5804,7 @@ def send_top_signals():
     msg   = f"🏆 <b>최우선 종목 TOP 5</b>  {datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━━\n"
     for i, t in enumerate(top5, 1):
         medal   = medals[i-1]
-        sig     = sig_labels.get(t["signal_type"], t["signal_type"])
+        sig     = get_signal_label(t["signal_type"], t["signal_type"])
         nxt_tag = f"  🔵NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
         entry   = t.get("entry_price", 0)
         stop    = t.get("stop_loss", 0)
@@ -5953,9 +5984,9 @@ def check_entry_watch():
                 watch["notify_count"]     = notify_count + 1
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
+                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"단기눌림목",
                 }
-                sig       = sig_labels.get(watch["signal_type"], watch["signal_type"])
+                sig       = get_signal_label(watch["signal_type"], watch["signal_type"])
                 diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
                 stop_pct  = round((watch["stop_loss"]    - entry) / entry * 100, 1) if entry else 0
                 tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
@@ -6522,9 +6553,7 @@ def send_alert(s: dict):
 
     emoji = {"UPPER_LIMIT":"🚨","NEAR_UPPER":"🔥","STRONG_BUY":"💎",
              "SURGE":"📈","ENTRY_POINT":"🎯","EARLY_DETECT":"🔍"}.get(s["signal_type"],"📊")
-    title = {"UPPER_LIMIT":"상한가 감지","NEAR_UPPER":"상한가 근접","STRONG_BUY":"강력 매수 신호",
-             "SURGE":"급등 감지","ENTRY_POINT":"★ 눌림목 진입 시점 ★",
-             "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
+    title = get_signal_title(s["signal_type"], "급등 감지")
 
     level    = get_alert_level(s["signal_type"], s.get("score",0), s.get("nxt_delta",0))
     nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
@@ -9566,7 +9595,7 @@ def poll_telegram_commands():
                     today_str = datetime.now().strftime("%m/%d")
                     sig_labels = {
                         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
                         "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
                     }
                     today_recs   = [v for v in data.values() if v.get("detect_date") == today]
@@ -10096,6 +10125,35 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         if gap_signal == "gap_down":
             risk_score += 15; reasons.append("⬇️ 갭하락 가능성")
 
+        try:
+            dr = check_dart_risk(code, name)
+            if isinstance(dr, dict) and dr.get("is_risk"):
+                risk_score += 25
+                reasons.append(f"📢 DART 리스크: {str(dr.get('title',''))[:28]}")
+        except Exception:
+            pass
+
+        try:
+            geo = _geo_event_state or {}
+            if geo.get("active") and time.time() - float(geo.get("ts", 0) or 0) < 3600 * 12:
+                unc = str(geo.get("uncertainty", "mid"))
+                if unc == "high":
+                    risk_score += 15; reasons.append("🌍 지정학 고위험")
+                else:
+                    risk_score += 8; reasons.append("🌍 지정학 변수")
+        except Exception:
+            pass
+
+        try:
+            ketf = get_korea_etf_signals()
+            market_adj = int(ketf.get("market_adj", 0) or 0)
+            if market_adj <= -5:
+                risk_score += 12; reasons.append(f"🇰🇷 해외 한국ETF 약세: {ketf.get('summary','')}")
+            elif market_adj <= -2:
+                risk_score += 6; reasons.append(f"🇰🇷 해외 한국ETF 경계: {ketf.get('summary','')}")
+        except Exception:
+            pass
+
         if current_pnl > 5:
             risk_score -= 10; reasons.append(f"✅ 현재 +{current_pnl:.1f}% 수익 중")
 
@@ -10443,7 +10501,7 @@ def on_market_close():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
 
@@ -10741,7 +10799,7 @@ def send_weekly_report():
 
         type_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
             "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
         }
         type_lines = ""
