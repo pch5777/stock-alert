@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.35-koreaetf-autolearn1
+버전: v37.35b-koreaetf-autolearn1-stable
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.35b-koreaetf-autolearn1-stable (2026-03-07): 오류 없던 v37.34 기준으로 EWY/FLKR→국내 섹터 가중치 자동학습을 재적용. signal_log에 해외 한국ETF 스냅샷 저장, auto_tune에서 최근 완료 신호 성과를 바탕으로 korea_etf_bucket_weights를 스무딩 재조정. v37.35에서 발생한 KOREA_ETF_BUCKET_WEIGHTS_DEFAULT NameError를 피하도록 상수/초기화 순서를 안정화.
 
 - v37.31-sectororigin1 (2026-03-06): 섹터 모니터링 메시지에 기준 종목의 출처를 표시하도록 개선. 기준 종목이 실제 포착 종목인지, 어떤 원신호/포착시각에서 시작된 감시인지 상단에 함께 표기해 섹터 알림의 의미를 바로 판단할 수 있게 정리.
 
@@ -19,8 +21,6 @@
 - v37.27-sector-namefix1 (2026-03-06): 섹터 모니터링 하위 종목 리스트에서 종목명이 비어 보이던 문제를 보완. calc_sector_momentum() 단계에서 peer 종목명을 즉시 복구하고, 섹터 모멘텀 메시지/요약 생성 직전에도 _resolve_stock_name() fallback을 적용해 하단 섹터 종목명 누락을 줄임.
 
 - v37.26-strict-namefix1 (2026-03-06): 포착/중기 눌림목/진입감시 알림에서 종목명이 비어 보이던 문제를 수정. 후보군 편입, 신호 생성, 로그 저장, 진입 감시 등록, 차트 버튼 발송 단계에 종목명 복구 fallback을 추가하여 코드만 보이던 현상을 방지.
-
-- v37.35-koreaetf-autolearn1 (2026-03-07): EWY/FLKR 장전 점수의 국내 섹터 연동 가중치를 signal_log 성과 기반으로 자동 재학습. 신호 저장 시 해외 한국ETF 스냅샷을 함께 기록하고, auto_tune에서 최근 완료 신호 성과를 바탕으로 섹터별 가중치를 스무딩 조정하여 dynamic_params에 영구 저장.
 
 - v37.25-strict-cleanup1 (2026-03-06): 엄격 진입가 도달 체계로 전환하기 위해 과거 signal_log의 비실진입(actual_entry!=True) 자동 entry_hit 기록을 1회성으로 초기화하는 마이그레이션 추가. 실행 전 원본 signal_log 백업 생성, cleanup 마커 파일로 재실행 방지.
 - v37.24-strict-entryhit1 (2026-03-06): 진입가 도달(entry_hit) 판정을 ATR 허용오차 기반에서 엄격형으로 변경. 이제 현재가가 진입가 이하(price <= entry)일 때만 [진입가 도달!] 알림과 entry_hit 기록이 발생하도록 수정. 허용오차만으로 진입가 도달로 처리되던 오인식을 방지.
@@ -3896,7 +3896,6 @@ def save_signal_log(stock: dict):
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
         }
-        korea_etf_snapshot = _get_korea_etf_snapshot(code, stock_name, sig_type, stock.get("sector_info", {}).get("theme", ""))
 
         data[log_key] = {
             "log_key":      log_key,
@@ -4854,7 +4853,18 @@ _dynamic = {
     # ── 포트폴리오 동시 신호 관리 ──
     "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
     # ── 해외 한국 ETF(EWY/FLKR) 섹터 가중치 자동학습 ──
-    "korea_etf_bucket_weights": dict(KOREA_ETF_BUCKET_WEIGHTS_DEFAULT),
+    "korea_etf_bucket_weights": {
+        "semiconductor": 1.00,
+        "financial":     0.70,
+        "industrial":    0.60,
+        "defense":       0.55,
+        "nuclear":       0.55,
+        "automobile":    0.50,
+        "internet":      0.45,
+        "biotech":       0.35,
+        "battery":       0.35,
+        "smallcap":      0.35,
+    },
 }
 
 # 긴급 튜닝: 연속 손절/수익 카운터
