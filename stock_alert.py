@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.37-ui-overhaul1
+버전: v37.38-marketregime1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.38-marketregime1 (2026-03-07): Market Regime 필터를 실제 점수 엔진과 텔레그램 UI에 반영. 시장 상태(상승장/보통장/하락장/급락장)에 따라 신호 점수 배율/최소점수 보정을 적용하고, 주요 신호/눌림목/진입가 도달 알림 상단에 시장 상태를 함께 표시하도록 개선.
 
 - v37.37-ui-overhaul1 (2026-03-07): 텔레그램 신호 UI 전반 개편. 강력매수/급등/조기포착/눌림목/진입가도달/분할청산/섹터모니터링 메시지를 '매매정보 → 현재상태 → 섹터요약 → 결론 → 근거/경고 → 상세' 순서로 재배치하고, 손익비/한줄 결론/섹터 요약/경고 블록을 추가해 가독성을 개선.
 
@@ -1777,6 +1779,10 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     if price < 500:
         return {}
 
+    _regime = get_market_regime()
+    _regime_mult = float(_dynamic.get("regime_score_mult", 1.0) or 1.0)
+    _regime_min_add = int(_dynamic.get("regime_min_add", 0) or 0)
+
     # ━━━ 1단계: 1차 급등 확인 ━━━
     # 최근 20일 내에서 저점 → 고점 상승률 계산
     lookback = items[-(MID_SURGE_LOOKBACK_DAYS + MID_PULLBACK_DAYS_MAX):-1]
@@ -1925,10 +1931,20 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     if not is_bullish and not vol_recovered:
         return {}
 
+    if _regime_mult != 1.0:
+        score = int(round(score * _regime_mult))
+    if _regime.get("mode", "normal") == "crash":
+        return {}
+    if _regime.get("mode", "normal") != "normal":
+        reasons.append(f"🌎 {regime_label()} 필터: 최소점수 +{_regime_min_add}점 / 점수배율 x{_regime_mult:.2f}")
+
     # 등급 결정
-    if score >= 80:   grade = "A"
-    elif score >= 60: grade = "B"
-    elif score >= 45: grade = "C"
+    _grade_a = 80 + _regime_min_add
+    _grade_b = 60 + _regime_min_add
+    _grade_c = 45 + _regime_min_add
+    if score >= _grade_a:   grade = "A"
+    elif score >= _grade_b: grade = "B"
+    elif score >= _grade_c: grade = "C"
     else:             return {}  # 점수 미달
 
     # 손절·목표가
@@ -1957,6 +1973,8 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "atr_used":      atr_used,
         "reasons":       reasons,
         "detected_at":   datetime.now(),
+        "market_regime_label": regime_label(),
+        "market_regime_mode": regime.get("mode", _regime_mode),
     }
 
 # ============================================================
@@ -6540,6 +6558,7 @@ def send_alert(s: dict):
 
     stars    = "★" * min(int(s["score"]/20), 5)
     now_str  = datetime.now().strftime("%H:%M:%S")
+    regime_line = regime_message_line()
     stop_pct = s.get("stop_pct",7.0); target_pct = s.get("target_pct",15.0)
     atr_tag  = " (ATR)" if s.get("atr_used") else " (고정)"
     strict_warn = "\n⏰ <b>장 시작·마감 근접 — 변동성 주의</b>\n" if is_strict_time() else ""
@@ -6673,9 +6692,16 @@ def analyze(stock: dict) -> dict:
     _slot = _get_timeslot(datetime.now().strftime("%H:%M:%S"))
     _slot_adj = int(_dynamic.get("timeslot_score_adj", {}).get(_slot, 0) or 0)
     min_score += _slot_adj
+    _regime_pre = get_market_regime()
+    _regime_mode = _regime_pre.get("mode", _dynamic.get("regime_mode", "normal"))
+    _regime_mult = float(_dynamic.get("regime_score_mult", 1.0) or 1.0)
+    _regime_min_add = int(_dynamic.get("regime_min_add", 0) or 0)
+    min_score += _regime_min_add
     score, reasons, signal_type = 0, [], None
     if _slot_adj > 0:
         reasons.append(f"🕐 [{_slot}] 학습 보정: 최소점수 +{_slot_adj}점")
+    if _regime_mode != "normal":
+        reasons.append(f"🌎 {regime_label()} 필터: 최소점수 +{_regime_min_add}점 / 점수배율 x{_regime_mult:.2f}")
 
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
@@ -6745,6 +6771,8 @@ def analyze(stock: dict) -> dict:
         except Exception as _e:
             _log_error(f"analyze_investor({stock.get('code', '')})", _e); inv = {}; f_net = 0; i_net = 0
 
+    if _regime_mult != 1.0:
+        score = int(round(score * _regime_mult))
     if score < min_score: return {}
 
     # ── 보조지표 필터 (RSI / 이동평균 / 볼린저밴드) ──
@@ -6795,11 +6823,10 @@ def analyze(stock: dict) -> dict:
 
     # ── ① 시장 국면 보정 ──
     regime = get_market_regime()
-    regime_mode = regime.get("mode", "normal")
+    regime_mode = regime.get("mode", _regime_mode)
     if regime_mode == "crash" and signal_type not in ("UPPER_LIMIT", "STRONG_BUY"):
         return {}   # 급락장: 상한가/강력매수만 허용
-    min_add = regime.get("min_add", 0)
-    if score < min_score + min_add: return {}
+    if score < min_score: return {}
     if regime_mode != "normal":
         reasons.append(f"🌐 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
 
@@ -10936,6 +10963,20 @@ def regime_label() -> str:
     r = get_market_regime()
     labels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
     return labels.get(r.get("mode","normal"), "🔵 보통장")
+
+def regime_message_line() -> str:
+    """텔레그램 표시용 시장 상태 요약."""
+    try:
+        r = get_market_regime()
+        parts = [regime_label()]
+        if r.get("us_regime") in ("panic", "risk_off", "risk_on"):
+            us_map = {"panic": "미국패닉", "risk_off": "미국위험회피", "risk_on": "미국위험선호"}
+            parts.append(us_map.get(r.get("us_regime"), ""))
+        if r.get("nxt_only"):
+            parts.append("NXT단독")
+        return "🌎 시장 상태: " + " / ".join([p for p in parts if p])
+    except Exception:
+        return "🌎 시장 상태: 🔵 보통장"
 
 
 # ============================================================
