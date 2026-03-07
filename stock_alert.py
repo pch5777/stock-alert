@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.34-sectororiginfix1
+버전: v37.35-koreaetf-autolearn1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -19,6 +19,8 @@
 - v37.27-sector-namefix1 (2026-03-06): 섹터 모니터링 하위 종목 리스트에서 종목명이 비어 보이던 문제를 보완. calc_sector_momentum() 단계에서 peer 종목명을 즉시 복구하고, 섹터 모멘텀 메시지/요약 생성 직전에도 _resolve_stock_name() fallback을 적용해 하단 섹터 종목명 누락을 줄임.
 
 - v37.26-strict-namefix1 (2026-03-06): 포착/중기 눌림목/진입감시 알림에서 종목명이 비어 보이던 문제를 수정. 후보군 편입, 신호 생성, 로그 저장, 진입 감시 등록, 차트 버튼 발송 단계에 종목명 복구 fallback을 추가하여 코드만 보이던 현상을 방지.
+
+- v37.35-koreaetf-autolearn1 (2026-03-07): EWY/FLKR 장전 점수의 국내 섹터 연동 가중치를 signal_log 성과 기반으로 자동 재학습. 신호 저장 시 해외 한국ETF 스냅샷을 함께 기록하고, auto_tune에서 최근 완료 신호 성과를 바탕으로 섹터별 가중치를 스무딩 조정하여 dynamic_params에 영구 저장.
 
 - v37.25-strict-cleanup1 (2026-03-06): 엄격 진입가 도달 체계로 전환하기 위해 과거 signal_log의 비실진입(actual_entry!=True) 자동 entry_hit 기록을 1회성으로 초기화하는 마이그레이션 추가. 실행 전 원본 signal_log 백업 생성, cleanup 마커 파일로 재실행 방지.
 - v37.24-strict-entryhit1 (2026-03-06): 진입가 도달(entry_hit) 판정을 ATR 허용오차 기반에서 엄격형으로 변경. 이제 현재가가 진입가 이하(price <= entry)일 때만 [진입가 도달!] 알림과 entry_hit 기록이 발생하도록 수정. 허용오차만으로 진입가 도달로 처리되던 오인식을 방지.
@@ -3894,6 +3896,7 @@ def save_signal_log(stock: dict):
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
         }
+        korea_etf_snapshot = _get_korea_etf_snapshot(code, stock_name, sig_type, stock.get("sector_info", {}).get("theme", ""))
 
         data[log_key] = {
             "log_key":      log_key,
@@ -3920,6 +3923,7 @@ def save_signal_log(stock: dict):
             "feature_flags": feature_flags,
             "params_snapshot":   params_snapshot,
             "feature_snapshot":  feature_snapshot,
+            "korea_etf_snapshot": korea_etf_snapshot,
             # ── 이론 추적 결과 (봇 자동 계산 → auto_tune 학습용) ──
             "status":            "추적중",   # 봇 추적 상태
             "exit_price":        0,
@@ -4849,6 +4853,8 @@ _dynamic = {
     "atr_target_mult":     ATR_TARGET_MULT,   # 목표가 배수 (변동성 따라 조정)
     # ── 포트폴리오 동시 신호 관리 ──
     "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
+    # ── 해외 한국 ETF(EWY/FLKR) 섹터 가중치 자동학습 ──
+    "korea_etf_bucket_weights": dict(KOREA_ETF_BUCKET_WEIGHTS_DEFAULT),
 }
 
 # 긴급 튜닝: 연속 손절/수익 카운터
@@ -5029,6 +5035,7 @@ def auto_tune(notify: bool = True):
             return
 
         changes = []
+        changes.extend(_auto_tune_korea_etf_weights(completed))
 
         # ── 0) params_snapshot 기반 성능 튜닝 (최적조건 만들기 핵심) ──
         best = _select_best_params(completed)
@@ -10689,7 +10696,7 @@ KOREA_ETF_MARKET_WEIGHT = 1.0
 KOREA_ETF_SMALLCAP_DAMPING = 0.35
 KOREA_ETF_MAX_ABS_ADJ = 10
 KOREA_ETF_TICKERS = {"EWY": "ewy", "FLKR": "flkr"}
-KOREA_ETF_BUCKET_WEIGHTS = {
+KOREA_ETF_BUCKET_WEIGHTS_DEFAULT = {
     "semiconductor": 1.00,
     "financial":     0.70,
     "industrial":    0.60,
@@ -10882,6 +10889,132 @@ def _korea_etf_time_weight(now: datetime | None = None) -> float:
     return 0.0
 
 
+def _get_korea_etf_bucket_weights() -> dict:
+    """동적 파라미터에 저장된 EWY/FLKR 섹터 가중치를 우선 사용."""
+    try:
+        saved = _dynamic.get("korea_etf_bucket_weights", {})
+        if isinstance(saved, dict) and saved:
+            merged = dict(KOREA_ETF_BUCKET_WEIGHTS_DEFAULT)
+            for k, v in saved.items():
+                if k in merged:
+                    merged[k] = float(v)
+            return merged
+    except Exception:
+        pass
+    return dict(KOREA_ETF_BUCKET_WEIGHTS_DEFAULT)
+
+
+def _get_korea_etf_snapshot(code: str, name: str, signal_type: str = "", theme_name: str = "") -> dict:
+    """신호 시점의 해외 한국 ETF 상태를 저장용으로 스냅샷."""
+    try:
+        weight = _korea_etf_time_weight()
+        bucket, _bw, bucket_label = _classify_korea_etf_bucket(name, theme_name, signal_type)
+        etf = get_korea_etf_signals() if USE_GLOBAL_KOREA_ETF_SCORE else {}
+        return {
+            "enabled": bool(USE_GLOBAL_KOREA_ETF_SCORE),
+            "time_weight": round(weight, 2),
+            "bucket": bucket,
+            "bucket_label": bucket_label,
+            "bucket_weight": round(float(_get_korea_etf_bucket_weights().get(bucket, KOREA_ETF_SMALLCAP_DAMPING)), 3),
+            "avg_chg": round(float(etf.get("avg_chg", 0.0) or 0.0), 2),
+            "market_adj": int(etf.get("market_adj", 0) or 0),
+            "tone": str(etf.get("tone", "neutral") or "neutral"),
+            "summary": str(etf.get("summary", "") or ""),
+        }
+    except Exception as e:
+        _log_error(f"_get_korea_etf_snapshot({code})", e)
+        return {"enabled": False, "time_weight": 0.0, "bucket": "smallcap", "bucket_label": "소형/테마"}
+
+
+def _auto_tune_korea_etf_weights(completed: list) -> list:
+    """signal_log 성과를 바탕으로 EWY/FLKR 섹터 가중치를 자동 재조정."""
+    changes = []
+    try:
+        if not USE_GLOBAL_KOREA_ETF_SCORE:
+            return changes
+
+        cutoff = datetime.now() - timedelta(days=TUNE_LOOKBACK_DAYS)
+        rows = []
+        for rec in completed:
+            snap = rec.get("korea_etf_snapshot") or {}
+            if not isinstance(snap, dict) or not snap.get("enabled"):
+                continue
+            try:
+                d = datetime.strptime(str(rec.get("detect_date", "")), "%Y%m%d")
+                if d < cutoff:
+                    continue
+            except Exception:
+                continue
+
+            bucket = str(snap.get("bucket", "") or "")
+            if not bucket:
+                continue
+            pnl = float(rec.get("pnl_pct", 0.0) or 0.0)
+            avg_chg = float(snap.get("avg_chg", 0.0) or 0.0)
+            tw = float(snap.get("time_weight", 0.0) or 0.0)
+            if tw <= 0:
+                continue
+            rows.append({
+                "bucket": bucket,
+                "pnl": pnl,
+                "avg_chg": avg_chg,
+                "time_weight": tw,
+            })
+
+        if len(rows) < 8:
+            return changes
+
+        cur = _get_korea_etf_bucket_weights()
+        new_weights = dict(cur)
+
+        for bucket, base_w in KOREA_ETF_BUCKET_WEIGHTS_DEFAULT.items():
+            subset = [r for r in rows if r["bucket"] == bucket]
+            if len(subset) < 4:
+                continue
+
+            aligned = [r for r in subset if (r["avg_chg"] >= 0 and r["pnl"] >= 0) or (r["avg_chg"] < 0 and r["pnl"] < 0)]
+            anti    = [r for r in subset if (r["avg_chg"] >= 0 and r["pnl"] < 0) or (r["avg_chg"] < 0 and r["pnl"] >= 0)]
+            if not aligned and not anti:
+                continue
+
+            def _wavg(items):
+                denom = sum(max(r["time_weight"], 0.2) for r in items) or 1.0
+                return sum(r["pnl"] * max(r["time_weight"], 0.2) for r in items) / denom
+
+            aligned_avg = _wavg(aligned) if aligned else 0.0
+            anti_avg = _wavg(anti) if anti else 0.0
+            edge = aligned_avg - anti_avg
+            sample_mult = min(len(subset) / 12.0, 1.0)
+
+            target = base_w
+            if edge >= 4.0:
+                target = base_w + 0.18 * sample_mult
+            elif edge >= 2.0:
+                target = base_w + 0.10 * sample_mult
+            elif edge <= -4.0:
+                target = base_w - 0.18 * sample_mult
+            elif edge <= -2.0:
+                target = base_w - 0.10 * sample_mult
+
+            target = max(0.15, min(1.20, target))
+            cur_w = float(cur.get(bucket, base_w) or base_w)
+            smoothed = round(cur_w * (1 - TUNE_ALPHA) + target * TUNE_ALPHA, 3)
+            smoothed = max(0.15, min(1.20, smoothed))
+            if abs(smoothed - cur_w) >= 0.03:
+                new_weights[bucket] = smoothed
+                changes.append(
+                    f"🇰🇷 <b>해외 한국ETF 학습</b> {bucket}: {cur_w:.2f} → {smoothed:.2f} "
+                    f"(edge {edge:+.1f}, n={len(subset)})"
+                )
+
+        if new_weights != cur:
+            _dynamic["korea_etf_bucket_weights"] = new_weights
+            _save_dynamic_params()
+    except Exception as e:
+        _log_error("auto_tune.korea_etf_weights", e)
+    return changes
+
+
 def _classify_korea_etf_bucket(name: str = "", theme_name: str = "", signal_type: str = "") -> tuple[str, float, str]:
     txt = f"{name or ''} {theme_name or ''} {signal_type or ''}"
 
@@ -10900,7 +11033,7 @@ def _classify_korea_etf_bucket(name: str = "", theme_name: str = "", signal_type
     lower = txt.lower()
     for bucket, label, keywords in bucket_rules:
         if any(k.lower() in lower for k in keywords):
-            return bucket, float(KOREA_ETF_BUCKET_WEIGHTS.get(bucket, 0.35) or 0.35), label
+            return bucket, float(_get_korea_etf_bucket_weights().get(bucket, 0.35) or 0.35), label
 
     return "smallcap", float(KOREA_ETF_SMALLCAP_DAMPING), "소형/테마"
 
