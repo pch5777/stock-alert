@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.35b-koreaetf-autolearn1-stable
+버전: v37.36-autotune-bridge1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.36-autotune-bridge1 (2026-03-07): signal_log에 쌓이기만 하던 earnings_risk, feature_snapshot(시간대/거래량/변동률), geo_sector_bias를 auto_tune과 실제 조건 반영에 연결. 실적 리스크별 감점 배율, 시간대 최소점수 보정의 실제 적용, 변동률/거래량 bucket 점수 조정, 지정학 섹터별 보정 배율 자동학습 추가.
 
 - v37.35b-koreaetf-autolearn1-stable (2026-03-07): 오류 없던 v37.34 기준으로 EWY/FLKR→국내 섹터 가중치 자동학습을 재적용. signal_log에 해외 한국ETF 스냅샷 저장, auto_tune에서 최근 완료 신호 성과를 바탕으로 korea_etf_bucket_weights를 스무딩 재조정. v37.35에서 발생한 KOREA_ETF_BUCKET_WEIGHTS_DEFAULT NameError를 피하도록 상수/초기화 순서를 안정화.
 
@@ -4865,6 +4867,20 @@ _dynamic = {
         "battery":       0.35,
         "smallcap":      0.35,
     },
+    # ── 실적/특징/지정학 자동학습 브리지 ──
+    "earnings_warn_mult": 0.85,
+    "earnings_high_mult": 0.72,
+    "feature_change_adj": {
+        "mild": 0,
+        "strong": 0,
+        "extreme": 0,
+    },
+    "feature_volume_adj": {
+        "normal": 0,
+        "high": 0,
+        "extreme": 0,
+    },
+    "geo_sector_weights": {},
 }
 
 # 긴급 튜닝: 연속 손절/수익 카운터
@@ -4965,6 +4981,38 @@ def analyze_timeslot_winrate(completed: list) -> dict:
             "rate":  round(sum(1 for p in pnls if p > 0) / len(pnls) * 100, 0),
         }
     return result
+
+def _feature_change_bucket(change_rate: float) -> str:
+    try:
+        cr = float(change_rate or 0)
+        if cr >= 20:
+            return "extreme"
+        elif cr >= 8:
+            return "strong"
+        return "mild"
+    except Exception:
+        return "mild"
+
+
+def _feature_volume_bucket(volume_ratio: float) -> str:
+    try:
+        vr = float(volume_ratio or 0)
+        if vr >= 8:
+            return "extreme"
+        elif vr >= 3:
+            return "high"
+        return "normal"
+    except Exception:
+        return "normal"
+
+
+def _safe_nested_dict(base: dict, key: str, default: dict) -> dict:
+    try:
+        val = base.get(key, default)
+        return val if isinstance(val, dict) else dict(default)
+    except Exception:
+        return dict(default)
+
 
 def analyze_loss_pattern(completed: list) -> str:
     """
@@ -5310,6 +5358,102 @@ def auto_tune(notify: bool = True):
                 opp_avg = sum(skip_pnls) / len(skip_pnls)
                 if opp_avg > 5.0:
                     changes.append(f"💡 스킵 기회비용: 평균 {opp_avg:+.1f}% 놓치는 중 (알림 설정 점검 권장)")
+
+        # ── ⑨-1 실적 리스크 자동학습 ──
+        risk_recs = [r for r in completed if r.get("feature_flags", {}).get("earnings_risk") in ("warn", "high", "none")]
+        if len(risk_recs) >= MIN_SAMPLES:
+            for risk_key, dyn_key, base_default, floor_v in (("warn", "earnings_warn_mult", 0.85, 0.60), ("high", "earnings_high_mult", 0.72, 0.40)):
+                with_risk = [r for r in risk_recs if r.get("feature_flags", {}).get("earnings_risk") == risk_key]
+                base_recs  = [r for r in risk_recs if r.get("feature_flags", {}).get("earnings_risk") == "none"]
+                if len(with_risk) < 3 or len(base_recs) < 3:
+                    continue
+                win_with  = sum(1 for r in with_risk if r.get("pnl_pct", 0) > 0) / len(with_risk)
+                win_base  = sum(1 for r in base_recs  if r.get("pnl_pct", 0) > 0) / len(base_recs)
+                avg_with  = sum(r.get("pnl_pct", 0) for r in with_risk) / len(with_risk)
+                avg_base  = sum(r.get("pnl_pct", 0) for r in base_recs) / len(base_recs)
+                edge = (win_with - win_base) + (avg_with - avg_base) / 20.0
+                old_mult = float(_dynamic.get(dyn_key, base_default) or base_default)
+                new_mult = old_mult
+                if edge < -0.10:
+                    new_mult = round(max(old_mult - 0.05, floor_v), 2)
+                elif edge > 0.10:
+                    new_mult = round(min(old_mult + 0.03, 1.00), 2)
+                if new_mult != old_mult:
+                    _dynamic[dyn_key] = new_mult
+                    changes.append(
+                        f"📅 실적 리스크[{risk_key}] 배율 조정: {old_mult:.2f}→{new_mult:.2f} "
+                        f"(승률 {win_with*100:.0f}% vs 무리스크 {win_base*100:.0f}%)"
+                    )
+
+        # ── ⑨-2 feature_snapshot(변동률/거래량) 자동학습 ──
+        snap_recs = [r for r in completed if isinstance(r.get("feature_snapshot"), dict)]
+        if len(snap_recs) >= MIN_SAMPLES * 2:
+            for dyn_key, bucket_fn, source_key, label in (
+                ("feature_change_adj", _feature_change_bucket, "change_rate", "변동률"),
+                ("feature_volume_adj", _feature_volume_bucket, "volume_ratio", "거래량"),
+            ):
+                cur_map = _safe_nested_dict(_dynamic, dyn_key, {})
+                bucket_groups = {}
+                for r in snap_recs:
+                    fs = r.get("feature_snapshot") or {}
+                    bucket = bucket_fn(fs.get(source_key, 0))
+                    bucket_groups.setdefault(bucket, []).append(r)
+                for bucket, group in bucket_groups.items():
+                    other = [r for b, rs in bucket_groups.items() if b != bucket for r in rs]
+                    if len(group) < 3 or len(other) < 3:
+                        continue
+                    win_g = sum(1 for r in group if r.get("pnl_pct", 0) > 0) / len(group)
+                    win_o = sum(1 for r in other if r.get("pnl_pct", 0) > 0) / len(other)
+                    avg_g = sum(r.get("pnl_pct", 0) for r in group) / len(group)
+                    avg_o = sum(r.get("pnl_pct", 0) for r in other) / len(other)
+                    edge = (win_g - win_o) + (avg_g - avg_o) / 18.0
+                    old_adj = int(cur_map.get(bucket, 0) or 0)
+                    new_adj = old_adj
+                    if edge < -0.10:
+                        new_adj = max(old_adj - 2, -10)
+                    elif edge > 0.10:
+                        new_adj = min(old_adj + 2, 10)
+                    if new_adj != old_adj:
+                        cur_map[bucket] = new_adj
+                        changes.append(
+                            f"🧪 {label} 학습[{bucket}] 보정: {old_adj:+d}→{new_adj:+d}점 "
+                            f"(승률 {win_g*100:.0f}% vs 타구간 {win_o*100:.0f}%)"
+                        )
+                _dynamic[dyn_key] = cur_map
+
+        # ── ⑨-3 지정학 섹터별 보정 배율 자동학습 ──
+        geo_recs = [r for r in completed if r.get("feature_flags", {}).get("geo_active") and isinstance(r.get("geo_sector_bias"), dict)]
+        if len(geo_recs) >= MIN_SAMPLES:
+            geo_weights = _safe_nested_dict(_dynamic, "geo_sector_weights", {})
+            sector_perf = {}
+            for r in geo_recs:
+                bias = r.get("geo_sector_bias") or {}
+                for sec, raw in bias.items():
+                    try:
+                        raw_v = float(raw or 0)
+                    except Exception:
+                        raw_v = 0.0
+                    if abs(raw_v) < 1:
+                        continue
+                    sector_perf.setdefault(sec, []).append(r.get("pnl_pct", 0))
+            global_avg = sum(r.get("pnl_pct", 0) for r in geo_recs) / len(geo_recs)
+            for sec, pnls in sector_perf.items():
+                if len(pnls) < 3:
+                    continue
+                avg_sec = sum(pnls) / len(pnls)
+                old_w = float(geo_weights.get(sec, 1.0) or 1.0)
+                new_w = old_w
+                if avg_sec < global_avg - 1.5:
+                    new_w = round(max(old_w - 0.10, 0.6), 2)
+                elif avg_sec > global_avg + 1.5:
+                    new_w = round(min(old_w + 0.08, 1.4), 2)
+                if new_w != old_w:
+                    geo_weights[sec] = new_w
+                    changes.append(
+                        f"🌍 지정학 섹터[{sec}] 배율 조정: {old_w:.2f}→{new_w:.2f} "
+                        f"(평균 {avg_sec:+.1f}% vs 전체 {global_avg:+.1f}%)"
+                    )
+            _dynamic["geo_sector_weights"] = geo_weights
 
         # ── ⑩ 기능별 기여도 분석 + 자동 가중치 조정 ──
         # feature_flags가 기록된 충분한 샘플이 있을 때만 분석
@@ -6452,7 +6596,12 @@ def analyze(stock: dict) -> dict:
 
     strict    = is_strict_time()
     min_score = _dynamic["min_score_strict"] if strict else _dynamic["min_score_normal"]
+    _slot = _get_timeslot(datetime.now().strftime("%H:%M:%S"))
+    _slot_adj = int(_dynamic.get("timeslot_score_adj", {}).get(_slot, 0) or 0)
+    min_score += _slot_adj
     score, reasons, signal_type = 0, [], None
+    if _slot_adj > 0:
+        reasons.append(f"🕐 [{_slot}] 학습 보정: 최소점수 +{_slot_adj}점")
 
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
@@ -6466,6 +6615,17 @@ def analyze(stock: dict) -> dict:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (5일 평균 대비)")
     elif vol_ratio >= VOLUME_SURGE_RATIO:
         score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (5일 평균 대비)")
+
+    _chg_bucket = _feature_change_bucket(change_rate)
+    _vol_bucket = _feature_volume_bucket(vol_ratio)
+    _chg_adj = int(_dynamic.get("feature_change_adj", {}).get(_chg_bucket, 0) or 0)
+    _vol_adj = int(_dynamic.get("feature_volume_adj", {}).get(_vol_bucket, 0) or 0)
+    if _chg_adj:
+        score += _chg_adj
+        reasons.append(f"📈 변동률 학습 보정 [{_chg_bucket}] {_chg_adj:+d}점")
+    if _vol_adj:
+        score += _vol_adj
+        reasons.append(f"📊 거래량 학습 보정 [{_vol_bucket}] {_vol_adj:+d}점")
 
     # 코스피 상대강도 ⑯
     rs = get_relative_strength(change_rate)
@@ -6685,7 +6845,9 @@ def analyze(stock: dict) -> dict:
                             adj = min(adj, -8)
                         if adj != 0:
                             _w_geo = _dynamic.get("feat_w_geo", 1.0)
-                            adj_weighted = int(adj * _w_geo)
+                            _geo_sw = float(_dynamic.get("geo_sector_weights", {}).get(sec_name, 1.0) or 1.0)
+                            _geo_sw = max(0.6, min(_geo_sw, 1.4))
+                            adj_weighted = int(adj * _w_geo * _geo_sw)
                             score += adj_weighted
                             _geo_adj_applied = adj_weighted
                             reasons.append(
@@ -6735,9 +6897,17 @@ def analyze(stock: dict) -> dict:
     earnings = check_earnings_risk(code, stock.get("name", code))
     if earnings["risk"] == "high":
         reasons.append(earnings["desc"])
+        _ehm = max(0.40, min(float(_dynamic.get("earnings_high_mult", 0.72) or 0.72), 1.0))
+        new_score = int(score * _ehm)
+        reasons.append(f"📅 실적 리스크 학습 보정 [high] x{_ehm:.2f}")
+        score = new_score
+        if score < min_score: return {}
     elif earnings["risk"] == "warn":
         reasons.append(earnings["desc"])
-        score = int(score * 0.85)   # 실적 발표 3일 전 → 점수 15% 감점
+        _ewm = max(0.60, min(float(_dynamic.get("earnings_warn_mult", 0.85) or 0.85), 1.0))
+        new_score = int(score * _ewm)
+        reasons.append(f"📅 실적 리스크 학습 보정 [warn] x{_ewm:.2f}")
+        score = new_score
         if score < min_score: return {}
 
     # ── ⑤ DART 리스크 차단 필터 ──
