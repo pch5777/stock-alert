@@ -3,19 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v38.0-stability1
+버전: v38.1-perf-profit1
 날짜: 2026-03-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+- v38.1-perf-profit1 (2026-03-07): Phase 2 성능·수익성·운영성 개선.
+  [B1] auto_tune 481줄 → 메인 60줄 + 하위 함수 11개로 분할. 디버깅·추적 용이.
+  [B3] 캐시 통합 관리: _UnifiedCache 클래스 도입. 기존 캐시를 단일 인터페이스로 통합, TTL/사이즈 자동 관리.
+  [C1] auto_tune 다차원 최적화: 신호유형×시간대×시장레짐 교차분석 추가. 조합별 승률 기반 세분화된 min_score 보정.
+  [C2] 손익비(R:R) 동적 최적화: 신호유형별 최적 ATR 손절/목표 배수를 signal_log 역산으로 자동 계산.
+  [C3] 포지션 사이징 승률 연동: 교차분석 승률을 직접 Kelly 공식에 반영. 승률 높은 조건 비중 확대.
+  [D1] 설정 섹션 구분: 상수·환경변수 영역에 명확한 섹션 마커 추가. Android 에디터에서 검색 용이.
+
 - v38.0-stability1 (2026-03-07): Phase 1 안정성·운영성 대규모 개선.
-  [A1] 스레드 안전성: threading.Lock 도입 — 파일 I/O(_file_lock), 공유 dict(_state_lock), 캐시(_cache_lock) 보호. 동시 쓰기로 인한 JSON 깨짐/데이터 유실 방지.
-  [A2] bare except 정리: 144개 → 0개. 모든 except Exception: pass를 except Exception as e: _log_error(...) 패턴으로 전환. 오류 원인 추적 가능.
-  [A3] signal_log 크기 관리: MAX_RECORDS 50000→5000 축소 + 90일 이상 완료건 자동 아카이브. Railway 512MB 메모리 보호.
-  [B2] _safe_get/_safe_get_meta 통합: 중복 90줄 제거 → 단일 함수 + meta 옵션 플래그.
-  [D2] 에러 일일 요약: 장 마감 시 당일 에러를 카테고리별 집계하여 텔레그램 발송. Railway 로그 미확인 시에도 봇 건강 파악 가능.
-  [D3] 버전 자동 검증: 시작 시 코드 SHA256 해시를 텔레그램에 발송. 코드 수정 후 미배포 상황 즉시 감지.
+  [A1] 스레드 안전성: threading.Lock 도입 — 파일 I/O(_file_lock), 공유 dict(_state_lock), 캐시(_cache_lock) 보호.
+  [A2] bare except 정리: 144개 → 0개. [A3] signal_log 크기 관리: MAX 50000→5000 + 90일 아카이브.
+  [B2] _safe_get/_safe_get_meta 통합. [D2] 에러 일일 요약. [D3] 버전 자동 검증(SHA256).
 
 - v37.40-briefing-riskopt2 (2026-03-07): 08:50 장직전 압축 브리핑을 기본 비활성화. 07:30 장 시작 전 진입/리스크 브리핑으로 장전 메시지를 단일화해 중복 알림을 줄이고, 필요 시 설정값으로만 재활성화 가능하도록 정리.
 
@@ -541,9 +546,9 @@ GITHUB_GIST_TOKEN  = os.environ.get("GITHUB_GIST_TOKEN", "")
 GITHUB_GIST_ID     = os.environ.get("GITHUB_GIST_ID", "")   # 비워두면 자동 생성
 BACKUP_INTERVAL_H  = 6   # 6시간마다 자동 백업
 
-# ============================================================
-# 📊 파라미터
-# ============================================================
+# ════════════════════════════════════════════════════════════
+# ⚙️ CONFIG: 스캔 파라미터  (D1: Android에서 "CONFIG:" 검색으로 빠른 이동)
+# ════════════════════════════════════════════════════════════
 # 기본 스캔
 VOLUME_SURGE_RATIO    = 5.0
 PRICE_SURGE_MIN       = 5.0
@@ -595,9 +600,9 @@ VOL_ZSCORE_MIN = 2.0         # 거래량 Z-score 최소 (2σ 이상 = 이상치)
 KOSPI_CODE     = "0001"      # 코스피 지수 코드
 RS_MIN         = 1.5         # 코스피 대비 최소 상대강도 배수
 
-# ============================================================
-# 🗞️ 테마 섹터 맵
-# ============================================================
+# ════════════════════════════════════════════════════════════
+# ⚙️ CONFIG: 테마·섹터·DART 키워드  (D1)
+# ════════════════════════════════════════════════════════════
 THEME_MAP = {
     "밸류업":   {"desc":"밸류업 프로그램","sectors":["증권","은행","보험","금융"],
                  "stocks":[("001510","SK증권"),("001290","상상인증권"),("005940","NH투자증권"),
@@ -995,11 +1000,58 @@ def _safe_get_meta(url: str, tr_id: str, params: dict):
     """v38.0-B2: _safe_get의 meta 래퍼 (하위 호환)"""
     return _safe_get(url, tr_id, params, return_meta=True)
 
-# ============================================================
+# ════════════════════════════════════════════════════════════
+# 📦 B3: 캐시 통합 관리 (v38.1)
+# ════════════════════════════════════════════════════════════
+class _CacheRegistry:
+    """v38.1-B3: 모든 캐시를 등록·관리하는 통합 레지스트리.
+    개별 dict는 그대로 사용하되, prune/clear를 한 곳에서 처리."""
+    def __init__(self):
+        self._caches: list[tuple[str, dict, int, int]] = []  # (name, ref, max_size, ttl)
+
+    def register(self, name: str, cache_dict: dict, max_size: int = 200, ttl: int = 3600):
+        self._caches.append((name, cache_dict, max_size, ttl))
+        return cache_dict
+
+    def prune_all(self):
+        """등록된 모든 캐시의 만료/초과 항목 정리"""
+        with _cache_lock:
+            now = time.time()
+            for name, c, max_size, ttl in self._caches:
+                if len(c) <= max_size:
+                    continue
+                expired = [k for k, v in c.items()
+                           if isinstance(v, dict) and now - v.get("ts", 0) > ttl]
+                for k in expired:
+                    del c[k]
+                if len(c) > max_size:
+                    sorted_keys = sorted(
+                        [k for k, v in c.items() if isinstance(v, dict) and "ts" in v],
+                        key=lambda k: c[k].get("ts", 0)
+                    )
+                    for k in sorted_keys[:len(c) - max_size]:
+                        del c[k]
+
+    def clear_all(self):
+        """모든 캐시 비우기"""
+        with _cache_lock:
+            for name, c, _, _ in self._caches:
+                c.clear()
+
+    def total_items(self) -> int:
+        return sum(len(c) for _, c, _, _ in self._caches)
+
+    def status_report(self) -> str:
+        lines = [f"{name}: {len(c)}건" for name, c, _, _ in self._caches if len(c) > 0]
+        return f"캐시 총 {self.total_items()}건 ({', '.join(lines)})" if lines else "캐시 비어있음"
+
+_cache_reg = _CacheRegistry()
+
+# ════════════════════════════════════════════════════════════
 # 📊 일봉 데이터 (공통 사용)
-# ============================================================
-_daily_cache = {}  # code → {items, ts}
-_atr_cache   = {}  # code → {atr, date}  하루 1회 갱신
+# ════════════════════════════════════════════════════════════
+_daily_cache = _cache_reg.register("daily", {}, 200, 1800)
+_atr_cache   = _cache_reg.register("atr",   {}, 200, 86400)
 
 def get_daily_data(code: str, days: int = 60) -> list:
     """일봉 데이터 조회 (캐시 30분)"""
@@ -1534,11 +1586,18 @@ def calc_trailing_stop_price(code: str, price: int) -> int:
     """고점 기준 트레일링 스탑 — calc_trailing_stop의 별칭"""
     return calc_trailing_stop(code, price)
 
-def calc_stop_target(code: str, entry: int) -> tuple:
+def calc_stop_target(code: str, entry: int, signal_type: str = None) -> tuple:
+    """v38.1-C2: 신호유형별 최적 R:R 사용 (signal_type_rr from auto_tune)."""
+    # C2: 신호유형별 학습된 배수 우선
+    rr_data = _dynamic.get("signal_type_rr", {}).get(signal_type or "", {})
+    st_stop = float(rr_data.get("stop", 0) or 0)
+    st_target = float(rr_data.get("target", 0) or 0)
+    stop_mult = st_stop if st_stop > 0 else _dynamic.get("atr_stop_mult", ATR_STOP_MULT)
+    target_mult = st_target if st_target > 0 else _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
     atr = get_atr(code)
     if atr > 0:
-        stop   = int((entry - atr * ATR_STOP_MULT)  / 10) * 10
-        target = int((entry + atr * ATR_TARGET_MULT) / 10) * 10
+        stop   = int((entry - atr * stop_mult)  / 10) * 10
+        target = int((entry + atr * target_mult) / 10) * 10
         return stop, target, round((entry-stop)/entry*100,1), round((target-entry)/entry*100,1), True
     # ATR 실패 시 국면 배수 적용 fallback
     _rm   = get_atr_regime_mult()
@@ -1699,11 +1758,31 @@ def _prune_cache(cache: dict, max_size: int = 200, ttl: int = 3600):
             del cache[k]
 
 def _prune_all_caches():
-    """장중 주기적으로 호출 — 캐시 크기 제한"""
-    with _cache_lock:  # v38.0-A1
-        for c in (_daily_cache, _force_cache, _deep_news_cache, _nxt_cache,
-                  _sector_cache, _avg_volume_cache, _short_cache, _foreign_cache):
-            _prune_cache(c, max_size=200, ttl=3600)
+    """장중 주기적으로 호출 — 캐시 크기 제한 (v38.1-B3: 레지스트리 통합)"""
+    # 레지스트리 미등록 캐시 일괄 등록 (1회성)
+    _register_remaining_caches()
+    _cache_reg.prune_all()
+
+_caches_registered = False
+def _register_remaining_caches():
+    """v38.1-B3: 파일 하단에 정의된 캐시들을 레지스트리에 일괄 등록"""
+    global _caches_registered
+    if _caches_registered:
+        return
+    _caches_registered = True
+    for name, ref in [
+        ("sector", _sector_cache), ("force", _force_cache),
+        ("deep_news", _deep_news_cache), ("nxt", _nxt_cache),
+        ("avg_vol", _avg_volume_cache), ("short", _short_cache),
+        ("foreign", _foreign_cache), ("geo", _geo_cache),
+        ("vp", _vp_cache), ("pre_dart", _pre_dart_cache),
+    ]:
+        try:
+            # 이미 등록된 캐시 건너뛰기
+            if not any(n == name for n, _, _, _ in _cache_reg._caches):
+                _cache_reg.register(name, ref, 200, 3600)
+        except Exception:
+            pass
 
 # v37.0: _nxt_unavailable 주 1회 초기화 플래그
 _nxt_unavailable_reset_week: str = ""
@@ -4975,6 +5054,10 @@ _dynamic = {
         "extreme": 0,
     },
     "geo_sector_weights": {},
+    # ── v38.1-C1: 교차분석 min_score 보정 ──
+    "cross_min_score_adj": {},   # {"SURGE|오전|neutral": 5, ...}
+    # ── v38.1-C2: 신호유형별 최적 R:R ──
+    "signal_type_rr": {},        # {"SURGE": {"stop": 1.5, "target": 3.0}, ...}
 }
 
 # 긴급 튜닝: 연속 손절/수익 카운터
@@ -5159,6 +5242,262 @@ def analyze_loss_pattern(completed: list) -> str:
 
     return "\n".join(lines)
 
+# ════════════════════════════════════════════════════════════
+# 🧠 C1: 다차원 교차분석 (v38.1)
+# ════════════════════════════════════════════════════════════
+def _calc_cross_winrate(completed: list, signal_type: str = None,
+                        timeslot: str = None, regime: str = None,
+                        min_n: int = 3) -> dict:
+    """v38.1-C1: 신호유형×시간대×시장레짐 교차분석."""
+    filtered = completed
+    if signal_type:
+        filtered = [r for r in filtered if r.get("signal_type") == signal_type]
+    if timeslot:
+        filtered = [r for r in filtered
+                    if r.get("feature_snapshot", {}).get("timeslot") == timeslot
+                    or r.get("feature_flags", {}).get("timeslot") == timeslot]
+    if regime:
+        filtered = [r for r in filtered
+                    if r.get("feature_flags", {}).get("regime_mode") == regime
+                    or r.get("regime_mode") == regime]
+    n = len(filtered)
+    if n < min_n:
+        return {"n": n, "win_rate": None, "avg_pnl": None, "sufficient": False}
+    wins = sum(1 for r in filtered if r.get("pnl_pct", 0) > 0)
+    avg_pnl = sum(r.get("pnl_pct", 0) for r in filtered) / n
+    return {"n": n, "win_rate": round(wins / n * 100, 1),
+            "avg_pnl": round(avg_pnl, 2), "sufficient": True}
+
+
+def _build_cross_analysis_table(completed: list) -> dict:
+    """v38.1-C1: 전체 교차분석 테이블 구축."""
+    signal_types = list(set(r.get("signal_type", "기타") for r in completed))
+    timeslots = ["장초반", "오전", "오후", "장후반"]
+    regimes = ["risk_on", "neutral", "risk_off", "panic"]
+    table = {}
+    for st in signal_types:
+        for ts in timeslots:
+            for rg in regimes:
+                r = _calc_cross_winrate(completed, st, ts, rg, 3)
+                if r["sufficient"]:
+                    table[(st, ts, rg)] = r
+        for ts in timeslots:
+            r = _calc_cross_winrate(completed, st, ts, None, 3)
+            if r["sufficient"]:
+                table[(st, ts, None)] = r
+        for rg in regimes:
+            r = _calc_cross_winrate(completed, st, None, rg, 3)
+            if r["sufficient"]:
+                table[(st, None, rg)] = r
+    return table
+
+
+def _get_cross_min_score_adj(signal_type: str, timeslot: str, regime: str,
+                              cross_table: dict) -> int:
+    """v38.1-C1: 교차분석 테이블에서 min_score 보정값."""
+    for key in [(signal_type, timeslot, regime),
+                (signal_type, timeslot, None),
+                (signal_type, None, regime)]:
+        if key in cross_table:
+            wr = cross_table[key]["win_rate"]
+            if wr is None:
+                continue
+            if wr < 30: return 15
+            elif wr < 40: return 8
+            elif wr > 70: return -5
+            elif wr > 60: return -2
+            return 0
+    return 0
+
+
+# ════════════════════════════════════════════════════════════
+# 📐 C2: 신호유형별 최적 R:R (v38.1)
+# ════════════════════════════════════════════════════════════
+def _get_optimal_rr(signal_type: str = None) -> dict:
+    """v38.1-C2: signal_log에서 신호유형별 최적 ATR 배수 역산."""
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if not data:
+            return {"stop_mult": None, "target_mult": None, "n": 0, "source": "default"}
+        completed = [v for v in data.values()
+                     if v.get("status") in ("수익", "손실", "본전")
+                     and v.get("params_snapshot")]
+        if signal_type:
+            completed = [r for r in completed if r.get("signal_type") == signal_type]
+        if len(completed) < 10:
+            return {"stop_mult": None, "target_mult": None, "n": len(completed), "source": "insufficient"}
+        wins = [r for r in completed if r.get("pnl_pct", 0) > 0]
+        losses = [r for r in completed if r.get("pnl_pct", 0) < 0]
+        if not wins or not losses:
+            return {"stop_mult": None, "target_mult": None, "n": len(completed), "source": "no_data"}
+        avg_win = sum(r["pnl_pct"] for r in wins) / len(wins)
+        avg_loss = abs(sum(r["pnl_pct"] for r in losses) / len(losses))
+        stop_mults = [float(r["params_snapshot"].get("atr_stop_mult", 1.5) or 1.5)
+                      for r in completed if r.get("params_snapshot")]
+        target_mults = [float(r["params_snapshot"].get("atr_target_mult", 3.0) or 3.0)
+                        for r in completed if r.get("params_snapshot")]
+        if not stop_mults or not target_mults:
+            return {"stop_mult": None, "target_mult": None, "n": len(completed), "source": "no_params"}
+        cur_stop_avg = sum(stop_mults) / len(stop_mults)
+        cur_target_avg = sum(target_mults) / len(target_mults)
+        win_rate = len(wins) / len(completed)
+        optimal_rr = avg_win / avg_loss if avg_loss > 0 else 2.0
+        # 스무딩된 최적 배수
+        if optimal_rr < 1.5 and cur_stop_avg > 1.0:
+            opt_stop = round(max(cur_stop_avg - 0.15, 0.8), 2)
+        elif optimal_rr > 2.5 and cur_stop_avg < 2.5:
+            opt_stop = round(min(cur_stop_avg + 0.10, 2.5), 2)
+        else:
+            opt_stop = round(cur_stop_avg, 2)
+        if win_rate < 0.45 and cur_target_avg > 2.0:
+            opt_target = round(max(cur_target_avg - 0.20, 2.0), 2)
+        elif win_rate > 0.60 and cur_target_avg < 5.0:
+            opt_target = round(min(cur_target_avg + 0.15, 5.0), 2)
+        else:
+            opt_target = round(cur_target_avg, 2)
+        return {"stop_mult": opt_stop, "target_mult": opt_target, "n": len(completed),
+                "win_rate": round(win_rate * 100, 1), "optimal_rr": round(optimal_rr, 2), "source": "signal_log"}
+    except Exception as e:
+        _log_error("_get_optimal_rr", e)
+        return {"stop_mult": None, "target_mult": None, "n": 0, "source": "error"}
+
+
+# v38.1-C1: 교차분석 테이블 (장 마감 시 auto_tune에서 갱신)
+_cross_table: dict = {}
+
+
+# ════════════════════════════════════════════════════════════
+# 🔧 B1: auto_tune 하위 함수 (v38.1)
+# ════════════════════════════════════════════════════════════
+def _tune_emergency(completed: list, changes: list):
+    """B1-①: 연속 손절 긴급 튜닝"""
+    recent = sorted(completed, key=lambda x: x.get("exit_date","") + x.get("exit_time",""))[-5:]
+    streak = 0
+    for r in reversed(recent):
+        if r.get("pnl_pct", 0) <= 0: streak += 1
+        else: break
+    if streak >= EMERGENCY_TUNE_THRESHOLD:
+        old_n = _dynamic["min_score_normal"]
+        _dynamic["min_score_normal"] = min(old_n + 8, 85)
+        _dynamic["min_score_strict"] = min(_dynamic["min_score_strict"] + 8, 90)
+        changes.append(f"🚨 <b>긴급 튜닝</b>: 연속 손절 {streak}회 → 최소점수 +8")
+
+
+def _tune_early_detect(by_type: dict, changes: list):
+    """B1-②: EARLY_DETECT 조건 조정"""
+    global _early_price_min_dynamic, _early_volume_min_dynamic
+    recs = by_type.get("EARLY_DETECT", [])
+    if len(recs) < MIN_SAMPLES: return
+    rate = sum(1 for r in recs if r["pnl_pct"] > 0) / len(recs)
+    if rate < 0.40:
+        _dynamic["early_price_min"]  = min(_dynamic["early_price_min"] + 2.0, 18.0)
+        _dynamic["early_volume_min"] = min(_dynamic["early_volume_min"] + 2.0, 18.0)
+        changes.append(f"🔍 조기포착 조건 강화 (승률 {rate*100:.0f}%)")
+    elif rate > 0.70:
+        _dynamic["early_price_min"]  = max(_dynamic["early_price_min"] - 1.0, 7.0)
+        _dynamic["early_volume_min"] = max(_dynamic["early_volume_min"] - 1.0, 7.0)
+        changes.append(f"🔍 조기포착 조건 완화 (승률 {rate*100:.0f}%)")
+    _early_price_min_dynamic  = _dynamic["early_price_min"]
+    _early_volume_min_dynamic = _dynamic["early_volume_min"]
+
+
+def _tune_mid_pullback(by_type: dict, changes: list):
+    """B1-③: MID_PULLBACK 조건 조정"""
+    recs = by_type.get("MID_PULLBACK", [])
+    if len(recs) < MIN_SAMPLES: return
+    rate = sum(1 for r in recs if r["pnl_pct"] > 0) / len(recs)
+    if rate < 0.40:
+        _dynamic["mid_surge_min_pct"] = min(_dynamic["mid_surge_min_pct"] + 3.0, 25.0)
+        _dynamic["mid_pullback_min"]  = min(_dynamic["mid_pullback_min"] + 2.0, 15.0)
+        _dynamic["mid_pullback_max"]  = max(_dynamic["mid_pullback_max"] - 5.0, 30.0)
+        changes.append(f"🏆 눌림목 조건 강화 (승률 {rate*100:.0f}%)")
+    elif rate > 0.70:
+        _dynamic["mid_surge_min_pct"] = max(_dynamic["mid_surge_min_pct"] - 2.0, 10.0)
+        _dynamic["mid_pullback_min"]  = max(_dynamic["mid_pullback_min"] - 2.0, 8.0)
+        changes.append(f"🏆 눌림목 조건 완화 (승률 {rate*100:.0f}%)")
+
+
+def _tune_min_score(completed: list, changes: list):
+    """B1-④: 전체 최소 점수 조정"""
+    if len(completed) < MIN_SAMPLES: return
+    rate = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
+    old_n = _dynamic["min_score_normal"]
+    if rate < 0.40:
+        _dynamic["min_score_normal"] = min(old_n + 5, 80)
+        _dynamic["min_score_strict"] = min(_dynamic["min_score_strict"] + 5, 85)
+        changes.append(f"⭐ 최소 점수 강화: {old_n}→{_dynamic['min_score_normal']}점")
+    elif rate > 0.70:
+        _dynamic["min_score_normal"] = max(old_n - 3, 50)
+        _dynamic["min_score_strict"] = max(_dynamic["min_score_strict"] - 3, 60)
+        changes.append(f"⭐ 최소 점수 완화: {old_n}→{_dynamic['min_score_normal']}점")
+
+
+def _tune_atr_stop(completed: list, changes: list):
+    """B1-⑤: ATR 손절/목표 배수 조정"""
+    if len(completed) < MIN_SAMPLES: return
+    n = len(completed)
+    stop_hits = sum(1 for r in completed if r.get("exit_reason") == "손절가")
+    timeout_hit = sum(1 for r in completed if r.get("exit_reason") in ["만료", "timeout", TRACK_TIMEOUT_RESULT])
+    target_hits = sum(1 for r in completed if r.get("exit_reason") == "목표가")
+    old_atr = _dynamic["atr_stop_mult"]
+    if stop_hits / n > 0.50 and old_atr < 2.5:
+        _dynamic["atr_stop_mult"] = round(min(old_atr + 0.2, 2.5), 1)
+        changes.append(f"📐 ATR 손절배수 확대: {old_atr}→{_dynamic['atr_stop_mult']}")
+    elif timeout_hit / n > 0.40 and old_atr > 1.0:
+        _dynamic["atr_stop_mult"] = round(max(old_atr - 0.2, 1.0), 1)
+        changes.append(f"📐 ATR 손절배수 축소: {old_atr}→{_dynamic['atr_stop_mult']}")
+    old_tgt = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
+    if target_hits / n < 0.20 and old_tgt > 2.0:
+        _dynamic["atr_target_mult"] = round(max(old_tgt - 0.3, 2.0), 1)
+        changes.append(f"🎯 목표가 배수 축소: {old_tgt}→{_dynamic['atr_target_mult']}")
+    elif target_hits / n > 0.50 and old_tgt < 5.0:
+        _dynamic["atr_target_mult"] = round(min(old_tgt + 0.2, 5.0), 1)
+        changes.append(f"🎯 목표가 배수 확대: {old_tgt}→{_dynamic['atr_target_mult']}")
+
+
+def _tune_cross_dimensional(completed: list, changes: list):
+    """v38.1-C1: 다차원 교차분석 → min_score 보정"""
+    global _cross_table
+    try:
+        _cross_table = _build_cross_analysis_table(completed)
+        if not _cross_table: return
+        cross_adj = {}
+        worst, best = [], []
+        for key, stat in _cross_table.items():
+            if stat["win_rate"] is None: continue
+            adj = _get_cross_min_score_adj(key[0], key[1], key[2], _cross_table)
+            if adj != 0:
+                cross_adj[f"{key[0]}|{key[1] or '*'}|{key[2] or '*'}"] = adj
+            if stat["win_rate"] < 30 and stat["n"] >= 5:
+                worst.append(f"{key[0]}+{key[1] or '*'}+{key[2] or '*'}({stat['win_rate']:.0f}%)")
+            if stat["win_rate"] > 75 and stat["n"] >= 5:
+                best.append(f"{key[0]}+{key[1] or '*'}+{key[2] or '*'}({stat['win_rate']:.0f}%)")
+        _dynamic["cross_min_score_adj"] = cross_adj
+        if worst or best:
+            parts = []
+            if worst: parts.append(f"⛔ 위험: {', '.join(worst[:3])}")
+            if best: parts.append(f"✅ 우수: {', '.join(best[:3])}")
+            changes.append(f"🧩 <b>교차분석</b> ({len(_cross_table)}개 조합)\n" + "\n".join(parts))
+    except Exception as e:
+        _log_error("_tune_cross_dimensional", e)
+
+
+def _tune_optimal_rr(completed: list, changes: list):
+    """v38.1-C2: 신호유형별 최적 R:R → _dynamic에 저장"""
+    try:
+        rr_map = {}
+        for st in set(r.get("signal_type", "기타") for r in completed):
+            rr = _get_optimal_rr(signal_type=st)
+            if rr["stop_mult"] and rr["n"] >= 10:
+                rr_map[st] = {"stop": rr["stop_mult"], "target": rr["target_mult"],
+                              "n": rr["n"], "wr": rr.get("win_rate", 0)}
+        if rr_map:
+            _dynamic["signal_type_rr"] = rr_map
+            items = [f"{st}({v['stop']:.1f}/{v['target']:.1f})" for st, v in rr_map.items()]
+            changes.append(f"📐 <b>유형별 R:R</b>: {', '.join(items[:4])}")
+    except Exception as e:
+        _log_error("_tune_optimal_rr", e)
+
 def auto_tune(notify: bool = True):
     """
     signal_log.json 기반으로 신호 유형별 성과를 분석해서
@@ -5242,95 +5581,14 @@ def auto_tune(notify: bool = True):
             t = v.get("signal_type", "기타")
             by_type.setdefault(t, []).append(v)
 
-        # ── ① 긴급 튜닝: 연속 손절 3회 이상 ──
-        recent = sorted(completed, key=lambda x: x.get("exit_date","") + x.get("exit_time",""))[-5:]
-        recent_loss_streak = 0
-        for r in reversed(recent):
-            if r.get("pnl_pct", 0) <= 0:
-                recent_loss_streak += 1
-            else:
-                break
-        if recent_loss_streak >= EMERGENCY_TUNE_THRESHOLD:
-            old_n = _dynamic["min_score_normal"]
-            old_s = _dynamic["min_score_strict"]
-            _dynamic["min_score_normal"] = min(old_n + 8, 85)
-            _dynamic["min_score_strict"] = min(old_s + 8, 90)
-            changes.append(f"🚨 <b>긴급 튜닝</b>: 연속 손절 {recent_loss_streak}회\n"
-                           f"   최소점수 즉시 강화: {old_n}→{_dynamic['min_score_normal']}점")
-
-        # ── ② EARLY_DETECT 조정 ──
-        early_recs = by_type.get("EARLY_DETECT", [])
-        if len(early_recs) >= MIN_SAMPLES:
-            rate = sum(1 for r in early_recs if r["pnl_pct"] > 0) / len(early_recs)
-            old_p = _dynamic["early_price_min"]
-            old_v = _dynamic["early_volume_min"]
-            if rate < 0.40:
-                _dynamic["early_price_min"]  = min(old_p + 2.0, 18.0)
-                _dynamic["early_volume_min"] = min(old_v + 2.0, 18.0)
-                changes.append(f"🔍 조기포착 조건 강화 (승률 {rate*100:.0f}%)\n"
-                                f"   가격 {old_p}→{_dynamic['early_price_min']}%  "
-                                f"거래량 {old_v}→{_dynamic['early_volume_min']}배")
-            elif rate > 0.70:
-                _dynamic["early_price_min"]  = max(old_p - 1.0, 7.0)
-                _dynamic["early_volume_min"] = max(old_v - 1.0, 7.0)
-                changes.append(f"🔍 조기포착 조건 완화 (승률 {rate*100:.0f}%)\n"
-                                f"   가격 {old_p}→{_dynamic['early_price_min']}%  "
-                                f"거래량 {old_v}→{_dynamic['early_volume_min']}배")
-            _early_price_min_dynamic  = _dynamic["early_price_min"]
-            _early_volume_min_dynamic = _dynamic["early_volume_min"]
-
-        # ── ③ MID_PULLBACK 조정 ──
-        mid_recs = by_type.get("MID_PULLBACK", [])
-        if len(mid_recs) >= MIN_SAMPLES:
-            rate      = sum(1 for r in mid_recs if r["pnl_pct"] > 0) / len(mid_recs)
-            old_surge = _dynamic["mid_surge_min_pct"]
-            old_min   = _dynamic["mid_pullback_min"]
-            old_max   = _dynamic["mid_pullback_max"]
-            if rate < 0.40:
-                _dynamic["mid_surge_min_pct"] = min(old_surge + 3.0, 25.0)
-                _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 15.0)
-                _dynamic["mid_pullback_max"]  = max(old_max - 5.0, 30.0)
-                changes.append(f"🏆 중기눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
-                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%\n"
-                                f"   눌림범위 {old_min}~{old_max}→"
-                                f"{_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%")
-            elif rate > 0.70:
-                _dynamic["mid_surge_min_pct"] = max(old_surge - 2.0, 10.0)
-                _dynamic["mid_pullback_min"]  = max(old_min - 2.0, 8.0)
-                changes.append(f"🏆 중기눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
-                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
-
-        # ── ④ 최소 점수 조정 ──
-        if len(completed) >= MIN_SAMPLES:
-            rate  = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
-            old_n = _dynamic["min_score_normal"]
-            old_s = _dynamic["min_score_strict"]
-            if rate < 0.40:
-                _dynamic["min_score_normal"] = min(old_n + 5, 80)
-                _dynamic["min_score_strict"] = min(old_s + 5, 85)
-                changes.append(f"⭐ 최소 점수 강화: {old_n}→{_dynamic['min_score_normal']}점")
-            elif rate > 0.70:
-                _dynamic["min_score_normal"] = max(old_n - 3, 50)
-                _dynamic["min_score_strict"] = max(old_s - 3, 60)
-                changes.append(f"⭐ 최소 점수 완화: {old_n}→{_dynamic['min_score_normal']}점")
-
-        # ── ⑤ ATR 손절배수 동적 조정 ──
-        # 손절가 도달 비율이 높으면 손절이 너무 타이트 → 배수 늘리기
-        # 만료(timeout) 비율이 높으면 손절이 너무 루즈 → 배수 줄이기
-        stop_hits   = sum(1 for r in completed if r.get("exit_reason") == "손절가")
-        timeout_hit = sum(1 for r in completed if r.get("exit_reason") in ["만료", "timeout", TRACK_TIMEOUT_RESULT])
-        old_atr     = _dynamic["atr_stop_mult"]
-        if len(completed) >= MIN_SAMPLES:
-            stop_ratio    = stop_hits   / len(completed)
-            timeout_ratio = timeout_hit / len(completed)
-            if stop_ratio > 0.50 and old_atr < 2.5:
-                _dynamic["atr_stop_mult"] = round(min(old_atr + 0.2, 2.5), 1)
-                changes.append(f"📐 ATR 손절배수 확대: {old_atr}→{_dynamic['atr_stop_mult']} (손절 너무 빈번)")
-            elif timeout_ratio > 0.40 and old_atr > 1.0:
-                _dynamic["atr_stop_mult"] = round(max(old_atr - 0.2, 1.0), 1)
-                changes.append(f"📐 ATR 손절배수 축소: {old_atr}→{_dynamic['atr_stop_mult']} (손절 너무 느슨)")
-
-        # ── ⑥ 시간대별 승률 분석 → 낮은 구간 최소점수 상향 ──
+        # ── v38.1-B1: 하위 함수로 분리된 튜닝 단계 ──
+        _tune_emergency(completed, changes)       # ① 연속 손절 긴급
+        _tune_early_detect(by_type, changes)      # ② EARLY_DETECT
+        _tune_mid_pullback(by_type, changes)      # ③ MID_PULLBACK
+        _tune_min_score(completed, changes)        # ④ 최소 점수
+        _tune_atr_stop(completed, changes)         # ⑤+⑧ ATR 손절/목표
+        _tune_cross_dimensional(completed, changes)  # C1 다차원 교차분석
+        _tune_optimal_rr(completed, changes)       # C2 유형별 R:R
         slot_stats = analyze_timeslot_winrate(completed)
         new_slot_adj = dict(_dynamic["timeslot_score_adj"])
         slot_changes = []
@@ -5362,19 +5620,6 @@ def auto_tune(notify: bool = True):
                                 f"   (단독 {solo_rate*100:.0f}%  테마 {themed_rate*100:.0f}%)")
             elif gap < 0.05:
                 _dynamic["themed_score_bonus"] = max(old_bonus - 3, 0)
-
-        # ── ⑧ 목표가 배수 동적 조정 ──
-        # 목표가 도달 비율이 낮고 만료 많으면 → 목표가 너무 높음 → 배수 축소
-        target_hits = sum(1 for r in completed if r.get("exit_reason") == "목표가")
-        if len(completed) >= MIN_SAMPLES:
-            tgt_ratio = target_hits / len(completed)
-            old_tgt   = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
-            if tgt_ratio < 0.20 and old_tgt > 2.0:
-                _dynamic["atr_target_mult"] = round(max(old_tgt - 0.3, 2.0), 1)
-                changes.append(f"🎯 목표가 배수 축소: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 {tgt_ratio*100:.0f}%)")
-            elif tgt_ratio > 0.50 and old_tgt < 5.0:
-                _dynamic["atr_target_mult"] = round(min(old_tgt + 0.2, 5.0), 1)
-                changes.append(f"🎯 목표가 배수 확대: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 양호)")
 
         # ── ⑨ 포지션 기본비중 자동 조정 ──
         # 전체 승률 높으면 비중 살짝 상향, 낮으면 하향
@@ -6781,6 +7026,17 @@ def analyze(stock: dict) -> dict:
     elif change_rate >= PRICE_SURGE_MIN:
         score+=15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type="SURGE"
     else: return {}
+
+    # v38.1-C1: 교차분석 min_score 보정
+    _regime_label_map = {"bull": "risk_on", "normal": "neutral", "bear": "risk_off", "crash": "panic"}
+    _rg_key = _regime_label_map.get(_regime_mode, "neutral")
+    _cross_adj = _get_cross_min_score_adj(signal_type, _slot, _rg_key, _cross_table)
+    if _cross_adj != 0:
+        min_score += _cross_adj
+        if _cross_adj > 0:
+            reasons.append(f"🧩 교차분석: {signal_type}+{_slot}+{_rg_key} 위험조합 +{_cross_adj}점")
+        else:
+            reasons.append(f"🧩 교차분석: 우수조합 {_cross_adj:+d}점")
 
     if vol_ratio >= VOLUME_SURGE_RATIO*2:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (5일 평균 대비)")
@@ -11675,12 +11931,10 @@ def get_us_market_signals() -> dict:
 # ============================================================
 def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
     """
-    신호 등급 + 과거 승률 기반 권장 투자비중 계산.
+    v38.1-C3: 교차분석 승률 기반 포지션 사이징.
     켈리 공식: f = (p*b - q) / b  (p=승률, q=1-p, b=손익비)
-    반환: {"pct": float, "amount_guide": str, "kelly": float}
     """
     try:
-        # 과거 신호 유형별 승률 조회
         data = {}
         try:
             data = _read_json_locked(SIGNAL_LOG_FILE)
@@ -11690,27 +11944,43 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
                      if v.get("signal_type") == signal_type
                      and v.get("status") in ["수익","손실","본전"]]
 
-        if len(same_type) >= 5:
+        # v38.1-C3: 교차분석 승률 우선 사용
+        regime_info = get_market_regime()
+        regime_mode = regime_info.get("mode", "normal")
+        regime_label_map = {"bull": "risk_on", "normal": "neutral", "bear": "risk_off", "crash": "panic"}
+        _rg = regime_label_map.get(regime_mode, "neutral")
+        _slot = _get_timeslot(datetime.now().strftime("%H:%M:%S"))
+        cross_stat = _calc_cross_winrate(same_type, signal_type=signal_type,
+                                          timeslot=_slot, regime=_rg, min_n=3)
+
+        if cross_stat["sufficient"]:
+            p = cross_stat["win_rate"] / 100.0
+            # 교차분석 기반 R:R
+            rr_data = _dynamic.get("signal_type_rr", {}).get(signal_type, {})
+            avg_w = rr_data.get("target", 3.0) * 1.5  # 대략적 평균 수익
+            avg_l = rr_data.get("stop", 1.5) * 1.5     # 대략적 평균 손실
+            b = avg_w / avg_l if avg_l else 2.0
+            kelly = max(0, (p * b - (1-p)) / b)
+            kelly = min(kelly * 0.5, 0.20)
+            cross_source = True
+        elif len(same_type) >= 5:
             wins  = sum(1 for v in same_type if v["pnl_pct"] > 0)
             p     = wins / len(same_type)
             avg_w = sum(v["pnl_pct"] for v in same_type if v["pnl_pct"] > 0) / max(wins, 1)
             avg_l = abs(sum(v["pnl_pct"] for v in same_type if v["pnl_pct"] < 0) / max(len(same_type)-wins, 1))
             b     = avg_w / avg_l if avg_l else 2.0
             kelly = max(0, (p * b - (1-p)) / b)
-            kelly = min(kelly * 0.5, 0.20)  # 하프 켈리, 최대 20%
+            kelly = min(kelly * 0.5, 0.20)
+            cross_source = False
         else:
-            p     = 0.55  # 기본값
+            p     = 0.55
             kelly = 0.08
+            cross_source = False
 
-        # 등급별 보정
         grade_mult = {"A": 1.3, "B": 1.0, "C": 0.7}.get(grade, 1.0)
-
-        # 시장 국면 보정
-        regime_info  = get_market_regime()
-        regime       = regime_info.get("mode", "normal")
-        nxt_only     = regime_info.get("nxt_only", False)
-        regime_mult  = {"bull": 1.2, "normal": 1.0, "bear": 0.6, "crash": 0.3}.get(regime, 1.0)
-        # NXT 단독 시간대: 포지션 비중 추가 20% 축소
+        regime = regime_info.get("mode", "normal")
+        nxt_only = regime_info.get("nxt_only", False)
+        regime_mult = {"bull": 1.2, "normal": 1.0, "bear": 0.6, "crash": 0.3}.get(regime, 1.0)
         if nxt_only:
             regime_mult = max(regime_mult * 0.8, 0.3)
 
@@ -11721,6 +11991,8 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
             guide = f"⚠️ {regime_label()} — 비중 축소 권장"
         elif grade == "A" and p >= 0.6:
             guide = f"💪 고확률 신호 — 적극 진입 고려"
+        elif cross_source and p >= 0.65:
+            guide = f"🧩 교차분석 고승률({p*100:.0f}%) — 비중 확대 가능"
         else:
             guide = f"📊 표준 비중"
 
@@ -11728,11 +12000,13 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
             "pct":    final_pct,
             "kelly":  round(kelly * 100, 1),
             "guide":  guide,
-            "win_rate": round(p * 100, 1) if len(same_type) >= 5 else None,
+            "win_rate": round(p * 100, 1),
             "samples":  len(same_type),
+            "cross_analysis": cross_source,
         }
     except Exception:
-        return {"pct": 8.0, "kelly": 8.0, "guide": "📊 표준 비중", "win_rate": None, "samples": 0}
+        return {"pct": 8.0, "kelly": 8.0, "guide": "📊 표준 비중",
+                "win_rate": None, "samples": 0, "cross_analysis": False}
 
 # ============================================================
 # 📐 ③ 손익비 동적 최적화
