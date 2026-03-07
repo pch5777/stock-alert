@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.36-autotune-bridge1
+버전: v37.37-ui-overhaul1
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.37-ui-overhaul1 (2026-03-07): 텔레그램 신호 UI 전반 개편. 강력매수/급등/조기포착/눌림목/진입가도달/분할청산/섹터모니터링 메시지를 '매매정보 → 현재상태 → 섹터요약 → 결론 → 근거/경고 → 상세' 순서로 재배치하고, 손익비/한줄 결론/섹터 요약/경고 블록을 추가해 가독성을 개선.
 
 - v37.36-autotune-bridge1 (2026-03-07): signal_log에 쌓이기만 하던 earnings_risk, feature_snapshot(시간대/거래량/변동률), geo_sector_bias를 auto_tune과 실제 조건 반영에 연결. 실적 리스크별 감점 배율, 시간대 최소점수 보정의 실제 적용, 변동률/거래량 bucket 점수 조정, 지정학 섹터별 보정 배율 자동학습 추가.
 
@@ -2464,12 +2466,14 @@ def send_mid_pullback_alert(s: dict):
     target = s.get("target_price", 0)
     price  = s.get("price", 0)
     diff_from_entry = ((price - entry) / entry * 100) if entry and price else 0
+    rr_text = _calc_rr_text(entry, stop, target)
     entry_block = (
         f"┌─────────────────────\n"
         f"│ 🟣 <b>진입 포인트</b>\n"
         f"│ 🎯 진입가  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
         f"│ 🛡 손절가  <b>{stop:,}원</b>  (-{s['stop_pct']:.1f}%){atr_tag}\n"
         f"│ 🏆 목표가  <b>{target:,}원</b>  (+{s['target_pct']:.1f}%){atr_tag}\n"
+        f"│ ⚖️ 손익비  <b>{rr_text}</b>\n"
         f"└─────────────────────"
     )
 
@@ -6381,6 +6385,70 @@ def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     if score >= 60:                                   return ALERT_LEVEL_NORMAL
     return ALERT_LEVEL_INFO
 
+def _calc_rr_text(entry: int, stop: int, target: int) -> str:
+    try:
+        if entry and stop and target and entry > stop:
+            rr = (target - entry) / max(1, (entry - stop))
+            return f"1 : {rr:.1f}"
+    except Exception:
+        pass
+    return "계산불가"
+
+
+def _split_reasons_for_ui(reasons: list) -> tuple[list, list]:
+    core, warns = [], []
+    for r in reasons or []:
+        txt = str(r or '').strip()
+        if not txt:
+            continue
+        if txt.startswith(('⚠️', '⏰', '🔴 [HIGH]', '🔴', '🔁')):
+            warns.append(txt)
+        else:
+            core.append(txt)
+    return core, warns
+
+
+def _build_sector_summary_block(s: dict) -> str:
+    si = s.get('sector_info') or {}
+    theme = str(si.get('theme', '') or '').strip()
+    if not theme:
+        return ''
+    bonus = int(si.get('bonus', 0) or 0)
+    summary = str(si.get('summary', '') or '').strip()
+    rising = si.get('rising', []) or []
+    lines = [f"🏭 <b>섹터 모멘텀</b> [{theme}]" + (f"  +{bonus}점" if bonus > 0 else "")]
+    if summary:
+        lines.append(f"  {summary}")
+    if rising:
+        picks = []
+        for r in rising[:3]:
+            nm = _resolve_stock_name(r.get('code',''), r.get('name',''))
+            picks.append(f"{nm} {r.get('change_rate',0):+.1f}%")
+        if picks:
+            lines.append("  📌 동반 상승: " + ", ".join(picks))
+    return "\n".join(lines) + "\n━━━━━━━━━━━━━━━\n"
+
+
+def _build_conclusion_line(s: dict) -> str:
+    st = str(s.get('signal_type', '') or '')
+    price = safe_int(s.get('price', 0))
+    entry = safe_int(s.get('entry_price', 0))
+    bonus = int(((s.get('sector_info') or {}).get('bonus', 0)) or 0)
+    if st == 'ENTRY_POINT':
+        return '✅ 결론: 진입 구간 진입, 분할 접근 유효'
+    if st == 'EARLY_DETECT':
+        return '✅ 결론: 선진입 후보, 눌림 확인 후 접근 유효'
+    if st == 'MID_PULLBACK':
+        return '✅ 결론: 눌림목 구조 양호, 진입가 기준 분할 대기'
+    if is_strict_time():
+        return '⚠️ 결론: 강하지만 장시작·마감 근접 구간, 추격보다 눌림 우선'
+    if entry and price and price > entry * 1.03:
+        return '⚠️ 결론: 신호 강도는 높지만 진입가 대비 괴리 커서 눌림 대기 우선'
+    if bonus > 0:
+        return '✅ 결론: 섹터 자금 유입 확인, 눌림 후 분할 진입 유효'
+    return '✅ 결론: 수급·거래량 확인, 추격보다 기준가 확인 후 접근'
+
+
 def _sector_block(s: dict) -> str:
     si = s.get("sector_info")
     if not si:
@@ -6486,32 +6554,38 @@ def send_alert(s: dict):
 
     detected_at = s.get("detected_at", datetime.now())
     if s["signal_type"] == "ENTRY_POINT":
+        rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
             f"┌─────────────────────\n"
             f"│ ⚡️ <b>지금 진입 구간!</b>\n"
             f"│ 🎯 진입가  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
             f"│ 🛡 손절가  <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가  <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"│ ⚖️ 손익비  <b>{rr_text}</b>\n"
             f"└─────────────────────"
         )
     elif s["signal_type"] == "EARLY_DETECT":
+        rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
             f"┌─────────────────────\n"
             f"│ ⚡️ <b>선진입 고려!</b>\n"
             f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
             f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"│ ⚖️ 손익비   <b>{rr_text}</b>\n"
             f"└─────────────────────"
         )
     else:
         elapsed = minutes_since(detected_at)
         wait_msg = f"⏰ 눌림목 대기 ({30-elapsed}분 후 체크)" if elapsed < 30 else "📡 눌림목 실시간 체크 중"
+        rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
             f"┌─────────────────────\n"
             f"│ {wait_msg}\n"
             f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
             f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
+            f"│ ⚖️ 손익비   <b>{rr_text}</b>\n"
             f"└─────────────────────"
         )
 
