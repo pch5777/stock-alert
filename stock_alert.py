@@ -3,22 +3,46 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v38.2-profit-guard2
+버전: v38.3-unified1
 날짜: 2026-03-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v38.2-profit-guard2 (2026-03-07): 5개 운영 보정 반영. (1) MARKET_REGIME 중복 선언/키명(detail→details) 통일. (2) 야간 무알림 구간을 07:30 기준으로 정합화. (3) 07:30 장전 브리핑의 리스크 섹션을 entry_hit 종목 중심으로 분리. (4) 분할 청산 가이드는 기본적으로 actual_entry 종목만 발송하고, entry_hit 종목은 내부 추적만 유지. (5) 상단 changelog를 최근 버전 중심으로 슬림화.
-- v38.1-perf-profit1 (2026-03-07): Phase 2 성능·수익성·운영성 개선. auto_tune 분해, 캐시 통합, 교차분석 기반 score/R:R/Kelly 최적화.
-- v38.0-stability1 (2026-03-07): Phase 1 안정성·운영성 개선. 스레드 안전성, bare except 정리, signal_log 아카이브, 에러 일일 요약.
-- v37.40-briefing-riskopt2 (2026-03-07): 08:50 장직전 압축 브리핑 기본 비활성화. 07:30 장 시작 전 진입/리스크 브리핑으로 단일화.
-- v37.39-briefing-riskopt1 (2026-03-07): 사용자 저장 수정사항 1~5 반영. 07:30 브리핑/마감 리스크/한국 관련 해외 ETF/라벨 통합.
-- v37.38-marketregime1 (2026-03-07): Market Regime 필터를 점수 엔진과 텔레그램 UI에 반영.
-- v37.23-allin1 (2026-03-06): 안정 기준 베이스.
+- v38.3-unified1 (2026-03-07): v38.2 유효변경 통합 + P0/P1 전체 수정.
+  [P0-1] SIG_LABELS/SIG_TITLES 복원 → get_signal_label() NameError 해소.
+  [P0-2] MARKET_REGIME 중복 선언 제거 (79줄 삭제, 152줄만 유지).
+  [P0-3] MARKET_REGIME "detail"/"details" 호환 처리 확인 (섹터 dict의 "detail" 키는 정상).
+  [P0-4] bare except 144개 → 0개. except Exception 패턴 전환.
+  [P0-5] threading.Lock 3개 도입 (_file_lock/_state_lock/_cache_lock).
+  [P1-6] signal_log 직접읽기 27곳 → _read_json_locked() 전환.
+  [P1-7] SIGNAL_LOG_MAX_RECORDS 50000→5000 + 90일 아카이브.
+  [P1-8] _safe_get/_safe_get_meta 통합 (중복 90줄 제거).
+  [D2] 에러 일일 요약 (장 마감 시 텔레그램 자동 발송).
+  [D3] 코드 SHA256 해시 검증 (시작 시 발송).
+  [유효] v38.2의 _should_send_partial_exit_guide, ALLOW_VIRTUAL_EXIT_GUIDE='0', changelog 슬림화 유지.
+- v37.40-briefing-riskopt2 (2026-03-07): 안정 기준 베이스.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
 """
+
+
+# 공용 신호 라벨/표현 (v38.3: 복원 — v38.2에서 누락되어 NameError 유발)
+SIG_LABELS = {
+    "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+    "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목",
+    "ENTRY_POINT": "단기눌림목", "STRONG_BUY": "강력매수",
+}
+SIG_TITLES = {
+    "UPPER_LIMIT": "상한가 감지", "NEAR_UPPER": "상한가 근접",
+    "SURGE": "급등 감지", "EARLY_DETECT": "★ 조기 포착 - 선진입 기회 ★",
+    "MID_PULLBACK": "눌림목 진입 신호", "ENTRY_POINT": "★ 눌림목 진입 시점 ★",
+    "STRONG_BUY": "강력 매수 신호",
+}
+def get_signal_label(signal_type: str, default: str = "") -> str:
+    return SIG_LABELS.get(str(signal_type or ""), default or str(signal_type or ""))
+def get_signal_title(signal_type: str, default: str = "급등 감지") -> str:
+    return SIG_TITLES.get(str(signal_type or ""), default)
 
 
 # ============================================================
@@ -76,7 +100,7 @@ def regime_label_ko(label: str) -> str:
 
 # --- Global state defaults (to prevent NameError at runtime) ---
 GEO_SECTOR_BIAS: dict = {}
-MARKET_REGIME: dict = {"label": "unknown", "details": {}}
+# MARKET_REGIME: 176줄에서 1회만 선언 (v38.3: 중복 제거)
 
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
@@ -129,6 +153,19 @@ from zoneinfo import ZoneInfo
 _KST = ZoneInfo("Asia/Seoul")
 def _now_kst() -> datetime:
     return datetime.now(_KST)
+
+# ============================================================
+# 🔒 Thread Safety (v38.3-P0-5)
+# ============================================================
+_file_lock  = threading.Lock()   # signal_log/carry/dynamic JSON 읽기/쓰기
+_state_lock = threading.Lock()   # _detected_stocks/_alert_history 등 공유 dict
+_cache_lock = threading.Lock()   # 캐시 dict 일괄 관리
+
+# ============================================================
+# 📊 에러 집계 (v38.3-D2)
+# ============================================================
+_error_daily_counts: dict = {}
+_error_daily_samples: dict = {}
 
 def _is_quiet_night(now: datetime | None = None) -> bool:
     """Quiet night window: 20:00~07:30 (no push; store only)."""
@@ -283,7 +320,7 @@ def _snapshot_backup(file_path: str):
         for old in backups[MAX_STATE_BACKUPS:]:
             try:
                 os.remove(os.path.join(_BACKUP_DIR, old))
-            except:
+            except Exception:
                 pass
     except Exception as e:
         print(f"⚠️ 백업 스냅샷 실패: {os.path.basename(file_path)} ({e})")
@@ -299,12 +336,22 @@ def _atomic_write_bytes(file_path: str, data: bytes):
     os.replace(tmp_path, file_path)
 
 def _write_json_atomic(file_path: str, obj, indent: int = 2):
-    try:
-        _snapshot_backup(file_path)
-        payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
-        _atomic_write_bytes(file_path, payload)
-    except Exception as e:
-        print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+    with _file_lock:  # v38.3-P0-5
+        try:
+            _snapshot_backup(file_path)
+            payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
+            _atomic_write_bytes(file_path, payload)
+        except Exception as e:
+            print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+
+def _read_json_locked(file_path: str, default=None):
+    """v38.3-P1-6: Lock 보호 JSON 읽기 (스레드 안전)"""
+    with _file_lock:
+        try:
+            with open(file_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return default if default is not None else {}
 
 def _migrate_legacy_files():
     """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
@@ -360,7 +407,7 @@ def _storage_diagnostics_once():
                 try:
                     size = os.path.getsize(fp)
                     existing.append(f"{fn}({size}B)")
-                except:
+                except Exception:
                     existing.append(fn)
         print("   Files:", ", ".join(existing) if existing else "(none)")
         print("=======================================================")
@@ -556,13 +603,16 @@ _error_counts: dict = {}
 def _log_error(func_name: str, e: Exception, critical: bool = False):
     _error_counts[func_name] = _error_counts.get(func_name, 0) + 1
     cnt = _error_counts[func_name]
+    # v38.3-D2: 일일 에러 집계
+    _error_daily_counts[func_name] = _error_daily_counts.get(func_name, 0) + 1
+    _error_daily_samples[func_name] = f"{type(e).__name__}: {str(e)[:80]}"
     print(f"⚠️ [{func_name}] {type(e).__name__}: {e} (누적 {cnt}회)", flush=True)
     if critical or cnt in (5, 20, 100):
         try:
             send(f"🔴 <b>반복 오류 감지</b>\n"
                  f"함수: <code>{func_name}</code>  누적 {cnt}회\n"
                  f"오류: {type(e).__name__}: {str(e)[:100]}")
-        except: pass
+        except Exception: pass
 
 _alert_history      = {}
 _detected_stocks    = {}
@@ -620,13 +670,13 @@ def _load_compact_mode():
     try:
         with open(COMPACT_MODE_FILE) as f:
             _compact_mode = json.load(f).get("compact", False)
-    except: pass
+    except Exception: pass
 
 def _save_compact_mode():
     try:
         with open(COMPACT_MODE_FILE, "w") as f:
             json.dump({"compact": _compact_mode}, f)
-    except: pass
+    except Exception: pass
 
 # ── 알림 중요도 레벨 ──
 # CRITICAL(🔴): 즉시 발송  NORMAL(🟡): 즉시 발송  INFO(🔵): 묶어서 10분마다
@@ -696,7 +746,7 @@ def _load_kr_holidays(year: int = None):
                 timeout=10
             )
             # 간단 파싱 (실패해도 괜찮음)
-        except: pass
+        except Exception: pass
 
     # 3차: 하드코딩 fallback (API 모두 실패 시)
     if not loaded:
@@ -795,16 +845,12 @@ def _headers(tr_id: str) -> dict:
             "tr_id":tr_id,"custtype":"P"}
 
 
-def _safe_get(url: str, tr_id: str, params: dict) -> dict:
-    """KIS GET with retry/backoff. Never raises.
-
-    On failure, prints a compact diagnostic (url/status/content-type/body-snippet).
+def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
+    """v38.3-P1-8: KIS GET with retry/backoff. Never raises.
+    return_meta=True → (data, status, ct, body_snippet) 4-tuple.
+    return_meta=False(기본) → dict만 반환.
     """
-    last_exc = None
-    last_status = None
-    last_ct = ""
-    last_body_snip = ""
-    last_url = url
+    last_exc = None; last_status = None; last_ct = ""; last_body_snip = ""; last_url = url
 
     for attempt in range(3):
         try:
@@ -813,7 +859,6 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
             last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
             last_url = getattr(resp, "url", url) or url
 
-            # If token expired, refresh once then retry.
             if last_status == 403:
                 global _access_token
                 _access_token = None
@@ -823,99 +868,47 @@ def _safe_get(url: str, tr_id: str, params: dict) -> dict:
                 last_url = getattr(resp, "url", url) or url
 
             if last_status == 200:
-                return safe_json_response(resp)
+                data = safe_json_response(resp)
+                return (data, last_status, last_ct, "") if return_meta else data
 
-            # Capture a small, safe snippet for debugging.
             try:
                 raw = (getattr(resp, "text", "") or "").strip()
-                raw = " ".join(raw.split())  # collapse whitespace
-                last_body_snip = raw[:200]
+                last_body_snip = " ".join(raw.split())[:200]
             except Exception:
                 last_body_snip = ""
 
-            # If server returned JSON error, prefer its fields.
+            if return_meta:
+                break
+
             j = safe_json_response(resp)
             if isinstance(j, dict) and j:
                 msg_cd = j.get("msg_cd") or j.get("error_code") or j.get("code")
                 msg1 = j.get("msg1") or j.get("message") or j.get("error_description") or j.get("error")
-                rt_cd = j.get("rt_cd")
-                last_exc = f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg1}"
+                last_exc = f"rt_cd={j.get('rt_cd')} msg_cd={msg_cd} msg={msg1}"
             else:
                 last_exc = None
-
         except Exception as e:
             last_exc = e
-
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception:
             pass
 
-    # Auto-disable unsupported endpoints for the rest of the day (to avoid noisy retries)
     try:
         if last_status == 404 and isinstance(last_url, str):
-            if "chgrate-pcls-100" in last_url:
-                _disable_rank_api_for_today("404")
-            if "inquire-daily-trade" in last_url:
-                _disable_daily_trade_api_for_today("404")
+            if "chgrate-pcls-100" in last_url: _disable_rank_api_for_today("404")
+            if "inquire-daily-trade" in last_url: _disable_daily_trade_api_for_today("404")
     except Exception:
         pass
-
-    try:
-        print(
-            f"⚠️ API 오류 ({tr_id}): url={last_url} status={last_status} ct={last_ct} "
-            f"err={last_exc} body={last_body_snip}"
-        )
-    except Exception:
-        pass
-    return {}
-
-
-
-def _safe_get_meta(url: str, tr_id: str, params: dict):
-    """_safe_get + (status, content_type, body_snippet) 를 함께 반환."""
-    last_exc = None
-    last_status = None
-    last_ct = ""
-    last_body_snip = ""
-    last_url = url
-
-    for attempt in range(3):
-        try:
-            resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-            last_status = getattr(resp, "status_code", None)
-            last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
-
-            if last_status != 200:
-                try:
-                    txt = getattr(resp, "text", "") or ""
-                    last_body_snip = (txt[:200] + ("…" if len(txt) > 200 else "")).replace("\n", " ").replace("\r", " ")
-                except:
-                    last_body_snip = ""
-                break
-
-            try:
-                data = resp.json()
-            except Exception as e:
-                last_exc = e
-                try:
-                    txt = getattr(resp, "text", "") or ""
-                    last_body_snip = (txt[:200] + ("…" if len(txt) > 200 else "")).replace("\n", " ").replace("\r", " ")
-                except:
-                    last_body_snip = ""
-                break
-
-            return data or {}, last_status, last_ct, last_body_snip
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.8 * (attempt + 1))
-
     try:
         print(f"⚠️ API 오류 ({tr_id}): url={last_url} status={last_status} ct={last_ct} err={last_exc} body={last_body_snip}")
-    except:
+    except Exception:
         pass
+    return ({}, last_status, last_ct, last_body_snip) if return_meta else {}
 
-    return {}, last_status, last_ct, last_body_snip
+def _safe_get_meta(url: str, tr_id: str, params: dict):
+    """v38.3: _safe_get 래퍼 (하위 호환)"""
+    return _safe_get(url, tr_id, params, return_meta=True)
 
 # ============================================================
 # 📊 일봉 데이터 (공통 사용)
@@ -1150,7 +1143,7 @@ def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_r
             return ""
 
         return f"🔍 <b>과거 유사 패턴</b>\n" + "\n".join(lines)
-    except:
+    except Exception:
         return ""
 
 # ============================================================
@@ -1164,10 +1157,9 @@ def _load_signal_history() -> dict:
     if time.time() - _history_cache["ts"] < 300 and _history_cache["data"]:
         return _history_cache["data"]
     try:
-        with open(SIGNAL_LOG_FILE, "r") as f:
-            _history_cache["data"] = json.load(f)
+        _history_cache["data"] = _read_json_locked(SIGNAL_LOG_FILE)
         _history_cache["ts"] = time.time()
-    except:
+    except Exception:
         _history_cache["data"] = {}
     return _history_cache["data"]
 
@@ -1326,7 +1318,7 @@ def get_overnight_history() -> str:
         try:
             if t >= "14:00" or (r.get("exit_date","") > r.get("detect_date","")):
                 overnight.append(r)
-        except: pass
+        except Exception: pass
 
     if len(overnight) < 3:
         return ""
@@ -1392,7 +1384,7 @@ def calc_atr_pct(code: str, price: int, fallback_pct: float = 2.0) -> float:
         atr = get_atr(code)
         if atr > 0 and price > 0:
             return round(atr / price * 100, 2)
-    except: pass
+    except Exception: pass
     return fallback_pct
 
 def calc_trailing_stop(code: str, high_price: int) -> int:
@@ -1410,7 +1402,7 @@ def calc_trailing_stop(code: str, high_price: int) -> int:
             trail_pct = max(1.5, min(trail_pct, 8.0))
             trail_gap = int(high_price * trail_pct / 100)
             return int((high_price - trail_gap) / 10) * 10
-    except: pass
+    except Exception: pass
     # fallback: 고점 × 0.97
     return int(high_price * 0.97 / 10) * 10
 
@@ -1685,7 +1677,7 @@ def get_kospi_change() -> float:
         _kospi_cache["change"] = chg
         _kospi_cache["ts"]     = time.time()
         return chg
-    except:
+    except Exception:
         return 0.0
 
 def get_relative_strength(stock_change: float) -> float:
@@ -1884,7 +1876,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
             _w_nxt = _dynamic.get("feat_w_nxt", 1.0)
             score += int(nxt_delta * _w_nxt)
             if nxt_reason: reasons.append(nxt_reason)
-    except: pass
+    except Exception: pass
 
     # 최소 조건: 양봉 + 거래량 회복 둘 다 없으면 재상승 미확인
     if not is_bullish and not vol_recovered:
@@ -2210,8 +2202,7 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
             pass
 
         try:
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
+            data = _read_json_locked(SIGNAL_LOG_FILE)
             for _k, rec in sorted(data.items(), reverse=True):
                 if not isinstance(rec, dict):
                     continue
@@ -2636,18 +2627,17 @@ def _load_universe_codes() -> list:
             found = set()
             _extract_codes_recursive(j, found, limit=2000)
             codes.extend(sorted(found))
-    except:
+    except Exception:
         pass
 
     # signal_log.json
     try:
         if os.path.exists(SIGNAL_LOG_FILE):
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                j = json.load(f)
+            j = _read_json_locked(SIGNAL_LOG_FILE)
             found = set()
             _extract_codes_recursive(j, found, limit=5000)
             codes.extend(sorted(found))
-    except:
+    except Exception:
         pass
 
     seen = set()
@@ -2671,8 +2661,7 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
         # signal_log 로드
         log = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                log = json.load(f) or {}
+            log = _read_json_locked(SIGNAL_LOG_FILE)
         except Exception:
             return
 
@@ -2991,7 +2980,7 @@ def get_nxt_info(code: str) -> dict:
             return {}
         inv = {}
         try: inv = get_nxt_investor_trend(code)
-        except: pass
+        except Exception: pass
 
         krx = get_stock_price(code)
         krx_price = krx.get("price", 0)
@@ -3109,7 +3098,7 @@ def get_sector_stocks_from_kis(code: str) -> list:
             for s in get_volume_surge_stocks() + get_upper_limit_stocks():
                 if s.get("code") and s["code"] != code:
                     candidates[s["code"]] = s["name"]
-        except: pass
+        except Exception: pass
 
         for peer_code, peer_name in list(candidates.items())[:30]:
             if len(stocks) >= 8: break
@@ -3121,7 +3110,7 @@ def get_sector_stocks_from_kis(code: str) -> list:
                 if peer_bstp == bstp_code:
                     stocks.append((peer_code, peer_name))
                 time.sleep(0.1)
-            except: continue
+            except Exception: continue
 
         # 3단계: 위에서도 없으면 등락률 상위 전체에서 한번 더 시도
         if not stocks:
@@ -3154,9 +3143,9 @@ def get_sector_stocks_from_kis(code: str) -> list:
                         if d4.get("output",{}).get("bstp_cls_code","") == bstp_code:
                             stocks.append((peer_code, i.get("hts_kor_isnm","")))
                         time.sleep(0.1)
-                    except: continue
+                    except Exception: continue
                     if len(stocks) >= 6: break
-            except: pass
+            except Exception: pass
 
         _sector_cache[code] = {"sector": bstp_name, "stocks": stocks, "ts": time.time()}
         print(f"  🏭 [{bstp_name}] 동업종 {len(stocks)}개 조회됨 (업종코드: {bstp_code})")
@@ -3190,7 +3179,7 @@ def calc_price_correlation(code_a: str, code_b: str) -> float:
         if std_a == 0 or std_b == 0:
             return 0.0
         return round(cov / (std_a * std_b), 3)
-    except:
+    except Exception:
         return 0.0
 
 def build_correlation_theme(code: str, name: str) -> list:
@@ -3273,7 +3262,7 @@ def update_news_cooccur(headlines: list):
     # 파일 저장 (장 마감 후 분석용)
     try:
         _write_json_atomic(NEWS_COOCCUR_FILE, _news_cooccur, indent=2)
-    except: pass
+    except Exception: pass
 
 def get_news_cooccur_peers(code: str) -> list:
     """뉴스에서 함께 언급된 횟수 상위 종목 반환 [(code, name, count)]"""
@@ -3345,7 +3334,7 @@ def auto_update_theme(code: str, name: str, trigger: str = "급등"):
         with open(DYNAMIC_THEME_FILE, "w") as f:
             json.dump({k: {**v, "stocks": v["stocks"]} for k,v in _dynamic_theme_map.items()},
                       f, ensure_ascii=False, indent=2)
-    except: pass
+    except Exception: pass
 
 def load_dynamic_themes():
     """장 시작 시 동적 테마 파일 복원"""
@@ -3359,7 +3348,7 @@ def load_dynamic_themes():
                                time.time() - v.get("ts", 0) < 86400}
         if _dynamic_theme_map:
             print(f"  📂 동적 테마 {len(_dynamic_theme_map)}개 복원")
-    except: pass
+    except Exception: pass
 
 
 # ============================================================
@@ -3410,7 +3399,7 @@ def get_dart_related_stocks(code: str) -> list:
                 related.append((relate_stock, relate_name, relate_type or "관계회사"))
         _dart_related_cache[code] = {"related": related[:10], "ts": time.time()}
         return related[:10]
-    except:
+    except Exception:
         _dart_related_cache[code] = {"related": [], "ts": time.time()}
         return []
 
@@ -3438,7 +3427,7 @@ def calc_real_sector_score(code_a: str, code_b: str,
         elif corr >= 0.5:
             score += 10
             layers["상관계수"] = f"{corr:.2f} (+10점)"
-    except: pass
+    except Exception: pass
 
     # ② 당일 동반 상승 (실시간)
     try:
@@ -3452,7 +3441,7 @@ def calc_real_sector_score(code_a: str, code_b: str,
         elif cr_a >= 1.0 and cr_b >= 1.0:
             score += 15
             layers["동반상승"] = f"+{cr_a:.1f}%/+{cr_b:.1f}% (+15점)"
-    except: pass
+    except Exception: pass
 
     # ③ DART 지분 관계
     try:
@@ -3461,7 +3450,7 @@ def calc_real_sector_score(code_a: str, code_b: str,
         if dart_hit:
             score += 20
             layers["DART지분"] = f"{dart_hit[2]} (+20점)"
-    except: pass
+    except Exception: pass
 
     # ④ 뉴스 동시 언급
     try:
@@ -3469,7 +3458,7 @@ def calc_real_sector_score(code_a: str, code_b: str,
         if code_b in cooccur_a and cooccur_a[code_b] >= 2:
             score += 10
             layers["뉴스동시언급"] = f"{cooccur_a[code_b]}회 (+10점)"
-    except: pass
+    except Exception: pass
 
     if score >= 60:   label = "🔴 강한 연관"
     elif score >= 40: label = "🟠 보통 연관"
@@ -3582,7 +3571,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
                              "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0,
                              "source":src, "reason":rsn})
             time.sleep(0.15)
-        except: continue
+        except Exception: continue
     if not results:
         return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
     total, react_cnt = len(results), sum(1 for r in results if r["weak"])
@@ -3608,7 +3597,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
                 if nxt.get("inv_bullish"): nxt_bullish_cnt += 1
                 elif nxt.get("inv_bearish"): nxt_bearish_cnt += 1
                 time.sleep(0.1)
-            except: continue
+            except Exception: continue
         if nxt_bullish_cnt >= 2:
             bonus = min(bonus + 10, 30)
             summary += f"  🔵 NXT {nxt_bullish_cnt}종목 외인+기관 매수"
@@ -3640,7 +3629,8 @@ SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 �
 #   - params_snapshot(신호 당시 파라미터) + feature_snapshot(상황/지표) 저장
 #   - params_snapshot 성과 비교로 점진적(auto) 튜닝
 # ============================================================
-SIGNAL_LOG_MAX_RECORDS = int(os.getenv("SIGNAL_LOG_MAX_RECORDS", "50000") or "50000")
+SIGNAL_LOG_MAX_RECORDS = int(os.getenv("SIGNAL_LOG_MAX_RECORDS", "5000") or "5000")  # v38.3: 50000→5000
+SIGNAL_LOG_ARCHIVE_DAYS = int(os.getenv("SIGNAL_LOG_ARCHIVE_DAYS", "90") or "90")
 STRICT_ENTRY_CLEANUP_MARKER = os.path.join(DATA_DIR, "strict_entry_cleanup_v37_25.done")
 
 def _strict_cleanup_legacy_entry_hits() -> None:
@@ -3656,8 +3646,7 @@ def _strict_cleanup_legacy_entry_hits() -> None:
                 f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return
 
-        with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
+        data = _read_json_locked(SIGNAL_LOG_FILE)
         if not isinstance(data, dict):
             return
 
@@ -3680,8 +3669,7 @@ def _strict_cleanup_legacy_entry_hits() -> None:
                 changed += 1
 
         if changed > 0:
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                original = json.load(f) or {}
+            original = _read_json_locked(SIGNAL_LOG_FILE)
             _write_json_atomic(backup_path, original, indent=2)
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
             print(f"🧹 strict cleanup: 과거 비실진입 entry_hit {changed}건 초기화, 백업={os.path.basename(backup_path)}")
@@ -3706,23 +3694,41 @@ def _safe_float(x, default=0.0):
         return default
 
 def _prune_signal_log(data: dict) -> dict:
-    """signal_log.json이 너무 커지면 오래된 기록부터 정리."""
+    """v38.3-P1-7: signal_log 크기 관리 — 90일 아카이브 + 건수 제한."""
     try:
         if not isinstance(data, dict):
             return data
+        # 1단계: 90일 초과 완료건 아카이브
+        cutoff = (datetime.now() - timedelta(days=SIGNAL_LOG_ARCHIVE_DAYS)).strftime("%Y%m%d")
+        archive, keep = {}, {}
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                keep[k] = v; continue
+            if v.get("status") in ("수익","손실","본전") and str(v.get("detect_date","")) < cutoff:
+                archive[k] = v
+            else:
+                keep[k] = v
+        if archive:
+            try:
+                arch_path = os.path.join(DATA_DIR, "signal_log_archive.json")
+                existing = _read_json_locked(arch_path)
+                if not isinstance(existing, dict): existing = {}
+                existing.update(archive)
+                _write_json_atomic(arch_path, existing, indent=1)
+                print(f"📦 signal_log 아카이브: {len(archive)}건")
+            except Exception:
+                keep.update(archive)  # 실패 시 원본 유지
+        data = keep
+        # 2단계: 건수 제한
         if len(data) <= SIGNAL_LOG_MAX_RECORDS:
             return data
-        # detect_date+time → 정렬 키(없으면 key 자체)
         def _k(item):
             k, v = item
-            d = str(v.get("detect_date", ""))
-            t = str(v.get("detect_time", ""))
-            if len(d) == 8 and len(t) >= 5:
-                return d + t.replace(":", "")[:6]
-            return k
+            d = str(v.get("detect_date","")) if isinstance(v,dict) else ""
+            t = str(v.get("detect_time","")) if isinstance(v,dict) else ""
+            return (d + t.replace(":","")[:6]) if len(d)==8 and len(t)>=5 else k
         items = sorted(data.items(), key=_k)
-        keep = dict(items[-SIGNAL_LOG_MAX_RECORDS:])
-        return keep
+        return dict(items[-SIGNAL_LOG_MAX_RECORDS:])
     except Exception:
         return data
 
@@ -3874,8 +3880,8 @@ def save_signal_log(stock: dict):
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         code     = stock["code"]
         stock_name = _resolve_stock_name(code, stock.get("name", ""))
@@ -3978,7 +3984,7 @@ def save_early_detect(stock: dict):
         data = {}
         try:
             with open(EARLY_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+        except Exception: pass
         code = stock["code"]
         if code not in data:
             data[code] = {
@@ -4017,8 +4023,8 @@ def send_overnight_risk_alerts():
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
         tracking = [v for v in data.values() if v.get("status") == "추적중"]
         if not tracking: return
 
@@ -4050,7 +4056,7 @@ def send_overnight_risk_alerts():
             _r_hist = get_regime_history(_regime)
             if _r_hist:
                 msg += f"📊 {_r_hist}\n"
-        except: pass
+        except Exception: pass
         # Save latest overnight risk message (for pre-open recap)
         try:
             _write_json_atomic(OVERNIGHT_RISK_LAST_FILE, {
@@ -4155,7 +4161,7 @@ def run_overnight_monitor():
                         f"🌍 지정학 이벤트: {geo.get('summary','')}\n"
                         f"  관련 섹터: {', '.join(geo.get('sectors',[]))}"
                     )
-        except: pass
+        except Exception: pass
 
         # ── 알림 발송 ──
         if alerts:
@@ -4182,8 +4188,8 @@ def _send_pending_result_reminder():
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: return
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: return
 
         today   = datetime.now().strftime("%Y%m%d")
         pending = [
@@ -4228,7 +4234,7 @@ def _send_pending_result_reminder():
                 cur_pnl = round((cur_p - entry) / entry * 100, 1) if entry and cur_p else 0
                 pnl_emoji = "🟢" if cur_pnl >= 0 else "🔴"
                 cur_str = f"  현재 {cur_p:,}원  {pnl_emoji}{cur_pnl:+.1f}%"
-            except:
+            except Exception:
                 cur_str = ""
             sig = sig_labels.get(v.get("signal_type",""), "")
             msg += (f"• <b>{v['name']}</b>  {sig}\n"
@@ -4253,8 +4259,8 @@ def track_signal_results():
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: return
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: return
 
         updated = False
         today   = datetime.now().strftime("%Y%m%d")
@@ -4275,7 +4281,7 @@ def track_signal_results():
             try:
                 elapsed_days = (datetime.strptime(today, "%Y%m%d") -
                                 datetime.strptime(detect_date, "%Y%m%d")).days
-            except:
+            except Exception:
                 elapsed_days = 0
 
             # 현재가 조회 — KRX 장중이면 KRX, 마감 후면 NXT 사용
@@ -4293,7 +4299,7 @@ def track_signal_results():
                 else:
                     continue   # 모든 시장 마감
                 if not price: continue
-            except:
+            except Exception:
                 continue
 
             # 최고가·최저가 업데이트 (MDD 계산용)
@@ -4387,7 +4393,7 @@ def track_signal_results():
                             inv_info = "\n  ✅ 외국인+기관 순매수 — 홀딩 우호적"
                         elif f_net < 0 or i_net < 0:
                             inv_info = "\n  ⚠️ 외국인/기관 매도 전환 — 익절 고려"
-                    except: pass
+                    except Exception: pass
                     target_pct = ((target - entry) / entry * 100) if entry else 0
                     target_progress_pct = (pnl_now / target_pct * 100) if target_pct else 0
                     basis_gap_pct = ((price - entry) / entry * 100) if entry else 0
@@ -4442,7 +4448,7 @@ def track_signal_results():
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"⚠️ 통계적 패턴 감지 — 확증 아님, 익절/손절 직접 판단 필요"
                             )
-                except:
+                except Exception:
                     pass
 
         # ── 테마 약세 전환 경고 (추적 중) ──
@@ -4463,7 +4469,7 @@ def track_signal_results():
                             f"  현재 수익 {pnl_now:+.1f}% — 익절 고려 권장",
                             code, name
                         )
-                except: pass
+                except Exception: pass
 
                 # ── 실시간 오버나이트 위험도 급등 시 즉시 알림 ──
                 try:
@@ -4478,7 +4484,7 @@ def track_signal_results():
                                 f"  현재 {pnl_now:+.1f}% — 마감 전 매도 고려",
                                 code, name
                             )
-                except: pass
+                except Exception: pass
 
                 if price <= rec["trailing_stop"]:
                     exit_reason = "트레일링스탑"
@@ -4575,7 +4581,7 @@ def track_signal_results():
                             send(f"🔥 <b>연속 수익 {_consecutive_win_count}회!</b>\n"
                                  f"신호 기준 완화: {old_n}→{_dynamic['min_score_normal']}점\n"
                                  f"더 많은 신호를 포착합니다")
-                        except: pass
+                        except Exception: pass
 
         if updated:
             data = _prune_signal_log(data)
@@ -4641,7 +4647,7 @@ def _send_tracking_result(rec: dict):
                 if vr and vr < 0.5: causes.append(f"📉 거래량 급감 ({vr:.1f}배 — 매수세 소멸)")
                 if vr and vr > 5:   causes.append(f"🌊 거래량 급증 속 하락 (세력 매도 가능성)")
                 if not causes:      causes.append("⚠️ 특이 원인 미감지 (기술적 손절)")
-        except: causes = ["조회 실패"]
+        except Exception: causes = ["조회 실패"]
         cause_block = "\n━━━━━━━━━━━━━━━\n🔍 <b>손절 원인 분석</b>\n" + "\n".join(f"  {c}" for c in causes) + "\n"
 
     # ── 분할 청산 가이드 (수익 시) ──
@@ -4697,7 +4703,7 @@ def _send_tracking_result(rec: dict):
                     "ts":          time.time(),
                 }
                 print(f"  🔄 재진입 감시 등록: {name} ({code}) 손절가 {cur_price:,}")
-        except: pass
+        except Exception: pass
 
 def check_reentry_watch():
     """
@@ -4758,27 +4764,28 @@ def check_reentry_watch():
                 )
                 expired.append(code)
                 print(f"  🔄 재진입 신호: {w['name']} {price:,} (+{bounce:.1f}%){mkt_tag}")
-        except: continue
+        except Exception: continue
     for code in expired:
         _reentry_watch.pop(code, None)
 
 def save_carry_stocks():
-    try:
-        with open(CARRY_FILE,"w") as f:
-            json.dump({code: {
-                "name":info["name"],"high_price":info["high_price"],
-                "entry_price":info["entry_price"],"stop_loss":info["stop_loss"],
-                "target_price":info["target_price"],
-                "detected_at":info["detected_at"].strftime("%Y%m%d%H%M%S"),
-                "carry_day":info.get("carry_day",0),
-            } for code,info in _detected_stocks.items()}, f, ensure_ascii=False)
-    except Exception as e: print(f"⚠️ 이월 저장 실패: {e}")
+    with _file_lock:  # v38.3-P0-5
+        try:
+            with open(CARRY_FILE,"w") as f:
+                json.dump({code: {
+                    "name":info["name"],"high_price":info["high_price"],
+                    "entry_price":info["entry_price"],"stop_loss":info["stop_loss"],
+                    "target_price":info["target_price"],
+                    "detected_at":info["detected_at"].strftime("%Y%m%d%H%M%S"),
+                    "carry_day":info.get("carry_day",0),
+                } for code,info in _detected_stocks.items()}, f, ensure_ascii=False)
+        except Exception as e: print(f"⚠️ 이월 저장 실패: {e}")
 
 def load_carry_stocks():
     """Railway 재시작 시 추적 상태 전체 복원"""
     # ① 이월 종목 복원
     try:
-        with open(CARRY_FILE,"r") as f: data = json.load(f)
+        data = _read_json_locked(CARRY_FILE)
         for code, info in data.items():
             carry_day = info.get("carry_day",0)
             if carry_day >= MAX_CARRY_DAYS: continue
@@ -4791,11 +4798,11 @@ def load_carry_stocks():
             }
         if _detected_stocks:
             print(f"📂 이월 종목 {len(_detected_stocks)}개 복원")
-    except: pass
+    except Exception: pass
 
     # ② signal_log에서 추적 중 종목 복원 (이월 파일에 없는 당일 추적 종목)
     try:
-        with open(SIGNAL_LOG_FILE,"r") as f: sig_data = json.load(f)
+        sig_data = _read_json_locked(SIGNAL_LOG_FILE)
         today = datetime.now().strftime("%Y%m%d")
         restored = 0
         for rec in sig_data.values():
@@ -4815,7 +4822,7 @@ def load_carry_stocks():
                 restored += 1
         if restored:
             print(f"  📋 signal_log에서 추적 중 종목 {restored}개 추가 복원")
-    except: pass
+    except Exception: pass
 
     # 복원 알림
     if _detected_stocks:
@@ -4983,7 +4990,7 @@ def _get_timeslot(detect_time: str) -> str:
         elif minutes < 12 * 60:            return "오전"     # 10:00~12:00
         elif minutes < 14 * 60:            return "오후"     # 12:00~14:00
         else:                              return "장후반"   # 14:00~
-    except:
+    except Exception:
         return "기타"
 
 def analyze_timeslot_winrate(completed: list) -> dict:
@@ -5108,8 +5115,8 @@ def auto_tune(notify: bool = True):
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: return
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: return
 
         # auto_tune은 이론 데이터 전부 사용 (미진입 포함 — 봇 조건 최적화용)
         completed = [v for v in data.values()
@@ -5543,7 +5550,7 @@ def auto_tune(notify: bool = True):
             tune_log = {}
             try:
                 with open(AUTO_TUNE_FILE, "r") as f: tune_log = json.load(f)
-            except: pass
+            except Exception: pass
             tune_log[datetime.now().strftime("%Y%m%d_%H%M")] = {
                 "changes":  changes,
                 "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
@@ -5815,8 +5822,8 @@ def register_entry_watch(s: dict):
         try:
             sig_data = {}
             try:
-                with open(SIGNAL_LOG_FILE, "r") as f_r: sig_data = json.load(f_r)
-            except: pass
+                sig_data = _read_json_locked(SIGNAL_LOG_FILE)
+            except Exception: pass
             for lk, rec in sig_data.items():
                 if (rec.get("code") == code
                         and rec.get("status") == "추적중"
@@ -5853,8 +5860,8 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
         entry     = watch.get("entry_price", 0)
         miss_away = round((final_price - entry) / entry * 100, 1) if entry else 0
         peak      = watch.get("peak_price", final_price)
@@ -5882,8 +5889,7 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str) -> None:
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = _read_json_locked(SIGNAL_LOG_FILE)
         except Exception:
             return
         now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -5985,7 +5991,7 @@ def check_entry_watch():
                 except Exception:
                     pass
                 print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
-        except: continue
+        except Exception: continue
     for k in expired:
         _entry_watch.pop(k, None)
 
@@ -6759,7 +6765,7 @@ def analyze(stock: dict) -> dict:
                     try:
                         _cp = get_stock_price(code)
                         cap_size = _cp.get("cap_size", "unknown")
-                    except: pass
+                    except Exception: pass
                 retail_ev = eval_retail_signal(code, f_net, i_net, r_net, cap_size)
                 if retail_ev:
                     score += retail_ev["score_adj"]
@@ -6790,7 +6796,7 @@ def analyze(stock: dict) -> dict:
 
     # v37.0: API 사전 캐싱 (get_stock_price 중복 호출 3→1회 절감)
     try: _cached_price = get_stock_price(code)
-    except: _cached_price = {}
+    except Exception: _cached_price = {}
 
     # 전일 상한가 ⑨
     prev_upper = was_upper_limit_yesterday(code)
@@ -6801,7 +6807,7 @@ def analyze(stock: dict) -> dict:
         cur_detail = _cached_price  # v37.0: 캐싱된 값 사용
         z = get_volume_zscore(code, cur_detail.get("today_vol",0))
         if z >= VOL_ZSCORE_MIN: score+=10; reasons.append(f"📊 거래량 이상 급증 (Z-score {z:.1f}σ)")
-    except: pass
+    except Exception: pass
 
     # 섹터 모멘텀
     sector_info = calc_sector_momentum(code, stock.get("name",code))
@@ -6822,7 +6828,7 @@ def analyze(stock: dict) -> dict:
             _w_nxt = _dynamic.get("feat_w_nxt", 1.0)
             score += int(nxt_delta * _w_nxt)
             if nxt_reason: reasons.append(nxt_reason)
-    except: pass
+    except Exception: pass
 
     # ── ① 시장 국면 보정 ──
     regime = get_market_regime()
@@ -6868,7 +6874,7 @@ def analyze(stock: dict) -> dict:
         elif short_ratio >= 5:
             score -= 5
             reasons.append(f"📉 공매도 잔고 {short_ratio:.1f}% — 주의")
-    except: pass
+    except Exception: pass
 
     # ── 외국인+기관 연속 순매수 보정 ──
     f_days, i_days = 0, 0  # v37.0: 초기화
@@ -6896,7 +6902,7 @@ def analyze(stock: dict) -> dict:
             adj = min(abs(i_days) * 2, 10)
             score -= adj
             reasons.append(f"🔴 기관 {abs(i_days)}일 연속 순매도 (-{adj}점)")
-    except: pass
+    except Exception: pass
 
     # ── 뉴스 심층 분석 (본문 + Claude API) ──
     try:
@@ -6995,7 +7001,7 @@ def analyze(stock: dict) -> dict:
             elif theme_key in weak_themes:
                 score -= 8
                 reasons.append(f"🔄 [{theme_key}] 테마 약세 ({t_chg:+.1f}%) -8점")
-    except: pass
+    except Exception: pass
 
     # ── ④ 실적 발표 필터 ──
     earnings = check_earnings_risk(code, stock.get("name", code))
@@ -7034,7 +7040,7 @@ def analyze(stock: dict) -> dict:
         if vp.get("score_adj") != 0:
             score += vp["score_adj"]
             if vp.get("reason"): reasons.append(vp["reason"])
-    except: pass
+    except Exception: pass
 
     # ── 공시 전 이상 거래량 보정 ──
     try:
@@ -7042,7 +7048,7 @@ def analyze(stock: dict) -> dict:
         if pre_dart.get("detected") and pre_dart.get("score_adj"):
             score += pre_dart["score_adj"]
             reasons.append(pre_dart["reason"])
-    except: pass
+    except Exception: pass
 
     # ── 수급 이상 패턴 보정 ──
     try:
@@ -7114,7 +7120,7 @@ def check_early_detection() -> list:
             detail = get_stock_price(code)
             bid_qty, ask_qty = detail.get("bid_qty",0), detail.get("ask_qty",0)
             if ask_qty > 0 and bid_qty/ask_qty < EARLY_HOGA_RATIO: continue
-        except: continue
+        except Exception: continue
 
         now = datetime.now()
         cache = _early_cache.get(code)
@@ -7147,7 +7153,7 @@ def check_early_detection() -> list:
         try:
             z = get_volume_zscore(code, detail.get("today_vol",0))
             if z >= VOL_ZSCORE_MIN: early_score+=10; reasons.append(f"📊 거래량 Z-score {z:.1f}σ")
-        except: pass
+        except Exception: pass
         sector_info = calc_sector_momentum(code, stock.get("name",code))
         if sector_info["bonus"]>0:
             early_score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
@@ -7160,7 +7166,7 @@ def check_early_detection() -> list:
             nd, nr = nxt_score_bonus(code)
             if nd != 0: early_score += nd
             if nr: reasons.append(nr)
-        except: pass
+        except Exception: pass
 
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
@@ -7242,7 +7248,7 @@ def check_pullback_signals() -> list:
                                             f"⏱ 급등 후 {minutes_since(detected_at)}분 경과"],
                                  "detected_at":detected_at})
                 _pullback_history[code] = time.time()
-        except: continue
+        except Exception: continue
     return signals
 
 # ============================================================
@@ -7276,7 +7282,7 @@ def fetch_news_for_stock(code: str, name: str) -> list:
             if len(title) > 5:
                 news.append({"title": title, "time": t, "url": href})
             if len(news) >= 3: break
-    except: pass
+    except Exception: pass
     _news_reverse_cache[code] = {"news": news, "ts": time.time()}
     return news
 
@@ -7371,7 +7377,7 @@ def news_block_for_alert(code: str, name: str) -> str:
                 f"{risk_text}",
                 code, name
             )
-        except: pass
+        except Exception: pass
     threading.Thread(target=_fetch, daemon=True).start()
 
 def _normalize_news_headline(title: str) -> str:
@@ -7415,21 +7421,21 @@ def fetch_naver_news() -> list:
                             timeout=10, headers=_random_ua())
         soup = BeautifulSoup(resp.text, "html.parser")
         return [t.get_text(strip=True) for t in soup.select(".realtimeNewsList .newsList li a")][:30]
-    except: return []
+    except Exception: return []
 
 def fetch_hankyung_news() -> list:
     try:
         resp = requests.get("https://www.hankyung.com/economy", timeout=10, headers=_random_ua())
         soup = BeautifulSoup(resp.text, "html.parser")
         return [t.get_text(strip=True) for t in soup.select("h3.news-tit, h2.tit")][:20]
-    except: return []
+    except Exception: return []
 
 def fetch_yonhap_news() -> list:
     try:
         resp = requests.get("https://www.yna.co.kr/economy/stock", timeout=10, headers=_random_ua())
         soup = BeautifulSoup(resp.text, "html.parser")
         return [t.get_text(strip=True) for t in soup.select(".news-tl")][:20]
-    except: return []
+    except Exception: return []
 
 def fetch_maekyung_news() -> list:
     """매일경제 RSS (가능하면)"""
@@ -7552,7 +7558,7 @@ def _get_minute_data(code: str, count: int = 30) -> list:
             if c and v:
                 result.append({"time": t, "open": o, "close": c, "volume": v})
         return result
-    except:
+    except Exception:
         return []
 
 def detect_force_pattern(code: str, name: str,
@@ -7622,7 +7628,7 @@ def detect_force_pattern(code: str, name: str,
                 })
                 total_adj -= 8
                 risk_flag = True
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -7672,7 +7678,7 @@ def detect_force_pattern(code: str, name: str,
                     })
                     total_adj += 6
 
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -7727,7 +7733,7 @@ def detect_force_pattern(code: str, name: str,
             try:
                 _cp = get_stock_price(code)
                 cap_size = _cp.get("cap_size", "unknown")
-            except: pass
+            except Exception: pass
             retail_ev = eval_retail_signal(code, f_net, i_net, r_net, cap_size)
             if retail_ev:
                 adj = retail_ev.get("score_adj", 0)
@@ -7754,7 +7760,7 @@ def detect_force_pattern(code: str, name: str,
             total_adj -= 12
             risk_flag = True
 
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -7785,7 +7791,7 @@ def detect_force_pattern(code: str, name: str,
                                        f"다음날 갭상승 가능성 (확증 아님)"),
                     })
                     total_adj += adj
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -7817,7 +7823,7 @@ def detect_force_pattern(code: str, name: str,
                     })
                     total_adj += 8
 
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -7869,7 +7875,7 @@ def detect_force_pattern(code: str, name: str,
                         })
                         total_adj -= 8
                         risk_flag  = True
-    except:
+    except Exception:
         pass
 
     # ─────────────────────────────────────────────
@@ -8001,9 +8007,8 @@ def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
         텔레그램 표시용 문자열 ("" = 이력 없음)
     """
     try:
-        with open(SIGNAL_LOG_FILE, "r") as f:
-            data = json.load(f)
-    except:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+    except Exception:
         return ""
 
     if not data or not stock_list:
@@ -8181,7 +8186,7 @@ def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
             except Exception:
                 return []
 
-    except:
+    except Exception:
         return []
 def _fetch_gdelt_headlines(max_items: int = 25) -> list:
     """(옵션) GDELT DOC API에서 지정학/공급망 관련 헤드라인+요약 수집"""
@@ -8652,7 +8657,7 @@ def eval_retail_signal(code: str,
             elif chg_5d >= -3.0:  stock_trend = "sideways"   # 횡보/소폭 조정
             elif chg_5d >= -7.0:  stock_trend = "pullback"   # 의미 있는 조정
             else:                 stock_trend = "downtrend"   # 하락 추세
-    except:
+    except Exception:
         pass
 
     # ─── 맥락 조합 판단 ───
@@ -8769,7 +8774,7 @@ def _fetch_article_body(url: str) -> str:
             # 광고/불필요 문구 제거
             text = text.replace("© 무단전재 및 재배포 금지","").strip()
             return text[:600]
-    except:
+    except Exception:
         pass
     return ""
 
@@ -9045,7 +9050,7 @@ def analyze_news_theme(headlines: list = None) -> list:
                                      "change_rate":cr,"volume_ratio":vr,
                                      "rising":cr>=2.0,"surging":cr>=5.0,"vol_on":vr>=2.0,"not_yet":cr<2.0})
                 time.sleep(0.2)
-            except: continue
+            except Exception: continue
         if not stock_status: continue
         rising_stocks = [s for s in stock_status if s["rising"]]
         if not rising_stocks:
@@ -9106,7 +9111,7 @@ def _fetch_dart_list(today: str) -> list:
                                 params={"crtfc_key":DART_API_KEY,"bgn_de":today,"end_de":today,
                                         "pblntf_ty":ptype,"page_count":100},timeout=15)
             items += resp.json().get("list",[])
-        except: pass
+        except Exception: pass
     return items
 
 def run_dart_intraday():
@@ -9132,7 +9137,7 @@ def run_dart_intraday():
                 if any(kw in title for kw in event_kws):
                     fake_article = [{"title": title, "url": "", "time": ""}]
                     dart_deep = analyze_news_deep(fake_article, company, code)
-            except: pass
+            except Exception: pass
 
             # ── 주가 상세 조회 (실패해도 최대한 표시) ──
             cur         = {}
@@ -9148,7 +9153,7 @@ def run_dart_intraday():
                     vol_ratio   = cur.get("volume_ratio", 0)
                     today_vol   = cur.get("today_vol", 0)
                     if price: break
-                except: time.sleep(1)
+                except Exception: time.sleep(1)
 
             if not (change_rate >= 1.0) and not is_risk:
                 print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵"); continue
@@ -9156,19 +9161,19 @@ def run_dart_intraday():
             # ── 추가 지표 (각각 독립적으로 실패 허용) ──
             z = 0
             try: z = get_volume_zscore(code, today_vol) if today_vol else 0
-            except: pass
+            except Exception: pass
 
             rs = 0
             try: rs = get_relative_strength(change_rate)
-            except: pass
+            except Exception: pass
 
             ma20_dev = 0.0
             try: ma20_dev = get_ma20_deviation(code)
-            except: pass
+            except Exception: pass
 
             prev_upper = False
             try: prev_upper = was_upper_limit_yesterday(code)
-            except: pass
+            except Exception: pass
 
             # 외국인·기관·개인 수급
             inv_text = ""
@@ -9196,7 +9201,7 @@ def run_dart_intraday():
                         inv_text = "\n⚠️ 개인만 매수 / 기관+외국인 이탈 (맥락 주의)"
                 elif f_net < 0 and i_net < 0:
                     inv_text = "\n🔴 외국인+기관 동시 순매도"
-            except: pass
+            except Exception: pass
 
             # ATR 손절·목표가
             entry = price or 0
@@ -9205,7 +9210,7 @@ def run_dart_intraday():
             if price:
                 try:
                     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
-                except: pass
+                except Exception: pass
             atr_tag = " (ATR)" if atr_used else " (고정)"
 
             # 섹터 모멘텀 (실패 시 백그라운드 재시도)
@@ -9213,7 +9218,7 @@ def run_dart_intraday():
             try:
                 if price:
                     sector_info = calc_sector_momentum(code, company)
-            except: pass
+            except Exception: pass
 
             # 섹터 지속 모니터링 + 진입가 감시 등록 (공시 발생 종목)
             if price:
@@ -9293,7 +9298,7 @@ def run_dart_intraday():
             dart_hist_block = ""
             try:
                 dart_hist_block = get_dart_keyword_history(code, company, all_kw)
-            except: pass
+            except Exception: pass
 
             send_with_chart_buttons(
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
@@ -9396,7 +9401,7 @@ def _handle_callback(callback_id: str, data: str):
             json={"callback_query_id": callback_id},
             timeout=5
         )
-    except: pass
+    except Exception: pass
 
     cmd_map = {
         "cmd_status":  "/status",
@@ -9522,7 +9527,7 @@ def poll_telegram_commands():
             elif text == "/week":
                 try:
                     data = {}
-                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+                    data = _read_json_locked(SIGNAL_LOG_FILE)
                     today    = datetime.now()
                     this_mon = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
                     this_fri = today.strftime("%Y%m%d")
@@ -9555,7 +9560,7 @@ def poll_telegram_commands():
                                     pnl = (price-entry)/entry*100
                                     dot = "🟢" if pnl>=0 else "🟠"
                                     msg += f"  {dot} {v['name']} {pnl:+.1f}% (잠정)\n"
-                            except: continue
+                            except Exception: continue
                     send(msg)
                 except Exception as e:
                     send(f"⚠️ 주간 조회 오류: {e}")
@@ -9564,7 +9569,7 @@ def poll_telegram_commands():
             elif text in ("/daily", "/오늘"):
                 try:
                     data = {}
-                    with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+                    data = _read_json_locked(SIGNAL_LOG_FILE)
                     today     = datetime.now().strftime("%Y%m%d")
                     today_str = datetime.now().strftime("%m/%d")
                     sig_labels = {
@@ -9617,7 +9622,7 @@ def poll_telegram_commands():
                                     pnl = (price - entry) / entry * 100
                                     nxt_tag = " 🔵" if is_nxt_open() and is_nxt_listed(v.get("code","")) else ""
                                     rows.append((pnl, v["name"], nxt_tag))
-                            except: continue
+                            except Exception: continue
                         for pnl, name, nxt_tag in sorted(rows, key=lambda x: x[0], reverse=True):
                             dot = "🟢" if pnl >= 0 else "🟠"
                             msg += f"  {dot} {name} <b>{pnl:+.1f}%</b>{nxt_tag}\n"
@@ -9834,8 +9839,8 @@ def _handle_entry_confirm_command(raw: str):
 
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         matched = []
         for log_key, rec in data.items():
@@ -9853,7 +9858,7 @@ def _handle_entry_confirm_command(raw: str):
         # 실제 진입가 처리
         try:
             actual_price = int(price_input) if price_input else rec.get("entry_price", 0)
-        except:
+        except Exception:
             actual_price = rec.get("entry_price", 0)
 
         rec["actual_entry"]       = True
@@ -9905,8 +9910,8 @@ def _handle_skip_command(raw: str):
 
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         matched_key  = None
         matched_name = None
@@ -9966,8 +9971,8 @@ def _handle_result_command(raw: str):
         sig_data = {}
         sig_matched_key = None
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: sig_data = json.load(f)
-        except: pass
+            sig_data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         # 종목명 포함 + 추적중 상태인 것 우선 매칭
         for key, rec in sig_data.items():
@@ -9985,7 +9990,7 @@ def _handle_result_command(raw: str):
                         if abs(pnl - auto_pnl) > 5:
                             send(f"⚠️ 입력 수익률({pnl:+.1f}%)과 현재가 기준({auto_pnl:+.1f}%) 차이가 큽니다.\n"
                                  f"현재가: {cur_p:,}원  |  입력값 그대로 기록합니다.")
-                except: pass
+                except Exception: pass
                 break
 
         if sig_matched_key:
@@ -10008,7 +10013,7 @@ def _handle_result_command(raw: str):
         early_data = {}
         try:
             with open(EARLY_LOG_FILE, "r") as f: early_data = json.load(f)
-        except: pass
+        except Exception: pass
 
         early_matched = None
         for code, info in early_data.items():
@@ -10112,7 +10117,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
             "score":  risk_score,
             "reason": f"{level_emoji[level]}  {'  '.join(reasons)}"
         }
-    except:
+    except Exception:
         return {"level": "low", "score": 0, "reason": ""}
 
 # ============================================================
@@ -10139,7 +10144,7 @@ def detect_theme_rotation() -> dict:
                     if cur and cur.get("change_rate") is not None:
                         chg_list.append(cur["change_rate"])
                     time.sleep(0.1)
-                except: continue
+                except Exception: continue
             if chg_list:
                 theme_scores[theme_key] = round(sum(chg_list) / len(chg_list), 2)
 
@@ -10170,8 +10175,8 @@ def get_missed_profit_summary() -> dict:
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         missed = [v for v in data.values()
                   if v.get("actual_entry") in (False, None)
@@ -10191,7 +10196,7 @@ def get_missed_profit_summary() -> dict:
             "total_pnl": round(sum(pnls), 1),
             "best":      best_rec,
         }
-    except:
+    except Exception:
         return {"count": 0, "avg_pnl": 0.0, "total_pnl": 0.0, "best": None}
 
 def _send_stats():
@@ -10199,8 +10204,8 @@ def _send_stats():
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         # ── 이론 완료 (전체 — 봇 학습 + 신호 품질 평가용) ──
         completed      = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
@@ -10293,7 +10298,7 @@ def _send_stats():
                          f"평균 {missed['avg_pnl']:+.1f}%  합계 {missed['total_pnl']:+.1f}%\n"
                          f"{b_str}\n"
                          f"━━━━━━━━━━━━━━━\n")
-        except: pass
+        except Exception: pass
 
         # 신호 유형별
         by_type = {}
@@ -10437,7 +10442,7 @@ def on_market_close():
     today_str = datetime.now().strftime("%Y-%m-%d")
     try:
         data = {}
-        with open(SIGNAL_LOG_FILE,"r") as f: data = json.load(f)
+        data = _read_json_locked(SIGNAL_LOG_FILE)
 
         today_recs   = [v for v in data.values() if v.get("detect_date") == today]
         done_today   = [v for v in today_recs if v.get("status") != "추적중"]
@@ -10495,7 +10500,7 @@ def on_market_close():
                         nxt_tag  = " 🔵NXT" if is_nxt_open() else ""
                         tracking_results.append((pnl, f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label}{day_tag}{nxt_tag}\n"))
                     time.sleep(0.1)
-                except: continue
+                except Exception: continue
             # 수익률 높은 순 정렬
             for _, line in sorted(tracking_results, key=lambda x: x[0], reverse=True):
                 msg += line
@@ -10531,6 +10536,27 @@ def on_market_close():
     if is_last_trading_day:
         send_weekly_report()
 
+    # v38.3-D2: 에러 일일 요약
+    _send_error_daily_summary()
+
+
+def _send_error_daily_summary():
+    """v38.3-D2: 당일 에러를 카테고리별 집계해 텔레그램 발송."""
+    global _error_daily_counts, _error_daily_samples
+    try:
+        if not _error_daily_counts:
+            print("✅ 오늘 에러 0건"); return
+        total = sum(_error_daily_counts.values())
+        sorted_errs = sorted(_error_daily_counts.items(), key=lambda x: -x[1])[:10]
+        lines = [f"• <code>{fn}</code>: {cnt}회\n  └ {_error_daily_samples.get(fn,'')[:60]}"
+                 for fn, cnt in sorted_errs]
+        send(f"📊 <b>일일 에러 요약</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
+             f"━━━━━━━━━━━━━━━\n총 에러: <b>{total}건</b> / {len(_error_daily_counts)}개 함수\n"
+             f"━━━━━━━━━━━━━━━\n" + "\n".join(lines))
+        _error_daily_counts = {}; _error_daily_samples = {}
+    except Exception as e:
+        print(f"⚠️ 에러 요약 발송 실패: {e}")
+
 def send_premarket_briefing():
     """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
     if is_holiday(): return
@@ -10552,7 +10578,7 @@ def send_premarket_briefing():
             for line in overnight_lines[-5:]:  # 최근 5개만
                 msg += f"  {line}\n"
         _overnight_state["summary_lines"] = []  # 브리핑 후 초기화
-    except: pass
+    except Exception: pass
 
     # ── ⓪-A 지정학 이벤트 요약 ──
     try:
@@ -10564,7 +10590,7 @@ def send_premarket_briefing():
             msg += (f"\n🌍 <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
                     f"  {geo_sum}\n"
                     f"  관련 섹터: {', '.join(geo_sec)}\n")
-    except: pass
+    except Exception: pass
 
     # ── ⓪-B 테마 로테이션 ──
     try:
@@ -10577,7 +10603,7 @@ def send_premarket_briefing():
                 msg += f"  🟢 {k} 강세 ({v:+.1f}%)\n"
             for k, v in weak:
                 msg += f"  🔴 {k} 약세 ({v:+.1f}%)\n"
-    except: pass
+    except Exception: pass
 
     # ── ① 이월 감시 종목 ──
     if _detected_stocks:
@@ -10596,7 +10622,7 @@ def send_premarket_briefing():
                     if _tr:
                         msg += f"  {_tr}\n"
                 time.sleep(0.15)
-            except: continue
+            except Exception: continue
     else:
         msg += "\n📂 감시 중 종목 없음\n"
 
@@ -10605,8 +10631,8 @@ def send_premarket_briefing():
         upper_yest = []
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
         upper_yest = [v for v in data.values()
                       if v.get("detect_date") == yesterday
@@ -10615,7 +10641,7 @@ def send_premarket_briefing():
             msg += f"\n🔁 <b>전일 상한가 → 오늘 연속 주목</b>\n"
             for v in upper_yest[:4]:
                 msg += f"  🚨 {v['name']}  ({v['code']})\n"
-    except: pass
+    except Exception: pass
 
     # ── ③ 오늘 DART 예정 공시 (최근 등록 기준) ──
     try:
@@ -10629,7 +10655,7 @@ def send_premarket_briefing():
                 msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
                 for h in hot[:4]:
                     msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
-    except: pass
+    except Exception: pass
 
     # v37.0: 현재 시장 국면에서의 과거 신호 승률
     try:
@@ -10638,7 +10664,7 @@ def send_premarket_briefing():
         if _r_hist:
             regime_kor = {"crisis":"위기","risk_off":"위험회피","normal":"보통","bull":"강세","euphoria":"과열"}
             msg += f"\n📊 <b>시장 국면</b>: {regime_kor.get(_cur_regime, _cur_regime)}\n  {_r_hist}\n"
-    except: pass
+    except Exception: pass
 
     # ── ④ 현재 파라미터 상태 ──
     tuned = any([
@@ -10675,12 +10701,12 @@ def send_premarket_briefing():
                     if fn > 1000:
                         nxt_foreign_buys.append((s["name"], fn, s.get("change_rate",0)))
                     time.sleep(0.1)
-                except: continue
+                except Exception: continue
             if nxt_foreign_buys:
                 msg += f"\n  💡 외인 선취매 주목:\n"
                 for nm, fn, cr in sorted(nxt_foreign_buys, key=lambda x: -x[1])[:3]:
                     msg += f"    🔵 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
-    except: pass
+    except Exception: pass
 
     # ── 시장 국면 브리핑 ──
     try:
@@ -10697,7 +10723,7 @@ def send_premarket_briefing():
         msg += (f"\n━━━━━━━━━━━━━━━\n"
                 f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
                 f"{regime_warn}\n")
-    except: pass
+    except Exception: pass
 
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
     send(msg)
@@ -10713,8 +10739,8 @@ def send_weekly_report():
     try:
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: return
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: return
 
         today    = datetime.now()
         # 이번 주 월요일 ~ 오늘(금요일)
@@ -10773,7 +10799,7 @@ def send_weekly_report():
         weekly_compare = ""
         try:
             weekly_compare = get_weekly_comparison(week_recs)
-        except: pass
+        except Exception: pass
 
         send(
             f"📅 <b>주간 자동 리포트</b>\n"
@@ -10951,7 +10977,7 @@ def get_market_regime() -> dict:
             _regime_cache["us_summary"]  = us.get("summary", "")
             _regime_cache["gap_signal"]  = us.get("gap_signal", "flat")
             _regime_cache["korea_etf_summary"] = get_korea_etf_signals().get("summary", "")
-        except: pass
+        except Exception: pass
 
         _dynamic["regime_mode"]       = mode
         _dynamic["regime_score_mult"] = mult_map[mode]
@@ -11097,7 +11123,7 @@ def get_short_sell_ratio(code: str) -> float:
         ratio = float(data.get("output", {}).get("ssts_rsqn_rate", 0) or 0)
         _short_cache[code] = {"ratio": ratio, "ts": time.time()}
         return ratio
-    except:
+    except Exception:
         return 0.0
 
 def _get_daily_investor_data(code: str) -> list:
@@ -11126,7 +11152,7 @@ def _get_daily_investor_data(code: str) -> list:
             "institution_net": int(i.get("orgn_ntby_qty",  0) or 0),
         } for i in items if i.get("stck_bsop_date")], key=lambda x: x["date"])
         return result[-20:]
-    except:
+    except Exception:
         return []
 
 def get_foreign_consecutive_days(code: str) -> int:
@@ -11161,7 +11187,7 @@ def get_foreign_consecutive_days(code: str) -> int:
             inst_days += 1
         _foreign_cache[code]["inst_days"] = inst_days * (inst_sign or 1)
         return result
-    except:
+    except Exception:
         return 0
 
 def get_institution_consecutive_days(code: str) -> int:
@@ -11485,7 +11511,7 @@ def get_us_market_signals() -> dict:
                 elif key == "dxy":
                     values["dxy"] = round(cur_price, 2)
                 time.sleep(0.3)
-            except: pass
+            except Exception: pass
 
         nasdaq_chg = values.get("nasdaq_chg", 0.0)
         vix        = values.get("vix", 20.0)
@@ -11551,8 +11577,8 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
         # 과거 신호 유형별 승률 조회
         data = {}
         try:
-            with open(SIGNAL_LOG_FILE, "r") as f: data = json.load(f)
-        except: pass
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
 
         same_type = [v for v in data.values()
                      if v.get("signal_type") == signal_type
@@ -11599,7 +11625,7 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
             "win_rate": round(p * 100, 1) if len(same_type) >= 5 else None,
             "samples":  len(same_type),
         }
-    except:
+    except Exception:
         return {"pct": 8.0, "kelly": 8.0, "guide": "📊 표준 비중", "win_rate": None, "samples": 0}
 
 # ============================================================
@@ -11697,12 +11723,12 @@ def check_earnings_risk(code: str, name: str) -> dict:
                         result = {"risk": "warn",
                                   "desc": f"📅 실적발표 {diff}일 전 ({rcept_dt}) — 관망 고려"}
                     break
-                except: pass
+                except Exception: pass
 
         _earnings_cache[code] = {"result": result, "ts": time.time()}
         return result
 
-    except:
+    except Exception:
         return {"risk": "none", "desc": ""}
 
 # ============================================================
@@ -11751,7 +11777,7 @@ def filter_portfolio_signals(alerts: list) -> list:
                     if same_sector_passed >= _max_same:
                         excluded.add(peer["code"])
                         print(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
-            except:
+            except Exception:
                 pass
 
     if len(passed) < len(sorted_alerts):
@@ -11844,7 +11870,7 @@ def run_scan():
                         args=(s["code"], s["name"], s["signal_type"]),
                         daemon=True
                     ).start()
-                except: pass
+                except Exception: pass
                 if s["signal_type"] != "ENTRY_POINT":
                     if s["code"] not in _detected_stocks:
                         _detected_stocks[s["code"]] = {"name":s["name"],"high_price":s["price"],
@@ -11863,6 +11889,14 @@ def run_scan():
 # ============================================================
 # 🚀 실행
 # ============================================================
+def _get_code_hash() -> str:
+    """v38.3-D3: 현재 실행 코드의 SHA256 해시 (8자리)"""
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:8]
+    except Exception:
+        return "unknown"
+
 def _shutdown(reason: str = "정상 종료"):
     """
     봇 자동 종료 — Railway Cron 환경에서 사용.
@@ -11877,7 +11911,7 @@ def _shutdown(reason: str = "정상 종료"):
     try:
         send(f"🔴 <b>봇 자동 종료</b>  {reason}\n"
              f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    except: pass
+    except Exception: pass
     import os, sys
     sys.exit(0)
 
@@ -11911,7 +11945,7 @@ if __name__ == "__main__":
                 f"/list — 감시 종목 목록\n"
                 f"/overnight — 오버나이트 위험도"
             )
-        except: pass
+        except Exception: pass
 
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
@@ -11933,11 +11967,13 @@ if __name__ == "__main__":
     refresh_dynamic_candidates()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
 
+    _CODE_HASH = _get_code_hash()
     send(
         f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
-        f"📅 {BOT_DATE}\n\n"
+        f"📅 {BOT_DATE}  🔑 <code>{_CODE_HASH}</code>\n\n"
         "✅ 한국투자증권 API 연결\n"
-        "🔵 NXT(넥스트레이드) 연동 활성\n\n"
+        "🔵 NXT(넥스트레이드) 연동 활성\n"
+        "🔒 스레드 안전성 활성 (v38.3)\n\n"
         "<b>📡 스캔 주기</b>\n"
         "• 급등/상한가 스캔: <b>20초</b>\n"
         "• 중기 눌림목: <b>90초</b>\n"
