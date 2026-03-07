@@ -3,11 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v37.39-briefing-riskopt1
+버전: v37.40-briefing-riskopt2
 날짜: 2026-03-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v37.40-briefing-riskopt2 (2026-03-07): 08:50 장직전 압축 브리핑을 기본 비활성화. 07:30 장 시작 전 진입/리스크 브리핑으로 장전 메시지를 단일화해 중복 알림을 줄이고, 필요 시 설정값으로만 재활성화 가능하도록 정리.
 
 - v37.39-briefing-riskopt1 (2026-03-07): 사용자 저장 수정사항 1~5 반영. (1) 07:30 메시지를 '장 시작 전 진입/리스크 브리핑'으로 개편하고 섹터 아래 후보 종목을 통합 표기. (2) 장 마감 전 리스크 안내를 entry_hit 종목 중심으로 정규장/NXT 타이틀 분리. (3) 야간/장전 리스크 판단에 DART·지정학·해외 한국 ETF(EWY/FLKR) 요약을 추가. (4) '중기 눌림목' 사용자 라벨을 '눌림목' 계열로 정리. (5) 반복되던 신호 라벨 문자열을 공용 helper로 통합해 중복/충돌 위험을 줄임.
 
@@ -232,6 +234,9 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
     t = now.time()
     return (t >= dtime(20, 0)) or (t < dtime(7, 55))
 from bs4 import BeautifulSoup
+
+# 장전 메시지 중복 방지: 08:50 압축 브리핑은 기본 비활성화
+ENABLE_PREMARKET_BRIEFING_0850 = False
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
 
@@ -10587,7 +10592,9 @@ def on_market_close():
         send_weekly_report()
 
 def send_premarket_briefing():
-    """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
+    """매일 08:50 장 시작 전 브리핑 — 기본 비활성화(필요 시 설정으로만 사용)"""
+    if not ENABLE_PREMARKET_BRIEFING_0850:
+        return
     if is_holiday(): return
     today = datetime.now().strftime("%Y-%m-%d (%a)")
     msg   = f"🌅 <b>장 시작 전 브리핑</b>  {today}\n━━━━━━━━━━━━━━━\n"
@@ -11995,7 +12002,7 @@ if __name__ == "__main__":
         "🔵 NXT(넥스트레이드) 연동 활성\n\n"
         "<b>📡 스캔 주기</b>\n"
         "• 급등/상한가 스캔: <b>20초</b>\n"
-        "• 중기 눌림목: <b>90초</b>\n"
+        "• 눌림목: <b>90초</b>\n"
         f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
         "• DART 공시: <b>60초</b>\n"
         "• 텔레그램 명령어: <b>10초</b>\n"
@@ -12012,8 +12019,9 @@ if __name__ == "__main__":
     schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("08:50").do(send_premarket_briefing)
+    schedule.every().day.at("07:30").do(send_preopen_watchlist)  # 장 시작 전 진입/리스크 브리핑
+    if ENABLE_PREMARKET_BRIEFING_0850:
+        schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
