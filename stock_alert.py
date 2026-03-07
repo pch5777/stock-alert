@@ -3,24 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v38.3-unified1
+버전: v38.4-hotfix1
 날짜: 2026-03-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v38.3-unified1 (2026-03-07): v38.2 유효변경 통합 + P0/P1 전체 수정.
-  [P0-1] SIG_LABELS/SIG_TITLES 복원 → get_signal_label() NameError 해소.
-  [P0-2] MARKET_REGIME 중복 선언 제거 (79줄 삭제, 152줄만 유지).
-  [P0-3] MARKET_REGIME "detail"/"details" 호환 처리 확인 (섹터 dict의 "detail" 키는 정상).
-  [P0-4] bare except 144개 → 0개. except Exception 패턴 전환.
-  [P0-5] threading.Lock 3개 도입 (_file_lock/_state_lock/_cache_lock).
-  [P1-6] signal_log 직접읽기 27곳 → _read_json_locked() 전환.
-  [P1-7] SIGNAL_LOG_MAX_RECORDS 50000→5000 + 90일 아카이브.
-  [P1-8] _safe_get/_safe_get_meta 통합 (중복 90줄 제거).
-  [D2] 에러 일일 요약 (장 마감 시 텔레그램 자동 발송).
-  [D3] 코드 SHA256 해시 검증 (시작 시 발송).
-  [유효] v38.2의 _should_send_partial_exit_guide, ALLOW_VIRTUAL_EXIT_GUIDE='0', changelog 슬림화 유지.
-- v37.40-briefing-riskopt2 (2026-03-07): 안정 기준 베이스.
+- v38.4-hotfix1 (2026-03-07): 운영 오류 2건 긴급 수정.
+  [Fix-1] analyze_geopolitical_event: Claude API 빈 응답 시 JSONDecodeError → safe_json_response + 빈 응답 fallback 처리. 30분마다 반복 에러 제거.
+  [Fix-2] 공휴일/주말 대기 모드에서 오버나이트·지정학 알림 사용자 발송 차단. 내부 데이터 수집은 유지 (기본수칙 #16: 사용자알림 보수적, 내부기록 적극적).
+  이유: Railway 로그에서 JSONDecodeError 10회/시간 반복 + 주말에 불필요한 알림 발송 확인.
+  주의: 대기 모드 스케줄(geo_scan/overnight)은 계속 실행되나, send() 호출만 차단됨.
+  영향: 주말 텔레그램 메시지 0건, API 에러 로그 대폭 감소.
+- v38.3-unified1 (2026-03-07): P0/P1 전체 수정 + v38.2 유효변경 통합. 안정 기준 베이스.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
@@ -4164,13 +4158,16 @@ def run_overnight_monitor():
         except Exception: pass
 
         # ── 알림 발송 ──
-        if alerts:
+        # v38.4: 공휴일/주말에는 내부 요약만 누적, 사용자 알림 차단 (기본수칙 #16)
+        if alerts and not is_holiday():
             gap_emoji = {"gap_up": "⬆️ 갭상승", "flat": "➡️ 갭 없음", "gap_down": "⬇️ 갭하락"}
             msg = (f"🌙 <b>오버나이트 알림</b>  {ts_str}\n"
                    f"━━━━━━━━━━━━━━━\n"
                    + "\n".join(alerts) +
                    f"\n\n내일 갭 예측: {gap_emoji.get(gap_signal, '➡️')}")
             send(msg)
+        elif alerts:
+            print(f"  🌙 오버나이트(대기모드): {len(alerts)}건 — 내부 저장만")
 
     except Exception as e:
         _log_error("run_overnight_monitor", e)
@@ -8482,9 +8479,21 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             },
             timeout=15
         )
-        raw  = extract_ai_text(resp.json())
+        # v38.4: 안전 파싱 (빈 응답/HTML 응답 대비)
+        resp_json = safe_json_response(resp)
+        if not resp_json:
+            _log_error("analyze_geopolitical_event", Exception("API 빈 응답"))
+            sectors = _map_geo_sectors(detected_kws)
+            sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+            return {"detected": True, "uncertainty": "mid", "sectors": sectors,
+                    "sector_directions": sec_dirs_fb,
+                    "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
+                    "entities": [], "ts": time.time()}
+        raw  = extract_ai_text(resp_json)
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
+        if not raw:
+            raise ValueError("Claude API 응답 텍스트 비어있음")
         data = json.loads(raw)
 
         # sector_directions → sectors 리스트도 같이 추출
@@ -8560,6 +8569,10 @@ def run_geo_news_scan():
         })
 
         # 텔레그램 알림 (1시간 쿨다운)
+        # v38.4: 공휴일/주말에는 내부 데이터만 저장, 사용자 알림 차단 (기본수칙 #16)
+        if is_holiday():
+            print(f"  🌍 지정학 감지(대기모드): {geo.get('uncertainty','')} — 내부 저장만")
+            return
         last_sent = _geo_event_state.get("last_sent_ts", 0)
         if time.time() - last_sent < 3600:
             return
