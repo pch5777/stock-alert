@@ -3,19 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v39.3-briefing-merge
+버전: v39.2-bar-remove
 날짜: 2026-03-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v39.3-briefing-merge (2026-03-08): 8:50 장전 브리핑 제거, 핵심 섹션 7:30으로 통합.
-  [A] send_premarket_briefing 함수 삭제: 8:50 스케줄 포함 완전 제거.
-  [B] 테마 로테이션·감시 중 종목 현재가 섹션을 send_preopen_watchlist(7:30)에 통합.
-      기존 진입가 도달 리스크 점검 다음에 추가, send_by_level 직전 실행.
-  이유: 7:30 브리핑이 실질적인 장전 준비 브리핑으로 자리잡혀 있어 8:50은 중복 알림.
-  개선: 알림 수 감소, 정보 손실 없이 핵심 2섹션(테마 로테이션·감시 중 종목) 유지.
-  주의: 8:50 전용이었던 미국 시장 요약·DART·NXT 장전 동향은 제거됨.
-        NXT 장전 동향은 실시간 신호로 대체 가능.
 - v39.2-bar-remove (2026-03-08): 기능별 가중치 시각화 바 제거.
   [A] 기능별 가중치 "█/░" 바 제거: 텔레그램에서 흰 블록으로 렌더링되던 문제 해결.
       수치(w값)와 상태 텍스트(정상/강화/약화)만 표기로 변경.
@@ -2191,42 +2183,6 @@ def send_preopen_watchlist():
             if risk_lines:
                 risk_lines.sort(key=lambda x: x[0], reverse=True)
                 msg += "\n\n⚠️ 진입가 도달 종목 리스크 점검\n" + "\n".join(line for _, line in risk_lines[:5])
-        except Exception:
-            pass
-
-        # ── 테마 로테이션 ──
-        try:
-            rotation = detect_theme_rotation()
-            strong = rotation.get("strong", [])
-            weak   = rotation.get("weak", [])
-            if strong or weak:
-                msg += "\n\n🔄 테마 로테이션\n"
-                for k, v in strong:
-                    msg += f"  🟢 {k} 강세 ({v:+.1f}%)\n"
-                for k, v in weak:
-                    msg += f"  🔴 {k} 약세 ({v:+.1f}%)\n"
-        except Exception:
-            pass
-
-        # ── 감시 중 종목 현재가 ──
-        try:
-            if _detected_stocks:
-                msg += f"\n\n📂 감시 중 종목  ({len(_detected_stocks)}개)\n"
-                for code, info in list(_detected_stocks.items())[:6]:
-                    try:
-                        cur   = get_stock_price(code)
-                        price = cur.get("price", 0)
-                        entry = info.get("entry_price", 0)
-                        if price and entry:
-                            pnl = round((price - entry) / entry * 100, 1)
-                            dot = "🟢" if pnl >= 0 else "🔴"
-                            msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
-                            _tr = get_stock_track_record(code, info.get("name", ""))
-                            if _tr:
-                                msg += f"  {_tr}\n"
-                        time.sleep(0.15)
-                    except Exception:
-                        continue
         except Exception:
             pass
 
@@ -10844,6 +10800,178 @@ def _send_error_daily_summary():
     except Exception as e:
         print(f"⚠️ 에러 요약 발송 실패: {e}")
 
+def send_premarket_briefing():
+    """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
+    if is_holiday(): return
+    today = datetime.now().strftime("%Y-%m-%d (%a)")
+    msg   = f"🌅 <b>장 시작 전 브리핑</b>  {today}\n━━━━━━━━━━━━━━━\n"
+
+    # ── ⓪ 미국 시장 요약 + 갭 예측 + 오버나이트 요약 ──
+    try:
+        us = get_us_market_signals()
+        if us.get("summary"):
+            gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
+            msg += (f"\n🌐 <b>미국 시장</b>\n"
+                    f"  {us['summary']}\n"
+                    f"  {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n")
+        # 오버나이트 중 발생한 이벤트 요약
+        overnight_lines = _overnight_state.get("summary_lines", [])
+        if overnight_lines:
+            msg += f"\n🌙 <b>오버나이트 이벤트</b>\n"
+            for line in overnight_lines[-5:]:  # 최근 5개만
+                msg += f"  {line}\n"
+        _overnight_state["summary_lines"] = []  # 브리핑 후 초기화
+    except Exception: pass
+
+    # ── ⓪-A 지정학 이벤트 요약 ──
+    try:
+        if _geo_event_state.get("active") and time.time() - _geo_event_state.get("ts",0) < 14400:
+            geo_sum = _geo_event_state.get("summary","")
+            geo_sec = _geo_event_state.get("sectors",[])
+            geo_unc = _geo_event_state.get("uncertainty","low")
+            unc_emoji = {"high":"🔴","mid":"🟠","low":"🟢"}.get(geo_unc,"🟠")
+            msg += (f"\n🌍 <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
+                    f"  {geo_sum}\n"
+                    f"  관련 섹터: {', '.join(geo_sec)}\n")
+    except Exception: pass
+
+    # ── ⓪-B 테마 로테이션 ──
+    try:
+        rotation = detect_theme_rotation()
+        strong = rotation.get("strong", [])
+        weak   = rotation.get("weak", [])
+        if strong or weak:
+            msg += "\n🔄 <b>테마 로테이션</b>\n"
+            for k, v in strong:
+                msg += f"  🟢 {k} 강세 ({v:+.1f}%)\n"
+            for k, v in weak:
+                msg += f"  🔴 {k} 약세 ({v:+.1f}%)\n"
+    except Exception: pass
+
+    # ── ① 이월 감시 종목 ──
+    if _detected_stocks:
+        msg += f"\n📂 <b>감시 중 종목</b>  ({len(_detected_stocks)}개)\n"
+        for code, info in list(_detected_stocks.items())[:6]:
+            try:
+                cur   = get_stock_price(code)
+                price = cur.get("price", 0)
+                entry = info.get("entry_price", 0)
+                if price and entry:
+                    pnl = round((price - entry) / entry * 100, 1)
+                    dot = "🟢" if pnl >= 0 else "🔴"
+                    msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
+                    # v37.0: 동일 종목 과거 전적
+                    _tr = get_stock_track_record(code, info.get("name",""))
+                    if _tr:
+                        msg += f"  {_tr}\n"
+                time.sleep(0.15)
+            except Exception: continue
+    else:
+        msg += "\n📂 감시 중 종목 없음\n"
+
+    # ── ② 어제 상한가 종목 ──
+    try:
+        upper_yest = []
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        upper_yest = [v for v in data.values()
+                      if v.get("detect_date") == yesterday
+                      and v.get("signal_type") == "UPPER_LIMIT"]
+        if upper_yest:
+            msg += f"\n🔁 <b>전일 상한가 → 오늘 연속 주목</b>\n"
+            for v in upper_yest[:4]:
+                msg += f"  🚨 {v['name']}  ({v['code']})\n"
+    except Exception: pass
+
+    # ── ③ 오늘 DART 예정 공시 (최근 등록 기준) ──
+    try:
+        if DART_API_KEY:
+            today_str = datetime.now().strftime("%Y%m%d")
+            dart_list = _fetch_dart_list(today_str)
+            hot = [i for i in dart_list[:10]
+                   if any(kw in i.get("report_nm","")
+                          for kw in ["유상증자","무상증자","합병","분할","실적","배당","자사주"])]
+            if hot:
+                msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
+                for h in hot[:4]:
+                    msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
+    except Exception: pass
+
+    # v37.0: 현재 시장 국면에서의 과거 신호 승률
+    try:
+        _cur_regime = get_market_regime()
+        _r_hist = get_regime_history(_cur_regime)
+        if _r_hist:
+            regime_kor = {"crisis":"위기","risk_off":"위험회피","normal":"보통","bull":"강세","euphoria":"과열"}
+            msg += f"\n📊 <b>시장 국면</b>: {regime_kor.get(_cur_regime, _cur_regime)}\n  {_r_hist}\n"
+    except Exception: pass
+
+    # ── ④ 현재 파라미터 상태 ──
+    tuned = any([
+        _dynamic["early_price_min"]  != EARLY_PRICE_MIN,
+        _dynamic["mid_surge_min_pct"] != MID_SURGE_MIN_PCT,
+        _dynamic["min_score_normal"] != 60,
+    ])
+    if tuned:
+        msg += (f"\n⚙️ <b>자동 조정된 파라미터</b>\n"
+                f"  조기포착 기준: {_dynamic['early_price_min']:.0f}%  "
+                f"눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
+                f"  최소점수: {_dynamic['min_score_normal']}점\n")
+
+    # ── ⑤ NXT 장전 동향 (08:00~09:00 사이에만) ──
+    try:
+        nxt_stocks = get_nxt_surge_stocks()
+        if nxt_stocks:
+            # 변동률 상위 5개
+            hot_nxt = sorted(nxt_stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:5]
+            msg += f"\n🔵 <b>NXT 장전 동향</b>  (KRX 개장 전)\n"
+            for s in hot_nxt:
+                cr  = s.get("change_rate", 0)
+                vr  = s.get("volume_ratio", 0)
+                dot = "📈" if cr > 0 else "📉"
+                vt  = f" 🔊{vr:.0f}x" if vr >= 3 else ""
+                msg += f"  {dot} {s['name']} <b>{cr:+.1f}%</b>{vt}\n"
+
+            # 외인 순매수 상위 종목 (NXT 선취매 신호)
+            nxt_foreign_buys = []
+            for s in nxt_stocks[:8]:
+                try:
+                    inv = get_nxt_investor_trend(s["code"])
+                    fn  = inv.get("foreign_net", 0)
+                    if fn > 1000:
+                        nxt_foreign_buys.append((s["name"], fn, s.get("change_rate",0)))
+                    time.sleep(0.1)
+                except Exception: continue
+            if nxt_foreign_buys:
+                msg += f"\n  💡 외인 선취매 주목:\n"
+                for nm, fn, cr in sorted(nxt_foreign_buys, key=lambda x: -x[1])[:3]:
+                    msg += f"    🔵 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
+    except Exception: pass
+
+    # ── 시장 국면 브리핑 ──
+    try:
+        regime = get_market_regime()
+        rmode  = regime.get("mode", "normal")
+        rlabels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+        regime_warn = ""
+        if rmode == "crash":
+            regime_warn = "\n⚠️ <b>급락장 모드</b> — 상한가 신호만 발송됩니다"
+        elif rmode == "bear":
+            regime_warn = "\n🟠 <b>하락장 모드</b> — 신호 기준 강화, 포지션 축소 권장"
+        elif rmode == "bull":
+            regime_warn = "\n🟢 <b>상승장 모드</b> — 신호 기준 완화, 적극 대응 가능"
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
+                f"{regime_warn}\n")
+    except Exception: pass
+
+    msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+    send(msg)
+
+
 def send_weekly_report():
     """매주 금요일 15:35 — 이번 주 성과 자동 발송 + AI 분석"""
     # 같은 주에 이미 발송했으면 스킵 (on_market_close와 스케줄 중복 방지)
@@ -12152,6 +12280,7 @@ if __name__ == "__main__":
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
