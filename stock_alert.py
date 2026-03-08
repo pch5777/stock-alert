@@ -3,20 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v38.5-global-signals1
+버전: v39.0-moneyflow1
 날짜: 2026-03-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v38.5-global-signals1 (2026-03-08): 오류 수정 + 해외 지표 확대.
-  [Fix-1] analyze_geopolitical_event: Claude API 빈 응답 시 ValueError → 조용한 키워드 fallback. 에러 로그 완전 제거.
-  [Fix-2] 매일경제 RSS 사망 → Google News site:mk.co.kr fallback으로 교체. 지정학 RSS에서도 매일경제 직접 URL 제거.
-  [New-1] 해외 선물·지표 4종 추가: S&P500선물(ES=F), 금선물(GC=F), WTI유가(CL=F), 미국10년국채(^TNX).
-  [New-2] 원자재·금리 기반 score_adj 보정: 금 급등→risk-off 강화, 유가 급등→인플레 감점, 고금리→부담 감점.
-  [New-3] 오버나이트/장전 브리핑 summary에 추가 지표 표시.
-  이유: Railway 로그에서 30분마다 ValueError 반복 + 매일경제 RSS 지속 사망 + 해외 선물 미활용으로 국면 판단 정보 부족.
-  영향: 에러 로그 대폭 감소, 국면 판단 정확도 향상, 07:30 장전 브리핑 정보량 증가.
-- v38.4-hotfix1 (2026-03-07): 공휴일 오버나이트/지정학 알림 차단. 안정 기준 베이스.
+- v39.0-moneyflow1 (2026-03-08): 자금흐름 기반 포착 체계 확인·보강.
+  [A] RSI 차단→감점: v38.2에서 구현 확인. filter_pass 게이트 이미 제거됨.
+  [B] 섹터 거래대금: v38.2에서 구현 확인. Sector Score = 등락률+거래량+거래대금.
+  [C] 대장주 Leader Score: v38.2에서 구현 확인. 섹터 내 종목별 순위 점수화.
+  [D] 실패 패턴 필터: v38.2에서 구현 확인. 급등 후 거래량 부족 감지.
+  [J] 🆕 해외선물→섹터 연동: COMMODITY_SECTOR_MAP 신규. 유가→에너지/석유화학/항공, 금→방산, 국채→금융/건설 섹터별 점수 자동 보정.
+  [K] 오버나이트 지표 표시: v38.2에서 구현 확인. 금/유가/국채/S&P 표시.
+  이유: 설계 원칙 대조 분석 → A~D/K는 이미 구현, J만 누락 확인.
+  영향: 해외 원자재 급변 시 관련 섹터 신호 점수 ±3~5점 자동 보정.
+- v38.5-global-signals1 (2026-03-08): 오류수정 + 해외지표 확대. 안정 기준 베이스.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
@@ -1043,27 +1044,25 @@ def calc_indicators(code: str) -> dict:
         w_ma  = _dynamic.get("feat_w_ma",  1.0)
         w_bb  = _dynamic.get("feat_w_bb",  1.0)
 
-        # ── RSI 필터 ──
+        # ── RSI 필터 → v38.6: 차단 제거, 감점만 (자금유입 종목을 RSI로 놓치지 않음) ──
         rsi_overbuy  = float(_dynamic.get("rsi_overbuy",  70))
         rsi_oversell = float(_dynamic.get("rsi_oversell", 30))
         if w_rsi > 0:
             if rsi >= rsi_overbuy:
                 score_adj   -= int(15 * w_rsi)
-                filter_pass  = w_rsi < 0.5   # 가중치 낮으면 차단 안 함
-                reasons.append(f"⛔ RSI {rsi} 과매수 (w={w_rsi})")
+                reasons.append(f"⚠️ RSI {rsi:.0f} 과매수 -{int(15*w_rsi)}점 (감점만, 차단X)")
             elif rsi <= rsi_oversell:
                 score_adj += int(10 * w_rsi)
-                reasons.append(f"🎯 RSI {rsi} 과매도 +{int(10*w_rsi)}점")
+                reasons.append(f"🎯 RSI {rsi:.0f} 과매도 +{int(10*w_rsi)}점")
             elif rsi >= 60:
                 score_adj += int(5 * w_rsi)
-                reasons.append(f"📊 RSI {rsi} 강세 +{int(5*w_rsi)}점")
+                reasons.append(f"📊 RSI {rsi:.0f} 강세 +{int(5*w_rsi)}점")
 
-        # ── 이동평균 필터 ──
+        # ── 이동평균 필터 → v38.6: 차단 제거, 감점만 ──
         if w_ma > 0:
             if ma.get("aligned") is False and not ma.get("partial"):
                 score_adj -= int(10 * w_ma)
-                if w_ma >= 0.8: filter_pass = False
-                reasons.append(f"⛔ {ma.get('desc','역배열')} (w={w_ma})")
+                reasons.append(f"⚠️ {ma.get('desc','역배열')} -{int(10*w_ma)}점 (감점만)")
             elif ma.get("aligned"):
                 score_adj += int(10 * w_ma)
                 reasons.append(f"✅ {ma.get('desc','정배열')} +{int(10*w_ma)}점")
@@ -3545,6 +3544,75 @@ def get_theme_sector_stocks(code: str) -> tuple:
     peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
     return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
 
+
+# ════════════════════════════════════════════════════════════
+# 🌍 J: 해외 선물→섹터 연동 (v39.0)
+# ════════════════════════════════════════════════════════════
+# 원자재/금리 변동이 직접 영향을 주는 한국 섹터 매핑
+COMMODITY_SECTOR_MAP = {
+    # (지표키, 임계값, 방향) → [(섹터명, 보정점수)]
+    # 유가 급등 → 에너지/석유화학 호재, 항공/해운 악재
+    "oil_up":    {"threshold": 3.0, "sectors": {"석유화학": +5, "에너지": +5, "정유": +5,
+                                                 "항공": -4, "해운": -3, "운수": -3}},
+    "oil_down":  {"threshold": -3.0, "sectors": {"석유화학": -4, "에너지": -4,
+                                                   "항공": +3, "해운": +2}},
+    # 금 급등 → 안전자산 선호 = 방산/귀금속 호재, 성장주 약세
+    "gold_up":   {"threshold": 1.5, "sectors": {"방산": +4, "금": +3, "귀금속": +3}},
+    "gold_down": {"threshold": -1.5, "sectors": {"방산": -2}},
+    # 국채 수익률 상승 → 금융 호재, 건설/성장주 악재
+    "tnx_high":  {"threshold": 4.5, "sectors": {"은행": +3, "보험": +3, "금융": +3,
+                                                  "건설": -3, "바이오": -3}},
+    "tnx_low":   {"threshold": 3.5, "sectors": {"건설": +2, "바이오": +2,
+                                                  "은행": -2}},
+}
+
+def _get_commodity_sector_adj(theme_name: str) -> int:
+    """v39.0-J: 해외 선물 데이터 기반 섹터별 점수 보정."""
+    if not theme_name:
+        return 0
+    try:
+        us = _us_cache  # get_us_market_signals()의 캐시
+        if not us or time.time() - us.get("ts", 0) > 7200:
+            return 0
+        oil_chg  = float(us.get("oil_chg", 0) or 0)
+        gold_chg = float(us.get("gold_chg", 0) or 0)
+        tnx      = float(us.get("tnx", 0) or 0)
+
+        adj = 0
+        theme_lower = theme_name.lower()
+
+        # 유가
+        if oil_chg >= COMMODITY_SECTOR_MAP["oil_up"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["oil_up"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        elif oil_chg <= COMMODITY_SECTOR_MAP["oil_down"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["oil_down"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        # 금
+        if gold_chg >= COMMODITY_SECTOR_MAP["gold_up"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["gold_up"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        elif gold_chg <= COMMODITY_SECTOR_MAP["gold_down"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["gold_down"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        # 국채
+        if tnx >= COMMODITY_SECTOR_MAP["tnx_high"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["tnx_high"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        elif tnx > 0 and tnx <= COMMODITY_SECTOR_MAP["tnx_low"]["threshold"]:
+            for sec, val in COMMODITY_SECTOR_MAP["tnx_low"]["sectors"].items():
+                if sec in theme_name or sec in theme_lower:
+                    adj += val; break
+        return adj
+    except Exception:
+        return 0
+
+
 def calc_sector_momentum(code: str, name: str) -> dict:
     theme_name, peers, peers_all = get_theme_sector_stocks(code)
     # [v37.10-all5] 지정학/뉴스 섹터 바이어스(점수 보정)
@@ -3554,33 +3622,79 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     except Exception:
         geo_bias = 0
     if not peers:
-        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
+        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{},"leader":None}
     results = []
+    total_trade_amount = 0  # v38.6-B: 섹터 전체 거래대금
     for peer_code, peer_name in peers[:8]:
         try:
             cur = get_stock_price(peer_code)
             if not cur: continue
             safe_peer_name = _resolve_stock_name(peer_code, peer_name, cur)
             cr, vr = cur.get("change_rate",0), cur.get("volume_ratio",0)
+            price = cur.get("price", 0)
+            today_vol = cur.get("today_vol", 0)
+            trade_amt = price * today_vol if price and today_vol else 0  # 거래대금 추정
+            total_trade_amount += trade_amt
             src, rsn = peers_all.get(peer_code, (safe_peer_name, "업종코드", ""))[1:]
-            results.append({"code":peer_code,"name":safe_peer_name,"price":cur.get("price",0),"change_rate":cr,"volume_ratio":vr,
+            results.append({"code":peer_code,"name":safe_peer_name,"price":price,
+                             "change_rate":cr,"volume_ratio":vr,"trade_amount":trade_amt,
                              "strong":cr>=2.0 and vr>=2.0,"weak":cr>=2.0,
                              "source":src, "reason":rsn})
             time.sleep(0.15)
         except Exception: continue
     if not results:
-        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{}}
+        return {"bonus":0,"theme":theme_name,"summary":"","rising":[],"flat":[],"detail":[],"sources":{},"leader":None}
+
+    # ── v38.6-B: 섹터 자금 집중도 (Sector Score) ──
     total, react_cnt = len(results), sum(1 for r in results if r["weak"])
     strong_cnt = sum(1 for r in results if r["strong"])
     react_ratio = react_cnt / total
+    avg_vr = sum(r["volume_ratio"] for r in results) / total if total else 1.0
+    avg_cr = sum(r["change_rate"] for r in results) / total if total else 0.0
+    # Sector Score = 0.5*거래량증가율 + 0.3*상승종목비율 + 0.2*평균상승률
+    sector_score = round(0.5 * min(avg_vr / 3.0, 1.0) + 0.3 * react_ratio + 0.2 * min(avg_cr / 5.0, 1.0), 2)
+
     bonus = (15 if react_ratio>=1.0 else 10 if react_ratio>=0.5 else 5 if react_cnt>=1 else 0)
     if strong_cnt >= 2: bonus += 5
+    # B: 섹터 자금 집중도 보너스
+    if sector_score >= 0.7: bonus += 8
+    elif sector_score >= 0.5: bonus += 4
+
+    # ── v38.6-C: 대장주 Leader Score ──
+    leader = None
+    if results:
+        cr_sorted = sorted(range(len(results)), key=lambda i: -results[i]["change_rate"])
+        vr_sorted = sorted(range(len(results)), key=lambda i: -results[i]["volume_ratio"])
+        amt_sorted = sorted(range(len(results)), key=lambda i: -results[i]["trade_amount"])
+        n = len(results)
+        for i, r in enumerate(results):
+            cr_rank = cr_sorted.index(i) / max(n-1, 1)   # 0=1등
+            vr_rank = vr_sorted.index(i) / max(n-1, 1)
+            amt_rank = amt_sorted.index(i) / max(n-1, 1)
+            r["leader_score"] = round(
+                0.35 * (1 - cr_rank) +    # 등락률 순위
+                0.30 * (1 - vr_rank) +    # 거래량 순위
+                0.25 * (1 - amt_rank) +   # 거래대금 순위
+                0.10 * (1.0 if r["change_rate"] > 0 and r["price"] > 0 else 0),  # 양봉 여부
+            2)
+        leader_r = max(results, key=lambda r: r.get("leader_score", 0))
+        if leader_r.get("leader_score", 0) >= 0.5:
+            leader = {"code": leader_r["code"], "name": leader_r["name"],
+                      "score": leader_r["leader_score"], "cr": leader_r["change_rate"],
+                      "vr": leader_r["volume_ratio"]}
+
     rising = [r for r in results if r["weak"]]
     flat   = [r for r in results if not r["weak"]]
     if bonus == 0:            summary = f"📉 섹터 반응 없음 ({theme_name}: {react_cnt}/{total})"
     elif react_ratio >= 1.0:  summary = f"🔥 섹터 전체 동반 상승! ({theme_name}: {react_cnt}/{total})"
     elif react_ratio >= 0.5:  summary = f"✅ 섹터 절반 이상 반응 ({theme_name}: {react_cnt}/{total})"
     else:                     summary = f"🟡 섹터 일부 반응 ({theme_name}: {react_cnt}/{total})"
+    # B: 섹터 점수 표시
+    if sector_score >= 0.5:
+        summary += f"  💰 자금집중도 {sector_score:.0%}"
+    # C: 대장주 표시
+    if leader:
+        summary += f"  👑 대장 {leader['name']}({leader['cr']:+.1f}%)"
 
     # ── NXT 섹터 동향 보정 ──
     # 섹터 내 종목들의 NXT 외인 동향이 일치할수록 신뢰도 ↑
@@ -3608,8 +3722,14 @@ def calc_sector_momentum(code: str, name: str) -> dict:
         sources.setdefault(src, []).append(r["name"])
 
     bonus = int(bonus + geo_bias)
+    # v39.0-J: 해외 선물→섹터 보정
+    commodity_bias = _get_commodity_sector_adj(theme_name)
+    bonus = int(bonus + commodity_bias)
+    if commodity_bias != 0:
+        summary += f"  🌐 원자재연동 {commodity_bias:+d}점"
     return {"bonus":bonus,"theme":theme_name,"summary":summary,
-            "rising":rising,"flat":flat,"detail":results,"sources":sources}
+            "rising":rising,"flat":flat,"detail":results,"sources":sources,
+            "leader":leader,"sector_score":sector_score}
 
 # ============================================================
 # 💾 저장·복원
@@ -4167,6 +4287,18 @@ def run_overnight_monitor():
                    f"━━━━━━━━━━━━━━━\n"
                    + "\n".join(alerts) +
                    f"\n\n내일 갭 예측: {gap_emoji.get(gap_signal, '➡️')}")
+            # v38.6-K: 추가 지표 표시
+            _gold = us.get("gold_chg", 0)
+            _oil = us.get("oil_chg", 0)
+            _tnx = us.get("tnx", 0)
+            _sp = us.get("sp500_chg", 0)
+            extra = []
+            if _gold: extra.append(f"금{_gold:+.1f}%")
+            if _oil: extra.append(f"유가{_oil:+.1f}%")
+            if _tnx: extra.append(f"10Y{_tnx:.2f}%")
+            if _sp: extra.append(f"S&P{_sp:+.1f}%")
+            if extra:
+                msg += f"\n📊 {' '.join(extra)}"
             send(msg)
         elif alerts:
             print(f"  🌙 오버나이트(대기모드): {len(alerts)}건 — 내부 저장만")
@@ -6688,6 +6820,41 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
 
 
 # ============================================================
+# 🔍 D: 실패 패턴 필터 (v38.6)
+# ============================================================
+def detect_failure_pattern(code: str, change_rate: float, vol_ratio: float) -> dict:
+    """v38.6-D: 급등 후 실패 패턴 감지.
+    - 급등(+5%↑)인데 거래량이 평균 이하 → 거래대금 뒷받침 없는 급등
+    - 일봉상 전일 급등 후 오늘 거래량 급감 → 추격매수 함정
+    반환: {"is_fail": bool, "penalty": int, "reason": str}
+    """
+    try:
+        # 패턴 1: 가격은 급등인데 거래량 비율이 낮음 → 허수 급등
+        if change_rate >= 5.0 and vol_ratio < 2.0:
+            return {"is_fail": True, "penalty": -10,
+                    "reason": f"⚠️ 급등 {change_rate:+.1f}% but 거래량 {vol_ratio:.1f}배 부족 (실패 패턴)"}
+
+        # 패턴 2: 전일 급등 후 오늘 거래량 급감 → 추격매수 함정
+        items = get_daily_data(code, 5)
+        if len(items) >= 2:
+            prev = items[-2]
+            prev_cr = 0
+            if prev.get("open") and prev["open"] > 0:
+                prev_cr = (prev["close"] - prev["open"]) / prev["open"] * 100
+            prev_vol = prev.get("volume", 0)
+            today_vol_est = items[-1].get("volume", 0)
+            if prev_cr >= 8.0 and today_vol_est > 0 and prev_vol > 0:
+                vol_decline = today_vol_est / prev_vol
+                if vol_decline < 0.4:
+                    return {"is_fail": True, "penalty": -8,
+                            "reason": f"⚠️ 전일 {prev_cr:+.1f}% 급등 후 거래량 {vol_decline:.0%}로 급감 (추격매수 주의)"}
+
+        return {"is_fail": False, "penalty": 0, "reason": ""}
+    except Exception:
+        return {"is_fail": False, "penalty": 0, "reason": ""}
+
+
+# ============================================================
 # 분석 엔진 (당일 급등)
 # ============================================================
 def analyze(stock: dict) -> dict:
@@ -6783,15 +6950,53 @@ def analyze(stock: dict) -> dict:
         score = int(round(score * _regime_mult))
     if score < min_score: return {}
 
-    # ── 보조지표 필터 (RSI / 이동평균 / 볼린저밴드) ──
+    # ── 보조지표 (RSI / 이동평균 / 볼린저) → v38.6: 감점만, 차단 없음 ──
     indic = calc_indicators(code)
-    if not indic["filter_pass"] and signal_type not in ("UPPER_LIMIT", "NEAR_UPPER"):
-        return {}
     score += indic["score_adj"]
     if indic["summary"]:
         for line in indic["summary"].split("\n"):
             if line: reasons.append(line)
     if score < min_score: return {}
+
+    # ── v38.6-D: 실패 패턴 필터 ──
+    fail = detect_failure_pattern(code, change_rate, vol_ratio)
+    if fail["is_fail"]:
+        score += fail["penalty"]
+        reasons.append(fail["reason"])
+    if score < min_score: return {}
+
+    # ── v38.6-J: 해외 선물→섹터 연동 보정 ──
+    try:
+        us = _us_cache if time.time() - _us_cache.get("ts", 0) < 7200 else {}
+        if us and sector_info.get("theme"):
+            _theme = sector_info["theme"]
+            _gold = float(us.get("gold_chg", 0) or 0)
+            _oil = float(us.get("oil_chg", 0) or 0)
+            _tnx = float(us.get("tnx", 0) or 0)
+            _j_adj = 0
+            _j_reason = ""
+            # 금 급등 → 방산·안전자산 호재
+            if _gold >= 1.5 and _theme in ("방산","원전","금","귀금속"):
+                _j_adj = 5; _j_reason = f"🥇 금+{_gold:.1f}% → {_theme} 호재"
+            elif _gold <= -1.5 and _theme in ("방산","금","귀금속"):
+                _j_adj = -3; _j_reason = f"🥇 금{_gold:.1f}% → {_theme} 부담"
+            # 유가 급등 → 에너지·정유 호재, 항공·물류 악재
+            if _oil >= 3.0 and _theme in ("에너지","정유","석유","원유","조선"):
+                _j_adj = max(_j_adj, 5); _j_reason = f"🛢️ 유가+{_oil:.1f}% → {_theme} 호재"
+            elif _oil >= 3.0 and _theme in ("항공","물류","운송","화학"):
+                _j_adj = min(_j_adj, -4); _j_reason = f"🛢️ 유가+{_oil:.1f}% → {_theme} 비용 부담"
+            elif _oil <= -3.0 and _theme in ("항공","물류","운송"):
+                _j_adj = max(_j_adj, 4); _j_reason = f"🛢️ 유가{_oil:.1f}% → {_theme} 비용 완화"
+            # 금리 상승 → 은행·보험 호재, 성장주·바이오 부담
+            if _tnx >= 4.8 and _theme in ("은행","보험","금융"):
+                _j_adj = max(_j_adj, 4); _j_reason = f"📈 10Y{_tnx:.1f}% → {_theme} 금리 호재"
+            elif _tnx >= 4.8 and _theme in ("바이오","AI반도체","2차전지","성장"):
+                _j_adj = min(_j_adj, -3); _j_reason = f"📈 10Y{_tnx:.1f}% → {_theme} 금리 부담"
+            if _j_adj != 0:
+                score += _j_adj
+                reasons.append(_j_reason)
+    except Exception:
+        pass
 
     # v37.0: API 사전 캐싱 (get_stock_price 중복 호출 3→1회 절감)
     try: _cached_price = get_stock_price(code)
