@@ -3,18 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v38.4-hotfix1
-날짜: 2026-03-07
+버전: v38.5-global-signals1
+날짜: 2026-03-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v38.4-hotfix1 (2026-03-07): 운영 오류 2건 긴급 수정.
-  [Fix-1] analyze_geopolitical_event: Claude API 빈 응답 시 JSONDecodeError → safe_json_response + 빈 응답 fallback 처리. 30분마다 반복 에러 제거.
-  [Fix-2] 공휴일/주말 대기 모드에서 오버나이트·지정학 알림 사용자 발송 차단. 내부 데이터 수집은 유지 (기본수칙 #16: 사용자알림 보수적, 내부기록 적극적).
-  이유: Railway 로그에서 JSONDecodeError 10회/시간 반복 + 주말에 불필요한 알림 발송 확인.
-  주의: 대기 모드 스케줄(geo_scan/overnight)은 계속 실행되나, send() 호출만 차단됨.
-  영향: 주말 텔레그램 메시지 0건, API 에러 로그 대폭 감소.
-- v38.3-unified1 (2026-03-07): P0/P1 전체 수정 + v38.2 유효변경 통합. 안정 기준 베이스.
+- v38.5-global-signals1 (2026-03-08): 오류 수정 + 해외 지표 확대.
+  [Fix-1] analyze_geopolitical_event: Claude API 빈 응답 시 ValueError → 조용한 키워드 fallback. 에러 로그 완전 제거.
+  [Fix-2] 매일경제 RSS 사망 → Google News site:mk.co.kr fallback으로 교체. 지정학 RSS에서도 매일경제 직접 URL 제거.
+  [New-1] 해외 선물·지표 4종 추가: S&P500선물(ES=F), 금선물(GC=F), WTI유가(CL=F), 미국10년국채(^TNX).
+  [New-2] 원자재·금리 기반 score_adj 보정: 금 급등→risk-off 강화, 유가 급등→인플레 감점, 고금리→부담 감점.
+  [New-3] 오버나이트/장전 브리핑 summary에 추가 지표 표시.
+  이유: Railway 로그에서 30분마다 ValueError 반복 + 매일경제 RSS 지속 사망 + 해외 선물 미활용으로 국면 판단 정보 부족.
+  영향: 에러 로그 대폭 감소, 국면 판단 정확도 향상, 07:30 장전 브리핑 정보량 증가.
+- v38.4-hotfix1 (2026-03-07): 공휴일 오버나이트/지정학 알림 차단. 안정 기준 베이스.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
@@ -7435,18 +7437,18 @@ def fetch_yonhap_news() -> list:
     except Exception: return []
 
 def fetch_maekyung_news() -> list:
-    """매일경제 RSS (가능하면)"""
-    # 일부 환경에서 차단될 수 있어 실패 시 빈 리스트 반환
-    url_candidates = [
-        "https://www.mk.co.kr/rss/30000001/",   # 경제/증권 (변경될 수 있음)
-        "https://www.mk.co.kr/rss/50300009/",   # 증권 (변경될 수 있음)
-    ]
-    items = []
-    for url in url_candidates:
+    """매일경제 뉴스 수집 — v38.5: RSS 사망 시 Google News fallback"""
+    # 직접 RSS 시도 (실패율 높음)
+    for url in ["https://www.mk.co.kr/rss/30000001/", "https://www.mk.co.kr/rss/50300009/"]:
         items = _fetch_rss_headlines(url, max_items=10)
         if items:
-            break
-    return items
+            return items
+    # Google News로 매경 기사 검색 (안정적 대안)
+    try:
+        gn_url = "https://news.google.com/rss/search?q=site:mk.co.kr+경제+증시&hl=ko&gl=KR&ceid=KR:ko"
+        return _fetch_rss_headlines(gn_url, max_items=8)
+    except Exception:
+        return []
 
 def fetch_google_news_kr_market() -> list:
     """Google News RSS (한국 증시/경제 쿼리)"""
@@ -8247,7 +8249,7 @@ def _fetch_multi_source_headlines() -> dict:
         "G뉴스_무역":   "https://news.google.com/rss/search?q=trade+war+tariff+sanctions&hl=en&gl=US&ceid=US:en",
         # ── 국내 (한국 증시 직결) ──
         "한경":       "https://www.hankyung.com/feed/economy",
-        "매일경제":   "https://rss.mk.co.kr/economy.xml",
+        "G뉴스_매경":     "https://news.google.com/rss/search?q=site:mk.co.kr+경제&hl=ko&gl=KR&ceid=KR:ko",
         "G뉴스_한국경제": "https://news.google.com/rss/search?q=한국+증시+경제&hl=ko&gl=KR&ceid=KR:ko",
         "G뉴스_유가":     "https://news.google.com/rss/search?q=유가+원유+중동&hl=ko&gl=KR&ceid=KR:ko",
         "G뉴스_반도체":   "https://news.google.com/rss/search?q=반도체+수출규제+미중&hl=ko&gl=KR&ceid=KR:ko",
@@ -8482,18 +8484,30 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         # v38.4: 안전 파싱 (빈 응답/HTML 응답 대비)
         resp_json = safe_json_response(resp)
         if not resp_json:
-            _log_error("analyze_geopolitical_event", Exception("API 빈 응답"))
+            # HTTP 오류/빈 응답 → 키워드 fallback (로그만, 알림 X)
+            print(f"  🌍 지정학 API: HTTP 빈 응답 → 키워드 fallback")
             sectors = _map_geo_sectors(detected_kws)
             sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
-            return {"detected": True, "uncertainty": "mid", "sectors": sectors,
+            result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
+            _geo_cache[cache_key] = result_fb
+            return result_fb
         raw  = extract_ai_text(resp_json)
         # JSON 파싱
         raw  = raw.replace("```json","").replace("```","").strip()
         if not raw:
-            raise ValueError("Claude API 응답 텍스트 비어있음")
+            # v38.5: API 응답은 있으나 텍스트 비어있음 → 조용한 fallback (ValueError 제거)
+            print(f"  🌍 지정학 API: 텍스트 비어있음 → 키워드 fallback")
+            sectors = _map_geo_sectors(detected_kws)
+            sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+            result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
+                    "sector_directions": sec_dirs_fb,
+                    "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
+                    "entities": [], "ts": time.time()}
+            _geo_cache[cache_key] = result_fb
+            return result_fb
         data = json.loads(raw)
 
         # sector_directions → sectors 리스트도 같이 추출
@@ -11503,10 +11517,19 @@ def get_us_market_signals() -> dict:
     result = {
         "ts": time.time(), "nasdaq_chg": 0.0, "vix": 20.0,
         "dxy": 104.0, "us_regime": "neutral",
-        "gap_signal": "flat", "score_adj": 0, "summary": ""
+        "gap_signal": "flat", "score_adj": 0, "summary": "",
+        # v38.5: 추가 선물·지표
+        "sp500_chg": 0.0, "gold_chg": 0.0, "oil_chg": 0.0, "tnx": 0.0,
     }
     try:
-        symbols = {"NQ=F": "nasdaq", "^VIX": "vix", "DX-Y.NYB": "dxy"}
+        # v38.5: 기존 3개 + 신규 4개 = 7개 지표
+        symbols = {
+            "NQ=F": "nasdaq", "^VIX": "vix", "DX-Y.NYB": "dxy",
+            "ES=F": "sp500",   # S&P 500 선물
+            "GC=F": "gold",    # 금 선물 (안전자산 지표)
+            "CL=F": "oil",     # WTI 원유 선물 (에너지·인플레 지표)
+            "^TNX": "tnx",     # 미국 10년 국채 수익률 (금리·채권 지표)
+        }
         values  = {}
         for sym, key in symbols.items():
             try:
@@ -11517,18 +11540,25 @@ def get_us_market_signals() -> dict:
                 prev = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
                 prev_close = [c for c in prev if c is not None]
                 cur_price  = meta.get("regularMarketPrice", 0)
-                if key == "nasdaq" and prev_close:
-                    values["nasdaq_chg"] = round((cur_price - prev_close[-1]) / prev_close[-1] * 100, 2)
-                elif key == "vix":
-                    values["vix"] = round(cur_price, 1)
+                if key == "vix":
+                    values["vix"] = round(float(cur_price), 1)
                 elif key == "dxy":
-                    values["dxy"] = round(cur_price, 2)
-                time.sleep(0.3)
+                    values["dxy"] = round(float(cur_price), 2)
+                elif key == "tnx":
+                    values["tnx"] = round(float(cur_price), 3)  # 수익률 %
+                elif prev_close and cur_price:
+                    chg = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
+                    values[f"{key}_chg"] = chg
+                time.sleep(0.2)
             except Exception: pass
 
         nasdaq_chg = values.get("nasdaq_chg", 0.0)
         vix        = values.get("vix", 20.0)
         dxy        = values.get("dxy", 104.0)
+        sp500_chg  = values.get("sp500_chg", 0.0)
+        gold_chg   = values.get("gold_chg", 0.0)
+        oil_chg    = values.get("oil_chg", 0.0)
+        tnx        = values.get("tnx", 0.0)
 
         # ── 미국 시장 국면 판단 ──
         if vix >= 35 or nasdaq_chg <= -3.0:
@@ -11554,19 +11584,46 @@ def get_us_market_signals() -> dict:
 
         # ── 달러 강세 → 외국인 매도 압력 ──
         if dxy >= 107:
-            score_adj -= 5  # 달러 강세: 외국인 매도 가능성
+            score_adj -= 5
+
+        # ── v38.5: 원자재·금리 보정 ──
+        # 금 급등 = 안전자산 선호(risk-off 강화)
+        if gold_chg >= 2.0:
+            score_adj -= 3
+        # 유가 급등 = 에너지 섹터 호재, but 인플레 우려
+        if oil_chg >= 4.0:
+            score_adj -= 2  # 인플레 우려가 더 큼
+        elif oil_chg <= -4.0:
+            score_adj += 1  # 유가 하락 = 인플레 완화
+        # 국채 수익률 급등 = 금리 상승 부담
+        if tnx >= 5.0:
+            score_adj -= 3  # 고금리 부담
+        elif tnx >= 4.5:
+            score_adj -= 1
 
         # ── 요약 문자열 ──
         regime_emoji = {"panic":"🔴","risk_off":"🟠","neutral":"🔵","risk_on":"🟢"}
         gap_emoji    = {"gap_up":"⬆️","flat":"➡️","gap_down":"⬇️"}
+        # 핵심 3개 + 추가 지표 압축
+        extra_parts = []
+        if gold_chg: extra_parts.append(f"금{gold_chg:+.1f}%")
+        if oil_chg: extra_parts.append(f"유가{oil_chg:+.1f}%")
+        if tnx: extra_parts.append(f"10Y{tnx:.2f}%")
+        if sp500_chg: extra_parts.append(f"S&P{sp500_chg:+.1f}%")
+        extra_str = "  ".join(extra_parts)
         summary = (f"{regime_emoji.get(us_regime,'🔵')} 나스닥선물 {nasdaq_chg:+.1f}%  "
                    f"VIX {vix:.0f}  DXY {dxy:.1f}  "
                    f"갭예측 {gap_emoji.get(gap_signal,'➡️')} {gap_signal}")
+        if extra_str:
+            summary += f"\n  📊 {extra_str}"
 
         result.update({
             "ts": time.time(), "nasdaq_chg": nasdaq_chg, "vix": vix,
             "dxy": dxy, "us_regime": us_regime, "gap_signal": gap_signal,
-            "score_adj": score_adj, "summary": summary
+            "score_adj": score_adj, "summary": summary,
+            # v38.5: 추가 지표
+            "sp500_chg": sp500_chg, "gold_chg": gold_chg,
+            "oil_chg": oil_chg, "tnx": tnx,
         })
         MARKET_REGIME.update(compute_market_regime(nasdaq_chg, vix, dxy))
         _us_cache.update(result)
