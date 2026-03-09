@@ -3,23 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v39.4-polish1
+버전: v40.0
 날짜: 2026-03-09
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v39.4-polish1 (2026-03-09): 7건 운영 품질 + 로그 오류 수정.
-  [#1] regime NameError 수정: analyze_mid_pullback에서 `regime` → `_regime` (눌림목 스캔 전체 실패 원인).
-  [#1b] korea_etf_snapshot NameError 수정: save_signal_log에서 변수 미정의 → _get_korea_etf_snapshot() 호출 추가.
-  [#2] "눌림목" 명칭 전면 통일: 중기/단기/장기 구분 삭제 → 코드 전반 35곳 "눌림목"으로 통일. SIG_LABELS/SIG_TITLES/인라인/auto_tune/stats 모두 반영.
-  [#3] 장 시작/마감 메시지: 이미 스케줄 존재 확인. _on_market_open(09:00) + on_market_close(15:30) 정상 발송.
-  [#4] 대장 종목 부각 + 중복 제거: 섹터 모니터링에서 👑 대장을 별도 블록으로 강조, 하위 리스트에서 중복 제거.
-  [#5] 원/달러 환율(KRW=X) 추가: Yahoo Finance KRW=X 실시간 수집. 원화 급락(+0.8%↑) → -3점, 원화 강세(-0.8%↓) → +2점, 1400원↑ → -5점 위기 보정. 오버나이트/장전 브리핑에 표시.
-  [#6] 대시보드 변동사항만 업데이트: 레짐/감시종목/성과 해시 비교 → 변동 없으면 편집 스킵.
-  [#7] "기타업종: 동업종 조회 중" → 30초 후 배경 재조회, 성공 시 섹터 정보 별도 발송 (눌림목/DART 모두 적용).
-  이유: 로그에서 눌림목 전체 실패(regime NameError 60+회) + 사용자 UX 7건 개선 요청.
-  영향: 눌림목 스캔 정상화, 환율 반영으로 외국인 자금흐름 판단↑, 불필요 대시보드 업데이트↓.
-- v39.3-quality1 (2026-03-09): 운영 품질 12건 수정. 안정 기준 베이스.
+- v40.0 (2026-03-09): 11건 종합 개선 — 리스크 체계·메시지·학습 전면 업그레이드.
+  [#1] 진입가 도달 메시지에 포착 이유(reasons) 포함. register_entry_watch에 reasons 저장, check_entry_watch에서 상위 3개 표시.
+  [#2] 섹터 약세 시 진입가 도달 알림 차단. 섹터 평균 등락률 -1.5% 이하면 차단, 내부 로그만 기록.
+  [#3] 08:30 장전 리스크 평가 알림 신설 (안전/경계/위험 3단계). 미국시장+VIX+환율+지정학+코스피 5축 종합 판단.
+  [#4] 시장 레짐 명칭 통일: crash/bear/normal/bull 4단계. 한글: 급락장/약세장/보통장/강세장. get_regime_history·REGIME_KO_MAP 일치.
+  [#5] 리스크 원인별 엔진: 유동성/에너지·지정학/국내추세 3축 태깅. calc_overnight_risk, send_premarket_risk_assessment에 적용.
+  [#6] 시간대별 리스크 분리: 장중(normal)/금요일마감전(friday_close)/야간장전(pre_open) 프로파일. is_strict_time 확장.
+  [#7] 메시지 차단 사유 내부 로그(_log_suppressed_alert). suppressed_alerts.json에 누적, 학습·개선 데이터로 활용.
+  [#8] 장 후반/엄격 시간대 승인 기준 강화: 14:30 이후 + 금요일 14:00 이후 strict 판정.
+  [#9] 이벤트 유형별 승률 분리: get_signal_type_stats() 함수 추가. 장전 브리핑/주간 리포트에 유형별 승률 표시.
+  [#10] 상한가 종목 반복 알림 차단: 상한가 유지 중(change_rate>=29%) 추가 알림 완전 차단.
+  [#11] 버그 3건 수정: re→_re(NameError), _atomic_write_json→_write_json_atomic, CARRY_STOCKS_FILE→CARRY_FILE.
+  이유: 사용자 요청 11건 + 로그 분석 기반 3건 버그.
+  개선점: 진입가 도달 메시지 품질↑, 모순 알림 제거, 사전 리스크 방어↑, 레짐 체계 통일, 학습 데이터↑.
+  주의점: 레짐 라벨 변경으로 기존 로그 조회 시 구 명칭(panic/crisis 등) 호환 유지.
+  영향: 알림 품질 대폭 향상, 불필요 알림 50%+ 감소 예상, 리스크 사전 감지 능력↑.
+- v39.4-polish1 (2026-03-09): 이전 버전. 7건 운영 품질 + 로그 오류 수정.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
@@ -81,11 +86,16 @@ import re as _re
 
 
 # === Regime label localization (Korean) ===
+# v40.0: 4단계 통일 — crash/bear/normal/bull (한글: 급락장/약세장/보통장/강세장)
 REGIME_KO_MAP = {
     "risk_on": "강세장",
+    "bull": "강세장",
     "neutral": "보통장",
+    "normal": "보통장",
     "risk_off": "약세장",
-    "panic": "패닉장",
+    "bear": "약세장",
+    "panic": "급락장",
+    "crash": "급락장",
     "unknown": "보통장",
 }
 
@@ -290,6 +300,7 @@ _PERSIST_FILES = [
     "dynamic_themes.json",
     "news_cooccur.json",
     "compact_mode.json",
+    "suppressed_alerts.json",
 ]
 
 def _ensure_dir(path: str):
@@ -412,6 +423,98 @@ def _storage_diagnostics_once():
         print("=======================================================")
     except Exception as e:
         print(f"⚠️ 스토리지 진단 실패: {e}")
+
+
+# ============================================================
+# v40.0-#7: 메시지 차단 사유 내부 로그 (학습·개선 데이터)
+# ============================================================
+SUPPRESSED_LOG_FILE = os.path.join(DATA_DIR, "suppressed_alerts.json")
+
+def _log_suppressed_alert(code: str, name: str, reason: str, signal_type: str = "", extra: dict = None):
+    """알림 차단 시 내부 로그에 기록 (사용자 알림 없음, 학습용)."""
+    try:
+        data = _read_json_locked(SUPPRESSED_LOG_FILE) if os.path.exists(SUPPRESSED_LOG_FILE) else {}
+        if not isinstance(data, dict):
+            data = {}
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        entry = {
+            "code": code, "name": name, "reason": reason,
+            "signal_type": signal_type, "time": now_s,
+        }
+        if extra and isinstance(extra, dict):
+            entry.update(extra)
+        data[key] = entry
+        # 최대 500건 유지
+        if len(data) > 500:
+            sorted_keys = sorted(data.keys())
+            for old_k in sorted_keys[:len(data) - 500]:
+                data.pop(old_k, None)
+        _write_json_atomic(SUPPRESSED_LOG_FILE, data, indent=2)
+        print(f"  🚫 차단: {name}({code}) — {reason}")
+    except Exception as e:
+        print(f"⚠️ 차단 로그 기록 오류: {e}")
+
+
+# ============================================================
+# v40.0-#9: 이벤트 유형별 승률 분리
+# ============================================================
+def get_signal_type_stats(signal_log_data: dict = None) -> dict:
+    """신호 유형별 승률·수익률 통계 반환.
+    반환: {signal_type: {count, wins, win_rate, avg_pnl}}
+    """
+    try:
+        if signal_log_data is None:
+            signal_log_data = _read_json_locked(
+                os.path.join(DATA_DIR, "signal_log.json"))
+        if not isinstance(signal_log_data, dict):
+            return {}
+
+        stats = {}
+        for _k, rec in signal_log_data.items():
+            if not isinstance(rec, dict):
+                continue
+            st = rec.get("status", "")
+            if st not in ("수익", "손실", "본전"):
+                continue
+            sig = rec.get("signal_type", "UNKNOWN")
+            s = stats.setdefault(sig, {"count": 0, "wins": 0, "sum_pnl": 0.0})
+            s["count"] += 1
+            pnl = float(rec.get("pnl_pct", 0) or 0)
+            s["sum_pnl"] += pnl
+            if pnl > 0:
+                s["wins"] += 1
+
+        result = {}
+        for sig, s in stats.items():
+            if s["count"] < 3:
+                continue
+            result[sig] = {
+                "count": s["count"],
+                "wins": s["wins"],
+                "win_rate": round(s["wins"] / s["count"] * 100),
+                "avg_pnl": round(s["sum_pnl"] / s["count"], 1),
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def _format_signal_type_stats_line(stats: dict) -> str:
+    """신호 유형별 승률을 브리핑용 한 줄로 포맷."""
+    if not stats:
+        return ""
+    label_map = {
+        "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+        "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목",
+        "ENTRY_POINT": "눌림목진입", "STRONG_BUY": "강력매수",
+    }
+    parts = []
+    for sig, s in sorted(stats.items(), key=lambda x: -x[1]["count"]):
+        label = label_map.get(sig, sig)
+        emoji = "🟢" if s["win_rate"] >= 60 else ("🟡" if s["win_rate"] >= 40 else "🔴")
+        parts.append(f"{emoji}{label} {s['win_rate']}%({s['count']}건)")
+    return "  ".join(parts[:5])
 
 
 # --- HOTFIX v37.3: safe AI response extractor (prevents KeyError: 'content') ---
@@ -644,6 +747,9 @@ ENTRY_TOLERANCE_PCT  = 2.0   # 진입가 ±2% 이내 → 진입 구간
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
 
+# v40.0-#10: 상한가 유지 종목 알림 차단 (당일 1회만 알림, 풀리기 전까지 재알림 없음)
+_upper_limit_day_alerted: dict = {}   # code → {"date": "YYYYMMDD", "alerted": True}
+
 # ── 분할 청산 가이드(메시지 스팸 방지) ──
 ALLOW_VIRTUAL_EXIT_GUIDE = os.getenv('ALLOW_VIRTUAL_EXIT_GUIDE', '0') == '1'  # 기본은 actual_entry만 발송, 필요 시 환경변수로 entry_hit 가이드 허용
 PARTIAL_EXIT_GUIDE_COOLDOWN_MIN = int(os.getenv('PARTIAL_EXIT_GUIDE_COOLDOWN_MIN', '30') or '30')
@@ -801,12 +907,21 @@ def minutes_since(dt: datetime) -> int:
     return int((datetime.now() - dt).total_seconds() // 60)
 
 def is_strict_time() -> bool:
-    """v37.0: KRX + NXT 장 초반/후반 엄격 시간대 판별"""
-    n   = datetime.now().time()
+    """v40.0: KRX + NXT 장 초반/후반 엄격 시간대 판별
+    v40.0-#8: 14:30 이후 + 금요일 14:00 이후 추가 엄격 판정
+    """
+    now = datetime.now()
+    n   = now.time()
     # KRX 장 초반/후반
-    o_e = (datetime.now().replace(hour=9,  minute=0)  + timedelta(minutes=STRICT_OPEN_MINUTES)).time()
-    c_s = (datetime.now().replace(hour=15, minute=30) - timedelta(minutes=STRICT_CLOSE_MINUTES)).time()
+    o_e = (now.replace(hour=9,  minute=0)  + timedelta(minutes=STRICT_OPEN_MINUTES)).time()
+    c_s = (now.replace(hour=15, minute=30) - timedelta(minutes=STRICT_CLOSE_MINUTES)).time()
     if dtime(9, 0) <= n <= o_e or n >= c_s:
+        return True
+    # v40.0-#8: 장 후반 14:30 이후 → 엄격 (마감 매물 / 변동성 확대)
+    if n >= dtime(14, 30):
+        return True
+    # v40.0-#8: 금요일 14:00 이후 → 엄격 (주말 오버나이트 리스크)
+    if now.weekday() == 4 and n >= dtime(14, 0):
         return True
     # NXT 장전 초반 (08:00~08:10) + 장후반 (19:50~20:00)
     if n <= dtime(8, STRICT_OPEN_MINUTES):
@@ -814,6 +929,22 @@ def is_strict_time() -> bool:
     if dtime(19, 50) <= n <= dtime(20, 0):
         return True
     return False
+
+
+def _get_time_risk_profile() -> str:
+    """v40.0-#6: 현재 시간대의 리스크 프로파일 반환.
+    장중(normal) / 금요일마감전(friday_close) / 야간장전(pre_open)
+    """
+    now = datetime.now()
+    n = now.time()
+    # 야간·장전 (20:00 ~ 08:59)
+    if n >= dtime(20, 0) or n < dtime(9, 0):
+        return "pre_open"
+    # 금요일 14:00 이후
+    if now.weekday() == 4 and n >= dtime(14, 0):
+        return "friday_close"
+    # 일반 장중
+    return "normal"
 
 # ============================================================
 # 🔐 KIS API
@@ -1264,9 +1395,11 @@ def get_regime_history(regime: str) -> str:
     if len(same_regime) < 3:
         return ""
 
+    # v40.0: crash/bear/normal/bull 4단계 통일 (구 명칭 호환 유지)
     regime_label = {
-        "crisis": "위기", "risk_off": "위험회피", "normal": "보통",
-        "bull": "강세", "euphoria": "과열"
+        "crash": "급락장", "bear": "약세장", "normal": "보통장", "bull": "강세장",
+        # 하위 호환 (기존 로그)
+        "crisis": "급락장", "risk_off": "약세장", "euphoria": "강세장", "panic": "급락장",
     }
     label = regime_label.get(regime, regime)
     return _format_history_stats(same_regime, f"{label} 국면 과거")
@@ -2701,7 +2834,7 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
                 except Exception:
                     dt = None
             if dt is None and isinstance(v.get("log_key"), str):
-                m = re.search(r"(\d{8})(\d{4})", v["log_key"])
+                m = _re.search(r"(\d{8})(\d{4})", v["log_key"])
                 if m:
                     try:
                         dt = datetime.strptime(m.group(1)+m.group(2), "%Y%m%d%H%M")
@@ -2740,8 +2873,8 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
         # carry_stocks 우선 유지
         carry_codes = []
         try:
-            if os.path.exists(CARRY_STOCKS_FILE):
-                with open(CARRY_STOCKS_FILE, "r", encoding="utf-8") as f:
+            if os.path.exists(CARRY_FILE):
+                with open(CARRY_FILE, "r", encoding="utf-8") as f:
                     j = json.load(f) or {}
                 carry_codes = list((j.get("codes") or j.get("watch") or j.get("carry") or []))
         except Exception:
@@ -2755,7 +2888,7 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
         if len(merged) < 50:
             return
 
-        _atomic_write_json(UNIVERSE_FILE, {"codes": merged[:max_codes]})
+        _write_json_atomic(UNIVERSE_FILE, {"codes": merged[:max_codes]})
         # cache reset
         _UNIVERSE_CACHE["ts"] = 0.0
         print(f"🧠 universe.json 자동 갱신: {len(merged[:max_codes])}종목 (최근 {days}일 성과 기반)")
@@ -4189,6 +4322,10 @@ def send_overnight_risk_alerts():
             msg += (f"{'🔴' if risk['level']=='high' else '🟡'} "
                     f"<b>{rec['name']}</b>  현재 {pnl_str}\n"
                     f"  {risk['reason']}\n")
+            # v40.0-#5: 리스크 원인별 표시
+            for c in risk.get("causes", [])[:2]:
+                c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+                msg += f"  {c_emoji} {c['label']}: {c['detail']}\n"
 
         # v37.0: 오버나이트 보유 과거 통계 + 현재 국면 이력
         try:
@@ -4261,7 +4398,7 @@ def run_overnight_monitor():
 
         if cur_rank > prev_rank and cur_regime != _overnight_state["alerted_regime"]:
             _overnight_state["alerted_regime"] = cur_regime
-            regime_label = {"risk_off": "🟠 위험회피", "panic": "🔴 패닉"}
+            regime_label = {"risk_off": "🟠 약세장", "panic": "🔴 급락장"}
             alerts.append(
                 f"⚠️ 미국 시장 국면 악화: {regime_label.get(cur_regime, cur_regime)}\n"
                 f"  나스닥 {nasdaq_chg:+.1f}%  VIX {cur_vix:.0f}"
@@ -4269,7 +4406,7 @@ def run_overnight_monitor():
         elif cur_rank < prev_rank and cur_regime != _overnight_state["alerted_regime"]:
             _overnight_state["alerted_regime"] = cur_regime
             alerts.append(
-                f"✅ 미국 시장 국면 개선: 🟢 위험선호 전환\n"
+                f"✅ 미국 시장 국면 개선: 🟢 강세장 전환\n"
                 f"  나스닥 {nasdaq_chg:+.1f}%  VIX {cur_vix:.0f}"
             )
 
@@ -6036,6 +6173,8 @@ def register_entry_watch(s: dict):
         "registered_ts": time.time(),
         "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
         "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
+        "reasons":      (s.get("reasons") or [])[:5],  # v40.0-#1: 포착 이유 상위 5개 저장
+        "sector_theme": s.get("sector_info", {}).get("theme", ""),  # v40.0-#2: 섹터 정보
     }
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
@@ -6142,6 +6281,38 @@ def check_entry_watch():
                 cooldown_sec = ENTRY_REWATCH_MINS * 60
                 if notify_count >= 3: expired.append(log_key); continue
                 if now_ts - last_ts < cooldown_sec: continue
+
+                # v40.0-#2: 섹터 약세 시 진입가 도달 알림 차단 (내부 로그만)
+                _sector_blocked = False
+                try:
+                    _s_theme = watch.get("sector_theme", "")
+                    if _s_theme and _s_theme != "기타업종":
+                        for _tk, _ti in THEME_MAP.items():
+                            if _tk == _s_theme or _s_theme in _ti.get("desc", ""):
+                                _chg_list = []
+                                for _sc, _sn in _ti.get("stocks", [])[:5]:
+                                    try:
+                                        _sp = get_stock_price(_sc)
+                                        _cr = _sp.get("change_rate", 0)
+                                        if _cr is not None:
+                                            _chg_list.append(float(_cr))
+                                        time.sleep(0.05)
+                                    except Exception:
+                                        continue
+                                if _chg_list and (sum(_chg_list) / len(_chg_list)) <= -1.5:
+                                    _sector_blocked = True
+                                    _log_suppressed_alert(
+                                        watch["code"], watch["name"],
+                                        f"섹터 약세 차단 (섹터 {_s_theme} 평균 {sum(_chg_list)/len(_chg_list):.1f}%)",
+                                        watch.get("signal_type", ""),
+                                        {"sector_avg_chg": round(sum(_chg_list)/len(_chg_list), 1)}
+                                    )
+                                break
+                except Exception:
+                    pass
+                if _sector_blocked:
+                    continue  # 사용자 알림 차단, 내부 로그만 기록
+
                 watch["last_notified_ts"] = now_ts
                 watch["notify_count"]     = notify_count + 1
                 sig_labels = {
@@ -6154,11 +6325,20 @@ def check_entry_watch():
                 tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
                 nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
                 count_tag  = f"  ({notify_count+1}/3회)" if notify_count > 0 else ""
+
+                # v40.0-#1: 포착 이유 블록 생성
+                _reasons = watch.get("reasons", [])
+                reasons_block = ""
+                if _reasons:
+                    reasons_lines = "\n".join([f"  {r}" for r in _reasons[:3]])
+                    reasons_block = f"\n📋 <b>포착 이유</b>\n{reasons_lines}\n"
+
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                     f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
+                    f"{reasons_block}"
                     f"━━━━━━━━━━━━━━━\n"
                     f"┌─────────────────────\n"
                     f"│ ⚡️ <b>지금 진입 구간!</b>\n"
@@ -6715,6 +6895,12 @@ def send_alert(s: dict):
         if st in ('UPPER_LIMIT','NEAR_UPPER'):
             key = f"{st}:{s.get('code','')}"
             if not _throttle_ok(_LAST_ALERT_TS, key, 3600):
+                # v40.0-#7: 차단 사유 로그
+                _log_suppressed_alert(
+                    s.get('code',''), s.get('name',''),
+                    f"쿨다운 차단 ({st} 1시간 이내 재알림)",
+                    st
+                )
                 return
     except Exception:
         pass
@@ -7109,8 +7295,8 @@ def analyze(stock: dict) -> dict:
         us_adj = us.get("score_adj", 0)
         if us_adj != 0:
             score = max(0, score + us_adj)
-            us_label = {"panic":"🔴 미국 패닉","risk_off":"🟠 미국 위험회피",
-                        "neutral":"🔵 미국 중립","risk_on":"🟢 미국 위험선호"}
+            us_label = {"panic":"🔴 미국 급락장","risk_off":"🟠 미국 약세장",
+                        "neutral":"🔵 미국 보통장","risk_on":"🟢 미국 강세장"}
             reasons.append(f"{us_label.get(us.get('us_regime','neutral'),'🔵')} ({us_adj:+d}점)")
         if us.get("gap_signal") == "gap_down":
             reasons.append("⬇️ 내일 갭하락 가능성 (미국 약세)")
@@ -10048,7 +10234,7 @@ def poll_telegram_commands():
                     _us_cache.clear()  # 캐시 무효화 → 강제 갱신
                     us = get_us_market_signals()
                     gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
-                    regime_kor = {"panic":"🔴 패닉","risk_off":"🟠 위험회피","neutral":"🔵 중립","risk_on":"🟢 위험선호"}
+                    regime_kor = {"panic":"🔴 급락장","risk_off":"🟠 약세장","neutral":"🔵 보통장","risk_on":"🟢 강세장","crash":"🔴 급락장","bear":"🟠 약세장","bull":"🟢 강세장"}
                     msg = (f"🌐 <b>미국 시장 현황</b>\n"
                            f"━━━━━━━━━━━━━━━\n"
                            f"나스닥선물: {us.get('nasdaq_chg',0):+.2f}%\n"
@@ -10369,8 +10555,8 @@ def _handle_result_command(raw: str):
 def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) -> dict:
     """
     장 마감 후 보유 위험도 계산.
-    미국 시장 방향 + 공매도 잔고 + VIX 조합.
-    반환: {level: "high"/"mid"/"low", score: int, reason: str}
+    v40.0-#5: 리스크 원인별 분류 (유동성/에너지·지정학/국내추세)
+    반환: {level: "high"/"mid"/"low", score: int, reason: str, causes: list}
     """
     try:
         us         = get_us_market_signals()
@@ -10388,9 +10574,9 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
             risk_score += 10; reasons.append("🔵 NXT 단독 시간대 (유동성 낮음)")
 
         if us_regime == "panic":
-            risk_score += 40; reasons.append("🔴 미국 패닉장")
+            risk_score += 40; reasons.append("🔴 미국 급락장")
         elif us_regime == "risk_off":
-            risk_score += 20; reasons.append("🟠 미국 위험회피")
+            risk_score += 20; reasons.append("🟠 미국 약세장")
 
         if vix >= 30:
             risk_score += 20; reasons.append(f"🔴 VIX {vix:.0f} (공포)")
@@ -10408,18 +10594,34 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         if current_pnl > 5:
             risk_score -= 10; reasons.append(f"✅ 현재 +{current_pnl:.1f}% 수익 중")
 
+        # v40.0-#6: 금요일 마감 시 주말 리스크 가중
+        if datetime.now().weekday() == 4 and _get_time_risk_profile() == "friday_close":
+            risk_score += 10; reasons.append("📅 금요일 오버나이트 (주말 리스크)")
+
         if   risk_score >= 50: level = "high"
         elif risk_score >= 25: level = "mid"
         else:                  level = "low"
 
-        level_emoji = {"high": "🔴 위험", "mid": "🟡 주의", "low": "🟢 안전"}
+        # v40.0-#5: 원인별 분류
+        kospi_5d = 0.0
+        try:
+            items = get_daily_data("0001", 10)
+            closes = [i["close"] for i in items if i.get("close")]
+            if len(closes) >= 5:
+                kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+        except Exception:
+            pass
+        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
+
+        level_emoji = {"high": "🔴 위험", "mid": "🟡 경계", "low": "🟢 안전"}
         return {
             "level":  level,
             "score":  risk_score,
-            "reason": f"{level_emoji[level]}  {'  '.join(reasons)}"
+            "reason": f"{level_emoji[level]}  {'  '.join(reasons)}",
+            "causes": causes,
         }
     except Exception:
-        return {"level": "low", "score": 0, "reason": ""}
+        return {"level": "low", "score": 0, "reason": "", "causes": []}
 
 # ============================================================
 # 🔄 테마 로테이션 감지
@@ -10858,6 +11060,187 @@ def _send_error_daily_summary():
     except Exception as e:
         print(f"⚠️ 에러 요약 발송 실패: {e}")
 
+
+# ============================================================
+# v40.0-#3: 장 시작 전 리스크 평가 알림 (08:30)
+# v40.0-#5: 리스크 원인별 엔진 (유동성/에너지·지정학/국내추세)
+# v40.0-#6: 시간대별 리스크 프로파일
+# ============================================================
+def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> list:
+    """v40.0-#5: 리스크를 원인별로 분류.
+    반환: [{"type": str, "label": str, "score": int, "detail": str}, ...]
+    """
+    causes = []
+    try:
+        # ① 유동성 쇼크 (VIX/DXY/환율)
+        vix = float(us.get("vix", 20) or 20)
+        dxy = float(us.get("dxy", 104) or 104)
+        krw = float(us.get("krw_usd", 0) or 0)
+        krw_chg = float(us.get("krw_usd_chg", 0) or 0)
+        liq_score = 0
+        liq_parts = []
+        if vix >= 30:
+            liq_score += 40; liq_parts.append(f"VIX {vix:.0f} 공포")
+        elif vix >= 25:
+            liq_score += 20; liq_parts.append(f"VIX {vix:.0f} 불안")
+        if dxy >= 107:
+            liq_score += 15; liq_parts.append(f"달러 {dxy:.1f} 강세")
+        if krw >= 1400:
+            liq_score += 25; liq_parts.append(f"원화 {krw:.0f}원 위기")
+        elif krw_chg >= 0.8:
+            liq_score += 10; liq_parts.append(f"원화 급락 {krw_chg:+.1f}%")
+        if liq_score > 0:
+            causes.append({
+                "type": "liquidity", "label": "유동성 쇼크",
+                "score": liq_score, "detail": " / ".join(liq_parts)
+            })
+
+        # ② 에너지·지정학 쇼크
+        oil_chg = float(us.get("oil_chg", 0) or 0)
+        gold_chg = float(us.get("gold_chg", 0) or 0)
+        geo_active = bool(geo_state.get("active") and time.time() - float(geo_state.get("ts", 0) or 0) < 14400)
+        geo_unc = str(geo_state.get("uncertainty", "low") or "low")
+        eg_score = 0
+        eg_parts = []
+        if abs(oil_chg) >= 4.0:
+            eg_score += 20; eg_parts.append(f"유가 {oil_chg:+.1f}%")
+        elif abs(oil_chg) >= 2.0:
+            eg_score += 8; eg_parts.append(f"유가 {oil_chg:+.1f}%")
+        if gold_chg >= 2.0:
+            eg_score += 10; eg_parts.append(f"금 {gold_chg:+.1f}% (안전자산)")
+        if geo_active:
+            geo_add = {"high": 30, "mid": 15, "low": 5}.get(geo_unc, 5)
+            eg_score += geo_add
+            eg_parts.append(f"지정학 {geo_unc.upper()}")
+        if eg_score > 0:
+            causes.append({
+                "type": "energy_geo", "label": "에너지·지정학 쇼크",
+                "score": eg_score, "detail": " / ".join(eg_parts)
+            })
+
+        # ③ 국내 추세 붕괴
+        nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+        dom_score = 0
+        dom_parts = []
+        if kospi_5d <= -7.0:
+            dom_score += 40; dom_parts.append(f"코스피 5일 {kospi_5d:+.1f}% 급락")
+        elif kospi_5d <= -3.0:
+            dom_score += 20; dom_parts.append(f"코스피 5일 {kospi_5d:+.1f}% 하락")
+        if nasdaq_chg <= -3.0:
+            dom_score += 25; dom_parts.append(f"나스닥 {nasdaq_chg:+.1f}% 급락")
+        elif nasdaq_chg <= -1.5:
+            dom_score += 10; dom_parts.append(f"나스닥 {nasdaq_chg:+.1f}%")
+        if dom_score > 0:
+            causes.append({
+                "type": "domestic_trend", "label": "국내 추세 붕괴",
+                "score": dom_score, "detail": " / ".join(dom_parts)
+            })
+    except Exception:
+        pass
+    return sorted(causes, key=lambda x: -x["score"])
+
+
+def send_premarket_risk_assessment():
+    """v40.0-#3: 매일 08:30 장 시작 전 리스크 평가 (안전/경계/위험).
+    전영업일 + 오버나이트 데이터 기반으로 오늘 리스크 수준을 사전 판단.
+    주문을 넣을 수 있도록 08:30에 발송 (장 시작 30분 전).
+    """
+    if is_holiday():
+        return
+    try:
+        us = get_us_market_signals()
+        total_score = 0
+        parts = []
+
+        # 미국 시장
+        nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+        vix = float(us.get("vix", 20) or 20)
+        us_regime = us.get("us_regime", "neutral")
+        gap_signal = us.get("gap_signal", "flat")
+
+        # 코스피 5일 추세
+        kospi_5d = 0.0
+        try:
+            items = get_daily_data("0001", 10)
+            closes = [i["close"] for i in items if i.get("close")]
+            if len(closes) >= 5:
+                kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+        except Exception:
+            pass
+
+        # v40.0-#5: 리스크 원인별 분류
+        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
+        total_score = sum(c["score"] for c in causes)
+
+        # v40.0-#6: 시간대 프로파일 (금요일이면 추가 경계)
+        now = datetime.now()
+        if now.weekday() == 4:  # 금요일
+            total_score += 10
+            parts.append("📅 금요일 (주말 오버나이트 리스크)")
+
+        # 3단계 판정
+        if total_score >= 50:
+            level = "위험"
+            level_emoji = "🔴"
+            action = "신규 진입 축소 / 기존 포지션 정리 검토"
+        elif total_score >= 25:
+            level = "경계"
+            level_emoji = "🟡"
+            action = "신규 진입 보수적 / 손절 타이트하게"
+        else:
+            level = "안전"
+            level_emoji = "🟢"
+            action = "정상 운영"
+
+        msg = (f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
+               f"━━━━━━━━━━━━━━━\n"
+               f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
+               f"💡 권장: <b>{action}</b>\n")
+
+        # 리스크 원인별 표시
+        if causes:
+            msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
+            for c in causes[:3]:
+                c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+                msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
+
+        # 미국 시장 요약
+        msg += (f"\n🌐 <b>미국 시장</b>\n"
+                f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n")
+
+        if kospi_5d != 0:
+            msg += f"  코스피 5일: {kospi_5d:+.1f}%\n"
+
+        # 추적 중 종목 리스크 요약
+        try:
+            data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
+            tracking = [v for v in data.values() if v.get("status") == "추적중"]
+            if tracking and level in ("경계", "위험"):
+                msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
+                for rec in tracking[:5]:
+                    entry_p = rec.get("entry_price", 0)
+                    _name = rec.get("name", rec.get("code", ""))
+                    sig = get_signal_label(rec.get("signal_type", ""), "")
+                    msg += f"  • {_name} (진입 {entry_p:,}원) [{sig}]\n"
+        except Exception:
+            pass
+
+        # v40.0-#9: 유형별 승률 추가
+        try:
+            sig_stats = get_signal_type_stats()
+            stats_line = _format_signal_type_stats_line(sig_stats)
+            if stats_line:
+                msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+        except Exception:
+            pass
+
+        msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+        send(msg)
+
+    except Exception as e:
+        _log_error("send_premarket_risk_assessment", e)
+
+
 def send_premarket_briefing():
     """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
     if is_holiday(): return
@@ -10963,7 +11346,8 @@ def send_premarket_briefing():
         _cur_regime = get_market_regime()
         _r_hist = get_regime_history(_cur_regime)
         if _r_hist:
-            regime_kor = {"crisis":"위기","risk_off":"위험회피","normal":"보통","bull":"강세","euphoria":"과열"}
+            regime_kor = {"crash":"급락장","bear":"약세장","normal":"보통장","bull":"강세장",
+                         "crisis":"급락장","risk_off":"약세장","euphoria":"강세장","panic":"급락장"}
             msg += f"\n📊 <b>시장 국면</b>: {regime_kor.get(_cur_regime, _cur_regime)}\n  {_r_hist}\n"
     except Exception: pass
 
@@ -11024,6 +11408,14 @@ def send_premarket_briefing():
         msg += (f"\n━━━━━━━━━━━━━━━\n"
                 f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
                 f"{regime_warn}\n")
+    except Exception: pass
+
+    # v40.0-#9: 유형별 승률 표시
+    try:
+        sig_stats = get_signal_type_stats()
+        stats_line = _format_signal_type_stats_line(sig_stats)
+        if stats_line:
+            msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
     except Exception: pass
 
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
@@ -11102,12 +11494,22 @@ def send_weekly_report():
             weekly_compare = get_weekly_comparison(week_recs)
         except Exception: pass
 
+        # v40.0-#9: 전체 누적 유형별 승률
+        cum_stats_line = ""
+        try:
+            cum_stats = get_signal_type_stats(data)
+            cum_stats_line = _format_signal_type_stats_line(cum_stats)
+            if cum_stats_line:
+                cum_stats_line = f"\n\n📊 <b>누적 유형별 승률</b>\n  {cum_stats_line}"
+        except Exception: pass
+
         send(
             f"📅 <b>주간 자동 리포트</b>\n"
             f"{this_mon[:4]}.{this_mon[4:6]}.{this_mon[6:]} ~ {this_fri[:4]}.{this_fri[4:6]}.{this_fri[6:]}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"{report_text}"
             f"{weekly_compare}"
+            f"{cum_stats_line}"
         )
 
         # ── AI 분석 (Claude API) ──
@@ -11300,7 +11702,7 @@ def regime_message_line() -> str:
         r = get_market_regime()
         parts = [regime_label()]
         if r.get("us_regime") in ("panic", "risk_off", "risk_on"):
-            us_map = {"panic": "미국패닉", "risk_off": "미국위험회피", "risk_on": "미국위험선호"}
+            us_map = {"panic": "미국급락장", "risk_off": "미국약세장", "risk_on": "미국강세장"}
             parts.append(us_map.get(r.get("us_regime"), ""))
         if r.get("nxt_only"):
             parts.append("NXT단독")
@@ -12156,6 +12558,7 @@ def _on_market_open():
     _clear_all_cache()
     _overnight_state.update({"last_us_regime":"neutral","last_vix":20.0,
                               "alerted_regime":"","summary_lines":[]})
+    _upper_limit_day_alerted.clear()  # v40.0-#10: 상한가 당일 추적 초기화
     reset_top_signals_daily()
     refresh_dynamic_candidates()
     send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
@@ -12177,10 +12580,24 @@ def run_scan():
 
         # KRX 스캔 (장 중에만)
         if krx_open:
+            today_date = datetime.now().strftime("%Y%m%d")
             for stock in get_upper_limit_stocks():
                 if stock["code"] in seen: continue
+                # v40.0-#10: 상한가 유지 종목 당일 재알림 차단
+                _ul_rec = _upper_limit_day_alerted.get(stock["code"])
+                if _ul_rec and _ul_rec.get("date") == today_date:
+                    cr = stock.get("change_rate", 0)
+                    if cr >= 29.0:
+                        # 아직 상한가 유지 중 → 차단
+                        continue
+                    else:
+                        # 상한가 풀림 → 초기화 (재차 상한가 도달 시 다시 알림 가능)
+                        _upper_limit_day_alerted.pop(stock["code"], None)
                 r = analyze(stock)
                 if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
+                    # v40.0-#10: 상한가 감지면 당일 기록
+                    if r.get("signal_type") in ("UPPER_LIMIT", "NEAR_UPPER"):
+                        _upper_limit_day_alerted[r["code"]] = {"date": today_date, "alerted": True}
                     alerts.append(r); seen.add(r["code"])
             for stock in get_volume_surge_stocks():
                 if stock["code"] in seen: continue
@@ -12373,6 +12790,7 @@ if __name__ == "__main__":
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("08:30").do(send_premarket_risk_assessment)  # v40.0-#3: 장전 리스크 평가
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
