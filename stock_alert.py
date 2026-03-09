@@ -3,26 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v39.3-quality1
+버전: v39.4-polish1
 날짜: 2026-03-09
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v39.3-quality1 (2026-03-09): 운영 품질 9건 + 로그 버그 2건 + 사진 추천 3건 통합 수정.
-  [#1] 오버나이트 시간 가드: 20:10~07:29만 → 장중(08:00↑) 알림 차단.
-  [#1b] 07:30 브리핑 놓침 보완: 봇 시작 시 07:30~09:00이면 자동 발송.
-  [#2] ETF/레버리지 추적결과: 사용자 알림 차단, 내부 기록만 (기본수칙 #16).
-  [#3] 동일종목 추적결과 중복 방지: code+날짜 기반 2차 dedup 추가.
-  [#5] "진입 못 했다면" 제거: 미응답=미진입 자동 처리.
-  [#6] 손절/결과 메시지에 현재가 필드 추가.
-  [#9-2] MID_PULLBACK↔ENTRY_POINT 동일종목 중복 억제.
-  [#9-4] MIN_SAMPLES 5→10 (학습 신뢰도 향상).
-  [#9-5] 섹터당 최대 신호 3개 제한 (집중도 향상).
-  [B1] _consecutive_win_count UnboundLocalError 수정 (global 추가).
-  [B2] DART now_hhmmss NameError 수정.
-  이유: v39.2(다른AI) 운영 로그에서 11건 문제 확인. 설계원칙 사진 5건 중 3건 타당 적용.
-  영향: 불필요 알림 대폭 감소, 중복 제거, 장중 오버나이트 차단, 에러 0건 목표.
-- v39.0-moneyflow1 (2026-03-08): 자금흐름 기반 포착. 안정 기준 베이스.
+- v39.4-polish1 (2026-03-09): 7건 운영 품질 + 로그 오류 수정.
+  [#1] regime NameError 수정: analyze_mid_pullback에서 `regime` → `_regime` (눌림목 스캔 전체 실패 원인).
+  [#1b] korea_etf_snapshot NameError 수정: save_signal_log에서 변수 미정의 → _get_korea_etf_snapshot() 호출 추가.
+  [#2] "눌림목" 명칭 전면 통일: 중기/단기/장기 구분 삭제 → 코드 전반 35곳 "눌림목"으로 통일. SIG_LABELS/SIG_TITLES/인라인/auto_tune/stats 모두 반영.
+  [#3] 장 시작/마감 메시지: 이미 스케줄 존재 확인. _on_market_open(09:00) + on_market_close(15:30) 정상 발송.
+  [#4] 대장 종목 부각 + 중복 제거: 섹터 모니터링에서 👑 대장을 별도 블록으로 강조, 하위 리스트에서 중복 제거.
+  [#5] 원/달러 환율(KRW=X) 추가: Yahoo Finance KRW=X 실시간 수집. 원화 급락(+0.8%↑) → -3점, 원화 강세(-0.8%↓) → +2점, 1400원↑ → -5점 위기 보정. 오버나이트/장전 브리핑에 표시.
+  [#6] 대시보드 변동사항만 업데이트: 레짐/감시종목/성과 해시 비교 → 변동 없으면 편집 스킵.
+  [#7] "기타업종: 동업종 조회 중" → 30초 후 배경 재조회, 성공 시 섹터 정보 별도 발송 (눌림목/DART 모두 적용).
+  이유: 로그에서 눌림목 전체 실패(regime NameError 60+회) + 사용자 UX 7건 개선 요청.
+  영향: 눌림목 스캔 정상화, 환율 반영으로 외국인 자금흐름 판단↑, 불필요 대시보드 업데이트↓.
+- v39.3-quality1 (2026-03-09): 운영 품질 12건 수정. 안정 기준 베이스.
 
 [참고]
 - 더 오래된 변경 이력은 운영 로그/백업 기준으로 관리.
@@ -33,7 +30,7 @@
 SIG_LABELS = {
     "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
     "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목",
-    "ENTRY_POINT": "단기눌림목", "STRONG_BUY": "강력매수",
+    "ENTRY_POINT": "눌림목", "STRONG_BUY": "강력매수",
 }
 SIG_TITLES = {
     "UPPER_LIMIT": "상한가 감지", "NEAR_UPPER": "상한가 근접",
@@ -509,7 +506,7 @@ ATR_TARGET_MULT  = 3.0
 STRICT_OPEN_MINUTES  = 10
 STRICT_CLOSE_MINUTES = 10
 
-# ⑭ 중기 눌림목 파라미터
+# ⑭ 눌림목 파라미터
 MID_PULLBACK_SCAN_INTERVAL = 90     # 300→90초 (일봉 기반이라 이 이상 빠르면 의미 없음)
 MID_SURGE_MIN_PCT          = 15.0
 MID_SURGE_LOOKBACK_DAYS    = 20
@@ -1701,7 +1698,7 @@ def get_volume_zscore(code: str, today_vol: int) -> float:
     return round((today_vol - mean) / std, 2) if std > 0 else 0.0
 
 # ============================================================
-# ⑭ 중기 눌림목 핵심 분석 함수
+# ⑭ 눌림목 핵심 분석 함수
 # ============================================================
 def analyze_mid_pullback(code: str, name: str) -> dict:
     """
@@ -1925,11 +1922,11 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "reasons":       reasons,
         "detected_at":   datetime.now(),
         "market_regime_label": regime_label(),
-        "market_regime_mode": regime.get("mode", _regime_mode),
+        "market_regime_mode": _regime.get("mode", "normal"),
     }
 
 # ============================================================
-# 중기 눌림목 스캐너 후보군 자동 확장
+# 눌림목 스캐너 후보군 자동 확장
 # ============================================================
 _dynamic_candidates = {}   # code → {name, desc, added_ts}
 
@@ -2404,19 +2401,19 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     }
 
 # ============================================================
-# 중기 눌림목 스캐너 — THEME_MAP + 동적 후보군 전체 스캔
+# 눌림목 스캐너 — THEME_MAP + 동적 후보군 전체 스캔
 # ============================================================
 def run_mid_pullback_scan():
     """
-    90초마다 전체 후보군 중기 눌림목 체크
-    ① 일봉 완성 기준 중기 눌림목 (KRX 장중에만)
+    90초마다 전체 후보군 눌림목 체크
+    ① 일봉 완성 기준 눌림목 (KRX 장중에만)
     ② KRX 마감 후에도 NXT 급등 종목은 눌림목 체크 계속
     """
     krx_open = is_market_open()
     nxt_open = is_nxt_open()
     if not krx_open and not nxt_open: return
     if _bot_paused: return
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 중기 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...", flush=True)
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...", flush=True)
 
     # 동적 후보군 갱신 (30분마다)
     if not _dynamic_candidates or time.time() - min(
@@ -2431,7 +2428,7 @@ def run_mid_pullback_scan():
         if time.time() - _mid_pullback_alert_history.get(code, 0) < MID_ALERT_COOLDOWN:
             continue
         try:
-            # ① 일봉 기준 중기 눌림목
+            # ① 일봉 기준 눌림목
             result = analyze_mid_pullback(code, name)
             if not result:
                 # ② 일봉 패턴 미완성이면 장중 돌파 감지로 재시도
@@ -2445,11 +2442,11 @@ def run_mid_pullback_scan():
                 signals.append(result)
             time.sleep(0.3)
         except Exception as e:
-            print(f"⚠️ 중기 눌림목 오류 ({code}): {e}")
+            print(f"⚠️ 눌림목 오류 ({code}): {e}")
             continue
 
     if not signals:
-        print("  → 중기 눌림목 조건 충족 종목 없음")
+        print("  → 눌림목 조건 충족 종목 없음")
         return
 
     signals.sort(key=lambda x: x["score"], reverse=True)
@@ -2463,7 +2460,7 @@ def run_mid_pullback_scan():
         start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True)  # ★ 섹터 지속 모니터링
         _mid_pullback_alert_history[s["code"]] = time.time()
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
-        print(f"  ✓ 중기 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
+        print(f"  ✓ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
 
 def send_mid_pullback_alert(s: dict):
     stock_name  = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
@@ -2509,12 +2506,32 @@ def send_mid_pullback_alert(s: dict):
             sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
     elif theme:
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
+        # v39.4-#7: 조회 실패 시 배경 재조회 → 성공 시 섹터 정보 별도 발송
+        def _deferred_sector_lookup(code, name, theme, delay=30, retries=3):
+            for attempt in range(retries):
+                time.sleep(delay)
+                try:
+                    si_retry = calc_sector_momentum(code, name)
+                    if si_retry.get("bonus", 0) > 0 or si_retry.get("rising"):
+                        _summary = si_retry.get("summary", "")
+                        _leader = si_retry.get("leader")
+                        _lines = f"🏭 <b>섹터 [{theme}] 조회 완료</b>\n  {_summary}\n"
+                        if _leader and isinstance(_leader, dict):
+                            _lines += f"  👑 <b>대장: {_leader['name']}</b> {_leader.get('cr',0):+.1f}%\n"
+                        for r in si_retry.get("rising", [])[:4]:
+                            if _leader and r["code"] == _leader["code"]: continue
+                            _lines += f"  🟩 {r['name']} {r['change_rate']:+.1f}%\n"
+                        send(_lines)
+                        return
+                except Exception:
+                    pass
+        threading.Thread(target=_deferred_sector_lookup, args=(s["code"], stock_name, theme), daemon=True).start()
     else:
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터: 조회 실패\n"
 
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     send_with_chart_buttons(
-        f"{grade_emoji} <b>[중기 눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
+        f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
@@ -3287,7 +3304,7 @@ def get_news_cooccur_peers(code: str) -> list:
 # ============================================================
 def auto_update_theme(code: str, name: str, trigger: str = "급등"):
     """
-    급등/상한가/중기눌림목 포착 시 해당 종목의 상관관계 종목을 동적 테마로 등록
+    급등/상한가/눌림목 포착 시 해당 종목의 상관관계 종목을 동적 테마로 등록
     trigger: 왜 이 테마가 만들어졌는지 (알림에 표시됨)
     """
     global _dynamic_theme_map
@@ -4034,6 +4051,11 @@ def save_signal_log(stock: dict):
 
         # ── 최적화용 스냅샷 (신호 당시 조건/상황) ──
         params_snapshot = _get_params_snapshot()
+        # v39.4: korea_etf_snapshot 변수 정의 (NameError 방지)
+        try:
+            korea_etf_snapshot = _get_korea_etf_snapshot(code, stock_name, sig_type, stock.get("sector_info", {}).get("theme", ""))
+        except Exception:
+            korea_etf_snapshot = {}
         feature_snapshot = {
             "regime": stock.get("regime", "normal"),
             "nxt_open": bool(is_nxt_open()),
@@ -4358,8 +4380,8 @@ def _send_pending_result_reminder():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+            "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
         }
         for v in pending:
             entry = v.get("entry_price", 0)
@@ -4770,7 +4792,7 @@ def _send_tracking_result(rec: dict):
     sig_labels = {
         "UPPER_LIMIT":"상한가", "NEAR_UPPER":"상한가근접",
         "SURGE":"급등", "EARLY_DETECT":"조기포착",
-        "MID_PULLBACK":"중기눌림목", "ENTRY_POINT":"단기눌림목",
+        "MID_PULLBACK":"눌림목", "ENTRY_POINT":"눌림목",
         "STRONG_BUY":"강력매수",
     }
     sig_label = sig_labels.get(sig_type, sig_type)
@@ -4890,7 +4912,7 @@ def check_reentry_watch():
             if bounce >= _reentry_min and vr >= REENTRY_VOL_MIN:
                 sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
                               "SURGE":"급등","EARLY_DETECT":"조기포착",
-                              "MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목"}
+                              "MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목"}
                 sig = sig_labels.get(w["signal_type"], w["signal_type"])
                 stop_new, target_new, sp, tp, atr = calc_stop_target(code, price)
                 rr = round((target_new - price) / (price - stop_new), 1) if price > stop_new else 0
@@ -4998,7 +5020,7 @@ _dynamic = {
     # 조기 포착
     "early_price_min":    EARLY_PRICE_MIN,
     "early_volume_min":   EARLY_VOLUME_MIN,
-    # 중기 눌림목
+    # 눌림목
     "mid_surge_min_pct":  MID_SURGE_MIN_PCT,
     "mid_pullback_min":   MID_PULLBACK_MIN,
     "mid_pullback_max":   MID_PULLBACK_MAX,
@@ -5234,8 +5256,8 @@ def analyze_loss_pattern(completed: list) -> str:
     worst_type = max(type_counts, key=type_counts.get) if type_counts else None
     if worst_type:
         type_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-                       "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수"}
+                       "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+                       "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수"}
         lines.append(f"  손실 많은 신호: {type_labels.get(worst_type, worst_type)} ({type_counts[worst_type]}건)")
 
     # 단독 vs 테마 손실 비율
@@ -5377,14 +5399,14 @@ def auto_tune(notify: bool = True):
                 _dynamic["mid_surge_min_pct"] = min(old_surge + 3.0, 25.0)
                 _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 15.0)
                 _dynamic["mid_pullback_max"]  = max(old_max - 5.0, 30.0)
-                changes.append(f"🏆 중기눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
+                changes.append(f"🏆 눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%\n"
                                 f"   눌림범위 {old_min}~{old_max}→"
                                 f"{_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%")
             elif rate > 0.70:
                 _dynamic["mid_surge_min_pct"] = max(old_surge - 2.0, 10.0)
                 _dynamic["mid_pullback_min"]  = max(old_min - 2.0, 8.0)
-                changes.append(f"🏆 중기눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
+                changes.append(f"🏆 눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
 
         # ── ④ 최소 점수 조정 ──
@@ -5812,7 +5834,18 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                     lines   = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
                     lines  += _sector_origin_line(code, info)
                     lines  += f"  {summary}\n" if summary else ""
+                    # v39.4-#4: 대장 종목 부각 + 하위 리스트에서 중복 제거
+                    leader = si.get("leader")
+                    leader_code = leader["code"] if isinstance(leader, dict) else None
+                    if leader and isinstance(leader, dict):
+                        lines += (f"  ━━━━━━━━━━━━━\n"
+                                  f"  👑 <b>대장: {leader['name']}</b>  "
+                                  f"<b>{leader.get('cr',0):+.1f}%</b>  "
+                                  f"거래량 {leader.get('vr',0):.1f}배  "
+                                  f"점수 {leader.get('score',0):.2f}\n"
+                                  f"  ━━━━━━━━━━━━━\n")
                     for r in rising[:5]:
+                        if r["code"] == leader_code: continue  # 대장은 위에서 이미 표시
                         vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
                         wsuf  = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
@@ -5926,8 +5959,8 @@ def send_top_signals():
 
     sig_labels = {
         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+        "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+        "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
     }
     top5  = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:5]
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
@@ -6113,7 +6146,7 @@ def check_entry_watch():
                 watch["notify_count"]     = notify_count + 1
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목","ENTRY_POINT":"단기눌림목",
+                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
                 }
                 sig       = sig_labels.get(watch["signal_type"], watch["signal_type"])
                 diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
@@ -6458,8 +6491,8 @@ def update_dashboard(force: bool = False) -> None:
     except Exception:
         pass
 
-    """대시보드 메시지(1개)를 편집 업데이트해서 메시지량 감소."""
-    global _LAST_DASHBOARD_TS
+    """대시보드 메시지(1개)를 편집 업데이트 — v39.4: 변동사항 있을 때만."""
+    global _LAST_DASHBOARD_TS, _LAST_DASHBOARD_HASH
     now = time.time()
     if (not force) and (now - _LAST_DASHBOARD_TS) < DASHBOARD_UPDATE_EVERY_SEC:
         return
@@ -6497,6 +6530,12 @@ def update_dashboard(force: bool = False) -> None:
     if perf:
         text += f"• 오늘 성과: {perf}\n"
     text += f"• 업데이트: {datetime.now().strftime('%m-%d %H:%M')}\n"
+
+    # v39.4-#6: 내용 해시 비교 → 변동 없으면 스킵 (메시지량 감소)
+    content_hash = hashlib.md5(f"{regime}{tracked_n}{perf}".encode()).hexdigest()[:8]
+    if not force and hasattr(update_dashboard, '_last_hash') and update_dashboard._last_hash == content_hash:
+        return  # 변동 없음 → 업데이트 불필요
+    update_dashboard._last_hash = content_hash
 
     state = _load_dashboard_state()
     mid = state.get("message_id")
@@ -6553,7 +6592,7 @@ def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     """
     신호 유형 + 점수 → 중요도 레벨 결정
     CRITICAL: 상한가·강력매수·NXT보정 +10 이상 고점수
-    NORMAL:   급등·조기포착·중기눌림목
+    NORMAL:   급등·조기포착·눌림목
     INFO:     참고용 섹터 업데이트·낮은 점수
     """
     if signal_type in ("UPPER_LIMIT", "STRONG_BUY"): return ALERT_LEVEL_CRITICAL
@@ -7442,7 +7481,7 @@ def check_early_detection() -> list:
     return signals
 
 # ============================================================
-# 단기 눌림목 체크 (당일 급등 후)
+# 눌림목 체크 (당일 급등 후)
 # ============================================================
 def check_pullback_signals() -> list:
     signals = []
@@ -7467,7 +7506,7 @@ def check_pullback_signals() -> list:
                                  "entry_price":entry,"stop_loss":stop,"target_price":target,
                                  "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                                  "prev_upper":False,
-                                 "reasons":[f"🎯 단기 눌림목{carry_text}",
+                                 "reasons":[f"🎯 눌림목{carry_text}",
                                             f"📌 고점 {high:,}원 → 현재 {price:,}원 (-{pullback:.1f}%)",
                                             f"⏱ 급등 후 {minutes_since(detected_at)}분 경과"],
                                  "detected_at":detected_at})
@@ -9528,6 +9567,19 @@ def run_dart_intraday():
                     sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
             elif theme:
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
+                # v39.4-#7: 배경 재조회 (DART 알림용)
+                def _dart_sector_retry(_code, _name, _theme):
+                    time.sleep(30)
+                    try:
+                        si2 = calc_sector_momentum(_code, _name)
+                        if si2.get("rising"):
+                            _l = si2.get("leader")
+                            _msg = f"🏭 <b>섹터 [{_theme}] 조회 완료</b>\n  {si2.get('summary','')}\n"
+                            if _l and isinstance(_l, dict):
+                                _msg += f"  👑 <b>대장: {_l['name']}</b> {_l.get('cr',0):+.1f}%\n"
+                            send(_msg)
+                    except Exception: pass
+                threading.Thread(target=_dart_sector_retry, args=(code, company, theme), daemon=True).start()
 
             # 심층 분석 블록
             deep_block = ""
@@ -9826,8 +9878,8 @@ def poll_telegram_commands():
                     today_str = datetime.now().strftime("%m/%d")
                     sig_labels = {
                         "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-                        "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+                        "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+                        "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
                     }
                     today_recs   = [v for v in data.values() if v.get("detect_date") == today]
                     done_today   = [v for v in today_recs if v.get("status") != "추적중"]
@@ -10476,8 +10528,8 @@ def _send_stats():
             "STRONG_BUY":   "💎 강력매수",
             "SURGE":        "📈 급등",
             "EARLY_DETECT": "🔍 조기포착",
-            "ENTRY_POINT":  "🎯 단기눌림목",
-            "MID_PULLBACK": "🏆 중기눌림목",
+            "ENTRY_POINT":  "🎯 눌림목",
+            "MID_PULLBACK": "🏆 눌림목",
             "MANUAL":       "✏️ 수동",
         }
 
@@ -10700,8 +10752,8 @@ def on_market_close():
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+            "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
         }
 
         msg = f"🔔 <b>장 마감 리포트</b>  {today_str}\n━━━━━━━━━━━━━━━\n"
@@ -10924,7 +10976,7 @@ def send_premarket_briefing():
     if tuned:
         msg += (f"\n⚙️ <b>자동 조정된 파라미터</b>\n"
                 f"  조기포착 기준: {_dynamic['early_price_min']:.0f}%  "
-                f"중기눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
+                f"눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
                 f"  최소점수: {_dynamic['min_score_normal']}점\n")
 
     # ── ⑤ NXT 장전 동향 (08:00~09:00 사이에만) ──
@@ -11019,8 +11071,8 @@ def send_weekly_report():
 
         type_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-            "EARLY_DETECT":"조기포착","MID_PULLBACK":"중기눌림목",
-            "ENTRY_POINT":"단기눌림목","STRONG_BUY":"강력매수",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+            "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
         }
         type_lines = ""
         for t, ps in sorted(by_type.items(), key=lambda x: -len(x[1])):
@@ -11089,8 +11141,8 @@ def _send_ai_analysis(week_recs: list, summary: str):
         params_text = (
             f"조기포착 최소가격변동: {_dynamic['early_price_min']}%\n"
             f"조기포착 최소거래량: {_dynamic['early_volume_min']}배\n"
-            f"중기눌림목 1차급등: {_dynamic['mid_surge_min_pct']}%\n"
-            f"중기눌림목 눌림범위: {_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%\n"
+            f"눌림목 1차급등: {_dynamic['mid_surge_min_pct']}%\n"
+            f"눌림목 눌림범위: {_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%\n"
             f"최소점수(일반/엄격): {_dynamic['min_score_normal']}/{_dynamic['min_score_strict']}점\n"
             f"테마보너스: {_dynamic['themed_score_bonus']}점"
         )
@@ -11742,15 +11794,17 @@ def get_us_market_signals() -> dict:
         "gap_signal": "flat", "score_adj": 0, "summary": "",
         # v38.5: 추가 선물·지표
         "sp500_chg": 0.0, "gold_chg": 0.0, "oil_chg": 0.0, "tnx": 0.0,
+        "krw_usd": 0.0, "krw_usd_chg": 0.0,  # v39.4: 원/달러 환율
     }
     try:
-        # v38.5: 기존 3개 + 신규 4개 = 7개 지표
+        # v39.4: 기존 7개 + KRW/USD = 8개 지표
         symbols = {
             "NQ=F": "nasdaq", "^VIX": "vix", "DX-Y.NYB": "dxy",
             "ES=F": "sp500",   # S&P 500 선물
             "GC=F": "gold",    # 금 선물 (안전자산 지표)
             "CL=F": "oil",     # WTI 원유 선물 (에너지·인플레 지표)
             "^TNX": "tnx",     # 미국 10년 국채 수익률 (금리·채권 지표)
+            "KRW=X": "krw",    # v39.4: 원/달러 환율 (외국인 자금흐름 핵심)
         }
         values  = {}
         for sym, key in symbols.items():
@@ -11768,6 +11822,10 @@ def get_us_market_signals() -> dict:
                     values["dxy"] = round(float(cur_price), 2)
                 elif key == "tnx":
                     values["tnx"] = round(float(cur_price), 3)  # 수익률 %
+                elif key == "krw":
+                    values["krw_usd"] = round(float(cur_price), 1)  # v39.4: 원/달러
+                    if prev_close and cur_price:
+                        values["krw_usd_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
                 elif prev_close and cur_price:
                     chg = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
                     values[f"{key}_chg"] = chg
@@ -11781,6 +11839,8 @@ def get_us_market_signals() -> dict:
         gold_chg   = values.get("gold_chg", 0.0)
         oil_chg    = values.get("oil_chg", 0.0)
         tnx        = values.get("tnx", 0.0)
+        krw_usd    = values.get("krw_usd", 0.0)
+        krw_usd_chg = values.get("krw_usd_chg", 0.0)
 
         # ── 미국 시장 국면 판단 ──
         if vix >= 35 or nasdaq_chg <= -3.0:
@@ -11808,6 +11868,14 @@ def get_us_market_signals() -> dict:
         if dxy >= 107:
             score_adj -= 5
 
+        # ── v39.4: 원/달러 환율 보정 (외국인 자금흐름 핵심) ──
+        if krw_usd >= 1400:
+            score_adj -= 5  # 원화 위기 수준 → 외국인 대량 이탈 위험
+        elif krw_usd_chg >= 0.8:
+            score_adj -= 3  # 원화 급락(달러 대비) → 외국인 매도 유인
+        elif krw_usd_chg <= -0.8:
+            score_adj += 2  # 원화 강세 → 외국인 매수 유인
+
         # ── v38.5: 원자재·금리 보정 ──
         # 금 급등 = 안전자산 선호(risk-off 강화)
         if gold_chg >= 2.0:
@@ -11828,6 +11896,7 @@ def get_us_market_signals() -> dict:
         gap_emoji    = {"gap_up":"⬆️","flat":"➡️","gap_down":"⬇️"}
         # 핵심 3개 + 추가 지표 압축
         extra_parts = []
+        if krw_usd: extra_parts.append(f"원/달러{krw_usd:.0f}원({krw_usd_chg:+.1f}%)")
         if gold_chg: extra_parts.append(f"금{gold_chg:+.1f}%")
         if oil_chg: extra_parts.append(f"유가{oil_chg:+.1f}%")
         if tnx: extra_parts.append(f"10Y{tnx:.2f}%")
@@ -11846,6 +11915,8 @@ def get_us_market_signals() -> dict:
             # v38.5: 추가 지표
             "sp500_chg": sp500_chg, "gold_chg": gold_chg,
             "oil_chg": oil_chg, "tnx": tnx,
+            # v39.4: 원/달러
+            "krw_usd": krw_usd, "krw_usd_chg": krw_usd_chg,
         })
         MARKET_REGIME.update(compute_market_regime(nasdaq_chg, vix, dxy))
         _us_cache.update(result)
@@ -12126,7 +12197,7 @@ def run_scan():
                     r["market"] = "NXT"
                     alerts.append(r); seen.add(stock["code"])
 
-        # 조기포착·단기눌림목은 KRX 장중에만 의미 있음
+        # 조기포착·눌림목은 KRX 장중에만 의미 있음
         if krx_open:
             for s in check_early_detection():
                 if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>ALERT_COOLDOWN:
@@ -12284,7 +12355,7 @@ if __name__ == "__main__":
         "🔒 스레드 안전성 활성 (v38.3)\n\n"
         "<b>📡 스캔 주기</b>\n"
         "• 급등/상한가 스캔: <b>20초</b>\n"
-        "• 중기 눌림목: <b>90초</b>\n"
+        "• 눌림목: <b>90초</b>\n"
         f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
         "• DART 공시: <b>60초</b>\n"
         "• 텔레그램 명령어: <b>10초</b>\n"
