@@ -6663,6 +6663,10 @@ def _save_dashboard_state(state: dict) -> None:
         pass
 
 def update_dashboard(force: bool = False) -> None:
+    # 장 운영 시간에만 텔레그램 대시보드 갱신
+    if not is_any_market_open():
+        return
+
     # ensure MARKET_REGIME is populated; fall back to US signals if needed
     try:
         us = get_us_market_signals()
@@ -9040,8 +9044,6 @@ def run_geo_news_scan():
         last_sent = _geo_event_state.get("last_sent_ts", 0)
         if time.time() - last_sent < 3600:
             return
-        _geo_event_state["last_sent_ts"] = time.time()
-
         unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
         msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
@@ -9088,7 +9090,17 @@ def run_geo_news_scan():
         if geo.get("summary"):
             msg += f"\n💡 {geo['summary']}"
 
-        send(msg)
+        if is_any_market_open():
+            last_sent_msg = str(_geo_event_state.get("last_sent_msg", "") or "")
+            msg_compare = "\n".join(line.rstrip() for line in msg.strip().splitlines())
+            if last_sent_msg == msg_compare:
+                print("🌍 지정학 이벤트 감지 — 장중 동일 내용 재발송 생략")
+                return
+            send(msg)
+            _geo_event_state["last_sent_ts"] = time.time()
+            _geo_event_state["last_sent_msg"] = msg_compare
+        else:
+            print("🌍 지정학 이벤트 감지 — 장외 시간 텔레그램 발송 비활성화")
 
     except Exception as e:
         _log_error("run_geo_news_scan", e)
@@ -11736,14 +11748,15 @@ KOREA_ETF_BUCKET_WEIGHTS_DEFAULT = {
     "smallcap":      0.35,
 }
 _geo_event_state: dict = {
-    "active":        False,
-    "uncertainty":   "low",
-    "sectors":       [],
-    "score_adj":     0,
-    "summary":       "",
-    "entities":      [],
-    "ts":            0,
-    "last_sent_ts":  0,
+    "active":         False,
+    "uncertainty":    "low",
+    "sectors":        [],
+    "score_adj":      0,
+    "summary":        "",
+    "entities":       [],
+    "ts":             0,
+    "last_sent_ts":   0,
+    "last_sent_msg":  "",
 }
 
 
