@@ -4466,7 +4466,7 @@ def run_overnight_monitor():
             if _sp: extra.append(f"S&P{_sp:+.1f}%")
             if extra:
                 msg += f"\n📊 {' '.join(extra)}"
-            send(msg)
+            print("🌙 오버나이트 알림 감지 — 텔레그램 발송 비활성화")
         elif alerts:
             print(f"  🌙 오버나이트(대기모드): {len(alerts)}건 — 내부 저장만")
 
