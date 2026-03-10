@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.2
+버전: v41.3
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.3 (2026-03-10): 체결지속속도 기반 진입 준비/확정 로직 추가.
+  [#1] 최근 시세 조회 스냅샷(가격·누적거래량·호가잔량)을 버퍼링해, 미세체결(낮은 체결금액) 필터를 거친 `execution_speed_score`와 `dip_resilience_score`를 계산하는 체결지속속도 엔진을 추가.
+  [#2] EARLY_DETECT / NEAR_UPPER / SURGE / PRECLOSE_GAP_ENTRY는 알림 직후 바로 진입가 감시로 넘기지 않고, 하락 중에도 체결지속속도가 유지되는지 확인하는 `진입준비` 상태로 저장한 뒤 확인 시점 가격으로 진입가·손절가·목표가를 확정하도록 변경.
+  [#3] ENTRY_POINT는 체결지속속도를 확인 필터로, MID_PULLBACK은 약한 가산점으로 반영해 신호 성격별 비중을 분리.
+  [#4] signal_log와 feature_snapshot에 체결지속속도/눌림유지/미세체결 제외비율/진입준비 여부를 함께 저장하고, 진입 확정 시 entry_hit/확정시각/확정가격으로 갱신해 후속 학습에 활용 가능하게 정리.
+  이유: 사용자가 원하는 진입 판단은 단순 상승 속도가 아니라 가격이 눌리는 동안에도 거래 흐름이 죽지 않는지 확인한 뒤 진입가를 확정하는 구조이므로, 빠른 신호군과 눌림목 계열의 역할을 나눠 최소 범위로 반영할 필요가 있기 때문.
+  개선점: 빠른 신호군 추격매수 완화↑, 눌림 유지 확인력↑, 진입준비→진입확정 데이터 일관성↑, 미세체결 잡음 완화↑.
+  주의점: 체결지속속도는 KIS 현재가 조회를 주기적으로 누적한 스냅샷 기반 추정치이며, 초단위 실제 체결 원본과는 차이가 있을 수 있다. 장 초반/초기 샘플 부족 구간에서는 보수적으로 `샘플 부족`으로 처리된다.
+  영향: 일부 빠른 신호는 즉시 진입가 감시 대신 `체결 확인 후 진입 확정` 흐름으로 바뀌며, 포착/선진입 메시지에 체결지속속도 요약이 함께 표시된다.
 - v41.2 (2026-03-10): 익영업일 갭상승 선진입 후보 + 장마감 전 진입가 도달 감시 추가.
   [#1] 기존 14:45/19:20 익개장 갭상승 후보 알림을 "익영업일 갭상승 선진입 후보"로 재구성하고, 각 종목에 현재가·오늘 선진입가·손절가·익일 목표가·손익비를 함께 표시.
   [#2] 새 신호유형 PRECLOSE_GAP_ENTRY를 추가해 signal_log에 별도 기록하고, 점수·가격계획·시장기준(KRX/NXT)·갭예측 메타데이터를 저장해 기존 성과 통계/학습 흐름에 편입.
@@ -2240,6 +2249,465 @@ def _read_json_safe(path: str, default):
     except Exception:
         return default
 
+FAST_EXECUTION_SIGNAL_TYPES = {"EARLY_DETECT", "NEAR_UPPER", "SURGE", PRECLOSE_GAP_SIGNAL_TYPE}
+ENTRY_EXECUTION_SIGNAL_TYPES = {"ENTRY_POINT"}
+MID_EXECUTION_SIGNAL_TYPES = {"MID_PULLBACK"}
+EXEC_SPEED_WINDOW_SEC = int(os.getenv("EXEC_SPEED_WINDOW_SEC", "90") or "90")
+EXEC_SPEED_MIN_SAMPLES = int(os.getenv("EXEC_SPEED_MIN_SAMPLES", "4") or "4")
+EXEC_SPEED_MICRO_TRADE_MIN_KRW = int(os.getenv("EXEC_SPEED_MICRO_TRADE_MIN_KRW", "300000") or "300000")
+EXEC_SPEED_CONFIRM_MIN_SCORE_FAST = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_FAST", "55") or "55")
+EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY", "45") or "45")
+EXEC_SPEED_CONFIRM_MIN_DIP_SCORE = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_DIP_SCORE", "55") or "55")
+EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT", "0.35") or "0.35")
+EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT", "3.2") or "3.2")
+EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.55") or "0.55")
+EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
+_execution_snapshots: dict = {}
+_execution_setup_watch: dict = {}
+
+
+def _prune_execution_snapshots(code: str, now_ts: float | None = None) -> None:
+    now_ts = float(now_ts or time.time())
+    buf = _execution_snapshots.get(code)
+    if not isinstance(buf, list):
+        return
+    cutoff = now_ts - max(EXEC_SPEED_WINDOW_SEC * 4, 360)
+    _execution_snapshots[code] = [s for s in buf if float(s.get("ts", 0) or 0) >= cutoff][-80:]
+
+
+def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") -> None:
+    code = normalize_stock_code(code)
+    if not code or not isinstance(payload, dict):
+        return
+    price = safe_int(payload.get("price", 0))
+    today_vol = safe_int(payload.get("today_vol", 0))
+    if price <= 0 or today_vol <= 0:
+        return
+    now_ts = time.time()
+    buf = _execution_snapshots.setdefault(code, [])
+    prev = buf[-1] if buf else {}
+    prev_vol = safe_int(prev.get("today_vol", 0))
+    vol_delta = max(today_vol - prev_vol, 0)
+    trade_value_delta = int(vol_delta * price)
+    micro_threshold = max(int(price * 20), EXEC_SPEED_MICRO_TRADE_MIN_KRW)
+    sample = {
+        "ts": now_ts,
+        "market": market,
+        "price": price,
+        "today_vol": today_vol,
+        "change_rate": float(payload.get("change_rate", 0.0) or 0.0),
+        "ask_qty": safe_int(payload.get("ask_qty", 0)),
+        "bid_qty": safe_int(payload.get("bid_qty", 0)),
+        "vol_delta": vol_delta,
+        "trade_value_delta": trade_value_delta,
+        "micro_trade": bool(vol_delta > 0 and trade_value_delta < micro_threshold),
+    }
+    if prev and prev.get("price") == price and prev.get("today_vol") == today_vol:
+        return
+    buf.append(sample)
+    _prune_execution_snapshots(code, now_ts)
+
+
+def get_execution_speed_metrics(code: str, current_price: int | None = None, window_sec: int = EXEC_SPEED_WINDOW_SEC) -> dict:
+    code = normalize_stock_code(code)
+    now_ts = time.time()
+    out = {
+        "ready": False,
+        "execution_speed_score": 0,
+        "dip_resilience_score": 0,
+        "micro_trade_filtered_ratio": 0.0,
+        "pullback_pct": 0.0,
+        "recent_peak_price": safe_int(current_price, 0),
+        "suggested_entry_price": safe_int(current_price, 0),
+        "valid_samples": 0,
+        "window_samples": 0,
+        "amount_per_active": 0,
+        "active_ratio": 0.0,
+        "avg_bid_ask_ratio": 0.0,
+        "summary": "샘플 부족",
+    }
+    if not code:
+        return out
+    samples = [s for s in (_execution_snapshots.get(code) or []) if float(s.get("ts", 0) or 0) >= now_ts - window_sec]
+    out["window_samples"] = len(samples)
+    if len(samples) < max(2, EXEC_SPEED_MIN_SAMPLES):
+        return out
+
+    positive = [s for s in samples if int(s.get("vol_delta", 0) or 0) > 0]
+    valid = [s for s in positive if not s.get("micro_trade")]
+    out["valid_samples"] = len(valid)
+    if len(valid) < max(2, EXEC_SPEED_MIN_SAMPLES - 1):
+        if positive:
+            out["micro_trade_filtered_ratio"] = round(max(0.0, 1.0 - len(valid) / max(len(positive), 1)), 2)
+        out["summary"] = "유효 체결 부족"
+        return out
+
+    prices = [safe_int(s.get("price", 0), 0) for s in samples if safe_int(s.get("price", 0), 0) > 0]
+    peak_price = max(prices) if prices else safe_int(current_price, 0)
+    last_price = safe_int(current_price, 0) or safe_int(samples[-1].get("price", 0), 0)
+    out["recent_peak_price"] = peak_price
+    out["pullback_pct"] = round((peak_price - last_price) / peak_price * 100, 2) if peak_price else 0.0
+
+    valid_amounts = [int(s.get("trade_value_delta", 0) or 0) for s in valid]
+    mean_amount = sum(valid_amounts) / max(len(valid_amounts), 1)
+    mean_abs_dev = sum(abs(v - mean_amount) for v in valid_amounts) / max(len(valid_amounts), 1)
+    consistency = max(0.0, 1.0 - (mean_abs_dev / mean_amount)) if mean_amount > 0 else 0.0
+    bid_ratios = []
+    for s in valid:
+        ask_qty = safe_int(s.get("ask_qty", 0), 0)
+        bid_qty = safe_int(s.get("bid_qty", 0), 0)
+        if ask_qty > 0 and bid_qty > 0:
+            bid_ratios.append(min(bid_qty / ask_qty, 3.0))
+    avg_bid_ratio = sum(bid_ratios) / len(bid_ratios) if bid_ratios else 1.0
+    out["avg_bid_ask_ratio"] = round(avg_bid_ratio, 2)
+    active_ratio = len(valid) / max(len(samples), 1)
+    out["active_ratio"] = round(active_ratio, 2)
+    out["micro_trade_filtered_ratio"] = round(max(0.0, 1.0 - len(valid) / max(len(positive), 1)), 2) if positive else 0.0
+    out["amount_per_active"] = int(mean_amount)
+
+    dip_samples = [s for s in valid if peak_price > 0 and safe_int(s.get("price", 0), 0) <= int(peak_price * (1 - EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT / 100.0))]
+    if dip_samples:
+        dip_mean = sum(int(s.get("trade_value_delta", 0) or 0) for s in dip_samples) / max(len(dip_samples), 1)
+        base_mean = mean_amount or 1.0
+        dip_ratio = max(0.0, min(dip_mean / base_mean, 1.4))
+        dip_score = int(min(100, max(0, round(dip_ratio * 100))))
+    elif out["pullback_pct"] >= EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT:
+        dip_score = 45
+    else:
+        dip_score = 35
+    out["dip_resilience_score"] = dip_score
+
+    if mean_amount >= 100_000_000:
+        amount_score = 40
+    elif mean_amount >= 50_000_000:
+        amount_score = 35
+    elif mean_amount >= 20_000_000:
+        amount_score = 30
+    elif mean_amount >= 10_000_000:
+        amount_score = 24
+    elif mean_amount >= 5_000_000:
+        amount_score = 18
+    elif mean_amount >= 2_000_000:
+        amount_score = 12
+    elif mean_amount >= 1_000_000:
+        amount_score = 8
+    else:
+        amount_score = 4
+    depth_score = min(len(valid) * 5, 15)
+    active_score = min(int(active_ratio * 20), 20)
+    consistency_score = min(int(consistency * 15), 15)
+    bid_score = min(max(int((avg_bid_ratio - 0.8) * 8), 0), 10)
+    speed_score = max(0, min(100, amount_score + depth_score + active_score + consistency_score + bid_score))
+    out["execution_speed_score"] = int(speed_score)
+
+    suggested_entry = safe_int(last_price, 0)
+    if peak_price and last_price:
+        if out["pullback_pct"] < EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT:
+            suggested_entry = int(peak_price * (1 - EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT / 100.0))
+        else:
+            suggested_entry = min(last_price, int(peak_price * (1 - min(out["pullback_pct"], EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT) / 100.0)))
+    out["suggested_entry_price"] = _round_price_down(max(suggested_entry, 0)) if suggested_entry else 0
+    out["ready"] = True
+    out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
+    return out
+
+
+def _execution_setup_required(signal_type: str) -> bool:
+    return str(signal_type or "") in FAST_EXECUTION_SIGNAL_TYPES
+
+
+def _entry_execution_confirmation_threshold(signal_type: str) -> tuple[int, int]:
+    sig = str(signal_type or "")
+    if sig in FAST_EXECUTION_SIGNAL_TYPES:
+        return EXEC_SPEED_CONFIRM_MIN_SCORE_FAST, EXEC_SPEED_CONFIRM_MIN_DIP_SCORE
+    if sig in ENTRY_EXECUTION_SIGNAL_TYPES:
+        return EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY, max(45, EXEC_SPEED_CONFIRM_MIN_DIP_SCORE - 10)
+    return 0, 0
+
+
+def _apply_execution_speed_to_signal(s: dict, mode: str | None = None) -> dict:
+    if not isinstance(s, dict):
+        return s
+    code = normalize_stock_code(s.get("code"))
+    if not code:
+        return s
+    signal_type = str(s.get("signal_type", "") or "")
+    metrics = get_execution_speed_metrics(code, current_price=safe_int(s.get("price", 0), 0))
+    s["execution_metrics"] = metrics
+    reasons = list(s.get("reasons") or [])
+    cautions = list(s.get("cautions") or [])
+
+    if metrics.get("ready"):
+        speed_score = int(metrics.get("execution_speed_score", 0) or 0)
+        dip_score = int(metrics.get("dip_resilience_score", 0) or 0)
+        filtered_ratio = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0)
+        reasons.append(f"⚡ 체결지속속도 {speed_score}점")
+        reasons.append(f"🪨 눌림 유지 {dip_score}점  (미세체결 제외 {filtered_ratio*100:.0f}%)")
+        if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
+            if speed_score >= 75:
+                s["score"] = int(s.get("score", 0) or 0) + 8
+            elif speed_score >= 60:
+                s["score"] = int(s.get("score", 0) or 0) + 4
+            elif speed_score < 40:
+                s["score"] = int(s.get("score", 0) or 0) - 6
+                cautions.append("⚠️ 체결지속속도 약함 — 눌림 확인 전 추격 주의")
+            if dip_score >= 75:
+                s["score"] = int(s.get("score", 0) or 0) + 6
+            elif dip_score < 45:
+                s["score"] = int(s.get("score", 0) or 0) - 4
+                cautions.append("⚠️ 하락 중 체결 유지 약함 — 진입보류 우선")
+            s["execution_setup_required"] = True
+            suggested_entry = safe_int(metrics.get("suggested_entry_price", 0), 0)
+            if suggested_entry > 0:
+                s["planned_entry_price"] = safe_int(s.get("entry_price", 0), 0)
+                s["entry_price"] = suggested_entry
+        elif signal_type in ENTRY_EXECUTION_SIGNAL_TYPES:
+            if speed_score >= 65:
+                s["score"] = int(s.get("score", 0) or 0) + 4
+            elif speed_score < 40:
+                s["score"] = int(s.get("score", 0) or 0) - 4
+            if dip_score >= 65:
+                s["score"] = int(s.get("score", 0) or 0) + 3
+                reasons.append("✅ 하락 중에도 체결속도 유지 확인")
+            elif dip_score < 40:
+                cautions.append("⚠️ 눌림 구간 체결 유지 약함")
+        elif signal_type in MID_EXECUTION_SIGNAL_TYPES:
+            if speed_score >= 70:
+                s["score"] = int(s.get("score", 0) or 0) + 2
+            elif speed_score < 35:
+                s["score"] = int(s.get("score", 0) or 0) - 2
+    else:
+        if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
+            reasons.append("⚡ 체결지속속도 샘플 부족 — 눌림 확인 후 진입가 확정")
+            s["execution_setup_required"] = True
+        elif signal_type in ENTRY_EXECUTION_SIGNAL_TYPES:
+            reasons.append("⚡ 체결속도 참고 샘플 부족")
+
+    if cautions:
+        s["cautions"] = cautions
+        s["reasons"] = reasons + cautions
+    else:
+        s["reasons"] = reasons
+    return s
+
+
+def _build_execution_speed_block(s: dict) -> str:
+    metrics = (s or {}).get("execution_metrics") or {}
+    if not metrics:
+        return ""
+    if not metrics.get("ready"):
+        if s.get("execution_setup_required"):
+            return "━━━━━━━━━━━━━━━\n⚡ <b>체결지속속도</b>  샘플 부족\n🧭 하락 중 속도 유지 확인 후 진입가를 확정합니다.\n"
+        return ""
+    filtered = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
+    lines = [
+        f"⚡ <b>체결지속속도</b>  {int(metrics.get('execution_speed_score', 0) or 0)}점",
+        f"🪨 눌림 유지  {int(metrics.get('dip_resilience_score', 0) or 0)}점",
+        f"🧹 미세체결 제외  {filtered:.0f}%",
+    ]
+    if s.get("execution_setup_required"):
+        lines.append("🧭 하락 중 속도 유지 확인 후 진입가를 확정합니다.")
+    return "━━━━━━━━━━━━━━━\n" + "\n".join(lines) + "\n"
+
+
+def _register_execution_setup_watch(s: dict) -> None:
+    code = normalize_stock_code(s.get("code"))
+    if not code:
+        return
+    for old_key, watch in list(_execution_setup_watch.items()):
+        if normalize_stock_code(watch.get("code")) == code and str(watch.get("signal_type", "")) == str(s.get("signal_type", "")):
+            _execution_setup_watch.pop(old_key, None)
+    metrics = dict(s.get("execution_metrics") or {})
+    now_dt = datetime.now()
+    log_key = f"{code}_{now_dt.strftime('%Y%m%d%H%M')}"
+    signal_log_key = ""
+    try:
+        _detected_at = s.get("detected_at")
+        if isinstance(_detected_at, datetime):
+            signal_log_key = f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+    except Exception:
+        signal_log_key = ""
+    if not signal_log_key:
+        signal_log_key = log_key
+    _execution_setup_watch[log_key] = {
+        "code": code,
+        "name": s.get("name", code),
+        "signal_type": s.get("signal_type", ""),
+        "price": safe_int(s.get("price", 0), 0),
+        "entry_price": safe_int(s.get("entry_price", 0), 0),
+        "planned_entry_price": safe_int(s.get("planned_entry_price", s.get("entry_price", 0)), 0),
+        "stop_loss": safe_int(s.get("stop_loss", 0), 0),
+        "target_price": safe_int(s.get("target_price", 0), 0),
+        "sector_theme": s.get("sector_info", {}).get("theme", ""),
+        "reasons": list(s.get("reasons") or []),
+        "registered_ts": time.time(),
+        "expire_ts": time.time() + EXEC_SPEED_SETUP_EXPIRE_SEC,
+        "detect_time": now_dt.strftime("%H:%M"),
+        "peak_price": max(safe_int(s.get("price", 0), 0), safe_int(metrics.get("recent_peak_price", 0), 0)),
+        "last_price": safe_int(s.get("price", 0), 0),
+        "signal_log_key": signal_log_key,
+        "execution_metrics": metrics,
+    }
+    print(f"  ⚡ 체결확인 대기 등록: {s.get('name', code)} [{s.get('signal_type','')}] 예상진입 {safe_int(s.get('entry_price',0),0):,}원")
+
+
+def _update_signal_log_execution_confirmed(log_key: str | None, watch: dict, entry_price: int, stop_price: int, target_price: int,
+                                          metrics: dict | None, hit_time: str, hit_price: int) -> None:
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    target_key = ""
+    if log_key and log_key in data:
+        target_key = log_key
+    if not target_key:
+        for _k, rec in data.items():
+            if not isinstance(rec, dict):
+                continue
+            if normalize_stock_code(rec.get("code")) != normalize_stock_code(watch.get("code")):
+                continue
+            if rec.get("signal_type") != watch.get("signal_type"):
+                continue
+            if rec.get("status") not in ("진입준비", "추적중"):
+                continue
+            target_key = _k
+    if not target_key:
+        return
+    rec = data.get(target_key) or {}
+    rec["status"] = "추적중"
+    rec["entry_price"] = int(entry_price)
+    rec["stop_price"] = int(stop_price)
+    rec["target_price"] = int(target_price)
+    rec["entry_hit"] = True
+    rec["entry_hit_price"] = int(hit_price)
+    rec["entry_hit_time"] = hit_time
+    if " " in hit_time:
+        rec["entry_hit_date"], rec["entry_hit_clock"] = hit_time.split(" ", 1)
+    rec["execution_setup_confirmed"] = True
+    rec["execution_setup_confirm_time"] = hit_time
+    rec.setdefault("feature_snapshot", {})
+    if isinstance(metrics, dict):
+        rec["feature_snapshot"]["execution_speed_score"] = int(metrics.get("execution_speed_score", 0) or 0)
+        rec["feature_snapshot"]["dip_resilience_score"] = int(metrics.get("dip_resilience_score", 0) or 0)
+        rec["feature_snapshot"]["micro_trade_filtered_ratio"] = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0)
+        rec["feature_snapshot"]["execution_pullback_pct"] = float(metrics.get("pullback_pct", 0.0) or 0.0)
+    _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+
+
+def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int, stop_price: int, target_price: int,
+                                                   hit_price: int, hit_time: str) -> None:
+    code = normalize_stock_code(watch.get("code"))
+    if not code:
+        return
+    key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M%S')}_active"
+    _entry_watch[key] = {
+        "code": code,
+        "name": watch.get("name", code),
+        "entry_price": int(entry_price),
+        "stop_loss": int(stop_price),
+        "target_price": int(target_price),
+        "signal_type": watch.get("signal_type", ""),
+        "signal_log_key": watch.get("signal_log_key", ""),
+        "detect_time": watch.get("detect_time", datetime.now().strftime("%H:%M")),
+        "last_notified_ts": time.time(),
+        "notify_count": 1,
+        "miss_count": 0,
+        "registered_ts": time.time(),
+        "expire_ts": time.time() + 86400 * MAX_CARRY_DAYS,
+        "peak_price": max(int(hit_price), safe_int(watch.get("peak_price", 0), 0)),
+        "reasons": list(watch.get("reasons") or [])[:5],
+        "sector_theme": watch.get("sector_theme", ""),
+        "entry_hit": True,
+        "entry_hit_locked": True,
+        "entry_hit_time": hit_time,
+        "entry_hit_price": int(hit_price),
+        "entry_hit_date": hit_time.split(" ", 1)[0] if " " in hit_time else "",
+        "entry_hit_clock": hit_time.split(" ", 1)[1] if " " in hit_time else "",
+    }
+
+
+def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_price: int, target_price: int,
+                                         hit_price: int, hit_time: str, metrics: dict | None = None) -> str:
+    metrics = metrics or {}
+    rr_text = _calc_rr_text(entry_price, stop_price, target_price)
+    stop_pct = round((stop_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
+    target_pct = round((target_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
+    sig_label = get_signal_label(str(watch.get("signal_type", "") or ""), watch.get("signal_type", ""))
+    lines = [
+        "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
+        "━━━━━━━━━━━━━━━",
+        f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
+        f"원신호: {sig_label}  |  포착: {watch.get('detect_time','')}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
+        "━━━━━━━━━━━━━━━",
+        f"⚡ 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
+        f"🪨 눌림 유지 {int(metrics.get('dip_resilience_score', 0) or 0)}점",
+        "━━━━━━━━━━━━━━━",
+        "┌─────────────────────",
+        "│ ⚡️ <b>하락 중 속도 유지 확인</b>",
+        f"│ 📍 현재가  <b>{hit_price:,}원</b>",
+        f"│ 🎯 확정 진입가  <b>{entry_price:,}원</b>",
+        f"│ 🛡 손절가  <b>{stop_price:,}원</b>  ({stop_pct:+.1f}%)",
+        f"│ 🏆 목표가  <b>{target_price:,}원</b>  ({target_pct:+.1f}%)",
+        f"│ ⚖️ 손익비  <b>{rr_text}</b>",
+        "└─────────────────────",
+    ]
+    return "\n".join(lines)
+
+
+
+def check_execution_setup_watch() -> None:
+    if not _execution_setup_watch:
+        return
+    expired = []
+    for key, watch in list(_execution_setup_watch.items()):
+        try:
+            if time.time() >= float(watch.get("expire_ts", 0) or 0):
+                _record_entry_miss(watch, "체결확인만료", int(watch.get("last_price", 0) or watch.get("entry_price", 0) or 0))
+                expired.append(key)
+                continue
+            cur = get_stock_price(watch.get("code"))
+            price = safe_int((cur or {}).get("price", 0), 0)
+            if not price:
+                continue
+            watch["last_price"] = price
+            if price > safe_int(watch.get("peak_price", 0), 0):
+                watch["peak_price"] = price
+            metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
+            watch["execution_metrics"] = metrics
+            min_speed, min_dip = _entry_execution_confirmation_threshold(watch.get("signal_type"))
+            pullback_pct = float(metrics.get("pullback_pct", 0.0) or 0.0)
+            if not metrics.get("ready"):
+                continue
+            if pullback_pct < EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT or pullback_pct > EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT:
+                continue
+            if int(metrics.get("execution_speed_score", 0) or 0) < min_speed:
+                continue
+            if int(metrics.get("dip_resilience_score", 0) or 0) < min_dip:
+                continue
+            if float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) > EXEC_SPEED_FILTER_MAX_RATIO:
+                continue
+            entry_price = _round_price_down(min(price, safe_int(metrics.get("suggested_entry_price", price), price) or price))
+            if entry_price <= 0:
+                entry_price = _round_price_down(price)
+            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price)
+            if stop_price <= 0 or target_price <= entry_price:
+                continue
+            hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            _update_signal_log_execution_confirmed(watch.get("signal_log_key"), watch, entry_price, stop_price, target_price, metrics, hit_time, price)
+            _register_active_entry_watch_from_confirmation(watch, entry_price, stop_price, target_price, price, hit_time)
+            send_with_chart_buttons(
+                _build_execution_confirmation_message(watch, entry_price, stop_price, target_price, price, hit_time, metrics),
+                watch.get("code", ""), watch.get("name", "")
+            )
+            print(f"  ⚡ 진입 확정: {watch.get('name','')} {price:,} / 확정진입 {entry_price:,}")
+            expired.append(key)
+        except Exception:
+            continue
+    for key in expired:
+        _execution_setup_watch.pop(key, None)
+
 def build_next_open_watchlist(max_codes: int = 30) -> dict:
     """장 종료 후: 내일 감시할 워치리스트를 생성해서 파일로 저장."""
     # 우선순위: carry_stocks → 최근 signal_log 종목 → (있으면) universe.json
@@ -2692,6 +3160,8 @@ def _upsert_preclose_gap_signal(candidate: dict, stage: str) -> str:
         "sector_info": candidate.get("sector_info") or {},
         "reasons": list(candidate.get("reasons") or []),
         "position": {"pct": 6.0},
+        "execution_setup_required": True,
+        "execution_metrics": dict(candidate.get("execution_metrics") or {}),
         "gap_entry_meta": {
             "stage": stage,
             "stage_label": candidate.get("stage_label", "1차 선별" if stage == "krx" else "최종 보정"),
@@ -2802,6 +3272,8 @@ def register_preclose_gap_watch(candidate: dict, signal_log_key: str) -> None:
         "detect_time": now.strftime("%H:%M"),
         "peak_price": int(candidate.get("current_price", 0) or 0),
         "signal_log_key": signal_log_key,
+        "execution_setup_required": True,
+        "execution_metrics": dict(candidate.get("execution_metrics") or {}),
     }
 
 
@@ -2863,21 +3335,35 @@ def check_preclose_gap_entry_watch() -> None:
             watch["last_price"] = price
             if price > int(watch.get("peak_price", 0) or 0):
                 watch["peak_price"] = price
-            if price <= int(watch.get("entry_price", 0) or 0):
-                hit_time = now.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    _mark_entry_hit_in_signal_log(
-                        watch["code"],
-                        watch.get("signal_type", PRECLOSE_GAP_SIGNAL_TYPE),
-                        hit_price=price,
-                        hit_time=hit_time,
-                        log_key=watch.get("signal_log_key"),
-                    )
-                except Exception:
-                    pass
-                _send_preclose_gap_entry_hit_message(watch, price, use_nxt=use_nxt)
-                print(f"  🎯 선진입가 도달: {watch.get('name','')} {price:,} / 진입 {int(watch.get('entry_price',0) or 0):,}")
-                expired.append(key)
+            if price > int(watch.get("entry_price", 0) or 0):
+                continue
+            metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
+            watch["execution_metrics"] = metrics
+            if not metrics.get("ready"):
+                continue
+            if float(metrics.get("pullback_pct", 0.0) or 0.0) < EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT:
+                continue
+            if int(metrics.get("execution_speed_score", 0) or 0) < EXEC_SPEED_CONFIRM_MIN_SCORE_FAST:
+                continue
+            if int(metrics.get("dip_resilience_score", 0) or 0) < EXEC_SPEED_CONFIRM_MIN_DIP_SCORE:
+                continue
+            if float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) > EXEC_SPEED_FILTER_MAX_RATIO:
+                continue
+            entry_price = _round_price_down(min(price, safe_int(metrics.get("suggested_entry_price", price), price) or price))
+            if entry_price <= 0:
+                entry_price = _round_price_down(price)
+            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price)
+            if stop_price <= 0 or target_price <= entry_price:
+                continue
+            hit_time = now.strftime("%Y-%m-%d %H:%M:%S")
+            _update_signal_log_execution_confirmed(watch.get("signal_log_key"), watch, entry_price, stop_price, target_price, metrics, hit_time, price)
+            _register_active_entry_watch_from_confirmation(watch, entry_price, stop_price, target_price, price, hit_time)
+            watch["entry_price"] = entry_price
+            watch["stop_loss"] = stop_price
+            watch["target_price"] = target_price
+            _send_preclose_gap_entry_hit_message(watch, price, use_nxt=use_nxt)
+            print(f"  🎯 선진입 확정: {watch.get('name','')} {price:,} / 확정진입 {entry_price:,}")
+            expired.append(key)
         except Exception:
             continue
     for key in expired:
@@ -2978,7 +3464,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
     summary = str(us.get("summary", "") or "").splitlines()[0].strip()
     if summary:
         msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
-    msg += "⚠️ 오늘 선진입가가 실제로 도달한 종목만 유효합니다. 미도달 시 자동으로 진입미달 처리됩니다."
+    msg += "⚠️ 예상 선진입가 근처에서 하락 중 체결속도 유지가 확인된 종목만 실제 진입으로 확정합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
 
 
@@ -3448,6 +3934,7 @@ def run_mid_pullback_scan():
         if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
             continue
+        s = _apply_execution_speed_to_signal(s)
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
@@ -3490,6 +3977,7 @@ def send_mid_pullback_alert(s: dict):
 
     sector_block = _sector_block(s)
     news_block = _build_news_summary_block(s, allow_fetch=True)
+    exec_block = _build_execution_speed_block(s)
 
     header_override = str(s.get("_header_override", "") or "").strip()
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
@@ -3536,12 +4024,13 @@ def get_stock_price(code: str) -> dict:
     if not price: return {}
     today_vol = int(o.get("acml_vol", 0))
     mktcap_raw = int(o.get("hts_avls", 0) or 0)  # 시가총액 (억원)
-    return {
+    payload = {
         "code": code, "name": o.get("hts_kor_isnm",""),
         "price": price, "change_rate": float(o.get("prdy_ctrt",0)),
         "volume_ratio": get_real_volume_ratio(code, today_vol),
         "today_vol": today_vol,
         "high": int(o.get("stck_hgpr",0)),
+        "open": int(o.get("stck_oprc",0)),
         "ask_qty": int(o.get("askp_rsqn1",0)),
         "bid_qty": int(o.get("bidp_rsqn1",0)),
         "prev_close": int(o.get("stck_sdpr",0)),
@@ -3551,6 +4040,11 @@ def get_stock_price(code: str) -> dict:
                       else "mid" if mktcap_raw >= 1000  # 1000억 이상
                       else "small"),
     }
+    try:
+        _record_execution_snapshot(code, payload, market="KRX")
+    except Exception:
+        pass
+    return payload
 
 
 
@@ -3926,13 +4420,21 @@ def get_nxt_stock_price(code: str) -> dict:
     o      = data.get("output", {})
     price  = int(o.get("stck_prpr", 0))
     if not price: return {}
-    return {
+    payload = {
         "code": code, "name": o.get("hts_kor_isnm",""),
         "price": price, "change_rate": float(o.get("prdy_ctrt",0)),
         "volume_ratio": float(o.get("vol_inrt",0) or 0),
         "today_vol": int(o.get("acml_vol",0)),
+        "ask_qty": int(o.get("askp_rsqn1",0) or 0),
+        "bid_qty": int(o.get("bidp_rsqn1",0) or 0),
+        "open": int(o.get("stck_oprc",0) or 0),
         "market": "NXT",
     }
+    try:
+        _record_execution_snapshot(code, payload, market="NXT")
+    except Exception:
+        pass
+    return payload
 
 def get_nxt_investor_trend(code: str) -> dict:
     """NXT 외인·기관 순매수 조회"""
@@ -5147,6 +5649,7 @@ def save_signal_log(stock: dict):
             korea_etf_snapshot = _get_korea_etf_snapshot(code, stock_name, sig_type, stock.get("sector_info", {}).get("theme", ""))
         except Exception:
             korea_etf_snapshot = {}
+        _exec_m = stock.get("execution_metrics") or {}
         feature_snapshot = {
             "regime": stock.get("regime", "normal"),
             "nxt_open": bool(is_nxt_open()),
@@ -5162,8 +5665,13 @@ def save_signal_log(stock: dict):
             "bb_breakout": indic.get("bb", {}).get("breakout", False),
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
+            "execution_speed_score": int(_exec_m.get("execution_speed_score", 0) or 0),
+            "dip_resilience_score": int(_exec_m.get("dip_resilience_score", 0) or 0),
+            "micro_trade_filtered_ratio": float(_exec_m.get("micro_trade_filtered_ratio", 0.0) or 0.0),
+            "execution_setup_required": bool(stock.get("execution_setup_required")),
         }
 
+        track_status = "진입준비" if stock.get("execution_setup_required") else "추적중"
         data[log_key] = {
             "log_key":      log_key,
             "code":         code,
@@ -5191,7 +5699,7 @@ def save_signal_log(stock: dict):
             "feature_snapshot":  feature_snapshot,
             "korea_etf_snapshot": korea_etf_snapshot,
             # ── 이론 추적 결과 (봇 자동 계산 → auto_tune 학습용) ──
-            "status":            "추적중",   # 봇 추적 상태
+            "status":            track_status,   # 봇 추적 상태
             "exit_price":        0,
             "exit_date":         "",
             "exit_time":         "",
@@ -5207,6 +5715,8 @@ def save_signal_log(stock: dict):
             "actual_pnl":        None,       # 실제 수익률 (사용자 /result 입력)
             "actual_exit_date":  "",
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
+            "execution_setup_required": bool(stock.get("execution_setup_required")),
+            "planned_entry_price": safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0),
         }
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
@@ -7246,6 +7756,9 @@ def reset_top_signals_daily():
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry: return
+    if s.get("execution_setup_required") and not s.get("force_register_entry_watch"):
+        _register_execution_setup_watch(s)
+        return
     code = s["code"]
     stock_name = _resolve_stock_name(code, s.get("name", ""))
     if is_scoring_only_instrument(code, stock_name):
@@ -7318,9 +7831,12 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
         miss_away = round((final_price - entry) / entry * 100, 1) if entry else 0
         peak      = watch.get("peak_price", final_price)
         peak_away = round((peak - entry) / entry * 100, 1) if entry else 0
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
         for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
             if (rec.get("code") == watch["code"]
-                    and rec.get("status") == "추적중"
+                    and rec.get("status") in ("추적중", "진입준비")
                     and rec.get("signal_type") == watch.get("signal_type")):
                 rec["entry_miss"]      = reason
                 rec["entry_miss_away"] = miss_away
@@ -7354,13 +7870,13 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | 
         target_key = ""
         if log_key and log_key in data:
             _rec = data.get(log_key) or {}
-            if _rec.get('code') == code and _rec.get('status') == '추적중':
+            if _rec.get('code') == code and _rec.get('status') in ('추적중', '진입준비'):
                 target_key = log_key
 
         if not target_key:
             candidates = []
             for _k, rec in data.items():
-                if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
+                if rec.get('code') == code and rec.get('status') in ('추적중', '진입준비') and rec.get('signal_type') == signal_type:
                     detect_key = f"{rec.get('detect_date','')}{rec.get('detect_time','')}".replace(":", "")
                     candidates.append((detect_key, _k))
             if candidates:
@@ -7499,6 +8015,8 @@ def check_entry_watch():
             # 최고가 갱신
             if price > watch.get("peak_price", 0):
                 watch["peak_price"] = price
+            if watch.get("entry_hit_locked"):
+                continue
 
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
@@ -8379,6 +8897,7 @@ def send_alert(s: dict):
     diff_from_entry = ((price - entry) / entry * 100) if entry and price else 0
 
     detected_at = s.get("detected_at", datetime.now())
+    exec_block = _build_execution_speed_block(s)
     if s["signal_type"] == "ENTRY_POINT":
         rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
@@ -14180,6 +14699,7 @@ def run_scan():
                 is_nxt = s.get("market") == "NXT"
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
                 mkt_tag  = " 🔵NXT" if is_nxt else ""
+                s = _apply_execution_speed_to_signal(s)
                 print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
@@ -14207,6 +14727,7 @@ def run_scan():
                         _detected_stocks[s["code"]]["high_price"] = s["price"]
                 # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
+        check_execution_setup_watch()  # ★ 체결속도 확인 후 진입 확정 체크
         check_entry_watch()     # ★ 진입가 도달 체크
         check_preclose_gap_entry_watch()  # ★ 장마감 전 선진입가 도달 체크
         run_entry_defense_monitor()  # 🛡 장마감 손익 방어 가이드
