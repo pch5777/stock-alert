@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.7
+버전: v40.8
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.8 (2026-03-10): 포착 메시지 UI 재배치 + 뉴스 요약 통합.
+  [#1] 일반 포착(send_alert)·눌림목(send_mid_pullback_alert) 상세 메시지의 표시 순서를 재정렬. 핵심 포착 사유 다음에 진입 박스를 올리고, 섹터 모멘텀은 진입 박스 바로 아래 독립 블록으로 이동.
+  [#2] 포착 사유(reasons)에서 섹터·뉴스 관련 문구는 UI 표시 단계에서 중복 제거하고, 나머지 핵심 사유/경고만 구분해서 보여주도록 정리. 점수 계산 로직은 그대로 유지.
+  [#3] 기존 별도 텔레그램 `[종목명 뉴스 분석]` 후속 발송을 제거하고, 포착 메시지 내부에 압축된 `뉴스 요약` 블록으로 통합.
+  [#4] analyze()에서 이미 계산한 뉴스 심층분석 결과/기사 목록을 알림 payload에 저장하고, 조기포착·눌림목 등 뉴스가 사전 계산되지 않은 경로는 헤드라인 기반 빠른 요약만 붙이도록 분리.
+  [#5] 섹터 재안내 재전송 시에도 최초 뉴스 요약 payload를 함께 복제해, 재전송 메시지의 정보 일관성을 유지.
+  이유: 사용자가 가장 먼저 봐야 할 진입/손절/목표가를 상단에 배치하고, 섹터·뉴스를 한 메시지에 통합해 행동 가능한 알림 품질을 높이기 위함.
+  개선점: 모바일 가독성↑, 알림 수↓, 포착 메시지 일관성↑, 중복 정보↓.
+  주의점: 조기포착·눌림목 경로의 뉴스 요약은 포착 속도 저하를 막기 위해 AI 본문 분석 대신 캐시/헤드라인 기반 요약을 우선 사용하므로, 본문 심층분석보다 간략할 수 있다.
+  영향: 별도 `[종목명 뉴스 분석]` 텔레그램은 기본 미발송. 포착 메시지 안에서 핵심 뉴스 요약 확인 가능.
 - v40.7 (2026-03-10): /list 조회를 상태별 2구역으로 분리.
   [#1] 기존 '감시 중인 종목' 단일 목록을 '진입가 감시중 종목'과 '진입가 도달 후 목표가 추적중 종목' 2구역으로 분리 표시.
   [#2] 내부 _entry_watch의 entry_hit 상태를 기준으로 분류하고, 종목별로 진입가/목표가/손절가/포착시각을 함께 표시.
@@ -88,6 +98,11 @@
   - run_overnight_monitor(): alerts가 있어도 텔레그램 send(msg)를 하지 않는다. 내부 요약/로그만 유지하는 설계다.
   - run_geo_news_scan(): is_any_market_open()일 때만 발송하며, _geo_event_state['last_sent_msg']와 동일한 내용이면 재발송하지 않는다.
   - update_dashboard(force=False): 함수 시작부에서 is_any_market_open()이 아니면 즉시 return 한다.
+- v40.8 메시지/UI 포인트:
+  - send_alert(), send_mid_pullback_alert()는 핵심 사유 → 진입 박스 → 섹터 블록 → 뉴스 요약 → 경고/보조 블록 순서로 정렬된 기준 버전이다.
+  - 별도 news_block_for_alert() 후속 텔레그램은 더 이상 기본 호출되지 않는다. 뉴스는 포착 메시지 내부 `📰 뉴스 요약` 블록에서 본다.
+  - analyze() 경로는 news_analysis/news_articles payload를 함께 싣고, 조기포착/눌림목처럼 사전 계산이 없는 경로는 `_build_news_summary_block(..., allow_fetch=True)`가 헤드라인 기반 빠른 요약을 붙인다.
+  - UI 중복 제거는 표시 단계에서만 수행한다. reasons 원본은 학습/로그용으로 유지되므로, 점수 계산 또는 save_signal_log()쪽 로직과 혼동하지 말 것.
 - v40.6 섹터 재안내 포인트:
   - alert-origin(start_sector_monitor(..., from_alert=True)) 경로는 더 이상 별도 [종목 섹터 모니터링] 텔레그램을 보내지 않는다.
   - 처음 포착 때 sector_info가 요약/동반상승 기준으로 비어 있던 종목만 재안내 후보가 된다.
@@ -2695,7 +2710,6 @@ def send_mid_pullback_alert(s: dict):
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
     now_str     = datetime.now().strftime("%H:%M:%S")
-    reasons     = "\n".join(s["reasons"])
     atr_tag     = " (ATR)" if s.get("atr_used") else " (고정)"
     entry  = s.get("entry_price", 0)
     stop   = s.get("stop_loss", 0)
@@ -2713,33 +2727,20 @@ def send_mid_pullback_alert(s: dict):
         f"└─────────────────────"
     )
 
-    si = s.get("sector_info") or {}
-    theme     = si.get("theme", "")
-    rising    = si.get("rising", [])
-    flat      = si.get("flat", [])
-    detail    = si.get("detail", [])
-    si_summary = si.get("summary", "")
-    bonus     = si.get("bonus", 0)
+    core_reasons, warn_reasons = _split_reasons_for_ui(s.get("reasons", []))
+    core_block = "\n".join(core_reasons).strip()
+    warn_block = ""
+    if warn_reasons:
+        warn_block = "━━━━━━━━━━━━━━━\n" + "\n".join(warn_reasons) + "\n"
 
-    if detail:
-        bonus_tag    = f"  +{bonus}점" if bonus > 0 else ""
-        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 <b>섹터 모멘텀</b> [{theme}]{bonus_tag}\n"
-        if si_summary:
-            sector_block += f"  {si_summary}\n"
-        for r in rising[:5]:
-            vol_tag       = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
-            sector_block += f"  📈 {r['name']} <b>{r['change_rate']:+.1f}%</b>{vol_tag}\n"
-        for r in flat[:3]:
-            sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
-    elif theme:
-        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
-    else:
-        sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터: 조회 실패\n"
+    sector_block = _sector_block(s)
+    news_block = _build_news_summary_block(s, allow_fetch=True)
 
     header_override = str(s.get("_header_override", "") or "").strip()
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
-    send_with_chart_buttons(
+
+    message = (
         f"{header_line}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -2753,13 +2754,20 @@ def send_mid_pullback_alert(s: dict):
         f"  거래량 Z-score: <b>{s['vol_zscore']:.1f}σ</b>\n"
         f"  코스피 상대강도: <b>{s['rs']:.1f}배</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{reasons}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{sector_block}\n"
-        f"💰 현재가: <b>{s['price']:,}원</b>  ({s['change_rate']:+.1f}%)\n"
-        f"\n{entry_block}",
-        s["code"], stock_name
     )
+
+    if core_block:
+        message += core_block + "\n"
+    message += f"\n{entry_block}\n\n"
+    if sector_block:
+        message += sector_block
+    if news_block:
+        message += news_block
+    if warn_block:
+        message += warn_block
+    message += f"💰 현재가: <b>{s['price']:,}원</b>  ({s['change_rate']:+.1f}%)"
+
+    send_with_chart_buttons(message, s["code"], stock_name)
 
 # ============================================================
 # 주가 조회
@@ -5994,6 +6002,10 @@ def _clone_alert_snapshot_for_sector_retry(s: dict | None) -> dict:
         cloned["position"] = dict(cloned["position"])
     if isinstance(cloned.get("indic"), dict):
         cloned["indic"] = dict(cloned["indic"])
+    if isinstance(cloned.get("news_analysis"), dict):
+        cloned["news_analysis"] = dict(cloned["news_analysis"])
+    if isinstance(cloned.get("news_articles"), list):
+        cloned["news_articles"] = [dict(x) if isinstance(x, dict) else x for x in cloned["news_articles"]]
     return cloned
 
 
@@ -7089,17 +7101,159 @@ def _calc_rr_text(entry: int, stop: int, target: int) -> str:
     return "계산불가"
 
 
+def _is_sector_reason_for_ui(txt: str) -> bool:
+    t = str(txt or '').strip()
+    if not t:
+        return False
+    if t.startswith('📌 동반 상승:'):
+        return True
+    sector_markers = (
+        '섹터 전체 동반 상승',
+        '섹터 강세',
+        '동업종',
+        '섹터 모멘텀',
+    )
+    return any(m in t for m in sector_markers)
+
+
+def _is_news_reason_for_ui(raw_txt: str) -> bool:
+    raw = str(raw_txt or '')
+    t = raw.strip()
+    if not t:
+        return False
+    if raw.startswith('  ⚠️ '):
+        return True
+    news_prefixes = (
+        '📰 뉴스 ', '🔍 뉴스 ', '💡 표면악재실질호재', '⚠️ 표면호재실질악재'
+    )
+    return t.startswith(news_prefixes)
+
+
 def _split_reasons_for_ui(reasons: list) -> tuple[list, list]:
     core, warns = [], []
     for r in reasons or []:
-        txt = str(r or '').strip()
+        raw = str(r or '')
+        txt = raw.strip()
         if not txt:
+            continue
+        if _is_sector_reason_for_ui(txt) or _is_news_reason_for_ui(raw):
             continue
         if txt.startswith(('⚠️', '⏰', '🔴 [HIGH]', '🔴', '🔁')):
             warns.append(txt)
         else:
             core.append(txt)
     return core, warns
+
+
+def _find_cached_deep_news_result(code: str, articles: list) -> dict:
+    try:
+        if not code or not articles:
+            return {}
+        first_title = str((articles[0] or {}).get('title', '') or '')
+        cache_key = f"{code}_{first_title[:20]}"
+        cached = _deep_news_cache.get(cache_key) or {}
+        if cached and time.time() - cached.get('ts', 0) < 3600:
+            return dict(cached)
+    except Exception:
+        pass
+    return {}
+
+
+def _build_quick_news_analysis(articles: list, stock_name: str) -> dict:
+    titles = [str((a or {}).get('title', '') or '').strip() for a in (articles or []) if str((a or {}).get('title', '') or '').strip()]
+    if not titles:
+        return {}
+    try:
+        sent = analyze_news_sentiment(titles, stock_name)
+        raw_score = int(sent.get('score', 0) or 0)
+        if raw_score >= 10:
+            verdict, adj = '실질호재', +8
+        elif raw_score >= 4:
+            verdict, adj = '실질호재', +4
+        elif raw_score <= -10:
+            verdict, adj = '실질악재', -10
+        elif raw_score <= -4:
+            verdict, adj = '실질악재', -5
+        else:
+            verdict, adj = '중립', 0
+        label = str(sent.get('label', '중립') or '중립')
+        if verdict == '중립':
+            reason = '헤드라인 방향성 중립'
+        elif verdict == '실질호재':
+            reason = f'헤드라인 {label} 우세'
+        else:
+            reason = f'헤드라인 {label} 우세 — 변동성 주의'
+        matched = sent.get('matched', []) or titles[:1]
+        return {
+            'verdict': verdict,
+            'score_adj': adj,
+            'reason': reason,
+            'risk_points': [],
+            'key_event': '',
+            'confidence': 'low',
+            'headline_source': 'quick',
+            'headline_sample': matched[:2],
+            'ts': time.time(),
+        }
+    except Exception:
+        return {}
+
+
+def _ensure_alert_news_payload(s: dict, allow_fetch: bool = False) -> tuple[dict, list]:
+    if not isinstance(s, dict):
+        return {}, []
+    analysis = dict(s.get('news_analysis') or {})
+    articles = list(s.get('news_articles') or [])
+    code = str(s.get('code', '') or '').strip()
+    name = _resolve_stock_name(code, str(s.get('name', '') or ''))
+
+    if not articles and allow_fetch and code:
+        try:
+            articles = list(fetch_news_for_stock(code, name) or [])
+        except Exception:
+            articles = []
+
+    if not analysis and articles:
+        analysis = _find_cached_deep_news_result(code, articles) or _build_quick_news_analysis(articles, name)
+
+    if analysis:
+        s['news_analysis'] = analysis
+    if articles:
+        s['news_articles'] = articles
+    return analysis, articles
+
+
+def _build_news_summary_block(s: dict, allow_fetch: bool = False) -> str:
+    analysis, articles = _ensure_alert_news_payload(s, allow_fetch=allow_fetch)
+    if not analysis and not articles:
+        return ''
+
+    verd = str((analysis or {}).get('verdict', '중립') or '중립')
+    adj = int((analysis or {}).get('score_adj', 0) or 0)
+    reason = str((analysis or {}).get('reason', '') or '').strip()
+    key_event = str((analysis or {}).get('key_event', '') or '').strip()
+    risk_points = [str(x).strip() for x in ((analysis or {}).get('risk_points', []) or []) if str(x).strip()]
+    conf = str((analysis or {}).get('confidence', 'low') or 'low')
+    conf_icon = {'high': '🔍', 'mid': '📰', 'low': '📰'}.get(conf, '📰')
+
+    label = verd + (f' {adj:+d}점' if adj else '')
+    if key_event:
+        label += f' · {key_event}'
+
+    lines = [f"📰 <b>뉴스 요약</b> [{label}]"]
+    if reason:
+        lines.append(f"  {conf_icon} {reason}")
+
+    shown_titles = []
+    for a in articles[:2]:
+        title = str((a or {}).get('title', '') or '').strip()
+        if title and title not in shown_titles:
+            shown_titles.append(title)
+    if shown_titles:
+        lines.append(f"  🗞 {shown_titles[0]}")
+    for rp in risk_points[:2]:
+        lines.append(f"  ⚠️ {rp}")
+    return "━━━━━━━━━━━━━━━\n" + "\n".join(lines) + "\n"
 
 
 def _build_sector_summary_block(s: dict) -> str:
@@ -7295,7 +7449,7 @@ def send_alert(s: dict):
 
 
     # 보조지표 + 포지션 사이징 + 유사패턴 블록
-    indic = s.get("indic") or calc_indicators(code)
+    indic = s.get("indic") or calc_indicators(s.get("code", ""))
     rsi     = indic.get("rsi", 50)
     ma_desc = indic.get("ma", {}).get("desc", "")
     bb_desc = indic.get("bb", {}).get("desc", "")
@@ -7339,7 +7493,15 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        entry_block, indic_block, position_block, pattern_block, level):
     header_override = str(s.get("_header_override", "") or "").strip()
     header_line = f"{header_override}{nxt_badge}" if header_override else f"{emoji} <b>[{title}]</b>{nxt_badge}"
-    send_by_level(
+    core_reasons, warn_reasons = _split_reasons_for_ui(s.get("reasons", []))
+    core_block = "\n".join(core_reasons).strip()
+    warn_block = ""
+    if warn_reasons:
+        warn_block = "━━━━━━━━━━━━━━━\n" + "\n".join(warn_reasons) + "\n"
+    sector_block = _sector_block(s)
+    news_block = _build_news_summary_block(s, allow_fetch=True)
+
+    msg = (
         f"{header_line}\n"
         f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -7351,15 +7513,19 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
         f"⭐ 신호강도: {stars} ({s['score']}점)\n"
         f"{prev_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
-        + "\n".join(s["reasons"]) + "\n"
-        + indic_block
-        + position_block
-        + pattern_block
-        + "━━━━━━━━━━━━━━━\n\n"
-        + _sector_block(s)
-        + f"\n{entry_block}",
-        level, s["code"], s["name"]
     )
+    if core_block:
+        msg += core_block + "\n"
+    msg += f"\n{entry_block}\n\n"
+    if sector_block:
+        msg += sector_block
+    if news_block:
+        msg += news_block
+    if warn_block:
+        msg += warn_block
+    msg += indic_block + position_block + pattern_block
+    send_by_level(msg.rstrip(), level, s["code"], s["name"])
+
 
 
 # ============================================================
@@ -7652,10 +7818,14 @@ def analyze(stock: dict) -> dict:
     except Exception: pass
 
     # ── 뉴스 심층 분석 (본문 + Claude API) ──
+    news_articles = []
+    news_analysis = {}
     try:
         _articles = fetch_news_for_stock(code, stock.get("name", code))
         if _articles:
+            news_articles = list(_articles[:3])
             deep = analyze_news_deep(_articles, stock.get("name", code), code)
+            news_analysis = dict(deep or {})
             adj  = int(deep.get("score_adj", 0) or 0)
             verd = deep.get("verdict", "중립")
             conf = deep.get("confidence", "low")
@@ -7668,8 +7838,6 @@ def analyze(stock: dict) -> dict:
                     reasons.append(f"⚠️ 표면호재실질악재 주의 ({deep.get('reason','')}) {adj:+d}점")
                 elif verd == "표면악재실질호재":
                     reasons.append(f"💡 표면악재실질호재 ({deep.get('reason','')}) {adj:+d}점")
-                elif adj > 0:
-                    reasons.append(f"{conf_emoji} 뉴스 {verd} ({deep.get('reason','')}) {adj:+d}점")
                 else:
                     reasons.append(f"{conf_emoji} 뉴스 {verd} ({deep.get('reason','')}) {adj:+d}점")
 
@@ -7848,6 +8016,8 @@ def analyze(stock: dict) -> dict:
             "position": position,
             "indic": indic,
             "grade": grade,
+            "news_analysis": news_analysis,
+            "news_articles": news_articles,
             "dart_risk": _dart_r["is_risk"]}
 
 # ============================================================
@@ -13047,7 +13217,6 @@ def run_scan():
                     _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
                     _sector_retry_snap["_alert_sender"] = "send_alert"
                     start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)
-                news_block_for_alert(s["code"], s["name"])
                 try:
                     threading.Thread(
                         target=auto_update_theme,
