@@ -3,12 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.3
+버전: v41.5
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.3 (2026-03-10): 체결지속속도 기반 진입 준비/확정 로직 추가.
+- v41.5 (2026-03-10): 빈칸/원형 기호 대체 없이 전역 제거.
+  [#1] 승률 바, 연관도/신뢰도/변동없음 마커, 중립 표시 등에 남아 있던 원형 중립 마커를 모두 제거하고 문구만 남도록 정리.
+  [#2] `_sanitize_telegram_text()` helper를 보강해 텔레그램 발송 직전 빈칸/원형 기호가 들어와도 빈 문자열로 제거되도록 변경.
+  이유: 사용자가 빈칸 기호를 다른 문자로 채우지 말고 아예 없애길 원했고, 원형 대체 표시도 같은 맥락에서 원치 않는다고 보았기 때문.
+  개선점: 불필요한 빈칸/중립 마커 제거, 메시지 외형 단순화, 재발 방지.
+  주의점: 승률 바 등 일부 출력은 빈칸 마커 없이 채워진 구간만 표시된다.
+  영향: `연관 없음`, `중립`, `변동 없음` 등은 아이콘 없이 문구만 표시된다.
+- v41.4 (2026-03-10): 체결지속속도 기반 진입 준비/확정 로직 추가.
   [#1] 최근 시세 조회 스냅샷(가격·누적거래량·호가잔량)을 버퍼링해, 미세체결(낮은 체결금액) 필터를 거친 `execution_speed_score`와 `dip_resilience_score`를 계산하는 체결지속속도 엔진을 추가.
   [#2] EARLY_DETECT / NEAR_UPPER / SURGE / PRECLOSE_GAP_ENTRY는 알림 직후 바로 진입가 감시로 넘기지 않고, 하락 중에도 체결지속속도가 유지되는지 확인하는 `진입준비` 상태로 저장한 뒤 확인 시점 가격으로 진입가·손절가·목표가를 확정하도록 변경.
   [#3] ENTRY_POINT는 체결지속속도를 확인 필터로, MID_PULLBACK은 약한 가산점으로 반영해 신호 성격별 비중을 분리.
@@ -1407,7 +1414,7 @@ def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_r
             avg_pnl  = round(sum(v["pnl_pct"] for v in similar) / len(similar), 1)
             best     = max(similar, key=lambda x: x["pnl_pct"])
             worst    = min(similar, key=lambda x: x["pnl_pct"])
-            bar   = "🟢" * (win_rate // 20) + "⬜" * (5 - win_rate // 20)
+            bar   = "🟢" * (win_rate // 20)
             label = "유사 조건" if len(similar) < len(same_type) else "동일 신호"
             lines.append(
                 f"  {bar} {label} {len(similar)}건  승률 {win_rate}%  평균 {avg_pnl:+.1f}%"
@@ -4954,7 +4961,7 @@ def calc_real_sector_score(code_a: str, code_b: str,
     if score >= 60:   label = "🔴 강한 연관"
     elif score >= 40: label = "🟠 보통 연관"
     elif score >= 20: label = "🟡 약한 연관"
-    else:             label = "⬜ 연관 없음"
+    else:             label = "연관 없음"
 
     return {"score": score, "layers": layers, "label": label}
 
@@ -6206,7 +6213,7 @@ def track_signal_results():
                                             if p.get("score_adj", 0) < 0]
                             lines = ""
                             for op in out_patterns[:3]:
-                                ce = {"high":"🔴","mid":"🟡","low":"⬜"}.get(op.get("confidence","low"),"⬜")
+                                ce = {"high":"🔴","mid":"🟡","low":""}.get(op.get("confidence","low"),"")
                                 ck = {"high":"신뢰높음","mid":"참고용"}.get(op.get("confidence",""),"참고용")
                                 lines += f"  {ce} {op['label']} [{ck}]\n  └ {op['detail']}\n"
                             send(
@@ -7615,10 +7622,10 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                         vt = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
                         wsuf = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
-                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '⬜')
+                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '')
                         lines += f"  {marker} {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
                     for r in flat[:2]:
-                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '⬜')
+                        marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '')
                         lines += f"  {marker} {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
                     if bonus > 0:
                         lines += f"  💡 섹터 가산점: +{bonus}점\n"
@@ -8327,6 +8334,15 @@ def run_entry_defense_monitor():
     except Exception as e:
         _log_error("run_entry_defense_monitor", e)
 
+def _sanitize_telegram_text(text: str | None) -> str | None:
+    """텔레그램 발송 전 표시상 어색한 문자를 정리한다."""
+    if text is None:
+        return None
+    try:
+        return str(text).replace(chr(0x2B1C), "").replace(chr(0x26AA), "")
+    except Exception:
+        return text
+
 def send_with_chart_buttons(text: str, code: str, name: str):
     """
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
@@ -8344,7 +8360,7 @@ def send_with_chart_buttons(text: str, code: str, name: str):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
                 "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         text,
+                "text":         _sanitize_telegram_text(text),
                 "parse_mode":   "HTML",
                 "reply_markup": keyboard,
             },
@@ -8372,7 +8388,7 @@ def _tg_request(method: str, payload: dict, timeout: int = 10) -> dict | None:
 
 def send(text: str, *, reply_markup: dict | None = None) -> int | None:
     """메시지 전송. 성공 시 message_id 반환."""
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _sanitize_telegram_text(text), "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     res = _tg_request("sendMessage", payload)
@@ -8858,7 +8874,7 @@ def send_alert(s: dict):
     # ── 컴팩트 모드 ──
     if _compact_mode:
         name_dot = {"UPPER_LIMIT":"🔴","NEAR_UPPER":"🟠","STRONG_BUY":"🟢",
-                    "SURGE":"🟡","EARLY_DETECT":"🔵","ENTRY_POINT":"🟣"}.get(s["signal_type"],"⚪")
+                    "SURGE":"🟡","EARLY_DETECT":"🔵","ENTRY_POINT":"🟣"}.get(s["signal_type"],"")
         entry  = s.get("entry_price", 0)
         stop   = s.get("stop_loss", 0)
         target = s.get("target_price", 0)
@@ -8879,7 +8895,7 @@ def send_alert(s: dict):
         "SURGE":       "🟡",
         "EARLY_DETECT":"🔵",
         "ENTRY_POINT": "🟣",
-    }.get(s["signal_type"], "⚪")
+    }.get(s["signal_type"], "")
 
     stars    = "★" * min(int(s["score"]/20), 5)
     now_str  = datetime.now().strftime("%H:%M:%S")
@@ -9470,7 +9486,7 @@ def analyze(stock: dict) -> dict:
             score += fp_adj
         for p in fp.get("patterns", []):
             if p.get("score_adj", 0) != 0 or p.get("confidence") == "high":
-                conf_emoji = {"high":"🔴","mid":"🟡","low":"⬜"}.get(p["confidence"],"⬜")
+                conf_emoji = {"high":"🔴","mid":"🟡","low":""}.get(p["confidence"],"")
                 reasons.append(
                     f"{conf_emoji} [{p['confidence'].upper()}] {p['label']} "
                     f"{int(p['score_adj'] or 0):+d}점 — {p['detail']}"
@@ -10291,12 +10307,12 @@ def detect_force_pattern(code: str, name: str,
     total_adj = max(-20, min(total_adj, 20))  # -20~+20 범위 제한
 
     # 신뢰도별 이모지 및 설명
-    CONF_EMOJI = {"high": "🔴", "mid": "🟡", "low": "⬜"}
+    CONF_EMOJI = {"high": "🔴", "mid": "🟡", "low": ""}
     CONF_KOR   = {"high": "신뢰높음", "mid": "참고용", "low": "참고용"}
 
     summary_lines = []
     for p in patterns:
-        ce  = CONF_EMOJI.get(p["confidence"], "⬜")
+        ce  = CONF_EMOJI.get(p["confidence"], "")
         ck  = CONF_KOR.get(p["confidence"], "참고용")
         adj = f"{int(p['score_adj'] or 0):+d}점" if p["score_adj"] != 0 else ""
         summary_lines.append(
@@ -11519,7 +11535,7 @@ def send_news_theme_alert(signal: dict):
     rising_lines = []
     for s in signal.get("rising", []):
         wsuf = _watch_suffix(s.get("code",""), safe_int(s.get("price", 0)))
-        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '⬜')
+        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '')
         rising_lines.append(
             f"  {marker} <b>{s['name']}</b> {s['change_rate']:+.1f}%"
             + (f" 🔊{s['volume_ratio']:.0f}x" if s.get("vol_on") else "")
@@ -11531,7 +11547,7 @@ def send_news_theme_alert(signal: dict):
     not_yet_lines = []
     for s in signal.get("not_yet", []):
         wsuf = _watch_suffix(s.get("code",""), safe_int(s.get("price", 0)))
-        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '⬜')
+        marker = '🟩' if s['change_rate'] > 0 else ('🟥' if s['change_rate'] < 0 else '')
         not_yet_lines.append(f"  {marker} {s['name']} {s['change_rate']:+.1f}%{wsuf}")
     not_yet_block = ("\n".join(not_yet_lines) + ("\n" if not_yet_lines else ""))
     send(f"{emoji} <b>[뉴스+주가 연동]</b>  {signal['signal_strength']}\n"
@@ -11793,7 +11809,7 @@ def analyze_dart_disclosures():
         if not scored[:5]: send("📋 <b>오늘 주목할 공시 없음</b>"); return
         msg = f"📋 <b>내일 주목 종목 - DART 분석</b>\n🗓 {today[:4]}.{today[4:6]}.{today[6:]}\n━━━━━━━━━━━━━━━\n\n"
         for i,item in enumerate(scored[:5],1):
-            e = {"매우강함":"🔴","강함":"🟡","보통":"🟢"}.get(item["strength"],"⚪")
+            e = {"매우강함":"🔴","강함":"🟡","보통":"🟢"}.get(item["strength"],"")
             msg += f"{i}. {e} <b>{item['company']}</b> ({item['code']})\n   📌 {item['title']}\n   🔑 {', '.join(item['matched'])}\n   ⭐ {item['score']}점\n\n"
         send(msg+"━━━━━━━━━━━━━━━\n⚠️ 내일 장 시작 전 확인 후 진입 판단")
     except Exception as e: print(f"⚠️ DART 분석 오류: {e}")
@@ -11838,7 +11854,7 @@ def _send_menu(title: str = ""):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
                 "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       menu_title,
+                "text":       _sanitize_telegram_text(menu_title),
                 "parse_mode": "HTML",
                 "reply_markup": keyboard,
             },
@@ -12864,7 +12880,7 @@ def _send_stats():
             avg  = sum(pnls) / len(pnls)
             best = max(pnls); worst = min(pnls)
             label = type_labels.get(t, t)
-            bar   = "🟢" * int(rate/20) + "⬜" * (5 - int(rate/20))
+            bar   = "🟢" * int(rate/20)
             # 청산 이유 분포
             reasons = {}
             for r in recs:
@@ -12898,7 +12914,7 @@ def _send_stats():
                 st  = slot_stats[slot]
                 adj = _dynamic["timeslot_score_adj"].get(slot, 0)
                 adj_str = f"  [+{adj}점 보정 중]" if adj > 0 else ""
-                bar = "🟢" * int(st["rate"] / 20) + "⬜" * (5 - int(st["rate"] / 20))
+                bar = "🟢" * int(st["rate"] / 20)
                 msg += (f"  {slot}: {bar}  승률 {st['rate']:.0f}%  "
                         f"평균 {st['avg']:+.1f}%  ({st['total']}건){adj_str}\n")
 
@@ -14164,8 +14180,8 @@ def get_korea_etf_signals() -> dict:
             tone, market_adj = "neutral", 0
 
         tone_map = {"strong_up":"🟢 강세", "up":"🟢 우호", "slight_up":"🟩 소폭 우호",
-                    "neutral":"⚪ 중립", "slight_down":"🟧 소폭 경계", "down":"🟠 경계", "strong_down":"🔴 약세"}
-        summary = f"{tone_map.get(tone, '⚪ 중립')} EWY {ewy:+.1f}% / FLKR {flkr:+.1f}%"
+                    "neutral":"중립", "slight_down":"🟧 소폭 경계", "down":"🟠 경계", "strong_down":"🔴 약세"}
+        summary = f"{tone_map.get(tone, '중립')} EWY {ewy:+.1f}% / FLKR {flkr:+.1f}%"
         result.update({
             "ts": time.time(),
             "ewy_chg": ewy,
