@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.5
+버전: v41.6
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.6 (2026-03-10): 목표가 도달/자동 추적 결과의 진입가 도달 정보 복구 강화.
+  [#1] `track_signal_results()` 경로에서 트레일링 모드·분할청산·자동추적결과 메시지 생성 시 현재 레코드의 exact log_key를 함께 넘기도록 보강해, 동일 종목 재포착/완료 상태에서도 도달가·도달시각을 정확히 조회하도록 정리.
+  [#2] `_lookup_entry_hit_fallback()`가 exact log_key 조회 시 status에 관계없이 현재 레코드를 우선 참조하고, 일반 entry_hit 필드뿐 아니라 legacy_entry_hit_* 보존값도 함께 읽도록 확장.
+  [#3] `_strict_cleanup_legacy_entry_hits()`가 cleanup 시 legacy_entry_hit_price/date/clock도 같이 백업하고, `_get_entry_hit_display()`가 legacy 필드까지 포함해 표시값을 복구하도록 보강.
+  이유: `[목표가 도달 → 트레일링 모드]`와 후속 자동 추적 결과에서 봇 재시작·정리 이후 또는 완료 레코드 상태에서 진입가 도달가/도달시각이 다시 빠지는 문제를 전반 경로에서 막기 위함.
+  개선점: 트레일링 모드 표시 안정성↑, 완료 결과 메시지 일관성↑, 재시작 후 도달 메타 복구력↑.
+  주의점: 과거 레거시 데이터 중 기존에 도달가/도달시각이 애초에 저장되지 않은 레코드는 여전히 일부가 비어 있을 수 있다.
+  영향: `[목표가 도달 → 트레일링 모드]`, `[분할 청산 타이밍]`, `[자동 추적 결과]`의 진입가 줄에서 도달 관련 정보가 더 안정적으로 표시된다.
 - v41.5 (2026-03-10): 빈칸/원형 기호 대체 없이 전역 제거.
   [#1] 승률 바, 연관도/신뢰도/변동없음 마커, 중립 표시 등에 남아 있던 원형 중립 마커를 모두 제거하고 문구만 남도록 정리.
   [#2] `_sanitize_telegram_text()` helper를 보강해 텔레그램 발송 직전 빈칸/원형 기호가 들어와도 빈 문자열로 제거되도록 변경.
@@ -5281,6 +5289,9 @@ def _strict_cleanup_legacy_entry_hits() -> None:
             if rec.get("entry_hit") is True:
                 rec["legacy_entry_hit"] = True
                 rec["legacy_entry_hit_time"] = rec.get("entry_hit_time")
+                rec["legacy_entry_hit_price"] = rec.get("entry_hit_price")
+                rec["legacy_entry_hit_date"] = rec.get("entry_hit_date")
+                rec["legacy_entry_hit_clock"] = rec.get("entry_hit_clock")
                 rec["legacy_entry_hit_reset_at"] = now_s
                 rec["legacy_entry_hit_reset_reason"] = "strict_cleanup_non_actual_entry"
                 rec["entry_hit"] = False
@@ -6172,7 +6183,8 @@ def track_signal_results():
                     except Exception: pass
                     target_pct = ((target - entry) / entry * 100) if entry else 0
                     target_progress_pct = (pnl_now / target_pct * 100) if target_pct else 0
-                    entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=False, include_hit_time=True)
+                    display_rec = dict(rec); display_rec['log_key'] = log_key
+                    entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=False, include_hit_time=True)
                     send_with_chart_buttons(
                         f"💡 <b>[분할 청산 타이밍]</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
@@ -6282,7 +6294,7 @@ def track_signal_results():
                     _apply_result_labels(rec)
                     _tracking_notified.add(log_key)
                     updated = True
-                    _send_tracking_result(rec)
+                    _send_tracking_result(rec, log_key=log_key)
                     print(f"  📊 트레일링 청산: {rec['name']} {pnl_pct:+.1f}%")
                     continue
 
@@ -6298,7 +6310,8 @@ def track_signal_results():
                     updated = True
                     if trailing_key not in _tracking_notified:
                         _tracking_notified.add(trailing_key)
-                        entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=True, include_hit_time=True)
+                        display_rec = dict(rec); display_rec['log_key'] = log_key
+                        entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=True, include_hit_time=True)
                         send_with_chart_buttons(
                             f"🎯 <b>[목표가 도달 → 트레일링 모드]</b>\n"
                             f"━━━━━━━━━━━━━━━\n"
@@ -6352,7 +6365,7 @@ def track_signal_results():
                 _dup_key = f"result_{code}_{rec.get('detect_date','')}"
                 if _dup_key not in _tracking_notified:
                     _tracking_notified.add(_dup_key)
-                    _send_tracking_result(rec)
+                    _send_tracking_result(rec, log_key=log_key)
                     print(f"  📊 추적 완료: {rec['name']} {pnl_pct:+.1f}% ({exit_reason}) [이론]")
                 else:
                     print(f"  📊 추적 완료(중복생략): {rec['name']} {pnl_pct:+.1f}%")
@@ -6393,7 +6406,7 @@ def track_signal_results():
         _log_error("track_signal_results", e, critical=True)
 
 
-def _send_tracking_result(rec: dict):
+def _send_tracking_result(rec: dict, log_key: str | None = None):
     """결과 확정 텔레그램 알림 + 손절 원인 분석"""
     pnl      = rec["pnl_pct"]
     reason   = rec["exit_reason"]
@@ -6463,7 +6476,10 @@ def _send_tracking_result(rec: dict):
             f"  → 절반 익절 후 나머지 홀딩 전략\n"
         )
 
-    entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=False, include_hit_time=True)
+    display_rec = dict(rec or {})
+    if log_key:
+        display_rec['log_key'] = log_key
+    entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=False, include_hit_time=True)
 
     send_with_chart_buttons(
         f"{emoji} <b>[자동 추적 결과]</b>  {title}\n"
@@ -7919,7 +7935,9 @@ def _lookup_entry_hit_fallback(rec: dict | None) -> dict:
         if isinstance(data, dict):
             target = None
             if log_key and isinstance(data.get(log_key), dict):
-                target = data.get(log_key)
+                _exact = data.get(log_key) or {}
+                if not code or _exact.get('code') == code:
+                    target = _exact
             if not target and code:
                 candidates = []
                 for _k, _rec in data.items():
@@ -7927,9 +7945,12 @@ def _lookup_entry_hit_fallback(rec: dict | None) -> dict:
                         continue
                     if _rec.get('code') != code:
                         continue
-                    if _rec.get('status') != '추적중':
-                        continue
                     if signal_type and _rec.get('signal_type') != signal_type:
+                        continue
+                    has_hit_meta = any(_rec.get(_k) not in (None, '', False) for _k in (
+                        'entry_hit_time', 'entry_hit_price', 'legacy_entry_hit_time', 'legacy_entry_hit_price'
+                    ))
+                    if not has_hit_meta and _rec.get('status') not in ('추적중', '진입준비'):
                         continue
                     detect_key = f"{_rec.get('detect_date','')}{_rec.get('detect_time','')}".replace(":", "")
                     candidates.append((detect_key, _rec))
@@ -7940,6 +7961,15 @@ def _lookup_entry_hit_fallback(rec: dict | None) -> dict:
                 for _k in ('entry_hit', 'entry_hit_price', 'entry_hit_time', 'entry_hit_date', 'entry_hit_clock'):
                     if target.get(_k) not in (None, '', False):
                         out[_k] = target.get(_k)
+                legacy_map = {
+                    'legacy_entry_hit_price': 'entry_hit_price',
+                    'legacy_entry_hit_time': 'entry_hit_time',
+                    'legacy_entry_hit_date': 'entry_hit_date',
+                    'legacy_entry_hit_clock': 'entry_hit_clock',
+                }
+                for _src, _dst in legacy_map.items():
+                    if out.get(_dst) in (None, '', False) and target.get(_src) not in (None, '', False):
+                        out[_dst] = target.get(_src)
     except Exception:
         pass
 
@@ -7958,6 +7988,15 @@ def _lookup_entry_hit_fallback(rec: dict | None) -> dict:
 def _get_entry_hit_display(rec: dict | None) -> tuple[int | None, str]:
     """진입가 도달 관련 표시용 데이터(도달가, 도달시각 문자열) 반환."""
     rec = dict(rec or {})
+    if rec.get('entry_hit_price') in (None, '', False) and rec.get('legacy_entry_hit_price') not in (None, '', False):
+        rec['entry_hit_price'] = rec.get('legacy_entry_hit_price')
+    if rec.get('entry_hit_time') in (None, '', False) and rec.get('legacy_entry_hit_time') not in (None, '', False):
+        rec['entry_hit_time'] = rec.get('legacy_entry_hit_time')
+    if rec.get('entry_hit_date') in (None, '', False) and rec.get('legacy_entry_hit_date') not in (None, '', False):
+        rec['entry_hit_date'] = rec.get('legacy_entry_hit_date')
+    if rec.get('entry_hit_clock') in (None, '', False) and rec.get('legacy_entry_hit_clock') not in (None, '', False):
+        rec['entry_hit_clock'] = rec.get('legacy_entry_hit_clock')
+
     if not rec.get('entry_hit_time') or not rec.get('entry_hit_price'):
         try:
             rec.update(_lookup_entry_hit_fallback(rec))
