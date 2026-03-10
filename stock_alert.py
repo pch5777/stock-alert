@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.2
+버전: v40.4
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.4 (2026-03-10): 메시지 표기 재조정 — v40.2 기준 재작업 (v40.3 과반영안 폐기).
+  [#1] [분할 청산 타이밍], [자동 추적 결과]의 진입가 표시에 도달시각만 추가. 도달가는 표시하지 않음.
+  [#2] [목표가 도달 → 트레일링 모드]의 진입가 표시에 도달가·도달시각을 함께 표시.
+  [#3] [진입가 도달!]에는 섹터 모멘텀만 추가. 진입가/도달가/도달시각 추가는 하지 않음.
+  [#4] 진입가 도달 시 signal_log에 entry_hit_price, entry_hit_date, entry_hit_clock, entry_hit_time 저장 확장.
+  이유: 사용자 요청대로 메시지별 정보 범위를 분리하고, v40.3의 과반영 범위를 버리고 v40.2 안정본 기준으로 다시 정리.
+  개선점: 메시지 혼선↓, 진입 판단용 섹터 정보↑, 후속 추적 메시지 정보 정확도↑.
+  주의점: 과거 레코드에는 entry_hit_price/date/clock이 없을 수 있어 일부 메시지에 도달시각/도달가가 비어 보일 수 있음.
+  영향: 신규 진입가 도달 건부터 후속 메시지 표기 강화. [진입가 도달!]은 섹터 판단 중심으로 단순화.
 - v40.2 (2026-03-10): 기본수칙 #6 강화 반영 — 후속 AI 인수인계용 내부 기록 구조 보강.
   [#1] 코드 로직 변경 없음. v40.1의 실동작(오버나이트/지정학/대시보드 제한, DART 이름복구)은 그대로 유지.
   [#2] 상단 변경 이력을 모델 비의존적으로 재정리. 다음 AI가 모델이 달라도 수정 배경·영향·주의점을 바로 이해할 수 있게 문서화.
@@ -53,6 +62,11 @@
   - run_overnight_monitor(): alerts가 있어도 텔레그램 send(msg)를 하지 않는다. 내부 요약/로그만 유지하는 설계다.
   - run_geo_news_scan(): is_any_market_open()일 때만 발송하며, _geo_event_state['last_sent_msg']와 동일한 내용이면 재발송하지 않는다.
   - update_dashboard(force=False): 함수 시작부에서 is_any_market_open()이 아니면 즉시 return 한다.
+- v40.4 메시지 표기 포인트:
+  - [진입가 도달!]은 섹터 모멘텀만 추가된 기준 버전이다. 진입가 도달가/시각 상세는 넣지 않는다.
+  - [분할 청산 타이밍], [자동 추적 결과]는 진입가 + 도달시각만 표시한다.
+  - [목표가 도달 → 트레일링 모드]만 진입가 + 도달가 + 도달시각을 모두 표시한다.
+  - v40.3에서 넓게 넣었던 진입가 도달 상세 표기안은 폐기되었으므로, 후속 수정 기준 버전은 v40.4로 본다.
 - 추가 수정 시 필수 기록 규칙:
   - 버전(Version) 반드시 변경.
   - 파일 내부 변경 이력(이 상단 docstring) 반드시 갱신.
@@ -4736,7 +4750,7 @@ def track_signal_results():
                     except Exception: pass
                     target_pct = ((target - entry) / entry * 100) if entry else 0
                     target_progress_pct = (pnl_now / target_pct * 100) if target_pct else 0
-                    basis_gap_pct = ((price - entry) / entry * 100) if entry else 0
+                    entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=False, include_hit_time=True)
                     send_with_chart_buttons(
                         f"💡 <b>[분할 청산 타이밍]</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
@@ -4746,7 +4760,7 @@ def track_signal_results():
                         f"📌 분할 기준: <b>+{half_pct:.1f}% 이상</b> 달성 시 1차 익절 검토\n"
                         f"✅ 현재 상태: 기준 대비 <b>{pnl_now-half_pct:+.1f}%p</b>\n"
                         f"📍 현재가: <b>{price:,}원</b>\n"
-                        f"🎯 진입가: <b>{entry:,}원</b>  ({basis_gap_pct:+.1f}%)\n"
+                        f"{entry_hit_line}\n"
                         f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%)\n"
                         f"{inv_info}\n"
                         f"━━━━━━━━━━━━━━━\n"
@@ -4857,10 +4871,12 @@ def track_signal_results():
                     updated = True
                     if trailing_key not in _tracking_notified:
                         _tracking_notified.add(trailing_key)
+                        entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=True, include_hit_time=True)
                         send_with_chart_buttons(
                             f"🎯 <b>[목표가 도달 → 트레일링 모드]</b>\n"
                             f"━━━━━━━━━━━━━━━\n"
                             f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                            f"{entry_hit_line}\n"
                             f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
                             f"━━━━━━━━━━━━━━━\n"
                             f"✅ 목표 달성! 추가 상승 시 자동으로 더 먹습니다\n"
@@ -5014,6 +5030,8 @@ def _send_tracking_result(rec: dict):
             f"  → 절반 익절 후 나머지 홀딩 전략\n"
         )
 
+    entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=False, include_hit_time=True)
+
     send_with_chart_buttons(
         f"{emoji} <b>[자동 추적 결과]</b>  {title}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -5022,7 +5040,7 @@ def _send_tracking_result(rec: dict):
         f"신호: {sig_label}  |  감지: {rec.get('detect_date','')} {rec.get('detect_time','')}\n"
         f"{theme_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"진입가:  <b>{entry:,}원</b>\n"
+        f"{entry_hit_line}\n"
         f"청산가:  <b>{exit_p:,}원</b>  ({reason})\n"
         f"현재가:  <b>{rec.get('current_price', exit_p):,}원</b>\n"
         f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
@@ -6249,7 +6267,7 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
         print(f"⚠️ 진입미달 기록 오류: {e}")
 
 
-def _mark_entry_hit_in_signal_log(code: str, signal_type: str) -> None:
+def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None) -> None:
     """진입가 도달(HIT) 이벤트를 signal_log에 기록. (가상진입/학습용)"""
     try:
         data = {}
@@ -6257,15 +6275,57 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str) -> None:
             data = _read_json_locked(SIGNAL_LOG_FILE)
         except Exception:
             return
-        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        now_s = str(hit_time or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        hit_date, hit_clock = "", ""
+        if " " in now_s:
+            hit_date, hit_clock = now_s.split(" ", 1)
+        elif len(now_s) >= 10:
+            hit_date = now_s[:10]
         for _k, rec in data.items():
             if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
                 rec['entry_hit'] = True
                 rec['entry_hit_time'] = now_s
+                if hit_price:
+                    rec['entry_hit_price'] = int(hit_price)
+                if hit_date:
+                    rec['entry_hit_date'] = hit_date
+                if hit_clock:
+                    rec['entry_hit_clock'] = hit_clock
                 break
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
     except Exception as e:
         print(f"⚠️ entry_hit 기록 오류: {e}")
+
+def _get_entry_hit_display(rec: dict | None) -> tuple[int | None, str]:
+    """진입가 도달 관련 표시용 데이터(도달가, 도달시각 문자열) 반환."""
+    rec = rec or {}
+    hit_price = None
+    try:
+        _hp = rec.get('entry_hit_price')
+        if _hp:
+            hit_price = int(_hp)
+    except Exception:
+        hit_price = None
+
+    hit_time = str(rec.get('entry_hit_time') or '').strip()
+    if not hit_time:
+        hit_date = str(rec.get('entry_hit_date') or '').strip()
+        hit_clock = str(rec.get('entry_hit_clock') or '').strip()
+        if hit_date and hit_clock:
+            hit_time = f"{hit_date} {hit_clock}"
+        else:
+            hit_time = hit_date or hit_clock
+    return hit_price, hit_time
+
+def _build_entry_hit_line(entry: int, rec: dict | None = None, include_hit_price: bool = False, include_hit_time: bool = True) -> str:
+    parts = [f"🎯 진입가: <b>{int(entry):,}원</b>"]
+    hit_price, hit_time = _get_entry_hit_display(rec)
+    if include_hit_price and hit_price:
+        parts.append(f"도달가 <b>{hit_price:,}원</b>")
+    if include_hit_time and hit_time:
+        parts.append(f"도달시각 {hit_time}")
+    return "  |  ".join(parts)
+
 def check_entry_watch():
     if not _entry_watch: return
     use_nxt = not is_market_open() and is_nxt_open()
@@ -6375,12 +6435,38 @@ def check_entry_watch():
                     reasons_lines = "\n".join([f"  {r}" for r in _reasons[:3]])
                     reasons_block = f"\n📋 <b>포착 이유</b>\n{reasons_lines}\n"
 
+                # v40.4: 진입가 도달 메시지에는 섹터 모멘텀만 추가 (도달가/도달시각은 미표시)
+                sector_block = ""
+                try:
+                    sector_info = calc_sector_momentum(watch["code"], watch["name"])
+                    _theme = str(sector_info.get("theme", "") or "").strip()
+                    _summary = str(sector_info.get("summary", "") or "").strip()
+                    _rising = sector_info.get("rising", []) or []
+                    _sector_lines = []
+                    if _theme:
+                        _sector_lines.append(f"🏭 <b>섹터 모멘텀</b> [{_theme}]")
+                    elif _summary or _rising:
+                        _sector_lines.append("🏭 <b>섹터 모멘텀</b>")
+                    if _summary:
+                        _sector_lines.append(f"  {_summary}")
+                    if _rising:
+                        _co_rise = ", ".join([
+                            f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
+                            for r in _rising[:4]
+                        ])
+                        _sector_lines.append(f"  📌 동반 상승: {_co_rise}")
+                    if _sector_lines:
+                        sector_block = "\n" + "\n".join(_sector_lines) + "\n"
+                except Exception:
+                    sector_block = ""
+
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                     f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
                     f"{reasons_block}"
+                    f"{sector_block}"
                     f"━━━━━━━━━━━━━━━\n"
                     f"┌─────────────────────\n"
                     f"│ ⚡️ <b>지금 진입 구간!</b>\n"
@@ -6391,9 +6477,14 @@ def check_entry_watch():
                     f"└─────────────────────",
                     watch["code"], watch["name"]
                 )
+                _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 watch['entry_hit'] = True
+                watch['entry_hit_time'] = _entry_hit_ts
+                watch['entry_hit_price'] = price
+                if ' ' in _entry_hit_ts:
+                    watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
                 try:
-                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''))
+                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts)
                 except Exception:
                     pass
                 print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
