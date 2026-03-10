@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.6
-날짜: 2026-03-10
+버전: v41.7
+날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.7 (2026-03-11): 07:30 DART 강재료 후보에 종목명 우선 표시 복구.
+  [#1] `_scan_recent_dart_materials()`가 DART 응답의 `corp_name`을 먼저 받아 `name_hint`로 `_resolve_stock_name()`을 호출하고, 응답 원본의 corp_name도 함께 저장하도록 보강.
+  [#2] `_build_preopen_issue_section()`의 `📢 공시(DART) 강재료 후보` 출력은 `종목명(코드)` 형식 우선으로 통일하고, 종목명 복구가 실패한 경우에만 코드 단독 fallback을 사용하도록 정리.
+  이유: 07:30 워치리스트 하단 DART 강재료 후보에서 일부 종목이 이름 없이 코드만 보여 사용자 가독성이 떨어지던 문제를 최소 범위에서 복구하기 위함.
+  개선점: 장전 공시 후보 가독성↑, 종목 식별 속도↑, DART 원본 corp_name 활용도↑.
+  주의점: DART 원본의 corp_name이 비어 있고 내부 종목명 복구도 실패한 경우에는 기존처럼 코드만 표시될 수 있다.
+  영향: `📢 공시(DART) 강재료 후보` 구간은 가능한 한 `종목명(코드)`로 표시된다.
 - v41.6 (2026-03-10): 목표가 도달/자동 추적 결과의 진입가 도달 정보 복구 강화.
   [#1] `track_signal_results()` 경로에서 트레일링 모드·분할청산·자동추적결과 메시지 생성 시 현재 레코드의 exact log_key를 함께 넘기도록 보강해, 동일 종목 재포착/완료 상태에서도 도달가·도달시각을 정확히 조회하도록 정리.
   [#2] `_lookup_entry_hit_fallback()`가 exact log_key 조회 시 status에 관계없이 현재 레코드를 우선 참조하고, 일반 entry_hit 필드뿐 아니라 legacy_entry_hit_* 보존값도 함께 읽도록 확장.
@@ -3485,7 +3492,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
 
 def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
     """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
-    반환: [{code,name,title,grade}, ...]
+    반환: [{code,name,corp_name,title,grade}, ...]
     """
     if not DART_API_KEY:
         return []
@@ -3507,6 +3514,7 @@ def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
             for it in (dart_list or []):
                 title = (it.get("report_nm") or it.get("title") or "").strip()
                 code  = normalize_stock_code(it.get("stock_code") or it.get("stock_code") or it.get("stock_code"))
+                corp_name = str(it.get("corp_name") or "").strip()
                 if not title or not code:
                     continue
                 # 리스크 공시는 제외 (손익 방어 쪽에서 따로 처리)
@@ -3519,9 +3527,11 @@ def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
                 if key in seen:
                     continue
                 seen.add(key)
-                name = _lookup_name_by_code(code)
+                name = _resolve_stock_name(code, name_hint=corp_name)
+                if not name or str(name).strip() == str(code):
+                    name = corp_name or name
                 grade = "매우강함" if any(k in title for k in DART_KEYWORDS.get("매우강함", [])) else "강함"
-                out.append({"code": code, "name": name, "title": title, "grade": grade})
+                out.append({"code": code, "name": name, "corp_name": corp_name, "title": title, "grade": grade})
                 if len(out) >= max_items:
                     return out
     except Exception as e:
@@ -3559,10 +3569,13 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
         if darts:
             lines.append("📢 공시(DART) 강재료 후보")
             for d in darts[:5]:
-                nm = d.get("name") or d.get("code")
+                code = normalize_stock_code(d.get("code") or "") or str(d.get("code") or "").strip()
+                nm = str(d.get("name") or d.get("corp_name") or "").strip()
                 title = d.get("title","")
                 grade = d.get("grade","")
-                lines.append(f" • {nm}: {grade} — {title}")
+                label = f"{nm}({code})" if nm and code and nm != code else (nm or code)
+                if label:
+                    lines.append(f" • {label}: {grade} — {title}")
     except Exception:
         pass
 
