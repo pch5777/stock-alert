@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.5
+버전: v40.6
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.6 (2026-03-10): 섹터 미반영 종목 재안내 조건 보수화 + 별도 섹터 모니터링 메시지 축소.
+  [#1] 포착 당시 섹터 블록이 실질적으로 비어 있었던 종목만 재안내 후보로 등록.
+  [#2] alert-origin 섹터 모니터링은 별도 [종목 섹터 모니터링] 메시지를 보내지 않고, 조건 충족 시에만 전체 포착 메시지를 1회 재전송하도록 변경.
+  [#3] 재전송 제목을 🔁 [섹터 미반영 종목 재안내]로 고정하고, 본문은 기존 포착 메시지 전체 + 새로 확보된 섹터 블록을 포함하도록 구성.
+  [#4] 재전송 허용 조건을 보수적으로 추가: 포착 후 30분 이내, 진입 의미 유지, 원신호 훼손 없음, 진입가 도달 후 한참 지난 상태 아님, 섹터 정보가 요약/동반상승 기준으로 의미 있게 조회된 경우만 허용.
+  [#5] 눌림목 진입 신호(send_mid_pullback_alert)의 구형 배경 섹터 재조회 별도 메시지를 제거하고 동일한 재안내 흐름으로 통일.
+  이유: [종목 섹터 모니터링] 단독 메시지는 앞선 포착 정보와 분리되어 찾기 어렵고, 단순 섹터 조회 성공만으로 늦은 재알림이 가면 행동 가치가 낮아지기 때문.
+  개선점: 포착 정보 일관성↑, 섹터 재안내 품질↑, 불필요 후속 알림↓.
+  주의점: 섹터가 나중에 조회돼도 재전송 조건을 하나라도 만족하지 못하면 조용히 종료된다. alert-origin 재안내는 1회만 허용된다.
+  영향: 포착 시 섹터 미반영 종목은 유효할 때만 전체 포착 메시지로 재안내되고, 기존 별도 [종목 섹터 모니터링] 알림은 alert-origin 경로에서 기본 미발송.
 - v40.5 (2026-03-10): [진입 여부 확인] 자동 발송 기본 비활성화.
   [#1] 이론 추적 완료 후 _request_actual_entry_confirm(rec)를 자동 호출하던 구간에 설정 플래그를 추가.
   [#2] ACTUAL_ENTRY_CONFIRM_ENABLED 환경변수를 도입하고 기본값을 False(0)로 설정.
@@ -70,6 +80,11 @@
   - run_overnight_monitor(): alerts가 있어도 텔레그램 send(msg)를 하지 않는다. 내부 요약/로그만 유지하는 설계다.
   - run_geo_news_scan(): is_any_market_open()일 때만 발송하며, _geo_event_state['last_sent_msg']와 동일한 내용이면 재발송하지 않는다.
   - update_dashboard(force=False): 함수 시작부에서 is_any_market_open()이 아니면 즉시 return 한다.
+- v40.6 섹터 재안내 포인트:
+  - alert-origin(start_sector_monitor(..., from_alert=True)) 경로는 더 이상 별도 [종목 섹터 모니터링] 텔레그램을 보내지 않는다.
+  - 처음 포착 때 sector_info가 요약/동반상승 기준으로 비어 있던 종목만 재안내 후보가 된다.
+  - 재안내 제목은 🔁 [섹터 미반영 종목 재안내]로 고정되며, 본문은 기존 포착 메시지 전체 + 새 섹터 블록이다.
+  - 재안내는 포착 후 30분 이내, 진입 의미 유지, 원신호 훼손 없음, 진입가 도달 후 한참 경과하지 않음, 섹터 요약/동반상승 확보를 모두 만족할 때만 1회 허용된다.
 - v40.4 메시지 표기 포인트:
   - [진입가 도달!]은 섹터 모멘텀만 추가된 기준 버전이다. 진입가 도달가/시각 상세는 넣지 않는다.
   - [분할 청산 타이밍], [자동 추적 결과]는 진입가 + 도달시각만 표시한다.
@@ -799,6 +814,9 @@ NEWS_COOCCUR_FILE   = os.path.join(DATA_DIR, "news_cooccur.json")
 _sector_monitor     = {}
 SECTOR_MONITOR_INTERVAL  = 180   # 600→180초 (3분)
 SECTOR_MONITOR_MAX_HOURS = 6
+SECTOR_RESEND_MAX_MINUTES = int(os.getenv("SECTOR_RESEND_MAX_MINUTES", "30") or "30")
+SECTOR_RESEND_ENTRY_DEVIATION_PCT = float(os.getenv("SECTOR_RESEND_ENTRY_DEVIATION_PCT", "3.0") or "3.0")
+SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES = int(os.getenv("SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES", "10") or "10")
 
 # ── 진입가 감지 ──
 _entry_watch        = {}
@@ -2655,7 +2673,10 @@ def run_mid_pullback_scan():
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
-        start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True)  # ★ 섹터 지속 모니터링
+        if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
+            _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
+            _sector_retry_snap["_alert_sender"] = "mid_pullback"
+            start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)  # ★ 섹터 재안내 조건부 모니터링
         _mid_pullback_alert_history[s["code"]] = time.time()
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
@@ -2704,32 +2725,14 @@ def send_mid_pullback_alert(s: dict):
             sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
     elif theme:
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
-        # v39.4-#7: 조회 실패 시 배경 재조회 → 성공 시 섹터 정보 별도 발송
-        def _deferred_sector_lookup(code, name, theme, delay=30, retries=3):
-            for attempt in range(retries):
-                time.sleep(delay)
-                try:
-                    si_retry = calc_sector_momentum(code, name)
-                    if si_retry.get("bonus", 0) > 0 or si_retry.get("rising"):
-                        _summary = si_retry.get("summary", "")
-                        _leader = si_retry.get("leader")
-                        _lines = f"🏭 <b>섹터 [{theme}] 조회 완료</b>\n  {_summary}\n"
-                        if _leader and isinstance(_leader, dict):
-                            _lines += f"  👑 <b>대장: {_leader['name']}</b> {_leader.get('cr',0):+.1f}%\n"
-                        for r in si_retry.get("rising", [])[:4]:
-                            if _leader and r["code"] == _leader["code"]: continue
-                            _lines += f"  🟩 {r['name']} {r['change_rate']:+.1f}%\n"
-                        send(_lines)
-                        return
-                except Exception:
-                    pass
-        threading.Thread(target=_deferred_sector_lookup, args=(s["code"], stock_name, theme), daemon=True).start()
     else:
         sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터: 조회 실패\n"
 
+    header_override = str(s.get("_header_override", "") or "").strip()
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
+    header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
     send_with_chart_buttons(
-        f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}\n"
+        f"{header_line}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
@@ -5964,7 +5967,133 @@ def _chart_links(code: str, name: str) -> str:
 # ============================================================
 # 📡 섹터 지속 모니터링
 # ============================================================
-def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_time: str = "", from_alert: bool = False):
+def _sector_info_has_meaningful_payload(si: dict | None) -> bool:
+    si = si or {}
+    summary = str(si.get("summary", "") or "").strip()
+    rising = si.get("rising", []) or []
+    return bool(summary or rising)
+
+
+def _clone_alert_snapshot_for_sector_retry(s: dict | None) -> dict:
+    if not isinstance(s, dict):
+        return {}
+    cloned = dict(s)
+    if isinstance(cloned.get("reasons"), list):
+        cloned["reasons"] = list(cloned["reasons"])
+    if isinstance(cloned.get("sector_info"), dict):
+        cloned["sector_info"] = dict(cloned["sector_info"])
+    if isinstance(cloned.get("position"), dict):
+        cloned["position"] = dict(cloned["position"])
+    if isinstance(cloned.get("indic"), dict):
+        cloned["indic"] = dict(cloned["indic"])
+    return cloned
+
+
+def _needs_sector_resend_for_alert(s: dict | None) -> bool:
+    if not isinstance(s, dict):
+        return False
+    return not _sector_info_has_meaningful_payload(s.get("sector_info") or {})
+
+
+def _get_live_quote_for_signal(s: dict | None) -> dict:
+    if not isinstance(s, dict):
+        return {}
+    code = str(s.get("code", "") or "").strip()
+    if not code:
+        return {}
+    market = str(s.get("market", "") or "").strip().upper()
+    try:
+        if market == "NXT" and is_nxt_open():
+            return get_nxt_stock_price(code) or get_stock_price(code) or {}
+        return get_stock_price(code) or (get_nxt_stock_price(code) if market == "NXT" and is_any_market_open() else {}) or {}
+    except Exception:
+        return {}
+
+
+def _signal_age_minutes_for_retry(s: dict | None) -> int:
+    if not isinstance(s, dict):
+        return 10**9
+    detected_at = s.get("detected_at")
+    if isinstance(detected_at, datetime):
+        return max(0, minutes_since(detected_at))
+    if isinstance(detected_at, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(detected_at, fmt)
+                if fmt == "%H:%M:%S":
+                    parsed = datetime.now().replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
+                return max(0, int((datetime.now() - parsed).total_seconds() // 60))
+            except Exception:
+                continue
+    return 10**9
+
+
+def _latest_entry_watch_by_code(code: str) -> dict | None:
+    if not code or not _entry_watch:
+        return None
+    cand = [w for w in _entry_watch.values() if isinstance(w, dict) and w.get("code") == code]
+    if not cand:
+        return None
+    return max(cand, key=lambda x: x.get("registered_ts", 0))
+
+
+def _sector_resend_relevance_ok(alert_snapshot: dict, si_retry: dict) -> bool:
+    if not _sector_info_has_meaningful_payload(si_retry):
+        return False
+    if _signal_age_minutes_for_retry(alert_snapshot) > SECTOR_RESEND_MAX_MINUTES:
+        return False
+
+    quote = _get_live_quote_for_signal(alert_snapshot)
+    price = safe_int((quote or {}).get("price", 0) or alert_snapshot.get("price", 0))
+    entry = safe_int(alert_snapshot.get("entry_price", 0))
+    stop = safe_int(alert_snapshot.get("stop_loss", 0))
+    base_vr = float(alert_snapshot.get("volume_ratio", 0) or 0)
+    live_vr = float((quote or {}).get("volume_ratio", 0) or 0)
+
+    if entry and price:
+        upper = entry * (1.0 + SECTOR_RESEND_ENTRY_DEVIATION_PCT / 100.0)
+        if price > upper:
+            return False
+    if stop and price and price <= stop:
+        return False
+    if base_vr >= 2.0 and live_vr and live_vr < max(1.0, base_vr * 0.35):
+        return False
+
+    watch = _latest_entry_watch_by_code(str(alert_snapshot.get("code", "") or ""))
+    if watch and watch.get("entry_hit"):
+        hit_time = str(watch.get("entry_hit_time") or "").strip()
+        if hit_time:
+            try:
+                parsed = datetime.strptime(hit_time, "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - parsed).total_seconds() / 60.0 > SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES:
+                    return False
+            except Exception:
+                pass
+    return True
+
+
+def _dispatch_sector_resend_alert(alert_snapshot: dict, si_retry: dict) -> None:
+    snap = _clone_alert_snapshot_for_sector_retry(alert_snapshot)
+    if not snap:
+        return
+    quote = _get_live_quote_for_signal(snap)
+    if quote:
+        for key in ("price", "change_rate", "volume_ratio", "today_vol", "market"):
+            if key in quote and quote.get(key) not in (None, ""):
+                snap[key] = quote.get(key)
+        if quote.get("name"):
+            snap["name"] = _resolve_stock_name(str(snap.get("code", "") or ""), str(quote.get("name", "") or ""))
+    snap["sector_info"] = si_retry or {}
+    snap["_skip_repeat_throttle"] = True
+    snap["_header_override"] = "🔁 <b>[섹터 미반영 종목 재안내]</b>"
+    sender_kind = str(snap.get("_alert_sender", "send_alert") or "send_alert")
+    if sender_kind == "mid_pullback":
+        send_mid_pullback_alert(snap)
+    else:
+        send_alert(snap)
+
+
+def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_time: str = "", from_alert: bool = False, alert_snapshot: dict | None = None):
     if is_scoring_only_instrument(code, name):
         return
     monitor_meta = {
@@ -5976,6 +6105,7 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
         "origin_signal": origin_signal or "",
         "detect_time": detect_time or "",
         "from_alert": bool(from_alert),
+        "alert_snapshot": _clone_alert_snapshot_for_sector_retry(alert_snapshot) if from_alert else None,
     }
     if code in _sector_monitor:
         info = _sector_monitor.get(code, {})
@@ -5986,6 +6116,7 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
             "origin_signal": origin_signal or info.get("origin_signal", ""),
             "detect_time": detect_time or info.get("detect_time", ""),
             "from_alert": bool(from_alert or info.get("from_alert", False)),
+            "alert_snapshot": _clone_alert_snapshot_for_sector_retry(alert_snapshot) if (from_alert and alert_snapshot) else info.get("alert_snapshot"),
         })
         return
     _sector_monitor[code] = monitor_meta
@@ -5993,32 +6124,43 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
         while True:
             time.sleep(SECTOR_MONITOR_INTERVAL)
             info = _sector_monitor.get(code)
-            if not info: break
-            # NXT 포함 실질 장 마감 체크
+            if not info:
+                break
             if not is_any_market_open():
                 _sector_monitor.pop(code, None); break
-            # ⑥ 동적 감시 기간: 섹터가 계속 강하면 최대 24시간까지 연장
-            elapsed_h   = (time.time() - info["start_ts"]) / 3600
-            alert_cnt   = info.get("alert_count", 0)
-            # 알림이 많이 발생 = 테마가 살아있음 → 시간 연장
-            max_hours   = min(SECTOR_MONITOR_MAX_HOURS + alert_cnt * 2, 24)
+            elapsed_h = (time.time() - info["start_ts"]) / 3600
+            alert_cnt = info.get("alert_count", 0)
+            max_hours = min(SECTOR_MONITOR_MAX_HOURS + alert_cnt * 2, 24)
             if elapsed_h > max_hours:
                 print(f"  📡 섹터 감시 종료: {info.get('name',code)} ({elapsed_h:.1f}h, 알림 {alert_cnt}회)")
                 _sector_monitor.pop(code, None); break
             try:
                 _sector_cache.pop(code, None)
                 si = calc_sector_momentum(code, name)
-                if not si.get("detail"): continue
-                new_rising = [r for r in si.get("rising",[]) if r["code"] not in info["known_codes"]]
-                info["known_codes"].update({r["code"] for r in si.get("detail",[])})
+                if info.get("from_alert"):
+                    snap = info.get("alert_snapshot") or {}
+                    if _signal_age_minutes_for_retry(snap) > SECTOR_RESEND_MAX_MINUTES:
+                        _sector_monitor.pop(code, None); break
+                    if not _sector_info_has_meaningful_payload(si):
+                        continue
+                    if _sector_resend_relevance_ok(snap, si):
+                        _dispatch_sector_resend_alert(snap, si)
+                    _sector_monitor.pop(code, None); break
+                if not si.get("detail"):
+                    continue
+                new_rising = [r for r in si.get("rising", []) if r["code"] not in info["known_codes"]]
+                info["known_codes"].update({r["code"] for r in si.get("detail", [])})
                 if new_rising or info["alert_count"] == 0:
                     info["alert_count"] += 1
-                    theme   = si.get("theme",""); rising = si.get("rising",[]); flat = si.get("flat",[])
-                    bonus   = si.get("bonus",0); summary = si.get("summary","")
+                    theme = si.get("theme", "")
+                    rising = si.get("rising", [])
+                    flat = si.get("flat", [])
+                    bonus = si.get("bonus", 0)
+                    summary = si.get("summary", "")
                     new_set = {x["code"] for x in new_rising}
-                    tag     = f"🆕 {len(new_rising)}종목 추가" if new_rising and info["alert_count"]>1 else f"#{info['alert_count']}회 업데이트"
+                    tag = f"🆕 {len(new_rising)}종목 추가" if new_rising and info["alert_count"] > 1 else f"#{info['alert_count']}회 업데이트"
+
                     def _watch_suffix(peer_code: str, peer_price: int) -> str:
-                        """섹터 라인에 감시 상태/수익률 표기 (진입가 대비 현재가 기준)"""
                         try:
                             if not _entry_watch:
                                 return ""
@@ -6038,10 +6180,9 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                         except Exception:
                             return ""
 
-                    lines   = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
-                    lines  += _sector_origin_line(code, info)
-                    lines  += f"  {summary}\n" if summary else ""
-                    # v39.4-#4: 대장 종목 부각 + 하위 리스트에서 중복 제거
+                    lines = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
+                    lines += _sector_origin_line(code, info)
+                    lines += f"  {summary}\n" if summary else ""
                     leader = si.get("leader")
                     leader_code = leader["code"] if isinstance(leader, dict) else None
                     if leader and isinstance(leader, dict):
@@ -6052,10 +6193,11 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                                   f"점수 {leader.get('score',0):.2f}\n"
                                   f"  ━━━━━━━━━━━━━\n")
                     for r in rising[:5]:
-                        if r["code"] == leader_code: continue  # 대장은 위에서 이미 표시
-                        vt    = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else ""
+                        if r["code"] == leader_code:
+                            continue
+                        vt = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
                         new_t = " 🆕" if r["code"] in new_set else ""
-                        wsuf  = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
+                        wsuf = _watch_suffix(r["code"], safe_int(r.get("price", 0)))
                         marker = '🟩' if r['change_rate'] > 0 else ('🟥' if r['change_rate'] < 0 else '⬜')
                         lines += f"  {marker} {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vt}{new_t}{wsuf}\n"
                     for r in flat[:2]:
@@ -7039,7 +7181,7 @@ def send_alert(s: dict):
     # throttle repetitive alerts (reduce spam)
     try:
         st = s.get('signal_type','')
-        if st in ('UPPER_LIMIT','NEAR_UPPER'):
+        if not s.get('_skip_repeat_throttle') and st in ('UPPER_LIMIT','NEAR_UPPER'):
             key = f"{st}:{s.get('code','')}"
             if not _throttle_ok(_LAST_ALERT_TS, key, 3600):
                 # v40.0-#7: 차단 사유 로그
@@ -7187,8 +7329,10 @@ def send_alert(s: dict):
 def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
                        entry_block, indic_block, position_block, pattern_block, level):
+    header_override = str(s.get("_header_override", "") or "").strip()
+    header_line = f"{header_override}{nxt_badge}" if header_override else f"{emoji} <b>[{title}]</b>{nxt_badge}"
     send_by_level(
-        f"{emoji} <b>[{title}]</b>{nxt_badge}\n"
+        f"{header_line}\n"
         f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
@@ -7208,7 +7352,6 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
         + f"\n{entry_block}",
         level, s["code"], s["name"]
     )
-
 
 
 # ============================================================
@@ -12812,9 +12955,11 @@ def run_scan():
                 if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
                 register_entry_watch(s)
                 register_top_signal(s)
-                # 섹터 모니터: 동시 최대 8개 스레드 제한
-                if len(_sector_monitor) < 8:
-                    start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True)
+                # 섹터 재안내: 처음 포착 때 섹터 미반영 종목만 조건부 모니터링
+                if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
+                    _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
+                    _sector_retry_snap["_alert_sender"] = "send_alert"
+                    start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)
                 news_block_for_alert(s["code"], s["name"])
                 try:
                     threading.Thread(
