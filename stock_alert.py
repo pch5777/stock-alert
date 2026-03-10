@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.6
+버전: v40.7
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.7 (2026-03-10): /list 조회를 상태별 2구역으로 분리.
+  [#1] 기존 '감시 중인 종목' 단일 목록을 '진입가 감시중 종목'과 '진입가 도달 후 목표가 추적중 종목' 2구역으로 분리 표시.
+  [#2] 내부 _entry_watch의 entry_hit 상태를 기준으로 분류하고, 종목별로 진입가/목표가/손절가/포착시각을 함께 표시.
+  [#3] _detected_stocks에만 남아 있는 종목은 보조적으로 '진입가 감시중 종목'에 포함.
+  이유: 현재 텔레그램 메뉴에는 진입가 미도달 감시 종목과 진입가 도달 후 목표가 추적 종목을 따로 확인하는 화면이 없어, 사용자가 현재 상태를 한 번에 보기 어렵기 때문.
+  개선점: 조회 편의성↑, 현재 추적 상태 가시성↑, 메뉴 추가 없이 기존 감시 종목 기능 활용.
+  주의점: 과거/예외 데이터 중 현재가 정보가 없는 종목은 가격 일부가 비어 보일 수 있다.
+  영향: '📋 감시 종목' 버튼(/list)에서 상태별로 분리된 목록을 확인 가능.
 - v40.6 (2026-03-10): 섹터 미반영 종목 재안내 조건 보수화 + 별도 섹터 모니터링 메시지 축소.
   [#1] 포착 당시 섹터 블록이 실질적으로 비어 있었던 종목만 재안내 후보로 등록.
   [#2] alert-origin 섹터 모니터링은 별도 [종목 섹터 모니터링] 메시지를 보내지 않고, 조건 충족 시에만 전체 포착 메시지를 1회 재전송하도록 변경.
@@ -10243,12 +10251,91 @@ def poll_telegram_commands():
 
             # ── /list ──
             elif text == "/list":
-                if not _detected_stocks:
+                pending_lines = []
+                active_lines = []
+                seen_pending = set()
+                seen_active = set()
+
+                # 1) 현재 핵심 기준: _entry_watch 상태
+                try:
+                    for _, watch in (_entry_watch or {}).items():
+                        try:
+                            code = str(watch.get("code") or "").strip()
+                            if not code:
+                                continue
+                            name = watch.get("name") or _resolve_stock_name(code) or code
+                            entry = int(watch.get("entry_price", 0) or 0)
+                            target = int(watch.get("target_price", 0) or 0)
+                            stop = int(watch.get("stop_loss", 0) or 0)
+                            detect_time = str(watch.get("detect_time") or "").strip()
+                            miss_count = int(watch.get("miss_count", 0) or 0)
+                            hit = bool(watch.get("entry_hit"))
+
+                            line = f"• <b>{name}</b> ({code})"
+                            if miss_count > 0:
+                                line += f" — 재포착 {miss_count}회"
+                            details = []
+                            if entry > 0:
+                                details.append(f"🎯 진입가 {entry:,}원")
+                            if target > 0:
+                                details.append(f"🏆 목표가 {target:,}원")
+                            if stop > 0:
+                                details.append(f"🛡 손절가 {stop:,}원")
+                            if details:
+                                line += "\n  " + "  |  ".join(details)
+                            if detect_time:
+                                line += f"\n  ⏰ 포착시각 {detect_time}"
+
+                            if hit:
+                                if code not in seen_active:
+                                    active_lines.append(line)
+                                    seen_active.add(code)
+                            else:
+                                if code not in seen_pending:
+                                    pending_lines.append(line)
+                                    seen_pending.add(code)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 2) 보조 기준: _detected_stocks에만 있고 _entry_watch에 안 잡힌 종목
+                try:
+                    for code, rec in (_detected_stocks or {}).items():
+                        try:
+                            code = str(code or "").strip()
+                            if not code or code in seen_pending or code in seen_active:
+                                continue
+                            name = rec.get("name") or _resolve_stock_name(code) or code
+                            carry_day = int(rec.get("carry_day", 0) or 0)
+                            line = f"• <b>{name}</b> ({code})"
+                            if carry_day > 0:
+                                line += f" — {carry_day}일차"
+                            pending_lines.append(line)
+                            seen_pending.add(code)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                if not pending_lines and not active_lines:
                     send("📋 감시 중인 종목 없음")
                 else:
-                    send("📋 <b>감시 중인 종목</b>\n" +
-                         "\n".join([f"• <b>{v['name']}</b> ({k}) — {v.get('carry_day',0)}일차"
-                                    for k, v in _detected_stocks.items()]))
+                    parts = ["📋 <b>감시 종목 현황</b>"]
+
+                    parts.append("\n🎯 <b>진입가 감시중 종목</b>")
+                    if pending_lines:
+                        parts.append("\n".join(pending_lines))
+                    else:
+                        parts.append("- 없음")
+
+                    parts.append("\n🏆 <b>진입가 도달 후 목표가 추적중 종목</b>")
+                    if active_lines:
+                        parts.append("\n".join(active_lines))
+                    else:
+                        parts.append("- 없음")
+
+                    send("\n".join(parts))
 
             # ── /stop / /resume ──
             elif text == "/stop":
