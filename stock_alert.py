@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.4
+버전: v40.5
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.5 (2026-03-10): [진입 여부 확인] 자동 발송 기본 비활성화.
+  [#1] 이론 추적 완료 후 _request_actual_entry_confirm(rec)를 자동 호출하던 구간에 설정 플래그를 추가.
+  [#2] ACTUAL_ENTRY_CONFIRM_ENABLED 환경변수를 도입하고 기본값을 False(0)로 설정.
+  [#3] /result, /skip 등 수동 실거래 기록 명령은 유지하고, 자동 확인 텔레그램만 기본 차단.
+  이유: 사용자는 현재 실진입 기록을 하지 않으며, [진입 여부 확인] 메시지는 행동 불필요 알림이므로 기본수칙(알림 품질 우선, 실진입 여부와 무관한 동일 규칙)에 맞게 축소.
+  개선점: 불필요 텔레그램 알림↓, 사용자 알림 피로↓, 이론 추적/학습 로직과 실거래 입력 보조 알림 분리↑.
+  주의점: 실제 진입 기록을 다시 사용할 경우 ACTUAL_ENTRY_CONFIRM_ENABLED=1로 켜야 자동 확인 메시지가 재개됨.
+  영향: 이론 추적 결과 저장·자동 추적 결과 발송·내부 데이터 누적은 유지되고, [진입 여부 확인] 자동 메시지만 기본 미발송.
 - v40.4 (2026-03-10): 메시지 표기 재조정 — v40.2 기준 재작업 (v40.3 과반영안 폐기).
   [#1] [분할 청산 타이밍], [자동 추적 결과]의 진입가 표시에 도달시각만 추가. 도달가는 표시하지 않음.
   [#2] [목표가 도달 → 트레일링 모드]의 진입가 표시에 도달가·도달시각을 함께 표시.
@@ -803,6 +811,7 @@ _upper_limit_day_alerted: dict = {}   # code → {"date": "YYYYMMDD", "alerted":
 
 # ── 분할 청산 가이드(메시지 스팸 방지) ──
 ALLOW_VIRTUAL_EXIT_GUIDE = os.getenv('ALLOW_VIRTUAL_EXIT_GUIDE', '0') == '1'  # 기본은 actual_entry만 발송, 필요 시 환경변수로 entry_hit 가이드 허용
+ACTUAL_ENTRY_CONFIRM_ENABLED = os.getenv('ACTUAL_ENTRY_CONFIRM_ENABLED', '0') == '1'  # 기본 OFF: [진입 여부 확인] 자동 발송 차단
 PARTIAL_EXIT_GUIDE_COOLDOWN_MIN = int(os.getenv('PARTIAL_EXIT_GUIDE_COOLDOWN_MIN', '30') or '30')
 _partial_exit_last_ts: dict[str, float] = {}  # code -> last sent ts
 
@@ -4906,7 +4915,8 @@ def track_signal_results():
             rec["exit_reason"] = exit_reason
 
             # 실제 진입 여부가 None(미확인)인 경우 → 진입 확인 요청 알림
-            if rec.get("actual_entry") is None and exit_reason != TRACK_TIMEOUT_RESULT:
+            # v40.5: 기본은 자동 발송 OFF. 필요 시 환경변수로만 활성화.
+            if ACTUAL_ENTRY_CONFIRM_ENABLED and rec.get("actual_entry") is None and exit_reason != TRACK_TIMEOUT_RESULT:
                 _request_actual_entry_confirm(rec)
 
             _tracking_notified.add(log_key)
