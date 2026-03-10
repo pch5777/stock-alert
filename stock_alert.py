@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.8
+버전: v41.0
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.0 (2026-03-10): 수수료/슬리피지 공통 합산값 반영 + gross/net 이중 저장.
+  [#1] ROUND_TRIP_COST_PCT 환경변수(기본 0.30)를 도입해, 이론 추적 완료 시 gross_pnl_pct와 net_pnl_pct를 함께 저장하고 pnl_pct는 net 기준으로 동기화.
+  [#2] 과거 signal_log 완료 레코드를 시작 시 1회 정규화해 gross/net/round_trip_cost_pct 필드를 보강하고, 기존 pnl_pct만 있던 기록도 net 기준 통계로 이어서 활용 가능하게 정리.
+  [#3] 성과 집계 helper를 추가해 신호 유형 통계, 유니버스 성과 반영, 이력 캐시가 net_pnl_pct를 우선 사용하도록 보강.
+  [#4] 수동 /result 기록은 실제 결과로 보고 gross/net을 동일값으로 저장해, 자동 비용 차감이 실거래 수익률을 다시 깎지 않도록 분리.
+  이유: 현재 학습/통계가 gross 기준으로 누적되어 실전 기대수익을 과대평가할 수 있어, 최소 범위 수정으로 net 기준 검증층을 추가하기 위함.
+  개선점: 성과 통계 실전 근접도↑, gross/net 비교 가능, 과거 로그 호환 유지, UI 변경 최소화.
+  주의점: 기본 공통 비용은 왕복 0.30%이며 증권사/종목/시간대별 실제 비용과 다를 수 있으므로, 실운용 환경에 맞게 환경변수로 조정해야 한다.
+  영향: 신규/기존 완료 기록의 pnl_pct는 net 기준으로 해석되며, 내부에는 gross_pnl_pct/net_pnl_pct가 함께 남는다.
+- v40.9 (2026-03-10): 트레일링 모드 메시지의 진입가 도달 정보 누락 보정.
+  [#1] register_entry_watch에서 signal_log 기준키(signal_log_key)를 함께 저장해, 이후 진입가 도달 기록이 현재 추적 레코드에 더 정확히 매칭되도록 보강.
+  [#2] _mark_entry_hit_in_signal_log()가 동일 종목/신호유형 후보가 여러 개일 때 첫 레코드가 아니라 exact log_key 우선, 없으면 최신 감지 레코드를 선택하도록 정리.
+  [#3] _get_entry_hit_display()에 signal_log/_entry_watch fallback 보강을 추가해, rec에 entry_hit_price·entry_hit_time이 비어 있어도 도달가·도달시각 표시를 최대한 복구.
+  이유: '[목표가 도달 → 트레일링 모드]' 메시지에서 실제로 기록된 진입가 도달 메타데이터가 누락 표시되는 문제를 최소 범위에서 복구하기 위함.
+  개선점: 트레일링/자동추적 결과 메시지의 도달가·도달시각 표시 안정성↑, 기존 포맷 유지, 학습/추적 로직 영향 최소화.
+  주의점: 과거 레코드 중 signal_log와 _entry_watch 모두 도달 정보가 비어 있는 건은 복구할 원천 데이터가 없어 여전히 빈 값일 수 있음.
+  영향: 동일 포맷을 쓰는 진입가/청산 관련 메시지에서 도달 정보가 더 자주 정상 표시됨.
 - v40.8 (2026-03-10): 포착 메시지 UI 재배치 + 뉴스 요약 통합.
   [#1] 일반 포착(send_alert)·눌림목(send_mid_pullback_alert) 상세 메시지의 표시 순서를 재정렬. 핵심 포착 사유 다음에 진입 박스를 올리고, 섹터 모멘텀은 진입 박스 바로 아래 독립 블록으로 이동.
   [#2] 포착 사유(reasons)에서 섹터·뉴스 관련 문구는 UI 표시 단계에서 중복 제거하고, 나머지 핵심 사유/경고만 구분해서 보여주도록 정리. 점수 계산 로직은 그대로 유지.
@@ -577,7 +594,8 @@ def get_signal_type_stats(signal_log_data: dict = None) -> dict:
             sig = rec.get("signal_type", "UNKNOWN")
             s = stats.setdefault(sig, {"count": 0, "wins": 0, "sum_pnl": 0.0})
             s["count"] += 1
-            pnl = float(rec.get("pnl_pct", 0) or 0)
+            _sync_record_pnl_fields(rec)
+            pnl = _effective_pnl_pct(rec, 0.0)
             s["sum_pnl"] += pnl
             if pnl > 0:
                 s["wins"] += 1
@@ -1386,19 +1404,30 @@ def _load_signal_history() -> dict:
     if time.time() - _history_cache["ts"] < 300 and _history_cache["data"]:
         return _history_cache["data"]
     try:
-        _history_cache["data"] = _read_json_locked(SIGNAL_LOG_FILE)
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if isinstance(data, dict):
+            _normalize_signal_log_pnl_fields(data)
+        _history_cache["data"] = data
         _history_cache["ts"] = time.time()
     except Exception:
         _history_cache["data"] = {}
     return _history_cache["data"]
 
 def _get_completed_signals(data: dict = None) -> list:
-    """완료된 신호만 추출"""
+    """완료된 신호만 추출 (net_pnl_pct 우선)"""
     if data is None:
         data = _load_signal_history()
-    return [v for v in data.values()
-            if v.get("status") in ("수익", "손실", "본전")
-            and v.get("pnl_pct", 0) != 0]
+    completed = []
+    for v in data.values():
+        if not isinstance(v, dict):
+            continue
+        if v.get("status") not in ("수익", "손실", "본전"):
+            continue
+        _sync_record_pnl_fields(v)
+        if _effective_pnl_pct(v, 0.0) == 0:
+            continue
+        completed.append(v)
+    return completed
 
 def _format_history_stats(records: list, label: str = "과거 이력") -> str:
     """공통 통계 포맷 (최소 2건 이상)"""
@@ -2930,13 +2959,13 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
                 continue
 
             outcome = v.get("outcome")  # "win"/"loss"/"flat" 등
-            ret = v.get("ret_pct")  # 있으면
+            _sync_record_pnl_fields(v)
+            ret = _effective_pnl_pct(v, 0.0)
             st = stats.setdefault(code, {"n": 0, "win": 0, "sum": 0.0})
             st["n"] += 1
             if outcome == "win":
                 st["win"] += 1
-            if isinstance(ret, (int, float)):
-                st["sum"] += float(ret)
+            st["sum"] += float(ret)
 
         # 최소 샘플 확보
         if len(stats) < 30:
@@ -4040,6 +4069,8 @@ TUNE_LOOKBACK_DAYS = int(os.getenv("TUNE_LOOKBACK_DAYS", "30") or "30")
 TUNE_MIN_SAMPLES   = int(os.getenv("TUNE_MIN_SAMPLES", "30") or "30")
 TUNE_ALPHA         = float(os.getenv("TUNE_ALPHA", "0.35") or "0.35")  # 0~1, 클수록 빠르게 반영
 
+ROUND_TRIP_COST_PCT = float(os.getenv("ROUND_TRIP_COST_PCT", "0.30") or "0.30")  # 왕복 수수료+슬리피지 공통 합산(%)
+
 def _safe_float(x, default=0.0):
     try:
         if x is None:
@@ -4047,6 +4078,122 @@ def _safe_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+def _is_manual_pnl_record(rec: dict) -> bool:
+    try:
+        if not isinstance(rec, dict):
+            return False
+        if rec.get("signal_type") == "MANUAL":
+            return True
+        if rec.get("exit_reason") == "수동입력":
+            return True
+        return False
+    except Exception:
+        return False
+
+def _calc_net_pnl_pct(gross_pnl_pct, round_trip_cost_pct=None, *, is_manual: bool = False) -> float:
+    gross = _safe_float(gross_pnl_pct, 0.0)
+    if is_manual:
+        return round(gross, 2)
+    cost = _safe_float(ROUND_TRIP_COST_PCT if round_trip_cost_pct is None else round_trip_cost_pct, ROUND_TRIP_COST_PCT)
+    return round(gross - cost, 2)
+
+def _effective_pnl_pct(rec: dict, default: float = 0.0) -> float:
+    try:
+        if not isinstance(rec, dict):
+            return default
+        is_manual = _is_manual_pnl_record(rec)
+        net = rec.get("net_pnl_pct")
+        if net is not None:
+            return round(_safe_float(net, default), 2)
+        gross = rec.get("gross_pnl_pct")
+        if gross is not None:
+            return _calc_net_pnl_pct(gross, rec.get("round_trip_cost_pct"), is_manual=is_manual)
+        pnl = rec.get("pnl_pct")
+        if pnl is not None:
+            return _calc_net_pnl_pct(pnl, rec.get("round_trip_cost_pct"), is_manual=is_manual)
+        return default
+    except Exception:
+        return default
+
+def _sync_record_pnl_fields(rec: dict) -> bool:
+    try:
+        if not isinstance(rec, dict):
+            return False
+        changed = False
+        is_manual = _is_manual_pnl_record(rec)
+        completed = rec.get("status") in ("수익", "손실", "본전") or bool(rec.get("exit_reason"))
+
+        desired_cost = 0.0 if is_manual else ROUND_TRIP_COST_PCT
+        cur_cost = rec.get("round_trip_cost_pct")
+        if cur_cost is None or abs(_safe_float(cur_cost, desired_cost) - desired_cost) > 1e-9:
+            rec["round_trip_cost_pct"] = round(desired_cost, 4)
+            changed = True
+
+        if completed:
+            gross_val = rec.get("gross_pnl_pct")
+            if gross_val is None:
+                src = rec.get("pnl_pct")
+                if src is None:
+                    src = rec.get("net_pnl_pct", 0.0)
+                gross_val = _safe_float(src, 0.0)
+                rec["gross_pnl_pct"] = round(gross_val, 2)
+                changed = True
+            else:
+                gross_val = _safe_float(gross_val, 0.0)
+
+            desired_net = _calc_net_pnl_pct(gross_val, rec.get("round_trip_cost_pct"), is_manual=is_manual)
+            cur_net = rec.get("net_pnl_pct")
+            if cur_net is None or abs(_safe_float(cur_net, desired_net) - desired_net) > 1e-9:
+                rec["net_pnl_pct"] = desired_net
+                changed = True
+
+            cur_pnl = rec.get("pnl_pct")
+            if cur_pnl is None or abs(_safe_float(cur_pnl, desired_net) - desired_net) > 1e-9:
+                rec["pnl_pct"] = desired_net
+                changed = True
+        else:
+            if rec.get("gross_pnl_pct") is None:
+                rec["gross_pnl_pct"] = 0.0
+                changed = True
+            if rec.get("net_pnl_pct") is None:
+                rec["net_pnl_pct"] = 0.0
+                changed = True
+            if rec.get("pnl_pct") is None:
+                rec["pnl_pct"] = 0.0
+                changed = True
+        return changed
+    except Exception:
+        return False
+
+def _normalize_signal_log_pnl_fields(data: dict) -> int:
+    if not isinstance(data, dict):
+        return 0
+    changed = 0
+    for rec in data.values():
+        if _sync_record_pnl_fields(rec):
+            changed += 1
+    return changed
+
+def migrate_signal_log_pnl_fields() -> None:
+    """기존 signal_log에 gross/net/cost 필드를 1회 보강해 net 기준 통계를 유지한다."""
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if not isinstance(data, dict) or not data:
+            return
+        changed = _normalize_signal_log_pnl_fields(data)
+        if changed <= 0:
+            return
+        data = _prune_signal_log(data)
+        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        try:
+            _history_cache["data"] = data
+            _history_cache["ts"] = time.time()
+        except Exception:
+            pass
+        print(f"💸 signal_log pnl 정규화 완료: {changed}건 (왕복비용 {ROUND_TRIP_COST_PCT:.2f}%)")
+    except Exception as e:
+        print(f"⚠️ signal_log pnl 정규화 오류: {e}")
 
 def _prune_signal_log(data: dict) -> dict:
     """v38.3-P1-7: signal_log 크기 관리 — 90일 아카이브 + 건수 제한."""
@@ -4113,7 +4260,7 @@ def _tune_score(records: list) -> float:
     """
     if not records:
         return -1e9
-    pnls = [_safe_float(r.get("pnl_pct"), 0.0) for r in records]
+    pnls = [_effective_pnl_pct(r, 0.0) for r in records]
     maes = [_safe_float(r.get("mae_pct"), 0.0) for r in records]  # 음수(손실폭)
     # MAE는 보통 음수이므로 abs로 페널티
     avg = sum(pnls) / len(pnls)
@@ -4201,7 +4348,8 @@ def _apply_result_labels(rec: dict):
             rec["hold_minutes"] = int((dt1 - dt0).total_seconds() // 60)
         except Exception:
             pass
-        pnl = _safe_float(rec.get("pnl_pct"), 0.0)
+        _sync_record_pnl_fields(rec)
+        pnl = _effective_pnl_pct(rec, 0.0)
         if pnl > 0:
             rec["outcome"] = "win"
         elif pnl < 0:
@@ -4321,7 +4469,10 @@ def save_signal_log(stock: dict):
             "exit_price":        0,
             "exit_date":         "",
             "exit_time":         "",
-            "pnl_pct":           0.0,        # 이론 수익률 (봇 학습 기준)
+            "gross_pnl_pct":     0.0,        # 비용 반영 전 이론 수익률
+            "net_pnl_pct":       0.0,        # 왕복비용 반영 후 이론 수익률
+            "round_trip_cost_pct": round(ROUND_TRIP_COST_PCT, 4),
+            "pnl_pct":           0.0,        # net 기준 이론 수익률 (하위호환)
             "exit_reason":       "",
             "max_price":         stock["price"],
             "min_price":         stock["price"],
@@ -4871,14 +5022,19 @@ def track_signal_results():
                 if price <= rec["trailing_stop"]:
                     exit_reason = "트레일링스탑"
                     exit_price  = price
-                    pnl_pct     = round((exit_price - entry) / entry * 100, 2) if entry else 0
-                    status      = "수익" if pnl_pct > 0 else "본전"
+                    gross_pnl_pct = round((exit_price - entry) / entry * 100, 2) if entry else 0
+                    net_pnl_pct   = _calc_net_pnl_pct(gross_pnl_pct, rec.get("round_trip_cost_pct"))
+                    pnl_pct       = net_pnl_pct
+                    status        = "수익" if net_pnl_pct > 0 else ("손실" if net_pnl_pct < 0 else "본전")
                     rec["status"]      = status
                     rec["exit_price"]  = exit_price
                     rec["current_price"] = price  # v39.3-#6
                     rec["exit_date"]   = today
                     rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
-                    rec["pnl_pct"]     = pnl_pct
+                    rec["gross_pnl_pct"] = gross_pnl_pct
+                    rec["net_pnl_pct"] = net_pnl_pct
+                    rec["round_trip_cost_pct"] = round(ROUND_TRIP_COST_PCT, 4)
+                    rec["pnl_pct"]     = net_pnl_pct
                     rec["exit_reason"] = exit_reason
                     _apply_result_labels(rec)
                     _tracking_notified.add(log_key)
@@ -4921,8 +5077,10 @@ def track_signal_results():
                 continue   # 아직 추적 중
 
             # ── 이론 수익률 계산 (봇 학습용) ──
-            pnl_pct = round((exit_price - entry) / entry * 100, 2) if entry else 0
-            status  = "수익" if pnl_pct > 0 else ("손실" if pnl_pct < 0 else "본전")
+            gross_pnl_pct = round((exit_price - entry) / entry * 100, 2) if entry else 0
+            net_pnl_pct   = _calc_net_pnl_pct(gross_pnl_pct, rec.get("round_trip_cost_pct"))
+            pnl_pct       = net_pnl_pct
+            status        = "수익" if net_pnl_pct > 0 else ("손실" if net_pnl_pct < 0 else "본전")
 
             # 이론 결과 저장 (항상)
             rec["status"]      = status
@@ -4930,7 +5088,10 @@ def track_signal_results():
             rec["current_price"] = price  # v39.3-#6
             rec["exit_date"]   = today
             rec["exit_time"]   = datetime.now().strftime("%H:%M:%S")
-            rec["pnl_pct"]     = pnl_pct        # 이론 수익률
+            rec["gross_pnl_pct"] = gross_pnl_pct
+            rec["net_pnl_pct"] = net_pnl_pct
+            rec["round_trip_cost_pct"] = round(ROUND_TRIP_COST_PCT, 4)
+            rec["pnl_pct"]     = net_pnl_pct   # net 기준 이론 수익률
             rec["exit_reason"] = exit_reason
 
             # 실제 진입 여부가 None(미확인)인 경우 → 진입 확인 요청 알림
@@ -6393,11 +6554,21 @@ def register_entry_watch(s: dict):
         del _entry_watch[k]
 
     log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
+    signal_log_key = ""
+    try:
+        _detected_at = s.get("detected_at")
+        if isinstance(_detected_at, datetime):
+            signal_log_key = f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+    except Exception:
+        signal_log_key = ""
+    if not signal_log_key:
+        signal_log_key = log_key
     _entry_watch[log_key] = {
         "code": code, "name": stock_name, "entry_price": entry,
         "stop_loss":    s.get("stop_loss", 0),
         "target_price": s.get("target_price", 0),
         "signal_type":  s.get("signal_type", ""),
+        "signal_log_key": signal_log_key,
         "detect_time":  datetime.now().strftime("%H:%M"),
         "last_notified_ts": 0,
         "notify_count": 0,
@@ -6439,7 +6610,7 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
         print(f"⚠️ 진입미달 기록 오류: {e}")
 
 
-def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None) -> None:
+def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None, log_key: str | None = None) -> None:
     """진입가 도달(HIT) 이벤트를 signal_log에 기록. (가상진입/학습용)"""
     try:
         data = {}
@@ -6453,24 +6624,97 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | 
             hit_date, hit_clock = now_s.split(" ", 1)
         elif len(now_s) >= 10:
             hit_date = now_s[:10]
-        for _k, rec in data.items():
-            if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
-                rec['entry_hit'] = True
-                rec['entry_hit_time'] = now_s
-                if hit_price:
-                    rec['entry_hit_price'] = int(hit_price)
-                if hit_date:
-                    rec['entry_hit_date'] = hit_date
-                if hit_clock:
-                    rec['entry_hit_clock'] = hit_clock
-                break
-        _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+
+        target_key = ""
+        if log_key and log_key in data:
+            _rec = data.get(log_key) or {}
+            if _rec.get('code') == code and _rec.get('status') == '추적중':
+                target_key = log_key
+
+        if not target_key:
+            candidates = []
+            for _k, rec in data.items():
+                if rec.get('code') == code and rec.get('status') == '추적중' and rec.get('signal_type') == signal_type:
+                    detect_key = f"{rec.get('detect_date','')}{rec.get('detect_time','')}".replace(":", "")
+                    candidates.append((detect_key, _k))
+            if candidates:
+                candidates.sort()
+                target_key = candidates[-1][1]
+
+        if target_key:
+            rec = data.get(target_key) or {}
+            rec['entry_hit'] = True
+            rec['entry_hit_time'] = now_s
+            if hit_price:
+                rec['entry_hit_price'] = int(hit_price)
+            if hit_date:
+                rec['entry_hit_date'] = hit_date
+            if hit_clock:
+                rec['entry_hit_clock'] = hit_clock
+            data[target_key] = rec
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
     except Exception as e:
         print(f"⚠️ entry_hit 기록 오류: {e}")
 
+
+def _lookup_entry_hit_fallback(rec: dict | None) -> dict:
+    """rec에 도달 메타가 비어 있을 때 signal_log/_entry_watch에서 보강용 entry_hit 정보를 조회."""
+    rec = rec or {}
+    out = {}
+    code = str(rec.get('code') or '').strip()
+    signal_type = str(rec.get('signal_type') or '').strip()
+    log_key = str(rec.get('log_key') or '').strip()
+
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if isinstance(data, dict):
+            target = None
+            if log_key and isinstance(data.get(log_key), dict):
+                target = data.get(log_key)
+            if not target and code:
+                candidates = []
+                for _k, _rec in data.items():
+                    if not isinstance(_rec, dict):
+                        continue
+                    if _rec.get('code') != code:
+                        continue
+                    if _rec.get('status') != '추적중':
+                        continue
+                    if signal_type and _rec.get('signal_type') != signal_type:
+                        continue
+                    detect_key = f"{_rec.get('detect_date','')}{_rec.get('detect_time','')}".replace(":", "")
+                    candidates.append((detect_key, _rec))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    target = candidates[-1][1]
+            if isinstance(target, dict):
+                for _k in ('entry_hit', 'entry_hit_price', 'entry_hit_time', 'entry_hit_date', 'entry_hit_clock'):
+                    if target.get(_k) not in (None, '', False):
+                        out[_k] = target.get(_k)
+    except Exception:
+        pass
+
+    if code and (not out.get('entry_hit_time') or not out.get('entry_hit_price')):
+        try:
+            watch = _latest_entry_watch_by_code(code)
+            if isinstance(watch, dict) and watch.get('entry_hit'):
+                for _k in ('entry_hit', 'entry_hit_price', 'entry_hit_time', 'entry_hit_date', 'entry_hit_clock'):
+                    if watch.get(_k) not in (None, '', False):
+                        out[_k] = watch.get(_k)
+        except Exception:
+            pass
+    return out
+
+
 def _get_entry_hit_display(rec: dict | None) -> tuple[int | None, str]:
     """진입가 도달 관련 표시용 데이터(도달가, 도달시각 문자열) 반환."""
-    rec = rec or {}
+    rec = dict(rec or {})
+    if not rec.get('entry_hit_time') or not rec.get('entry_hit_price'):
+        try:
+            rec.update(_lookup_entry_hit_fallback(rec))
+        except Exception:
+            pass
+
     hit_price = None
     try:
         _hp = rec.get('entry_hit_price')
@@ -6656,7 +6900,7 @@ def check_entry_watch():
                 if ' ' in _entry_hit_ts:
                     watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
                 try:
-                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts)
+                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts, log_key=watch.get('signal_log_key'))
                 except Exception:
                     pass
                 print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
@@ -11039,6 +11283,9 @@ def _handle_result_command(raw: str):
             rec = sig_data[sig_matched_key]
             # 이론 수익률이 아직 없으면 함께 기록
             if not rec.get("pnl_pct"):
+                rec["gross_pnl_pct"] = pnl
+                rec["net_pnl_pct"]   = pnl
+                rec["round_trip_cost_pct"] = 0.0
                 rec["pnl_pct"]     = pnl
                 rec["status"]      = status
                 rec["exit_date"]   = today
@@ -11064,7 +11311,7 @@ def _handle_result_command(raw: str):
 
         if early_matched:
             early_data[early_matched].update({
-                "status": status, "pnl_pct": pnl,
+                "status": status, "gross_pnl_pct": pnl, "net_pnl_pct": pnl, "round_trip_cost_pct": 0.0, "pnl_pct": pnl,
                 "exit_date": today,
             })
         else:
@@ -11076,7 +11323,7 @@ def _handle_result_command(raw: str):
                 "detect_date": today, "detect_time": datetime.now().strftime("%H:%M:%S"),
                 "detect_price": 0, "entry_price": 0,
                 "stop_price": 0, "target_price": 0,
-                "status": status, "pnl_pct": pnl,
+                "status": status, "gross_pnl_pct": pnl, "net_pnl_pct": pnl, "round_trip_cost_pct": 0.0, "pnl_pct": pnl,
                 "exit_date": today, "exit_time": datetime.now().strftime("%H:%M:%S"),
                 "exit_reason": "수동입력",
                 "score": 0, "sector_bonus": 0, "sector_theme": "",
@@ -13303,6 +13550,7 @@ if __name__ == "__main__":
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
+        migrate_signal_log_pnl_fields()
         _load_dynamic_params()
         schedule.every(10).seconds.do(poll_telegram_commands)
         schedule.every(30).minutes.do(run_overnight_monitor)
@@ -13315,6 +13563,7 @@ if __name__ == "__main__":
 
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
+    migrate_signal_log_pnl_fields()
     load_tracker_feedback()
     load_dynamic_themes()
     refresh_dynamic_candidates()
