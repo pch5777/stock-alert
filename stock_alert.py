@@ -3,11 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.11
+버전: v41.12
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.12 (2026-03-11): 포착 날짜/시간 helper 실제 정의 누락 보정.
+  [#1] `_format_capture_datetime_label()` helper를 코드 본문에 실제로 추가해 `detected_at`, `detect_date`, `detect_time`를 안전하게 `YYYY-MM-DD HH:MM[:SS]`로 변환하도록 정리.
+  [#2] `run_scan` 중 NameError를 유발하던 helper 누락 문제를 제거하고, detect_date가 없거나 형식이 다른 오래된 레코드도 최대한 자연스럽게 표시하도록 보강.
+  이유: v41.11에서 날짜+시간 표시를 적용하면서 changelog만 반영되고 helper 정의가 실제 파일에 빠져 런타임 NameError가 발생했기 때문.
+  개선점: 포착형 메시지 날짜 표기 정상화, run_scan 안정성 복구.
+  영향: 포착형 메시지의 날짜+시간 표기가 실제로 동작한다.
 - v41.11 (2026-03-11): 포착형 메시지에 날짜+시간 표시 추가.
   [#1] `_format_capture_datetime_label()` helper를 추가해 `detected_at`, `detect_date`, `detect_time`를 공통 포맷으로 정리.
   [#2] 일반 포착 메시지(`send_alert`), 눌림목 포착 메시지(`send_mid_pullback_alert`), 진입가 도달, 체결속도 확인 후 진입 확정, 종가 선진입 도달 메시지에서 포착 시각을 `YYYY-MM-DD HH:MM:SS` 또는 `YYYY-MM-DD HH:MM` 형식으로 표시하도록 수정.
