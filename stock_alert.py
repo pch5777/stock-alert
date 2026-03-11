@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.19
+버전: v41.20
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.20 (2026-03-11): 대시보드 런타임 버그 2건 수정.
+  [#1] `_save_dashboard_state()`의 `_atomic_write_json` 오타를 `_write_json_atomic`으로 수정해 대시보드 상태 저장 시 NameError가 나지 않도록 정리.
+  [#2] 누락됐던 `get_today_performance_summary()` helper를 추가해 대시보드의 `오늘 성과` 요약이 안전하게 계산되도록 보강.
+  이유: `stock_alert_v41.19.py` 기준 전체 점검에서 대시보드 경로에 확정 런타임 버그 2건이 확인되어 최소 범위로 안정화가 필요했기 때문.
+  개선점: 대시보드 저장 안정성↑, 오늘 성과 요약 표시 안정성↑.
+  주의점: 성과 요약은 signal_log의 당일 완료 건 기준 간단 집계이며, 결과가 없으면 빈 문자열을 반환한다.
+  영향: 운영 대시보드 업데이트 경로의 NameError 가능성이 줄어든다.
 - v41.19 (2026-03-11): [진입가 도달!] 메시지에 포착시각과 실제 도달시각 동시 표시.
   [#1] check_entry_watch()의 [진입가 도달!] 발송 전에 `_entry_hit_ts`를 먼저 계산하도록 순서를 조정해, 메시지 본문에 `포착`과 `도달`을 함께 표시하도록 정리.
   [#2] 본문 헤더를 `원신호: ... | 포착: ... | 도달: ...` 형식으로 변경해, 신호 생성 후 실제 진입가 도달까지 걸린 시간을 사용자가 바로 구분할 수 있게 보강.
@@ -8834,10 +8841,32 @@ def _load_dashboard_state() -> dict:
     except Exception:
         return {}
 
+def get_today_performance_summary() -> str:
+    """signal_log 기준 당일 완료 성과를 한 줄로 요약."""
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if not isinstance(data, dict):
+            return ""
+        done_today = [
+            v for v in data.values()
+            if (v.get("exit_date") or v.get("detect_date")) == today
+            and v.get("status") in ["수익", "손실", "본전"]
+        ]
+        if not done_today:
+            return ""
+        wins = sum(1 for v in done_today if float(v.get("pnl_pct", 0) or 0) > 0)
+        total = len(done_today)
+        win_rate = round(wins / total * 100) if total else 0
+        avg_pnl = sum(float(v.get("pnl_pct", 0) or 0) for v in done_today) / total if total else 0.0
+        return f"{total}건 · 승률 {win_rate}% · 평균 {avg_pnl:+.1f}%"
+    except Exception:
+        return ""
+
 def _save_dashboard_state(state: dict) -> None:
     try:
         os.makedirs(os.path.dirname(DASHBOARD_STATE_FILE), exist_ok=True)
-        _atomic_write_json(DASHBOARD_STATE_FILE, state)
+        _write_json_atomic(DASHBOARD_STATE_FILE, state)
     except Exception:
         pass
 
