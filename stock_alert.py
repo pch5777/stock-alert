@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.20
+버전: v41.22
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.22 (2026-03-11): 가격 도달 but 실진입 불가 상태를 별도 기록하도록 보강.
+  [#1] check_entry_watch()에 상한가 고정/매도호가 부재 등 실진입 곤란 상태 필터를 유지하면서, 메시지 차단 시 _record_entry_blocked()를 통해 signal_log에 entry_blocked/entry_blocked_reason/time/price를 기록하도록 추가.
+  [#2] _record_entry_miss()는 entry_blocked 이력이 있는 감시건이 만료되면 최종 status를 `진입불가`로 기록하고, 일반 미도달과 분리되도록 조정.
+  [#3] _mark_entry_hit_in_signal_log()에서 이후 정상 진입이 성사되면 기존 entry_blocked 플래그를 정리해 최종 학습 데이터가 충돌하지 않도록 보강.
+  이유: 가격 숫자상 진입가에 닿았더라도 상한가 잠김 등으로 실제 체결이 불가능한 경우를 단순 `진입미달`로 처리하면 신호 품질 통계가 왜곡되기 때문.
+  개선점: `가격 도달 but 진입불가`와 `아예 미도달` 구분 가능, 학습 왜곡 감소, 사용자 설명 가능성↑.
+  주의점: 상한가 잠김이 풀린 뒤 이후 실제로 진입되면 최종 기록은 정상 진입 기준으로 이어진다.
+
 - v41.20 (2026-03-11): 대시보드 런타임 버그 2건 수정.
   [#1] `_save_dashboard_state()`의 `_atomic_write_json` 오타를 `_write_json_atomic`으로 수정해 대시보드 상태 저장 시 NameError가 나지 않도록 정리.
   [#2] 누락됐던 `get_today_performance_summary()` helper를 추가해 대시보드의 `오늘 성과` 요약이 안전하게 계산되도록 보강.
@@ -6072,6 +6080,10 @@ def save_signal_log(stock: dict):
             "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
             "execution_setup_required": bool(stock.get("execution_setup_required")),
             "planned_entry_price": safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0),
+            "entry_blocked":    False,
+            "entry_blocked_reason": "",
+            "entry_blocked_time": "",
+            "entry_blocked_price": 0,
         }
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
@@ -8170,6 +8182,57 @@ def register_entry_watch(s: dict):
     }
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
+def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
+    """가격은 도달했지만 실제 진입이 곤란한 상태를 signal_log에 기록."""
+    try:
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        blocked_date, blocked_clock = (now_s.split(' ', 1) + [""])[:2]
+        updated = False
+        for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
+            if (rec.get("code") == watch.get("code")
+                    and rec.get("status") in ("추적중", "진입준비")
+                    and rec.get("signal_type") == watch.get("signal_type")):
+                rec["entry_blocked"] = True
+                rec["entry_blocked_reason"] = str(reason or "")
+                rec["entry_blocked_time"] = now_s
+                rec["entry_blocked_date"] = blocked_date
+                rec["entry_blocked_clock"] = blocked_clock
+                rec["entry_blocked_price"] = int(blocked_price or 0)
+                rec["entry_reachable_but_untradable"] = True
+                updated = True
+                break
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        print(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
+    except Exception as e:
+        print(f"⚠️ 진입불가 기록 오류: {e}")
+
+
+def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
+    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
+    try:
+        change_rate = float(cur.get("change_rate", 0.0) or 0.0)
+    except Exception:
+        change_rate = 0.0
+    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+    bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+    sig_type = str(watch.get("signal_type") or "")
+    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
+    if upper_like and ask_qty <= 0 and bid_qty > 0:
+        return "limit_up_locked"
+    if upper_like and ask_qty <= 0:
+        return "no_ask_liquidity"
+    return ""
+
+
 def _record_entry_miss(watch: dict, reason: str, final_price: int):
     """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
     try:
@@ -8192,9 +8255,15 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
                 rec["entry_miss_away"] = miss_away
                 rec["entry_peak_away"] = peak_away
                 rec["miss_count"]      = watch.get("miss_count", 0)
-                rec["status"]          = "진입미달"
-                rec["pnl_pct"]         = 0.0
-                rec["exit_reason"]     = f"진입미달_{reason}"
+                if watch.get("entry_blocked") or rec.get("entry_blocked"):
+                    rec["status"]      = "진입불가"
+                    rec["pnl_pct"]     = 0.0
+                    _blk_reason = watch.get("entry_blocked_reason") or rec.get("entry_blocked_reason") or reason
+                    rec["exit_reason"] = f"진입불가_{_blk_reason}"
+                else:
+                    rec["status"]      = "진입미달"
+                    rec["pnl_pct"]     = 0.0
+                    rec["exit_reason"] = f"진입미달_{reason}"
                 break
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
@@ -8237,6 +8306,9 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | 
             rec = data.get(target_key) or {}
             rec['entry_hit'] = True
             rec['entry_hit_time'] = now_s
+            rec['entry_blocked'] = False
+            rec['entry_blocked_reason'] = ''
+            rec['entry_reachable_but_untradable'] = False
             if hit_price:
                 rec['entry_hit_price'] = int(hit_price)
             if hit_date:
@@ -8457,6 +8529,21 @@ def check_entry_watch():
                     pass
                 if _sector_blocked:
                     continue  # 사용자 알림 차단, 내부 로그만 기록
+
+                _blocked_reason = _detect_entry_block_reason(cur, watch, price, entry)
+                if _blocked_reason:
+                    watch["entry_blocked"] = True
+                    watch["entry_blocked_reason"] = _blocked_reason
+                    watch["entry_blocked_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    watch["entry_blocked_price"] = int(price or 0)
+                    _record_entry_blocked(watch, _blocked_reason, price)
+                    _log_suppressed_alert(
+                        watch["code"], watch["name"],
+                        f"진입불가 차단 ({_blocked_reason})",
+                        watch.get("signal_type", ""),
+                        {"entry_price": entry, "blocked_price": int(price or 0), "change_rate": cur.get("change_rate", 0), "ask_qty": cur.get("ask_qty", 0), "bid_qty": cur.get("bid_qty", 0)}
+                    )
+                    continue
 
                 watch["last_notified_ts"] = now_ts
                 watch["notify_count"]     = notify_count + 1
