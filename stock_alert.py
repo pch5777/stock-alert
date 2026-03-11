@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.22
+버전: v41.23
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.23 (2026-03-11): [진입가 도달!] 메시지에 과거 유사패턴 요약 추가.
+  [#1] register_entry_watch()가 진입가 감시 등록 시 유사패턴 재계산용 `change_at_detect`와 `volume_ratio`를 함께 저장하도록 보강.
+  [#2] check_entry_watch()의 [진입가 도달!] 메시지 상단에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 노출해, 실제 진입 직전에도 동일 신호의 승률/평균 손익을 바로 확인할 수 있게 정리.
+  이유: 사용자가 [진입가 도달!] 단계에서도 과거 유사패턴을 보고 신뢰도를 판단하고 싶어 했고, 이미 포착 메시지에서 신뢰도가 높다고 느끼는 요소를 진입 시점에도 이어서 확인할 필요가 있기 때문.
+  개선점: 진입 시점 판단 정보↑, 메시지 일관성↑, 기존 유사패턴 로직 재사용으로 유지보수성↑.
+  주의점: 오래전에 등록된 일부 감시 건은 change_at_detect/volume_ratio 저장값이 없어 현재값 기반으로 요약될 수 있다.
+
 - v41.22 (2026-03-11): 가격 도달 but 실진입 불가 상태를 별도 기록하도록 보강.
   [#1] check_entry_watch()에 상한가 고정/매도호가 부재 등 실진입 곤란 상태 필터를 유지하면서, 메시지 차단 시 _record_entry_blocked()를 통해 signal_log에 entry_blocked/entry_blocked_reason/time/price를 기록하도록 추가.
   [#2] _record_entry_miss()는 entry_blocked 이력이 있는 감시건이 만료되면 최종 status를 `진입불가`로 기록하고, 일반 미도달과 분리되도록 조정.
@@ -8179,6 +8186,8 @@ def register_entry_watch(s: dict):
         "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
         "reasons":      (s.get("reasons") or [])[:5],  # v40.0-#1: 포착 이유 상위 5개 저장
         "sector_theme": s.get("sector_info", {}).get("theme", ""),  # v40.0-#2: 섹터 정보
+        "change_at_detect": float(s.get("change_rate", 0) or 0),
+        "volume_ratio": float(s.get("volume_ratio", 0) or 0),
     }
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
@@ -8592,11 +8601,25 @@ def check_entry_watch():
                     sector_block = ""
 
                 _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                _similar_stats = _get_similar_pattern_stats(
+                    watch["code"],
+                    watch.get("signal_type", ""),
+                    float(watch.get("change_at_detect", cur.get("change_rate", 0)) or 0),
+                    float(watch.get("volume_ratio", cur.get("volume_ratio", 0)) or 0),
+                )
+                similar_block = ""
+                try:
+                    _similar_line = _build_similar_pattern_summary_block(_similar_stats, top_exposed=True)
+                    if _similar_line:
+                        similar_block = f"{_similar_line}\n\n"
+                except Exception:
+                    similar_block = ""
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n"
+                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
+                    f"{similar_block}"
                     f"{reasons_block}"
                     f"{sector_block}"
                     f"━━━━━━━━━━━━━━━\n"
