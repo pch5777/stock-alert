@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.23
+버전: v41.24
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.24 (2026-03-11): 진입가 감시의 시장 선택(KRX/NXT/VI 예외)과 상태 기록 구조 정교화.
+  [#1] check_entry_watch()를 종목별 시장 선택 구조로 재정리해, KRX 정상 거래 중이면 KRX만 사용하고 KRX 종료 후 NXT 거래 가능 종목에만 NXT 가격을 사용하도록 보강.
+  [#2] KRX 장중 VI/거래정지 의심 + NXT 거래 가능 종목은 NXT 가격을 참고하되 즉시 [진입가 도달!]을 보내지 않고 `NXT참고도달`로 내부 기록 후 KRX 재확인을 기다리도록 추가.
+  [#3] _record_entry_reference_reach() 및 관련 signal_log 필드를 추가하고, 감시 만료 시 `진입미달 / 진입불가 / NXT참고도달`을 분리 기록하도록 조정.
+  [#4] 실제 entry_hit 확정 시 기존 entry_blocked / entry_reference_* 플래그를 정리해 최종 학습 데이터가 충돌하지 않도록 보강.
+  이유: KRX 전용 종목이 KRX 마감 후에도 진입가 도달 판정을 받거나, KRX VI 중 NXT가 움직일 때 같은 규칙으로 처리하면 시장별 의미가 섞여 통계와 알림이 왜곡될 수 있기 때문.
+  개선점: 시장별 판정 일관성↑, KRX/NXT 혼선 감소↑, `진입불가`와 `NXT참고도달` 구분 가능↑.
+  주의점: VI 탐지는 KIS 현재가 응답 플래그 + 호가 비정상 패턴을 함께 보는 보수적 추정이며, 확실한 VI API 연동 전까지는 참고용 성격이 있다.
+
 - v41.23 (2026-03-11): [진입가 도달!] 메시지에 과거 유사패턴 요약 추가.
   [#1] register_entry_watch()가 진입가 감시 등록 시 유사패턴 재계산용 `change_at_detect`와 `volume_ratio`를 함께 저장하도록 보강.
   [#2] check_entry_watch()의 [진입가 도달!] 메시지 상단에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 노출해, 실제 진입 직전에도 동일 신호의 승률/평균 손익을 바로 확인할 수 있게 정리.
@@ -4402,6 +4411,8 @@ def get_stock_price(code: str) -> dict:
         "bid_qty": int(o.get("bidp_rsqn1",0)),
         "prev_close": int(o.get("stck_sdpr",0)),
         "bstp_code": o.get("bstp_cls_code",""),
+        "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
         "mktcap":    mktcap_raw,       # 억원 단위
         "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
                       else "mid" if mktcap_raw >= 1000  # 1000억 이상
@@ -6091,6 +6102,13 @@ def save_signal_log(stock: dict):
             "entry_blocked_reason": "",
             "entry_blocked_time": "",
             "entry_blocked_price": 0,
+            "entry_reference_only": False,
+            "entry_reference_market": "",
+            "entry_reference_reason": "",
+            "entry_reference_time": "",
+            "entry_reference_date": "",
+            "entry_reference_clock": "",
+            "entry_reference_price": 0,
         }
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
@@ -8188,6 +8206,11 @@ def register_entry_watch(s: dict):
         "sector_theme": s.get("sector_info", {}).get("theme", ""),  # v40.0-#2: 섹터 정보
         "change_at_detect": float(s.get("change_rate", 0) or 0),
         "volume_ratio": float(s.get("volume_ratio", 0) or 0),
+        "entry_reference_only": False,
+        "entry_reference_market": "",
+        "entry_reference_reason": "",
+        "entry_reference_time": "",
+        "entry_reference_price": 0,
     }
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
@@ -8242,6 +8265,61 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     return ""
 
 
+def _is_truthy_market_flag(v) -> bool:
+    s = str(v or "").strip().upper()
+    return s in ("Y", "1", "TRUE", "T", "VI", "HALT", "STOP")
+
+
+def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
+    """KRX 장중이지만 NXT 참고만 허용할 만한 VI/거래정지 유사 상태인지 보수적으로 판별."""
+    if not is_market_open():
+        return False
+    if not (is_nxt_open() and is_nxt_listed(code)):
+        return False
+    for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
+        if _is_truthy_market_flag(cur.get(_k)):
+            return True
+    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+    bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+    if ask_qty <= 0 and bid_qty <= 0:
+        return True
+    return False
+
+
+def _record_entry_reference_reach(watch: dict, ref_price: int, market: str = "NXT", reason: str = "krx_vi_reference"):
+    """KRX VI/거래정지 유사 상태에서 NXT 참고 도달만 기록."""
+    try:
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ref_date, ref_clock = (now_s.split(' ', 1) + [""])[:2]
+        updated = False
+        for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
+            if (rec.get("code") == watch.get("code")
+                    and rec.get("status") in ("추적중", "진입준비")
+                    and rec.get("signal_type") == watch.get("signal_type")):
+                rec["entry_reference_only"] = True
+                rec["entry_reference_market"] = str(market or "")
+                rec["entry_reference_reason"] = str(reason or "")
+                rec["entry_reference_time"] = now_s
+                rec["entry_reference_date"] = ref_date
+                rec["entry_reference_clock"] = ref_clock
+                rec["entry_reference_price"] = int(ref_price or 0)
+                updated = True
+                break
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        print(f"  🟦 참고도달 기록: {watch.get('name','')} {market} @ {int(ref_price or 0):,}")
+    except Exception as e:
+        print(f"⚠️ 참고도달 기록 오류: {e}")
+
+
 def _record_entry_miss(watch: dict, reason: str, final_price: int):
     """진입가 미도달 만료 시 signal_log에 기록 → auto_tune 학습"""
     try:
@@ -8264,7 +8342,13 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
                 rec["entry_miss_away"] = miss_away
                 rec["entry_peak_away"] = peak_away
                 rec["miss_count"]      = watch.get("miss_count", 0)
-                if watch.get("entry_blocked") or rec.get("entry_blocked"):
+                if watch.get("entry_reference_market") or rec.get("entry_reference_market"):
+                    rec["status"]      = "NXT참고도달"
+                    rec["pnl_pct"]     = 0.0
+                    _ref_market = watch.get("entry_reference_market") or rec.get("entry_reference_market") or "NXT"
+                    _ref_reason = watch.get("entry_reference_reason") or rec.get("entry_reference_reason") or reason
+                    rec["exit_reason"] = f"{_ref_market}참고도달_{_ref_reason}"
+                elif watch.get("entry_blocked") or rec.get("entry_blocked"):
                     rec["status"]      = "진입불가"
                     rec["pnl_pct"]     = 0.0
                     _blk_reason = watch.get("entry_blocked_reason") or rec.get("entry_blocked_reason") or reason
@@ -8318,6 +8402,13 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | 
             rec['entry_blocked'] = False
             rec['entry_blocked_reason'] = ''
             rec['entry_reachable_but_untradable'] = False
+            rec['entry_reference_only'] = False
+            rec['entry_reference_market'] = ''
+            rec['entry_reference_reason'] = ''
+            rec['entry_reference_time'] = ''
+            rec['entry_reference_date'] = ''
+            rec['entry_reference_clock'] = ''
+            rec['entry_reference_price'] = 0
             if hit_price:
                 rec['entry_hit_price'] = int(hit_price)
             if hit_date:
@@ -8450,7 +8541,6 @@ def _should_send_trailing_mode_message(rec: dict | None = None) -> bool:
 
 def check_entry_watch():
     if not _entry_watch: return
-    use_nxt = not is_market_open() and is_nxt_open()
     expired = []
     for log_key, watch in list(_entry_watch.items()):
         # ── 만료 체크 (3일) ──
@@ -8465,16 +8555,35 @@ def check_entry_watch():
             expired.append(log_key); continue
 
         try:
-            if use_nxt:
-                cur   = get_nxt_stock_price(watch["code"])
+            code = watch["code"]
+            krx_ok = is_market_open()
+            nxt_ok = (not krx_ok) and is_nxt_open() and is_nxt_listed(code)
+            nxt_reference_ok = krx_ok and is_nxt_open() and is_nxt_listed(code)
+            use_nxt = False
+            reference_only = False
+            reference_reason = ""
+
+            if krx_ok:
+                cur = get_stock_price(code)
                 price = cur.get("price", 0)
                 if not price:
-                    cur   = get_stock_price(watch["code"])
-                    price = cur.get("price", 0)
-            else:
-                cur   = get_stock_price(watch["code"])
+                    continue
+                if nxt_reference_ok and _is_krx_vi_reference_mode(cur, code):
+                    nxt_cur = get_nxt_stock_price(code)
+                    nxt_price = nxt_cur.get("price", 0)
+                    if nxt_price:
+                        cur = nxt_cur
+                        price = nxt_price
+                        reference_only = True
+                        reference_reason = "krx_vi_reference"
+            elif nxt_ok:
+                use_nxt = True
+                cur = get_nxt_stock_price(code)
                 price = cur.get("price", 0)
-            if not price: continue
+                if not price:
+                    continue
+            else:
+                continue
 
             # 최고가 갱신
             if price > watch.get("peak_price", 0):
@@ -8501,6 +8610,22 @@ def check_entry_watch():
 
             # ── 엄격형 진입가 도달: 현재가가 진입가 이하일 때만 인정 ──
             if price <= entry:
+                if reference_only:
+                    if not watch.get("entry_reference_only"):
+                        watch["entry_reference_only"] = True
+                        watch["entry_reference_market"] = "NXT"
+                        watch["entry_reference_reason"] = reference_reason or "krx_vi_reference"
+                        watch["entry_reference_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        watch["entry_reference_price"] = int(price or 0)
+                        _record_entry_reference_reach(watch, price, market="NXT", reason=reference_reason or "krx_vi_reference")
+                        _log_suppressed_alert(
+                            watch["code"], watch["name"],
+                            f"NXT 참고 도달 ({reference_reason or 'krx_vi_reference'})",
+                            watch.get("signal_type", ""),
+                            {"entry_price": entry, "reference_price": int(price or 0), "market": "NXT"}
+                        )
+                    continue
+
                 now_ts       = time.time()
                 last_ts      = watch.get("last_notified_ts", 0)
                 notify_count = watch.get("notify_count", 0)
@@ -8556,6 +8681,11 @@ def check_entry_watch():
 
                 watch["last_notified_ts"] = now_ts
                 watch["notify_count"]     = notify_count + 1
+                watch["entry_reference_only"] = False
+                watch["entry_reference_market"] = ""
+                watch["entry_reference_reason"] = ""
+                watch["entry_reference_time"] = ""
+                watch["entry_reference_price"] = 0
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
