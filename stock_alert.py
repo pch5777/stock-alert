@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.14
+버전: v41.15
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1645,6 +1645,41 @@ def _format_recent_examples(records: list, max_n: int = 3) -> str:
         d_str = f"({d[4:6]}/{d[6:8]})" if d and len(d) == 8 else ""
         parts.append(f"{r.get('name','?')} {r['pnl_pct']:+.1f}%{d_str}")
     return " | ".join(parts) if parts else ""
+
+def _format_capture_datetime_label(detected_at=None, detect_date: str = "", detect_time: str = "") -> str:
+    """포착 시각을 사용자 표시용 문자열로 정리한다."""
+    try:
+        if isinstance(detected_at, datetime):
+            return detected_at.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    d = str(detect_date or "").strip()
+    t = str(detect_time or "").strip()
+
+    date_label = ""
+    time_label = t
+    if d:
+        try:
+            if len(d) == 8 and d.isdigit():
+                date_label = datetime.strptime(d, "%Y%m%d").strftime("%Y-%m-%d")
+            else:
+                date_label = d
+        except Exception:
+            date_label = d
+
+    if t:
+        try:
+            if len(t) >= 8:
+                time_label = t[:8]
+            elif len(t) >= 5:
+                time_label = t[:5]
+        except Exception:
+            time_label = t
+
+    if date_label and time_label:
+        return f"{date_label} {time_label}"
+    return date_label or time_label or "-"
 
 
 def get_stock_track_record(code: str, name: str = "") -> str:
