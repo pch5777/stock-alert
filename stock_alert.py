@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.7
+버전: v41.8
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.8 (2026-03-11): 조건 자동 조정 중복 실행/중복 알림 억제 강화.
+  [#1] `auto_tune()`에 긴급 상태 락과 단계별 강화(stage 1/2/3)를 추가해, 같은 연속 손절 상태에서는 동일 긴급 튜닝을 반복 적용하지 않고 더 악화된 경우에만 추가 강화하도록 정리.
+  [#2] `auto_tune_state.json`을 도입해 직전 유효 파라미터 해시와 마지막 발송 해시를 저장하고, 실제 파라미터 변화가 있을 때만 조정 이력/텔레그램 메시지를 남기도록 보강.
+  [#3] Railway 다중 replica 상황을 줄이기 위해 `leader_lock.json` 기반 리더 락을 추가하고, 스케줄 실행/자동조정/장전 catch-up/초기 즉시 스캔은 리더 인스턴스만 수행하도록 정리.
+  [#4] `track_signal_results()`의 긴급 튜닝 트리거는 연속 손절 카운트를 강제로 0으로 되돌리지 않고 유지하며, 수익 발생 시 긴급 상태를 해제해 악화 시 추가 강화·회복 시 정상화 흐름이 이어지도록 조정.
+  이유: `조건 자동 조정 완료` 메시지가 실제 반복 튜닝과 replica 중복 실행이 섞여 과도하게 많아질 수 있어, 리스크 대응은 유지하면서도 같은 상태/같은 조정값의 중복 실행과 중복 발송을 줄일 필요가 있기 때문.
+  개선점: 동일 긴급상태 재튜닝 억제↑, 실질 변경 없는 조정 메시지 억제↑, replica 중복 실행 완화↑, 악화 시 추가 강화 유지↑.
+  주의점: 리더 락은 lease 기반이라 배포 전환 직후 약간의 승계 지연이 있을 수 있고, `leader_lock.json`이 잠시 남아 있어도 lease 만료 후 자동 승계된다.
+  영향: `조건 자동 조정 완료` / 긴급 튜닝 관련 알림 수가 줄고, 실제 값이 변했을 때 위주로만 발송된다.
 - v41.7 (2026-03-11): 07:30 DART 강재료 후보에 종목명 우선 표시 복구.
   [#1] `_scan_recent_dart_materials()`가 DART 응답의 `corp_name`을 먼저 받아 `name_hint`로 `_resolve_stock_name()`을 호출하고, 응답 원본의 corp_name도 함께 저장하도록 보강.
   [#2] `_build_preopen_issue_section()`의 `📢 공시(DART) 강재료 후보` 출력은 `종목명(코드)` 형식 우선으로 통일하고, 종목명 복구가 실패한 경우에만 코드 단독 fallback을 사용하도록 정리.
@@ -465,7 +474,139 @@ _PERSIST_FILES = [
     "news_cooccur.json",
     "compact_mode.json",
     "suppressed_alerts.json",
+    "auto_tune_state.json",
 ]
+
+LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
+AUTO_TUNE_STATE_FILE = os.path.join(DATA_DIR, "auto_tune_state.json")
+LEADER_LOCK_LEASE_SEC = int(os.getenv("LEADER_LOCK_LEASE_SEC", "75") or "75")
+_INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'local'}:{os.getpid()}:{random.randint(1000, 9999)}"
+_RUNTIME_IS_LEADER = False
+
+def _normalize_for_hash(obj):
+    if isinstance(obj, dict):
+        return {str(k): _normalize_for_hash(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(obj, list):
+        return [_normalize_for_hash(v) for v in obj]
+    if isinstance(obj, float):
+        return round(obj, 6)
+    return obj
+
+def _payload_hash(obj) -> str:
+    try:
+        raw = json.dumps(_normalize_for_hash(obj), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        raw = str(obj)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _read_state_json(file_path: str, default=None):
+    if default is None:
+        default = {}
+    try:
+        with _file_lock:
+            if not os.path.exists(file_path):
+                return dict(default) if isinstance(default, dict) else default
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return dict(default) if isinstance(default, dict) else default
+
+def _write_state_json(file_path: str, obj):
+    try:
+        payload = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        with _file_lock:
+            _ensure_dir(os.path.dirname(file_path))
+            _atomic_write_bytes(file_path, payload)
+    except Exception as e:
+        print(f"⚠️ 상태 저장 실패: {os.path.basename(file_path)} ({e})")
+
+def _default_auto_tune_state() -> dict:
+    return {
+        "last_notify_hash": "",
+        "last_effective_hash": "",
+        "emergency_stage": 0,
+        "emergency_active": False,
+        "last_emergency_reason": "",
+        "last_emergency_ts": 0.0,
+    }
+
+def _get_auto_tune_state() -> dict:
+    st = _read_state_json(AUTO_TUNE_STATE_FILE, _default_auto_tune_state())
+    base = _default_auto_tune_state()
+    if isinstance(st, dict):
+        base.update(st)
+    return base
+
+def _save_auto_tune_state(state: dict):
+    merged = _default_auto_tune_state()
+    if isinstance(state, dict):
+        merged.update(state)
+    _write_state_json(AUTO_TUNE_STATE_FILE, merged)
+
+def _clear_emergency_tune_state(reason: str = ""):
+    st = _get_auto_tune_state()
+    if st.get("emergency_active") or int(st.get("emergency_stage", 0) or 0) > 0:
+        st["emergency_active"] = False
+        st["emergency_stage"] = 0
+        st["last_emergency_reason"] = reason or "recovered"
+        st["last_emergency_ts"] = time.time()
+        _save_auto_tune_state(st)
+
+def _emergency_stage(loss_streak: int) -> int:
+    if loss_streak >= 7:
+        return 3
+    if loss_streak >= 5:
+        return 2
+    if loss_streak >= EMERGENCY_TUNE_THRESHOLD:
+        return 1
+    return 0
+
+def _emergency_stage_label(stage: int) -> str:
+    return {0: "정상", 1: "경계", 2: "심화", 3: "위기"}.get(int(stage or 0), "정상")
+
+def _current_dynamic_signature() -> dict:
+    return _normalize_for_hash({k: v for k, v in _dynamic.items()})
+
+def _try_acquire_leader_lock(force: bool = False) -> bool:
+    global _RUNTIME_IS_LEADER
+    now_ts = time.time()
+    try:
+        with _file_lock:
+            cur = {}
+            try:
+                if os.path.exists(LEADER_LOCK_FILE):
+                    with open(LEADER_LOCK_FILE, "r", encoding="utf-8") as f:
+                        cur = json.load(f)
+            except Exception:
+                cur = {}
+            owner = str(cur.get("instance_id") or "")
+            last_ts = float(cur.get("ts") or 0.0)
+            stale = (now_ts - last_ts) > LEADER_LOCK_LEASE_SEC
+            if force or owner == _INSTANCE_ID or not owner or stale:
+                payload = {
+                    "instance_id": _INSTANCE_ID,
+                    "ts": now_ts,
+                    "pid": os.getpid(),
+                    "host": os.getenv("HOSTNAME") or "",
+                    "railway_replica": os.getenv("RAILWAY_REPLICA_ID") or "",
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                _ensure_dir(os.path.dirname(LEADER_LOCK_FILE))
+                _atomic_write_bytes(LEADER_LOCK_FILE, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+                _RUNTIME_IS_LEADER = True
+                return True
+            _RUNTIME_IS_LEADER = False
+            return False
+    except Exception as e:
+        print(f"⚠️ 리더 락 확인 실패: {e}")
+        return True
+
+def _leader_job(fn):
+    def _wrapped(*args, **kwargs):
+        if not _try_acquire_leader_lock():
+            return None
+        return fn(*args, **kwargs)
+    return _wrapped
 
 def _ensure_dir(path: str):
     try:
@@ -6389,10 +6530,11 @@ def track_signal_results():
                 _consecutive_loss_count += 1
                 _consecutive_win_count  = 0   # 손실 시 연속 수익 카운터 리셋
                 if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
-                    print(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 실행")
+                    print(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 평가")
                     auto_tune(notify=True)
-                    _consecutive_loss_count = 0
             else:
+                if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
+                    _clear_emergency_tune_state("win_recovered")
                 _consecutive_loss_count = 0
                 _consecutive_win_count  += 1
                 # ③ 연속 수익 공격 모드
@@ -6944,11 +7086,20 @@ def auto_tune(notify: bool = True):
     global _dynamic, _early_price_min_dynamic, _early_volume_min_dynamic
     global _consecutive_loss_count
 
+    if not _try_acquire_leader_lock():
+        print("  ⏸ auto_tune 생략 — 현재 replica는 리더 아님")
+        return
+
     try:
+        before_sig = _current_dynamic_signature()
+        before_hash = _payload_hash(before_sig)
+        tune_state = _get_auto_tune_state()
+
         data = {}
         try:
             data = _read_json_locked(SIGNAL_LOG_FILE)
-        except Exception: return
+        except Exception:
+            return
 
         # auto_tune은 이론 데이터 전부 사용 (미진입 포함 — 봇 조건 최적화용)
         completed = [v for v in data.values()
@@ -6963,31 +7114,26 @@ def auto_tune(notify: bool = True):
         best = _select_best_params(completed)
         if best:
             try:
-                # 현재값
                 cur_min_n = int(_dynamic.get("min_score_normal", 60))
                 cur_min_s = int(_dynamic.get("min_score_strict", 70))
                 cur_atr_s = _safe_float(_dynamic.get("atr_stop_mult", 1.5), 1.5)
                 cur_atr_t = _safe_float(_dynamic.get("atr_target_mult", 3.0), 3.0)
 
-                # 후보값
                 cand_min_n = int(best.get("min_score_normal", cur_min_n))
                 cand_min_s = int(best.get("min_score_strict", cur_min_s))
                 cand_atr_s = _safe_float(best.get("atr_stop_mult", cur_atr_s), cur_atr_s)
                 cand_atr_t = _safe_float(best.get("atr_target_mult", cur_atr_t), cur_atr_t)
 
-                # 스무딩(완만하게)
                 new_min_n = int(round(cur_min_n * (1 - TUNE_ALPHA) + cand_min_n * TUNE_ALPHA))
                 new_min_s = int(round(cur_min_s * (1 - TUNE_ALPHA) + cand_min_s * TUNE_ALPHA))
                 new_atr_s = round(cur_atr_s * (1 - TUNE_ALPHA) + cand_atr_s * TUNE_ALPHA, 2)
                 new_atr_t = round(cur_atr_t * (1 - TUNE_ALPHA) + cand_atr_t * TUNE_ALPHA, 2)
 
-                # 가드레일
                 new_min_n = max(45, min(new_min_n, 80))
                 new_min_s = max(55, min(new_min_s, 90))
                 new_atr_s = max(0.8, min(new_atr_s, 3.5))
                 new_atr_t = max(1.5, min(new_atr_t, 6.0))
 
-                # 반영
                 if (new_min_n, new_min_s, new_atr_s, new_atr_t) != (cur_min_n, cur_min_s, cur_atr_s, cur_atr_t):
                     _dynamic["min_score_normal"] = new_min_n
                     _dynamic["min_score_strict"] = new_min_s
@@ -7003,14 +7149,12 @@ def auto_tune(notify: bool = True):
             except Exception as te:
                 _log_error("auto_tune.params_snapshot", te)
 
-
-        # ── 신호 유형별 승률 계산 ──
         by_type = {}
         for v in completed:
             t = v.get("signal_type", "기타")
             by_type.setdefault(t, []).append(v)
 
-        # ── ① 긴급 튜닝: 연속 손절 3회 이상 ──
+        # ── ① 긴급 튜닝: 같은 상태 중복 재실행 금지, 악화 시만 추가 강화 ──
         recent = sorted(completed, key=lambda x: x.get("exit_date","") + x.get("exit_time",""))[-5:]
         recent_loss_streak = 0
         for r in reversed(recent):
@@ -7018,13 +7162,32 @@ def auto_tune(notify: bool = True):
                 recent_loss_streak += 1
             else:
                 break
-        if recent_loss_streak >= EMERGENCY_TUNE_THRESHOLD:
-            old_n = _dynamic["min_score_normal"]
-            old_s = _dynamic["min_score_strict"]
-            _dynamic["min_score_normal"] = min(old_n + 8, 85)
-            _dynamic["min_score_strict"] = min(old_s + 8, 90)
-            changes.append(f"🚨 <b>긴급 튜닝</b>: 연속 손절 {recent_loss_streak}회\n"
-                           f"   최소점수 즉시 강화: {old_n}→{_dynamic['min_score_normal']}점")
+
+        cur_stage = _emergency_stage(recent_loss_streak)
+        prev_stage = int(tune_state.get("emergency_stage", 0) or 0)
+        if cur_stage <= 0:
+            if tune_state.get("emergency_active") or prev_stage > 0:
+                tune_state["emergency_active"] = False
+                tune_state["emergency_stage"] = 0
+                tune_state["last_emergency_reason"] = "streak_cleared"
+                tune_state["last_emergency_ts"] = time.time()
+        else:
+            tune_state["emergency_active"] = True
+            if cur_stage > prev_stage:
+                old_n = _dynamic["min_score_normal"]
+                old_s = _dynamic["min_score_strict"]
+                bump = {1: 8, 2: 5, 3: 5}.get(cur_stage, 4)
+                _dynamic["min_score_normal"] = min(old_n + bump, 85)
+                _dynamic["min_score_strict"] = min(old_s + bump, 90)
+                changes.append(
+                    f"🚨 <b>긴급 튜닝[{_emergency_stage_label(cur_stage)}]</b>: 연속 손절 {recent_loss_streak}회\n"
+                    f"   최소점수 즉시 강화: {old_n}→{_dynamic['min_score_normal']}점"
+                )
+                tune_state["emergency_stage"] = cur_stage
+                tune_state["last_emergency_reason"] = f"loss_streak_{recent_loss_streak}"
+                tune_state["last_emergency_ts"] = time.time()
+            else:
+                tune_state["emergency_stage"] = max(prev_stage, cur_stage)
 
         # ── ② EARLY_DETECT 조정 ──
         early_recs = by_type.get("EARLY_DETECT", [])
@@ -7083,8 +7246,6 @@ def auto_tune(notify: bool = True):
                 changes.append(f"⭐ 최소 점수 완화: {old_n}→{_dynamic['min_score_normal']}점")
 
         # ── ⑤ ATR 손절배수 동적 조정 ──
-        # 손절가 도달 비율이 높으면 손절이 너무 타이트 → 배수 늘리기
-        # 만료(timeout) 비율이 높으면 손절이 너무 루즈 → 배수 줄이기
         stop_hits   = sum(1 for r in completed if r.get("exit_reason") == "손절가")
         timeout_hit = sum(1 for r in completed if r.get("exit_reason") in ["만료", "timeout", TRACK_TIMEOUT_RESULT])
         old_atr     = _dynamic["atr_stop_mult"]
@@ -7103,7 +7264,8 @@ def auto_tune(notify: bool = True):
         new_slot_adj = dict(_dynamic["timeslot_score_adj"])
         slot_changes = []
         for slot, st in slot_stats.items():
-            if st["total"] < 3: continue
+            if st["total"] < 3:
+                continue
             old_adj = new_slot_adj.get(slot, 0)
             if st["rate"] < 35 and old_adj < 20:
                 new_slot_adj[slot] = old_adj + 5
@@ -7124,107 +7286,43 @@ def auto_tune(notify: bool = True):
             gap         = themed_rate - solo_rate
             old_bonus   = _dynamic["themed_score_bonus"]
             if gap > 0.20:
-                _dynamic["themed_score_bonus"] = min(old_bonus + 5, 20)
-                changes.append(f"🏭 테마 동반 우대 강화\n"
-                                f"   격차 {gap*100:.0f}%p → 보너스 {old_bonus}→{_dynamic['themed_score_bonus']}점\n"
-                                f"   (단독 {solo_rate*100:.0f}%  테마 {themed_rate*100:.0f}%)")
-            elif gap < 0.05:
-                _dynamic["themed_score_bonus"] = max(old_bonus - 3, 0)
+                _dynamic["themed_score_bonus"] = min(old_bonus + 5, 25)
+                changes.append(f"🏭 테마 보너스 강화: {old_bonus}→{_dynamic['themed_score_bonus']}점")
+            elif gap < -0.10 and old_bonus > 5:
+                _dynamic["themed_score_bonus"] = max(old_bonus - 3, 5)
+                changes.append(f"🏭 테마 보너스 축소: {old_bonus}→{_dynamic['themed_score_bonus']}점")
 
-        # ── ⑧ 목표가 배수 동적 조정 ──
-        # 목표가 도달 비율이 낮고 만료 많으면 → 목표가 너무 높음 → 배수 축소
-        target_hits = sum(1 for r in completed if r.get("exit_reason") == "목표가")
-        if len(completed) >= MIN_SAMPLES:
-            tgt_ratio = target_hits / len(completed)
-            old_tgt   = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
-            if tgt_ratio < 0.20 and old_tgt > 2.0:
-                _dynamic["atr_target_mult"] = round(max(old_tgt - 0.3, 2.0), 1)
-                changes.append(f"🎯 목표가 배수 축소: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 {tgt_ratio*100:.0f}%)")
-            elif tgt_ratio > 0.50 and old_tgt < 5.0:
-                _dynamic["atr_target_mult"] = round(min(old_tgt + 0.2, 5.0), 1)
-                changes.append(f"🎯 목표가 배수 확대: {old_tgt}→{_dynamic['atr_target_mult']} (목표 도달률 양호)")
+        # ── ⑧-1 오버나이트 신호/결과 분석 ──
+        overnight_recs = [r for r in completed if r.get("feature_flags", {}).get("gap_signal") in ["gap_up", "gap_down", "flat"]]
+        if len(overnight_recs) >= 5:
+            gap_groups = {}
+            for r in overnight_recs:
+                g = r.get("feature_flags", {}).get("gap_signal", "flat")
+                gap_groups.setdefault(g, []).append(r)
+            for gap_label, dyn_key in (("gap_up", "overnight_gapup_bonus"), ("gap_down", "overnight_gapdown_penalty")):
+                grp = gap_groups.get(gap_label, [])
+                if len(grp) < 3:
+                    continue
+                win_rate = sum(1 for r in grp if r.get("pnl_pct", 0) > 0) / len(grp)
+                avg_pnl = sum(r.get("pnl_pct", 0) for r in grp) / len(grp)
+                old_v = int(_dynamic.get(dyn_key, 0) or 0)
+                new_v = old_v
+                if gap_label == "gap_up":
+                    if win_rate > 0.70 and avg_pnl > 1.5:
+                        new_v = min(old_v + 2, 8)
+                    elif win_rate < 0.40 or avg_pnl < -1.0:
+                        new_v = max(old_v - 2, -2)
+                else:
+                    if win_rate < 0.40 or avg_pnl < -1.0:
+                        new_v = min(old_v + 2, 10)
+                    elif win_rate > 0.60 and avg_pnl > 0.5:
+                        new_v = max(old_v - 1, 0)
+                if new_v != old_v:
+                    _dynamic[dyn_key] = new_v
+                    changes.append(f"🌙 오버나이트[{gap_label}] 보정: {old_v:+d}→{new_v:+d}점 (승률 {win_rate*100:.0f}% / 평균 {avg_pnl:+.1f}%)")
 
-        # ── ⑨ 포지션 기본비중 자동 조정 ──
-        # 전체 승률 높으면 비중 살짝 상향, 낮으면 하향
-        if len(completed) >= MIN_SAMPLES * 2:
-            overall_win = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
-            old_pos = _dynamic.get("position_base_pct", 8.0)
-            if overall_win > 0.65 and old_pos < 15.0:
-                _dynamic["position_base_pct"] = round(min(old_pos + 0.5, 15.0), 1)
-                changes.append(f"💰 포지션 비중 상향: {old_pos}%→{_dynamic['position_base_pct']}% (승률 {overall_win*100:.0f}%)")
-            elif overall_win < 0.40 and old_pos > 4.0:
-                _dynamic["position_base_pct"] = round(max(old_pos - 1.0, 4.0), 1)
-                changes.append(f"💰 포지션 비중 하향: {old_pos}%→{_dynamic['position_base_pct']}% (승률 저조)")
-
-        # ── ⑪ 스킵 패턴 학습 ──
-        # ── 진입가 미달 패턴 분석 → entry_pullback_ratio 자동 조정 ──
-        # "진입미달_상승이탈": 진입가가 너무 낮게 설정 → 비율 올리기 (더 공격적)
-        # "진입미달_기간만료": 진입가가 너무 높게 설정 → 비율 낮추기 (더 보수적)
-        # "진입가변경": 같은 종목 재포착 반복 → 변동성 큰 상황, 비율 완화
-        miss_recs = [r for r in data.values()
-                     if r.get("status") in ["진입미달", "진입가변경"]
-                     and r.get("detect_date", "") >= (
-                         datetime.now() - timedelta(days=30)
-                     ).strftime("%Y%m%d")]
-
-        if len(miss_recs) >= 5:
-            surge_miss   = sum(1 for r in miss_recs if "상승이탈"   in str(r.get("exit_reason","")))
-            expire_miss  = sum(1 for r in miss_recs if "기간만료"   in str(r.get("exit_reason","")))
-            reentry_miss = sum(1 for r in miss_recs if "진입가변경" in str(r.get("exit_reason","")))
-            total_miss   = len(miss_recs)
-            old_ratio    = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
-
-            if surge_miss / total_miss >= 0.5:
-                # 절반 이상이 상승이탈 → 진입가 너무 낮음 → 비율 올리기 (진입가를 현재가에 더 가깝게)
-                new_ratio = round(min(old_ratio + 0.05, 0.7), 2)
-                if new_ratio != old_ratio:
-                    _dynamic["entry_pullback_ratio"] = new_ratio
-                    changes.append(
-                        f"📈 진입가 비율 상향: {old_ratio:.2f}→{new_ratio:.2f} "
-                        f"(상승이탈 {surge_miss}/{total_miss}건 — 진입가 너무 낮았음)"
-                    )
-            elif expire_miss / total_miss >= 0.6:
-                # 60% 이상이 기간만료 → 진입가 너무 높음 → 비율 낮추기 (진입가를 더 눌림목으로)
-                new_ratio = round(max(old_ratio - 0.05, 0.2), 2)
-                if new_ratio != old_ratio:
-                    _dynamic["entry_pullback_ratio"] = new_ratio
-                    changes.append(
-                        f"📉 진입가 비율 하향: {old_ratio:.2f}→{new_ratio:.2f} "
-                        f"(기간만료 {expire_miss}/{total_miss}건 — 진입가 너무 높았음)"
-                    )
-            if reentry_miss >= 3:
-                # 재포착 반복 → 변동성 큰 종목들 → 진입가 범위 완화
-                new_ratio = round(max(old_ratio - 0.03, 0.2), 2)
-                if new_ratio != old_ratio:
-                    _dynamic["entry_pullback_ratio"] = new_ratio
-                    changes.append(
-                        f"🔄 재포착 반복 {reentry_miss}건 → 진입가 비율 완화: {old_ratio:.2f}→{new_ratio:.2f}"
-                    )
-
-        # 자주 스킵하는 이유가 "이미상승"이면 → entry_pullback_ratio 더 완화
-        # 자주 스킵하는 이유가 "시간없음"이면 → ALERT_COOLDOWN 늘리기 (신호 집중)
-        skipped_recs = [r for r in data.values() if r.get("actual_entry") is False]
-        if len(skipped_recs) >= 5:
-            skip_reasons = {}
-            for r in skipped_recs:
-                reason = r.get("skip_reason", "").strip()
-                if reason: skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-            top_reason = max(skip_reasons, key=skip_reasons.get) if skip_reasons else ""
-            if "이미상승" in top_reason or "상승" in top_reason:
-                # 진입가가 너무 낮아서 기회를 못 잡는 패턴 → pullback 완화
-                old_ratio = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
-                if old_ratio > 0.15:
-                    _dynamic["entry_pullback_ratio"] = round(old_ratio - 0.03, 2)
-                    changes.append(f"📈 스킵패턴 학습: '이미상승' 빈번 → 진입가 비율 완화 {old_ratio:.2f}→{_dynamic['entry_pullback_ratio']:.2f}")
-            # 스킵 기회비용 계산 (놓친 이론 수익 평균)
-            skip_pnls = [r.get("pnl_pct", 0) for r in skipped_recs if r.get("pnl_pct")]
-            if skip_pnls:
-                opp_avg = sum(skip_pnls) / len(skip_pnls)
-                if opp_avg > 5.0:
-                    changes.append(f"💡 스킵 기회비용: 평균 {opp_avg:+.1f}% 놓치는 중 (알림 설정 점검 권장)")
-
-        # ── ⑨-1 실적 리스크 자동학습 ──
-        risk_recs = [r for r in completed if r.get("feature_flags", {}).get("earnings_risk") in ("warn", "high", "none")]
+        # ── ⑨ 실적 리스크 자동학습 ──
+        risk_recs = [r for r in completed if r.get("feature_flags", {}).get("earnings_risk") in ["warn", "high", "none"]]
         if len(risk_recs) >= MIN_SAMPLES:
             for risk_key, dyn_key, base_default, floor_v in (("warn", "earnings_warn_mult", 0.85, 0.60), ("high", "earnings_high_mult", 0.72, 0.40)):
                 with_risk = [r for r in risk_recs if r.get("feature_flags", {}).get("earnings_risk") == risk_key]
@@ -7320,7 +7418,6 @@ def auto_tune(notify: bool = True):
             _dynamic["geo_sector_weights"] = geo_weights
 
         # ── ⑩ 기능별 기여도 분석 + 자동 가중치 조정 ──
-        # feature_flags가 기록된 충분한 샘플이 있을 때만 분석
         feat_recs = [r for r in completed if r.get("feature_flags")]
         if len(feat_recs) >= MIN_SAMPLES * 2:
             feat_analyses = {
@@ -7344,7 +7441,6 @@ def auto_tune(notify: bool = True):
                 contribution = (win_with - win_without) + (avg_with - avg_without) / 20
 
                 if contribution < -0.15 and old_w > 0.3:
-                    # 기능이 오히려 수익을 깎고 있음 → 가중치 축소
                     new_w = round(max(old_w - 0.2, 0.2), 1)
                     _dynamic[feat_key] = new_w
                     changes.append(
@@ -7352,7 +7448,6 @@ def auto_tune(notify: bool = True):
                         f"(있을때 승률{win_with*100:.0f}% vs 없을때 {win_without*100:.0f}%)"
                     )
                 elif contribution > 0.15 and old_w < 1.5:
-                    # 기능이 수익에 기여 → 가중치 강화
                     new_w = round(min(old_w + 0.1, 1.5), 1)
                     _dynamic[feat_key] = new_w
                     changes.append(
@@ -7361,11 +7456,7 @@ def auto_tune(notify: bool = True):
                     )
 
         # ── ⑧ RSI 기간 자동 조정 ──
-        # RSI 차단된 신호 중 이후 성공한 케이스 비율이 높으면 → 기준 완화
         if len(completed) >= MIN_SAMPLES * 2:
-            blocked_ok = [r for r in completed
-                          if r.get("rsi_at_signal", 50) >= _dynamic["rsi_overbuy"]
-                          and r["pnl_pct"] > 0]
             all_rsi_high = [r for r in completed if r.get("rsi_at_signal", 50) >= 65]
             if len(all_rsi_high) >= 3:
                 rsi_high_rate = sum(1 for r in all_rsi_high if r["pnl_pct"] > 0) / len(all_rsi_high)
@@ -7377,30 +7468,54 @@ def auto_tune(notify: bool = True):
                     _dynamic["rsi_overbuy"] = max(old_ob - 2, 60)
                     changes.append(f"📊 RSI 과매수 기준 강화: {old_ob:.0f}→{_dynamic['rsi_overbuy']:.0f} (고RSI 성공률 저조)")
 
-        # ── 조정 이력 저장 ──
-        if changes:
-            tune_log = {}
-            try:
-                with open(AUTO_TUNE_FILE, "r") as f: tune_log = json.load(f)
-            except Exception: pass
-            tune_log[datetime.now().strftime("%Y%m%d_%H%M")] = {
-                "changes":  changes,
-                "params":   {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
-                "samples":  len(completed),
-            }
-            _write_json_atomic(AUTO_TUNE_FILE, tune_log, indent=2)
+        after_sig = _current_dynamic_signature()
+        after_hash = _payload_hash(after_sig)
 
-            if notify:
+        if after_hash == before_hash:
+            _save_auto_tune_state(tune_state)
+            print(f"  🧠 자동 조정: 유효 파라미터 변경 없음 ({len(completed)}건 분석)")
+            return
+
+        tune_log = {}
+        try:
+            with open(AUTO_TUNE_FILE, "r", encoding="utf-8") as f:
+                tune_log = json.load(f)
+        except Exception:
+            pass
+
+        ts_key = datetime.now().strftime("%Y%m%d_%H%M%S")
+        while ts_key in tune_log:
+            ts_key = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{random.randint(10,99)}"
+
+        tune_log[ts_key] = {
+            "changes": changes,
+            "params": {k: v for k, v in _dynamic.items() if k != "timeslot_score_adj"},
+            "samples": len(completed),
+            "effective_hash": after_hash,
+            "instance_id": _INSTANCE_ID,
+        }
+        _write_json_atomic(AUTO_TUNE_FILE, tune_log, indent=2)
+
+        notify_hash = _payload_hash({
+            "effective_hash": after_hash,
+            "changes": changes,
+            "samples": len(completed),
+        })
+        if notify:
+            if tune_state.get("last_notify_hash") == notify_hash:
+                print("  📨 조건 자동 조정 알림 중복 생략 (동일 변경)")
+            else:
                 change_text = "\n".join(changes)
                 send(f"🔧 <b>조건 자동 조정 완료</b>\n"
                      f"근거: {len(completed)}건 결과 분석\n"
                      f"━━━━━━━━━━━━━━━\n"
                      f"{change_text}\n\n"
                      f"/stats 로 전체 통계 확인")
-            # ★ 조정값 파일에 저장 → 재시작 후에도 유지
-            _save_dynamic_params()
-        else:
-            print(f"  🧠 자동 조정: 변경 없음 ({len(completed)}건 분석)")
+                tune_state["last_notify_hash"] = notify_hash
+
+        tune_state["last_effective_hash"] = after_hash
+        _save_auto_tune_state(tune_state)
+        _save_dynamic_params()
 
     except Exception as e:
         _log_error("auto_tune", e, critical=True)
@@ -14850,28 +14965,29 @@ if __name__ == "__main__":
     # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
     if is_holiday():
         print(f"📅 오늘은 공휴일/주말 — 대기 모드로 실행")
-        try:
-            send(
-                f"😴 <b>주말/공휴일 대기 모드</b>  {BOT_VERSION}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"📡 스캔은 멈추고 명령어만 응답해요\n\n"
-                f"사용 가능한 명령어:\n"
-                f"/us — 미국 시장 현황\n"
-                f"/geo — 지정학 뉴스 분석\n"
-                f"/stats — 신호 통계\n"
-                f"/list — 감시 종목 목록\n"
-                f"/overnight — 오버나이트 위험도"
-            )
-        except Exception: pass
+        if _try_acquire_leader_lock():
+            try:
+                send(
+                    f"😴 <b>주말/공휴일 대기 모드</b>  {BOT_VERSION}\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📡 스캔은 멈추고 명령어만 응답해요\n\n"
+                    f"사용 가능한 명령어:\n"
+                    f"/us — 미국 시장 현황\n"
+                    f"/geo — 지정학 뉴스 분석\n"
+                    f"/stats — 신호 통계\n"
+                    f"/list — 감시 종목 목록\n"
+                    f"/overnight — 오버나이트 위험도"
+                )
+            except Exception: pass
 
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
         migrate_signal_log_pnl_fields()
         _load_dynamic_params()
-        schedule.every(10).seconds.do(poll_telegram_commands)
-        schedule.every(30).minutes.do(run_overnight_monitor)
-        schedule.every(60).minutes.do(run_geo_news_scan)
+        schedule.every(10).seconds.do(_leader_job(poll_telegram_commands))
+        schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
+        schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
 
         print("✅ 대기 모드 스케줄 등록 완료")
         while True:
@@ -14887,7 +15003,8 @@ if __name__ == "__main__":
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
 
     _CODE_HASH = _get_code_hash()
-    send(
+    if _try_acquire_leader_lock():
+        send(
         f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
         f"📅 {BOT_DATE}  🔑 <code>{_CODE_HASH}</code>\n\n"
         "✅ 한국투자증권 API 연결\n"
@@ -14903,82 +15020,85 @@ if __name__ == "__main__":
         "• NXT 마감 후 추적: 15:30~20:00\n\n"
         "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
         "⚙️ <b>/설정</b> — BotFather 명령어 자동완성 등록법"
-    )
+        )
+    else:
+        print("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
 
-    schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
-    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(run_news_scan)
-    schedule.every(DART_INTERVAL).seconds.do(run_dart_intraday)
-    schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(run_mid_pullback_scan)
-    schedule.every(10).seconds.do(poll_telegram_commands)  # 30→10초
-    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
-    schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("08:30").do(send_premarket_risk_assessment)  # v40.0-#3: 장전 리스크 평가
-    schedule.every().day.at("08:50").do(send_premarket_briefing)
-    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(
+    schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_scan))
+    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
+    schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
+    schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
+    schedule.every(10).seconds.do(_leader_job(poll_telegram_commands))  # 30→10초
+    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
+    schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
+    schedule.every().day.at("07:30").do(_leader_job(send_preopen_watchlist))  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("08:30").do(_leader_job(send_premarket_risk_assessment))  # v40.0-#3: 장전 리스크 평가
+    schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes()
-    )
-    schedule.every().day.at("14:45").do(
+    ))
+    schedule.every().day.at("14:45").do(_leader_job(
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx")
-    )
-    schedule.every().day.at("19:20").do(
+    ))
+    schedule.every().day.at("19:20").do(_leader_job(
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt")
-    )
-    schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
+    ))
+    schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
     for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
-        schedule.every().day.at(_top_hhmm).do(
+        schedule.every().day.at(_top_hhmm).do(_leader_job(
             lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
-        )
-    schedule.every().day.at(MARKET_OPEN).do(_on_market_open)  # v37.0: 명명 함수
-    schedule.every().day.at(MARKET_CLOSE).do(
+        ))
+    schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))  # v37.0: 명명 함수
+    schedule.every().day.at(MARKET_CLOSE).do(_leader_job(
         lambda: None if is_holiday() else on_market_close()
-    )
+    ))
     # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전, 매도 가능 시간)
-    schedule.every().day.at("15:10").do(
+    schedule.every().day.at("15:10").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
-    )
+    ))
     # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전, 매도 가능 시간)
-    schedule.every().day.at("19:40").do(
+    schedule.every().day.at("19:40").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
-    )
+    ))
     # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
-    schedule.every().day.at("20:05").do(
+    schedule.every().day.at("20:05").do(_leader_job(
         lambda: (
             _reentry_watch.clear(),
             _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
             print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() else None
-    )
+    ))
     # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
-    schedule.every(30).minutes.do(run_overnight_monitor)
+    schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
     # 지정학 뉴스 스캔 (1시간마다)
-    schedule.every(60).minutes.do(run_geo_news_scan)
+    schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
 
     # 평일만 백업 (장 운영일에만)
-    schedule.every(BACKUP_INTERVAL_H).hours.do(
+    schedule.every(BACKUP_INTERVAL_H).hours.do(_leader_job(
         lambda: run_auto_backup(notify=False) if not is_holiday() else None
-    )
+    ))
 
     # NXT 마감 후 자동 종료 (20:10)
-    schedule.every().day.at("20:10").do(
+    schedule.every().day.at("20:10").do(_leader_job(
         lambda: _shutdown("NXT 마감 (20:00) — 오늘 운영 완료")
         if not is_holiday() else None
-    )
+    ))
 
     # v39.3: 시작 시 07:30 브리핑 놓침 보완 (봇이 07:30 이후 시작된 경우)
     _now = datetime.now()
-    if dtime(7, 30) <= _now.time() <= dtime(9, 0) and not is_holiday():
+    if dtime(7, 30) <= _now.time() <= dtime(9, 0) and not is_holiday() and _try_acquire_leader_lock():
         try:
             print("📋 시작 시 장전 브리핑 보완 발송")
             send_preopen_watchlist()
         except Exception as e:
             print(f"⚠️ 장전 브리핑 보완 실패: {e}")
 
-    run_scan()
-    run_news_scan()
-    run_mid_pullback_scan()
+    if _try_acquire_leader_lock():
+        run_scan()
+        run_news_scan()
+        run_mid_pullback_scan()
 
     while True:
         try:
