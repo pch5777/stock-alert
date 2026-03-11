@@ -3,11 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.8
+버전: v41.9
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.9 (2026-03-11): [목표가 도달 → 트레일링 모드] 오발송 억제 강화.
+  [#1] `_has_entry_hit_metadata()` / `_should_send_trailing_mode_message()`를 추가해, 도달가·도달시각을 복구할 수 있는 레코드에서만 트레일링 모드 메시지를 발송하도록 제한.
+  [#2] 동일 종목의 다중 추적 레코드 중 진입가 도달 메타가 없는 가상/중복 레코드는 `[목표가 도달 → 트레일링 모드]` 메시지를 보내지 않도록 보강.
+  이유: 같은 종목에서 여러 추적 레코드가 동시에 목표가를 넘을 때, 마지막 1건만 도달정보가 있고 앞선 여러 건은 도달정보 없이 트레일링 메시지가 연속 발송되는 문제를 줄이기 위함.
+  개선점: 트레일링 모드 중복 알림 감소, 도달정보 없는 오발송 감소, 실제 진입 확인된 레코드 중심으로 메시지 일관성 향상.
+
 - v41.8 (2026-03-11): 조건 자동 조정 중복 실행/중복 알림 억제 강화.
   [#1] `auto_tune()`에 긴급 상태 락과 단계별 강화(stage 1/2/3)를 추가해, 같은 연속 손절 상태에서는 동일 긴급 튜닝을 반복 적용하지 않고 더 악화된 경우에만 추가 강화하도록 정리.
   [#2] `auto_tune_state.json`을 도입해 직전 유효 파라미터 해시와 마지막 발송 해시를 저장하고, 실제 파라미터 변화가 있을 때만 조정 이력/텔레그램 메시지를 남기도록 보강.
@@ -6463,20 +6469,24 @@ def track_signal_results():
                     rec["trailing_stop"]   = calc_trailing_stop(code, price)
                     updated = True
                     if trailing_key not in _tracking_notified:
-                        _tracking_notified.add(trailing_key)
                         display_rec = dict(rec); display_rec['log_key'] = log_key
-                        entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=True, include_hit_time=True)
-                        send_with_chart_buttons(
-                            f"🎯 <b>[목표가 도달 → 트레일링 모드]</b>\n"
-                            f"━━━━━━━━━━━━━━━\n"
-                            f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
-                            f"{entry_hit_line}\n"
-                            f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
-                            f"━━━━━━━━━━━━━━━\n"
-                            f"✅ 목표 달성! 추가 상승 시 자동으로 더 먹습니다\n"
-                            f"📉 고점 대비 -3% 하락 시 자동 청산",
-                            code, rec["name"]
-                        )
+                        if _should_send_trailing_mode_message(display_rec):
+                            _tracking_notified.add(trailing_key)
+                            entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=True, include_hit_time=True)
+                            send_with_chart_buttons(
+                                f"🎯 <b>[목표가 도달 → 트레일링 모드]</b>\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                                f"{entry_hit_line}\n"
+                                f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"✅ 목표 달성! 추가 상승 시 자동으로 더 먹습니다\n"
+                                f"📉 고점 대비 -3% 하락 시 자동 청산",
+                                code, rec["name"]
+                            )
+                        else:
+                            _tracking_notified.add(f"{trailing_key}_suppressed_no_entry_hit")
+                            print(f"  🔇 트레일링모드 메시지 억제(도달메타 없음): {rec.get('name', code)} {log_key}")
                 continue   # 트레일링 모드로 계속 추적
             elif price <= stop:
                 exit_reason = "손절가"
