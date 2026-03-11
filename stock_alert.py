@@ -3,36 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.12
+버전: v41.14
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.12 (2026-03-11): 포착 날짜/시간 helper 실제 정의 누락 보정.
-  [#1] `_format_capture_datetime_label()` helper를 코드 본문에 실제로 추가해 `detected_at`, `detect_date`, `detect_time`를 안전하게 `YYYY-MM-DD HH:MM[:SS]`로 변환하도록 정리.
-  [#2] `run_scan` 중 NameError를 유발하던 helper 누락 문제를 제거하고, detect_date가 없거나 형식이 다른 오래된 레코드도 최대한 자연스럽게 표시하도록 보강.
-  이유: v41.11에서 날짜+시간 표시를 적용하면서 changelog만 반영되고 helper 정의가 실제 파일에 빠져 런타임 NameError가 발생했기 때문.
-  개선점: 포착형 메시지 날짜 표기 정상화, run_scan 안정성 복구.
-  영향: 포착형 메시지의 날짜+시간 표기가 실제로 동작한다.
-- v41.11 (2026-03-11): 포착형 메시지에 날짜+시간 표시 추가.
-  [#1] `_format_capture_datetime_label()` helper를 추가해 `detected_at`, `detect_date`, `detect_time`를 공통 포맷으로 정리.
-  [#2] 일반 포착 메시지(`send_alert`), 눌림목 포착 메시지(`send_mid_pullback_alert`), 진입가 도달, 체결속도 확인 후 진입 확정, 종가 선진입 도달 메시지에서 포착 시각을 `YYYY-MM-DD HH:MM:SS` 또는 `YYYY-MM-DD HH:MM` 형식으로 표시하도록 수정.
-  이유: 텔레그램에서 나중에 다시 확인할 때 당일 시각만 보이면 날짜 구분이 어려워 사용자가 불편하기 때문.
-  개선점: 과거 메시지 재확인성↑, 날짜 혼동 감소, 포착 이력 식별 속도↑.
-  주의점: 아주 오래된 레코드 중 `detect_date`가 비어 있는 경우에는 현재 날짜를 보조로 붙일 수 있다.
-  영향: 포착형 메시지의 `🕐` 또는 `포착:` 표기가 날짜 포함 형식으로 바뀐다.
-- v41.10 (2026-03-11): 트레일링 모드 helper 누락 보정 + 도달정보 없는 트레일링 메시지 억제.
-  [#1] `_has_entry_hit_metadata()`와 `_should_send_trailing_mode_message()` helper를 실제 파일에 포함시켜, `track_signal_results()`에서 발생하던 NameError를 제거.
-  [#2] `[목표가 도달 → 트레일링 모드]` 발송 전에 실제로 복구 가능한 도달가/도달시각이 있는지 검사하고, 없으면 메시지를 억제하도록 보강.
-  [#3] 시작 안내 문구의 `v38.3` 하드코딩 제거는 유지하여, 텔레그램 시작 메시지에 더 이상 과거 버전이 보이지 않도록 정리.
-  이유: v41.9 반영 중 helper 누락으로 런타임 오류가 발생했고, 동시에 도달정보 없는 가상/중복 레코드의 트레일링 메시지까지 같이 막을 필요가 있었기 때문.
-  개선점: NameError 제거, 도달정보 없는 트레일링 메시지 감소, 시작 버전 표기 일관성 유지.
-  영향: 실제 진입가 도달 메타를 복구할 수 있는 레코드에서만 트레일링 모드 메시지가 발송된다.
-- v41.9 (2026-03-11): 시작 안내 문구의 하드코딩 버전 표시(v38.3) 제거.
-  [#1] 텔레그램 시작 메시지의 `🔒 스레드 안전성 활성 (v38.3)` 문구를 버전 없는 `🔒 스레드 안전성 활성`으로 변경.
-  이유: 실제 실행 버전과 무관한 과거 도입 버전 문구가 남아 사용자 혼선을 유발하기 때문.
-  개선점: 시작 안내 문구와 실제 버전 표기 일관성↑.
-  영향: 텔레그램 시작 메시지에서 더 이상 `v38.3`가 표시되지 않음.
+- v41.14 (2026-03-11): v41.8 기준 재빌드 — 트레일링 오발송 억제 + 시작 메시지 버전 문구 정리 + 포착 날짜 표시 추가.
+  [#1] [목표가 도달 → 트레일링 모드]는 실제 진입가 도달 메타(도달가/도달시각)를 복구할 수 있는 레코드에서만 발송하도록 제한.
+  [#2] 시작 메시지의 하드코딩 문구 `스레드 안전성 활성 (v38.3)`를 `스레드 안전성 활성`으로 정리.
+  [#3] 포착/확정/선진입 관련 메시지의 포착 시각은 가능한 한 `YYYY-MM-DD HH:MM[:SS]` 형식으로 표시되도록 공통 helper 적용.
+
 - v41.8 (2026-03-11): 조건 자동 조정 중복 실행/중복 알림 억제 강화.
   [#1] `auto_tune()`에 긴급 상태 락과 단계별 강화(stage 1/2/3)를 추가해, 같은 연속 손절 상태에서는 동일 긴급 튜닝을 반복 적용하지 않고 더 악화된 경우에만 추가 강화하도록 정리.
   [#2] `auto_tune_state.json`을 도입해 직전 유효 파라미터 해시와 마지막 발송 해시를 저장하고, 실제 파라미터 변화가 있을 때만 조정 이력/텔레그램 메시지를 남기도록 보강.
@@ -2823,12 +2803,11 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     stop_pct = round((stop_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
     target_pct = round((target_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
     sig_label = get_signal_label(str(watch.get("signal_type", "") or ""), watch.get("signal_type", ""))
-    detect_label = _format_capture_datetime_label(watch)
     lines = [
         "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
-        f"원신호: {sig_label}  |  포착: {detect_label}  |  확정: {hit_time}",
+        f"원신호: {sig_label}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
         "━━━━━━━━━━━━━━━",
         f"⚡ 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
         f"🪨 눌림 유지 {int(metrics.get('dip_resilience_score', 0) or 0)}점",
@@ -3474,7 +3453,6 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     stop_pct = round((stop - entry) / entry * 100, 1) if entry else 0.0
     target_pct = round((target - entry) / entry * 100, 1) if entry else 0.0
     market_tag = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
-    detect_label = _format_capture_datetime_label(watch)
     reasons_block = ""
     if watch.get("reasons"):
         reasons_block = "\n" + "\n".join(f"  {r}" for r in list(watch.get("reasons") or [])[:3]) + "\n"
@@ -3482,7 +3460,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
         f"🎯 <b>[선진입가 도달!]</b>{market_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
-        f"원신호: 종가선진입  |  포착: {detect_label}  |  {watch.get('market_basis','KRX')}\n"
+        f"원신호: 종가선진입  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  {watch.get('market_basis','KRX')}\n"
         f"{reasons_block}"
         f"━━━━━━━━━━━━━━━\n"
         f"┌─────────────────────\n"
@@ -4148,7 +4126,6 @@ def send_mid_pullback_alert(s: dict):
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
     now_str     = datetime.now().strftime("%H:%M:%S")
-    detect_label = _format_capture_datetime_label(s)
     atr_tag     = " (ATR)" if s.get("atr_used") else " (고정)"
     entry  = s.get("entry_price", 0)
     stop   = s.get("stop_loss", 0)
@@ -4182,7 +4159,7 @@ def send_mid_pullback_alert(s: dict):
 
     message = (
         f"{header_line}\n"
-        f"🕐 {detect_label}  |  테마: {s.get('theme_desc','')}\n"
+        f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -8191,16 +8168,13 @@ def _build_entry_hit_line(entry: int, rec: dict | None = None, include_hit_price
     return "  |  ".join(parts)
 
 def _has_entry_hit_metadata(rec: dict | None = None) -> bool:
-    """표시 가능한 진입가 도달 메타(도달가/도달시각)가 있는지 확인."""
     try:
-        probe = dict(rec or {})
-        hit_price, hit_time = _get_entry_hit_display(probe)
+        hit_price, hit_time = _get_entry_hit_display(dict(rec or {}))
         return hit_price not in (None, '', False) and bool(str(hit_time or '').strip())
     except Exception:
         return False
 
 def _should_send_trailing_mode_message(rec: dict | None = None) -> bool:
-    """[목표가 도달 → 트레일링 모드]는 실제 진입가 도달 메타가 확인될 때만 발송."""
     return _has_entry_hit_metadata(rec)
 
 def check_entry_watch():
@@ -8344,7 +8318,7 @@ def check_entry_watch():
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(watch)}\n"
+                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}\n"
                     f"{reasons_block}"
                     f"{sector_block}"
                     f"━━━━━━━━━━━━━━━\n"
@@ -9110,8 +9084,7 @@ def send_alert(s: dict):
     }.get(s["signal_type"], "")
 
     stars    = "★" * min(int(s["score"]/20), 5)
-    now_str  = datetime.now().strftime("%H:%M:%S")
-    detect_label = _format_capture_datetime_label(s, detected_at)
+    now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     regime_line = regime_message_line()
     stop_pct = s.get("stop_pct",7.0); target_pct = s.get("target_pct",15.0)
     atr_tag  = " (ATR)" if s.get("atr_used") else " (고정)"
@@ -9202,12 +9175,12 @@ def send_alert(s: dict):
     if pattern_block:
         pattern_block = "━━━━━━━━━━━━━━━\n" + pattern_block + "\n"
 
-    _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str, detect_label,
+    _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
                        entry_block, indic_block, position_block, pattern_block, level)
 
 # ── 내부 헬퍼: 상세 모드 실제 발송 (send_alert에서 호출) ──
-def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str, detect_label,
+def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
                        entry_block, indic_block, position_block, pattern_block, level):
     header_override = str(s.get("_header_override", "") or "").strip()
@@ -9222,7 +9195,7 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str, det
 
     msg = (
         f"{header_line}\n"
-        f"🕐 {detect_label}\n"
+        f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -12173,7 +12146,7 @@ def poll_telegram_commands():
                             if details:
                                 line += "\n  " + "  |  ".join(details)
                             if detect_time:
-                                line += f"\n  ⏰ 포착시각 {detect_time}"
+                                line += f"\n  ⏰ 포착시각 {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=detect_time)}"
 
                             if hit:
                                 if code not in seen_active:
