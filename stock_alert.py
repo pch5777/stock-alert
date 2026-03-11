@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.17
+버전: v41.19
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.19 (2026-03-11): [진입가 도달!] 메시지에 포착시각과 실제 도달시각 동시 표시.
+  [#1] check_entry_watch()의 [진입가 도달!] 발송 전에 `_entry_hit_ts`를 먼저 계산하도록 순서를 조정해, 메시지 본문에 `포착`과 `도달`을 함께 표시하도록 정리.
+  [#2] 본문 헤더를 `원신호: ... | 포착: ... | 도달: ...` 형식으로 변경해, 신호 생성 후 실제 진입가 도달까지 걸린 시간을 사용자가 바로 구분할 수 있게 보강.
+  이유: 포착시각과 텔레그램 하단 전송시각 차이를 딜레이로 오해할 수 있어, 실제 진입가 도달시각을 본문에 명시할 필요가 있었기 때문.
+
+- v41.18 (2026-03-11): `[눌림목 진입 신호]` 상단 시각이 여전히 `now_str`를 써서 날짜 없이 보이던 문제 수정.
+  [#1] send_mid_pullback_alert() 메시지 헤더의 `🕐` 라인을 `now_str` 대신 `_format_capture_datetime_label()` 결과(`capture_label`)를 사용하도록 교체.
+  이유: 실제 포착 기준시각을 날짜+시간으로 보여주려는 변경이 있었지만, 눌림목 진입 신호 경로만 구형 변수(`now_str`)를 그대로 사용해 날짜가 누락되고 있었기 때문.
+  개선점: `[눌림목 진입 신호]`에서도 포착 날짜+시간 일관성 확보.
+
 - v41.17 (2026-03-11): 포착/진입 관련 메시지의 날짜+시간 표시 누락 정리.
   [#1] `[눌림목 진입 신호]`와 일반 포착 상세 메시지 상단의 `now_str` 표기를 `_format_capture_datetime_label()` 기반으로 교체해 날짜+시간이 함께 보이도록 수정.
   [#2] `register_entry_watch()`가 `detect_date`도 함께 저장하도록 보강해 `[진입가 도달!]` 메시지에서도 포착 날짜가 빠지지 않게 정리.
@@ -4319,7 +4329,7 @@ def send_mid_pullback_alert(s: dict):
 
     message = (
         f"{header_line}\n"
-        f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
+        f"🕐 {capture_label}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
         f"{pattern_summary_top + chr(10) if pattern_summary_top else ''}"
@@ -8487,11 +8497,12 @@ def check_entry_watch():
                 except Exception:
                     sector_block = ""
 
+                _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}\n"
+                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n"
                     f"{reasons_block}"
                     f"{sector_block}"
                     f"━━━━━━━━━━━━━━━\n"
@@ -8504,7 +8515,6 @@ def check_entry_watch():
                     f"└─────────────────────",
                     watch["code"], watch["name"]
                 )
-                _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 watch['entry_hit'] = True
                 watch['entry_hit_time'] = _entry_hit_ts
                 watch['entry_hit_price'] = price
