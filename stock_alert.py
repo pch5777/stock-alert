@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.10
+버전: v41.11
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.11 (2026-03-11): 포착형 메시지에 날짜+시간 표시 추가.
+  [#1] `_format_capture_datetime_label()` helper를 추가해 `detected_at`, `detect_date`, `detect_time`를 공통 포맷으로 정리.
+  [#2] 일반 포착 메시지(`send_alert`), 눌림목 포착 메시지(`send_mid_pullback_alert`), 진입가 도달, 체결속도 확인 후 진입 확정, 종가 선진입 도달 메시지에서 포착 시각을 `YYYY-MM-DD HH:MM:SS` 또는 `YYYY-MM-DD HH:MM` 형식으로 표시하도록 수정.
+  이유: 텔레그램에서 나중에 다시 확인할 때 당일 시각만 보이면 날짜 구분이 어려워 사용자가 불편하기 때문.
+  개선점: 과거 메시지 재확인성↑, 날짜 혼동 감소, 포착 이력 식별 속도↑.
+  주의점: 아주 오래된 레코드 중 `detect_date`가 비어 있는 경우에는 현재 날짜를 보조로 붙일 수 있다.
+  영향: 포착형 메시지의 `🕐` 또는 `포착:` 표기가 날짜 포함 형식으로 바뀐다.
 - v41.10 (2026-03-11): 트레일링 모드 helper 누락 보정 + 도달정보 없는 트레일링 메시지 억제.
   [#1] `_has_entry_hit_metadata()`와 `_should_send_trailing_mode_message()` helper를 실제 파일에 포함시켜, `track_signal_results()`에서 발생하던 NameError를 제거.
   [#2] `[목표가 도달 → 트레일링 모드]` 발송 전에 실제로 복구 가능한 도달가/도달시각이 있는지 검사하고, 없으면 메시지를 억제하도록 보강.
@@ -2810,11 +2817,12 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     stop_pct = round((stop_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
     target_pct = round((target_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
     sig_label = get_signal_label(str(watch.get("signal_type", "") or ""), watch.get("signal_type", ""))
+    detect_label = _format_capture_datetime_label(watch)
     lines = [
         "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
-        f"원신호: {sig_label}  |  포착: {watch.get('detect_time','')}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
+        f"원신호: {sig_label}  |  포착: {detect_label}  |  확정: {hit_time}",
         "━━━━━━━━━━━━━━━",
         f"⚡ 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
         f"🪨 눌림 유지 {int(metrics.get('dip_resilience_score', 0) or 0)}점",
@@ -3460,6 +3468,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     stop_pct = round((stop - entry) / entry * 100, 1) if entry else 0.0
     target_pct = round((target - entry) / entry * 100, 1) if entry else 0.0
     market_tag = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
+    detect_label = _format_capture_datetime_label(watch)
     reasons_block = ""
     if watch.get("reasons"):
         reasons_block = "\n" + "\n".join(f"  {r}" for r in list(watch.get("reasons") or [])[:3]) + "\n"
@@ -3467,7 +3476,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
         f"🎯 <b>[선진입가 도달!]</b>{market_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
-        f"원신호: 종가선진입  |  포착: {watch.get('detect_time','')}  |  {watch.get('market_basis','KRX')}\n"
+        f"원신호: 종가선진입  |  포착: {detect_label}  |  {watch.get('market_basis','KRX')}\n"
         f"{reasons_block}"
         f"━━━━━━━━━━━━━━━\n"
         f"┌─────────────────────\n"
@@ -4133,6 +4142,7 @@ def send_mid_pullback_alert(s: dict):
     grade_emoji = {"A":"🏆","B":"🥈","C":"🥉"}.get(s["grade"],"📊")
     grade_text  = {"A":"A등급 (최우선)","B":"B등급 (우선)","C":"C등급 (참고)"}.get(s["grade"],"")
     now_str     = datetime.now().strftime("%H:%M:%S")
+    detect_label = _format_capture_datetime_label(s)
     atr_tag     = " (ATR)" if s.get("atr_used") else " (고정)"
     entry  = s.get("entry_price", 0)
     stop   = s.get("stop_loss", 0)
@@ -4166,7 +4176,7 @@ def send_mid_pullback_alert(s: dict):
 
     message = (
         f"{header_line}\n"
-        f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
+        f"🕐 {detect_label}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -8328,7 +8338,7 @@ def check_entry_watch():
                     f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                    f"원신호: {sig}  |  포착: {watch['detect_time']}\n"
+                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(watch)}\n"
                     f"{reasons_block}"
                     f"{sector_block}"
                     f"━━━━━━━━━━━━━━━\n"
@@ -9095,6 +9105,7 @@ def send_alert(s: dict):
 
     stars    = "★" * min(int(s["score"]/20), 5)
     now_str  = datetime.now().strftime("%H:%M:%S")
+    detect_label = _format_capture_datetime_label(s, detected_at)
     regime_line = regime_message_line()
     stop_pct = s.get("stop_pct",7.0); target_pct = s.get("target_pct",15.0)
     atr_tag  = " (ATR)" if s.get("atr_used") else " (고정)"
@@ -9185,12 +9196,12 @@ def send_alert(s: dict):
     if pattern_block:
         pattern_block = "━━━━━━━━━━━━━━━\n" + pattern_block + "\n"
 
-    _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
+    _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str, detect_label,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
                        entry_block, indic_block, position_block, pattern_block, level)
 
 # ── 내부 헬퍼: 상세 모드 실제 발송 (send_alert에서 호출) ──
-def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
+def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str, detect_label,
                        stop_pct, target_pct, atr_tag, strict_warn, prev_tag,
                        entry_block, indic_block, position_block, pattern_block, level):
     header_override = str(s.get("_header_override", "") or "").strip()
@@ -9205,7 +9216,7 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
 
     msg = (
         f"{header_line}\n"
-        f"🕐 {now_str}\n"
+        f"🕐 {detect_label}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
