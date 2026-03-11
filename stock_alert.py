@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.24
+버전: v41.25
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.25 (2026-03-11): 장마감 전 갭투자 신호(KRX 14:45 / NXT 19:20) 실행 로그 및 catch-up 보강.
+  [#1] `send_next_open_gap_alert()`에 stage별 시작/시장닫힘/후보0건/발송완료 로그를 추가해, 함수가 안 돈 건지 후보가 0건인지 로그만으로 구분 가능하게 정리.
+  [#2] `preclose_gap_run_state.json`을 추가해 같은 날짜·같은 stage(KRX/NXT)의 선진입 후보 알림을 1회만 처리하고, 재시작 후 catch-up이나 중복 스케줄로 같은 알림이 다시 나가는 것을 방지.
+  [#3] 시작 시 14:45~15:05(KRX), 19:20~19:35(NXT) 구간이면 놓친 장마감 전 선진입 후보 알림을 1회 보완 발송하는 catch-up helper를 추가.
+  [#4] `build_next_open_gap_candidates()` payload에 pool_count / candidate_count 메타를 함께 담아 실행 로그에서 후보 풀 크기와 최종 건수를 바로 확인할 수 있게 보강.
+  이유: 최신 로그에서 19:20 NXT 장마감 전 선진입 후보 알림이 실제로 실행됐는지 구분이 안 되었고, 14:45 KRX도 같은 문제를 가질 수 있어 실행/후보0건/발송완료를 명확히 남기고 재시작 시 놓친 스케줄도 보완할 필요가 있기 때문.
+  개선점: KRX/NXT 선진입 후보 알림 가시성↑, 재시작 시 누락 복구력↑, 후보0건 원인 파악 용이성↑, 중복 발송 억제↑.
+  주의점: catch-up은 정해진 보완 시간창에서만 동작하며, 이미 같은 stage가 처리된 날이면 재발송하지 않는다.
+  영향: 14:45/19:20 관련 로그가 상세해지고, 재시작 직후 해당 시간창이면 선진입 후보 알림이 1회 보완 발송될 수 있다.
 - v41.24 (2026-03-11): 진입가 감시의 시장 선택(KRX/NXT/VI 예외)과 상태 기록 구조 정교화.
   [#1] check_entry_watch()를 종목별 시장 선택 구조로 재정리해, KRX 정상 거래 중이면 KRX만 사용하고 KRX 종료 후 NXT 거래 가능 종목에만 NXT 가격을 사용하도록 보강.
   [#2] KRX 장중 VI/거래정지 의심 + NXT 거래 가능 종목은 NXT 가격을 참고하되 즉시 [진입가 도달!]을 보내지 않고 `NXT참고도달`로 내부 기록 후 KRX 재확인을 기다리도록 추가.
@@ -2572,6 +2581,7 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
 OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
+PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
 NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "10") or "10")
 NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "55") or "55")
@@ -3456,7 +3466,8 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
         pass
 
     candidates = []
-    for code in _collect_next_open_gap_candidate_codes(max_codes=NEXT_OPEN_GAP_POOL_MAX):
+    pool_codes = list(_collect_next_open_gap_candidate_codes(max_codes=NEXT_OPEN_GAP_POOL_MAX) or [])
+    for code in pool_codes:
         code = normalize_stock_code(code)
         if not code or code in active_preclose_codes:
             continue
@@ -3771,19 +3782,84 @@ def update_preclose_gap_open_outcomes() -> None:
         print(f"⚠️ preclose gap open outcome 기록 오류: {e}")
 
 
+def _get_preclose_gap_run_state() -> dict:
+    try:
+        st = _read_json_safe(PRECLOSE_GAP_RUN_STATE_FILE, {})
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+def _save_preclose_gap_run_state(state: dict):
+    try:
+        _write_json_atomic(PRECLOSE_GAP_RUN_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
+    except Exception as e:
+        print(f"⚠️ preclose_gap_run_state 저장 오류: {e}")
+
+def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0):
+    st = _get_preclose_gap_run_state()
+    today = datetime.now().strftime("%Y%m%d")
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    st_key = f"{today}_{stage}"
+    st[st_key] = {
+        "date": today,
+        "stage": stage,
+        "status": str(status or ""),
+        "candidate_count": int(candidate_count or 0),
+        "ts": time.time(),
+        "time": datetime.now().strftime("%H:%M:%S"),
+    }
+    _save_preclose_gap_run_state(st)
+
+def _was_preclose_gap_run(stage: str) -> bool:
+    st = _get_preclose_gap_run_state()
+    today = datetime.now().strftime("%Y%m%d")
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    return f"{today}_{stage}" in st
+
+def _maybe_run_preclose_gap_alert_catchup():
+    if is_holiday() or not _try_acquire_leader_lock():
+        return
+    now_t = datetime.now().time()
+    try:
+        if dtime(14, 45) <= now_t <= dtime(15, 5):
+            print("🕒 KRX 선진입 후보 catch-up 점검")
+            send_next_open_gap_alert(stage="krx")
+    except Exception as e:
+        print(f"⚠️ KRX 선진입 후보 catch-up 실패: {e}")
+    try:
+        if dtime(19, 20) <= now_t <= dtime(19, 35):
+            print("🕒 NXT 선진입 후보 catch-up 점검")
+            send_next_open_gap_alert(stage="nxt")
+    except Exception as e:
+        print(f"⚠️ NXT 선진입 후보 catch-up 실패: {e}")
+
 def send_next_open_gap_alert(stage: str = "krx"):
     """장마감 전에 익영업일 갭상승 선진입 후보를 보수적으로 발송."""
     if is_holiday():
+        print("⏸ 선진입 후보 스캔 생략 — 공휴일")
         return
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
-    if stage == "krx" and not is_market_open():
-        return
-    if stage == "nxt" and not is_nxt_open():
+    stage_tag = "NXT 19:20" if stage == "nxt" else "KRX 14:45"
+
+    if _was_preclose_gap_run(stage):
+        print(f"⏭️ [{stage_tag}] 선진입 후보 스캔 중복 생략 — 오늘 이미 처리됨")
         return
 
+    if stage == "krx" and not is_market_open():
+        print(f"⏸ [{stage_tag}] 선진입 후보 스캔 생략 — KRX 장 미운영")
+        return
+    if stage == "nxt" and not is_nxt_open():
+        print(f"⏸ [{stage_tag}] 선진입 후보 스캔 생략 — NXT 장 미운영")
+        return
+
+    print(f"🕒 [{stage_tag}] 선진입 후보 스캔 시작")
     payload = build_next_open_gap_candidates(stage=stage, max_items=NEXT_OPEN_GAP_MAX_SHOW)
     cand = payload.get("candidates") or []
+    pool_count = int(payload.get("pool_count", 0) or 0)
+    candidate_count = int(payload.get("candidate_count", len(cand)) or len(cand))
     if not cand:
+        print(f"📭 [{stage_tag}] 후보 0건 (pool={pool_count}, candidate={candidate_count})")
+        _mark_preclose_gap_run(stage, status="zero", candidate_count=0)
         return
 
     for item in cand:
@@ -3821,7 +3897,8 @@ def send_next_open_gap_alert(stage: str = "krx"):
         msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
     msg += "⚠️ 예상 선진입가 근처에서 하락 중 체결속도 유지가 확인된 종목만 실제 진입으로 확정합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
-
+    _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand))
+    print(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
 
 def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
     """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
@@ -15586,6 +15663,8 @@ if __name__ == "__main__":
             send_preopen_watchlist()
         except Exception as e:
             print(f"⚠️ 장전 브리핑 보완 실패: {e}")
+
+    _maybe_run_preclose_gap_alert_catchup()
 
     if _try_acquire_leader_lock():
         run_scan()
