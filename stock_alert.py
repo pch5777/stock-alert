@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.15
+버전: v41.17
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.17 (2026-03-11): 포착/진입 관련 메시지의 날짜+시간 표시 누락 정리.
+  [#1] `[눌림목 진입 신호]`와 일반 포착 상세 메시지 상단의 `now_str` 표기를 `_format_capture_datetime_label()` 기반으로 교체해 날짜+시간이 함께 보이도록 수정.
+  [#2] `register_entry_watch()`가 `detect_date`도 함께 저장하도록 보강해 `[진입가 도달!]` 메시지에서도 포착 날짜가 빠지지 않게 정리.
+  [#3] `[자동 추적 결과]`의 감지시각 표시도 공통 helper를 쓰도록 통일.
+  이유: 일부 메시지는 이미 날짜 helper를 쓰고 있었지만, 눌림목 진입·진입가 도달·자동 추적 결과 등 주요 운용 메시지에 날짜가 빠져 사용자 확인성이 떨어졌기 때문.
+  개선점: 포착/진입/결과 메시지의 시각 표시 일관성↑, 날짜 누락 감소↑.
+
+- v41.16 (2026-03-11): 유사패턴 기능을 상단 노출 + 전반 활용 구조로 확장.
+  [#1] `_get_similar_pattern_stats()` / `_build_similar_pattern_detail_block()` / `_build_similar_pattern_summary_block()` / `_apply_similar_pattern_score()`를 추가해 유사패턴을 상세형·요약형·점수형으로 공통화.
+  [#2] `EARLY_DETECT`, `NEAR_UPPER`, `SURGE`, `ENTRY_POINT`, `MID_PULLBACK`, `PRECLOSE_GAP_ENTRY` 계열 신호에 유사패턴 기반 점수 보정을 반영.
+  [#3] 일반 포착 상세 메시지, 눌림목 메시지, 종가선진입 후보/도달 메시지 상단에 유사패턴 요약 또는 상세 블록을 노출하도록 정리.
+  이유: 사용자가 과거 유사패턴 블록을 신뢰도 판단에 중요하게 보고 있어, 일부 상세 알림에만 제한되던 기능을 코드 전반에서 일관되게 활용할 필요가 있기 때문.
+  개선점: 신뢰 판단 속도↑, 메시지 상단 가독성↑, 과거 성과 기반 점수화 일관성↑.
+  주의점: signal_log 샘플이 적은 종목/신호는 유사패턴 표시나 점수 보정이 생략될 수 있다.
+
 - v41.14 (2026-03-11): v41.8 기준 재빌드 — 트레일링 오발송 억제 + 시작 메시지 버전 문구 정리 + 포착 날짜 표시 추가.
   [#1] [목표가 도달 → 트레일링 모드]는 실제 진입가 도달 메타(도달가/도달시각)를 복구할 수 있는 레코드에서만 발송하도록 제한.
   [#2] 시작 메시지의 하드코딩 문구 `스레드 안전성 활성 (v38.3)`를 `스레드 안전성 활성`으로 정리.
@@ -1535,59 +1550,137 @@ def calc_indicators(code: str) -> dict:
         return {"rsi": 50, "ma": {}, "bb": {}, "filter_pass": True, "score_adj": 0, "summary": ""}
 
 # ── 유사 패턴 매칭 (signal_log 기반) ──
-def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> str:
-    """
-    v37.0 강화: signal_log.json 과거 신호 분석.
-    ① 동일 종목 전적 → ② 유사 조건 패턴 (동일 신호유형 + 상승률±3 + 거래량±3)
-    """
+def _get_similar_pattern_stats(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> dict:
+    """유사패턴 통계 공통 계산 (상세 표시 / 요약 표시 / 내부 점수화 공용)."""
     try:
         data = _load_signal_history()
         completed = _get_completed_signals(data)
         if len(completed) < 3:
-            return ""
+            return {}
 
-        lines = []
+        out = {"same_stock": {}, "similar": {}, "primary": {}}
 
-        # ── ① 동일 종목 전적 (최우선 정보) ──
         same_stock = [v for v in completed if v.get("code") == code]
         if len(same_stock) >= 2:
-            s_wins = sum(1 for v in same_stock if v["pnl_pct"] > 0)
-            s_wr   = round(s_wins / len(same_stock) * 100)
-            s_avg  = round(sum(v["pnl_pct"] for v in same_stock) / len(same_stock), 1)
-            s_best = max(same_stock, key=lambda x: x["pnl_pct"])
-            s_emoji = "🟢" if s_wr >= 60 else ("🟡" if s_wr >= 40 else "🔴")
-            s_name = same_stock[0].get("name", code)
-            lines.append(
-                f"  {s_emoji} <b>{s_name} 전적</b>: {len(same_stock)}건 승률 {s_wr}% 평균 {s_avg:+.1f}%"
-                f" (최고 {s_best['pnl_pct']:+.1f}%)"
-            )
+            s_wins = sum(1 for v in same_stock if v.get("pnl_pct", 0) > 0)
+            s_wr = round(s_wins / len(same_stock) * 100)
+            s_avg = round(sum(v.get("pnl_pct", 0) for v in same_stock) / len(same_stock), 1)
+            s_best = max(same_stock, key=lambda x: x.get("pnl_pct", 0))
+            s_worst = min(same_stock, key=lambda x: x.get("pnl_pct", 0))
+            out["same_stock"] = {
+                "label": "동일 종목",
+                "count": len(same_stock),
+                "win_rate": s_wr,
+                "avg_pnl": s_avg,
+                "best_pnl": round(float(s_best.get("pnl_pct", 0) or 0), 1),
+                "worst_pnl": round(float(s_worst.get("pnl_pct", 0) or 0), 1),
+                "name": same_stock[0].get("name", code),
+            }
 
-        # ── ② 유사 조건 패턴 (기존 로직) ──
         same_type = [v for v in completed if v.get("signal_type") == signal_type]
         if len(same_type) >= 3:
             similar = [v for v in same_type
-                       if abs(v.get("change_at_detect", 0) - change_rate) <= 3.0
-                       and abs(v.get("volume_ratio", 0) - vol_ratio) <= 3.0]
+                       if abs(float(v.get("change_at_detect", 0) or 0) - float(change_rate or 0)) <= 3.0
+                       and abs(float(v.get("volume_ratio", 0) or 0) - float(vol_ratio or 0)) <= 3.0]
+            label = "유사 조건"
             if len(similar) < 2:
                 similar = same_type
-            wins     = sum(1 for v in similar if v["pnl_pct"] > 0)
+                label = "동일 신호"
+            wins = sum(1 for v in similar if v.get("pnl_pct", 0) > 0)
             win_rate = round(wins / len(similar) * 100)
-            avg_pnl  = round(sum(v["pnl_pct"] for v in similar) / len(similar), 1)
-            best     = max(similar, key=lambda x: x["pnl_pct"])
-            worst    = min(similar, key=lambda x: x["pnl_pct"])
-            bar   = "🟢" * (win_rate // 20)
-            label = "유사 조건" if len(similar) < len(same_type) else "동일 신호"
-            lines.append(
-                f"  {bar} {label} {len(similar)}건  승률 {win_rate}%  평균 {avg_pnl:+.1f}%"
-                f"\n  최고 {best['pnl_pct']:+.1f}%  최저 {worst['pnl_pct']:+.1f}%"
-            )
+            avg_pnl = round(sum(v.get("pnl_pct", 0) for v in similar) / len(similar), 1)
+            best = max(similar, key=lambda x: x.get("pnl_pct", 0))
+            worst = min(similar, key=lambda x: x.get("pnl_pct", 0))
+            out["similar"] = {
+                "label": label,
+                "count": len(similar),
+                "win_rate": win_rate,
+                "avg_pnl": avg_pnl,
+                "best_pnl": round(float(best.get("pnl_pct", 0) or 0), 1),
+                "worst_pnl": round(float(worst.get("pnl_pct", 0) or 0), 1),
+            }
 
-        if not lines:
-            return ""
-
-        return f"🔍 <b>과거 유사 패턴</b>\n" + "\n".join(lines)
+        out["primary"] = out.get("similar") or out.get("same_stock") or {}
+        return out if out.get("primary") else {}
     except Exception:
+        return {}
+
+
+def _build_similar_pattern_summary_block(stats: dict | None, top_exposed: bool = True) -> str:
+    stats = dict(stats or {})
+    primary = stats.get("primary") or {}
+    if not primary:
         return ""
+    prefix = "📚 <b>과거 유사패턴</b>" if top_exposed else "📚 유사패턴"
+    return (
+        f"{prefix}  {primary.get('label','유사 조건')} {int(primary.get('count',0) or 0)}건"
+        f"  승률 {int(primary.get('win_rate',0) or 0)}%"
+        f"  평균 {float(primary.get('avg_pnl',0.0) or 0.0):+.1f}%"
+    )
+
+
+def _build_similar_pattern_detail_block(stats: dict | None) -> str:
+    stats = dict(stats or {})
+    if not stats:
+        return ""
+    lines = []
+    same_stock = stats.get("same_stock") or {}
+    if same_stock:
+        s_wr = int(same_stock.get("win_rate", 0) or 0)
+        s_emoji = "🟢" if s_wr >= 60 else ("🟡" if s_wr >= 40 else "🔴")
+        lines.append(
+            f"  {s_emoji} <b>{same_stock.get('name','')} 전적</b>: {int(same_stock.get('count',0) or 0)}건 "
+            f"승률 {s_wr}% 평균 {float(same_stock.get('avg_pnl',0.0) or 0.0):+.1f}%"
+            f" (최고 {float(same_stock.get('best_pnl',0.0) or 0.0):+.1f}%)"
+        )
+    similar = stats.get("similar") or {}
+    if similar:
+        wr = int(similar.get("win_rate", 0) or 0)
+        bar = "🟢" * max(1, wr // 20) if wr > 0 else ""
+        lines.append(
+            f"  {bar} {similar.get('label','유사 조건')} {int(similar.get('count',0) or 0)}건  승률 {wr}%  평균 {float(similar.get('avg_pnl',0.0) or 0.0):+.1f}%"
+            f"\n  최고 {float(similar.get('best_pnl',0.0) or 0.0):+.1f}%  최저 {float(similar.get('worst_pnl',0.0) or 0.0):+.1f}%"
+        )
+    if not lines:
+        return ""
+    return "🔍 <b>과거 유사 패턴</b>\n" + "\n".join(lines)
+
+
+def _apply_similar_pattern_score(score: int, reasons: list, code: str, signal_type: str,
+                                 change_rate: float, vol_ratio: float,
+                                 weight_mode: str = "strong") -> tuple[int, list, dict]:
+    stats = _get_similar_pattern_stats(code, signal_type, change_rate, vol_ratio)
+    primary = (stats or {}).get("primary") or {}
+    if not primary:
+        return score, reasons, {}
+
+    sample = int(primary.get("count", 0) or 0)
+    win_rate = float(primary.get("win_rate", 0) or 0)
+    avg_pnl = float(primary.get("avg_pnl", 0) or 0)
+    adj = 0
+
+    if sample >= 10 and win_rate >= 70 and avg_pnl >= 2.0:
+        adj = 6 if weight_mode == "strong" else 4 if weight_mode == "confirm" else 2
+    elif sample >= 5 and win_rate >= 60 and avg_pnl >= 0.5:
+        adj = 4 if weight_mode == "strong" else 3 if weight_mode == "confirm" else 2
+    elif sample >= 5 and (win_rate <= 35 or avg_pnl <= -1.5):
+        adj = -6 if weight_mode == "strong" else -4 if weight_mode == "confirm" else -2
+    elif sample >= 3 and (win_rate < 45 and avg_pnl < 0):
+        adj = -3 if weight_mode == "strong" else -2 if weight_mode == "confirm" else -1
+
+    if adj != 0:
+        score += adj
+        reasons.append(
+            f"📚 유사패턴 학습 보정 {adj:+d}점 "
+            f"({primary.get('label','유사 조건')} {sample}건 / 승률 {int(win_rate)}% / 평균 {avg_pnl:+.1f}%)"
+        )
+    return score, reasons, stats
+
+
+def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> str:
+    stats = _get_similar_pattern_stats(code, signal_type, change_rate, vol_ratio)
+    return _build_similar_pattern_detail_block(stats)
+
 
 # ============================================================
 # v37.0 — 📊 중앙 이력 조회 시스템 (signal_log 기반)
@@ -2373,6 +2466,10 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     if not is_bullish and not vol_recovered:
         return {}
 
+    score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
+        score, reasons, code, "MID_PULLBACK", today_chg, round(today_vol / avg_surge_vol, 1) if avg_surge_vol else 0, weight_mode="weak"
+    )
+
     if _regime_mult != 1.0:
         score = int(round(score * _regime_mult))
     if _regime.get("mode", "normal") == "crash":
@@ -2409,6 +2506,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "ma20_dev":      ma20_dev,
         "rs":            rs,
         "vol_zscore":    z,
+        "similar_pattern_stats": similar_pattern_stats,
         "entry_price":   entry,
         "stop_loss":     stop, "target_price": target,
         "stop_pct":      stop_pct, "target_pct": target_pct,
@@ -3191,6 +3289,11 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         if latest_rec.get("entry_hit"):
             score += 4; reasons.append("🎯 진입가 도달 이력 +4")
 
+    score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
+        score, reasons, code, "PRECLOSE_GAP_ENTRY", change_rate, volume_ratio, weight_mode="strong"
+    )
+    similar_pattern_summary = _build_similar_pattern_summary_block(similar_pattern_stats)
+
     gap_signal = str(us.get("gap_signal", "flat") or "flat")
     if gap_signal == "gap_up":
         score += 6; reasons.append("🌐 미국시장 갭상승 우호 +6")
@@ -3252,6 +3355,8 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         "code": code,
         "name": name,
         "score": score,
+        "similar_pattern_stats": similar_pattern_stats,
+        "similar_pattern_summary": similar_pattern_summary,
         "signal_type": PRECLOSE_GAP_SIGNAL_TYPE,
         "origin_signal_type": sig_type,
         "current_price": price,
@@ -3491,10 +3596,13 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     reasons_block = ""
     if watch.get("reasons"):
         reasons_block = "\n" + "\n".join(f"  {r}" for r in list(watch.get("reasons") or [])[:3]) + "\n"
+    pattern_summary_top = str(watch.get("similar_pattern_summary", "") or "").strip()
+    pattern_summary_block = (pattern_summary_top + "\n") if pattern_summary_top else ""
     send_with_chart_buttons(
         f"🎯 <b>[선진입가 도달!]</b>{market_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+        f"{pattern_summary_block}"
         f"원신호: 종가선진입  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  {watch.get('market_basis','KRX')}\n"
         f"{reasons_block}"
         f"━━━━━━━━━━━━━━━\n"
@@ -3651,8 +3759,11 @@ def send_next_open_gap_alert(stage: str = "krx"):
         f"🕒 {payload.get('stage_label','')}  ·  {payload.get('market_basis','KRX')} 기준\n"
     )
     for idx, item in enumerate(cand, 1):
+        sim_summary = str(item.get("similar_pattern_summary", "") or "").strip()
+        msg += f"\n{idx}) <b>{item.get('name','')}</b>  {item.get('code','')}  <b>{item.get('score',0)}점</b>\n"
+        if sim_summary:
+            msg += f"  {sim_summary}\n"
         msg += (
-            f"\n{idx}) <b>{item.get('name','')}</b>  {item.get('code','')}  <b>{item.get('score',0)}점</b>\n"
             f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
             f"  🎯 오늘 선진입가 {int(item.get('entry_price',0) or 0):,}원  (현재 대비 {float(item.get('entry_away_pct',0.0) or 0.0):.1f}%)\n"
             f"  🛡 손절가 {int(item.get('stop_loss',0) or 0):,}원  ({float(item.get('stop_pct',0.0) or 0.0):+.1f}%)\n"
@@ -4068,6 +4179,9 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     if rs >= RS_MIN: score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
     if ma20_dev > 0: score+=5; reasons.append(f"📐 20일선 돌파 (+{ma20_dev:.1f}%)")
 
+    score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
+        score, reasons, code, "MID_PULLBACK", today_chg, vol_ratio, weight_mode="weak"
+    )
     if score < 45:
         return {}
 
@@ -4084,6 +4198,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         "current_pullback": round((surge_peak_price-today_price)/surge_peak_price*100,1),
         "vol_dried": vol_dried, "vol_recovered": True, "is_bullish": True,
         "ma20_dev": ma20_dev, "rs": rs, "vol_zscore": z,
+        "similar_pattern_stats": similar_pattern_stats,
         "entry_price": entry, "stop_loss": stop, "target_price": target,
         "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
         "reasons": reasons, "detected_at": datetime.now(),
@@ -4191,12 +4306,23 @@ def send_mid_pullback_alert(s: dict):
     header_override = str(s.get("_header_override", "") or "").strip()
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
+    capture_label = _format_capture_datetime_label(
+        detected_at=s.get("detected_at"),
+        detect_date=s.get("detect_date", ""),
+        detect_time=s.get("detect_time", "")
+    ) or _format_capture_datetime_label(detected_at=datetime.now())
+
+    pattern_stats = s.get("similar_pattern_stats") or _get_similar_pattern_stats(
+        s["code"], s.get("signal_type", "MID_PULLBACK"), s.get("change_rate", 0), s.get("volume_ratio", 0)
+    )
+    pattern_summary_top = _build_similar_pattern_summary_block(pattern_stats)
 
     message = (
         f"{header_line}\n"
         f"🕐 {now_str}  |  테마: {s.get('theme_desc','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
+        f"{pattern_summary_top + chr(10) if pattern_summary_top else ''}"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>패턴 요약</b>\n"
         f"  1차 급등: <b>+{s['surge_pct']:.0f}%</b>\n"
@@ -6685,7 +6811,7 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
         f"━━━━━━━━━━━━━━━\n"
         f"{pnl_emoji} <b>{name}</b>  <code>{code}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"신호: {sig_label}  |  감지: {rec.get('detect_date','')} {rec.get('detect_time','')}\n"
+        f"신호: {sig_label}  |  감지: {_format_capture_datetime_label(detect_date=rec.get('detect_date',''), detect_time=rec.get('detect_time',''))}\n"
         f"{theme_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{entry_hit_line}\n"
@@ -7987,14 +8113,25 @@ def register_entry_watch(s: dict):
             print(f"⚠️ 진입가변경 기록 오류: {e}")
         del _entry_watch[k]
 
-    log_key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M')}"
+    now_dt = datetime.now()
+    log_key = f"{code}_{now_dt.strftime('%Y%m%d%H%M')}"
     signal_log_key = ""
+    detect_date = str(s.get("detect_date") or "").strip()
+    detect_time = str(s.get("detect_time") or "").strip()
     try:
         _detected_at = s.get("detected_at")
         if isinstance(_detected_at, datetime):
             signal_log_key = f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+            if not detect_date:
+                detect_date = _detected_at.strftime('%Y%m%d')
+            if not detect_time:
+                detect_time = _detected_at.strftime('%H:%M:%S')
     except Exception:
         signal_log_key = ""
+    if not detect_date:
+        detect_date = now_dt.strftime('%Y%m%d')
+    if not detect_time:
+        detect_time = now_dt.strftime('%H:%M:%S')
     if not signal_log_key:
         signal_log_key = log_key
     _entry_watch[log_key] = {
@@ -8003,7 +8140,8 @@ def register_entry_watch(s: dict):
         "target_price": s.get("target_price", 0),
         "signal_type":  s.get("signal_type", ""),
         "signal_log_key": signal_log_key,
-        "detect_time":  datetime.now().strftime("%H:%M"),
+        "detect_date":  detect_date,
+        "detect_time":  detect_time,
         "last_notified_ts": 0,
         "notify_count": 0,
         "miss_count":   len(old_keys),        # 이 종목 누적 재포착 횟수
@@ -9203,10 +9341,10 @@ def send_alert(s: dict):
     else:
         position_block = ""
 
-    pattern_block = find_similar_patterns(
-        s["code"], s["signal_type"],
-        s.get("change_rate", 0), s.get("volume_ratio", 0)
+    pattern_stats = s.get("similar_pattern_stats") or _get_similar_pattern_stats(
+        s["code"], s["signal_type"], s.get("change_rate", 0), s.get("volume_ratio", 0)
     )
+    pattern_block = _build_similar_pattern_detail_block(pattern_stats)
     if pattern_block:
         pattern_block = "━━━━━━━━━━━━━━━\n" + pattern_block + "\n"
 
@@ -9228,12 +9366,14 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
     sector_block = _sector_block(s)
     news_block = _build_news_summary_block(s, allow_fetch=True)
 
+    top_pattern_block = pattern_block if pattern_block else ""
     msg = (
         f"{header_line}\n"
         f"🕐 {now_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
+        f"{top_pattern_block}"
         f"{strict_warn}"
         f"💰 현재가: <b>{s['price']:,}원</b>  (<b>{s['change_rate']:+.1f}%</b>)\n"
         f"📊 거래량: <b>{s['volume_ratio']:.1f}배</b> (5일 평균 대비)\n"
@@ -9250,7 +9390,7 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
         msg += news_block
     if warn_block:
         msg += warn_block
-    msg += indic_block + position_block + pattern_block
+    msg += indic_block + position_block
     send_by_level(msg.rstrip(), level, s["code"], s["name"])
 
 
@@ -9381,6 +9521,10 @@ def analyze(stock: dict) -> dict:
                 reasons.append(f"⚠️ 외국인({f_net:+,}) 기관({i_net:+,}) 동시 매도")
         except Exception as _e:
             _log_error(f"analyze_investor({stock.get('code', '')})", _e); inv = {}; f_net = 0; i_net = 0
+
+    score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
+        score, reasons, code, signal_type, change_rate, vol_ratio, weight_mode="strong"
+    )
 
     if _regime_mult != 1.0:
         score = int(round(score * _regime_mult))
@@ -9745,6 +9889,7 @@ def analyze(stock: dict) -> dict:
             "grade": grade,
             "news_analysis": news_analysis,
             "news_articles": news_articles,
+            "similar_pattern_stats": similar_pattern_stats,
             "dart_risk": _dart_r["is_risk"]}
 
 # ============================================================
@@ -9812,9 +9957,13 @@ def check_early_detection() -> list:
             if nr: reasons.append(nr)
         except Exception: pass
 
+        early_score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
+            early_score, reasons, code, "EARLY_DETECT", change_rate, vol_ratio, weight_mode="strong"
+        )
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
                         "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
+                        "similar_pattern_stats":similar_pattern_stats,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":prev_upper,"reasons":reasons,"detected_at":now})
@@ -9850,10 +9999,14 @@ def check_early_detection() -> list:
             if time.time() - _alert_history.get(pre_key, 0) < 3600: continue
             _alert_history[pre_key] = time.time()
 
+            pre_score, pre_reasons, pre_similar_pattern_stats = _apply_similar_pattern_score(
+                pre_score, pre_reasons, code, "EARLY_DETECT", cr, vr, weight_mode="strong"
+            )
             signals.append({"code":code,"name":stock.get("name",code),"price":price,
                             "change_rate":cr,"volume_ratio":vr,
                             "signal_type":"EARLY_DETECT","score":pre_score,
                             "sector_info":{},"market":"NXT",
+                            "similar_pattern_stats":pre_similar_pattern_stats,
                             "entry_price":entry,"stop_loss":stop,"target_price":target,
                             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                             "prev_upper":False,"reasons":pre_reasons,
@@ -9881,15 +10034,21 @@ def check_pullback_signals() -> list:
                 entry = price
                 stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
                 carry_text = f" (이월 {carry}일차)" if carry>0 else ""
+                entry_score = 95
+                entry_reasons = [f"🎯 눌림목{carry_text}",
+                                            f"📌 고점 {high:,}원 → 현재 {price:,}원 (-{pullback:.1f}%)",
+                                            f"⏱ 급등 후 {minutes_since(detected_at)}분 경과"]
+                entry_score, entry_reasons, similar_pattern_stats = _apply_similar_pattern_score(
+                    entry_score, entry_reasons, code, "ENTRY_POINT", cur.get("change_rate",0), 0, weight_mode="confirm"
+                )
                 signals.append({"code":code,"name":cur.get("name",code),"price":price,
                                  "change_rate":cur.get("change_rate",0),"volume_ratio":0,
-                                 "signal_type":"ENTRY_POINT","score":95,
+                                 "signal_type":"ENTRY_POINT","score":entry_score,
+                                 "similar_pattern_stats":similar_pattern_stats,
                                  "entry_price":entry,"stop_loss":stop,"target_price":target,
                                  "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                                  "prev_upper":False,
-                                 "reasons":[f"🎯 눌림목{carry_text}",
-                                            f"📌 고점 {high:,}원 → 현재 {price:,}원 (-{pullback:.1f}%)",
-                                            f"⏱ 급등 후 {minutes_since(detected_at)}분 경과"],
+                                 "reasons":entry_reasons,
                                  "detected_at":detected_at})
                 _pullback_history[code] = time.time()
         except Exception: continue
