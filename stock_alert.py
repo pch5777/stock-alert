@@ -3,11 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.34
+버전: v41.35
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.35 (2026-03-12): [눌림목 진입 신호] 발송 전 실진입 가능성 필터 추가.
+  [#1] run_mid_pullback_scan()에서 send_mid_pullback_alert() 호출 전에 _get_live_quote_for_signal() + _detect_entry_block_reason()를 사용해 상한가 고정/매도호가 부재 등 진입불가 상태를 먼저 판별하도록 보강.
+  [#2] 진입불가 상태면 사용자용 [눌림목 진입 신호]는 억제하고, suppressed log만 남기되 save_signal_log()/register_entry_watch() 흐름은 유지해 상한가 해제 후 후속 감시는 가능하도록 정리.
+  이유: 패턴은 성립했지만 실진입이 불가능한 상태에서 [눌림목 진입 신호]가 먼저 발송돼 사용자에게 즉시 진입 가능한 신호처럼 보이던 문제를 막기 위함.
+  개선점: 상한가 잠김/매도호가 부재 종목의 오발송 감소, 사용자 메시지 실전성↑, 후속 해제 시 감시 유지.
+
 - v41.34 (2026-03-12): `_load_dynamic_params()`의 남아 있던 강제 완화 호출 제거.
   [#1] `dynamic_params.json`이 없을 때 FileNotFoundError 분기에서 남아 있던 `_apply_capture_relaxation()` 호출을 제거해, 새 환경/초기 실행 시 `NameError`가 발생하지 않도록 정리.
   이유: helper는 이미 제거됐는데 호출 한 줄이 남아 있어 런타임 버그가 날 수 있었기 때문.
@@ -4435,7 +4441,25 @@ def run_mid_pullback_scan():
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
             continue
         s = _apply_execution_speed_to_signal(s)
-        send_mid_pullback_alert(s)
+
+        _live = _get_live_quote_for_signal(s)
+        _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
+        _entry = safe_int(s.get("entry_price", 0), 0)
+        _blocked_reason = ""
+        if _entry and _live_price and _live_price >= _entry:
+            try:
+                _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
+            except Exception:
+                _blocked_reason = ""
+        if _blocked_reason:
+            _log_suppressed_alert(
+                s["code"], s["name"],
+                f"눌림목 진입 신호 차단 ({_blocked_reason})",
+                s.get("signal_type", ""),
+                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+            )
+        else:
+            send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
         if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
