@@ -3,11 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.32
+버전: v41.34
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.34 (2026-03-12): `_load_dynamic_params()`의 남아 있던 강제 완화 호출 제거.
+  [#1] `dynamic_params.json`이 없을 때 FileNotFoundError 분기에서 남아 있던 `_apply_capture_relaxation()` 호출을 제거해, 새 환경/초기 실행 시 `NameError`가 발생하지 않도록 정리.
+  이유: helper는 이미 제거됐는데 호출 한 줄이 남아 있어 런타임 버그가 날 수 있었기 때문.
+  개선점: 초기 실행 안정성↑, 재시작 일관성↑.
+
 - v41.32 (2026-03-12): 정상본 v41.30 기준으로 강제 포착 완화 제거를 재적용.
   [#1] `_load_dynamic_params()`에서 `_apply_capture_relaxation()` 호출을 제거해, 재시작 시 저장된 학습/자동조정 파라미터를 강제 완화하지 않도록 정리.
   [#2] `_apply_capture_relaxation()` helper 자체도 제거해, 학습 기반 동적 파라미터보다 강제 완화 기본선이 우선하지 않도록 정리.
@@ -7338,7 +7343,6 @@ def _load_dynamic_params():
               f"atr_stop={_dynamic['atr_stop_mult']})")
     except FileNotFoundError:
         print("  🔧 dynamic_params.json 없음 → 기본값 사용")
-        _apply_capture_relaxation()
         # 저장 파일이 없으면 기본값을 즉시 저장해 다음 재시작부터 복원되도록 한다
         try:
             _save_dynamic_params()
