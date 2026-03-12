@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.39
-날짜: 2026-03-11
+버전: v41.40
+날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.40 (2026-03-13): 07:30/08:30 장전 메시지의 leader/passive 의존 완화 및 날짜별 1회 보장.
+  [#1] `preopen_dispatch_state.json` 상태 파일과 `_try_mark_preopen_dispatch()`를 추가해, 워치리스트/장전 리스크 평가/장전 리스크 업데이트를 replica와 관계없이 날짜별 1회만 처리하도록 정리.
+  [#2] 07:30 워치리스트, 07:30 장전 리스크 평가, 08:30 장전 리스크 업데이트 스케줄에서 `_leader_job(...)`를 제거하고 직접 once-wrapper를 호출하도록 변경.
+  [#3] 시작 시 07:30~08:45 catch-up도 leader 여부와 무관하게 once-wrapper 기준으로 동작하도록 정리해, passive로 떠도 해당 시간대 장전 메시지가 누락되지 않게 보강.
+  이유: 예전 버전에서는 오던 07:30/08:30 장전 메시지가 최근 버전에서는 leader/passive 영향으로 누락되는 체감이 있었기 때문.
+  개선점: 장전 메시지 발송 안정성↑, replica 전환 시 누락 감소↑, 중복 발송 없이 1회 보장↑.
+
 - v41.39 (2026-03-12): 장마감 전 선진입 후보(KRX/NXT) 조건 완화.
   [#1] `_collect_next_open_gap_candidate_codes()`가 기존 detected/entry/carry/signal_log 외에 `_dynamic_candidates`와 `get_all_scan_candidates()`도 후보 풀에 보강 반영하도록 확장.
   [#2] 선진입 플랜 조건을 소폭 완화해 `PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT` 기본값을 2.4→3.8, `PRECLOSE_GAP_MIN_RR` 기본값을 1.25→1.00으로 조정.
@@ -2636,6 +2643,7 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
 OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
 PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
+PREOPEN_DISPATCH_STATE_FILE = os.path.join(DATA_DIR, "preopen_dispatch_state.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
@@ -14274,6 +14282,56 @@ def _save_premarket_risk_payload(payload: dict):
     except Exception:
         pass
 
+def _try_mark_preopen_dispatch(kind: str, now_dt: datetime | None = None) -> bool:
+    now_dt = now_dt or _now_kst()
+    day_key = now_dt.strftime("%Y-%m-%d")
+    key = f"{day_key}:{kind}"
+    try:
+        with _file_lock:
+            state = {}
+            if os.path.isfile(PREOPEN_DISPATCH_STATE_FILE):
+                try:
+                    with open(PREOPEN_DISPATCH_STATE_FILE, "r", encoding="utf-8") as f:
+                        state = json.load(f) or {}
+                except Exception:
+                    state = {}
+            if key in state:
+                return False
+            # prune old entries (keep recent 14 days)
+            cutoff = (now_dt - timedelta(days=14)).strftime("%Y-%m-%d")
+            pruned = {}
+            for k, v in state.items():
+                day = str(k).split(":", 1)[0]
+                if day >= cutoff:
+                    pruned[k] = v
+            pruned[key] = {
+                "ts": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "instance": _INSTANCE_ID,
+            }
+            _atomic_write_bytes(PREOPEN_DISPATCH_STATE_FILE, json.dumps(pruned, ensure_ascii=False, indent=2).encode("utf-8"))
+            return True
+    except Exception as e:
+        print(f"⚠️ 장전 디스패치 상태 기록 실패({kind}): {e}")
+        return True
+
+def _send_preopen_watchlist_once():
+    if not _try_mark_preopen_dispatch("watchlist_0730"):
+        print("ℹ️ 07:30 워치리스트 이미 처리됨")
+        return
+    send_preopen_watchlist()
+
+def _send_premarket_risk_assessment_once():
+    if not _try_mark_preopen_dispatch("risk_full_0730"):
+        print("ℹ️ 07:30 장전 리스크 평가 이미 처리됨")
+        return
+    send_premarket_risk_assessment()
+
+def _send_premarket_risk_update_once():
+    if not _try_mark_preopen_dispatch("risk_update_0830"):
+        print("ℹ️ 08:30 장전 리스크 업데이트 이미 처리됨")
+        return
+    send_premarket_risk_update_if_changed()
+
 def send_premarket_risk_update_if_changed():
     if is_holiday():
         return
@@ -15881,9 +15939,9 @@ if __name__ == "__main__":
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:30").do(_leader_job(send_preopen_watchlist))  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("07:30").do(_leader_job(send_premarket_risk_assessment))  # 장전 리스크 평가 full
-    schedule.every().day.at("08:30").do(_leader_job(send_premarket_risk_update_if_changed))  # 변화 있을 때만 짧은 업데이트
+    schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
+    schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes()
@@ -15937,25 +15995,25 @@ if __name__ == "__main__":
         if not is_holiday() else None
     ))
 
-    # v39.3: 시작 시 07:30 브리핑 놓침 보완 (봇이 07:30 이후 시작된 경우)
+    # v39.3: 시작 시 07:30/08:30 장전 메시지 놓침 보완 (leader/passive와 무관하게 날짜별 1회 보장)
     _now = datetime.now()
-    if not is_holiday() and _try_acquire_leader_lock():
+    if not is_holiday():
         if dtime(7, 30) <= _now.time() <= dtime(9, 0):
             try:
                 print("📋 시작 시 장전 브리핑 보완 발송")
-                send_preopen_watchlist()
+                _send_preopen_watchlist_once()
             except Exception as e:
                 print(f"⚠️ 장전 브리핑 보완 실패: {e}")
         if dtime(7, 30) <= _now.time() < dtime(8, 30):
             try:
                 print("🛡 시작 시 장전 리스크 평가 보완 발송")
-                send_premarket_risk_assessment()
+                _send_premarket_risk_assessment_once()
             except Exception as e:
                 print(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
         elif dtime(8, 30) <= _now.time() < dtime(8, 45):
             try:
                 print("🔄 시작 시 장전 리스크 업데이트 보완 발송")
-                send_premarket_risk_update_if_changed()
+                _send_premarket_risk_update_once()
             except Exception as e:
                 print(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
 
