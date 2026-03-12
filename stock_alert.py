@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.38
+버전: v41.39
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.39 (2026-03-12): 장마감 전 선진입 후보(KRX/NXT) 조건 완화.
+  [#1] `_collect_next_open_gap_candidate_codes()`가 기존 detected/entry/carry/signal_log 외에 `_dynamic_candidates`와 `get_all_scan_candidates()`도 후보 풀에 보강 반영하도록 확장.
+  [#2] 선진입 플랜 조건을 소폭 완화해 `PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT` 기본값을 2.4→3.8, `PRECLOSE_GAP_MIN_RR` 기본값을 1.25→1.00으로 조정.
+  [#3] `NEXT_OPEN_GAP_POOL_MAX` 기본값을 10→20, `NEXT_OPEN_GAP_MIN_SCORE` 기본값을 55→48로 완화하고 payload에 `pool_count/candidate_count`를 실제 값으로 저장.
+  이유: 14:45 KRX / 19:20 NXT 장마감 전 추천이 실행되더라도 `pool=0, candidate=0`으로 끝나는 빈도가 높아, 후보군 확보와 선별 조건을 함께 조금 완화할 필요가 있었기 때문.
+  개선점: KRX/NXT 선진입 후보 노출률↑, 후보 풀 다양성↑, 실행 로그 가시성↑.
+
 - v41.37 (2026-03-12): 정상본 v41.34 기준으로 v41.35/v41.36 의도 재적용.
   [#1] run_mid_pullback_scan()에서 실진입 불가(limit_up_locked/no_ask_liquidity) 판정 시 [눌림목 진입 신호]를 억제할 뿐 아니라 save_signal_log()/register_entry_watch()/등급 출력까지 중단하도록 정리.
   [#2] `_get_countertrend_surge_context()`를 추가해 장기 하락 추세 속 급등(60일 수익률, 120일 고점 대비 낙폭, 20/60일선 관계)을 판정하고, UPPER_LIMIT/NEAR_UPPER/SURGE에 추세 역행 패널티를 반영.
@@ -2632,11 +2639,11 @@ PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
-NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "10") or "10")
-NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "55") or "55")
+NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
+NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
 PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
-PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "2.4") or "2.4")
-PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.25") or "1.25")
+PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
+PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.00") or "1.00")
 PRECLOSE_GAP_OPEN_EVAL_TIME = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME", "09:05") or "09:05"
 _preclose_gap_entry_watch: dict = {}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
@@ -3227,6 +3234,25 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
 
     if len(codes) < max_codes:
         try:
+            with _state_lock:
+                for c in list((_dynamic_candidates or {}).keys()):
+                    _push(c)
+                    if len(codes) >= max_codes:
+                        break
+        except Exception:
+            pass
+
+    if len(codes) < max_codes:
+        try:
+            for c, _n, _d in get_all_scan_candidates() or []:
+                _push(c)
+                if len(codes) >= max_codes:
+                    break
+        except Exception:
+            pass
+
+    if len(codes) < max_codes:
+        try:
             base = build_next_open_watchlist(max_codes=max_codes).get("codes", [])
             for c in base:
                 _push(c)
@@ -3460,7 +3486,8 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         cautions.append(f"⏰ 진입가까지 {entry_away_pct:.1f}% 여유")
 
     score = int(round(score))
-    if score < NEXT_OPEN_GAP_MIN_SCORE:
+    min_score = NEXT_OPEN_GAP_MIN_SCORE - (2 if stage == "nxt" else 0)
+    if score < min_score:
         return None
 
     sig_type = latest_rec.get("signal_type", "") if latest_rec else ""
@@ -3551,6 +3578,8 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
         "stage_label": stage_label,
         "market_basis": "NXT" if stage == "nxt" else "KRX",
         "us_gap_signal": us.get("gap_signal", "flat"),
+        "pool_count": len(pool_codes),
+        "candidate_count": len(candidates),
         "codes": [c.get("code") for c in candidates[:max_items]],
         "candidates": candidates[:max_items],
     }
