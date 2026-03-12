@@ -3,16 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.35
+버전: v41.37
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.35 (2026-03-12): [눌림목 진입 신호] 발송 전 실진입 가능성 필터 추가.
-  [#1] run_mid_pullback_scan()에서 send_mid_pullback_alert() 호출 전에 _get_live_quote_for_signal() + _detect_entry_block_reason()를 사용해 상한가 고정/매도호가 부재 등 진입불가 상태를 먼저 판별하도록 보강.
-  [#2] 진입불가 상태면 사용자용 [눌림목 진입 신호]는 억제하고, suppressed log만 남기되 save_signal_log()/register_entry_watch() 흐름은 유지해 상한가 해제 후 후속 감시는 가능하도록 정리.
-  이유: 패턴은 성립했지만 실진입이 불가능한 상태에서 [눌림목 진입 신호]가 먼저 발송돼 사용자에게 즉시 진입 가능한 신호처럼 보이던 문제를 막기 위함.
-  개선점: 상한가 잠김/매도호가 부재 종목의 오발송 감소, 사용자 메시지 실전성↑, 후속 해제 시 감시 유지.
+- v41.37 (2026-03-12): 정상본 v41.34 기준으로 v41.35/v41.36 의도 재적용.
+  [#1] run_mid_pullback_scan()에서 실진입 불가(limit_up_locked/no_ask_liquidity) 판정 시 [눌림목 진입 신호]를 억제할 뿐 아니라 save_signal_log()/register_entry_watch()/등급 출력까지 중단하도록 정리.
+  [#2] `_get_countertrend_surge_context()`를 추가해 장기 하락 추세 속 급등(60일 수익률, 120일 고점 대비 낙폭, 20/60일선 관계)을 판정하고, UPPER_LIMIT/NEAR_UPPER/SURGE에 추세 역행 패널티를 반영.
+  [#3] 장기 하락 추세로 판정된 급등 신호는 최고 등급 A를 제한해 최대 B까지만 부여하고, 일반 포착 메시지 상단에 역추세 반등 주의 문구를 추가.
+  이유: v41.35의 차단 의도는 맞았지만 차단 후에도 저장/감시등록이 이어지는 논리 버그가 있었고, v41.36의 장기 하락 패널티도 helper 누락 없이 정상본 기준으로 다시 얹어야 했기 때문.
+  개선점: 실진입 불가 눌림목 오발송 제거, 장기 하락 급등 과대평가 감소, 메시지 해석력 향상.
+  주의점: 장기 하락 역추세 급등도 완전 차단은 아니며, 점수 감점과 등급 제한으로만 보수화한다.
 
 - v41.34 (2026-03-12): `_load_dynamic_params()`의 남아 있던 강제 완화 호출 제거.
   [#1] `dynamic_params.json`이 없을 때 FileNotFoundError 분기에서 남아 있던 `_apply_capture_relaxation()` 호출을 제거해, 새 환경/초기 실행 시 `NameError`가 발생하지 않도록 정리.
@@ -4441,7 +4443,6 @@ def run_mid_pullback_scan():
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
             continue
         s = _apply_execution_speed_to_signal(s)
-
         _live = _get_live_quote_for_signal(s)
         _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
         _entry = safe_int(s.get("entry_price", 0), 0)
@@ -4458,8 +4459,8 @@ def run_mid_pullback_scan():
                 s.get("signal_type", ""),
                 {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
             )
-        else:
-            send_mid_pullback_alert(s)
+            continue
+        send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
         if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
@@ -8006,6 +8007,45 @@ def _get_live_quote_for_signal(s: dict | None) -> dict:
     except Exception:
         return {}
 
+def _get_countertrend_surge_context(code: str) -> dict:
+    """장기 하락 추세 속 급등인지 보수적으로 판정."""
+    out = {"is_countertrend": False, "ret60": 0.0, "drawdown120": 0.0, "cond_ma": False}
+    try:
+        items = get_daily_data(code, 130) or []
+        if len(items) < 60:
+            return out
+        closes = [float((it or {}).get("close", 0) or 0) for it in items if float((it or {}).get("close", 0) or 0) > 0]
+        if len(closes) < 60:
+            return out
+        last_close = closes[-1]
+        ref60 = closes[-60]
+        ret60 = ((last_close / ref60) - 1.0) * 100.0 if ref60 > 0 else 0.0
+        last120 = items[-120:] if len(items) >= 120 else items[:]
+        highs = [float((it or {}).get("high", 0) or 0) for it in last120 if float((it or {}).get("high", 0) or 0) > 0]
+        if not highs:
+            highs = [float((it or {}).get("close", 0) or 0) for it in last120 if float((it or {}).get("close", 0) or 0) > 0]
+        high120 = max(highs) if highs else last_close
+        drawdown120 = ((last_close / high120) - 1.0) * 100.0 if high120 > 0 else 0.0
+        ma20 = sum(closes[-20:]) / min(20, len(closes))
+        ma60 = sum(closes[-60:]) / min(60, len(closes))
+        cond_ma = ma20 < ma60
+        flags = 0
+        if ret60 <= -15.0:
+            flags += 1
+        if drawdown120 <= -30.0:
+            flags += 1
+        if cond_ma:
+            flags += 1
+        out.update({
+            "is_countertrend": flags >= 2,
+            "ret60": round(ret60, 1),
+            "drawdown120": round(drawdown120, 1),
+            "cond_ma": bool(cond_ma),
+        })
+        return out
+    except Exception:
+        return out
+
 
 def _signal_age_minutes_for_retry(s: dict | None) -> int:
     if not isinstance(s, dict):
@@ -10040,6 +10080,18 @@ def analyze(stock: dict) -> dict:
         score, reasons, code, signal_type, change_rate, vol_ratio, weight_mode="strong"
     )
 
+    countertrend_ctx = {"is_countertrend": False}
+    if signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "SURGE"):
+        countertrend_ctx = _get_countertrend_surge_context(code)
+        if countertrend_ctx.get("is_countertrend"):
+            _ctr_penalty = {"UPPER_LIMIT": 8, "NEAR_UPPER": 12, "SURGE": 12}.get(signal_type, 10)
+            score -= _ctr_penalty
+            reasons.append(
+                f"⚠️ 장기 하락 추세 속 급등 — 추세 역행 -{_ctr_penalty}점 "
+                f"(60일 {countertrend_ctx.get('ret60',0):+.1f}% / 120일 고점대비 {countertrend_ctx.get('drawdown120',0):+.1f}% / "
+                f"20일선{'<' if countertrend_ctx.get('cond_ma') else '≥'}60일선)"
+            )
+
     if _regime_mult != 1.0:
         score = int(round(score * _regime_mult))
     if score < min_score: return {}
@@ -10379,6 +10431,9 @@ def analyze(stock: dict) -> dict:
     if   score >= 80: grade = "A"
     elif score >= 60: grade = "B"
     else:             grade = "C"
+    if countertrend_ctx.get("is_countertrend") and signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "SURGE") and grade == "A":
+        grade = "B"
+        reasons.append("⚠️ 장기 하락 추세 역행 급등 — 최고 등급 A 제한")
 
     # ── ② 포지션 사이징 ──
     position = calc_position_size(signal_type, score, grade)
@@ -10404,7 +10459,9 @@ def analyze(stock: dict) -> dict:
             "news_analysis": news_analysis,
             "news_articles": news_articles,
             "similar_pattern_stats": similar_pattern_stats,
-            "dart_risk": _dart_r["is_risk"]}
+            "dart_risk": _dart_r["is_risk"],
+            "countertrend_warning": bool(countertrend_ctx.get("is_countertrend")),
+            "countertrend_ctx": countertrend_ctx}
 
 # ============================================================
 # 조기 포착
