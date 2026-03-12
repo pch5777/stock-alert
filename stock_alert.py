@@ -3,11 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v40.8
+버전: v40.9
 날짜: 2026-03-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v40.9 (2026-03-12): 장전 리스크 평가를 07:30으로 앞당기고 08:30에는 변화가 있을 때만 짧은 보강 알림 발송.
+  [#1] send_premarket_risk_assessment()를 07:30 full 발송으로 이동.
+  [#2] _premarket_risk_state를 추가해 직전 snapshot hash를 저장하고, send_premarket_risk_update_if_changed()에서 08:30 변화가 있을 때만 업데이트 발송.
+  [#3] 리스크 평가 본문 생성 로직을 _build_premarket_risk_payload()로 분리해 full/update가 같은 계산을 재사용하도록 정리.
 - v40.8 (2026-03-12): NXT 후보군 보강 + 텔레그램 명령/버튼 응답 분리.
   [#1] KIS `chgrate-pcls-100` 404 등으로 KRX 랭킹 API가 비활성화되더라도, NXT 시간대에는 `get_nxt_surge_stocks()`가 유니버스 기반 NXT fallback 후보군을 생성하도록 보강.
   [#2] `refresh_dynamic_candidates()`가 NXT 운영 시간에는 NXT 급등 후보도 함께 반영하도록 확장해, NXT 시간대 동적 후보군 0건으로 굳어지는 현상을 완화.
@@ -11557,106 +11561,197 @@ def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> l
     return sorted(causes, key=lambda x: -x["score"])
 
 
+def _build_premarket_risk_payload() -> dict:
+    """장전 리스크 평가 계산 공통 payload 반환."""
+    us = get_us_market_signals()
+    total_score = 0
+    parts = []
+
+    nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+    vix = float(us.get("vix", 20) or 20)
+    us_regime = us.get("us_regime", "neutral")
+    gap_signal = us.get("gap_signal", "flat")
+
+    kospi_5d = 0.0
+    try:
+        items = get_daily_data("0001", 10)
+        closes = [i["close"] for i in items if i.get("close")]
+        if len(closes) >= 5:
+            kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+    except Exception:
+        pass
+
+    causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
+    total_score = sum(c["score"] for c in causes)
+
+    now = datetime.now()
+    if now.weekday() == 4:
+        total_score += 10
+        parts.append("📅 금요일 (주말 오버나이트 리스크)")
+
+    if total_score >= 50:
+        level = "위험"
+        level_emoji = "🔴"
+        action = "신규 진입 축소 / 기존 포지션 정리 검토"
+    elif total_score >= 25:
+        level = "경계"
+        level_emoji = "🟡"
+        action = "신규 진입 보수적 / 손절 타이트하게"
+    else:
+        level = "안전"
+        level_emoji = "🟢"
+        action = "정상 운영"
+
+    tracking_lines = []
+    try:
+        data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
+        tracking = [v for v in data.values() if v.get("status") == "추적중"]
+        if tracking and level in ("경계", "위험"):
+            for rec in tracking[:5]:
+                entry_p = rec.get("entry_price", 0)
+                _name = rec.get("name", rec.get("code", ""))
+                sig = get_signal_label(rec.get("signal_type", ""), "")
+                tracking_lines.append(f"  • {_name} (진입 {entry_p:,}원) [{sig}]")
+    except Exception:
+        pass
+
+    stats_line = ""
+    try:
+        sig_stats = get_signal_type_stats()
+        stats_line = _format_signal_type_stats_line(sig_stats) or ""
+    except Exception:
+        stats_line = ""
+
+    snapshot = {
+        "level": level,
+        "total_score": total_score,
+        "action": action,
+        "causes": [{"type": c.get("type",""), "label": c.get("label",""), "detail": c.get("detail",""), "score": int(c.get("score",0) or 0)} for c in causes[:5]],
+        "nasdaq_chg": round(nasdaq_chg, 2),
+        "vix": round(vix, 2),
+        "gap_signal": str(gap_signal),
+        "kospi_5d": round(kospi_5d, 2),
+        "stats_line": stats_line,
+        "geo_active": bool(_geo_event_state.get("active") and time.time() - float(_geo_event_state.get("ts", 0) or 0) < 14400),
+        "geo_unc": str(_geo_event_state.get("uncertainty", "low") or "low"),
+        "geo_summary": str(_geo_event_state.get("summary", "") or ""),
+    }
+    try:
+        snap_raw = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        snapshot_hash = hashlib.sha256(snap_raw.encode("utf-8")).hexdigest()
+    except Exception:
+        snapshot_hash = str(snapshot)
+
+    return {
+        "now": now,
+        "us": us,
+        "nasdaq_chg": nasdaq_chg,
+        "vix": vix,
+        "us_regime": us_regime,
+        "gap_signal": gap_signal,
+        "kospi_5d": kospi_5d,
+        "causes": causes,
+        "total_score": total_score,
+        "level": level,
+        "level_emoji": level_emoji,
+        "action": action,
+        "tracking_lines": tracking_lines,
+        "stats_line": stats_line,
+        "snapshot_hash": snapshot_hash,
+    }
+
+
 def send_premarket_risk_assessment():
-    """v40.0-#3: 매일 08:30 장 시작 전 리스크 평가 (안전/경계/위험).
+    """v40.9: 매일 07:30 장 시작 전 리스크 평가 (안전/경계/위험).
     전영업일 + 오버나이트 데이터 기반으로 오늘 리스크 수준을 사전 판단.
-    주문을 넣을 수 있도록 08:30에 발송 (장 시작 30분 전).
+    07:30에 선제 발송하고, 08:30에는 변화 있을 때만 짧게 보강한다.
     """
+    global _premarket_risk_state
     if is_holiday():
         return
     try:
-        us = get_us_market_signals()
-        total_score = 0
-        parts = []
+        payload = _build_premarket_risk_payload()
+        now = payload["now"]
+        msg = (
+            f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 오늘 리스크 등급: {payload['level_emoji']} <b>{payload['level']}</b> ({payload['total_score']}점)\n"
+            f"💡 권장: <b>{payload['action']}</b>\n"
+        )
 
-        # 미국 시장
-        nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
-        vix = float(us.get("vix", 20) or 20)
-        us_regime = us.get("us_regime", "neutral")
-        gap_signal = us.get("gap_signal", "flat")
-
-        # 코스피 5일 추세
-        kospi_5d = 0.0
-        try:
-            items = get_daily_data("0001", 10)
-            closes = [i["close"] for i in items if i.get("close")]
-            if len(closes) >= 5:
-                kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
-        except Exception:
-            pass
-
-        # v40.0-#5: 리스크 원인별 분류
-        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
-        total_score = sum(c["score"] for c in causes)
-
-        # v40.0-#6: 시간대 프로파일 (금요일이면 추가 경계)
-        now = datetime.now()
-        if now.weekday() == 4:  # 금요일
-            total_score += 10
-            parts.append("📅 금요일 (주말 오버나이트 리스크)")
-
-        # 3단계 판정
-        if total_score >= 50:
-            level = "위험"
-            level_emoji = "🔴"
-            action = "신규 진입 축소 / 기존 포지션 정리 검토"
-        elif total_score >= 25:
-            level = "경계"
-            level_emoji = "🟡"
-            action = "신규 진입 보수적 / 손절 타이트하게"
-        else:
-            level = "안전"
-            level_emoji = "🟢"
-            action = "정상 운영"
-
-        msg = (f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
-               f"━━━━━━━━━━━━━━━\n"
-               f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
-               f"💡 권장: <b>{action}</b>\n")
-
-        # 리스크 원인별 표시
+        causes = payload["causes"]
         if causes:
             msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
             for c in causes[:3]:
                 c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
                 msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
 
-        # 미국 시장 요약
-        msg += (f"\n🌐 <b>미국 시장</b>\n"
-                f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n")
+        msg += (
+            f"\n🌐 <b>미국 시장</b>\n"
+            f"  나스닥 {payload['nasdaq_chg']:+.1f}%  VIX {payload['vix']:.0f}  갭예측 {payload['gap_signal']}\n"
+        )
 
-        if kospi_5d != 0:
-            msg += f"  코스피 5일: {kospi_5d:+.1f}%\n"
+        if payload["kospi_5d"] != 0:
+            msg += f"  코스피 5일: {payload['kospi_5d']:+.1f}%\n"
 
-        # 추적 중 종목 리스크 요약
-        try:
-            data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
-            tracking = [v for v in data.values() if v.get("status") == "추적중"]
-            if tracking and level in ("경계", "위험"):
-                msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
-                for rec in tracking[:5]:
-                    entry_p = rec.get("entry_price", 0)
-                    _name = rec.get("name", rec.get("code", ""))
-                    sig = get_signal_label(rec.get("signal_type", ""), "")
-                    msg += f"  • {_name} (진입 {entry_p:,}원) [{sig}]\n"
-        except Exception:
-            pass
+        if payload["tracking_lines"]:
+            msg += f"\n⚠️ <b>추적 중 {len(payload['tracking_lines'])}건 — 진입가 도달 종목 주의</b>\n"
+            msg += "\n".join(payload["tracking_lines"]) + "\n"
 
-        # v40.0-#9: 유형별 승률 추가
-        try:
-            sig_stats = get_signal_type_stats()
-            stats_line = _format_signal_type_stats_line(sig_stats)
-            if stats_line:
-                msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
-        except Exception:
-            pass
+        if payload["stats_line"]:
+            msg += f"\n📈 <b>유형별 승률</b>\n  {payload['stats_line']}\n"
 
         msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
         send(msg)
+        _premarket_risk_state.update({
+            "last_hash": payload["snapshot_hash"],
+            "last_sent_ts": time.time(),
+            "last_level": payload["level"],
+            "last_score": payload["total_score"],
+        })
 
     except Exception as e:
         _log_error("send_premarket_risk_assessment", e)
 
+
+def send_premarket_risk_update_if_changed():
+    """08:30 리스크 변화가 있을 때만 짧은 업데이트 발송."""
+    global _premarket_risk_state
+    if is_holiday():
+        return
+    try:
+        payload = _build_premarket_risk_payload()
+        if payload["snapshot_hash"] == str(_premarket_risk_state.get("last_hash", "") or ""):
+            print("🛡 장전 리스크 업데이트: 변경 없음 — 발송 생략")
+            return
+        prev_level = str(_premarket_risk_state.get("last_level", "") or "")
+        prev_score = _premarket_risk_state.get("last_score", None)
+        diff_parts = []
+        if prev_level and prev_level != payload["level"]:
+            diff_parts.append(f"등급 {prev_level}→{payload['level']}")
+        if prev_score is not None and prev_score != payload["total_score"]:
+            diff_parts.append(f"점수 {prev_score}→{payload['total_score']}")
+        if not diff_parts:
+            diff_parts.append("세부 리스크 변화")
+        cause_txt = " / ".join([c.get("detail", "") for c in payload["causes"][:2] if c.get("detail")])
+        msg = (
+            f"🛡 <b>장전 리스크 업데이트</b>  {payload['now'].strftime('%Y-%m-%d %H:%M')}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 현재 등급: {payload['level_emoji']} <b>{payload['level']}</b> ({payload['total_score']}점)\n"
+            f"🔄 변화: {' / '.join(diff_parts)}\n"
+        )
+        if cause_txt:
+            msg += f"💡 핵심 변화: {cause_txt}\n"
+        msg += f"━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+        send(msg)
+        _premarket_risk_state.update({
+            "last_hash": payload["snapshot_hash"],
+            "last_sent_ts": time.time(),
+            "last_level": payload["level"],
+            "last_score": payload["total_score"],
+        })
+    except Exception as e:
+        _log_error("send_premarket_risk_update_if_changed", e)
 
 def send_premarket_briefing():
     """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
@@ -12163,6 +12258,7 @@ _geo_event_state: dict = {
     "last_sent_ts":   0,
     "last_sent_msg":  "",
 }
+_premarket_risk_state: dict = {"last_hash": "", "last_sent_ts": 0, "last_level": "", "last_score": None}
 
 
 # ============================================================
@@ -13214,7 +13310,8 @@ if __name__ == "__main__":
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(flush_info_alerts)  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_prune_all_caches)  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(send_preopen_watchlist)  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("08:30").do(send_premarket_risk_assessment)  # v40.0-#3: 장전 리스크 평가
+    schedule.every().day.at("07:30").do(send_premarket_risk_assessment)  # v40.9: 장전 리스크 평가 선제 발송
+    schedule.every().day.at("08:30").do(send_premarket_risk_update_if_changed)  # v40.9: 변화 있을 때만 짧은 보강
     schedule.every().day.at("08:50").do(send_premarket_briefing)
     schedule.every(10).minutes.do(lambda: update_dashboard(force=False))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
