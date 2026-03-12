@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.26
+버전: v41.28
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.28 (2026-03-12): KIS rank API 404/비정상 응답 fallback 경로 정리 및 로그 강화.
+  [#1] `get_upper_limit_stocks()`가 `chgrate-pcls-100` 호출에서 404/비정상 status/빈 output을 공통 fallback 경로로 처리하고, KRX 유니버스 fallback 후보군 개수까지 즉시 로그로 남기도록 정리.
+  [#2] `_rank_api_fallback()`에 사유·상태·fallback 건수 로그를 보강하고, disable 파일 reason을 함께 읽어 `disabled_today` 상태에서도 왜 비활성화됐는지 한 번은 바로 보이도록 개선.
+  [#3] `refresh_dynamic_candidates()` 로그에 KRX rank source가 실제 API인지 fallback인지 보조 표시를 추가해, 동적 후보군 0건 원인이 rank API 실패인지 한눈에 확인 가능하게 정리.
+  이유: `chgrate-pcls-100` 404가 날 때 NXT/KRX 후보군 약화가 체감되는데, 기존에는 단순 비활성만 남아 실행/대체/최종 건수를 즉시 구분하기 어려웠기 때문.
+  개선점: rank API 실패 원인 파악↑, fallback 사용 여부 가시성↑, 후보군 0건 디버깅 용이성↑.
+
+- v41.27 (2026-03-12): 텔레그램 반응성 개선 복구 + 장전 리스크 07:30 전환 + NXT 후보군 보강 재적용.
+  [#1] poll_telegram_commands()를 별도 daemon polling loop로 분리하고 schedule 기반 명령 polling을 제거해 /menu 및 버튼 반응 지연을 완화.
+  [#2] 장전 리스크 평가를 07:30으로 이동하고, 08:30에는 내용이 바뀐 경우에만 짧은 업데이트를 보내도록 보강.
+  [#3] _rank_from_universe()에 NXT 시장 지원을 추가하고, get_nxt_surge_stocks()/refresh_dynamic_candidates()가 NXT fallback 후보군을 반영하도록 확장.
 - v41.26 (2026-03-12): 트레일링 메시지 의미/발송조건 정리 + 눌림목 메시지 구조 복원 보강.
   [#1] `[목표가 도달 → 트레일링 모드]`를 `[목표가 도달 → 보유 유지·트레일링]`으로 정리하고, 본문에 `지금은 매도 지시가 아니라 보유 유지 구간`이라는 안내를 추가해 기다림/보유 유지 의미가 분명하게 보이도록 수정.
   [#2] 같은 종목의 다중 추적 레코드가 동시에 목표가를 넘을 때 가장 최근 대표 레코드만 트레일링 메시지를 보내도록 `_is_representative_tracking_record()`를 추가해 중복 발송을 억제.
@@ -977,6 +988,7 @@ SCAN_INTERVAL         = 20    # 60→20초 (KIS API 분당 20회 한도 내 최�
 ALERT_COOLDOWN        = 1800
 NEWS_SCAN_INTERVAL    = 45    # 120→45초 (크롤링 차단 방지 최소값)
 DART_INTERVAL         = 60    # 180→60초 (DART API 여유 있음)
+TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "2") or "2")
 MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
@@ -2588,6 +2600,7 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 # ============================================================
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
 OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
+PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
@@ -4143,7 +4156,7 @@ def _lookup_name_by_code(code: str, name_hint: str = "") -> str:
 def refresh_dynamic_candidates():
     """
     거래량 상위 50종목을 자동으로 후보군에 편입
-    → THEME_MAP에 없는 종목(아주IB투자, 국전약품 등)도 포착 가능
+    → THEME_MAP에 없는 종목도 포착 가능
     매일 장 시작 시 + 1시간마다 갱신
     """
     if not is_any_market_open():
@@ -4152,27 +4165,31 @@ def refresh_dynamic_candidates():
         return
 
     try:
-        # 거래량 급증 상위 종목
-        vol_stocks = get_volume_surge_stocks()
-        # 상한가 근접 상위 종목
-        upper_stocks = get_upper_limit_stocks()
+        krx_open = is_market_open()
+        nxt_open = is_nxt_open()
+        vol_stocks = get_volume_surge_stocks() if krx_open else []
+        upper_stocks = get_upper_limit_stocks() if krx_open else []
+        nxt_stocks = get_nxt_surge_stocks() if nxt_open else []
         candidates = {}
         excluded_cnt = 0
-        for s in vol_stocks + upper_stocks:
-            code = s.get("code")
+        for item in vol_stocks + upper_stocks + nxt_stocks:
+            code = item.get("code")
             if not code:
                 continue
-            name = _resolve_stock_name(code, s.get("name", ""))
+            name = _resolve_stock_name(code, item.get("name", ""))
             if not is_trade_candidate_name(name):
                 excluded_cnt += 1
                 continue
-            candidates[code] = name
-        for code, name in candidates.items():
+            desc = "NXT자동편입" if str(item.get("market","")) == "NXT" else "자동편입"
+            candidates[code] = {"name": name, "desc": desc}
+        for code, info in candidates.items():
             if code not in _dynamic_candidates:
-                _dynamic_candidates[code] = {"name": name, "desc": "자동편입", "added_ts": time.time()}
+                _dynamic_candidates[code] = {"name": info["name"], "desc": info["desc"], "added_ts": time.time()}
             else:
-                _dynamic_candidates[code]["name"] = name
-        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개)")
+                _dynamic_candidates[code]["name"] = info["name"]
+                _dynamic_candidates[code]["desc"] = info["desc"]
+        krx_rank_source = "fallback" if _rank_api_disabled_today() else "api"
+        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], NXT={len(nxt_stocks)})")
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
 
@@ -4516,7 +4533,7 @@ def get_stock_price(code: str) -> dict:
 # ============================================================
 UNIVERSE_FILE = os.path.join(DATA_DIR, "universe.json")
 _UNIVERSE_CACHE = {"ts": 0.0, "codes": []}
-_UNIVERSE_RANK_CACHE = {"ts": 0.0, "items": []}
+_UNIVERSE_RANK_CACHE = {"ts": 0.0, "items": [], "KRX_items": [], "NXT_items": []}
 
 UNIVERSE_MAX = int(os.getenv("UNIVERSE_MAX", "200") or "200")
 UNIVERSE_CACHE_TTL_SEC = int(os.getenv("UNIVERSE_CACHE_TTL_SEC", "3600") or "3600")
@@ -4691,15 +4708,17 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
     except Exception as e:
         _log_error("update_universe_from_performance", e)
 
-def _rank_from_universe() -> list:
+def _rank_from_universe(market: str = "KRX") -> list:
+    market = "NXT" if str(market).upper() == "NXT" else "KRX"
+    cache_key = f"{market}_items"
     now = time.time()
-    if now - _UNIVERSE_RANK_CACHE["ts"] < UNIVERSE_RANK_TTL_SEC and _UNIVERSE_RANK_CACHE["items"]:
-        return _UNIVERSE_RANK_CACHE["items"]
+    if now - _UNIVERSE_RANK_CACHE["ts"] < UNIVERSE_RANK_TTL_SEC and _UNIVERSE_RANK_CACHE.get(cache_key):
+        return _UNIVERSE_RANK_CACHE.get(cache_key, [])
 
     codes = _load_universe_codes()[:UNIVERSE_MAX]
     items = []
     for code in codes:
-        info = get_stock_price(code)
+        info = get_nxt_stock_price(code) if market == "NXT" else get_stock_price(code)
         if not info:
             continue
         if info.get("price", 0) < UNIVERSE_MIN_PRICE:
@@ -4715,13 +4734,13 @@ def _rank_from_universe() -> list:
             "price": int(info.get("price",0) or 0),
             "change_rate": float(info.get("change_rate",0) or 0),
             "volume_ratio": float(info.get("volume_ratio",0) or 0),
-            "market": "KRX",
+            "today_vol": int(info.get("today_vol",0) or 0),
+            "market": market,
         })
 
     items.sort(key=lambda x: (x.get("change_rate",0), x.get("volume_ratio",0), x.get("price",0)), reverse=True)
     items = items[:30]
 
-    # [v37.10-all5] 다양성 제한(테마/섹터 쏠림 완화)
     max_per_theme = int(os.getenv("UNIVERSE_MAX_PER_THEME", "6") or "6")
     if max_per_theme > 0:
         bucket = {}
@@ -4739,7 +4758,9 @@ def _rank_from_universe() -> list:
         items = diversified[:30]
 
     _UNIVERSE_RANK_CACHE["ts"] = now
-    _UNIVERSE_RANK_CACHE["items"] = items
+    _UNIVERSE_RANK_CACHE[cache_key] = items
+    if market == "KRX":
+        _UNIVERSE_RANK_CACHE["items"] = items
     return items
 
 
@@ -4790,21 +4811,45 @@ def _disable_rank_api_for_today(reason: str) -> None:
     except Exception:
         pass
 
-def _rank_api_fallback(reason: str) -> list:
+def _get_rank_api_disable_reason() -> str:
+    try:
+        if not os.path.exists(_RANK_API_DISABLE_FILE):
+            return ""
+        with open(_RANK_API_DISABLE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if str(obj.get("disabled_date", "")) != _now_kst().date().isoformat():
+            return ""
+        return str(obj.get("reason", "") or "")
+    except Exception:
+        return ""
+
+def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: str = "KRX") -> list:
     """Fallback to universe ranking and (optionally) disable rank API for the rest of the day."""
     global _rank_api_disable_notified
-    # Mark disabled for today unless this is already the disabled_today path
     if reason != "disabled_today":
         _disable_rank_api_for_today(str(reason))
+    elif not reason:
+        reason = _get_rank_api_disable_reason() or "disabled_today"
+
+    items = _rank_from_universe(market)
     if not _rank_api_disable_notified:
-        print(f"⚠️ [KIS] chgrate-pcls-100 비활성(오늘) → 유니버스 후보군 사용 ({reason})")
+        msg = f"⚠️ [KIS] chgrate-pcls-100 비활성/대체 → {market} 유니버스 후보군 사용 ({reason})"
+        if status not in (None, ""):
+            msg += f" status={status}"
+        if ct not in (None, ""):
+            msg += f" ct={ct}"
+        if body not in (None, ""):
+            body_snip = str(body)[:120].replace("\n", " ")
+            msg += f" body={body_snip}"
+        print(msg)
         _rank_api_disable_notified = True
-    return _rank_from_universe()
+    print(f"  ↪ rank fallback[{market}] {len(items)}건")
+    return items
 
 
 def get_upper_limit_stocks() -> list:
     if _rank_api_disabled_today():
-        return _rank_api_fallback('disabled_today')
+        return _rank_api_fallback(_get_rank_api_disable_reason() or 'disabled_today', market='KRX')
 
     url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
     params = {
@@ -4818,8 +4863,11 @@ def get_upper_limit_stocks() -> list:
     data, status, ct, body = _safe_get_meta(url, "FHPST01700000", params)
 
     if status == 404:
-        _disable_rank_api_for_today("404")
-        return _rank_api_fallback("404")
+        return _rank_api_fallback("404", status=status, ct=ct, body=body, market="KRX")
+    if status not in (None, 200):
+        return _rank_api_fallback(f"status_{status}", status=status, ct=ct, body=body, market="KRX")
+    if not isinstance(data, dict):
+        return _rank_api_fallback("invalid_response", status=status, ct=ct, body=body, market="KRX")
 
     items = [{
         "code": i.get("mksc_shrn_iscd",""), "name": i.get("hts_kor_isnm",""),
@@ -4828,9 +4876,10 @@ def get_upper_limit_stocks() -> list:
     } for i in (data.get("output", []) if isinstance(data, dict) else [])]
 
     if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
-        print(f"⚠️ [KIS] 랭킹 응답 비어있음(status={status}, ct={ct}) → 유니버스 후보군으로 대체")
-        return _rank_from_universe()
+        print(f"⚠️ [KIS] 랭킹 응답 비어있음(status={status}, ct={ct}) → KRX 유니버스 후보군으로 대체")
+        return _rank_api_fallback("empty_output", status=status, ct=ct, body=body, market="KRX")
 
+    print(f"  ✅ [KIS] chgrate-pcls-100 응답 {len(items)}건 (status={status}, ct={ct or '-'})")
     return items
 
 def get_volume_surge_stocks() -> list:
@@ -4868,12 +4917,17 @@ def get_nxt_surge_stocks() -> list:
             "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"",
             "FID_VOL_CNT":"20","FID_INPUT_DATE_1":"",
         })
-        return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
-                 "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-                 "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"NXT"}
-                for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+        items = [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
+                  "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
+                  "volume_ratio":float(i.get("vol_inrt",0) or 0), "today_vol": int(i.get("acml_vol",0) or 0), "market":"NXT"}
+                 for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+        if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
+            print("⚠️ [NXT] volume-rank 응답 비어있음 → NXT 유니버스 후보군으로 대체")
+            return _rank_from_universe("NXT")
+        return items
     except Exception as e:
-        print(f"⚠️ NXT 조회 오류: {e}"); return []
+        print(f"⚠️ NXT 조회 오류: {e}")
+        return _rank_from_universe("NXT") if os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1" else []
 
 def get_nxt_stock_price(code: str) -> dict:
     """NXT 개별 종목 현재가 조회"""
@@ -12671,7 +12725,7 @@ def poll_telegram_commands():
     global _tg_offset, _bot_paused
     try:
         resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                            params={"offset":_tg_offset,"timeout":5},timeout=10)
+                            params={"offset":_tg_offset,"timeout":2},timeout=4)
         for update in resp.json().get("result",[]):
             _tg_offset = update["update_id"]+1
 
@@ -13113,6 +13167,16 @@ def poll_telegram_commands():
                 _send_menu(f"❓ <b>'{raw}'</b> 는 알 수 없는 명령어예요\n아래 버튼으로 실행해보세요")
     except Exception as e:
         print(f"⚠️ TG 명령어 오류: {e}")
+
+def _telegram_poll_loop():
+    """스캔과 분리된 텔레그램 명령/버튼 전용 루프."""
+    while True:
+        try:
+            poll_telegram_commands()
+        except Exception as e:
+            print(f"⚠️ 텔레그램 폴링 루프 오류: {e}")
+        time.sleep(max(1, TELEGRAM_POLL_INTERVAL))
+
 
 
 
@@ -13980,103 +14044,109 @@ def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> l
     return sorted(causes, key=lambda x: -x["score"])
 
 
-def send_premarket_risk_assessment():
-    """v40.0-#3: 매일 08:30 장 시작 전 리스크 평가 (안전/경계/위험).
-    전영업일 + 오버나이트 데이터 기반으로 오늘 리스크 수준을 사전 판단.
-    주문을 넣을 수 있도록 08:30에 발송 (장 시작 30분 전).
-    """
+def _build_premarket_risk_payload() -> dict:
+    us = get_us_market_signals()
+    total_score = 0
+    parts = []
+
+    nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+    vix = float(us.get("vix", 20) or 20)
+    gap_signal = us.get("gap_signal", "flat")
+
+    kospi_5d = 0.0
+    try:
+        items = get_daily_data("0001", 10)
+        closes = [i["close"] for i in items if i.get("close")]
+        if len(closes) >= 5:
+            kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+    except Exception:
+        pass
+
+    causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
+    total_score = sum(c["score"] for c in causes)
+
+    now = datetime.now()
+    if now.weekday() == 4:
+        total_score += 10
+        parts.append("📅 금요일 (주말 오버나이트 리스크)")
+
+    if total_score >= 50:
+        level = "위험"; level_emoji = "🔴"; action = "신규 진입 축소 / 기존 포지션 정리 검토"
+    elif total_score >= 25:
+        level = "경계"; level_emoji = "🟡"; action = "신규 진입 보수적 / 손절 타이트하게"
+    else:
+        level = "안전"; level_emoji = "🟢"; action = "정상 운영"
+
+    msg = (f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
+           f"━━━━━━━━━━━━━━━\n"
+           f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
+           f"💡 권장: <b>{action}</b>\n")
+
+    if causes:
+        msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
+        for c in causes[:3]:
+            c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+            msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
+
+    msg += (f"\n🌐 <b>미국 시장</b>\n"
+            f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n")
+    if kospi_5d != 0:
+        msg += f"  코스피 5일: {kospi_5d:+.1f}%\n"
+
+    try:
+        data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
+        tracking = [v for v in data.values() if v.get("status") == "추적중"]
+        if tracking and level in ("경계", "위험"):
+            msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
+            for rec in tracking[:5]:
+                entry_p = rec.get("entry_price", 0)
+                _name = rec.get("name", rec.get("code", ""))
+                sig = get_signal_label(rec.get("signal_type", ""), "")
+                msg += f"  • {_name} (진입 {entry_p:,}원) [{sig}]\n"
+    except Exception:
+        pass
+
+    try:
+        sig_stats = get_signal_type_stats()
+        stats_line = _format_signal_type_stats_line(sig_stats)
+        if stats_line:
+            msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+    except Exception:
+        pass
+
+    msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+    digest = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    return {"msg": msg, "digest": digest, "score": total_score, "level": level, "ts": now.strftime('%Y-%m-%d %H:%M')}
+
+def _save_premarket_risk_payload(payload: dict):
+    try:
+        _write_json_atomic(PREMARKET_RISK_LAST_FILE, payload, indent=2)
+    except Exception:
+        pass
+
+def send_premarket_risk_update_if_changed():
     if is_holiday():
         return
     try:
-        us = get_us_market_signals()
-        total_score = 0
-        parts = []
-
-        # 미국 시장
-        nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
-        vix = float(us.get("vix", 20) or 20)
-        us_regime = us.get("us_regime", "neutral")
-        gap_signal = us.get("gap_signal", "flat")
-
-        # 코스피 5일 추세
-        kospi_5d = 0.0
-        try:
-            items = get_daily_data("0001", 10)
-            closes = [i["close"] for i in items if i.get("close")]
-            if len(closes) >= 5:
-                kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
-        except Exception:
-            pass
-
-        # v40.0-#5: 리스크 원인별 분류
-        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
-        total_score = sum(c["score"] for c in causes)
-
-        # v40.0-#6: 시간대 프로파일 (금요일이면 추가 경계)
-        now = datetime.now()
-        if now.weekday() == 4:  # 금요일
-            total_score += 10
-            parts.append("📅 금요일 (주말 오버나이트 리스크)")
-
-        # 3단계 판정
-        if total_score >= 50:
-            level = "위험"
-            level_emoji = "🔴"
-            action = "신규 진입 축소 / 기존 포지션 정리 검토"
-        elif total_score >= 25:
-            level = "경계"
-            level_emoji = "🟡"
-            action = "신규 진입 보수적 / 손절 타이트하게"
+        payload = _build_premarket_risk_payload()
+        prev = _read_json_safe(PREMARKET_RISK_LAST_FILE, {})
+        if not isinstance(prev, dict) or prev.get("digest") != payload.get("digest"):
+            msg = "🔄 <b>장전 리스크 업데이트</b>\n━━━━━━━━━━━━━━━\n" + str(payload.get("msg", ""))
+            send(msg)
+            _save_premarket_risk_payload(payload)
         else:
-            level = "안전"
-            level_emoji = "🟢"
-            action = "정상 운영"
+            print("ℹ️ 장전 리스크 업데이트 생략 — 07:30 대비 변화 없음")
+    except Exception as e:
+        _log_error("send_premarket_risk_update_if_changed", e)
 
-        msg = (f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
-               f"━━━━━━━━━━━━━━━\n"
-               f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
-               f"💡 권장: <b>{action}</b>\n")
-
-        # 리스크 원인별 표시
-        if causes:
-            msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
-            for c in causes[:3]:
-                c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
-                msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
-
-        # 미국 시장 요약
-        msg += (f"\n🌐 <b>미국 시장</b>\n"
-                f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n")
-
-        if kospi_5d != 0:
-            msg += f"  코스피 5일: {kospi_5d:+.1f}%\n"
-
-        # 추적 중 종목 리스크 요약
-        try:
-            data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
-            tracking = [v for v in data.values() if v.get("status") == "추적중"]
-            if tracking and level in ("경계", "위험"):
-                msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
-                for rec in tracking[:5]:
-                    entry_p = rec.get("entry_price", 0)
-                    _name = rec.get("name", rec.get("code", ""))
-                    sig = get_signal_label(rec.get("signal_type", ""), "")
-                    msg += f"  • {_name} (진입 {entry_p:,}원) [{sig}]\n"
-        except Exception:
-            pass
-
-        # v40.0-#9: 유형별 승률 추가
-        try:
-            sig_stats = get_signal_type_stats()
-            stats_line = _format_signal_type_stats_line(sig_stats)
-            if stats_line:
-                msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
-        except Exception:
-            pass
-
-        msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
-        send(msg)
-
+def send_premarket_risk_assessment():
+    """07:30 장전 리스크 평가 full 발송."""
+    if is_holiday():
+        return
+    try:
+        payload = _build_premarket_risk_payload()
+        send(str(payload.get("msg", "")))
+        _save_premarket_risk_payload(payload)
     except Exception as e:
         _log_error("send_premarket_risk_assessment", e)
 
@@ -15571,6 +15641,12 @@ if __name__ == "__main__":
 
     _load_kr_holidays(datetime.now().year)
 
+    try:
+        threading.Thread(target=_telegram_poll_loop, daemon=True).start()
+        print(f"✅ 텔레그램 폴링 전용 루프 시작 ({TELEGRAM_POLL_INTERVAL}s)")
+    except Exception as e:
+        print(f"⚠️ 텔레그램 폴링 루프 시작 실패: {e}")
+
     # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
     if is_holiday():
         print(f"📅 오늘은 공휴일/주말 — 대기 모드로 실행")
@@ -15594,7 +15670,6 @@ if __name__ == "__main__":
         load_carry_stocks()
         migrate_signal_log_pnl_fields()
         _load_dynamic_params()
-        schedule.every(10).seconds.do(_leader_job(poll_telegram_commands))
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
 
@@ -15624,7 +15699,7 @@ if __name__ == "__main__":
         "• 눌림목: <b>90초</b>\n"
         f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
         "• DART 공시: <b>60초</b>\n"
-        "• 텔레그램 명령어: <b>10초</b>\n"
+        f"• 텔레그램 명령어: <b>{TELEGRAM_POLL_INTERVAL}초</b> (별도 루프)\n"
         "• NXT 장전 선포착: 08:00~09:00\n"
         "• NXT 마감 후 추적: 15:30~20:00\n\n"
         "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
@@ -15637,11 +15712,11 @@ if __name__ == "__main__":
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
-    schedule.every(10).seconds.do(_leader_job(poll_telegram_commands))  # 30→10초
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(_leader_job(send_preopen_watchlist))  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("08:30").do(_leader_job(send_premarket_risk_assessment))  # v40.0-#3: 장전 리스크 평가
+    schedule.every().day.at("07:30").do(_leader_job(send_premarket_risk_assessment))  # 장전 리스크 평가 full
+    schedule.every().day.at("08:30").do(_leader_job(send_premarket_risk_update_if_changed))  # 변화 있을 때만 짧은 업데이트
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes()
@@ -15697,12 +15772,25 @@ if __name__ == "__main__":
 
     # v39.3: 시작 시 07:30 브리핑 놓침 보완 (봇이 07:30 이후 시작된 경우)
     _now = datetime.now()
-    if dtime(7, 30) <= _now.time() <= dtime(9, 0) and not is_holiday() and _try_acquire_leader_lock():
-        try:
-            print("📋 시작 시 장전 브리핑 보완 발송")
-            send_preopen_watchlist()
-        except Exception as e:
-            print(f"⚠️ 장전 브리핑 보완 실패: {e}")
+    if not is_holiday() and _try_acquire_leader_lock():
+        if dtime(7, 30) <= _now.time() <= dtime(9, 0):
+            try:
+                print("📋 시작 시 장전 브리핑 보완 발송")
+                send_preopen_watchlist()
+            except Exception as e:
+                print(f"⚠️ 장전 브리핑 보완 실패: {e}")
+        if dtime(7, 30) <= _now.time() < dtime(8, 30):
+            try:
+                print("🛡 시작 시 장전 리스크 평가 보완 발송")
+                send_premarket_risk_assessment()
+            except Exception as e:
+                print(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
+        elif dtime(8, 30) <= _now.time() < dtime(8, 45):
+            try:
+                print("🔄 시작 시 장전 리스크 업데이트 보완 발송")
+                send_premarket_risk_update_if_changed()
+            except Exception as e:
+                print(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
 
     _maybe_run_preclose_gap_alert_catchup()
 
