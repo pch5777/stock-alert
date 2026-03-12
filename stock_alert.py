@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.28
+버전: v41.29
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.29 (2026-03-12): 체결속도 확인 확정 메시지에 과거 유사패턴 추가 + 가격 박스 순서 정리.
+  [#1] `_register_execution_setup_watch()`가 `change_rate`와 `volume_ratio`를 함께 저장하도록 보강해 `[체결속도 확인 → 진입 확정]` 단계에서도 포착 당시 기준으로 유사패턴을 계산할 수 있게 정리.
+  [#2] `_build_execution_confirmation_message()`에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 추가해, 확정 직전에도 동일 신호의 승률/평균 손익을 상단에서 바로 확인할 수 있게 보강.
+  [#3] 유사패턴이 표시되는 텔레그램 메시지에서는 가격 관련 진입 포인트 박스가 항상 그 아래에 오도록 순서를 유지/재확인.
+  이유: 사용자가 `[체결속도 확인 → 진입 확정]` 메시지에서도 과거 유사패턴을 보고 싶어 했고, 가격사항들은 유사패턴 아래에서 보는 편이 더 자연스럽다고 요청했기 때문.
+  개선점: 진입 확정 메시지 신뢰도 판단 정보↑, 메시지 상단 정보 구조 일관성↑.
+  주의점: 오래전에 등록된 일부 체결확인 대기 건은 change_rate/volume_ratio가 없어 현재값 또는 0값 기준으로 요약될 수 있다.
+
 - v41.28 (2026-03-12): KIS rank API 404/비정상 응답 fallback 경로 정리 및 로그 강화.
   [#1] `get_upper_limit_stocks()`가 `chgrate-pcls-100` 호출에서 404/비정상 status/빈 output을 공통 fallback 경로로 처리하고, KRX 유니버스 fallback 후보군 개수까지 즉시 로그로 남기도록 정리.
   [#2] `_rank_api_fallback()`에 사유·상태·fallback 건수 로그를 보강하고, disable 파일 reason을 함께 읽어 `disabled_today` 상태에서도 왜 비활성화됐는지 한 번은 바로 보이도록 개선.
@@ -2907,6 +2915,8 @@ def _register_execution_setup_watch(s: dict) -> None:
         "name": s.get("name", code),
         "signal_type": s.get("signal_type", ""),
         "price": safe_int(s.get("price", 0), 0),
+        "change_rate": safe_float(s.get("change_rate", 0.0), 0.0),
+        "volume_ratio": safe_float(s.get("volume_ratio", 0.0), 0.0),
         "entry_price": safe_int(s.get("entry_price", 0), 0),
         "planned_entry_price": safe_int(s.get("planned_entry_price", s.get("entry_price", 0)), 0),
         "stop_loss": safe_int(s.get("stop_loss", 0), 0),
@@ -3007,12 +3017,23 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     rr_text = _calc_rr_text(entry_price, stop_price, target_price)
     stop_pct = round((stop_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
     target_pct = round((target_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
-    sig_label = get_signal_label(str(watch.get("signal_type", "") or ""), watch.get("signal_type", ""))
+    sig_type = str(watch.get("signal_type", "") or "")
+    sig_label = get_signal_label(sig_type, watch.get("signal_type", ""))
+    change_at_detect = safe_float(watch.get("change_at_detect", watch.get("change_rate", 0.0)), 0.0)
+    volume_ratio = safe_float(watch.get("volume_ratio", 0.0), 0.0)
+    pattern_stats = watch.get("similar_pattern_stats") or _get_similar_pattern_stats(
+        watch.get("code", ""), sig_type, change_at_detect, volume_ratio
+    )
+    pattern_summary = _build_similar_pattern_summary_block(pattern_stats)
     lines = [
         "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
         f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
         f"원신호: {sig_label}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
+    ]
+    if pattern_summary:
+        lines.append(pattern_summary)
+    lines.extend([
         "━━━━━━━━━━━━━━━",
         f"⚡ 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
         f"🪨 눌림 유지 {int(metrics.get('dip_resilience_score', 0) or 0)}점",
@@ -3025,7 +3046,7 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
         f"│ 🏆 목표가  <b>{target_price:,}원</b>  ({target_pct:+.1f}%)",
         f"│ ⚖️ 손익비  <b>{rr_text}</b>",
         "└─────────────────────",
-    ]
+    ])
     return "\n".join(lines)
 
 
