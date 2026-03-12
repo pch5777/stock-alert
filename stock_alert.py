@@ -4495,6 +4495,10 @@ def send_mid_pullback_alert(s: dict):
         f"━━━━━━━━━━━━━━━\n"
         f"🟣 <b>{stock_name}</b>  <code>{s['code']}</code>\n"
         f"{pattern_summary_top + chr(10) if pattern_summary_top else ''}"
+    )
+
+    message += f"\n{entry_block}\n\n"
+    message += (
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>패턴 요약</b>\n"
         f"  1차 급등: <b>+{s['surge_pct']:.0f}%</b>\n"
@@ -4508,7 +4512,6 @@ def send_mid_pullback_alert(s: dict):
 
     if core_block:
         message += core_block + "\n"
-    message += f"\n{entry_block}\n\n"
     if sector_block:
         message += sector_block
     if news_block:
@@ -9855,6 +9858,9 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{top_pattern_block}"
+    )
+    msg += f"\n{entry_block}\n\n"
+    msg += (
         f"{strict_warn}"
         f"💰 현재가: <b>{s['price']:,}원</b>  (<b>{s['change_rate']:+.1f}%</b>)\n"
         f"📊 거래량: <b>{s['volume_ratio']:.1f}배</b> (5일 평균 대비)\n"
@@ -9864,7 +9870,6 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
     )
     if core_block:
         msg += core_block + "\n"
-    msg += f"\n{entry_block}\n\n"
     if sector_block:
         msg += sector_block
     if news_block:
