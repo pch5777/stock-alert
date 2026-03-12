@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.40
+버전: v41.41
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.41 (2026-03-13): 오버나이트/지정학 데이터를 파일 저장형으로 누적하고, 07:30 장전 리스크 평가에 통합 반영.
+  [#1] `overnight_active.json`, `geo_active.json` 활성 버퍼와 `overnight_snapshot_last.json`, `geo_snapshot_last.json` 스냅샷 파일을 도입해 야간 누적 데이터를 프로세스 재시작 후에도 유지.
+  [#2] `run_overnight_monitor()`와 `run_geo_news_scan()`가 메모리뿐 아니라 파일에도 상태를 기록하도록 보강.
+  [#3] `_build_premarket_risk_payload()`가 파일 기반 유효 오버나이트/지정학 상태를 읽어 07:30 메시지 안에 `야간 이슈 요약` 섹션으로 통합 반영. 지정학 점수도 파일 상태를 기준으로 계산.
+  [#4] 07:30 장전 리스크 평가 발송 성공 후 활성 버퍼는 비우고 날짜별 스냅샷으로만 보관. 08:30 업데이트 비교용으로는 마지막 스냅샷/요약만 유지.
+  이유: 20:10 종료/재시작 구조에서 야간 데이터가 메모리형이면 07:30 점수와 요약에 누락될 수 있어 파일 기반 지속성이 필요했기 때문.
+  개선점: 장마감 후~07:30 사이 오버나이트/지정학 이슈가 07:30 메시지와 점수에 안정적으로 반영됨.
+  주의점: 07:30 이후 활성 버퍼는 비워지므로, 이후 비교는 마지막 스냅샷과 새 이벤트 기준으로만 이뤄짐.
 - v41.40 (2026-03-13): 07:30/08:30 장전 메시지의 leader/passive 의존 완화 및 날짜별 1회 보장.
   [#1] `preopen_dispatch_state.json` 상태 파일과 `_try_mark_preopen_dispatch()`를 추가해, 워치리스트/장전 리스크 평가/장전 리스크 업데이트를 replica와 관계없이 날짜별 1회만 처리하도록 정리.
   [#2] 07:30 워치리스트, 07:30 장전 리스크 평가, 08:30 장전 리스크 업데이트 스케줄에서 `_leader_job(...)`를 제거하고 직접 once-wrapper를 호출하도록 변경.
@@ -606,6 +614,10 @@ _PERSIST_FILES = [
     "compact_mode.json",
     "suppressed_alerts.json",
     "auto_tune_state.json",
+    "overnight_active.json",
+    "geo_active.json",
+    "overnight_snapshot_last.json",
+    "geo_snapshot_last.json",
 ]
 
 LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
@@ -2642,6 +2654,11 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 # ============================================================
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
 OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
+OVERNIGHT_ACTIVE_FILE      = os.path.join(DATA_DIR, "overnight_active.json")
+OVERNIGHT_SNAPSHOT_LAST_FILE = os.path.join(DATA_DIR, "overnight_snapshot_last.json")
+GEO_ACTIVE_FILE            = os.path.join(DATA_DIR, "geo_active.json")
+GEO_SNAPSHOT_LAST_FILE     = os.path.join(DATA_DIR, "geo_snapshot_last.json")
+PREOPEN_SNAPSHOT_DIR       = os.path.join(DATA_DIR, "preopen_snapshots")
 PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
 PREOPEN_DISPATCH_STATE_FILE = os.path.join(DATA_DIR, "preopen_dispatch_state.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
@@ -4052,7 +4069,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
     lines = []
     try:
         # 1) 지정학/거시 이슈(섹터 방향)
-        geo = _geo_event_state or {}
+        geo = _get_effective_geo_state() or {}
         if geo.get("active") and time.time() - float(geo.get("ts", 0) or 0) < 3600 * 12:
             sec_dirs = geo.get("sector_directions", []) or []
             if not sec_dirs and geo.get("sectors"):
@@ -6461,6 +6478,134 @@ def send_overnight_risk_alerts():
 
 
 # ============================================================
+# 🌙/🌍 장전 버퍼 파일 저장 helpers
+# ============================================================
+def _default_overnight_active_state(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    return {
+        "day_key": now_dt.strftime("%Y-%m-%d"),
+        "last_us_regime": "neutral",
+        "last_vix": 20.0,
+        "alerted_regime": "",
+        "summary_lines": [],
+        "updated_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+def _load_overnight_active_state(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    base = _default_overnight_active_state(now_dt)
+    raw = _read_json_safe(OVERNIGHT_ACTIVE_FILE, {})
+    if isinstance(raw, dict):
+        base.update(raw)
+    if str(base.get("day_key") or "") != now_dt.strftime("%Y-%m-%d"):
+        base = _default_overnight_active_state(now_dt)
+    return base
+
+def _save_overnight_active_state(state: dict):
+    payload = _default_overnight_active_state()
+    if isinstance(state, dict):
+        payload.update(state)
+    payload["updated_at"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    _write_json_atomic(OVERNIGHT_ACTIVE_FILE, payload, indent=2)
+
+def _default_geo_active_state(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    return {
+        "day_key": now_dt.strftime("%Y-%m-%d"),
+        "active": False,
+        "uncertainty": "low",
+        "sectors": [],
+        "sector_directions": [],
+        "score_adj": 0,
+        "summary": "",
+        "entities": [],
+        "kws": [],
+        "history_lines": [],
+        "ts": 0,
+        "last_sent_ts": 0,
+        "last_sent_msg": "",
+        "updated_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+def _load_geo_active_state(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    base = _default_geo_active_state(now_dt)
+    raw = _read_json_safe(GEO_ACTIVE_FILE, {})
+    if isinstance(raw, dict):
+        base.update(raw)
+    if str(base.get("day_key") or "") != now_dt.strftime("%Y-%m-%d"):
+        base = _default_geo_active_state(now_dt)
+    return base
+
+def _save_geo_active_state(state: dict):
+    payload = _default_geo_active_state()
+    if isinstance(state, dict):
+        payload.update(state)
+    payload["updated_at"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    _write_json_atomic(GEO_ACTIVE_FILE, payload, indent=2)
+
+def _write_preopen_snapshot(prefix: str, payload: dict, now_dt: datetime | None = None):
+    now_dt = now_dt or _now_kst()
+    _ensure_dir(PREOPEN_SNAPSHOT_DIR)
+    day_key = now_dt.strftime("%Y-%m-%d")
+    last_path = OVERNIGHT_SNAPSHOT_LAST_FILE if prefix == "overnight" else GEO_SNAPSHOT_LAST_FILE
+    dated_path = os.path.join(PREOPEN_SNAPSHOT_DIR, f"{prefix}_{day_key}.json")
+    _write_json_atomic(last_path, payload, indent=2)
+    _write_json_atomic(dated_path, payload, indent=2)
+
+def _get_effective_geo_state(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    day_key = now_dt.strftime("%Y-%m-%d")
+    active = _load_geo_active_state(now_dt)
+    if active.get("active") and int(active.get("ts", 0) or 0) > 0:
+        return active
+    snap = _read_json_safe(GEO_SNAPSHOT_LAST_FILE, {})
+    if isinstance(snap, dict) and str(snap.get("day_key") or "") == day_key and snap.get("summary"):
+        return snap
+    return active if isinstance(active, dict) else {}
+
+def _get_effective_overnight_lines(now_dt: datetime | None = None) -> list:
+    now_dt = now_dt or _now_kst()
+    day_key = now_dt.strftime("%Y-%m-%d")
+    active = _load_overnight_active_state(now_dt)
+    lines = active.get("summary_lines") if isinstance(active, dict) else None
+    if lines:
+        return list(lines)[-10:]
+    snap = _read_json_safe(OVERNIGHT_SNAPSHOT_LAST_FILE, {})
+    if isinstance(snap, dict) and str(snap.get("day_key") or "") == day_key:
+        return list(snap.get("summary_lines") or [])[-10:]
+    return []
+
+def _consume_preopen_buffers(now_dt: datetime | None = None):
+    now_dt = now_dt or _now_kst()
+    ov = _load_overnight_active_state(now_dt)
+    geo = _load_geo_active_state(now_dt)
+    if (ov.get("summary_lines") or geo.get("active") or geo.get("history_lines")):
+        _write_preopen_snapshot("overnight", ov, now_dt)
+        _write_preopen_snapshot("geo", geo, now_dt)
+    cleared_ov = _default_overnight_active_state(now_dt)
+    cleared_geo = _default_geo_active_state(now_dt)
+    _save_overnight_active_state(cleared_ov)
+    _save_geo_active_state(cleared_geo)
+    _overnight_state.update({
+        "last_us_regime": cleared_ov["last_us_regime"],
+        "last_vix": cleared_ov["last_vix"],
+        "alerted_regime": cleared_ov["alerted_regime"],
+        "summary_lines": [],
+    })
+    _geo_event_state.update({
+        "active": False,
+        "uncertainty": "low",
+        "sectors": [],
+        "sector_directions": [],
+        "score_adj": 0,
+        "summary": "",
+        "entities": [],
+        "kws": [],
+        "ts": 0,
+    })
+
+# ============================================================
 # 🌙 오버나이트 모니터링 (장 마감 후 ~ 장 시작 전)
 # ============================================================
 _overnight_state: dict = {
@@ -6469,6 +6614,16 @@ _overnight_state: dict = {
     "alerted_regime":  "",        # 이미 알림 보낸 국면
     "summary_lines":   [],        # 오버나이트 요약 (브리핑용)
 }
+try:
+    _ov_boot = _load_overnight_active_state()
+    _overnight_state.update({
+        "last_us_regime": _ov_boot.get("last_us_regime", "neutral"),
+        "last_vix": float(_ov_boot.get("last_vix", 20.0) or 20.0),
+        "alerted_regime": _ov_boot.get("alerted_regime", ""),
+        "summary_lines": list(_ov_boot.get("summary_lines") or [])[-10:],
+    })
+except Exception:
+    pass
 
 def run_overnight_monitor():
     """
@@ -6484,6 +6639,12 @@ def run_overnight_monitor():
         in_overnight = (now_h >= 20 and now_m >= 10) or (now_h < 7) or (now_h == 7 and now_m < 30)
         if not in_overnight:
             return
+
+        persisted = _load_overnight_active_state()
+        _overnight_state["last_us_regime"] = str(persisted.get("last_us_regime") or _overnight_state.get("last_us_regime", "neutral"))
+        _overnight_state["last_vix"] = float(persisted.get("last_vix", _overnight_state.get("last_vix", 20.0)) or 20.0)
+        _overnight_state["alerted_regime"] = str(persisted.get("alerted_regime") or _overnight_state.get("alerted_regime", ""))
+        _overnight_state["summary_lines"] = list(persisted.get("summary_lines") or _overnight_state.get("summary_lines") or [])[-10:]
 
         us = get_us_market_signals()
         cur_regime  = us.get("us_regime", "neutral")
@@ -6537,6 +6698,13 @@ def run_overnight_monitor():
             _overnight_state["summary_lines"].append(line)
             # 최근 10개만 유지
             _overnight_state["summary_lines"] = _overnight_state["summary_lines"][-10:]
+
+        _save_overnight_active_state({
+            "last_us_regime": _overnight_state.get("last_us_regime", "neutral"),
+            "last_vix": _overnight_state.get("last_vix", 20.0),
+            "alerted_regime": _overnight_state.get("alerted_regime", ""),
+            "summary_lines": list(_overnight_state.get("summary_lines") or [])[-10:],
+        })
 
         # ── 지정학 이벤트 오버나이트 체크 ──
         try:
@@ -11983,6 +12151,12 @@ def run_geo_news_scan():
             return
 
         # 결과를 전역에 저장 (신호 포착 시 참조)
+        _geo_prev = _load_geo_active_state()
+        _geo_history = list(_geo_prev.get("history_lines") or [])
+        _geo_line = f"[{_now_kst().strftime('%H:%M')}] {geo.get('uncertainty','low').upper()} — {geo.get('summary','')}"
+        if _geo_line not in _geo_history:
+            _geo_history.append(_geo_line)
+        _geo_history = _geo_history[-10:]
         _geo_event_state.update({
             "active":           True,
             "uncertainty":      geo["uncertainty"],
@@ -11991,8 +12165,13 @@ def run_geo_news_scan():
             "score_adj":        geo["score_adj"],
             "summary":          geo["summary"],
             "entities":         geo["entities"],
+            "kws":              geo.get("kws", []),
+            "history_lines":    _geo_history,
             "ts":               time.time(),
+            "last_sent_ts":     float(_geo_prev.get("last_sent_ts", 0) or 0),
+            "last_sent_msg":    str(_geo_prev.get("last_sent_msg", "") or ""),
         })
+        _save_geo_active_state(dict(_geo_event_state))
 
         # 텔레그램 알림 (1시간 쿨다운)
         # v38.4: 공휴일/주말에는 내부 데이터만 저장, 사용자 알림 차단 (기본수칙 #16)
@@ -13673,7 +13852,9 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
                 kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
         except Exception:
             pass
-        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
+        geo_state = _get_effective_geo_state(now)
+        overnight_lines = _get_effective_overnight_lines(now)
+        causes = _classify_risk_causes(us, geo_state, kospi_5d)
 
         level_emoji = {"high": "🔴 위험", "mid": "🟡 경계", "low": "🟢 안전"}
         return {
@@ -14212,6 +14393,7 @@ def _build_premarket_risk_payload() -> dict:
     gap_signal = us.get("gap_signal", "flat")
 
     kospi_5d = 0.0
+    now = datetime.now()
     try:
         items = get_daily_data("0001", 10)
         closes = [i["close"] for i in items if i.get("close")]
@@ -14223,7 +14405,6 @@ def _build_premarket_risk_payload() -> dict:
     causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
     total_score = sum(c["score"] for c in causes)
 
-    now = datetime.now()
     if now.weekday() == 4:
         total_score += 10
         parts.append("📅 금요일 (주말 오버나이트 리스크)")
@@ -14353,8 +14534,10 @@ def send_premarket_risk_assessment():
         return
     try:
         payload = _build_premarket_risk_payload()
-        send(str(payload.get("msg", "")))
+        sent_id = send(str(payload.get("msg", "")))
         _save_premarket_risk_payload(payload)
+        if sent_id is not None:
+            _consume_preopen_buffers()
     except Exception as e:
         _log_error("send_premarket_risk_assessment", e)
 
@@ -14857,13 +15040,21 @@ _geo_event_state: dict = {
     "active":         False,
     "uncertainty":    "low",
     "sectors":        [],
+    "sector_directions": [],
     "score_adj":      0,
     "summary":        "",
     "entities":       [],
+    "kws":            [],
+    "history_lines":  [],
     "ts":             0,
     "last_sent_ts":   0,
     "last_sent_msg":  "",
 }
+try:
+    _geo_boot = _load_geo_active_state()
+    _geo_event_state.update({k: v for k, v in _geo_boot.items() if k in _geo_event_state or k in {"sector_directions", "kws", "history_lines"}})
+except Exception:
+    pass
 
 
 # ============================================================
@@ -15677,6 +15868,11 @@ def _on_market_open():
     _clear_all_cache()
     _overnight_state.update({"last_us_regime":"neutral","last_vix":20.0,
                               "alerted_regime":"","summary_lines":[]})
+    try:
+        _save_overnight_active_state(_default_overnight_active_state())
+        _save_geo_active_state(_default_geo_active_state())
+    except Exception:
+        pass
     _upper_limit_day_alerted.clear()  # v40.0-#10: 상한가 당일 추적 초기화
     reset_top_signals_daily()
     refresh_dynamic_candidates()
