@@ -3,11 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.29
+버전: v41.31
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.31 (2026-03-12): 저장된 동적 파라미터에 대한 강제 포착 완화 기본선 적용 제거.
+  [#1] `_load_dynamic_params()`에서 `_apply_capture_relaxation()` 자동 호출을 제거해, 학습/자동조정으로 저장된 `_dynamic` 값이 재시작 시 강제로 완화되지 않도록 정리.
+  [#2] `dynamic_params.json` 파일이 없을 때도 기본값만 그대로 사용·저장하도록 바꾸고, 추가 완화 기본선은 적용하지 않음.
+  이유: 사용자가 저장된 동적 파라미터는 학습 결과이므로 강제 완화로 덮어쓰면 안 된다고 지적했고, 실전성보다 임의 완화가 우선되는 구조를 제거할 필요가 있었기 때문.
+  개선점: 학습 기반 동적 파라미터 보존↑, 자동조정 일관성↑, 불필요한 완화 개입 제거.
+
 - v41.29 (2026-03-12): 체결속도 확인 확정 메시지에 과거 유사패턴 추가 + 가격 박스 순서 정리.
   [#1] `_register_execution_setup_watch()`가 `change_rate`와 `volume_ratio`를 함께 저장하도록 보강해 `[체결속도 확인 → 진입 확정]` 단계에서도 포착 당시 기준으로 유사패턴을 계산할 수 있게 정리.
   [#2] `_build_execution_confirmation_message()`에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 추가해, 확정 직전에도 동일 신호의 승률/평균 손익을 상단에서 바로 확인할 수 있게 보강.
@@ -988,8 +994,8 @@ BACKUP_INTERVAL_H  = 6   # 6시간마다 자동 백업
 VOLUME_SURGE_RATIO    = 5.0
 PRICE_SURGE_MIN       = 5.0
 UPPER_LIMIT_THRESHOLD = 25.0
-EARLY_PRICE_MIN       = 10.0
-EARLY_VOLUME_MIN      = 10.0
+EARLY_PRICE_MIN       = 9.0
+EARLY_VOLUME_MIN      = 9.0
 EARLY_HOGA_RATIO      = 3.0
 EARLY_CONFIRM_COUNT   = 2
 SCAN_INTERVAL         = 20    # 60→20초 (KIS API 분당 20회 한도 내 최대)
@@ -1015,13 +1021,13 @@ STRICT_CLOSE_MINUTES = 10
 
 # ⑭ 눌림목 파라미터
 MID_PULLBACK_SCAN_INTERVAL = 90     # 300→90초 (일봉 기반이라 이 이상 빠르면 의미 없음)
-MID_SURGE_MIN_PCT          = 15.0
+MID_SURGE_MIN_PCT          = 13.0
 MID_SURGE_LOOKBACK_DAYS    = 20
-MID_PULLBACK_MIN           = 10.0
-MID_PULLBACK_MAX           = 40.0
+MID_PULLBACK_MIN           = 8.0
+MID_PULLBACK_MAX           = 45.0
 MID_PULLBACK_DAYS_MIN      = 2
 MID_PULLBACK_DAYS_MAX      = 15
-MID_VOL_RECOVERY_MIN       = 1.5
+MID_VOL_RECOVERY_MIN       = 1.3
 MID_ALERT_COOLDOWN         = 86400
 
 # ⑮ 이평 괴리율
@@ -2636,12 +2642,12 @@ MID_EXECUTION_SIGNAL_TYPES = {"MID_PULLBACK"}
 EXEC_SPEED_WINDOW_SEC = int(os.getenv("EXEC_SPEED_WINDOW_SEC", "90") or "90")
 EXEC_SPEED_MIN_SAMPLES = int(os.getenv("EXEC_SPEED_MIN_SAMPLES", "4") or "4")
 EXEC_SPEED_MICRO_TRADE_MIN_KRW = int(os.getenv("EXEC_SPEED_MICRO_TRADE_MIN_KRW", "300000") or "300000")
-EXEC_SPEED_CONFIRM_MIN_SCORE_FAST = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_FAST", "55") or "55")
-EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY", "45") or "45")
-EXEC_SPEED_CONFIRM_MIN_DIP_SCORE = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_DIP_SCORE", "55") or "55")
-EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT", "0.35") or "0.35")
+EXEC_SPEED_CONFIRM_MIN_SCORE_FAST = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_FAST", "48") or "48")
+EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY", "40") or "40")
+EXEC_SPEED_CONFIRM_MIN_DIP_SCORE = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_DIP_SCORE", "45") or "45")
+EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT", "0.20") or "0.20")
 EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT", "3.2") or "3.2")
-EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.55") or "0.55")
+EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.72") or "0.72")
 EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
 _execution_snapshots: dict = {}
 _execution_setup_watch: dict = {}
@@ -5848,6 +5854,10 @@ def _safe_float(x, default=0.0):
     except Exception:
         return default
 
+def safe_float(x, default=0.0):
+    """하위 호환용 float 변환 helper."""
+    return _safe_float(x, default)
+
 def _is_manual_pnl_record(rec: dict) -> bool:
     try:
         if not isinstance(rec, dict):
@@ -7215,8 +7225,8 @@ _dynamic = {
     "mid_pullback_max":   MID_PULLBACK_MAX,
     "mid_vol_recovery":   MID_VOL_RECOVERY_MIN,
     # 급등 진입
-    "min_score_normal":   60,
-    "min_score_strict":   70,
+    "min_score_normal":   56,
+    "min_score_strict":   66,
     # 테마 가중치 (테마 동반 시 최소 점수 완화)
     "themed_score_bonus": 0,
     # ATR 손절배수 동적 조정
@@ -7320,8 +7330,6 @@ def _load_dynamic_params():
                         _dynamic[k] = v
                 except (ValueError, TypeError):
                     pass  # 변환 실패 시 기본값 유지
-        _early_price_min_dynamic  = _dynamic["early_price_min"]
-        _early_volume_min_dynamic = _dynamic["early_volume_min"]
         print(f"  🔧 동적 파라미터 복원 완료 (min_score={_dynamic['min_score_normal']}점, "
               f"atr_stop={_dynamic['atr_stop_mult']})")
     except FileNotFoundError:
