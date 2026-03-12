@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.37
+버전: v41.38
 날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -15683,6 +15683,23 @@ def run_scan():
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
                 mkt_tag  = " 🔵NXT" if is_nxt else ""
                 s = _apply_execution_speed_to_signal(s)
+                _live = _get_live_quote_for_signal(s)
+                _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
+                _entry = safe_int(s.get("entry_price", 0), 0)
+                _blocked_reason = ""
+                if _entry and _live_price and _live_price >= _entry:
+                    try:
+                        _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
+                    except Exception:
+                        _blocked_reason = ""
+                if _blocked_reason:
+                    _log_suppressed_alert(
+                        s["code"], s["name"],
+                        f"일반 포착 신호 차단 ({_blocked_reason})",
+                        s.get("signal_type", ""),
+                        {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+                    )
+                    continue
                 print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[hist_key] = time.time()
                 save_signal_log(s)
