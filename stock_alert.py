@@ -3,40 +3,12 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.42
-날짜: 2026-03-13
+버전: v41.38
+날짜: 2026-03-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.42 (2026-03-13): KIS API 404 경로 중 `chgrate-pcls-100` / `inquire-daily-trade` 처리 보강.
-  [#1] `_get_daily_investor_data()`를 `_safe_get_meta()` 기반으로 바꿔 `inquire-daily-trade`가 404/비정상 status/잘못된 응답일 때 일별 거래 API를 하루 동안 비활성화하고, code/status/사유를 한 번은 명확히 로그로 남기도록 정리.
-  [#2] `_daily_trade_api_fallback()` / `_get_daily_trade_api_disable_reason()`를 추가해, disable 상태에서도 왜 비활성화됐는지와 fallback 결과가 빈 리스트임을 조용히 숨기지 않도록 보강.
-  [#3] 업종/테마 보강용 3단계 랭킹 조회(`chgrate-pcls-100`)에서도 404/비정상 status를 공통 로그로 남기고, 비활성화 사유를 즉시 확인 가능하게 정리.
-  이유: 최신 로그에서 `chgrate-pcls-100`과 `inquire-daily-trade`가 404를 내며 일부 기능이 조용히 약해졌는데, 기존에는 fallback은 되더라도 어느 경로가 죽었는지 즉시 구분하기 어려웠기 때문.
-  개선점: 404 원인 가시성↑, daily-trade 경로의 조용한 실패 감소↑, rank/daily-trade fallback 추적성↑.
-
-- v41.41 (2026-03-13): 오버나이트/지정학 데이터를 파일 저장형으로 누적하고, 07:30 장전 리스크 평가에 통합 반영.
-  [#1] `overnight_active.json`, `geo_active.json` 활성 버퍼와 `overnight_snapshot_last.json`, `geo_snapshot_last.json` 스냅샷 파일을 도입해 야간 누적 데이터를 프로세스 재시작 후에도 유지.
-  [#2] `run_overnight_monitor()`와 `run_geo_news_scan()`가 메모리뿐 아니라 파일에도 상태를 기록하도록 보강.
-  [#3] `_build_premarket_risk_payload()`가 파일 기반 유효 오버나이트/지정학 상태를 읽어 07:30 메시지 안에 `야간 이슈 요약` 섹션으로 통합 반영. 지정학 점수도 파일 상태를 기준으로 계산.
-  [#4] 07:30 장전 리스크 평가 발송 성공 후 활성 버퍼는 비우고 날짜별 스냅샷으로만 보관. 08:30 업데이트 비교용으로는 마지막 스냅샷/요약만 유지.
-  이유: 20:10 종료/재시작 구조에서 야간 데이터가 메모리형이면 07:30 점수와 요약에 누락될 수 있어 파일 기반 지속성이 필요했기 때문.
-  개선점: 장마감 후~07:30 사이 오버나이트/지정학 이슈가 07:30 메시지와 점수에 안정적으로 반영됨.
-  주의점: 07:30 이후 활성 버퍼는 비워지므로, 이후 비교는 마지막 스냅샷과 새 이벤트 기준으로만 이뤄짐.
-- v41.40 (2026-03-13): 07:30/08:30 장전 메시지의 leader/passive 의존 완화 및 날짜별 1회 보장.
-  [#1] `preopen_dispatch_state.json` 상태 파일과 `_try_mark_preopen_dispatch()`를 추가해, 워치리스트/장전 리스크 평가/장전 리스크 업데이트를 replica와 관계없이 날짜별 1회만 처리하도록 정리.
-  [#2] 07:30 워치리스트, 07:30 장전 리스크 평가, 08:30 장전 리스크 업데이트 스케줄에서 `_leader_job(...)`를 제거하고 직접 once-wrapper를 호출하도록 변경.
-  [#3] 시작 시 07:30~08:45 catch-up도 leader 여부와 무관하게 once-wrapper 기준으로 동작하도록 정리해, passive로 떠도 해당 시간대 장전 메시지가 누락되지 않게 보강.
-  이유: 예전 버전에서는 오던 07:30/08:30 장전 메시지가 최근 버전에서는 leader/passive 영향으로 누락되는 체감이 있었기 때문.
-  개선점: 장전 메시지 발송 안정성↑, replica 전환 시 누락 감소↑, 중복 발송 없이 1회 보장↑.
-
-- v41.39 (2026-03-12): 장마감 전 선진입 후보(KRX/NXT) 조건 완화.
-  [#1] `_collect_next_open_gap_candidate_codes()`가 기존 detected/entry/carry/signal_log 외에 `_dynamic_candidates`와 `get_all_scan_candidates()`도 후보 풀에 보강 반영하도록 확장.
-  [#2] 선진입 플랜 조건을 소폭 완화해 `PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT` 기본값을 2.4→3.8, `PRECLOSE_GAP_MIN_RR` 기본값을 1.25→1.00으로 조정.
-  [#3] `NEXT_OPEN_GAP_POOL_MAX` 기본값을 10→20, `NEXT_OPEN_GAP_MIN_SCORE` 기본값을 55→48로 완화하고 payload에 `pool_count/candidate_count`를 실제 값으로 저장.
-  이유: 14:45 KRX / 19:20 NXT 장마감 전 추천이 실행되더라도 `pool=0, candidate=0`으로 끝나는 빈도가 높아, 후보군 확보와 선별 조건을 함께 조금 완화할 필요가 있었기 때문.
-  개선점: KRX/NXT 선진입 후보 노출률↑, 후보 풀 다양성↑, 실행 로그 가시성↑.
-
+- v41.38 (2026-03-12): 일반 포착 공통 경로(run_scan→send_alert)에도 실진입 불가 필터를 적용해, 상한가 잠김(limit_up_locked)·매도호가 부재(no_ask_liquidity) 상태면 `[강력 매수 신호]`, `[상한가 감지]`, `[상한가 근접]` 같은 메시지를 억제하도록 수정.
 - v41.37 (2026-03-12): 정상본 v41.34 기준으로 v41.35/v41.36 의도 재적용.
   [#1] run_mid_pullback_scan()에서 실진입 불가(limit_up_locked/no_ask_liquidity) 판정 시 [눌림목 진입 신호]를 억제할 뿐 아니라 save_signal_log()/register_entry_watch()/등급 출력까지 중단하도록 정리.
   [#2] `_get_countertrend_surge_context()`를 추가해 장기 하락 추세 속 급등(60일 수익률, 120일 고점 대비 낙폭, 20/60일선 관계)을 판정하고, UPPER_LIMIT/NEAR_UPPER/SURGE에 추세 역행 패널티를 반영.
@@ -621,10 +593,6 @@ _PERSIST_FILES = [
     "compact_mode.json",
     "suppressed_alerts.json",
     "auto_tune_state.json",
-    "overnight_active.json",
-    "geo_active.json",
-    "overnight_snapshot_last.json",
-    "geo_snapshot_last.json",
 ]
 
 LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
@@ -2661,21 +2629,15 @@ _dynamic_candidates = {}   # code → {name, desc, added_ts}
 # ============================================================
 WATCHLIST_NEXT_OPEN_FILE = os.path.join(DATA_DIR, "watchlist_next_open.json")
 OVERNIGHT_RISK_LAST_FILE   = os.path.join(DATA_DIR, "overnight_risk_last.json")
-OVERNIGHT_ACTIVE_FILE      = os.path.join(DATA_DIR, "overnight_active.json")
-OVERNIGHT_SNAPSHOT_LAST_FILE = os.path.join(DATA_DIR, "overnight_snapshot_last.json")
-GEO_ACTIVE_FILE            = os.path.join(DATA_DIR, "geo_active.json")
-GEO_SNAPSHOT_LAST_FILE     = os.path.join(DATA_DIR, "geo_snapshot_last.json")
-PREOPEN_SNAPSHOT_DIR       = os.path.join(DATA_DIR, "preopen_snapshots")
 PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
-PREOPEN_DISPATCH_STATE_FILE = os.path.join(DATA_DIR, "preopen_dispatch_state.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
-NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
-NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
+NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "10") or "10")
+NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "55") or "55")
 PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
-PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
-PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.00") or "1.00")
+PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "2.4") or "2.4")
+PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.25") or "1.25")
 PRECLOSE_GAP_OPEN_EVAL_TIME = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME", "09:05") or "09:05"
 _preclose_gap_entry_watch: dict = {}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
@@ -3266,25 +3228,6 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
 
     if len(codes) < max_codes:
         try:
-            with _state_lock:
-                for c in list((_dynamic_candidates or {}).keys()):
-                    _push(c)
-                    if len(codes) >= max_codes:
-                        break
-        except Exception:
-            pass
-
-    if len(codes) < max_codes:
-        try:
-            for c, _n, _d in get_all_scan_candidates() or []:
-                _push(c)
-                if len(codes) >= max_codes:
-                    break
-        except Exception:
-            pass
-
-    if len(codes) < max_codes:
-        try:
             base = build_next_open_watchlist(max_codes=max_codes).get("codes", [])
             for c in base:
                 _push(c)
@@ -3518,8 +3461,7 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         cautions.append(f"⏰ 진입가까지 {entry_away_pct:.1f}% 여유")
 
     score = int(round(score))
-    min_score = NEXT_OPEN_GAP_MIN_SCORE - (2 if stage == "nxt" else 0)
-    if score < min_score:
+    if score < NEXT_OPEN_GAP_MIN_SCORE:
         return None
 
     sig_type = latest_rec.get("signal_type", "") if latest_rec else ""
@@ -3610,8 +3552,6 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
         "stage_label": stage_label,
         "market_basis": "NXT" if stage == "nxt" else "KRX",
         "us_gap_signal": us.get("gap_signal", "flat"),
-        "pool_count": len(pool_codes),
-        "candidate_count": len(candidates),
         "codes": [c.get("code") for c in candidates[:max_items]],
         "candidates": candidates[:max_items],
     }
@@ -4076,7 +4016,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
     lines = []
     try:
         # 1) 지정학/거시 이슈(섹터 방향)
-        geo = _get_effective_geo_state() or {}
+        geo = _geo_event_state or {}
         if geo.get("active") and time.time() - float(geo.get("ts", 0) or 0) < 3600 * 12:
             sec_dirs = geo.get("sector_directions", []) or []
             if not sec_dirs and geo.get("sectors"):
@@ -4913,39 +4853,6 @@ def _disable_daily_trade_api_for_today(reason: str) -> None:
     except Exception:
         pass
 
-def _get_daily_trade_api_disable_reason() -> str:
-    try:
-        if not os.path.exists(_DAILY_TRADE_DISABLE_FILE):
-            return ""
-        with open(_DAILY_TRADE_DISABLE_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if str(obj.get("disabled_date", "")) != _now_kst().date().isoformat():
-            return ""
-        return str(obj.get("reason", "") or "")
-    except Exception:
-        return ""
-
-def _daily_trade_api_fallback(reason: str, *, code: str = "", status=None, ct=None, body=None) -> list:
-    global _daily_trade_disable_notified
-    if reason != "disabled_today":
-        _disable_daily_trade_api_for_today(str(reason))
-    elif not reason:
-        reason = _get_daily_trade_api_disable_reason() or "disabled_today"
-    if not _daily_trade_disable_notified:
-        msg = f"⚠️ [KIS] inquire-daily-trade 비활성/대체 → 빈 데이터 반환 ({reason})"
-        if code:
-            msg += f" code={code}"
-        if status not in (None, ""):
-            msg += f" status={status}"
-        if ct not in (None, ""):
-            msg += f" ct={ct}"
-        if body not in (None, ""):
-            body_snip = str(body)[:120].replace("\n", " ")
-            msg += f" body={body_snip}"
-        print(msg)
-        _daily_trade_disable_notified = True
-    return []
-
 
 def _rank_api_disabled_today() -> bool:
     try:
@@ -5294,10 +5201,7 @@ def get_sector_stocks_from_kis(code: str) -> list:
                      "FID_RSFL_RATE1":"-30","FID_RSFL_RATE2":"30"}
                 )
                 if status3 == 404:
-                    _rank_api_fallback("404", status=status3, ct=ct3, body=body3, market="KRX")
-                    return stocks
-                if status3 not in (None, 200):
-                    print(f"⚠️ [KIS] 테마/업종 보강용 chgrate-pcls-100 실패 status={status3} ct={ct3 or '-'} body={str(body3)[:120]}")
+                    _disable_rank_api_for_today("404")
                     return stocks
                 for i in data3.get("output",[]):
                     peer_code = i.get("mksc_shrn_iscd","")
@@ -6521,134 +6425,6 @@ def send_overnight_risk_alerts():
 
 
 # ============================================================
-# 🌙/🌍 장전 버퍼 파일 저장 helpers
-# ============================================================
-def _default_overnight_active_state(now_dt: datetime | None = None) -> dict:
-    now_dt = now_dt or _now_kst()
-    return {
-        "day_key": now_dt.strftime("%Y-%m-%d"),
-        "last_us_regime": "neutral",
-        "last_vix": 20.0,
-        "alerted_regime": "",
-        "summary_lines": [],
-        "updated_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-def _load_overnight_active_state(now_dt: datetime | None = None) -> dict:
-    now_dt = now_dt or _now_kst()
-    base = _default_overnight_active_state(now_dt)
-    raw = _read_json_safe(OVERNIGHT_ACTIVE_FILE, {})
-    if isinstance(raw, dict):
-        base.update(raw)
-    if str(base.get("day_key") or "") != now_dt.strftime("%Y-%m-%d"):
-        base = _default_overnight_active_state(now_dt)
-    return base
-
-def _save_overnight_active_state(state: dict):
-    payload = _default_overnight_active_state()
-    if isinstance(state, dict):
-        payload.update(state)
-    payload["updated_at"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    _write_json_atomic(OVERNIGHT_ACTIVE_FILE, payload, indent=2)
-
-def _default_geo_active_state(now_dt: datetime | None = None) -> dict:
-    now_dt = now_dt or _now_kst()
-    return {
-        "day_key": now_dt.strftime("%Y-%m-%d"),
-        "active": False,
-        "uncertainty": "low",
-        "sectors": [],
-        "sector_directions": [],
-        "score_adj": 0,
-        "summary": "",
-        "entities": [],
-        "kws": [],
-        "history_lines": [],
-        "ts": 0,
-        "last_sent_ts": 0,
-        "last_sent_msg": "",
-        "updated_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-def _load_geo_active_state(now_dt: datetime | None = None) -> dict:
-    now_dt = now_dt or _now_kst()
-    base = _default_geo_active_state(now_dt)
-    raw = _read_json_safe(GEO_ACTIVE_FILE, {})
-    if isinstance(raw, dict):
-        base.update(raw)
-    if str(base.get("day_key") or "") != now_dt.strftime("%Y-%m-%d"):
-        base = _default_geo_active_state(now_dt)
-    return base
-
-def _save_geo_active_state(state: dict):
-    payload = _default_geo_active_state()
-    if isinstance(state, dict):
-        payload.update(state)
-    payload["updated_at"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    _write_json_atomic(GEO_ACTIVE_FILE, payload, indent=2)
-
-def _write_preopen_snapshot(prefix: str, payload: dict, now_dt: datetime | None = None):
-    now_dt = now_dt or _now_kst()
-    _ensure_dir(PREOPEN_SNAPSHOT_DIR)
-    day_key = now_dt.strftime("%Y-%m-%d")
-    last_path = OVERNIGHT_SNAPSHOT_LAST_FILE if prefix == "overnight" else GEO_SNAPSHOT_LAST_FILE
-    dated_path = os.path.join(PREOPEN_SNAPSHOT_DIR, f"{prefix}_{day_key}.json")
-    _write_json_atomic(last_path, payload, indent=2)
-    _write_json_atomic(dated_path, payload, indent=2)
-
-def _get_effective_geo_state(now_dt: datetime | None = None) -> dict:
-    now_dt = now_dt or _now_kst()
-    day_key = now_dt.strftime("%Y-%m-%d")
-    active = _load_geo_active_state(now_dt)
-    if active.get("active") and int(active.get("ts", 0) or 0) > 0:
-        return active
-    snap = _read_json_safe(GEO_SNAPSHOT_LAST_FILE, {})
-    if isinstance(snap, dict) and str(snap.get("day_key") or "") == day_key and snap.get("summary"):
-        return snap
-    return active if isinstance(active, dict) else {}
-
-def _get_effective_overnight_lines(now_dt: datetime | None = None) -> list:
-    now_dt = now_dt or _now_kst()
-    day_key = now_dt.strftime("%Y-%m-%d")
-    active = _load_overnight_active_state(now_dt)
-    lines = active.get("summary_lines") if isinstance(active, dict) else None
-    if lines:
-        return list(lines)[-10:]
-    snap = _read_json_safe(OVERNIGHT_SNAPSHOT_LAST_FILE, {})
-    if isinstance(snap, dict) and str(snap.get("day_key") or "") == day_key:
-        return list(snap.get("summary_lines") or [])[-10:]
-    return []
-
-def _consume_preopen_buffers(now_dt: datetime | None = None):
-    now_dt = now_dt or _now_kst()
-    ov = _load_overnight_active_state(now_dt)
-    geo = _load_geo_active_state(now_dt)
-    if (ov.get("summary_lines") or geo.get("active") or geo.get("history_lines")):
-        _write_preopen_snapshot("overnight", ov, now_dt)
-        _write_preopen_snapshot("geo", geo, now_dt)
-    cleared_ov = _default_overnight_active_state(now_dt)
-    cleared_geo = _default_geo_active_state(now_dt)
-    _save_overnight_active_state(cleared_ov)
-    _save_geo_active_state(cleared_geo)
-    _overnight_state.update({
-        "last_us_regime": cleared_ov["last_us_regime"],
-        "last_vix": cleared_ov["last_vix"],
-        "alerted_regime": cleared_ov["alerted_regime"],
-        "summary_lines": [],
-    })
-    _geo_event_state.update({
-        "active": False,
-        "uncertainty": "low",
-        "sectors": [],
-        "sector_directions": [],
-        "score_adj": 0,
-        "summary": "",
-        "entities": [],
-        "kws": [],
-        "ts": 0,
-    })
-
-# ============================================================
 # 🌙 오버나이트 모니터링 (장 마감 후 ~ 장 시작 전)
 # ============================================================
 _overnight_state: dict = {
@@ -6657,16 +6433,6 @@ _overnight_state: dict = {
     "alerted_regime":  "",        # 이미 알림 보낸 국면
     "summary_lines":   [],        # 오버나이트 요약 (브리핑용)
 }
-try:
-    _ov_boot = _load_overnight_active_state()
-    _overnight_state.update({
-        "last_us_regime": _ov_boot.get("last_us_regime", "neutral"),
-        "last_vix": float(_ov_boot.get("last_vix", 20.0) or 20.0),
-        "alerted_regime": _ov_boot.get("alerted_regime", ""),
-        "summary_lines": list(_ov_boot.get("summary_lines") or [])[-10:],
-    })
-except Exception:
-    pass
 
 def run_overnight_monitor():
     """
@@ -6682,12 +6448,6 @@ def run_overnight_monitor():
         in_overnight = (now_h >= 20 and now_m >= 10) or (now_h < 7) or (now_h == 7 and now_m < 30)
         if not in_overnight:
             return
-
-        persisted = _load_overnight_active_state()
-        _overnight_state["last_us_regime"] = str(persisted.get("last_us_regime") or _overnight_state.get("last_us_regime", "neutral"))
-        _overnight_state["last_vix"] = float(persisted.get("last_vix", _overnight_state.get("last_vix", 20.0)) or 20.0)
-        _overnight_state["alerted_regime"] = str(persisted.get("alerted_regime") or _overnight_state.get("alerted_regime", ""))
-        _overnight_state["summary_lines"] = list(persisted.get("summary_lines") or _overnight_state.get("summary_lines") or [])[-10:]
 
         us = get_us_market_signals()
         cur_regime  = us.get("us_regime", "neutral")
@@ -6741,13 +6501,6 @@ def run_overnight_monitor():
             _overnight_state["summary_lines"].append(line)
             # 최근 10개만 유지
             _overnight_state["summary_lines"] = _overnight_state["summary_lines"][-10:]
-
-        _save_overnight_active_state({
-            "last_us_regime": _overnight_state.get("last_us_regime", "neutral"),
-            "last_vix": _overnight_state.get("last_vix", 20.0),
-            "alerted_regime": _overnight_state.get("alerted_regime", ""),
-            "summary_lines": list(_overnight_state.get("summary_lines") or [])[-10:],
-        })
 
         # ── 지정학 이벤트 오버나이트 체크 ──
         try:
@@ -12194,12 +11947,6 @@ def run_geo_news_scan():
             return
 
         # 결과를 전역에 저장 (신호 포착 시 참조)
-        _geo_prev = _load_geo_active_state()
-        _geo_history = list(_geo_prev.get("history_lines") or [])
-        _geo_line = f"[{_now_kst().strftime('%H:%M')}] {geo.get('uncertainty','low').upper()} — {geo.get('summary','')}"
-        if _geo_line not in _geo_history:
-            _geo_history.append(_geo_line)
-        _geo_history = _geo_history[-10:]
         _geo_event_state.update({
             "active":           True,
             "uncertainty":      geo["uncertainty"],
@@ -12208,13 +11955,8 @@ def run_geo_news_scan():
             "score_adj":        geo["score_adj"],
             "summary":          geo["summary"],
             "entities":         geo["entities"],
-            "kws":              geo.get("kws", []),
-            "history_lines":    _geo_history,
             "ts":               time.time(),
-            "last_sent_ts":     float(_geo_prev.get("last_sent_ts", 0) or 0),
-            "last_sent_msg":    str(_geo_prev.get("last_sent_msg", "") or ""),
         })
-        _save_geo_active_state(dict(_geo_event_state))
 
         # 텔레그램 알림 (1시간 쿨다운)
         # v38.4: 공휴일/주말에는 내부 데이터만 저장, 사용자 알림 차단 (기본수칙 #16)
@@ -13895,9 +13637,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
                 kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
         except Exception:
             pass
-        geo_state = _get_effective_geo_state(now)
-        overnight_lines = _get_effective_overnight_lines(now)
-        causes = _classify_risk_causes(us, geo_state, kospi_5d)
+        causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
 
         level_emoji = {"high": "🔴 위험", "mid": "🟡 경계", "low": "🟢 안전"}
         return {
@@ -14436,7 +14176,6 @@ def _build_premarket_risk_payload() -> dict:
     gap_signal = us.get("gap_signal", "flat")
 
     kospi_5d = 0.0
-    now = datetime.now()
     try:
         items = get_daily_data("0001", 10)
         closes = [i["close"] for i in items if i.get("close")]
@@ -14448,6 +14187,7 @@ def _build_premarket_risk_payload() -> dict:
     causes = _classify_risk_causes(us, _geo_event_state, kospi_5d)
     total_score = sum(c["score"] for c in causes)
 
+    now = datetime.now()
     if now.weekday() == 4:
         total_score += 10
         parts.append("📅 금요일 (주말 오버나이트 리스크)")
@@ -14506,56 +14246,6 @@ def _save_premarket_risk_payload(payload: dict):
     except Exception:
         pass
 
-def _try_mark_preopen_dispatch(kind: str, now_dt: datetime | None = None) -> bool:
-    now_dt = now_dt or _now_kst()
-    day_key = now_dt.strftime("%Y-%m-%d")
-    key = f"{day_key}:{kind}"
-    try:
-        with _file_lock:
-            state = {}
-            if os.path.isfile(PREOPEN_DISPATCH_STATE_FILE):
-                try:
-                    with open(PREOPEN_DISPATCH_STATE_FILE, "r", encoding="utf-8") as f:
-                        state = json.load(f) or {}
-                except Exception:
-                    state = {}
-            if key in state:
-                return False
-            # prune old entries (keep recent 14 days)
-            cutoff = (now_dt - timedelta(days=14)).strftime("%Y-%m-%d")
-            pruned = {}
-            for k, v in state.items():
-                day = str(k).split(":", 1)[0]
-                if day >= cutoff:
-                    pruned[k] = v
-            pruned[key] = {
-                "ts": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "instance": _INSTANCE_ID,
-            }
-            _atomic_write_bytes(PREOPEN_DISPATCH_STATE_FILE, json.dumps(pruned, ensure_ascii=False, indent=2).encode("utf-8"))
-            return True
-    except Exception as e:
-        print(f"⚠️ 장전 디스패치 상태 기록 실패({kind}): {e}")
-        return True
-
-def _send_preopen_watchlist_once():
-    if not _try_mark_preopen_dispatch("watchlist_0730"):
-        print("ℹ️ 07:30 워치리스트 이미 처리됨")
-        return
-    send_preopen_watchlist()
-
-def _send_premarket_risk_assessment_once():
-    if not _try_mark_preopen_dispatch("risk_full_0730"):
-        print("ℹ️ 07:30 장전 리스크 평가 이미 처리됨")
-        return
-    send_premarket_risk_assessment()
-
-def _send_premarket_risk_update_once():
-    if not _try_mark_preopen_dispatch("risk_update_0830"):
-        print("ℹ️ 08:30 장전 리스크 업데이트 이미 처리됨")
-        return
-    send_premarket_risk_update_if_changed()
-
 def send_premarket_risk_update_if_changed():
     if is_holiday():
         return
@@ -14577,10 +14267,8 @@ def send_premarket_risk_assessment():
         return
     try:
         payload = _build_premarket_risk_payload()
-        sent_id = send(str(payload.get("msg", "")))
+        send(str(payload.get("msg", "")))
         _save_premarket_risk_payload(payload)
-        if sent_id is not None:
-            _consume_preopen_buffers()
     except Exception as e:
         _log_error("send_premarket_risk_assessment", e)
 
@@ -15083,21 +14771,13 @@ _geo_event_state: dict = {
     "active":         False,
     "uncertainty":    "low",
     "sectors":        [],
-    "sector_directions": [],
     "score_adj":      0,
     "summary":        "",
     "entities":       [],
-    "kws":            [],
-    "history_lines":  [],
     "ts":             0,
     "last_sent_ts":   0,
     "last_sent_msg":  "",
 }
-try:
-    _geo_boot = _load_geo_active_state()
-    _geo_event_state.update({k: v for k, v in _geo_boot.items() if k in _geo_event_state or k in {"sector_directions", "kws", "history_lines"}})
-except Exception:
-    pass
 
 
 # ============================================================
@@ -15191,7 +14871,7 @@ def _get_daily_investor_data(code: str) -> list:
         end   = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         if _daily_trade_api_disabled_today():
-            return _daily_trade_api_fallback(_get_daily_trade_api_disable_reason() or "disabled_today", code=code)
+            return None
         url   = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-trade"
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
@@ -15200,16 +14880,8 @@ def _get_daily_investor_data(code: str) -> list:
             "FID_INPUT_DATE_2": end,
             "FID_PERIOD_DIV_CODE": "D",
         }
-        data, status, ct, body = _safe_get_meta(url, "FHKST03010400", params)
-        if status == 404:
-            return _daily_trade_api_fallback("404", code=code, status=status, ct=ct, body=body)
-        if status not in (None, 200):
-            return _daily_trade_api_fallback(f"status_{status}", code=code, status=status, ct=ct, body=body)
-        if not isinstance(data, dict):
-            return _daily_trade_api_fallback("invalid_response", code=code, status=status, ct=ct, body=body)
+        data = _safe_get(url, "FHKST03010400", params)
         items = data.get("output2", []) if data else []
-        if not isinstance(items, list):
-            return _daily_trade_api_fallback("invalid_output2", code=code, status=status, ct=ct, body=body)
         result = sorted([{
             "date":            i.get("stck_bsop_date", ""),
             "foreign_net":     int(i.get("frgn_ntby_qty", 0) or 0),
@@ -15919,11 +15591,6 @@ def _on_market_open():
     _clear_all_cache()
     _overnight_state.update({"last_us_regime":"neutral","last_vix":20.0,
                               "alerted_regime":"","summary_lines":[]})
-    try:
-        _save_overnight_active_state(_default_overnight_active_state())
-        _save_geo_active_state(_default_geo_active_state())
-    except Exception:
-        pass
     _upper_limit_day_alerted.clear()  # v40.0-#10: 상한가 당일 추적 초기화
     reset_top_signals_daily()
     refresh_dynamic_candidates()
@@ -16018,21 +15685,11 @@ def run_scan():
                 mkt_tag  = " 🔵NXT" if is_nxt else ""
                 s = _apply_execution_speed_to_signal(s)
                 _live = _get_live_quote_for_signal(s)
-                _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
+                _live_price = safe_int((_live or {}).get("price", 0) or s.get("price", 0), 0)
                 _entry = safe_int(s.get("entry_price", 0), 0)
-                _blocked_reason = ""
-                if _entry and _live_price and _live_price >= _entry:
-                    try:
-                        _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
-                    except Exception:
-                        _blocked_reason = ""
-                if _blocked_reason:
-                    _log_suppressed_alert(
-                        s["code"], s["name"],
-                        f"일반 포착 신호 차단 ({_blocked_reason})",
-                        s.get("signal_type", ""),
-                        {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
-                    )
+                _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
+                if _blocked_reason in {"limit_up_locked", "no_ask_liquidity"}:
+                    print(f"  🚫 차단: {s.get('name', s.get('code',''))}({s.get('code','')}) — 일반 포착 차단 ({_blocked_reason})")
                     continue
                 print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
                 send_alert(s); _alert_history[hist_key] = time.time()
@@ -16186,9 +15843,9 @@ if __name__ == "__main__":
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
-    schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
-    schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
+    schedule.every().day.at("07:30").do(_leader_job(send_preopen_watchlist))  # v37.9: 익개장 전 워치리스트 요약
+    schedule.every().day.at("07:30").do(_leader_job(send_premarket_risk_assessment))  # 장전 리스크 평가 full
+    schedule.every().day.at("08:30").do(_leader_job(send_premarket_risk_update_if_changed))  # 변화 있을 때만 짧은 업데이트
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes()
@@ -16242,25 +15899,25 @@ if __name__ == "__main__":
         if not is_holiday() else None
     ))
 
-    # v39.3: 시작 시 07:30/08:30 장전 메시지 놓침 보완 (leader/passive와 무관하게 날짜별 1회 보장)
+    # v39.3: 시작 시 07:30 브리핑 놓침 보완 (봇이 07:30 이후 시작된 경우)
     _now = datetime.now()
-    if not is_holiday():
+    if not is_holiday() and _try_acquire_leader_lock():
         if dtime(7, 30) <= _now.time() <= dtime(9, 0):
             try:
                 print("📋 시작 시 장전 브리핑 보완 발송")
-                _send_preopen_watchlist_once()
+                send_preopen_watchlist()
             except Exception as e:
                 print(f"⚠️ 장전 브리핑 보완 실패: {e}")
         if dtime(7, 30) <= _now.time() < dtime(8, 30):
             try:
                 print("🛡 시작 시 장전 리스크 평가 보완 발송")
-                _send_premarket_risk_assessment_once()
+                send_premarket_risk_assessment()
             except Exception as e:
                 print(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
         elif dtime(8, 30) <= _now.time() < dtime(8, 45):
             try:
                 print("🔄 시작 시 장전 리스크 업데이트 보완 발송")
-                _send_premarket_risk_update_once()
+                send_premarket_risk_update_if_changed()
             except Exception as e:
                 print(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
 
