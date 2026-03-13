@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.57
+버전: v41.58
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.58 (2026-03-13): 체결속도 샘플 부족 완화 + NXT 미세체결 기준 보정 + 예비판단 표시 추가.
+  [#1] `EXEC_SPEED_MIN_SAMPLES` 기본값을 4→3으로 낮추고, `EXEC_SPEED_PREWARM_MAX_CODES` 기본값을 5→8로 늘려 포착 후 60~80초 내 진입가 도달 케이스에서도 현재 시점 체결속도 샘플이 더 자주 표시되도록 조정.
+  [#2] `_get_exec_speed_micro_trade_threshold()` helper를 추가해 NXT/비정규 시간대 체결은 미세체결 하한을 더 완화(기본 30만/20주 → 15만/10주)하고, `_record_execution_snapshot()`에 반영해 저녁장 얇은 체결이 과도하게 제외되지 않도록 보강.
+  [#3] `get_execution_speed_metrics()`에 `provisional`(예비판단) 경로를 추가해, 확정용 ready 기준에는 못 미쳐도 최근 유효 샘플 2개 이상이면 점수·눌림유지·미세체결 제외율을 참고용으로 계산하도록 정리.
+  [#4] `[진입가 도달!]` 메시지의 체결속도 블록은 ready가 아니더라도 예비판단이 가능하면 `예비판단`으로 참고값을 표시하고, 포착시 fallback보다 현재 시점 부분 샘플을 우선 보여주도록 조정.
+  이유: 현재 구조에서는 NXT 저녁장/빠른 도달 종목이 실제 체결은 있어도 샘플 인정 기준이 보수적이라 `샘플 부족`만 반복 표시되는 경우가 많았기 때문.
+  개선점: 체결속도 현재값 표시율↑, NXT 저녁장 샘플 인정률↑, 빠른 도달 구간 참고성↑.
+  주의점: `예비판단`은 참고용이며, 체결확정 로직의 ready 기준(구조상 충분한 샘플 확보)은 유지된다.
+
 - v41.57 (2026-03-13): 텔레그램 폴링 지수 백오프 도입 + check_entry_watch peak_price 저장 누락 수정.
   [BUG-1 🔴 데이터 유실] `check_entry_watch()` 9933줄에서 peak_price 갱신 시 `changed = True`로 기록하지만,
   파일 저장 조건은 `changed_active`만 확인 → peak_price가 파일에 저장되지 않아 재시작 시 이전 값으로 복원되는 문제.
@@ -3075,8 +3084,11 @@ FAST_EXECUTION_SIGNAL_TYPES = {"EARLY_DETECT", "NEAR_UPPER", "SURGE", PRECLOSE_G
 ENTRY_EXECUTION_SIGNAL_TYPES = {"ENTRY_POINT"}
 MID_EXECUTION_SIGNAL_TYPES = {"MID_PULLBACK"}
 EXEC_SPEED_WINDOW_SEC = int(os.getenv("EXEC_SPEED_WINDOW_SEC", "90") or "90")
-EXEC_SPEED_MIN_SAMPLES = int(os.getenv("EXEC_SPEED_MIN_SAMPLES", "4") or "4")
+EXEC_SPEED_MIN_SAMPLES = int(os.getenv("EXEC_SPEED_MIN_SAMPLES", "3") or "3")
 EXEC_SPEED_MICRO_TRADE_MIN_KRW = int(os.getenv("EXEC_SPEED_MICRO_TRADE_MIN_KRW", "300000") or "300000")
+EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER = int(os.getenv("EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER", "20") or "20")
+EXEC_SPEED_MICRO_TRADE_MIN_KRW_NXT = int(os.getenv("EXEC_SPEED_MICRO_TRADE_MIN_KRW_NXT", "150000") or "150000")
+EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER_NXT = int(os.getenv("EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER_NXT", "10") or "10")
 EXEC_SPEED_CONFIRM_MIN_SCORE_FAST = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_FAST", "48") or "48")
 EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_SCORE_ENTRY", "40") or "40")
 EXEC_SPEED_CONFIRM_MIN_DIP_SCORE = int(os.getenv("EXEC_SPEED_CONFIRM_MIN_DIP_SCORE", "45") or "45")
@@ -3085,7 +3097,7 @@ EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MAX_PU
 EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.72") or "0.72")
 EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
 EXEC_SPEED_PREWARM_MAX_SEC   = int(os.getenv("EXEC_SPEED_PREWARM_MAX_SEC",   "120")  or "120")   # 포착 후 워밍 최대 기간(초)
-EXEC_SPEED_PREWARM_MAX_CODES = int(os.getenv("EXEC_SPEED_PREWARM_MAX_CODES", "5")    or "5")     # 동시 워밍 최대 종목 수 (API 부담 제한)
+EXEC_SPEED_PREWARM_MAX_CODES = int(os.getenv("EXEC_SPEED_PREWARM_MAX_CODES", "8")    or "8")     # 동시 워밍 최대 종목 수 (API 부담 제한)
 _execution_snapshots: dict = {}
 _exec_speed_prewarm: dict = {}          # code → registered_ts, 포착 직후 스냅샷 사전 누적용
 _execution_setup_watch: dict = {}
@@ -3099,6 +3111,23 @@ def _prune_execution_snapshots(code: str, now_ts: float | None = None) -> None:
         return
     cutoff = now_ts - max(EXEC_SPEED_WINDOW_SEC * 4, 360)
     _execution_snapshots[code] = [s for s in buf if float(s.get("ts", 0) or 0) >= cutoff][-80:]
+
+
+def _get_exec_speed_micro_trade_threshold(price: int, market: str = "KRX", sample_ts: float | None = None) -> int:
+    price = safe_int(price, 0)
+    if price <= 0:
+        return 0
+    market_name = str(market or "KRX").upper()
+    ts = float(sample_ts or time.time())
+    try:
+        local_dt = datetime.fromtimestamp(ts)
+        afterhours_hint = (local_dt.hour > 15) or (local_dt.hour == 15 and local_dt.minute >= 30) or (local_dt.hour < 9)
+    except Exception:
+        afterhours_hint = False
+    relaxed = market_name == "NXT" or afterhours_hint
+    share_multiplier = EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER_NXT if relaxed else EXEC_SPEED_MICRO_TRADE_SHARE_MULTIPLIER
+    min_krw = EXEC_SPEED_MICRO_TRADE_MIN_KRW_NXT if relaxed else EXEC_SPEED_MICRO_TRADE_MIN_KRW
+    return max(int(price * max(1, share_multiplier)), int(min_krw))
 
 
 def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") -> None:
@@ -3115,7 +3144,7 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
     prev_vol = safe_int(prev.get("today_vol", 0))
     vol_delta = max(today_vol - prev_vol, 0)
     trade_value_delta = int(vol_delta * price)
-    micro_threshold = max(int(price * 20), EXEC_SPEED_MICRO_TRADE_MIN_KRW)
+    micro_threshold = _get_exec_speed_micro_trade_threshold(price, market=market, sample_ts=now_ts)
     sample = {
         "ts": now_ts,
         "market": market,
@@ -3139,6 +3168,7 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
     now_ts = time.time()
     out = {
         "ready": False,
+        "provisional": False,
         "execution_speed_score": 0,
         "dip_resilience_score": 0,
         "micro_trade_filtered_ratio": 0.0,
@@ -3156,15 +3186,15 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
         return out
     samples = [s for s in (_execution_snapshots.get(code) or []) if float(s.get("ts", 0) or 0) >= now_ts - window_sec]
     out["window_samples"] = len(samples)
-    if len(samples) < max(2, EXEC_SPEED_MIN_SAMPLES):
+    if len(samples) < 2:
         return out
 
     positive = [s for s in samples if int(s.get("vol_delta", 0) or 0) > 0]
     valid = [s for s in positive if not s.get("micro_trade")]
     out["valid_samples"] = len(valid)
-    if len(valid) < max(2, EXEC_SPEED_MIN_SAMPLES - 1):
-        if positive:
-            out["micro_trade_filtered_ratio"] = round(max(0.0, 1.0 - len(valid) / max(len(positive), 1)), 2)
+    if positive:
+        out["micro_trade_filtered_ratio"] = round(max(0.0, 1.0 - len(valid) / max(len(positive), 1)), 2)
+    if len(valid) < 2:
         out["summary"] = "유효 체결 부족"
         return out
 
@@ -3188,7 +3218,6 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
     out["avg_bid_ask_ratio"] = round(avg_bid_ratio, 2)
     active_ratio = len(valid) / max(len(samples), 1)
     out["active_ratio"] = round(active_ratio, 2)
-    out["micro_trade_filtered_ratio"] = round(max(0.0, 1.0 - len(valid) / max(len(positive), 1)), 2) if positive else 0.0
     out["amount_per_active"] = int(mean_amount)
 
     dip_samples = [s for s in valid if peak_price > 0 and safe_int(s.get("price", 0), 0) <= int(peak_price * (1 - EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT / 100.0))]
@@ -3233,10 +3262,16 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
         else:
             suggested_entry = min(last_price, int(peak_price * (1 - min(out["pullback_pct"], EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT) / 100.0)))
     out["suggested_entry_price"] = _round_price_down(max(suggested_entry, 0)) if suggested_entry else 0
-    out["ready"] = True
-    out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
-    return out
 
+    ready_window_min = max(2, EXEC_SPEED_MIN_SAMPLES)
+    ready_valid_min = max(2, EXEC_SPEED_MIN_SAMPLES - 1)
+    if len(samples) >= ready_window_min and len(valid) >= ready_valid_min:
+        out["ready"] = True
+        out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
+    else:
+        out["provisional"] = True
+        out["summary"] = f"예비판단 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
+    return out
 
 def _tick_exec_speed_prewarm() -> None:
     """포착 직후 등록된 종목의 체결속도 스냅샷을 사전 누적 (진입가 도달 시 샘플 부족 최소화).
@@ -3270,11 +3305,16 @@ def _tick_exec_speed_prewarm() -> None:
     for code, _reg_ts in targets:
         # 현재 유효 샘플 수 확인
         samples = _execution_snapshots.get(code) or []
-        recent_count = sum(
-            1 for s in samples
+        recent_samples = [
+            s for s in samples
             if float(s.get("ts", 0) or 0) >= now_ts - EXEC_SPEED_WINDOW_SEC
+        ]
+        recent_count = len(recent_samples)
+        recent_valid_count = sum(
+            1 for s in recent_samples
+            if int(s.get("vol_delta", 0) or 0) > 0 and not s.get("micro_trade")
         )
-        if recent_count >= EXEC_SPEED_MIN_SAMPLES:
+        if recent_count >= max(2, EXEC_SPEED_MIN_SAMPLES) and recent_valid_count >= max(2, EXEC_SPEED_MIN_SAMPLES - 1):
             # 충분히 쌓임 → 워밍 해제
             _exec_speed_prewarm.pop(code, None)
             continue
@@ -3321,7 +3361,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
     current_metrics = metrics or get_execution_speed_metrics(code, current_price=price) or {}
     if not current_metrics and not fallback_metrics:
         return ""
-    base_metrics = current_metrics if current_metrics.get("ready") else (fallback_metrics or current_metrics)
+    base_metrics = current_metrics if (current_metrics.get("ready") or current_metrics.get("provisional")) else (fallback_metrics or current_metrics)
     if not base_metrics:
         return ""
     speed_score = int(base_metrics.get("execution_speed_score", 0) or 0)
@@ -3330,29 +3370,38 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
     speed_label = _execution_score_label(speed_score)
     dip_label = _execution_score_label(dip_score)
     judgement_label, judgement_line = _entry_execution_judgement(base_metrics)
-    if not current_metrics.get("ready"):
-        if fallback_metrics and fallback_metrics.get("ready"):
-            return (
-                "━━━━━━━━━━━━━━━\n"
-                f"⚡ <b>진입 시 체결속도</b>  현재 샘플 부족 (참고)\n"
-                f"📌 포착시 체결속도  {speed_score}점 ({speed_label})\n"
-                f"🪨 포착시 눌림 유지  {dip_score}점 ({dip_label})\n"
-                f"🧹 포착시 미세체결 제외  {filtered_ratio:.0f}%\n"
-                f"🧭 <b>참고</b>  — 현재 샘플이 부족해 포착시 체결 기준으로 표시합니다. 진입 전 호가를 한 번 더 확인하세요.\n"
-            )
+    if current_metrics.get("ready"):
         return (
             "━━━━━━━━━━━━━━━\n"
-            f"⚡ <b>진입 시 체결속도</b>  샘플 부족 ({judgement_label})\n"
-            f"{judgement_line}\n"
+            f"⚡ <b>진입 시 체결속도</b>  {speed_score}점 ({speed_label})\n"
+            f"🪨 눌림 유지  {dip_score}점 ({dip_label})\n"
+            f"🧹 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🧭 <b>{judgement_label}</b>  — {judgement_line.replace('✅ ', '').replace('⚠️ ', '').replace('🟡 ', '')}\n"
+        )
+    if current_metrics.get("provisional"):
+        return (
+            "━━━━━━━━━━━━━━━\n"
+            f"⚡ <b>진입 시 체결속도</b>  예비판단 {speed_score}점 ({speed_label})\n"
+            f"🪨 예비 눌림 유지  {dip_score}점 ({dip_label})\n"
+            f"🧹 예비 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🧭 <b>참고</b>  — 현재 샘플이 충분하진 않지만 최근 유효 체결 {int(current_metrics.get('valid_samples', 0) or 0)}개 기준 참고값입니다. 진입 전 호가를 한 번 더 확인하세요.\n"
+        )
+    if fallback_metrics and (fallback_metrics.get("ready") or fallback_metrics.get("provisional")):
+        ref_prefix = "포착시"
+        ref_mode = "예비판단" if fallback_metrics.get("provisional") and not fallback_metrics.get("ready") else "체결속도"
+        return (
+            "━━━━━━━━━━━━━━━\n"
+            f"⚡ <b>진입 시 체결속도</b>  현재 샘플 부족 (참고)\n"
+            f"📌 {ref_prefix} {ref_mode}  {speed_score}점 ({speed_label})\n"
+            f"🪨 {ref_prefix} 눌림 유지  {dip_score}점 ({dip_label})\n"
+            f"🧹 {ref_prefix} 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🧭 <b>참고</b>  — 현재 샘플이 부족해 포착시 체결 기준으로 표시합니다. 진입 전 호가를 한 번 더 확인하세요.\n"
         )
     return (
         "━━━━━━━━━━━━━━━\n"
-        f"⚡ <b>진입 시 체결속도</b>  {speed_score}점 ({speed_label})\n"
-        f"🪨 눌림 유지  {dip_score}점 ({dip_label})\n"
-        f"🧹 미세체결 제외  {filtered_ratio:.0f}%\n"
-        f"🧭 <b>{judgement_label}</b>  — {judgement_line.replace('✅ ', '').replace('⚠️ ', '').replace('🟡 ', '')}\n"
+        f"⚡ <b>진입 시 체결속도</b>  샘플 부족 ({judgement_label})\n"
+        f"{judgement_line}\n"
     )
-
 
 def _entry_execution_confirmation_threshold(signal_type: str) -> tuple[int, int]:
     sig = str(signal_type or "")
