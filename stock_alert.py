@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.58
+버전: v41.59
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.59 (2026-03-13): 시작 배너를 leader 승계 시점에도 1회 발송하도록 보강.
+  [#1] `_send_startup_banner_once()` helper와 `_STARTUP_BANNER_SENT` 상태를 추가해, 기존처럼 부팅 순간 leader일 때뿐 아니라
+       passive로 시작한 replica가 나중에 leader 락을 승계했을 때도 시작 배너를 정확히 1회 발송하도록 정리.
+  [#2] `_leader_job()`에서 이전 runtime leader 상태를 보고 `passive → leader` 전환이 감지되면 스케줄 작업 실행 전에
+       시작 배너 전송 helper를 먼저 호출하도록 연결.
+  [#3] 메인 진입부의 시작 배너 문자열은 helper로 통합해, 부팅 직후 leader 획득과 이후 leader 승계가 같은 메시지 포맷을 사용하도록 정리.
+  이유: 현재 구조에서는 부팅 순간 `_try_acquire_leader_lock()`이 실패하면 이후 실제 leader가 되어도 시작 배너가 다시 전송되지 않아
+       `🤖 주식 급등 알림 봇 ON` 메시지가 누락될 수 있었기 때문.
+  개선점: Railway 다중 replica 환경에서 시작 배너 누락↓, leader 승계 가시성↑, 메시지 포맷 일관성↑.
+  주의점: 시작 배너는 프로세스당 1회만 발송되며, leader 재획득이 반복돼도 중복 발송되지 않음.
+
 - v41.58 (2026-03-13): 체결속도 샘플 부족 완화 + NXT 미세체결 기준 보정 + 예비판단 표시 추가.
   [#1] `EXEC_SPEED_MIN_SAMPLES` 기본값을 4→3으로 낮추고, `EXEC_SPEED_PREWARM_MAX_CODES` 기본값을 5→8로 늘려 포착 후 60~80초 내 진입가 도달 케이스에서도 현재 시점 체결속도 샘플이 더 자주 표시되도록 조정.
   [#2] `_get_exec_speed_micro_trade_threshold()` helper를 추가해 NXT/비정규 시간대 체결은 미세체결 하한을 더 완화(기본 30만/20주 → 15만/10주)하고, `_record_execution_snapshot()`에 반영해 저녁장 얇은 체결이 과도하게 제외되지 않도록 보강.
@@ -736,6 +747,7 @@ AUTO_TUNE_STATE_FILE = os.path.join(DATA_DIR, "auto_tune_state.json")
 LEADER_LOCK_LEASE_SEC = int(os.getenv("LEADER_LOCK_LEASE_SEC", "75") or "75")
 _INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'local'}:{os.getpid()}:{random.randint(1000, 9999)}"
 _RUNTIME_IS_LEADER = False
+_STARTUP_BANNER_SENT = False
 
 def _normalize_for_hash(obj):
     if isinstance(obj, dict):
@@ -855,10 +867,45 @@ def _try_acquire_leader_lock(force: bool = False) -> bool:
         print(f"⚠️ 리더 락 확인 실패: {e}")
         return True
 
+def _send_startup_banner_once() -> bool:
+    """시작 배너는 프로세스당 1회만 전송."""
+    global _STARTUP_BANNER_SENT
+    if _STARTUP_BANNER_SENT:
+        return False
+    try:
+        code_hash = _get_code_hash()
+        message_id = send(
+            f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
+            f"📅 {BOT_DATE}  🔑 <code>{code_hash}</code>\n\n"
+            "✅ 한국투자증권 API 연결\n"
+            "🔵 NXT(넥스트레이드) 연동 활성\n"
+            "🔒 스레드 안전성 활성\n\n"
+            "<b>📡 스캔 주기</b>\n"
+            "• 급등/상한가 스캔: <b>20초</b>\n"
+            "• 눌림목: <b>90초</b>\n"
+            f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
+            "• DART 공시: <b>60초</b>\n"
+            f"• 텔레그램 명령어: <b>{TELEGRAM_POLL_INTERVAL}초</b> (별도 루프)\n"
+            "• NXT 장전 선포착: 08:00~09:00\n"
+            "• NXT 마감 후 추적: 15:30~20:00\n\n"
+            "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
+            "⚙️ <b>/설정</b> — BotFather 명령어 자동완성 등록법"
+        )
+        if message_id is not None:
+            _STARTUP_BANNER_SENT = True
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️ 시작 배너 전송 실패: {e}")
+        return False
+
 def _leader_job(fn):
     def _wrapped(*args, **kwargs):
+        was_leader = bool(_RUNTIME_IS_LEADER)
         if not _try_acquire_leader_lock():
             return None
+        if not was_leader:
+            _send_startup_banner_once()
         return fn(*args, **kwargs)
     return _wrapped
 
@@ -17351,26 +17398,8 @@ if __name__ == "__main__":
     load_dynamic_themes()
     refresh_dynamic_candidates()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
-
-    _CODE_HASH = _get_code_hash()
     if _try_acquire_leader_lock():
-        send(
-        f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
-        f"📅 {BOT_DATE}  🔑 <code>{_CODE_HASH}</code>\n\n"
-        "✅ 한국투자증권 API 연결\n"
-        "🔵 NXT(넥스트레이드) 연동 활성\n"
-        "🔒 스레드 안전성 활성\n\n"
-        "<b>📡 스캔 주기</b>\n"
-        "• 급등/상한가 스캔: <b>20초</b>\n"
-        "• 눌림목: <b>90초</b>\n"
-        f"• 뉴스 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스): <b>45초</b>\n"
-        "• DART 공시: <b>60초</b>\n"
-        f"• 텔레그램 명령어: <b>{TELEGRAM_POLL_INTERVAL}초</b> (별도 루프)\n"
-        "• NXT 장전 선포착: 08:00~09:00\n"
-        "• NXT 마감 후 추적: 15:30~20:00\n\n"
-        "💬 <b>/menu</b> — 버튼 메뉴 열기\n"
-        "⚙️ <b>/설정</b> — BotFather 명령어 자동완성 등록법"
-        )
+        _send_startup_banner_once()
     else:
         print("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
 
