@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.56
+버전: v41.57
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.57 (2026-03-13): 텔레그램 폴링 지수 백오프 도입 + check_entry_watch peak_price 저장 누락 수정.
+  [BUG-1 🔴 데이터 유실] `check_entry_watch()` 9933줄에서 peak_price 갱신 시 `changed = True`로 기록하지만,
+  파일 저장 조건은 `changed_active`만 확인 → peak_price가 파일에 저장되지 않아 재시작 시 이전 값으로 복원되는 문제.
+  수정: `changed = True` → `changed_active = True`로 교체해 peak_price 갱신이 즉시 파일에 반영되도록 정리.
+  [OPT-1] `_telegram_poll_loop()`에 지수 백오프(exponential backoff) 도입.
+  기존: 실패해도 고정 2초 대기 후 즉시 재시도 → 네트워크 일시 불안 시 로그 범람 + 불필요한 재시도 반복.
+  수정: 연속 실패 시 대기 시간을 2→4→8→…최대 60초까지 점진 증가, 성공 시 즉시 정상 간격(2초)으로 복귀.
+  연속 실패 5회 이상 시 1회만 경고 로그 출력하여 로그 범람 방지.
+  개선점: peak_price 재시작 복원 안정성↑, 네트워크 불안 시 로그 범람↓, 폴링 회복 속도 유지↑.
+
 - v41.56 (2026-03-13): 체결속도 사전 워밍(prewarm) 구조 추가.
   [#1] `_exec_speed_prewarm: dict` 전역변수와 상수 `EXEC_SPEED_PREWARM_MAX_SEC(120초)` /
        `EXEC_SPEED_PREWARM_MAX_CODES(5종목)`를 추가해 포착 시점부터 체결속도 스냅샷을
@@ -9930,7 +9940,7 @@ def check_entry_watch():
             # 최고가 갱신
             if price > watch.get("peak_price", 0):
                 watch["peak_price"] = price
-                changed = True
+                changed_active = True
             if watch.get("entry_hit_locked"):
                 continue
 
@@ -14399,12 +14409,22 @@ def poll_telegram_commands():
         print(f"⚠️ TG 명령어 오류: {e}")
 
 def _telegram_poll_loop():
-    """스캔과 분리된 텔레그램 명령/버튼 전용 루프."""
+    """스캔과 분리된 텔레그램 명령/버튼 전용 루프 (지수 백오프 적용)."""
+    _consecutive_fails = 0
+    _TG_POLL_BACKOFF_MAX = 60  # 최대 백오프 60초
     while True:
         try:
             poll_telegram_commands()
+            _consecutive_fails = 0  # 성공 시 즉시 정상 간격 복귀
         except Exception as e:
-            print(f"⚠️ 텔레그램 폴링 루프 오류: {e}")
+            _consecutive_fails += 1
+            if _consecutive_fails <= 3 or _consecutive_fails == 5:
+                print(f"⚠️ 텔레그램 폴링 루프 오류 ({_consecutive_fails}회 연속): {e}")
+            elif _consecutive_fails == 10:
+                print(f"⚠️ 텔레그램 폴링 연속 실패 {_consecutive_fails}회 — 백오프 {min(TELEGRAM_POLL_INTERVAL * (2 ** min(_consecutive_fails, 5)), _TG_POLL_BACKOFF_MAX)}초")
+            backoff = min(TELEGRAM_POLL_INTERVAL * (2 ** min(_consecutive_fails, 5)), _TG_POLL_BACKOFF_MAX)
+            time.sleep(max(1, backoff))
+            continue
         time.sleep(max(1, TELEGRAM_POLL_INTERVAL))
 
 
