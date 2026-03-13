@@ -2689,6 +2689,8 @@ PREOPEN_DISPATCH_STATE_FILE = os.path.join(DATA_DIR, "preopen_dispatch_state.jso
 MARKET_LEADER_STATE_FILE = os.path.join(DATA_DIR, "market_leader_sector_state.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
+PRECLOSE_GAP_ENTRY_WATCH_FILE = os.path.join(DATA_DIR, "preclose_gap_entry_watch.json")
+REENTRY_WATCH_FILE = os.path.join(DATA_DIR, "reentry_watch.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
 NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
 NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
@@ -2707,6 +2709,84 @@ def _read_json_safe(path: str, default):
             return json.load(f)
     except Exception:
         return default
+
+def _save_preclose_gap_entry_watch() -> None:
+    try:
+        _write_json_atomic(PRECLOSE_GAP_ENTRY_WATCH_FILE, _preclose_gap_entry_watch if isinstance(_preclose_gap_entry_watch, dict) else {}, indent=2)
+    except Exception:
+        pass
+
+def _load_preclose_gap_entry_watch() -> None:
+    global _preclose_gap_entry_watch
+    try:
+        raw = _read_json_safe(PRECLOSE_GAP_ENTRY_WATCH_FILE, {})
+        if not isinstance(raw, dict):
+            _preclose_gap_entry_watch = {}
+            return
+        now_ts = time.time()
+        restored = {}
+        for key, watch in raw.items():
+            if not isinstance(watch, dict):
+                continue
+            code = normalize_stock_code(watch.get("code"))
+            deadline_ts = float(watch.get("deadline_ts", 0) or 0)
+            if not code or (deadline_ts and now_ts >= deadline_ts):
+                continue
+            restored[str(key)] = watch
+        _preclose_gap_entry_watch = restored
+        if raw != restored:
+            _save_preclose_gap_entry_watch()
+    except Exception:
+        _preclose_gap_entry_watch = {}
+
+def _save_reentry_watch() -> None:
+    try:
+        _write_json_atomic(REENTRY_WATCH_FILE, _reentry_watch if isinstance(_reentry_watch, dict) else {}, indent=2)
+    except Exception:
+        pass
+
+def _load_reentry_watch() -> None:
+    global _reentry_watch
+    try:
+        raw = _read_json_safe(REENTRY_WATCH_FILE, {})
+        if not isinstance(raw, dict):
+            _reentry_watch = {}
+            return
+        now_ts = time.time()
+        restored = {}
+        for code, watch in raw.items():
+            if not isinstance(watch, dict):
+                continue
+            norm = normalize_stock_code(code or watch.get("code"))
+            ts = float(watch.get("ts", 0) or 0)
+            if not norm:
+                continue
+            if ts and now_ts - ts > 60 * 60 * 48:
+                continue
+            entry = int(watch.get("entry", 0) or 0)
+            stop = int(watch.get("stop", 0) or 0)
+            target = int(watch.get("target", 0) or 0)
+            stop_price = int(watch.get("stop_price", 0) or 0)
+            restored[norm] = {
+                "name": str(watch.get("name", "") or ""),
+                "stop_price": stop_price,
+                "entry": entry,
+                "stop": stop,
+                "target": target,
+                "signal_type": str(watch.get("signal_type", "") or ""),
+                "ts": ts or now_ts,
+                "nxt_listed": bool(watch.get("nxt_listed", is_nxt_listed(norm))),
+                "market_basis": str(watch.get("market_basis", "NXT" if is_nxt_listed(norm) else "KRX") or ("NXT" if is_nxt_listed(norm) else "KRX")),
+            }
+        _reentry_watch = restored
+        if raw != restored:
+            _save_reentry_watch()
+    except Exception:
+        _reentry_watch = {}
+
+def _clear_reentry_watch_all() -> None:
+    _reentry_watch.clear()
+    _save_reentry_watch()
 
 FAST_EXECUTION_SIGNAL_TYPES = {"EARLY_DETECT", "NEAR_UPPER", "SURGE", PRECLOSE_GAP_SIGNAL_TYPE}
 ENTRY_EXECUTION_SIGNAL_TYPES = {"ENTRY_POINT"}
@@ -3200,10 +3280,13 @@ def check_execution_setup_watch() -> None:
             if not price:
                 continue
             watch["last_price"] = price
+            changed = True
             if price > safe_int(watch.get("peak_price", 0), 0):
                 watch["peak_price"] = price
+                changed = True
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
             watch["execution_metrics"] = metrics
+            changed = True
             min_speed, min_dip = _entry_execution_confirmation_threshold(watch.get("signal_type"))
             pullback_pct = float(metrics.get("pullback_pct", 0.0) or 0.0)
             if not metrics.get("ready"):
@@ -3833,6 +3916,7 @@ def register_preclose_gap_watch(candidate: dict, signal_log_key: str) -> None:
         "execution_setup_required": True,
         "execution_metrics": dict(candidate.get("execution_metrics") or {}),
     }
+    _save_preclose_gap_entry_watch()
 
 
 def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: bool = False) -> None:
@@ -3875,6 +3959,7 @@ def check_preclose_gap_entry_watch() -> None:
         return
     now = _now_kst()
     expired = []
+    changed = False
     for key, watch in list(_preclose_gap_entry_watch.items()):
         try:
             stage = "nxt" if str(watch.get("stage", "krx")).lower() == "nxt" else "krx"
@@ -3894,12 +3979,15 @@ def check_preclose_gap_entry_watch() -> None:
             if not price:
                 continue
             watch["last_price"] = price
+            changed = True
             if price > int(watch.get("peak_price", 0) or 0):
                 watch["peak_price"] = price
+                changed = True
             if price > int(watch.get("entry_price", 0) or 0):
                 continue
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
             watch["execution_metrics"] = metrics
+            changed = True
             if not metrics.get("ready"):
                 continue
             if float(metrics.get("pullback_pct", 0.0) or 0.0) < EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT:
@@ -3920,8 +4008,11 @@ def check_preclose_gap_entry_watch() -> None:
             _update_signal_log_execution_confirmed(watch.get("signal_log_key"), watch, entry_price, stop_price, target_price, metrics, hit_time, price)
             _register_active_entry_watch_from_confirmation(watch, entry_price, stop_price, target_price, price, hit_time)
             watch["entry_price"] = entry_price
+            changed = True
             watch["stop_loss"] = stop_price
+            changed = True
             watch["target_price"] = target_price
+            changed = True
             _send_preclose_gap_entry_hit_message(watch, price, use_nxt=use_nxt)
             print(f"  🎯 선진입 확정: {watch.get('name','')} {price:,} / 확정진입 {entry_price:,}")
             expired.append(key)
@@ -3929,6 +4020,9 @@ def check_preclose_gap_entry_watch() -> None:
             continue
     for key in expired:
         _preclose_gap_entry_watch.pop(key, None)
+        changed = True
+    if changed:
+        _save_preclose_gap_entry_watch()
 
 
 def update_preclose_gap_open_outcomes() -> None:
@@ -7430,7 +7524,10 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
                     "target":      rec.get("target_price", 0),
                     "signal_type": rec.get("signal_type", ""),
                     "ts":          time.time(),
+                    "nxt_listed":  bool(is_nxt_listed(code)),
+                    "market_basis": "NXT" if is_nxt_listed(code) else "KRX",
                 }
+                _save_reentry_watch()
                 print(f"  🔄 재진입 감시 등록: {name} ({code}) 손절가 {cur_price:,}")
         except Exception: pass
 
@@ -7442,6 +7539,7 @@ def check_reentry_watch():
     """
     if not _reentry_watch: return
     expired = []
+    changed = False
     for code, w in list(_reentry_watch.items()):
         # 종목별 실질 마감 판단
         nxt_ok  = is_nxt_open() and is_nxt_listed(code)
@@ -7496,6 +7594,9 @@ def check_reentry_watch():
         except Exception: continue
     for code in expired:
         _reentry_watch.pop(code, None)
+        changed = True
+    if changed:
+        _save_reentry_watch()
 
 def save_carry_stocks():
     with _file_lock:  # v38.3-P0-5
@@ -9184,6 +9285,7 @@ def check_entry_watch():
             # 최고가 갱신
             if price > watch.get("peak_price", 0):
                 watch["peak_price"] = price
+                changed = True
             if watch.get("entry_hit_locked"):
                 continue
 
@@ -16456,6 +16558,8 @@ if __name__ == "__main__":
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
+        _load_preclose_gap_entry_watch()
+        _load_reentry_watch()
         migrate_signal_log_pnl_fields()
         _load_dynamic_params()
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
@@ -16468,6 +16572,8 @@ if __name__ == "__main__":
 
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
+    _load_preclose_gap_entry_watch()
+    _load_reentry_watch()
     migrate_signal_log_pnl_fields()
     load_tracker_feedback()
     load_dynamic_themes()
@@ -16538,7 +16644,7 @@ if __name__ == "__main__":
     # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
     schedule.every().day.at("20:05").do(_leader_job(
         lambda: (
-            _reentry_watch.clear(),
+            _clear_reentry_watch_all(),
             _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
             print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() else None
