@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.46
+버전: v41.47
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2988,17 +2988,29 @@ def _entry_execution_judgement(metrics: dict | None = None) -> tuple[str, str]:
     return ("보통", "🟡 체결속도는 보통 수준 — 무리한 추격보다 분할/확인 우선")
 
 
-def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | None = None) -> str:
-    metrics = metrics or get_execution_speed_metrics(code, current_price=price) or {}
-    if not metrics:
+def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | None = None, fallback_metrics: dict | None = None) -> str:
+    current_metrics = metrics or get_execution_speed_metrics(code, current_price=price) or {}
+    if not current_metrics and not fallback_metrics:
         return ""
-    speed_score = int(metrics.get("execution_speed_score", 0) or 0)
-    dip_score = int(metrics.get("dip_resilience_score", 0) or 0)
-    filtered_ratio = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
+    base_metrics = current_metrics if current_metrics.get("ready") else (fallback_metrics or current_metrics)
+    if not base_metrics:
+        return ""
+    speed_score = int(base_metrics.get("execution_speed_score", 0) or 0)
+    dip_score = int(base_metrics.get("dip_resilience_score", 0) or 0)
+    filtered_ratio = float(base_metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
     speed_label = _execution_score_label(speed_score)
     dip_label = _execution_score_label(dip_score)
-    judgement_label, judgement_line = _entry_execution_judgement(metrics)
-    if not metrics.get("ready"):
+    judgement_label, judgement_line = _entry_execution_judgement(base_metrics)
+    if not current_metrics.get("ready"):
+        if fallback_metrics and fallback_metrics.get("ready"):
+            return (
+                "━━━━━━━━━━━━━━━\n"
+                f"⚡ <b>진입 시 체결속도</b>  현재 샘플 부족 (참고)\n"
+                f"📌 포착시 체결속도  {speed_score}점 ({speed_label})\n"
+                f"🪨 포착시 눌림 유지  {dip_score}점 ({dip_label})\n"
+                f"🧹 포착시 미세체결 제외  {filtered_ratio:.0f}%\n"
+                f"🧭 <b>참고</b>  — 현재 샘플이 부족해 포착시 체결 기준으로 표시합니다. 진입 전 호가를 한 번 더 확인하세요.\n"
+            )
         return (
             "━━━━━━━━━━━━━━━\n"
             f"⚡ <b>진입 시 체결속도</b>  샘플 부족 ({judgement_label})\n"
@@ -8883,6 +8895,7 @@ def register_entry_watch(s: dict):
         "sector_theme": s.get("sector_info", {}).get("theme", ""),  # v40.0-#2: 섹터 정보
         "change_at_detect": float(s.get("change_rate", 0) or 0),
         "volume_ratio": float(s.get("volume_ratio", 0) or 0),
+        "execution_metrics": dict(s.get("execution_metrics") or {}),
         "entry_reference_only": False,
         "entry_reference_market": "",
         "entry_reference_reason": "",
@@ -9444,7 +9457,12 @@ def check_entry_watch():
                     float(watch.get("volume_ratio", cur.get("volume_ratio", 0)) or 0),
                 )
                 _entry_exec_metrics = get_execution_speed_metrics(watch["code"], current_price=price)
-                _entry_exec_block = _entry_execution_status_block(watch["code"], price=price, metrics=_entry_exec_metrics)
+                _entry_exec_block = _entry_execution_status_block(
+                    watch["code"],
+                    price=price,
+                    metrics=_entry_exec_metrics,
+                    fallback_metrics=dict(watch.get("execution_metrics") or {}),
+                )
                 similar_block = ""
                 try:
                     _similar_line = _build_similar_pattern_summary_block(_similar_stats, top_exposed=True)
@@ -14749,9 +14767,10 @@ def _market_leader_profile(now_dt: datetime | None = None) -> dict:
     hhmm = now_dt.strftime("%H:%M")
     is_morning_open = "09:00" <= hhmm < "09:30"
     is_morning = "09:30" <= hhmm < "10:30"
-    leader_min = 4.5 if is_morning_open else 6.0 if is_morning else 7.0
-    score_min = 58 if is_morning_open else 64 if is_morning else 68
-    follow_min = 1.2 if is_morning_open else 1.5 if is_morning else 2.0
+    # 오전/이슈장엔 더 빨리 잡히게, 일반장도 지나치게 높지 않게 조정
+    leader_min = 4.0 if is_morning_open else 5.5 if is_morning else 6.5
+    score_min = 54 if is_morning_open else 60 if is_morning else 64
+    follow_min = 0.8 if is_morning_open else 1.2 if is_morning else 1.6
     max_sections = 4 if is_morning_open or is_morning else 3
     return {
         "leader_min": leader_min,
@@ -14783,6 +14802,15 @@ def _collect_market_leader_seed_stocks() -> list:
             seeds.extend(get_volume_surge_stocks()[:16])
         if is_nxt_open():
             seeds.extend(get_nxt_surge_stocks()[:10])
+        for item in list(_dynamic_candidates or [])[:24]:
+            if isinstance(item, dict):
+                seeds.append(item)
+        try:
+            for item in list(get_all_scan_candidates() or [])[:24]:
+                if isinstance(item, dict):
+                    seeds.append(item)
+        except Exception:
+            pass
     except Exception as e:
         print(f"⚠️ 시장 주도 섹터 seed 수집 오류: {e}")
     seen = set()
@@ -14836,6 +14864,7 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     profile = _market_leader_profile(now_dt)
     seeds = _collect_market_leader_seed_stocks()
     if not seeds:
+        print("ℹ️ 시장 주도 섹터 생략 — seed 0건")
         return {}
     market_chg = get_kospi_change()
     candidate_themes = {}
@@ -14866,6 +14895,9 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
             bucket["members"].setdefault(peer_code, peer_name)
     if upper_seed_cnt >= 1 or strong_seed_cnt >= 2:
         event_mode = True
+    if not candidate_themes:
+        print("ℹ️ 시장 주도 섹터 생략 — 유효 테마 0개")
+        return {}
     leader_min = max(3.8, profile["leader_min"] - (1.0 if event_mode else 0.0))
     score_min = max(52, profile["score_min"] - (5 if event_mode else 0))
     follow_min = max(1.0, profile["follow_min"] - (0.3 if event_mode else 0.0))
@@ -16614,7 +16646,7 @@ if __name__ == "__main__":
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
-    schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
+    schedule.every(5).minutes.do(lambda: send_market_leading_sector_update(force=False))
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
