@@ -3,11 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.55
+버전: v41.56
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.56 (2026-03-13): 체결속도 사전 워밍(prewarm) 구조 추가.
+  [#1] `_exec_speed_prewarm: dict` 전역변수와 상수 `EXEC_SPEED_PREWARM_MAX_SEC(120초)` /
+       `EXEC_SPEED_PREWARM_MAX_CODES(5종목)`를 추가해 포착 시점부터 체결속도 스냅샷을
+       사전 누적하는 전용 워밍 버킷을 마련.
+  [#2] `_tick_exec_speed_prewarm()` 함수를 추가해 run_scan() 1사이클(20초)마다
+       prewarm 버킷에 있는 종목의 최근 샘플 수를 확인하고, EXEC_SPEED_MIN_SAMPLES 미만이면
+       get_stock_price()/get_nxt_stock_price()를 호출해 스냅샷을 추가 누적.
+       120초 경과 또는 샘플 충족 시 자동 해제. API 부담 제한: 동시 최대 5종목, 등록 최신순 처리.
+  [#3] `register_entry_watch()` 및 `_register_execution_setup_watch()`에서 포착 등록 직후
+       `_exec_speed_prewarm[code] = time.time()`을 추가해 워밍이 즉시 시작되도록 연결.
+  [#4] `run_scan()` 의 `check_entry_watch()` 호출 직전에 `_tick_exec_speed_prewarm()`을
+       삽입해 진입가 도달 판단 전 스냅샷 최신 상태를 보장.
+  이유: 포착 직후 빠르게 진입가에 도달하면 스냅샷이 EXEC_SPEED_MIN_SAMPLES(4개) 미만이어서
+       "샘플 부족" 메시지가 표시되는 문제 개선. 체결속도의 목적(급등 종목 안정적 진입 보조)에
+       맞게 포착 단계부터 데이터를 쌓기 시작하도록 구조 변경.
+  주의점: 진입가 도달 메시지 자체는 샘플 부족 여부와 무관하게 반드시 발송됨(기존 동작 유지).
+          매우 빠른 진입(포착 후 20초 이내)은 여전히 샘플 부족 가능 — 이 경우에도 도달 메시지는 발송됨.
+  개선점: 포착 후 60~80초 이후 도달 케이스의 샘플 부족 빈도↓, 체결속도 판단 유효성↑.
+
 - v41.55 (2026-03-13): track_signal_results 수급 이탈 경고 블록 버그 2건 수정.
   [BUG-1 🔴 NameError] 7749줄 수급 이탈 경고 메시지에서 미정의 변수 `cur_price` / `pnl_pct` 참조.
   `risk_flag=True` 조건 충족 시 반드시 NameError 발생해 경고 메시지가 전송되지 않고 except로 묻히던 문제.
@@ -3055,7 +3074,10 @@ EXEC_SPEED_CONFIRM_MIN_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MIN_PU
 EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT = float(os.getenv("EXEC_SPEED_CONFIRM_MAX_PULLBACK_PCT", "3.2") or "3.2")
 EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.72") or "0.72")
 EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
+EXEC_SPEED_PREWARM_MAX_SEC   = int(os.getenv("EXEC_SPEED_PREWARM_MAX_SEC",   "120")  or "120")   # 포착 후 워밍 최대 기간(초)
+EXEC_SPEED_PREWARM_MAX_CODES = int(os.getenv("EXEC_SPEED_PREWARM_MAX_CODES", "5")    or "5")     # 동시 워밍 최대 종목 수 (API 부담 제한)
 _execution_snapshots: dict = {}
+_exec_speed_prewarm: dict = {}          # code → registered_ts, 포착 직후 스냅샷 사전 누적용
 _execution_setup_watch: dict = {}
 _execution_setup_watch_last_persist_ts: float = 0.0
 
@@ -3204,6 +3226,56 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
     out["ready"] = True
     out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
     return out
+
+
+def _tick_exec_speed_prewarm() -> None:
+    """포착 직후 등록된 종목의 체결속도 스냅샷을 사전 누적 (진입가 도달 시 샘플 부족 최소화).
+
+    run_scan() 1사이클(20초)마다 호출되며, check_entry_watch() 직전에 실행해
+    진입가 도달 판단 전 스냅샷 상태를 최신으로 유지한다.
+    - 샘플이 EXEC_SPEED_MIN_SAMPLES 이상이면 해당 종목 워밍 해제.
+    - EXEC_SPEED_PREWARM_MAX_SEC 초 경과 시 자동 해제 (방치 방지).
+    - API 부담 제한: 가장 최근 등록 종목 기준 최대 EXEC_SPEED_PREWARM_MAX_CODES개만 처리.
+    """
+    global _exec_speed_prewarm
+    if not _exec_speed_prewarm:
+        return
+    now_ts = time.time()
+
+    # 만료 정리
+    expired_codes = [c for c, ts in list(_exec_speed_prewarm.items())
+                     if now_ts - ts > EXEC_SPEED_PREWARM_MAX_SEC]
+    for c in expired_codes:
+        _exec_speed_prewarm.pop(c, None)
+    if not _exec_speed_prewarm:
+        return
+
+    krx_ok = is_market_open()
+    nxt_ok = is_nxt_open()
+
+    # 최근 등록 순으로 최대 N개만 처리
+    targets = sorted(_exec_speed_prewarm.items(), key=lambda x: x[1], reverse=True)
+    targets = targets[:EXEC_SPEED_PREWARM_MAX_CODES]
+
+    for code, _reg_ts in targets:
+        # 현재 유효 샘플 수 확인
+        samples = _execution_snapshots.get(code) or []
+        recent_count = sum(
+            1 for s in samples
+            if float(s.get("ts", 0) or 0) >= now_ts - EXEC_SPEED_WINDOW_SEC
+        )
+        if recent_count >= EXEC_SPEED_MIN_SAMPLES:
+            # 충분히 쌓임 → 워밍 해제
+            _exec_speed_prewarm.pop(code, None)
+            continue
+        # 스냅샷 1회 추가 수집 (시장 상태에 따라 KRX/NXT 선택)
+        try:
+            if krx_ok:
+                get_stock_price(code)
+            elif nxt_ok and is_nxt_listed(code):
+                get_nxt_stock_price(code)
+        except Exception:
+            pass
 
 
 def _execution_setup_required(signal_type: str) -> bool:
@@ -3430,6 +3502,7 @@ def _register_execution_setup_watch(s: dict) -> None:
         "signal_log_key": signal_log_key,
         "execution_metrics": metrics,
     }
+    _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
     _save_execution_setup_watch()
     print(f"  ⚡ 체결확인 대기 등록: {s.get('name', code)} [{s.get('signal_type','')}] 예상진입 {safe_int(s.get('entry_price',0),0):,}원")
 
@@ -9451,6 +9524,7 @@ def register_entry_watch(s: dict):
         "entry_watch_state": "active",
     }
     _save_entry_watch_active()
+    _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
 def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
@@ -17104,6 +17178,7 @@ def run_scan():
                 # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
         check_execution_setup_watch()  # ★ 체결속도 확인 후 진입 확정 체크
+        _tick_exec_speed_prewarm()     # ★ 체결속도 사전 워밍 — 진입가 도달 전 샘플 최신화
         check_entry_watch()     # ★ 진입가 도달 체크
         check_preclose_gap_entry_watch()  # ★ 장마감 전 선진입가 도달 체크
         run_entry_defense_monitor()  # 🛡 장마감 손익 방어 가이드
