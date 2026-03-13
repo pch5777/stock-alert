@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.54
+버전: v41.55
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.55 (2026-03-13): track_signal_results 수급 이탈 경고 블록 버그 2건 수정.
+  [BUG-1 🔴 NameError] 7749줄 수급 이탈 경고 메시지에서 미정의 변수 `cur_price` / `pnl_pct` 참조.
+  `risk_flag=True` 조건 충족 시 반드시 NameError 발생해 경고 메시지가 전송되지 않고 except로 묻히던 문제.
+  수정: `cur_price` → `price`, `pnl_pct` → `pnl_now` (동일 함수 스코프 내 올바른 변수로 교체).
+  [BUG-2 🟡 코드품질] 7740줄 `lines = ""` 로컬 변수가 혼동을 유발하는 명명.
+  수정: `out_lines`로 변경해 가독성 및 유지보수성 개선. 동작 변경 없음.
+  개선점: 수급 이탈 경고 메시지 정상 발송↑, 변수명 혼동 위험↓.
+  주의점: `_weak_now = [k for k, v in _rot.get("weak", [])]` 구조는 `weak`가 항상 `list[tuple]`로 반환되므로 안전 — 수정 불필요 확인.
+
 - v41.54 (2026-03-13): 같은 종목 근접 재포착을 거래 에피소드 1건으로 통합하고, 대표 진입가/최종 결과를 단일 기준으로 고정.
   [#1] 같은 종목·같은 신호가 비슷한 시점에 다시 포착될 때 `signal_log`에 별도 활성 추적 레코드를 계속 늘리지 않고, 기존 대표 레코드에 `episode_candidates` / `entry_update_history`를 누적하는 구조로 정리.
   [#2] `register_entry_watch()`와 체결확정/실행준비 경로에서 대표 외 활성 레코드는 `대표진입승계` 상태로 정리하고, 사용자에게 제시되는 실전 진입 기준은 에피소드당 1건만 유지하도록 보강.
@@ -7737,16 +7746,16 @@ def track_signal_results():
                             _tracking_notified.add(fp_key)
                             out_patterns = [p for p in fp.get("patterns", [])
                                             if p.get("score_adj", 0) < 0]
-                            lines = ""
+                            out_lines = ""
                             for op in out_patterns[:3]:
                                 ce = {"high":"🔴","mid":"🟡","low":""}.get(op.get("confidence","low"),"")
                                 ck = {"high":"신뢰높음","mid":"참고용"}.get(op.get("confidence",""),"참고용")
-                                lines += f"  {ce} {op['label']} [{ck}]\n  └ {op['detail']}\n"
+                                out_lines += f"  {ce} {op['label']} [{ck}]\n  └ {op['detail']}\n"
                             send(
                                 f"🔴 <b>[수급 이탈 경고]  {name}</b>\n"
                                 f"━━━━━━━━━━━━━━━\n"
-                                f"{lines}"
-                                f"현재가: {cur_price:,}원  ({pnl_pct:+.1f}%)\n"
+                                f"{out_lines}"
+                                f"현재가: {price:,}원  ({pnl_now:+.1f}%)\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"⚠️ 통계적 패턴 감지 — 확증 아님, 익절/손절 직접 판단 필요"
                             )
