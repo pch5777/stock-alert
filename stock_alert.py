@@ -3,17 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.47
+버전: v41.49
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.46 (2026-03-13): v41.45 1단계 저장형 반영본의 코드 내부 버전/변경이력 표기 누락 수정.
-  [#1] 상단 `버전:` 문자열을 실제 파일 상태에 맞게 `v41.46`으로 갱신해, 시작 메시지/로그/버전 파싱이 파일명과 어긋나지 않도록 정리.
-  [#2] 변경이력 최상단에 이번 수정 이력을 추가하고, 직전 v41.45 반영 내용(_preclose_gap_entry_watch / _reentry_watch 파일 저장형, NXT 정보 포함 저장/복구)이 코드 내부 이력과도 일관되게 이어지도록 정리.
-  [#3] 추가로 코드 내부에 남아 있던 `v41.44` 표기를 전수 확인해 상단 버전/최상단 변경이력 불일치 외 다른 버전 잔존 표기가 없음을 점검.
-  이유: 파일명은 v41.45였지만 코드 내부 버전과 변경이력이 v41.44로 남아 있어, 시작 메시지와 로그상 버전 표시가 실제 수정 상태와 어긋나는 문제가 있었기 때문.
-  개선점: 파일명/내부 버전/변경이력 일치, 운영 중 버전 추적 정확성↑.
+- v41.49 (2026-03-13): 2단계 반영본 보정 — `_execution_setup_watch` 저장형 helper 정의 누락 수정.
+  [#1] `_save_execution_setup_watch()` / `_load_execution_setup_watch()` 정의를 실제 코드 본문에 추가해, 실행 중 저장 호출과 시작 시 복구 호출이 런타임 `NameError` 없이 동작하도록 정리.
+  [#2] 기존 v41.48에서 넣었던 `execution_setup_watch.json` 상수, 등록/변경/정리 시 저장, 시작 시 복구 호출은 그대로 유지.
+  이유: 2단계 저장형을 반영하면서 helper 호출은 넣었지만 정의 블록이 빠져 있어, 재시작 또는 등록 시 런타임 오류가 날 수 있는 상태였기 때문.
+  개선점: 체결확인 대기 저장/복구 안정성↑, 2단계 반영 일관성↑.
+
 
 [변경 이력]
 - v41.44 (2026-03-13): 시장 주도 섹터 메시지 추가 및 오전/이슈장 가중형 발송 로직 도입.
@@ -2699,6 +2699,7 @@ NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.js
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 PRECLOSE_GAP_ENTRY_WATCH_FILE = os.path.join(DATA_DIR, "preclose_gap_entry_watch.json")
 REENTRY_WATCH_FILE = os.path.join(DATA_DIR, "reentry_watch.json")
+EXECUTION_SETUP_WATCH_FILE = os.path.join(DATA_DIR, "execution_setup_watch.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
 NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
 NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
@@ -2795,6 +2796,47 @@ def _load_reentry_watch() -> None:
 def _clear_reentry_watch_all() -> None:
     _reentry_watch.clear()
     _save_reentry_watch()
+
+def _save_execution_setup_watch() -> None:
+    try:
+        _write_json_atomic(EXECUTION_SETUP_WATCH_FILE, _execution_setup_watch if isinstance(_execution_setup_watch, dict) else {}, indent=2)
+    except Exception:
+        pass
+
+def _load_execution_setup_watch() -> None:
+    global _execution_setup_watch
+    try:
+        raw = _read_json_safe(EXECUTION_SETUP_WATCH_FILE, {})
+        if not isinstance(raw, dict):
+            _execution_setup_watch = {}
+            return
+        now_ts = time.time()
+        restored = {}
+        for key, watch in raw.items():
+            if not isinstance(watch, dict):
+                continue
+            code = normalize_stock_code(watch.get("code"))
+            expire_ts = float(watch.get("expire_ts", 0) or 0)
+            if not code:
+                continue
+            if expire_ts and now_ts >= expire_ts:
+                continue
+            watch["code"] = code
+            watch.setdefault("name", watch.get("name", code))
+            watch.setdefault("signal_type", watch.get("signal_type", ""))
+            watch.setdefault("registered_ts", now_ts)
+            watch.setdefault("last_price", safe_int(watch.get("last_price", 0), 0))
+            watch.setdefault("peak_price", safe_int(watch.get("peak_price", 0), 0))
+            watch.setdefault("signal_log_key", str(watch.get("signal_log_key", key) or key))
+            watch.setdefault("detect_time", str(watch.get("detect_time", "") or ""))
+            watch.setdefault("market_basis", str(watch.get("market_basis", "") or ""))
+            watch.setdefault("stage", str(watch.get("stage", "") or ""))
+            restored[str(key)] = watch
+        _execution_setup_watch = restored
+        if raw != restored:
+            _save_execution_setup_watch()
+    except Exception:
+        _execution_setup_watch = {}
 
 FAST_EXECUTION_SIGNAL_TYPES = {"EARLY_DETECT", "NEAR_UPPER", "SURGE", PRECLOSE_GAP_SIGNAL_TYPE}
 ENTRY_EXECUTION_SIGNAL_TYPES = {"ENTRY_POINT"}
@@ -3129,9 +3171,11 @@ def _register_execution_setup_watch(s: dict) -> None:
     code = normalize_stock_code(s.get("code"))
     if not code:
         return
+    removed_existing = False
     for old_key, watch in list(_execution_setup_watch.items()):
         if normalize_stock_code(watch.get("code")) == code and str(watch.get("signal_type", "")) == str(s.get("signal_type", "")):
             _execution_setup_watch.pop(old_key, None)
+            removed_existing = True
     metrics = dict(s.get("execution_metrics") or {})
     now_dt = datetime.now()
     log_key = f"{code}_{now_dt.strftime('%Y%m%d%H%M')}"
@@ -3289,6 +3333,7 @@ def check_execution_setup_watch() -> None:
     if not _execution_setup_watch:
         return
     expired = []
+    changed_any = False
     for key, watch in list(_execution_setup_watch.items()):
         try:
             if time.time() >= float(watch.get("expire_ts", 0) or 0):
@@ -3301,12 +3346,15 @@ def check_execution_setup_watch() -> None:
                 continue
             watch["last_price"] = price
             changed = True
+            changed_any = True
             if price > safe_int(watch.get("peak_price", 0), 0):
                 watch["peak_price"] = price
                 changed = True
+                changed_any = True
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
             watch["execution_metrics"] = metrics
             changed = True
+            changed_any = True
             min_speed, min_dip = _entry_execution_confirmation_threshold(watch.get("signal_type"))
             pullback_pct = float(metrics.get("pullback_pct", 0.0) or 0.0)
             if not metrics.get("ready"):
@@ -3338,6 +3386,9 @@ def check_execution_setup_watch() -> None:
             continue
     for key in expired:
         _execution_setup_watch.pop(key, None)
+        changed_any = True
+    if changed_any:
+        _save_execution_setup_watch()
 
 def build_next_open_watchlist(max_codes: int = 30) -> dict:
     """장 종료 후: 내일 감시할 워치리스트를 생성해서 파일로 저장."""
@@ -16600,6 +16651,7 @@ if __name__ == "__main__":
         load_carry_stocks()
         _load_preclose_gap_entry_watch()
         _load_reentry_watch()
+        _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
         _load_dynamic_params()
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
@@ -16614,6 +16666,7 @@ if __name__ == "__main__":
     load_carry_stocks()
     _load_preclose_gap_entry_watch()
     _load_reentry_watch()
+    _load_execution_setup_watch()
     migrate_signal_log_pnl_fields()
     load_tracker_feedback()
     load_dynamic_themes()
