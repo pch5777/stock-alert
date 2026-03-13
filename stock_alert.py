@@ -3366,9 +3366,13 @@ def _register_execution_setup_watch(s: dict) -> None:
     code = normalize_stock_code(s.get("code"))
     if not code:
         return
+    existing_watch = _latest_entry_watch_by_code(code)
+    if isinstance(existing_watch, dict) and (existing_watch.get("entry_hit") or existing_watch.get("entry_hit_locked")):
+        print(f"  🔒 체결확인 대기 생략: {_resolve_stock_name(code, s.get('name', code))} (이미 대표 진입 확정)")
+        return
     removed_existing = False
     for old_key, watch in list(_execution_setup_watch.items()):
-        if normalize_stock_code(watch.get("code")) == code and str(watch.get("signal_type", "")) == str(s.get("signal_type", "")):
+        if normalize_stock_code(watch.get("code")) == code:
             _execution_setup_watch.pop(old_key, None)
             removed_existing = True
     metrics = dict(s.get("execution_metrics") or {})
@@ -3444,8 +3448,10 @@ def _update_signal_log_execution_confirmed(log_key: str | None, watch: dict, ent
             target_key = _k
     if not target_key:
         return
+    _merge_tracking_episode_records(data, watch.get("code"), target_key, reason="체결확정_대표레코드통합")
     rec = data.get(target_key) or {}
     rec["status"] = "추적중"
+    rec["episode_representative"] = True
     rec["entry_price"] = int(entry_price)
     rec["stop_price"] = int(stop_price)
     rec["target_price"] = int(target_price)
@@ -3470,6 +3476,12 @@ def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int
     code = normalize_stock_code(watch.get("code"))
     if not code:
         return
+    for old_key, old_watch in list(_entry_watch.items()):
+        if normalize_stock_code((old_watch or {}).get("code")) != code:
+            continue
+        archived_watch = _entry_watch.pop(old_key, None)
+        if archived_watch:
+            _archive_entry_watch_record(old_key, archived_watch, consume_reason="체결확정_대표진입승계", final_status="대표진입승계")
     key = f"{code}_{datetime.now().strftime('%Y%m%d%H%M%S')}_active"
     _entry_watch[key] = {
         "code": code,
@@ -6744,6 +6756,126 @@ def _is_real_trade(rec: dict) -> bool:
         return False
     return True
 
+TRACK_ACTIVE_STATUSES = {"추적중", "진입준비"}
+TRACK_EPISODE_CANDIDATE_KEEP = int(os.getenv("TRACK_EPISODE_CANDIDATE_KEEP", "12") or "12")
+TRACK_ENTRY_UPDATE_HISTORY_KEEP = int(os.getenv("TRACK_ENTRY_UPDATE_HISTORY_KEEP", "8") or "8")
+
+
+def _extract_signal_detect_datetime(stock: dict | None) -> datetime:
+    stock = stock or {}
+    detected_at = stock.get("detected_at")
+    if isinstance(detected_at, datetime):
+        return detected_at
+    return datetime.now()
+
+
+def _build_tracking_episode_candidate(stock: dict | None, reason: str = "신호포착") -> dict:
+    stock = stock or {}
+    detected_at = _extract_signal_detect_datetime(stock)
+    return {
+        "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": str(reason or "신호포착"),
+        "detect_date": detected_at.strftime("%Y%m%d"),
+        "detect_time": detected_at.strftime("%H:%M:%S"),
+        "signal_type": str(stock.get("signal_type", "") or ""),
+        "entry_price": safe_int(stock.get("entry_price", stock.get("price", 0)), 0),
+        "stop_price": safe_int(stock.get("stop_loss", 0), 0),
+        "target_price": safe_int(stock.get("target_price", 0), 0),
+        "detect_price": safe_int(stock.get("price", 0), 0),
+        "change_rate": safe_float(stock.get("change_rate", 0.0), 0.0),
+        "volume_ratio": safe_float(stock.get("volume_ratio", 0.0), 0.0),
+        "score": safe_int(stock.get("score", 0), 0),
+        "grade": str(stock.get("grade", "") or ""),
+    }
+
+
+def _append_tracking_episode_candidate(rec: dict | None, candidate: dict | None) -> None:
+    if not isinstance(rec, dict) or not isinstance(candidate, dict):
+        return
+    items = list(rec.get("episode_candidates") or [])
+    items.append(candidate)
+    keep = max(2, TRACK_EPISODE_CANDIDATE_KEEP)
+    rec["episode_candidates"] = items[-keep:]
+    rec["episode_candidate_count"] = len(rec["episode_candidates"])
+    rec["episode_last_signal_time"] = f"{candidate.get('detect_date', '')} {candidate.get('detect_time', '')}".strip()
+
+
+def _append_tracking_entry_update(rec: dict | None, old_entry: int, new_entry: int, reason: str = "재포착대표진입갱신") -> None:
+    if not isinstance(rec, dict):
+        return
+    old_entry = safe_int(old_entry, 0)
+    new_entry = safe_int(new_entry, 0)
+    if old_entry <= 0 or new_entry <= 0 or old_entry == new_entry:
+        return
+    hist = list(rec.get("entry_update_history") or [])
+    hist.append({
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": str(reason or "재포착대표진입갱신"),
+        "old_entry": old_entry,
+        "new_entry": new_entry,
+    })
+    keep = max(2, TRACK_ENTRY_UPDATE_HISTORY_KEEP)
+    rec["entry_update_history"] = hist[-keep:]
+    rec["entry_update_count"] = len(rec["entry_update_history"])
+    rec["last_entry_update_time"] = rec["entry_update_history"][-1].get("updated_at", "")
+
+
+def _tracking_active_items(data: dict | None, code: str = "") -> list[tuple[str, dict]]:
+    data = data or {}
+    code = normalize_stock_code(code)
+    items = []
+    for _k, _rec in data.items():
+        if not isinstance(_rec, dict):
+            continue
+        if _rec.get("status") not in TRACK_ACTIVE_STATUSES:
+            continue
+        if code and normalize_stock_code(_rec.get("code")) != code:
+            continue
+        items.append((_k, _rec))
+    return items
+
+
+def _find_representative_tracking_log_key(data: dict | None, code: str, preferred_key: str = "") -> str:
+    code = normalize_stock_code(code)
+    if not code:
+        return ""
+    data = data or {}
+    if preferred_key:
+        pref = data.get(preferred_key)
+        if isinstance(pref, dict) and pref.get("status") in TRACK_ACTIVE_STATUSES and normalize_stock_code(pref.get("code")) == code:
+            return preferred_key
+    items = _tracking_active_items(data, code)
+    if not items:
+        return ""
+    best_key, _ = max(items, key=lambda kv: _tracking_record_sort_key(kv[1]))
+    return best_key
+
+
+def _merge_tracking_episode_records(data: dict | None, code: str, representative_key: str, reason: str = "대표레코드통합") -> bool:
+    data = data or {}
+    code = normalize_stock_code(code)
+    if not code or not representative_key or representative_key not in data:
+        return False
+    changed = False
+    for _k, _rec in data.items():
+        if _k == representative_key or not isinstance(_rec, dict):
+            continue
+        if _rec.get("status") not in TRACK_ACTIVE_STATUSES:
+            continue
+        if normalize_stock_code(_rec.get("code")) != code:
+            continue
+        _rec["status"] = "대표진입승계"
+        _rec["exit_reason"] = str(reason or "대표레코드통합")
+        _rec["pnl_pct"] = 0.0
+        _rec["merged_into_log_key"] = representative_key
+        _rec["episode_representative"] = False
+        changed = True
+    rep = data.get(representative_key)
+    if isinstance(rep, dict):
+        rep["episode_representative"] = True
+    return changed
+
+
 def save_signal_log(stock: dict):
     """
     알림 발송된 모든 신호를 로그에 저장
@@ -6754,39 +6886,37 @@ def save_signal_log(stock: dict):
         data = {}
         try:
             data = _read_json_locked(SIGNAL_LOG_FILE)
-        except Exception: pass
+        except Exception:
+            pass
 
-        code     = stock["code"]
+        code = normalize_stock_code(stock["code"])
         stock_name = _resolve_stock_name(code, stock.get("name", ""))
         stock["name"] = stock_name
         sig_type = stock.get("signal_type", "UNKNOWN")
-        # 같은 종목이 이미 추적 중이면 업데이트하지 않음 (중복 방지)
-        log_key  = f"{code}_{stock.get('detected_at', datetime.now()).strftime('%Y%m%d%H%M')}"
+        detected_at = _extract_signal_detect_datetime(stock)
+        detect_date = detected_at.strftime("%Y%m%d")
+        detect_time = detected_at.strftime("%H:%M:%S")
+        log_key = f"{code}_{detected_at.strftime('%Y%m%d%H%M')}"
 
-        # 신호 발생 시 활성화된 기능 플래그 기록
-        indic    = stock.get("indic", {})
+        indic = stock.get("indic", {})
         position = stock.get("position", {})
         _geo_st = _geo_event_state if _geo_event_state.get("active") else {}
         feature_flags = {
-            "rsi":              indic.get("rsi", 50),
-            "ma_aligned":       indic.get("ma", {}).get("aligned"),
-            "bb_breakout":      indic.get("bb", {}).get("breakout", False),
-            "sector_bonus":     stock.get("sector_info", {}).get("bonus", 0),
-            "regime":           stock.get("regime", "normal"),
-            "earnings_risk":    stock.get("earnings_risk", "none"),
-            "position_pct":     position.get("pct", 8.0),
-            "nxt_delta":        stock.get("nxt_delta", 0),
-            "indic_score_adj":  indic.get("score_adj", 0),
-            # ── 지정학 이벤트 기여도 (auto_tune 학습용) ──
-            "geo_active":       bool(_geo_st),
-            "geo_uncertainty":  _geo_st.get("uncertainty", ""),
-            "geo_sector_adj":   locals().get("_geo_adj_applied", 0),
+            "rsi": indic.get("rsi", 50),
+            "ma_aligned": indic.get("ma", {}).get("aligned"),
+            "bb_breakout": indic.get("bb", {}).get("breakout", False),
+            "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
+            "regime": stock.get("regime", "normal"),
+            "earnings_risk": stock.get("earnings_risk", "none"),
+            "position_pct": position.get("pct", 8.0),
+            "nxt_delta": stock.get("nxt_delta", 0),
+            "indic_score_adj": indic.get("score_adj", 0),
+            "geo_active": bool(_geo_st),
+            "geo_uncertainty": _geo_st.get("uncertainty", ""),
+            "geo_sector_adj": locals().get("_geo_adj_applied", 0),
         }
 
-
-        # ── 최적화용 스냅샷 (신호 당시 조건/상황) ──
         params_snapshot = _get_params_snapshot()
-        # v39.4: korea_etf_snapshot 변수 정의 (NameError 방지)
         try:
             korea_etf_snapshot = _get_korea_etf_snapshot(code, stock_name, sig_type, stock.get("sector_info", {}).get("theme", ""))
         except Exception:
@@ -6814,52 +6944,130 @@ def save_signal_log(stock: dict):
         }
 
         track_status = "진입준비" if stock.get("execution_setup_required") else "추적중"
+        candidate = _build_tracking_episode_candidate(stock, reason="신호포착")
+        representative_key = _find_representative_tracking_log_key(data, code)
+        if representative_key and isinstance(data.get(representative_key), dict):
+            rec = data.get(representative_key) or {}
+            _append_tracking_episode_candidate(rec, candidate)
+            _merge_tracking_episode_records(data, code, representative_key, reason="대표레코드통합")
+            rec.setdefault("first_detect_date", rec.get("detect_date", detect_date))
+            rec.setdefault("first_detect_time", rec.get("detect_time", detect_time))
+            rec["last_detect_date"] = detect_date
+            rec["last_detect_time"] = detect_time
+            sig_hist = list(rec.get("signal_type_history") or [])
+            if rec.get("signal_type") and rec.get("signal_type") not in sig_hist:
+                sig_hist.append(rec.get("signal_type"))
+            if sig_type and sig_type not in sig_hist:
+                sig_hist.append(sig_type)
+            rec["signal_type_history"] = sig_hist[-TRACK_EPISODE_CANDIDATE_KEEP:]
+            rec["latest_signal_score"] = stock.get("score", rec.get("score", 0))
+            rec["latest_signal_grade"] = stock.get("grade", rec.get("grade", "B"))
+            rec["episode_representative"] = True
+            rec["log_key"] = representative_key
+            stock["signal_log_key"] = representative_key
+            if not rec.get("entry_hit"):
+                prev_entry = safe_int(rec.get("entry_price", 0), 0)
+                next_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
+                _append_tracking_entry_update(rec, prev_entry, next_entry, reason="재포착대표진입갱신")
+                rec["name"] = stock_name
+                rec["signal_type"] = sig_type or rec.get("signal_type", "")
+                rec["score"] = stock.get("score", rec.get("score", 0))
+                rec["grade"] = stock.get("grade", rec.get("grade", "B"))
+                rec["market_regime"] = MARKET_REGIME.get("label", "unknown")
+                rec["market_regime_det"] = market_regime_details()
+                rec["geo_sector_bias"] = globals().get('GEO_SECTOR_BIAS', {})
+                rec["sector_bonus"] = stock.get("sector_info", {}).get("bonus", 0)
+                rec["sector_theme"] = stock.get("sector_info", {}).get("theme", "")
+                rec["detect_price"] = stock["price"]
+                rec["change_at_detect"] = stock.get("change_rate", 0)
+                rec["volume_ratio"] = stock.get("volume_ratio", 0)
+                rec["rsi_at_signal"] = indic.get("rsi", 50)
+                rec["entry_price"] = next_entry
+                rec["stop_price"] = stock.get("stop_loss", 0)
+                rec["target_price"] = stock.get("target_price", 0)
+                rec["atr_used"] = stock.get("atr_used", False)
+                rec["feature_flags"] = feature_flags
+                rec["params_snapshot"] = params_snapshot
+                rec["feature_snapshot"] = feature_snapshot
+                rec["korea_etf_snapshot"] = korea_etf_snapshot
+                rec["execution_setup_required"] = bool(stock.get("execution_setup_required"))
+                rec["planned_entry_price"] = safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0)
+                rec["status"] = track_status
+                rec["max_price"] = max(safe_int(rec.get("max_price", 0), 0), safe_int(stock.get("price", 0), 0))
+                min_prev = safe_int(rec.get("min_price", stock.get("price", 0)), safe_int(stock.get("price", 0), 0))
+                rec["min_price"] = min(min_prev or safe_int(stock.get("price", 0), 0), safe_int(stock.get("price", 0), 0))
+                rec["entry_blocked"] = False
+                rec["entry_blocked_reason"] = ""
+                rec["entry_blocked_time"] = ""
+                rec["entry_blocked_price"] = 0
+                rec["entry_reference_only"] = False
+                rec["entry_reference_market"] = ""
+                rec["entry_reference_reason"] = ""
+                rec["entry_reference_time"] = ""
+                rec["entry_reference_date"] = ""
+                rec["entry_reference_clock"] = ""
+                rec["entry_reference_price"] = 0
+            data = _prune_signal_log(data)
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+            print(f"  💾 신호 저장(대표갱신): {stock['name']} [{sig_type}] → {representative_key}")
+            return
+
         data[log_key] = {
-            "log_key":      log_key,
-            "code":         code,
-            "name":         stock_name,
-            "signal_type":  sig_type,
-            "score":        stock.get("score", 0),
-            "grade":        stock.get("grade", "B"),
-            "market_regime": MARKET_REGIME.get("label","unknown"),
+            "log_key": log_key,
+            "code": code,
+            "name": stock_name,
+            "signal_type": sig_type,
+            "signal_type_history": [sig_type] if sig_type else [],
+            "score": stock.get("score", 0),
+            "grade": stock.get("grade", "B"),
+            "latest_signal_score": stock.get("score", 0),
+            "latest_signal_grade": stock.get("grade", "B"),
+            "market_regime": MARKET_REGIME.get("label", "unknown"),
             "market_regime_det": market_regime_details(),
             "geo_sector_bias": globals().get('GEO_SECTOR_BIAS', {}),
             "sector_bonus": stock.get("sector_info", {}).get("bonus", 0),
             "sector_theme": stock.get("sector_info", {}).get("theme", ""),
-            "detect_date":  datetime.now().strftime("%Y%m%d"),
-            "detect_time":  datetime.now().strftime("%H:%M:%S"),
+            "detect_date": detect_date,
+            "detect_time": detect_time,
+            "first_detect_date": detect_date,
+            "first_detect_time": detect_time,
+            "last_detect_date": detect_date,
+            "last_detect_time": detect_time,
             "detect_price": stock["price"],
             "change_at_detect": stock.get("change_rate", 0),
             "volume_ratio": stock.get("volume_ratio", 0),
             "rsi_at_signal": indic.get("rsi", 50),
-            "entry_price":  stock.get("entry_price", stock["price"]),
-            "stop_price":   stock.get("stop_loss", 0),
+            "entry_price": stock.get("entry_price", stock["price"]),
+            "stop_price": stock.get("stop_loss", 0),
             "target_price": stock.get("target_price", 0),
-            "atr_used":     stock.get("atr_used", False),
+            "atr_used": stock.get("atr_used", False),
             "feature_flags": feature_flags,
-            "params_snapshot":   params_snapshot,
-            "feature_snapshot":  feature_snapshot,
+            "params_snapshot": params_snapshot,
+            "feature_snapshot": feature_snapshot,
             "korea_etf_snapshot": korea_etf_snapshot,
-            # ── 이론 추적 결과 (봇 자동 계산 → auto_tune 학습용) ──
-            "status":            track_status,   # 봇 추적 상태
-            "exit_price":        0,
-            "exit_date":         "",
-            "exit_time":         "",
-            "gross_pnl_pct":     0.0,        # 비용 반영 전 이론 수익률
-            "net_pnl_pct":       0.0,        # 왕복비용 반영 후 이론 수익률
+            "episode_candidates": [candidate],
+            "episode_candidate_count": 1,
+            "entry_update_history": [],
+            "entry_update_count": 0,
+            "episode_representative": True,
+            "status": track_status,
+            "exit_price": 0,
+            "exit_date": "",
+            "exit_time": "",
+            "gross_pnl_pct": 0.0,
+            "net_pnl_pct": 0.0,
             "round_trip_cost_pct": round(ROUND_TRIP_COST_PCT, 4),
-            "pnl_pct":           0.0,        # net 기준 이론 수익률 (하위호환)
-            "exit_reason":       "",
-            "max_price":         stock["price"],
-            "min_price":         stock["price"],
-            # ── 실제 진입 결과 (사용자 입력 → 내 수익 통계용) ──
-            "actual_entry":      None,       # True=진입함 / False=진입안함 / None=미확인
-            "actual_pnl":        None,       # 실제 수익률 (사용자 /result 입력)
-            "actual_exit_date":  "",
-            "skip_reason":       "",         # 진입 못 한 이유 (/skip으로 기록)
+            "pnl_pct": 0.0,
+            "exit_reason": "",
+            "max_price": stock["price"],
+            "min_price": stock["price"],
+            "actual_entry": None,
+            "actual_pnl": None,
+            "actual_exit_date": "",
+            "skip_reason": "",
             "execution_setup_required": bool(stock.get("execution_setup_required")),
             "planned_entry_price": safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0),
-            "entry_blocked":    False,
+            "entry_blocked": False,
             "entry_blocked_reason": "",
             "entry_blocked_time": "",
             "entry_blocked_price": 0,
@@ -6871,6 +7079,7 @@ def save_signal_log(stock: dict):
             "entry_reference_clock": "",
             "entry_reference_price": 0,
         }
+        stock["signal_log_key"] = log_key
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
@@ -7333,14 +7542,32 @@ def track_signal_results():
         data = {}
         try:
             data = _read_json_locked(SIGNAL_LOG_FILE)
-        except Exception: return
+        except Exception:
+            return
 
         updated = False
-        today   = datetime.now().strftime("%Y%m%d")
+        today = datetime.now().strftime("%Y%m%d")
+
+        active_codes = []
+        for _k, _rec in data.items():
+            if not isinstance(_rec, dict):
+                continue
+            if _rec.get("status") not in TRACK_ACTIVE_STATUSES:
+                continue
+            _code = normalize_stock_code(_rec.get("code"))
+            if _code and _code not in active_codes:
+                active_codes.append(_code)
+        for _code in active_codes:
+            rep_key = _find_representative_tracking_log_key(data, _code)
+            if rep_key and _merge_tracking_episode_records(data, _code, rep_key, reason="추적중_대표레코드통합"):
+                updated = True
 
         for log_key, rec in data.items():
-            if rec.get("status") != "추적중": continue
-            if log_key in _tracking_notified:  continue
+            if rec.get("status") != "추적중":
+                continue
+            if log_key in _tracking_notified:
+                continue
+            rec["episode_representative"] = True
 
             code         = rec["code"]
             entry        = rec.get("entry_price", 0)
@@ -9090,81 +9317,119 @@ def reset_top_signals_daily():
 
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
-    if not entry: return
+    if not entry:
+        return
     if s.get("execution_setup_required") and not s.get("force_register_entry_watch"):
         _register_execution_setup_watch(s)
         return
-    code = s["code"]
+    code = normalize_stock_code(s["code"])
     stock_name = _resolve_stock_name(code, s.get("name", ""))
     if is_scoring_only_instrument(code, stock_name):
         return
     s["name"] = stock_name
 
-    # ── 같은 종목 기존 감시 제거 (재포착 시 진입가 갱신) ──
-    old_keys = [k for k, w in _entry_watch.items() if w["code"] == code]
-    for k in old_keys:
-        old_entry  = _entry_watch[k].get("entry_price", 0)
-        miss_count = _entry_watch[k].get("miss_count", 0)
-        print(f"  🔄 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
-        # signal_log의 기존 "추적중" 레코드를 "진입가변경"으로 업데이트
-        try:
-            sig_data = {}
-            try:
-                sig_data = _read_json_locked(SIGNAL_LOG_FILE)
-            except Exception: pass
-            for lk, rec in sig_data.items():
-                if (rec.get("code") == code
-                        and rec.get("status") == "추적중"
-                        and rec.get("signal_type") == _entry_watch[k].get("signal_type")):
-                    rec["status"]        = "진입가변경"
-                    rec["exit_reason"]   = "재포착_진입가변경"
-                    rec["old_entry"]     = old_entry
-                    rec["new_entry"]     = entry
-                    rec["pnl_pct"]       = 0.0
-                    break
-            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
-        except Exception as e:
-            print(f"⚠️ 진입가변경 기록 오류: {e}")
-        _archive_entry_watch_record(k, _entry_watch.get(k), consume_reason="재포착_진입가변경", final_status="진입가변경")
-        del _entry_watch[k]
+    locked_watch = None
+    for _k, _watch in list(_entry_watch.items()):
+        if normalize_stock_code((_watch or {}).get("code")) != code:
+            continue
+        if _watch.get("entry_hit") or _watch.get("entry_hit_locked"):
+            locked_watch = (_k, _watch)
+            break
+    if locked_watch:
+        print(f"  🔒 재포착 진입가 갱신 생략: {stock_name} (이미 대표 진입 확정)")
+        return
 
     now_dt = datetime.now()
     log_key = f"{code}_{now_dt.strftime('%Y%m%d%H%M')}"
-    signal_log_key = ""
+    signal_log_key = str(s.get("signal_log_key") or "").strip()
     detect_date = str(s.get("detect_date") or "").strip()
     detect_time = str(s.get("detect_time") or "").strip()
     try:
         _detected_at = s.get("detected_at")
         if isinstance(_detected_at, datetime):
-            signal_log_key = f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+            signal_log_key = signal_log_key or f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
             if not detect_date:
                 detect_date = _detected_at.strftime('%Y%m%d')
             if not detect_time:
                 detect_time = _detected_at.strftime('%H:%M:%S')
     except Exception:
-        signal_log_key = ""
+        signal_log_key = signal_log_key or ""
     if not detect_date:
         detect_date = now_dt.strftime('%Y%m%d')
     if not detect_time:
         detect_time = now_dt.strftime('%H:%M:%S')
+
+    old_items = [(k, w) for k, w in _entry_watch.items() if normalize_stock_code((w or {}).get("code")) == code]
+    latest_old_watch = max((w for _, w in old_items), key=lambda x: x.get("registered_ts", 0), default=None)
+    previous_entry = safe_int((latest_old_watch or {}).get("entry_price", 0), 0)
+    previous_miss_count = safe_int((latest_old_watch or {}).get("miss_count", 0), 0)
+
+    try:
+        sig_data = {}
+        try:
+            sig_data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        representative_key = _find_representative_tracking_log_key(sig_data, code, preferred_key=signal_log_key)
+        if representative_key:
+            signal_log_key = representative_key
+            rec = sig_data.get(representative_key) or {}
+            candidate = _build_tracking_episode_candidate(s, reason="진입감시재등록")
+            _append_tracking_episode_candidate(rec, candidate)
+            _append_tracking_entry_update(rec, previous_entry, entry, reason="재포착대표진입갱신")
+            rec["episode_representative"] = True
+            rec["signal_type"] = s.get("signal_type", rec.get("signal_type", ""))
+            rec["name"] = stock_name
+            rec["entry_price"] = entry
+            rec["stop_price"] = s.get("stop_loss", rec.get("stop_price", 0))
+            rec["target_price"] = s.get("target_price", rec.get("target_price", 0))
+            rec["execution_setup_required"] = False
+            rec["planned_entry_price"] = safe_int(s.get("planned_entry_price", entry), entry)
+            rec["status"] = "추적중"
+            rec["last_detect_date"] = detect_date
+            rec["last_detect_time"] = detect_time
+            rec["entry_blocked"] = False
+            rec["entry_blocked_reason"] = ""
+            rec["entry_blocked_time"] = ""
+            rec["entry_blocked_price"] = 0
+            rec["entry_reference_only"] = False
+            rec["entry_reference_market"] = ""
+            rec["entry_reference_reason"] = ""
+            rec["entry_reference_time"] = ""
+            rec["entry_reference_date"] = ""
+            rec["entry_reference_clock"] = ""
+            rec["entry_reference_price"] = 0
+            _merge_tracking_episode_records(sig_data, code, representative_key, reason="재포착_대표레코드통합")
+            _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
+    except Exception as e:
+        print(f"⚠️ 대표 진입가 동기화 오류: {e}")
+
+    for k, watch in old_items:
+        old_entry = safe_int((watch or {}).get("entry_price", 0), 0)
+        miss_count = safe_int((watch or {}).get("miss_count", 0), 0)
+        print(f"  🔄 대표 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
+        archived_watch = _entry_watch.pop(k, None)
+        if archived_watch:
+            _archive_entry_watch_record(k, archived_watch, consume_reason="재포착_대표진입승계", final_status="대표진입승계")
+
     if not signal_log_key:
         signal_log_key = log_key
     _entry_watch[log_key] = {
         "code": code, "name": stock_name, "entry_price": entry,
-        "stop_loss":    s.get("stop_loss", 0),
+        "stop_loss": s.get("stop_loss", 0),
         "target_price": s.get("target_price", 0),
-        "signal_type":  s.get("signal_type", ""),
+        "signal_type": s.get("signal_type", ""),
         "signal_log_key": signal_log_key,
-        "detect_date":  detect_date,
-        "detect_time":  detect_time,
+        "detect_date": detect_date,
+        "detect_time": detect_time,
         "last_notified_ts": 0,
         "notify_count": 0,
-        "miss_count":   len(old_keys),        # 이 종목 누적 재포착 횟수
+        "miss_count": previous_miss_count + len(old_items),
         "registered_ts": time.time(),
-        "expire_ts":    time.time() + 86400 * MAX_CARRY_DAYS,  # 3일 감시
-        "peak_price":   s.get("price", 0),    # 포착 시점 가격 (상승 추적용)
-        "reasons":      (s.get("reasons") or [])[:5],  # v40.0-#1: 포착 이유 상위 5개 저장
-        "sector_theme": s.get("sector_info", {}).get("theme", ""),  # v40.0-#2: 섹터 정보
+        "expire_ts": time.time() + 86400 * MAX_CARRY_DAYS,
+        "peak_price": s.get("price", 0),
+        "reasons": (s.get("reasons") or [])[:5],
+        "sector_theme": s.get("sector_info", {}).get("theme", ""),
         "change_at_detect": float(s.get("change_rate", 0) or 0),
         "volume_ratio": float(s.get("volume_ratio", 0) or 0),
         "execution_metrics": dict(s.get("execution_metrics") or {}),
