@@ -3,11 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.41
+버전: v41.42
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.42 (2026-03-13): KIS API 404 경로 중 `chgrate-pcls-100` / `inquire-daily-trade` 처리 보강.
+  [#1] `_get_daily_investor_data()`를 `_safe_get_meta()` 기반으로 바꿔 `inquire-daily-trade`가 404/비정상 status/잘못된 응답일 때 일별 거래 API를 하루 동안 비활성화하고, code/status/사유를 한 번은 명확히 로그로 남기도록 정리.
+  [#2] `_daily_trade_api_fallback()` / `_get_daily_trade_api_disable_reason()`를 추가해, disable 상태에서도 왜 비활성화됐는지와 fallback 결과가 빈 리스트임을 조용히 숨기지 않도록 보강.
+  [#3] 업종/테마 보강용 3단계 랭킹 조회(`chgrate-pcls-100`)에서도 404/비정상 status를 공통 로그로 남기고, 비활성화 사유를 즉시 확인 가능하게 정리.
+  이유: 최신 로그에서 `chgrate-pcls-100`과 `inquire-daily-trade`가 404를 내며 일부 기능이 조용히 약해졌는데, 기존에는 fallback은 되더라도 어느 경로가 죽었는지 즉시 구분하기 어려웠기 때문.
+  개선점: 404 원인 가시성↑, daily-trade 경로의 조용한 실패 감소↑, rank/daily-trade fallback 추적성↑.
+
 - v41.41 (2026-03-13): 오버나이트/지정학 데이터를 파일 저장형으로 누적하고, 07:30 장전 리스크 평가에 통합 반영.
   [#1] `overnight_active.json`, `geo_active.json` 활성 버퍼와 `overnight_snapshot_last.json`, `geo_snapshot_last.json` 스냅샷 파일을 도입해 야간 누적 데이터를 프로세스 재시작 후에도 유지.
   [#2] `run_overnight_monitor()`와 `run_geo_news_scan()`가 메모리뿐 아니라 파일에도 상태를 기록하도록 보강.
@@ -4906,6 +4913,39 @@ def _disable_daily_trade_api_for_today(reason: str) -> None:
     except Exception:
         pass
 
+def _get_daily_trade_api_disable_reason() -> str:
+    try:
+        if not os.path.exists(_DAILY_TRADE_DISABLE_FILE):
+            return ""
+        with open(_DAILY_TRADE_DISABLE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if str(obj.get("disabled_date", "")) != _now_kst().date().isoformat():
+            return ""
+        return str(obj.get("reason", "") or "")
+    except Exception:
+        return ""
+
+def _daily_trade_api_fallback(reason: str, *, code: str = "", status=None, ct=None, body=None) -> list:
+    global _daily_trade_disable_notified
+    if reason != "disabled_today":
+        _disable_daily_trade_api_for_today(str(reason))
+    elif not reason:
+        reason = _get_daily_trade_api_disable_reason() or "disabled_today"
+    if not _daily_trade_disable_notified:
+        msg = f"⚠️ [KIS] inquire-daily-trade 비활성/대체 → 빈 데이터 반환 ({reason})"
+        if code:
+            msg += f" code={code}"
+        if status not in (None, ""):
+            msg += f" status={status}"
+        if ct not in (None, ""):
+            msg += f" ct={ct}"
+        if body not in (None, ""):
+            body_snip = str(body)[:120].replace("\n", " ")
+            msg += f" body={body_snip}"
+        print(msg)
+        _daily_trade_disable_notified = True
+    return []
+
 
 def _rank_api_disabled_today() -> bool:
     try:
@@ -5254,7 +5294,10 @@ def get_sector_stocks_from_kis(code: str) -> list:
                      "FID_RSFL_RATE1":"-30","FID_RSFL_RATE2":"30"}
                 )
                 if status3 == 404:
-                    _disable_rank_api_for_today("404")
+                    _rank_api_fallback("404", status=status3, ct=ct3, body=body3, market="KRX")
+                    return stocks
+                if status3 not in (None, 200):
+                    print(f"⚠️ [KIS] 테마/업종 보강용 chgrate-pcls-100 실패 status={status3} ct={ct3 or '-'} body={str(body3)[:120]}")
                     return stocks
                 for i in data3.get("output",[]):
                     peer_code = i.get("mksc_shrn_iscd","")
@@ -15148,7 +15191,7 @@ def _get_daily_investor_data(code: str) -> list:
         end   = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         if _daily_trade_api_disabled_today():
-            return None
+            return _daily_trade_api_fallback(_get_daily_trade_api_disable_reason() or "disabled_today", code=code)
         url   = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-trade"
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
@@ -15157,8 +15200,16 @@ def _get_daily_investor_data(code: str) -> list:
             "FID_INPUT_DATE_2": end,
             "FID_PERIOD_DIV_CODE": "D",
         }
-        data = _safe_get(url, "FHKST03010400", params)
+        data, status, ct, body = _safe_get_meta(url, "FHKST03010400", params)
+        if status == 404:
+            return _daily_trade_api_fallback("404", code=code, status=status, ct=ct, body=body)
+        if status not in (None, 200):
+            return _daily_trade_api_fallback(f"status_{status}", code=code, status=status, ct=ct, body=body)
+        if not isinstance(data, dict):
+            return _daily_trade_api_fallback("invalid_response", code=code, status=status, ct=ct, body=body)
         items = data.get("output2", []) if data else []
+        if not isinstance(items, list):
+            return _daily_trade_api_fallback("invalid_output2", code=code, status=status, ct=ct, body=body)
         result = sorted([{
             "date":            i.get("stck_bsop_date", ""),
             "foreign_net":     int(i.get("frgn_ntby_qty", 0) or 0),
