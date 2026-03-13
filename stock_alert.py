@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.51
+버전: v41.53
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.53 (2026-03-13): 체결확인 감시 저장 I/O 최적화 + 배치 저장 정리.
+  [OPT-1] `check_execution_setup_watch()`가 스캔마다 갱신되는 `last_price`/`execution_metrics` 같은 휘발성 상태 때문에 매 루프 파일 저장으로 이어질 수 있던 흐름을 구조 변경 저장과 주기 저장으로 분리.
+  등록/확정/만료처럼 구조가 바뀔 때는 즉시 저장하고, 단순 상태 스냅샷은 최소 주기(`EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC`, 기본 45초)로만 기록해 디스크 I/O를 줄이도록 조정.
+  [OPT-2] `_register_active_entry_watch_from_confirmation()`에 배치 저장 옵션을 추가하고, `check_execution_setup_watch()`에서는 여러 종목이 같은 루프에서 확정돼도 `_save_entry_watch_active()`를 1회만 호출하도록 정리.
+  [FIX-1] `check_execution_setup_watch()` 내부의 사용되지 않던 상태 플래그를 정리하고, 저장 사유를 `구조 변경`과 `상태 스냅샷`으로 분리해 코드 경로를 더 명확하게 보강.
+  개선점: 체결확인 감시 루프의 저장 빈도↓, 동시 확정 시 active 저장 중복↓, Railway Hobby 환경의 파일 I/O 부담↓.
+
+- v41.52 (2026-03-13): 체결확인 저장 안정화 + 진입감시 archive 경쟁조건 보강 + 주도섹터 조회 최적화.
+  [BUG-1] `_register_execution_setup_watch()`가 등록 직후 `_save_execution_setup_watch()`를 호출하지 않아, 체결확인 대기 등록 직후 프로세스 재시작 시 대기 상태가 유실될 수 있던 문제를 수정.
+  추가로 `detect_date`/`detect_time`/`market_basis`/기존 `signal_log_key`를 함께 보존해 후속 확정 메시지와 복구 일관성도 보강.
+  [BUG-2] `_archive_entry_watch_record()`의 consumed/archive 갱신을 단일 `_file_lock` 임계구역 안에서 처리하도록 정리해, polling 스레드/감시 루프가 동시에 종료 기록을 남길 때 마지막 쓰기 기준으로 일부 archive 항목이 누락될 수 있는 경쟁 조건을 완화.
+  [OPT-1] 시장 주도 섹터 payload 빌드 시 장상태(`KRX/NXT`)와 실시간 호가를 1회 빌드 단위 캐시로 재사용하도록 조정해, 중복 `is_market_open()`/`is_nxt_open()`/실시간 현재가 조회를 줄여 핫패스 부담을 낮춤.
+  개선점: 체결확인 복구 안정성↑, archive 기록 보존성↑, 주도섹터 스캔 응답성↑.
+
 - v41.51 (2026-03-13): 버그 2건 수정.
   [BUG-1] `send_market_leading_sector_update` 스케줄 등록에 `_leader_job` 누락 수정.
   기존: `schedule.every(5).minutes.do(lambda: send_market_leading_sector_update(...))` — passive replica도 실행 가능, 중복 알림 위험.
@@ -842,23 +856,29 @@ def _atomic_write_bytes(file_path: str, data: bytes):
         os.fsync(f.fileno())
     os.replace(tmp_path, file_path)
 
+def _write_json_atomic_unlocked(file_path: str, obj, indent: int = 2):
+    try:
+        _snapshot_backup(file_path)
+        payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
+        _atomic_write_bytes(file_path, payload)
+    except Exception as e:
+        print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+
 def _write_json_atomic(file_path: str, obj, indent: int = 2):
     with _file_lock:  # v38.3-P0-5
-        try:
-            _snapshot_backup(file_path)
-            payload = json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
-            _atomic_write_bytes(file_path, payload)
-        except Exception as e:
-            print(f"⚠️ JSON 저장 실패: {os.path.basename(file_path)} ({e})")
+        _write_json_atomic_unlocked(file_path, obj, indent=indent)
+
+def _read_json_unlocked(file_path: str, default=None):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
 
 def _read_json_locked(file_path: str, default=None):
     """v38.3-P1-6: Lock 보호 JSON 읽기 (스레드 안전)"""
     with _file_lock:
-        try:
-            with open(file_path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return default if default is not None else {}
+        return _read_json_unlocked(file_path, default=default)
 
 def _migrate_legacy_files():
     """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
@@ -2716,6 +2736,7 @@ PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.jso
 PRECLOSE_GAP_ENTRY_WATCH_FILE = os.path.join(DATA_DIR, "preclose_gap_entry_watch.json")
 REENTRY_WATCH_FILE = os.path.join(DATA_DIR, "reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = os.path.join(DATA_DIR, "execution_setup_watch.json")
+EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC = int(os.getenv("EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC", "45") or "45")
 ENTRY_WATCH_ACTIVE_FILE = os.path.join(DATA_DIR, "entry_watch_active.json")
 ENTRY_WATCH_CONSUMED_FILE = os.path.join(DATA_DIR, "entry_watch_consumed.json")
 ENTRY_WATCH_ARCHIVE_FILE = os.path.join(DATA_DIR, "entry_watch_archive.json")
@@ -2818,9 +2839,16 @@ def _clear_reentry_watch_all() -> None:
     _reentry_watch.clear()
     _save_reentry_watch()
 
-def _save_execution_setup_watch() -> None:
+def _save_execution_setup_watch(force: bool = True) -> None:
+    global _execution_setup_watch_last_persist_ts
     try:
+        now_ts = time.time()
+        min_interval = max(0, int(EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC or 0))
+        if not force and min_interval > 0 and _execution_setup_watch_last_persist_ts:
+            if now_ts - _execution_setup_watch_last_persist_ts < min_interval:
+                return
         _write_json_atomic(EXECUTION_SETUP_WATCH_FILE, _execution_setup_watch if isinstance(_execution_setup_watch, dict) else {}, indent=2)
+        _execution_setup_watch_last_persist_ts = now_ts
     except Exception:
         pass
 
@@ -2849,6 +2877,7 @@ def _load_execution_setup_watch() -> None:
             watch.setdefault("last_price", safe_int(watch.get("last_price", 0), 0))
             watch.setdefault("peak_price", safe_int(watch.get("peak_price", 0), 0))
             watch.setdefault("signal_log_key", str(watch.get("signal_log_key", key) or key))
+            watch.setdefault("detect_date", str(watch.get("detect_date", "") or ""))
             watch.setdefault("detect_time", str(watch.get("detect_time", "") or ""))
             watch.setdefault("market_basis", str(watch.get("market_basis", "") or ""))
             watch.setdefault("stage", str(watch.get("stage", "") or ""))
@@ -2966,21 +2995,30 @@ def _archive_entry_watch_record(log_key: str, watch: dict | None, consume_reason
         if final_status:
             payload["final_status"] = str(final_status)
 
-        consumed = _read_json_locked(ENTRY_WATCH_CONSUMED_FILE, {})
-        if not isinstance(consumed, dict):
-            consumed = {}
-        consumed = _prune_entry_watch_store(consumed, ENTRY_WATCH_CONSUMED_KEEP_DAYS)
-        ckey = _entry_watch_store_key(consumed, log_key)
-        consumed[ckey] = payload
-        _save_entry_watch_consumed_store(consumed)
+        with _file_lock:
+            consumed = _read_json_unlocked(ENTRY_WATCH_CONSUMED_FILE, {})
+            if not isinstance(consumed, dict):
+                consumed = {}
+            consumed = _prune_entry_watch_store(consumed, ENTRY_WATCH_CONSUMED_KEEP_DAYS)
+            ckey = _entry_watch_store_key(consumed, log_key)
+            consumed[ckey] = payload
+            _write_json_atomic_unlocked(
+                ENTRY_WATCH_CONSUMED_FILE,
+                _prune_entry_watch_store(consumed, ENTRY_WATCH_CONSUMED_KEEP_DAYS),
+                indent=2,
+            )
 
-        archive = _read_json_locked(ENTRY_WATCH_ARCHIVE_FILE, {})
-        if not isinstance(archive, dict):
-            archive = {}
-        archive = _prune_entry_watch_store(archive, ENTRY_WATCH_ARCHIVE_KEEP_DAYS)
-        akey = _entry_watch_store_key(archive, log_key)
-        archive[akey] = payload
-        _save_entry_watch_archive_store(archive)
+            archive = _read_json_unlocked(ENTRY_WATCH_ARCHIVE_FILE, {})
+            if not isinstance(archive, dict):
+                archive = {}
+            archive = _prune_entry_watch_store(archive, ENTRY_WATCH_ARCHIVE_KEEP_DAYS)
+            akey = _entry_watch_store_key(archive, log_key)
+            archive[akey] = payload
+            _write_json_atomic_unlocked(
+                ENTRY_WATCH_ARCHIVE_FILE,
+                _prune_entry_watch_store(archive, ENTRY_WATCH_ARCHIVE_KEEP_DAYS),
+                indent=2,
+            )
     except Exception:
         pass
 
@@ -3009,6 +3047,7 @@ EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.
 EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
 _execution_snapshots: dict = {}
 _execution_setup_watch: dict = {}
+_execution_setup_watch_last_persist_ts: float = 0.0
 
 
 def _prune_execution_snapshots(code: str, now_ts: float | None = None) -> None:
@@ -3335,13 +3374,23 @@ def _register_execution_setup_watch(s: dict) -> None:
     metrics = dict(s.get("execution_metrics") or {})
     now_dt = datetime.now()
     log_key = f"{code}_{now_dt.strftime('%Y%m%d%H%M')}"
-    signal_log_key = ""
+    signal_log_key = str(s.get("signal_log_key") or "").strip()
+    detect_date = str(s.get("detect_date") or "").strip()
+    detect_time = str(s.get("detect_time") or "").strip()
     try:
         _detected_at = s.get("detected_at")
         if isinstance(_detected_at, datetime):
-            signal_log_key = f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+            signal_log_key = signal_log_key or f"{code}_{_detected_at.strftime('%Y%m%d%H%M')}"
+            if not detect_date:
+                detect_date = _detected_at.strftime('%Y%m%d')
+            if not detect_time:
+                detect_time = _detected_at.strftime('%H:%M:%S')
     except Exception:
-        signal_log_key = ""
+        signal_log_key = signal_log_key or ""
+    if not detect_date:
+        detect_date = now_dt.strftime('%Y%m%d')
+    if not detect_time:
+        detect_time = now_dt.strftime('%H:%M:%S')
     if not signal_log_key:
         signal_log_key = log_key
     _execution_setup_watch[log_key] = {
@@ -3359,12 +3408,15 @@ def _register_execution_setup_watch(s: dict) -> None:
         "reasons": list(s.get("reasons") or []),
         "registered_ts": time.time(),
         "expire_ts": time.time() + EXEC_SPEED_SETUP_EXPIRE_SEC,
-        "detect_time": now_dt.strftime("%H:%M"),
+        "detect_date": detect_date,
+        "detect_time": detect_time,
+        "market_basis": str(s.get("market_basis", s.get("market", "")) or ""),
         "peak_price": max(safe_int(s.get("price", 0), 0), safe_int(metrics.get("recent_peak_price", 0), 0)),
         "last_price": safe_int(s.get("price", 0), 0),
         "signal_log_key": signal_log_key,
         "execution_metrics": metrics,
     }
+    _save_execution_setup_watch()
     print(f"  ⚡ 체결확인 대기 등록: {s.get('name', code)} [{s.get('signal_type','')}] 예상진입 {safe_int(s.get('entry_price',0),0):,}원")
 
 
@@ -3414,7 +3466,7 @@ def _update_signal_log_execution_confirmed(log_key: str | None, watch: dict, ent
 
 
 def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int, stop_price: int, target_price: int,
-                                                   hit_price: int, hit_time: str) -> None:
+                                                   hit_price: int, hit_time: str, persist: bool = True) -> None:
     code = normalize_stock_code(watch.get("code"))
     if not code:
         return
@@ -3446,7 +3498,8 @@ def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int
         "entry_hit_date": hit_time.split(" ", 1)[0] if " " in hit_time else "",
         "entry_hit_clock": hit_time.split(" ", 1)[1] if " " in hit_time else "",
     }
-    _save_entry_watch_active()
+    if persist:
+        _save_entry_watch_active()
 
 
 def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_price: int, target_price: int,
@@ -3493,7 +3546,9 @@ def check_execution_setup_watch() -> None:
     if not _execution_setup_watch:
         return
     expired = []
-    changed_any = False
+    state_snapshot_changed = False
+    structure_changed = False
+    active_changed = False
     for key, watch in list(_execution_setup_watch.items()):
         try:
             if time.time() >= float(watch.get("expire_ts", 0) or 0):
@@ -3504,17 +3559,16 @@ def check_execution_setup_watch() -> None:
             price = safe_int((cur or {}).get("price", 0), 0)
             if not price:
                 continue
-            watch["last_price"] = price
-            changed = True
-            changed_any = True
+            if price != safe_int(watch.get("last_price", 0), 0):
+                watch["last_price"] = price
+                state_snapshot_changed = True
             if price > safe_int(watch.get("peak_price", 0), 0):
                 watch["peak_price"] = price
-                changed_active = True
-                changed_any = True
+                state_snapshot_changed = True
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
-            watch["execution_metrics"] = metrics
-            changed = True
-            changed_any = True
+            if metrics != watch.get("execution_metrics"):
+                watch["execution_metrics"] = metrics
+                state_snapshot_changed = True
             min_speed, min_dip = _entry_execution_confirmation_threshold(watch.get("signal_type"))
             pullback_pct = float(metrics.get("pullback_pct", 0.0) or 0.0)
             if not metrics.get("ready"):
@@ -3535,7 +3589,8 @@ def check_execution_setup_watch() -> None:
                 continue
             hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             _update_signal_log_execution_confirmed(watch.get("signal_log_key"), watch, entry_price, stop_price, target_price, metrics, hit_time, price)
-            _register_active_entry_watch_from_confirmation(watch, entry_price, stop_price, target_price, price, hit_time)
+            _register_active_entry_watch_from_confirmation(watch, entry_price, stop_price, target_price, price, hit_time, persist=False)
+            active_changed = True
             send_with_chart_buttons(
                 _build_execution_confirmation_message(watch, entry_price, stop_price, target_price, price, hit_time, metrics),
                 watch.get("code", ""), watch.get("name", "")
@@ -3545,10 +3600,15 @@ def check_execution_setup_watch() -> None:
         except Exception:
             continue
     for key in expired:
-        _execution_setup_watch.pop(key, None)
-        changed_any = True
-    if changed_any:
-        _save_execution_setup_watch()
+        if key in _execution_setup_watch:
+            _execution_setup_watch.pop(key, None)
+            structure_changed = True
+    if active_changed:
+        _save_entry_watch_active()
+    if structure_changed:
+        _save_execution_setup_watch(force=True)
+    elif state_snapshot_changed:
+        _save_execution_setup_watch(force=False)
 
 def build_next_open_watchlist(max_codes: int = 30) -> dict:
     """장 종료 후: 내일 감시할 워치리스트를 생성해서 파일로 저장."""
@@ -15029,13 +15089,15 @@ def _save_market_leader_state(state: dict):
         print(f"⚠️ 시장 주도 섹터 상태 저장 실패: {e}")
 
 
-def _collect_market_leader_seed_stocks() -> list:
+def _collect_market_leader_seed_stocks(market_open: bool | None = None, nxt_open: bool | None = None) -> list:
+    market_open = is_market_open() if market_open is None else bool(market_open)
+    nxt_open = is_nxt_open() if nxt_open is None else bool(nxt_open)
     seeds = []
     try:
-        if is_market_open():
+        if market_open:
             seeds.extend(get_upper_limit_stocks()[:8])
             seeds.extend(get_volume_surge_stocks()[:16])
-        if is_nxt_open():
+        if nxt_open:
             seeds.extend(get_nxt_surge_stocks()[:10])
         for item in list(_dynamic_candidates or [])[:24]:
             if isinstance(item, dict):
@@ -15061,10 +15123,12 @@ def _collect_market_leader_seed_stocks() -> list:
     return merged
 
 
-def _get_market_leader_live_quote(code: str, name: str = "") -> dict:
+def _get_market_leader_live_quote(code: str, name: str = "", market_open: bool | None = None, nxt_open: bool | None = None) -> dict:
+    market_open = is_market_open() if market_open is None else bool(market_open)
+    nxt_open = is_nxt_open() if nxt_open is None else bool(nxt_open)
     market = ""
     try:
-        if is_nxt_open() and not is_market_open() and is_nxt_listed(code):
+        if nxt_open and not market_open and is_nxt_listed(code):
             market = "NXT"
     except Exception:
         market = ""
@@ -15093,11 +15157,13 @@ def _calc_market_leader_sector_score(quotes: list, leader: dict, follow_min: flo
 
 
 def _build_market_leading_sector_payload(force: bool = False) -> dict:
-    if not is_any_market_open():
+    market_open = is_market_open()
+    nxt_open = is_nxt_open()
+    if not (market_open or nxt_open):
         return {}
     now_dt = _now_kst()
     profile = _market_leader_profile(now_dt)
-    seeds = _collect_market_leader_seed_stocks()
+    seeds = _collect_market_leader_seed_stocks(market_open=market_open, nxt_open=nxt_open)
     if not seeds:
         print("ℹ️ 시장 주도 섹터 생략 — seed 0건")
         return {}
@@ -15137,11 +15203,19 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     score_min = max(52, profile["score_min"] - (5 if event_mode else 0))
     follow_min = max(1.0, profile["follow_min"] - (0.3 if event_mode else 0.0))
     sectors = []
+    quote_cache: dict[tuple[str, str], dict] = {}
+    quote_market_basis = "NXT" if nxt_open and not market_open else "KRX"
     for theme_name, bucket in list(candidate_themes.items())[:10]:
         members = list(bucket.get("members", {}).items())[:6]
         quotes = []
         for code, name in members:
-            q = _get_market_leader_live_quote(code, name)
+            cache_key = (str(code), quote_market_basis)
+            q = quote_cache.get(cache_key)
+            if q is None:
+                q = _get_market_leader_live_quote(code, name, market_open=market_open, nxt_open=nxt_open)
+                quote_cache[cache_key] = dict(q) if isinstance(q, dict) else {}
+            else:
+                q = dict(q) if isinstance(q, dict) else {}
             if not q or not q.get("price"):
                 continue
             nm = _resolve_stock_name(code, name, q)
@@ -15184,7 +15258,7 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     market_heat = min(100, int(len(sectors) * 12 + strong_seed_cnt * 10 + upper_seed_cnt * 15 + max(s.get("score", 0) for s in top) * 0.2))
     interval_min = 10 if market_heat >= 70 or event_mode else 15 if market_heat >= 45 else 20
     title_icon = "🔥" if max(s.get("score", 0) for s in top) >= 75 else "📈"
-    mode_line = "🔵 NXT (넥스트레이드) 주도" if is_nxt_open() and not is_market_open() else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🟢 장중 주도"
+    mode_line = "🔵 NXT (넥스트레이드) 주도" if nxt_open and not market_open else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🟢 장중 주도"
     lines = [
         f"{title_icon} <b>[시장 주도 섹터]</b>",
         f"🕐 {now_dt.strftime('%Y-%m-%d %H:%M:%S')}  |  {mode_line}",
