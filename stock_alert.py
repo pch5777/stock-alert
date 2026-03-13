@@ -3,9 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.43
+버전: v41.44
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[변경 이력]
+- v41.44 (2026-03-13): 시장 주도 섹터 메시지 추가 및 오전/이슈장 가중형 발송 로직 도입.
+  [#1] `send_market_leading_sector_update()` / `_build_market_leading_sector_payload()`를 추가해 테마별 동반상승, 대장주 강도, 포함주 추종, 거래량 집중, 시장 대비 상대강도를 점수화한 `시장 주도 섹터` 메시지를 발송하도록 구현.
+  [#2] 오전(09:00~10:30)과 급격한 이슈 장세에서 대장주 기준과 점수 기준을 더 민감하게 적용하고, 장이 활발할수록 10~20분 주기로 더 자주 나가도록 가변 발송 간격을 도입.
+  [#3] `market_leader_sector_state.json` 상태 파일을 추가해 같은 내용이 짧은 간격으로 반복 발송되지 않게 하고, 대장주/포함주 구성이나 점수 변화가 있을 때만 재발송되도록 보강.
+  이유: 사용자가 대장주 혼자만 오르는 섹터보다 실제로 동반 상승이 붙는 `시장 주도 섹터`를 더 빠르게 보고 싶어 했고, 특히 오전과 대형 이슈 직후엔 고정 주기보다 이벤트 반응형 알림이 더 실전적이기 때문.
+  개선점: 주도 섹터 가시성↑, 오전/이슈장 반응 속도↑, 중복 메시지 피로도↓.
+  주의점: 기타업종이나 동반상승 종목 수가 부족한 테마는 제외되며, leader/passive 구조상 최종 발송은 leader 인스턴스만 수행한다.
 
 [변경 이력]
 - v41.43 (2026-03-13): 체결속도를 포착 억제형에서 보조형으로 재조정하고, 진입가 도달 시 체결 판단 표시를 강화.
@@ -2677,6 +2686,7 @@ GEO_SNAPSHOT_LAST_FILE     = os.path.join(DATA_DIR, "geo_snapshot_last.json")
 PREOPEN_SNAPSHOT_DIR       = os.path.join(DATA_DIR, "preopen_snapshots")
 PREMARKET_RISK_LAST_FILE   = os.path.join(DATA_DIR, "premarket_risk_last.json")
 PREOPEN_DISPATCH_STATE_FILE = os.path.join(DATA_DIR, "preopen_dispatch_state.json")
+MARKET_LEADER_STATE_FILE = os.path.join(DATA_DIR, "market_leader_sector_state.json")
 NEXT_OPEN_GAP_FILE         = os.path.join(DATA_DIR, "next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.json")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
@@ -14624,6 +14634,244 @@ def _send_premarket_risk_update_once():
         return
     send_premarket_risk_update_if_changed()
 
+def _market_leader_profile(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    hhmm = now_dt.strftime("%H:%M")
+    is_morning_open = "09:00" <= hhmm < "09:30"
+    is_morning = "09:30" <= hhmm < "10:30"
+    leader_min = 4.5 if is_morning_open else 6.0 if is_morning else 7.0
+    score_min = 58 if is_morning_open else 64 if is_morning else 68
+    follow_min = 1.2 if is_morning_open else 1.5 if is_morning else 2.0
+    max_sections = 4 if is_morning_open or is_morning else 3
+    return {
+        "leader_min": leader_min,
+        "score_min": score_min,
+        "follow_min": follow_min,
+        "max_sections": max_sections,
+        "is_morning_open": is_morning_open,
+        "is_morning": is_morning,
+    }
+
+
+def _read_market_leader_state() -> dict:
+    state = _read_json_safe(MARKET_LEADER_STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _save_market_leader_state(state: dict):
+    try:
+        _write_json_atomic(MARKET_LEADER_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
+    except Exception as e:
+        print(f"⚠️ 시장 주도 섹터 상태 저장 실패: {e}")
+
+
+def _collect_market_leader_seed_stocks() -> list:
+    seeds = []
+    try:
+        if is_market_open():
+            seeds.extend(get_upper_limit_stocks()[:8])
+            seeds.extend(get_volume_surge_stocks()[:16])
+        if is_nxt_open():
+            seeds.extend(get_nxt_surge_stocks()[:10])
+    except Exception as e:
+        print(f"⚠️ 시장 주도 섹터 seed 수집 오류: {e}")
+    seen = set()
+    merged = []
+    for item in seeds:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code", "") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        merged.append(item)
+    return merged
+
+
+def _get_market_leader_live_quote(code: str, name: str = "") -> dict:
+    market = ""
+    try:
+        if is_nxt_open() and not is_market_open() and is_nxt_listed(code):
+            market = "NXT"
+    except Exception:
+        market = ""
+    q = _get_live_quote_for_signal({"code": code, "name": name, "market": market})
+    if not q:
+        return {}
+    q = dict(q)
+    q["market"] = market or str(q.get("market", "") or "")
+    return q
+
+
+def _calc_market_leader_sector_score(quotes: list, leader: dict, follow_min: float, market_chg: float) -> tuple[float, int, float, float]:
+    risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= follow_min]
+    breadth_ratio = len(risers) / max(1, len(quotes))
+    breadth_score = 35.0 * breadth_ratio
+    leader_score = min(25.0, max(0.0, safe_float(leader.get("change_rate", 0))))
+    follow_rates = [safe_float(q.get("change_rate", 0)) for q in risers if str(q.get("code", "")) != str(leader.get("code", ""))]
+    follow_avg = sum(follow_rates) / len(follow_rates) if follow_rates else 0.0
+    follow_score = min(20.0, max(0.0, follow_avg * 2.5))
+    flow_avg = sum(max(0.0, safe_float(q.get("volume_ratio", 0))) for q in quotes) / max(1, len(quotes))
+    flow_score = min(10.0, max(0.0, flow_avg * 2.0))
+    avg_change = sum(safe_float(q.get("change_rate", 0)) for q in risers) / max(1, len(risers)) if risers else 0.0
+    relative_score = min(10.0, max(0.0, (avg_change - market_chg) * 2.0))
+    total = breadth_score + leader_score + follow_score + flow_score + relative_score
+    return round(total, 1), len(risers), round(avg_change, 1), round(flow_avg, 1)
+
+
+def _build_market_leading_sector_payload(force: bool = False) -> dict:
+    if not is_any_market_open():
+        return {}
+    now_dt = _now_kst()
+    profile = _market_leader_profile(now_dt)
+    seeds = _collect_market_leader_seed_stocks()
+    if not seeds:
+        return {}
+    market_chg = get_kospi_change()
+    candidate_themes = {}
+    strong_seed_cnt = 0
+    upper_seed_cnt = 0
+    event_mode = False
+    for item in seeds[:24]:
+        code = str(item.get("code", "") or "").strip()
+        if not code:
+            continue
+        chg = safe_float(item.get("change_rate", 0))
+        vr = safe_float(item.get("volume_ratio", 0))
+        if chg >= 8.0 and vr >= 5.0:
+            strong_seed_cnt += 1
+        if chg >= 29.0:
+            upper_seed_cnt += 1
+        theme_name, peers, _ = get_theme_sector_stocks(code)
+        if not theme_name or theme_name == "기타업종":
+            continue
+        bucket = candidate_themes.setdefault(theme_name, {"members": {}, "seed_codes": set()})
+        nm = _resolve_stock_name(code, item.get("name", ""))
+        if is_trade_candidate_name(nm):
+            bucket["members"][code] = nm
+            bucket["seed_codes"].add(code)
+        for peer_code, peer_name in peers[:5]:
+            if peer_code == code:
+                continue
+            bucket["members"].setdefault(peer_code, peer_name)
+    if upper_seed_cnt >= 1 or strong_seed_cnt >= 2:
+        event_mode = True
+    leader_min = max(3.8, profile["leader_min"] - (1.0 if event_mode else 0.0))
+    score_min = max(52, profile["score_min"] - (5 if event_mode else 0))
+    follow_min = max(1.0, profile["follow_min"] - (0.3 if event_mode else 0.0))
+    sectors = []
+    for theme_name, bucket in list(candidate_themes.items())[:10]:
+        members = list(bucket.get("members", {}).items())[:6]
+        quotes = []
+        for code, name in members:
+            q = _get_market_leader_live_quote(code, name)
+            if not q or not q.get("price"):
+                continue
+            nm = _resolve_stock_name(code, name, q)
+            if not is_trade_candidate_name(nm):
+                continue
+            quotes.append({
+                "code": code,
+                "name": nm,
+                "change_rate": safe_float(q.get("change_rate", 0)),
+                "volume_ratio": safe_float(q.get("volume_ratio", 0)),
+                "market": q.get("market", ""),
+            })
+            time.sleep(0.05)
+        if len(quotes) < 2:
+            continue
+        quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+        leader = quotes[0]
+        score, riser_cnt, avg_change, flow_avg = _calc_market_leader_sector_score(quotes, leader, follow_min, market_chg)
+        followers = [q for q in quotes if q["code"] != leader["code"] and safe_float(q.get("change_rate", 0)) >= follow_min][:4]
+        if safe_float(leader.get("change_rate", 0)) < leader_min:
+            continue
+        if riser_cnt < 2 or not followers:
+            continue
+        if score < score_min:
+            continue
+        sectors.append({
+            "theme": theme_name,
+            "score": int(round(score)),
+            "leader": leader,
+            "followers": followers,
+            "riser_cnt": riser_cnt,
+            "member_cnt": len(quotes),
+            "avg_change": avg_change,
+            "flow_avg": flow_avg,
+        })
+    if not sectors:
+        return {}
+    sectors.sort(key=lambda s: (s.get("score", 0), safe_float(s.get("leader", {}).get("change_rate", 0))), reverse=True)
+    top = sectors[:profile["max_sections"]]
+    market_heat = min(100, int(len(sectors) * 12 + strong_seed_cnt * 10 + upper_seed_cnt * 15 + max(s.get("score", 0) for s in top) * 0.2))
+    interval_min = 10 if market_heat >= 70 or event_mode else 15 if market_heat >= 45 else 20
+    title_icon = "🔥" if max(s.get("score", 0) for s in top) >= 75 else "📈"
+    mode_line = "🔵 NXT (넥스트레이드) 주도" if is_nxt_open() and not is_market_open() else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🟢 장중 주도"
+    lines = [
+        f"{title_icon} <b>[시장 주도 섹터]</b>",
+        f"🕐 {now_dt.strftime('%Y-%m-%d %H:%M:%S')}  |  {mode_line}",
+        "━━━━━━━━━━━━━━━",
+    ]
+    digest_parts = []
+    for sec in top:
+        leader = sec["leader"]
+        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
+        lines.append(f"👑 {leader['name']} {leader['change_rate']:+.1f}%")
+        fol = "  ".join(f"{q['name']} {q['change_rate']:+.1f}%" for q in sec.get("followers", [])[:4])
+        if fol:
+            lines.append(f"📈 {fol}")
+        lines.append("")
+        digest_parts.append(sec['theme'])
+        digest_parts.append(f"{leader['code']}:{leader['change_rate']:.1f}")
+        digest_parts.extend(f"{q['code']}:{q['change_rate']:.1f}" for q in sec.get('followers', [])[:4])
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append(f"💥 시장 활력 {market_heat}점  |  다음 재평가 {interval_min}분")
+    msg = "\n".join(lines).strip()
+    digest = hashlib.sha256("|".join(digest_parts).encode("utf-8")).hexdigest()
+    return {
+        "msg": msg,
+        "digest": digest,
+        "interval_min": interval_min,
+        "market_heat": market_heat,
+        "event_mode": event_mode,
+        "sectors": top,
+        "ts": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def send_market_leading_sector_update(force: bool = False):
+    if is_holiday() or not is_any_market_open():
+        return
+    try:
+        payload = _build_market_leading_sector_payload(force=force)
+        if not payload:
+            print("ℹ️ 시장 주도 섹터 생략 — 조건 충족 섹터 없음")
+            return
+        now_ts = time.time()
+        state = _read_market_leader_state()
+        last_ts = float(state.get("last_ts", 0) or 0)
+        last_digest = str(state.get("last_digest", "") or "")
+        interval_sec = int(max(600, safe_float(payload.get("interval_min", 15)) * 60))
+        if not force and last_ts and now_ts - last_ts < interval_sec:
+            print(f"ℹ️ 시장 주도 섹터 생략 — 최근 발송 {int(now_ts-last_ts)}초 전")
+            return
+        if not force and last_digest == payload.get("digest") and last_ts and now_ts - last_ts < max(interval_sec, 1800):
+            print("ℹ️ 시장 주도 섹터 생략 — 구성 변화 없음")
+            return
+        send(payload.get("msg", ""))
+        _save_market_leader_state({
+            "last_ts": now_ts,
+            "last_digest": payload.get("digest", ""),
+            "interval_min": payload.get("interval_min", 15),
+            "market_heat": payload.get("market_heat", 0),
+            "sent_at": payload.get("ts", ""),
+            "themes": [sec.get("theme", "") for sec in payload.get("sectors", [])],
+        })
+        print(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 섹터, heat={payload.get('market_heat', 0)})")
+    except Exception as e:
+        _log_error("send_market_leading_sector_update", e)
+
 def send_premarket_risk_update_if_changed():
     if is_holiday():
         return
@@ -16252,6 +16500,7 @@ if __name__ == "__main__":
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
+    schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
