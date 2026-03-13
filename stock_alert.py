@@ -3,11 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.49
+버전: v41.51
 날짜: 2026-03-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.51 (2026-03-13): 버그 2건 수정.
+  [BUG-1] `send_market_leading_sector_update` 스케줄 등록에 `_leader_job` 누락 수정.
+  기존: `schedule.every(5).minutes.do(lambda: send_market_leading_sector_update(...))` — passive replica도 실행 가능, 중복 알림 위험.
+  수정: `_leader_job(lambda: ...)` 로 감싸 leader 인스턴스만 실행하도록 정리.
+  [BUG-2] `_archive_entry_watch_record`의 consumed/archive 파일 읽기에 `_file_lock` 누락 수정.
+  기존: `_read_json_safe()` — lock 없이 읽기, `poll_telegram_commands` 별도 스레드와 경쟁 조건 가능.
+  수정: `_read_json_locked()` — `_file_lock` 보호 읽기로 교체. 이후 `_write_json_atomic` 호출은 별도 lock 획득이므로 데드락 없음.
+  개선점: passive replica 중복 알림 위험↓, archive 기록 스레드 안전성↑.
+
+- v41.50 (2026-03-13): 3단계 반영 — `_entry_watch` 파일 저장형과 active/consumed/archive 구조 도입.
+  [#1] `entry_watch_active.json`, `entry_watch_consumed.json`, `entry_watch_archive.json`을 추가하고 `_save_entry_watch_active()` / `_load_entry_watch_active()` / `_archive_entry_watch_record()`를 구현해, 진입가 감시 상태를 재시작 후에도 복구하되 종료된 watch는 active에서 제거하고 consumed/archive로만 보관하도록 정리.
+  [#2] `register_entry_watch()`, `_register_active_entry_watch_from_confirmation()`, `check_entry_watch()`, `run_entry_defense_monitor()`에 active 저장을 연결하고, 재포착 교체·기간만료·상승이탈·알림횟수만료 시 archive로 이동하도록 보강.
+  [#3] 시작 시 `_load_entry_watch_active()`를 호출해 active watch만 복구하고, expired/invalid/consumed 상태는 active에서 자동 정리되게 구성.
+  이유: 3단계에서는 `_entry_watch`를 단순 파일 저장이 아니라 active/consumed/archive 구조로 다뤄야 중복 알림과 종료된 watch 재등장을 줄일 수 있기 때문.
+  개선점: 진입가 감시 복구 안정성↑, 재시작 후 후속 추적 지속성↑, 종료 watch 재부활 위험↓.
+
 - v41.49 (2026-03-13): 2단계 반영본 보정 — `_execution_setup_watch` 저장형 helper 정의 누락 수정.
   [#1] `_save_execution_setup_watch()` / `_load_execution_setup_watch()` 정의를 실제 코드 본문에 추가해, 실행 중 저장 호출과 시작 시 복구 호출이 런타임 `NameError` 없이 동작하도록 정리.
   [#2] 기존 v41.48에서 넣었던 `execution_setup_watch.json` 상수, 등록/변경/정리 시 저장, 시작 시 복구 호출은 그대로 유지.
@@ -2700,6 +2716,11 @@ PRECLOSE_GAP_RUN_STATE_FILE = os.path.join(DATA_DIR, "preclose_gap_run_state.jso
 PRECLOSE_GAP_ENTRY_WATCH_FILE = os.path.join(DATA_DIR, "preclose_gap_entry_watch.json")
 REENTRY_WATCH_FILE = os.path.join(DATA_DIR, "reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = os.path.join(DATA_DIR, "execution_setup_watch.json")
+ENTRY_WATCH_ACTIVE_FILE = os.path.join(DATA_DIR, "entry_watch_active.json")
+ENTRY_WATCH_CONSUMED_FILE = os.path.join(DATA_DIR, "entry_watch_consumed.json")
+ENTRY_WATCH_ARCHIVE_FILE = os.path.join(DATA_DIR, "entry_watch_archive.json")
+ENTRY_WATCH_CONSUMED_KEEP_DAYS = int(os.getenv("ENTRY_WATCH_CONSUMED_KEEP_DAYS", "7") or "7")
+ENTRY_WATCH_ARCHIVE_KEEP_DAYS = int(os.getenv("ENTRY_WATCH_ARCHIVE_KEEP_DAYS", "30") or "30")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
 NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
 NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
@@ -2837,6 +2858,141 @@ def _load_execution_setup_watch() -> None:
             _save_execution_setup_watch()
     except Exception:
         _execution_setup_watch = {}
+
+def _entry_watch_store_key(store: dict, base_key: str) -> str:
+    key = str(base_key or "entry_watch")
+    if key not in store:
+        return key
+    idx = 2
+    while f"{key}__{idx}" in store:
+        idx += 1
+    return f"{key}__{idx}"
+
+def _prune_entry_watch_store(raw: dict, keep_days: int) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    now_ts = time.time()
+    keep_sec = max(1, int(keep_days or 1)) * 86400
+    out = {}
+    for key, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue
+        ts = 0.0
+        try:
+            ts = float(rec.get("consumed_ts", 0) or rec.get("archived_ts", 0) or rec.get("registered_ts", 0) or 0)
+        except Exception:
+            ts = 0.0
+        if ts and now_ts - ts > keep_sec:
+            continue
+        out[str(key)] = rec
+    return out
+
+def _save_entry_watch_active() -> None:
+    try:
+        _write_json_atomic(ENTRY_WATCH_ACTIVE_FILE, _entry_watch if isinstance(_entry_watch, dict) else {}, indent=2)
+    except Exception:
+        pass
+
+def _load_entry_watch_active() -> None:
+    global _entry_watch
+    try:
+        raw = _read_json_safe(ENTRY_WATCH_ACTIVE_FILE, {})
+        if not isinstance(raw, dict):
+            _entry_watch = {}
+            return
+        now_ts = time.time()
+        restored = {}
+        for key, watch in raw.items():
+            if not isinstance(watch, dict):
+                continue
+            code = normalize_stock_code(watch.get("code"))
+            if not code:
+                continue
+            state = str(watch.get("entry_watch_state", "active") or "active")
+            if state != "active":
+                continue
+            expire_ts = float(watch.get("expire_ts", 0) or 0)
+            if expire_ts and now_ts >= expire_ts:
+                continue
+            watch = dict(watch)
+            watch["code"] = code
+            watch.setdefault("name", watch.get("name", code))
+            watch.setdefault("signal_type", str(watch.get("signal_type", "") or ""))
+            watch.setdefault("registered_ts", now_ts)
+            watch.setdefault("signal_log_key", str(watch.get("signal_log_key", key) or key))
+            watch.setdefault("detect_date", str(watch.get("detect_date", "") or ""))
+            watch.setdefault("detect_time", str(watch.get("detect_time", "") or ""))
+            watch.setdefault("notify_count", safe_int(watch.get("notify_count", 0), 0))
+            watch.setdefault("miss_count", safe_int(watch.get("miss_count", 0), 0))
+            watch.setdefault("peak_price", safe_int(watch.get("peak_price", 0), 0))
+            watch.setdefault("entry_reference_only", False)
+            watch.setdefault("entry_reference_market", "")
+            watch.setdefault("entry_reference_reason", "")
+            watch.setdefault("entry_reference_time", "")
+            watch.setdefault("entry_reference_price", 0)
+            watch["entry_watch_state"] = "active"
+            restored[str(key)] = watch
+        _entry_watch = restored
+        if raw != restored:
+            _save_entry_watch_active()
+    except Exception:
+        _entry_watch = {}
+
+def _save_entry_watch_consumed_store(store: dict) -> None:
+    try:
+        _write_json_atomic(ENTRY_WATCH_CONSUMED_FILE, _prune_entry_watch_store(store, ENTRY_WATCH_CONSUMED_KEEP_DAYS), indent=2)
+    except Exception:
+        pass
+
+def _save_entry_watch_archive_store(store: dict) -> None:
+    try:
+        _write_json_atomic(ENTRY_WATCH_ARCHIVE_FILE, _prune_entry_watch_store(store, ENTRY_WATCH_ARCHIVE_KEEP_DAYS), indent=2)
+    except Exception:
+        pass
+
+def _archive_entry_watch_record(log_key: str, watch: dict | None, consume_reason: str = "", final_status: str = "") -> None:
+    if not isinstance(watch, dict):
+        return
+    try:
+        now_ts = time.time()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        payload = dict(watch)
+        payload["entry_watch_state"] = "consumed"
+        payload["consumed"] = True
+        payload["consumed_at"] = now_s
+        payload["consumed_ts"] = now_ts
+        if consume_reason:
+            payload["consume_reason"] = str(consume_reason)
+        if final_status:
+            payload["final_status"] = str(final_status)
+
+        consumed = _read_json_locked(ENTRY_WATCH_CONSUMED_FILE, {})
+        if not isinstance(consumed, dict):
+            consumed = {}
+        consumed = _prune_entry_watch_store(consumed, ENTRY_WATCH_CONSUMED_KEEP_DAYS)
+        ckey = _entry_watch_store_key(consumed, log_key)
+        consumed[ckey] = payload
+        _save_entry_watch_consumed_store(consumed)
+
+        archive = _read_json_locked(ENTRY_WATCH_ARCHIVE_FILE, {})
+        if not isinstance(archive, dict):
+            archive = {}
+        archive = _prune_entry_watch_store(archive, ENTRY_WATCH_ARCHIVE_KEEP_DAYS)
+        akey = _entry_watch_store_key(archive, log_key)
+        archive[akey] = payload
+        _save_entry_watch_archive_store(archive)
+    except Exception:
+        pass
+
+def _entry_watch_final_status(watch: dict | None, default_status: str = "") -> str:
+    watch = watch or {}
+    if watch.get("entry_reference_market"):
+        return "NXT참고도달"
+    if watch.get("entry_blocked"):
+        return "진입불가"
+    if watch.get("entry_hit"):
+        return default_status or "진입후종료"
+    return default_status or "진입미달"
 
 FAST_EXECUTION_SIGNAL_TYPES = {"EARLY_DETECT", "NEAR_UPPER", "SURGE", PRECLOSE_GAP_SIGNAL_TYPE}
 ENTRY_EXECUTION_SIGNAL_TYPES = {"ENTRY_POINT"}
@@ -3271,6 +3427,7 @@ def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int
         "target_price": int(target_price),
         "signal_type": watch.get("signal_type", ""),
         "signal_log_key": watch.get("signal_log_key", ""),
+        "detect_date": str(watch.get("detect_date", "") or ""),
         "detect_time": watch.get("detect_time", datetime.now().strftime("%H:%M")),
         "last_notified_ts": time.time(),
         "notify_count": 1,
@@ -3280,6 +3437,8 @@ def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int
         "peak_price": max(int(hit_price), safe_int(watch.get("peak_price", 0), 0)),
         "reasons": list(watch.get("reasons") or [])[:5],
         "sector_theme": watch.get("sector_theme", ""),
+        "execution_metrics": dict(watch.get("execution_metrics") or {}),
+        "entry_watch_state": "active",
         "entry_hit": True,
         "entry_hit_locked": True,
         "entry_hit_time": hit_time,
@@ -3287,6 +3446,7 @@ def _register_active_entry_watch_from_confirmation(watch: dict, entry_price: int
         "entry_hit_date": hit_time.split(" ", 1)[0] if " " in hit_time else "",
         "entry_hit_clock": hit_time.split(" ", 1)[1] if " " in hit_time else "",
     }
+    _save_entry_watch_active()
 
 
 def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_price: int, target_price: int,
@@ -3349,7 +3509,7 @@ def check_execution_setup_watch() -> None:
             changed_any = True
             if price > safe_int(watch.get("peak_price", 0), 0):
                 watch["peak_price"] = price
-                changed = True
+                changed_active = True
                 changed_any = True
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
             watch["execution_metrics"] = metrics
@@ -4053,7 +4213,7 @@ def check_preclose_gap_entry_watch() -> None:
             changed = True
             if price > int(watch.get("peak_price", 0) or 0):
                 watch["peak_price"] = price
-                changed = True
+                changed_active = True
             if price > int(watch.get("entry_price", 0) or 0):
                 continue
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
@@ -8905,6 +9065,7 @@ def register_entry_watch(s: dict):
             _write_json_atomic(SIGNAL_LOG_FILE, sig_data, indent=2)
         except Exception as e:
             print(f"⚠️ 진입가변경 기록 오류: {e}")
+        _archive_entry_watch_record(k, _entry_watch.get(k), consume_reason="재포착_진입가변경", final_status="진입가변경")
         del _entry_watch[k]
 
     now_dt = datetime.now()
@@ -8952,7 +9113,9 @@ def register_entry_watch(s: dict):
         "entry_reference_reason": "",
         "entry_reference_time": "",
         "entry_reference_price": 0,
+        "entry_watch_state": "active",
     }
+    _save_entry_watch_active()
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
 def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
@@ -9310,7 +9473,8 @@ def _is_representative_tracking_record(data: dict | None, log_key: str, rec: dic
 
 def check_entry_watch():
     if not _entry_watch: return
-    expired = []
+    expired: list[tuple[str, str, str]] = []
+    changed_active = False
     for log_key, watch in list(_entry_watch.items()):
         # ── 만료 체크 (3일) ──
         if time.time() > watch.get("expire_ts", watch["registered_ts"] + 86400):
@@ -9321,7 +9485,7 @@ def check_entry_watch():
                 if old_ratio > 0.15:
                     _dynamic["entry_pullback_ratio"] = round(old_ratio - 0.05, 2)
                     print(f"  🔧 진입가 비율 완화: {old_ratio:.2f}→{_dynamic['entry_pullback_ratio']:.2f} (미도달 {miss_count}회)")
-            expired.append(log_key); continue
+            expired.append((log_key, "기간만료", _entry_watch_final_status(watch))); continue
 
         try:
             code = watch["code"]
@@ -9376,7 +9540,7 @@ def check_entry_watch():
                     f"진입 기회 없이 상승 → 감시 종료",
                     watch["code"], watch["name"]
                 )
-                expired.append(log_key); continue
+                expired.append((log_key, "상승이탈", _entry_watch_final_status(watch, "진입미달"))); continue
 
             # ── 엄격형 진입가 도달: 현재가가 진입가 이하일 때만 인정 ──
             if price <= entry:
@@ -9387,6 +9551,7 @@ def check_entry_watch():
                         watch["entry_reference_reason"] = reference_reason or "krx_vi_reference"
                         watch["entry_reference_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         watch["entry_reference_price"] = int(price or 0)
+                        changed_active = True
                         _record_entry_reference_reach(watch, price, market="NXT", reason=reference_reason or "krx_vi_reference")
                         _log_suppressed_alert(
                             watch["code"], watch["name"],
@@ -9400,7 +9565,9 @@ def check_entry_watch():
                 last_ts      = watch.get("last_notified_ts", 0)
                 notify_count = watch.get("notify_count", 0)
                 cooldown_sec = ENTRY_REWATCH_MINS * 60
-                if notify_count >= 3: expired.append(log_key); continue
+                if notify_count >= 3:
+                    expired.append((log_key, "알림횟수만료", _entry_watch_final_status(watch, "진입미달")))
+                    continue
                 if now_ts - last_ts < cooldown_sec: continue
 
                 # v40.0-#2: 섹터 약세 시 진입가 도달 알림 차단 (내부 로그만)
@@ -9440,6 +9607,7 @@ def check_entry_watch():
                     watch["entry_blocked_reason"] = _blocked_reason
                     watch["entry_blocked_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     watch["entry_blocked_price"] = int(price or 0)
+                    changed_active = True
                     _record_entry_blocked(watch, _blocked_reason, price)
                     _log_suppressed_alert(
                         watch["code"], watch["name"],
@@ -9456,6 +9624,7 @@ def check_entry_watch():
                 watch["entry_reference_reason"] = ""
                 watch["entry_reference_time"] = ""
                 watch["entry_reference_price"] = 0
+                changed_active = True
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
@@ -9543,6 +9712,7 @@ def check_entry_watch():
                 watch['entry_hit'] = True
                 watch['entry_hit_time'] = _entry_hit_ts
                 watch['entry_hit_price'] = price
+                changed_active = True
                 if ' ' in _entry_hit_ts:
                     watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
                 try:
@@ -9550,9 +9720,19 @@ def check_entry_watch():
                 except Exception:
                     pass
                 print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
-        except Exception: continue
-    for k in expired:
-        _entry_watch.pop(k, None)
+        except Exception:
+            continue
+    for item in expired:
+        if isinstance(item, tuple):
+            k, consume_reason, final_status = item
+        else:
+            k, consume_reason, final_status = item, "", ""
+        watch = _entry_watch.pop(k, None)
+        if watch:
+            _archive_entry_watch_record(k, watch, consume_reason=consume_reason, final_status=final_status or _entry_watch_final_status(watch))
+            changed_active = True
+    if changed_active:
+        _save_entry_watch_active()
 
 # ============================================================
 # 🛡 장마감 전/후 손익 방어 가이드 (entry_hit 감시 종목)
@@ -9657,6 +9837,7 @@ def run_entry_defense_monitor():
     try:
         if not _entry_watch:
             return
+        changed_active = False
         # 마감 구간이 아니면 불필요한 API 호출 줄이기
         if not _is_close_defense_window():
             return
@@ -9724,7 +9905,10 @@ def run_entry_defense_monitor():
 
             # 기록
             w["defense_last_ts"] = now_ts
+            changed_active = True
 
+        if changed_active:
+            _save_entry_watch_active()
     except Exception as e:
         _log_error("run_entry_defense_monitor", e)
 
@@ -16649,6 +16833,7 @@ if __name__ == "__main__":
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
+        _load_entry_watch_active()
         _load_preclose_gap_entry_watch()
         _load_reentry_watch()
         _load_execution_setup_watch()
@@ -16664,6 +16849,7 @@ if __name__ == "__main__":
 
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
+    _load_entry_watch_active()
     _load_preclose_gap_entry_watch()
     _load_reentry_watch()
     _load_execution_setup_watch()
@@ -16699,7 +16885,7 @@ if __name__ == "__main__":
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
-    schedule.every(5).minutes.do(lambda: send_market_leading_sector_update(force=False))
+    schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
     schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))  # INFO 알림 묶음 발송
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))  # v37.0: 캐시 메모리 관리
     schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
