@@ -3,11 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.63
+버전: v41.64
 날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.64 (2026-03-17): NXT 전용 파라미터 분리 — 시간대별 4단계 차등 적용.
+  [#1] NXT_TIME_PARAMS 테이블 추가: pre(08~09)/overlap(09~15:30)/post_early(15:30~17)/post_late(17~20)
+       각 시간대별 score_mult/min_add/cooldown_mult/stop_mult/target_mult/position_mult 정의.
+  [#2] get_nxt_time_slot()/get_nxt_params() 헬퍼 함수 추가.
+  [#3] analyze()에 NXT 시간대별 최소점수 보정 + 점수 배율 적용.
+  [#4] calc_dynamic_stop_target()에 NXT 시간대별 손절/목표 배수 세분화.
+  [#5] calc_position_size()에 NXT 시간대별 포지션 비중 배수 세분화.
+  [#6] get_regime_cooldown()에 NXT 시간대별 쿨다운 배수 적용.
+  이유: 스킬의 "NXT 전용 전략" 강화 영역 실제 반영. NXT 08~09 장전은 유동성 매우 낮아
+       보수적으로, 15:30~17 장후 초반은 적당히, 17~20 야간은 가장 보수적으로 자동 전환.
+  개선점: NXT 4개 시간대 × 6개 파라미터 = 24개 조합이 자동 적용.
+  주의점: KRX+NXT 겹치는 09~15:30은 overlap으로 보정 없음 (기존과 동일).
+
 - v41.63 (2026-03-17): signal_log 피드백 루프 강화 — 포착→진입→결과 파이프라인 KPI 자동 분석.
   [#1] compute_signal_kpi() 신규 함수: signal_log 기반 승률/손익비/기대수익 KPI 자동 계산.
        신호유형별·레짐별·시간대별 세분화 KPI를 dict로 반환.
@@ -1266,10 +1279,16 @@ REGIME_PARAMS = {
 }
 
 def get_regime_cooldown() -> int:
-    """현재 시장 레짐에 따른 포착 알림 쿨다운(초) 반환."""
+    """현재 시장 레짐에 따른 포착 알림 쿨다운(초) 반환.
+    v41.64: NXT 시간대별 쿨다운 배수 추가 적용."""
     try:
         mode = _dynamic.get("regime_mode", "normal")
-        return REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["cooldown"]
+        base = REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["cooldown"]
+        # NXT 시간대별 쿨다운 배수
+        _nxt_p = get_nxt_params()
+        if _nxt_p:
+            base = int(base * _nxt_p.get("cooldown_mult", 1.0))
+        return base
     except Exception:
         return ALERT_COOLDOWN
 
@@ -5831,6 +5850,50 @@ def get_volume_surge_stocks() -> list:
 # 시장 구분: NX (넥스트레이드), 오전 8:00~오후 8:00 운영
 NXT_OPEN  = dtime(8, 0)
 NXT_CLOSE = dtime(20, 0)
+
+# ── v41.64: NXT 시간대별 전용 파라미터 테이블 ──
+# 시간대: pre(08~09), overlap(09~15:30), post_early(15:30~17), post_late(17~20)
+# score_mult: 포착 점수 배율 (낮을수록 보수적)
+# min_add: 최소점수 추가 보정
+# cooldown_mult: 쿨다운 배수 (높을수록 느림)
+# stop_mult: 손절 ATR 배수 보정 (높을수록 여유)
+# target_mult: 목표가 ATR 배수 보정 (낮을수록 보수적)
+# position_mult: 포지션 비중 배수
+NXT_TIME_PARAMS = {
+    "pre":        {"score_mult": 0.85, "min_add": 10, "cooldown_mult": 1.5,
+                   "stop_mult": 1.3,  "target_mult": 0.75, "position_mult": 0.6,
+                   "label": "🔵 NXT 장전 (08~09)"},
+    "overlap":    {"score_mult": 1.0,  "min_add": 0,  "cooldown_mult": 1.0,
+                   "stop_mult": 1.0,  "target_mult": 1.0,  "position_mult": 1.0,
+                   "label": "⚪ KRX+NXT 병행"},
+    "post_early": {"score_mult": 0.90, "min_add": 5,  "cooldown_mult": 1.3,
+                   "stop_mult": 1.2,  "target_mult": 0.85, "position_mult": 0.7,
+                   "label": "🔵 NXT 장후 초반 (15:30~17)"},
+    "post_late":  {"score_mult": 0.75, "min_add": 12, "cooldown_mult": 2.0,
+                   "stop_mult": 1.5,  "target_mult": 0.65, "position_mult": 0.5,
+                   "label": "🌙 NXT 야간 (17~20)"},
+}
+
+def get_nxt_time_slot() -> str:
+    """현재 시각 기준 NXT 시간대 구분 반환."""
+    if not is_nxt_open():
+        return ""
+    n = datetime.now().time()
+    if n < dtime(9, 0):
+        return "pre"
+    elif n <= dtime(15, 30):
+        return "overlap"
+    elif n <= dtime(17, 0):
+        return "post_early"
+    else:
+        return "post_late"
+
+def get_nxt_params() -> dict:
+    """현재 NXT 시간대에 해당하는 파라미터 반환. NXT 아니면 빈 dict."""
+    slot = get_nxt_time_slot()
+    if not slot:
+        return {}
+    return NXT_TIME_PARAMS.get(slot, {})
 
 def is_nxt_open() -> bool:
     """NXT는 주말/공휴일 제외, 08:00~20:00"""
@@ -11505,11 +11568,19 @@ def analyze(stock: dict) -> dict:
     _regime_mult = float(_dynamic.get("regime_score_mult", 1.0) or 1.0)
     _regime_min_add = int(_dynamic.get("regime_min_add", 0) or 0)
     min_score += _regime_min_add
+    # v41.64: NXT 시간대별 파라미터 보정
+    _nxt_params = get_nxt_params()
+    _nxt_score_mult = 1.0
+    if _nxt_params and stock.get("market") == "NXT":
+        min_score += _nxt_params.get("min_add", 0)
+        _nxt_score_mult = _nxt_params.get("score_mult", 1.0)
     score, reasons, signal_type = 0, [], None
     if _slot_adj > 0:
         reasons.append(f"🕐 [{_slot}] 학습 보정: 최소점수 +{_slot_adj}점")
     if _regime_mode != "normal":
         reasons.append(f"🌎 {regime_label()} 필터: 최소점수 +{_regime_min_add}점 / 점수배율 x{_regime_mult:.2f}")
+    if _nxt_params and stock.get("market") == "NXT" and _nxt_params.get("min_add", 0) > 0:
+        reasons.append(f"🔵 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
 
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
@@ -11597,6 +11668,9 @@ def analyze(stock: dict) -> dict:
 
     if _regime_mult != 1.0:
         score = int(round(score * _regime_mult))
+    # v41.64: NXT 시간대별 점수 배율 적용
+    if _nxt_score_mult != 1.0:
+        score = int(round(score * _nxt_score_mult))
     if score < min_score: return {}
 
     # ── 보조지표 (RSI / 이동평균 / 볼린저) → v38.6: 감점만, 차단 없음 ──
@@ -17380,9 +17454,13 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
         regime       = regime_info.get("mode", "normal")
         nxt_only     = regime_info.get("nxt_only", False)
         regime_mult  = {"bull": 1.2, "normal": 1.0, "bear": 0.6, "crash": 0.3}.get(regime, 1.0)
-        # NXT 단독 시간대: 포지션 비중 추가 20% 축소
+        # v41.64: NXT 시간대별 포지션 비중 세분화
         if nxt_only:
-            regime_mult = max(regime_mult * 0.8, 0.3)
+            _nxt_p = get_nxt_params()
+            if _nxt_p:
+                regime_mult = max(regime_mult * _nxt_p.get("position_mult", 0.8), 0.3)
+            else:
+                regime_mult = max(regime_mult * 0.8, 0.3)
 
         base_pct = _dynamic.get("position_base_pct", 8.0)
         final_pct = round(min(base_pct * grade_mult * regime_mult, 20.0), 1)
@@ -17456,10 +17534,15 @@ def calc_dynamic_stop_target(code: str, entry: int, signal_type: str | None = No
     elif regime == "bull":
         tgt_m   = min(tgt_m   * 1.2, 5.0)
 
-    # NXT 단독 시간대 보정: 거래량 얇아 변동성 높음 → 손절 여유 + 목표 축소
+    # NXT 단독 시간대 보정: v41.64 시간대별 세분화
     if nxt_only:
-        stop_m  = max(stop_m  * 0.85, 1.0)   # 손절 더 여유롭게
-        tgt_m   = max(tgt_m   * 0.80, 1.5)   # 목표 보수적
+        _nxt_p = get_nxt_params()
+        if _nxt_p:
+            stop_m  = max(stop_m  * _nxt_p.get("stop_mult", 1.0),   1.0)
+            tgt_m   = max(tgt_m   * _nxt_p.get("target_mult", 1.0), 1.5)
+        else:
+            stop_m  = max(stop_m  * 0.85, 1.0)
+            tgt_m   = max(tgt_m   * 0.80, 1.5)
 
     stop      = int((entry - atr * stop_m)  / 10) * 10
     target    = int((entry + atr * tgt_m)   / 10) * 10
