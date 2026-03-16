@@ -21,11 +21,21 @@
        이전 레짐→현재 레짐, 변경 파라미터 요약 포함.
   [#6] calc_overnight_risk()에 한국 시장 레짐 반영.
        bear/crash 시 오버나이트 위험 점수 추가 가중(+15/+25).
+  [#7] calc_stop_target → calc_dynamic_stop_target 위임으로 통합.
+       기존 9곳의 레거시 호출부가 자동으로 레짐+신호유형+변동성 고도화 적용.
+  [#8] calc_dynamic_stop_target에 SIGNAL_STOP_PARAMS(신호유형별 손절·익절 배수)
+       + 종목 ATR 변동성 구간(저/중/고) 보정 추가.
+  [#9] calc_trailing_stop에 변동성 구간 기반 트레일링 폭 자동 조정.
+       저변동 종목은 타이트, 고변동 종목은 여유 있게.
+  [#10] SIGNAL_STOP_PARAMS 테이블 추가 (8개 신호유형별 손절·익절 배수 정의).
   이유: 스킬의 "시장 레짐별 전략 전환" 강화 영역을 코드에 실제 반영하여
        상승장에서는 공격적으로, 하락장에서는 방어적으로 자동 전환.
   개선점: 레짐 전환 시 6개 파라미터가 동시에 연동되어 일관된 전략 대응 가능.
+       + 신호유형별 손절·익절이 차등 적용되어 UPPER_LIMIT은 타이트, PRECLOSE_GAP은 여유롭게.
+       + 종목 변동성 구간(저/중/고)에 따라 손절폭·트레일링이 자동 조절.
   주의점: 기존 고정 ALERT_COOLDOWN 참조하던 곳은 get_regime_cooldown()으로 대체.
        레짐 전환 알림은 동일 레짐 연속 시 중복 발송 안 됨.
+       calc_stop_target의 시그니처에 signal_type 옵션 파라미터 추가됨 (기본값 None → 하위호환).
 
 - v41.60 (2026-03-16): 원본 v41.59 기준 야간 모니터링/장전 브리핑 핫픽스 적용.
   [#1] 수정 기준 파일을 사용자 업로드 원본(v41.59)으로 재정렬해, v41.56~v41.59 기능 누락 없이 최신 로직 위에 핫픽스가 얹히도록 정리.
@@ -1293,6 +1303,22 @@ ATR_PERIOD       = 5
 ATR_STOP_MULT    = 1.5
 ATR_TARGET_MULT  = 3.0
 
+# ── v41.61 #10: 신호유형별 손절·익절 파라미터 테이블 ──
+# stop_mult: ATR × 이 배수 = 손절폭 (작을수록 타이트)
+# target_mult: ATR × 이 배수 = 목표폭
+# 스킬 기준: UPPER_LIMIT -3% 손절/+10% 익절, SURGE -3%/+5%, 눌림목 -2.5%/+8%
+SIGNAL_STOP_PARAMS = {
+    "UPPER_LIMIT":        {"stop_mult": 1.0, "target_mult": 4.0},   # 타이트 손절, 큰 목표
+    "NEAR_UPPER":         {"stop_mult": 1.2, "target_mult": 3.5},
+    "STRONG_BUY":         {"stop_mult": 1.0, "target_mult": 4.0},   # 수급 강력 → 큰 목표
+    "SURGE":              {"stop_mult": 1.5, "target_mult": 3.0},   # 표준
+    "EARLY_DETECT":       {"stop_mult": 1.3, "target_mult": 3.5},   # 조기포착 → 약간 공격적
+    "MID_PULLBACK":       {"stop_mult": 1.2, "target_mult": 3.5},   # 눌림목 → 타이트 손절, 높은 목표
+    "ENTRY_POINT":        {"stop_mult": 1.5, "target_mult": 3.0},   # 표준
+    "PRECLOSE_GAP_ENTRY": {"stop_mult": 1.8, "target_mult": 2.5},   # 선진입 → 여유 손절, 보수적 목표
+    "MANUAL":             {"stop_mult": 1.5, "target_mult": 3.0},   # 수동 = 표준
+}
+
 # 시간대 필터
 STRICT_OPEN_MINUTES  = 10
 STRICT_CLOSE_MINUTES = 10
@@ -2337,11 +2363,21 @@ def calc_trailing_stop(code: str, high_price: int) -> int:
     """
     트레일링 스탑 가격 계산.
     고점 - ATR × 국면배수 (최소 -1.5%, 최대 -8%)
+    v41.61 #9: 종목별 ATR 변동성 구간 보정 추가.
+      저변동(ATR<1.5%) → 트레일링 타이트 (빠른 익절 보호)
+      고변동(ATR>4.0%) → 트레일링 여유 (노이즈 방지)
     """
     try:
         atr  = get_atr(code)
         mult = get_atr_regime_mult()
         if atr > 0:
+            # v41.61: 변동성 구간 보정
+            atr_pct = atr / high_price * 100 if high_price else 3.0
+            if atr_pct < 1.5:
+                mult = max(mult * 0.8, 0.6)    # 저변동: 더 타이트
+            elif atr_pct > 4.0:
+                mult = min(mult * 1.3, 3.5)    # 고변동: 더 여유
+
             trail_gap = int(atr * mult)
             trail_pct = trail_gap / high_price * 100 if high_price else 3.0
             # 최소 1.5%, 최대 8% 범위 제한
@@ -2398,19 +2434,13 @@ def calc_trailing_stop_price(code: str, price: int) -> int:
     """고점 기준 트레일링 스탑 — calc_trailing_stop의 별칭"""
     return calc_trailing_stop(code, price)
 
-def calc_stop_target(code: str, entry: int) -> tuple:
-    atr = get_atr(code)
-    if atr > 0:
-        stop   = int((entry - atr * ATR_STOP_MULT)  / 10) * 10
-        target = int((entry + atr * ATR_TARGET_MULT) / 10) * 10
-        return stop, target, round((entry-stop)/entry*100,1), round((target-entry)/entry*100,1), True
-    # ATR 실패 시 국면 배수 적용 fallback
-    _rm   = get_atr_regime_mult()
-    _stop_pct   = max(0.05, 0.07 * _rm)
-    _target_pct = max(0.08, 0.15 / _rm)
-    stop   = int(entry * (1 - _stop_pct)   / 10) * 10
-    target = int(entry * (1 + _target_pct) / 10) * 10
-    return stop, target, round(_stop_pct*100,1), round(_target_pct*100,1), False
+def calc_stop_target(code: str, entry: int, signal_type: str | None = None) -> tuple:
+    """
+    손절/목표가 계산 — v41.61: calc_dynamic_stop_target으로 위임.
+    기존 호출부 호환: signal_type 미지정 시 표준 배수 적용.
+    반환: (stop, target, stop_pct, target_pct, atr_used)
+    """
+    return calc_dynamic_stop_target(code, entry, signal_type=signal_type)
 
 # ============================================================
 # ⑨ 전일 상한가 체크
@@ -2853,7 +2883,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
 
     # 손절·목표가
     entry = today_close
-    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
 
     return {
         "code": code, "name": name,
@@ -3862,7 +3892,7 @@ def check_execution_setup_watch() -> None:
             entry_price = _round_price_down(min(price, safe_int(metrics.get("suggested_entry_price", price), price) or price))
             if entry_price <= 0:
                 entry_price = _round_price_down(price)
-            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price)
+            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price, signal_type=watch.get("signal_type"))
             if stop_price <= 0 or target_price <= entry_price:
                 continue
             hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -4079,7 +4109,7 @@ def _build_preclose_gap_entry_plan(code: str, current_price: int, change_rate: f
     if entry_price <= 0 or entry_price >= current_price:
         return None
 
-    stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(code, entry_price)
+    stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(code, entry_price, signal_type="PRECLOSE_GAP_ENTRY")
     if stop_price <= 0 or target_price <= entry_price:
         return None
     if current_price >= target_price:
@@ -4570,7 +4600,7 @@ def check_preclose_gap_entry_watch() -> None:
             entry_price = _round_price_down(min(price, safe_int(metrics.get("suggested_entry_price", price), price) or price))
             if entry_price <= 0:
                 entry_price = _round_price_down(price)
-            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price)
+            stop_price, target_price, _, _, _ = calc_stop_target(watch.get("code"), entry_price, signal_type=watch.get("signal_type"))
             if stop_price <= 0 or target_price <= entry_price:
                 continue
             hit_time = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -5170,7 +5200,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
 
     grade = "A" if score>=80 else "B" if score>=60 else "C"
     entry = today_price
-    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
 
     return {
         "code": code, "name": _resolve_stock_name(code, name, cur), "price": today_price, "change_rate": today_chg,
@@ -8351,7 +8381,7 @@ def check_reentry_watch():
                               "SURGE":"급등","EARLY_DETECT":"조기포착",
                               "MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목"}
                 sig = sig_labels.get(w["signal_type"], w["signal_type"])
-                stop_new, target_new, sp, tp, atr = calc_stop_target(code, price)
+                stop_new, target_new, sp, tp, atr = calc_stop_target(code, price, signal_type=w.get("signal_type"))
                 rr = round((target_new - price) / (price - stop_new), 1) if price > stop_new else 0
                 send_with_chart_buttons(
                     f"🔄 <b>[손절 후 재진입 후보{mkt_tag}]</b>\n"
@@ -11664,7 +11694,7 @@ def analyze(stock: dict) -> dict:
     entry        = int((price-(price-open_est)*_pullback_r)/10)*10
 
     # ── ③ 손익비 동적 조정 ──
-    stop, target, stop_pct, target_pct, atr_used = calc_dynamic_stop_target(code, entry)
+    stop, target, stop_pct, target_pct, atr_used = calc_dynamic_stop_target(code, entry, signal_type=signal_type)
 
     # ── 매물대/지지저항선 보정 ──
     try:
@@ -11778,7 +11808,7 @@ def check_early_detection() -> list:
         open_est     = price/(1+change_rate/100)
         _pullback_r  = _dynamic.get("entry_pullback_ratio", get_regime_pullback_ratio())
         entry        = int((price-(price-open_est)*_pullback_r)/10)*10
-        stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+        stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="EARLY_DETECT")
         hoga_text = f"{bid_qty/ask_qty:.1f}배" if ask_qty > 0 else "압도적"
         prev_upper = was_upper_limit_yesterday(code)
         early_score = 85 + (10 if prev_upper else 0)
@@ -11845,7 +11875,7 @@ def check_early_detection() -> list:
             if pre_score < 75: continue
 
             entry = price
-            stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+            stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="EARLY_DETECT")
             pre_key = f"NXT_PRE_{code}"
             if time.time() - _alert_history.get(pre_key, 0) < 3600: continue
             _alert_history[pre_key] = time.time()
@@ -11883,7 +11913,7 @@ def check_pullback_signals() -> list:
             carry    = info.get("carry_day",0)
             if 25.0 <= pullback <= 55.0:
                 entry = price
-                stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+                stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="ENTRY_POINT")
                 carry_text = f" (이월 {carry}일차)" if carry>0 else ""
                 entry_score = 95
                 entry_reasons = [f"🎯 눌림목{carry_text}",
@@ -13910,7 +13940,7 @@ def run_dart_intraday():
             atr_used = False
             if price:
                 try:
-                    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
+                    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MANUAL")
                 except Exception: pass
             atr_tag = " (ATR)" if atr_used else " (고정)"
 
@@ -17144,10 +17174,10 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
 # ============================================================
 # 📐 ③ 손익비 동적 최적화
 # ============================================================
-def calc_dynamic_stop_target(code: str, entry: int) -> tuple:
+def calc_dynamic_stop_target(code: str, entry: int, signal_type: str | None = None) -> tuple:
     """
-    시장 변동성 + 국면에 따라 손절/목표가 배수 동적 조정.
-    기존 calc_stop_target 대체.
+    시장 변동성 + 국면 + 신호유형에 따라 손절/목표가 배수 동적 조정.
+    v41.61: 신호유형별 SIGNAL_STOP_PARAMS 적용 + 종목 ATR 변동성 구간 보정.
     반환: (stop, target, stop_pct, target_pct, atr_used)
     """
     atr = get_atr(code)
@@ -17162,8 +17192,26 @@ def calc_dynamic_stop_target(code: str, entry: int) -> tuple:
     regime_info = get_market_regime()
     regime  = regime_info.get("mode", "normal")
     nxt_only = regime_info.get("nxt_only", False)
-    stop_m  = _dynamic.get("atr_stop_mult",   ATR_STOP_MULT)
-    tgt_m   = _dynamic.get("atr_target_mult", ATR_TARGET_MULT)
+
+    # ── v41.61 #8: 신호유형별 기본 배수 선택 ──
+    sig_params = SIGNAL_STOP_PARAMS.get(signal_type or "", {})
+    stop_m  = _dynamic.get("atr_stop_mult",   sig_params.get("stop_mult", ATR_STOP_MULT))
+    tgt_m   = _dynamic.get("atr_target_mult", sig_params.get("target_mult", ATR_TARGET_MULT))
+    # signal_type이 명시된 경우 해당 유형 배수를 우선 적용
+    if signal_type and signal_type in SIGNAL_STOP_PARAMS:
+        stop_m = sig_params["stop_mult"]
+        tgt_m  = sig_params["target_mult"]
+
+    # ── v41.61 #8: 종목별 ATR 변동성 구간 보정 ──
+    # 저변동(ATR<1.5%) → 손절 타이트, 목표 보수적
+    # 고변동(ATR>4.0%) → 손절 여유, 목표 확대
+    atr_pct = atr / entry * 100 if entry > 0 else 2.0
+    if atr_pct < 1.5:
+        stop_m  = max(stop_m * 0.85, 0.8)    # 저변동: 타이트
+        tgt_m   = max(tgt_m * 0.85, 1.5)
+    elif atr_pct > 4.0:
+        stop_m  = min(stop_m * 1.25, 3.5)    # 고변동: 여유
+        tgt_m   = min(tgt_m * 1.20, 6.0)
 
     # 시장 국면 보정
     if regime == "crash":
