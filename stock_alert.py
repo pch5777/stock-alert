@@ -3,11 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.60
+버전: v41.61
 날짜: 2026-03-16
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.61 (2026-03-16): 시장 레짐별 전략 전환 강화 — 6개 영역 통합 업그레이드.
+  [#1] get_market_regime()에 레짐별 파라미터 대응표(REGIME_PARAMS) 통합 반환 추가.
+       손절/익절/포지션/쿨다운/눌림비율/동시종목 등 레짐별 차등 파라미터를 한 곳에서 관리.
+  [#2] calc_partial_exit_min_pct()에 레짐별 분할 청산 트리거 차등 적용.
+       bull: 기준 0.8배(빨리 익절), bear: 1.3배(여유), crash: 1.5배(노이즈 방어).
+  [#3] analyze() 내 진입가 계산 시 레짐별 ENTRY_PULLBACK_RATIO 동적 조정.
+       bull: 0.35(공격적 진입), bear: 0.50(깊은 눌림 대기), crash: 0.55.
+  [#4] ALERT_COOLDOWN을 get_regime_cooldown() 함수로 대체.
+       bull: 900초(빠른 포착), normal: 1800초, bear: 2700초, crash: 3600초.
+  [#5] 레짐 전환 시 텔레그램 1회 알림 발송 (_notify_regime_change).
+       이전 레짐→현재 레짐, 변경 파라미터 요약 포함.
+  [#6] calc_overnight_risk()에 한국 시장 레짐 반영.
+       bear/crash 시 오버나이트 위험 점수 추가 가중(+15/+25).
+  이유: 스킬의 "시장 레짐별 전략 전환" 강화 영역을 코드에 실제 반영하여
+       상승장에서는 공격적으로, 하락장에서는 방어적으로 자동 전환.
+  개선점: 레짐 전환 시 6개 파라미터가 동시에 연동되어 일관된 전략 대응 가능.
+  주의점: 기존 고정 ALERT_COOLDOWN 참조하던 곳은 get_regime_cooldown()으로 대체.
+       레짐 전환 알림은 동일 레짐 연속 시 중복 발송 안 됨.
+
 - v41.60 (2026-03-16): 원본 v41.59 기준 야간 모니터링/장전 브리핑 핫픽스 적용.
   [#1] 수정 기준 파일을 사용자 업로드 원본(v41.59)으로 재정렬해, v41.56~v41.59 기능 누락 없이 최신 로직 위에 핫픽스가 얹히도록 정리.
   [#2] 20:10 `sys.exit(0)` 자동 종료 스케줄을 제거하고 야간 모니터링 모드 전환 로그만 남기도록 변경.
@@ -1212,6 +1231,53 @@ EARLY_HOGA_RATIO      = 3.0
 EARLY_CONFIRM_COUNT   = 2
 SCAN_INTERVAL         = 20    # 60→20초 (KIS API 분당 20회 한도 내 최대)
 ALERT_COOLDOWN        = 1800
+
+# ── v41.61: 시장 레짐별 파라미터 대응표 ──
+# get_market_regime()에서 mode 확정 후 이 테이블에서 파라미터를 꺼내 _regime_cache에 병합.
+# 각 키: score_mult/min_add(포착), cooldown(알림간격), pullback_ratio(진입눌림),
+#         partial_exit_mult(분할청산기준 배수), max_positions(동시보유), overnight_add(야간위험가중)
+REGIME_PARAMS = {
+    "bull":   {"score_mult": 1.15, "min_add": -5,  "cooldown": 900,  "pullback_ratio": 0.35,
+               "partial_exit_mult": 0.8, "max_positions": 3, "overnight_add": 0},
+    "normal": {"score_mult": 1.0,  "min_add": 0,   "cooldown": 1800, "pullback_ratio": 0.40,
+               "partial_exit_mult": 1.0, "max_positions": 3, "overnight_add": 0},
+    "bear":   {"score_mult": 0.75, "min_add": 8,   "cooldown": 2700, "pullback_ratio": 0.50,
+               "partial_exit_mult": 1.3, "max_positions": 2, "overnight_add": 15},
+    "crash":  {"score_mult": 0.5,  "min_add": 15,  "cooldown": 3600, "pullback_ratio": 0.55,
+               "partial_exit_mult": 1.5, "max_positions": 1, "overnight_add": 25},
+}
+
+def get_regime_cooldown() -> int:
+    """현재 시장 레짐에 따른 포착 알림 쿨다운(초) 반환."""
+    try:
+        mode = _dynamic.get("regime_mode", "normal")
+        return REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["cooldown"]
+    except Exception:
+        return ALERT_COOLDOWN
+
+def get_regime_pullback_ratio() -> float:
+    """현재 시장 레짐에 따른 진입 눌림 비율 반환."""
+    try:
+        mode = _dynamic.get("regime_mode", "normal")
+        return REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["pullback_ratio"]
+    except Exception:
+        return ENTRY_PULLBACK_RATIO
+
+def get_regime_partial_exit_mult() -> float:
+    """현재 시장 레짐에 따른 분할 청산 트리거 배수 반환."""
+    try:
+        mode = _dynamic.get("regime_mode", "normal")
+        return REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["partial_exit_mult"]
+    except Exception:
+        return 1.0
+
+def get_regime_overnight_add() -> int:
+    """현재 시장 레짐에 따른 오버나이트 위험 점수 추가분 반환."""
+    try:
+        mode = _dynamic.get("regime_mode", "normal")
+        return REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])["overnight_add"]
+    except Exception:
+        return 0
 NEWS_SCAN_INTERVAL    = 45    # 120→45초 (크롤링 차단 방지 최소값)
 DART_INTERVAL         = 60    # 180→60초 (DART API 여유 있음)
 TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "2") or "2")
@@ -2321,9 +2387,12 @@ def calc_partial_exit_min_pct(code: str, price: int) -> float:
     """
     분할 청산 트리거 최소 수익률 (%) — 이 이상 수익일 때만 분할 청산 알림.
     ATR × 1배 (최소 1.5%, 최대 5.0%)
+    v41.61: 레짐별 배수 적용 — bull이면 일찍 익절, bear/crash면 여유.
     """
     atr_pct = calc_atr_pct(code, price, fallback_pct=2.0)
-    return max(1.5, min(round(atr_pct, 1), 5.0))
+    base = max(1.5, min(round(atr_pct, 1), 5.0))
+    regime_mult = get_regime_partial_exit_mult()
+    return max(1.0, min(round(base * regime_mult, 1), 7.0))
 
 def calc_trailing_stop_price(code: str, price: int) -> int:
     """고점 기준 트레일링 스탑 — calc_trailing_stop의 별칭"""
@@ -11591,7 +11660,7 @@ def analyze(stock: dict) -> dict:
         return {}
 
     open_est     = price/(1+change_rate/100)
-    _pullback_r  = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+    _pullback_r  = _dynamic.get("entry_pullback_ratio", get_regime_pullback_ratio())
     entry        = int((price-(price-open_est)*_pullback_r)/10)*10
 
     # ── ③ 손익비 동적 조정 ──
@@ -11707,7 +11776,7 @@ def check_early_detection() -> list:
         del _early_cache[code]
 
         open_est     = price/(1+change_rate/100)
-        _pullback_r  = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
+        _pullback_r  = _dynamic.get("entry_pullback_ratio", get_regime_pullback_ratio())
         entry        = int((price-(price-open_est)*_pullback_r)/10)*10
         stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry)
         hoga_text = f"{bid_qty/ask_qty:.1f}배" if ask_qty > 0 else "압도적"
@@ -14855,6 +14924,14 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         if datetime.now().weekday() == 4 and _get_time_risk_profile() == "friday_close":
             risk_score += 10; reasons.append("📅 금요일 오버나이트 (주말 리스크)")
 
+        # v41.61 #6: 한국 시장 레짐 기반 오버나이트 위험 가중
+        _on_regime_add = get_regime_overnight_add()
+        if _on_regime_add > 0:
+            risk_score += _on_regime_add
+            _on_regime_mode = _dynamic.get("regime_mode", "normal")
+            _on_labels = {"bear": "🟠 하락장", "crash": "🔴 급락장"}
+            reasons.append(f"{_on_labels.get(_on_regime_mode, '')} 레짐 가중 +{_on_regime_add}점")
+
         if   risk_score >= 50: level = "high"
         elif risk_score >= 25: level = "mid"
         else:                  level = "low"
@@ -16210,6 +16287,41 @@ def run_news_scan():
     except Exception as e: print(f"⚠️ 뉴스 오류: {e}")
 
 
+# ── v41.61 #5: 레짐 전환 알림 ──
+_last_regime_notify_mode: str = ""   # 중복 발송 방지
+
+def _notify_regime_change(prev_mode: str, new_mode: str):
+    """시장 레짐 전환 시 텔레그램 1회 알림. 동일 전환 연속 발송 차단."""
+    global _last_regime_notify_mode
+    try:
+        if new_mode == _last_regime_notify_mode:
+            return   # 이미 같은 전환 알림 발송함
+        _last_regime_notify_mode = new_mode
+
+        labels = {"bull": "🟢 상승장", "normal": "🔵 보통장", "bear": "🟠 하락장", "crash": "🔴 급락장"}
+        prev_label = labels.get(prev_mode, prev_mode)
+        new_label  = labels.get(new_mode, new_mode)
+
+        rp = REGIME_PARAMS.get(new_mode, REGIME_PARAMS["normal"])
+        msg = (
+            f"🔄 <b>시장 레짐 전환</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{prev_label} → {new_label}\n\n"
+            f"📊 <b>자동 조정 파라미터</b>\n"
+            f"  • 신호 점수 배율: ×{rp['score_mult']}\n"
+            f"  • 최소점수 보정: {rp['min_add']:+d}점\n"
+            f"  • 포착 쿨다운: {rp['cooldown']//60}분\n"
+            f"  • 진입 눌림비율: {rp['pullback_ratio']:.0%}\n"
+            f"  • 분할청산 배수: ×{rp['partial_exit_mult']}\n"
+            f"  • 동시 보유 한도: {rp['max_positions']}종목\n"
+            f"  • 야간 위험 가중: {rp['overnight_add']:+d}점\n"
+        )
+        send(msg)
+        print(f"  🔄 레짐 전환 알림: {prev_mode} → {new_mode}")
+    except Exception as e:
+        _log_error("_notify_regime_change", e)
+
+
 # ============================================================
 # 🌐 ① 시장 국면 판단 (Market Regime)
 # ============================================================
@@ -16292,9 +16404,18 @@ def get_market_regime() -> dict:
             _regime_cache["korea_etf_summary"] = get_korea_etf_signals().get("summary", "")
         except Exception: pass
 
+        # ── v41.61 #5: 레짐 전환 감지 → 텔레그램 1회 알림 ──
+        prev_mode = _dynamic.get("regime_mode", "normal")
+        if mode != prev_mode:
+            _notify_regime_change(prev_mode, mode)
+
         _dynamic["regime_mode"]       = mode
         _dynamic["regime_score_mult"] = mult_map[mode]
         _dynamic["regime_min_add"]    = add_map[mode]
+
+        # v41.61: REGIME_PARAMS 파라미터도 _regime_cache에 병합
+        _rp = REGIME_PARAMS.get(mode, REGIME_PARAMS["normal"])
+        _regime_cache["regime_params"] = _rp
 
     except Exception as e:
         _log_error("get_market_regime", e)
@@ -17226,7 +17347,7 @@ def run_scan():
                         # 상한가 풀림 → 초기화 (재차 상한가 도달 시 다시 알림 가능)
                         _upper_limit_day_alerted.pop(stock["code"], None)
                 r = analyze(stock)
-                if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
+                if r and time.time()-_alert_history.get(r["code"],0)>get_regime_cooldown():
                     # v40.0-#10: 상한가 감지면 당일 기록
                     if r.get("signal_type") in ("UPPER_LIMIT", "NEAR_UPPER"):
                         _upper_limit_day_alerted[r["code"]] = {"date": today_date, "alerted": True}
@@ -17234,7 +17355,7 @@ def run_scan():
             for stock in get_volume_surge_stocks():
                 if stock["code"] in seen: continue
                 r = analyze(stock)
-                if r and time.time()-_alert_history.get(r["code"],0)>ALERT_COOLDOWN:
+                if r and time.time()-_alert_history.get(r["code"],0)>get_regime_cooldown():
                     alerts.append(r); seen.add(r["code"])
 
         # ── NXT 스캔 (NXT 운영 시간에만) ──
@@ -17242,14 +17363,14 @@ def run_scan():
             for stock in get_nxt_surge_stocks():
                 if stock["code"] in seen: continue
                 r = analyze(stock)
-                if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>ALERT_COOLDOWN:
+                if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>get_regime_cooldown():
                     r["market"] = "NXT"
                     alerts.append(r); seen.add(stock["code"])
 
         # 조기포착·눌림목은 KRX 장중에만 의미 있음
         if krx_open:
             for s in check_early_detection():
-                if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>ALERT_COOLDOWN:
+                if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>get_regime_cooldown():
                     alerts.append(s); seen.add(s["code"])
             for s in check_pullback_signals():
                 # v39.3-#9-2: MID_PULLBACK↔ENTRY_POINT 동일종목 중복 억제
