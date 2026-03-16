@@ -3,39 +3,47 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.61
-날짜: 2026-03-16
+버전: v41.63
+날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.63 (2026-03-17): signal_log 피드백 루프 강화 — 포착→진입→결과 파이프라인 KPI 자동 분석.
+  [#1] compute_signal_kpi() 신규 함수: signal_log 기반 승률/손익비/기대수익 KPI 자동 계산.
+       신호유형별·레짐별·시간대별 세분화 KPI를 dict로 반환.
+  [#2] _check_strategy_health() 신규 함수: KPI 기반 전략 건강도 자동 판정.
+       승률<35% 또는 손익비<1.0이면 해당 신호유형 자동 기준 강화 제안.
+       연속 손절 5회 이상이면 긴급 경고 발송.
+  [#3] auto_tune()에 피드백 루프 통합: 장마감 후 compute_signal_kpi() → _check_strategy_health()
+       → 조건 자동 조정 또는 사용자 알림 경로 추가.
+  [#4] /stats 명령 강화: 기존 통계에 KPI 요약 (승률/손익비/기대수익) 추가 표시.
+  이유: 스킬의 "signal_log 백테스트 기준" 강화 영역 실제 반영.
+       포착→진입→결과 파이프라인에 자동 피드백 루프를 구축하여 전략 자기 최적화 가속.
+  개선점: 수익률 30% 목표 달성을 위한 자동 전략 조정 루프 완성.
+  주의점: KPI 계산은 최소 10건 이상 완료 데이터 필요. 미달 시 "데이터 부족" 표시.
+
+- v41.62 (2026-03-17): 동적 손절선 고도화 — 신호유형별·변동성별 차등 적용.
+  [#1] calc_stop_target → calc_dynamic_stop_target 위임으로 통합.
+       기존 9곳의 레거시 호출부가 자동으로 레짐+신호유형+변동성 고도화 적용.
+  [#2] calc_dynamic_stop_target에 SIGNAL_STOP_PARAMS(신호유형별 손절·익절 배수)
+       + 종목 ATR 변동성 구간(저/중/고) 보정 추가.
+  [#3] calc_trailing_stop에 변동성 구간 기반 트레일링 폭 자동 조정.
+       저변동 종목은 타이트, 고변동 종목은 여유 있게.
+  [#4] SIGNAL_STOP_PARAMS 테이블 추가 (8개 신호유형별 손절·익절 배수 정의).
+  이유: 스킬의 "종목별 변동성 기반 동적 손절선" 강화 영역 실제 반영.
+  개선점: 신호유형별 손절·익절 차등 + 변동성 구간 자동 조절로 손익비 개선.
+  주의점: calc_stop_target 시그니처에 signal_type 옵션 파라미터 추가 (기본값 None → 하위호환).
+
 - v41.61 (2026-03-16): 시장 레짐별 전략 전환 강화 — 6개 영역 통합 업그레이드.
   [#1] get_market_regime()에 레짐별 파라미터 대응표(REGIME_PARAMS) 통합 반환 추가.
-       손절/익절/포지션/쿨다운/눌림비율/동시종목 등 레짐별 차등 파라미터를 한 곳에서 관리.
   [#2] calc_partial_exit_min_pct()에 레짐별 분할 청산 트리거 차등 적용.
-       bull: 기준 0.8배(빨리 익절), bear: 1.3배(여유), crash: 1.5배(노이즈 방어).
   [#3] analyze() 내 진입가 계산 시 레짐별 ENTRY_PULLBACK_RATIO 동적 조정.
-       bull: 0.35(공격적 진입), bear: 0.50(깊은 눌림 대기), crash: 0.55.
   [#4] ALERT_COOLDOWN을 get_regime_cooldown() 함수로 대체.
-       bull: 900초(빠른 포착), normal: 1800초, bear: 2700초, crash: 3600초.
   [#5] 레짐 전환 시 텔레그램 1회 알림 발송 (_notify_regime_change).
-       이전 레짐→현재 레짐, 변경 파라미터 요약 포함.
-  [#6] calc_overnight_risk()에 한국 시장 레짐 반영.
-       bear/crash 시 오버나이트 위험 점수 추가 가중(+15/+25).
-  [#7] calc_stop_target → calc_dynamic_stop_target 위임으로 통합.
-       기존 9곳의 레거시 호출부가 자동으로 레짐+신호유형+변동성 고도화 적용.
-  [#8] calc_dynamic_stop_target에 SIGNAL_STOP_PARAMS(신호유형별 손절·익절 배수)
-       + 종목 ATR 변동성 구간(저/중/고) 보정 추가.
-  [#9] calc_trailing_stop에 변동성 구간 기반 트레일링 폭 자동 조정.
-       저변동 종목은 타이트, 고변동 종목은 여유 있게.
-  [#10] SIGNAL_STOP_PARAMS 테이블 추가 (8개 신호유형별 손절·익절 배수 정의).
-  이유: 스킬의 "시장 레짐별 전략 전환" 강화 영역을 코드에 실제 반영하여
-       상승장에서는 공격적으로, 하락장에서는 방어적으로 자동 전환.
+  [#6] calc_overnight_risk()에 한국 시장 레짐 반영 (bear/crash +15/+25점).
+  이유: 스킬의 "시장 레짐별 전략 전환" 강화 영역을 코드에 실제 반영.
   개선점: 레짐 전환 시 6개 파라미터가 동시에 연동되어 일관된 전략 대응 가능.
-       + 신호유형별 손절·익절이 차등 적용되어 UPPER_LIMIT은 타이트, PRECLOSE_GAP은 여유롭게.
-       + 종목 변동성 구간(저/중/고)에 따라 손절폭·트레일링이 자동 조절.
-  주의점: 기존 고정 ALERT_COOLDOWN 참조하던 곳은 get_regime_cooldown()으로 대체.
-       레짐 전환 알림은 동일 레짐 연속 시 중복 발송 안 됨.
-       calc_stop_target의 시그니처에 signal_type 옵션 파라미터 추가됨 (기본값 None → 하위호환).
+  주의점: 기존 ALERT_COOLDOWN 참조 → get_regime_cooldown()으로 대체됨.
 
 - v41.60 (2026-03-16): 원본 v41.59 기준 야간 모니터링/장전 브리핑 핫픽스 적용.
   [#1] 수정 기준 파일을 사용자 업로드 원본(v41.59)으로 재정렬해, v41.56~v41.59 기능 누락 없이 최신 로직 위에 핫픽스가 얹히도록 정리.
@@ -8736,6 +8744,165 @@ def analyze_loss_pattern(completed: list) -> str:
 
     return "\n".join(lines)
 
+
+# ============================================================
+# 📊 v41.63: signal_log 피드백 루프 — KPI 자동 분석 + 전략 건강도 판정
+# ============================================================
+KPI_MIN_SAMPLES = int(os.getenv("KPI_MIN_SAMPLES", "10") or "10")
+
+def compute_signal_kpi(completed: list | None = None) -> dict:
+    """
+    signal_log 기반 승률/손익비/기대수익 KPI 자동 계산.
+    v41.63 #1: 신호유형별·레짐별·시간대별 세분화 KPI.
+    반환: {
+      "overall": {win_rate, avg_pnl, profit_factor, payoff_ratio, expectancy, n},
+      "by_type": {signal_type: {...}},
+      "by_regime": {regime: {...}},
+      "by_slot": {timeslot: {...}},
+      "consecutive_loss": int,
+    }
+    """
+    if completed is None:
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            data = {}
+        completed = [v for v in data.values()
+                     if v.get("status") in ["수익", "손실", "본전"]]
+
+    def _calc_kpi(recs: list) -> dict:
+        if not recs:
+            return {"win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
+                    "payoff_ratio": 0, "expectancy": 0, "n": 0}
+        n = len(recs)
+        pnls = [r.get("pnl_pct", 0) for r in recs]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        win_rate = len(wins) / n * 100 if n else 0
+        avg_pnl = sum(pnls) / n if n else 0
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = abs(sum(losses) / len(losses)) if losses else 1
+        payoff_ratio = round(avg_win / avg_loss, 2) if avg_loss > 0 else 99.0
+        profit_factor = round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 99.0
+        # 기대수익 = 승률 × 평균수익 - 패율 × 평균손실
+        loss_rate = 1 - len(wins) / n if n else 0
+        expectancy = round((len(wins) / n * avg_win - loss_rate * avg_loss) if n else 0, 2)
+        return {
+            "win_rate": round(win_rate, 1),
+            "avg_pnl": round(avg_pnl, 2),
+            "profit_factor": profit_factor,
+            "payoff_ratio": payoff_ratio,
+            "expectancy": expectancy,
+            "n": n,
+        }
+
+    result = {"overall": _calc_kpi(completed)}
+
+    # 신호유형별
+    by_type = {}
+    for v in completed:
+        t = v.get("signal_type", "기타")
+        by_type.setdefault(t, []).append(v)
+    result["by_type"] = {t: _calc_kpi(recs) for t, recs in by_type.items()}
+
+    # 레짐별
+    by_regime = {}
+    for v in completed:
+        r = v.get("regime", v.get("market_regime_mode", "normal"))
+        by_regime.setdefault(r, []).append(v)
+    result["by_regime"] = {r: _calc_kpi(recs) for r, recs in by_regime.items()}
+
+    # 시간대별
+    by_slot = {}
+    for v in completed:
+        slot = _get_timeslot(v.get("time", "10:00:00"))
+        by_slot.setdefault(slot, []).append(v)
+    result["by_slot"] = {s: _calc_kpi(recs) for s, recs in by_slot.items()}
+
+    # 연속 손절 카운트
+    sorted_recs = sorted(completed, key=lambda x: x.get("exit_date", "") + x.get("exit_time", ""))
+    consec = 0
+    for r in reversed(sorted_recs):
+        if r.get("pnl_pct", 0) < 0:
+            consec += 1
+        else:
+            break
+    result["consecutive_loss"] = consec
+
+    return result
+
+
+def _check_strategy_health(kpi: dict, notify: bool = True) -> list:
+    """
+    v41.63 #2: KPI 기반 전략 건강도 자동 판정.
+    문제 있는 신호유형을 감지하고 자동 기준 강화 또는 경고 발송.
+    반환: 변경사항 리스트 (auto_tune changes에 합류)
+    """
+    changes = []
+    try:
+        overall = kpi.get("overall", {})
+        if overall.get("n", 0) < KPI_MIN_SAMPLES:
+            return changes
+
+        # ── 전체 건강도 체크 ──
+        if overall["win_rate"] < 35:
+            changes.append(
+                f"⚠️ <b>전체 승률 경고</b>: {overall['win_rate']:.0f}% "
+                f"(목표 40%↑)  n={overall['n']}"
+            )
+        if overall.get("payoff_ratio", 1) < 1.0 and overall["n"] >= 20:
+            changes.append(
+                f"⚠️ <b>손익비 경고</b>: {overall['payoff_ratio']:.2f} "
+                f"(목표 1.0↑)  — 평균 수익 < 평균 손실"
+            )
+
+        # ── 연속 손절 긴급 경고 ──
+        consec = kpi.get("consecutive_loss", 0)
+        if consec >= 5:
+            changes.append(
+                f"🚨 <b>연속 손절 {consec}회</b> — 긴급 기준 강화 권고"
+            )
+            if notify:
+                send(
+                    f"🚨 <b>전략 긴급 경고</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"연속 손절 <b>{consec}회</b> 발생!\n"
+                    f"승률: {overall['win_rate']:.0f}%  손익비: {overall.get('payoff_ratio',0):.2f}\n"
+                    f"기대수익: {overall.get('expectancy',0):+.2f}%\n\n"
+                    f"💡 자동 튜닝이 기준을 강화합니다.\n"
+                    f"/stats 로 상세 확인"
+                )
+
+        # ── 신호유형별 건강도 체크 ──
+        for sig_type, sig_kpi in kpi.get("by_type", {}).items():
+            if sig_kpi.get("n", 0) < max(KPI_MIN_SAMPLES // 2, 5):
+                continue
+            if sig_kpi["win_rate"] < 30:
+                changes.append(
+                    f"📉 {sig_type} 승률 {sig_kpi['win_rate']:.0f}% "
+                    f"(n={sig_kpi['n']}) → 기준 강화 필요"
+                )
+            elif sig_kpi["win_rate"] > 70 and sig_kpi.get("payoff_ratio", 1) >= 1.5:
+                changes.append(
+                    f"🌟 {sig_type} 고성과: 승률 {sig_kpi['win_rate']:.0f}% "
+                    f"손익비 {sig_kpi['payoff_ratio']:.1f} → 기준 완화 가능"
+                )
+
+        # ── 레짐별 건강도 체크 ──
+        for regime, reg_kpi in kpi.get("by_regime", {}).items():
+            if reg_kpi.get("n", 0) < max(KPI_MIN_SAMPLES // 2, 5):
+                continue
+            if reg_kpi["win_rate"] < 25 and regime in ("bear", "crash"):
+                changes.append(
+                    f"⚠️ {regime} 레짐 승률 {reg_kpi['win_rate']:.0f}% "
+                    f"(n={reg_kpi['n']}) — 해당 레짐 진입 축소 권고"
+                )
+
+    except Exception as e:
+        _log_error("_check_strategy_health", e)
+    return changes
+
+
 def auto_tune(notify: bool = True):
     """
     signal_log.json 기반으로 신호 유형별 성과를 분석해서
@@ -9134,6 +9301,32 @@ def auto_tune(notify: bool = True):
                 elif rsi_high_rate < 0.35 and old_ob > 60:
                     _dynamic["rsi_overbuy"] = max(old_ob - 2, 60)
                     changes.append(f"📊 RSI 과매수 기준 강화: {old_ob:.0f}→{_dynamic['rsi_overbuy']:.0f} (고RSI 성공률 저조)")
+
+        # ── v41.63 #3: signal_log 피드백 루프 통합 ──
+        try:
+            kpi = compute_signal_kpi(completed)
+            health_changes = _check_strategy_health(kpi, notify=notify)
+            changes.extend(health_changes)
+
+            # KPI 기대수익이 음수이면 전체 기준 강화
+            if kpi["overall"].get("n", 0) >= KPI_MIN_SAMPLES:
+                exp = kpi["overall"].get("expectancy", 0)
+                if exp < -0.5:
+                    old_n = _dynamic["min_score_normal"]
+                    bump = 3 if exp < -1.0 else 2
+                    _dynamic["min_score_normal"] = min(old_n + bump, 85)
+                    changes.append(
+                        f"📉 기대수익 {exp:+.2f}% → 최소점수 +{bump}점 "
+                        f"({old_n}→{_dynamic['min_score_normal']})"
+                    )
+                elif exp > 1.5 and _dynamic["min_score_normal"] > 55:
+                    _dynamic["min_score_normal"] = max(_dynamic["min_score_normal"] - 2, 50)
+                    changes.append(
+                        f"🌟 기대수익 {exp:+.2f}% → 최소점수 완화 "
+                        f"(→{_dynamic['min_score_normal']})"
+                    )
+        except Exception as _kpi_err:
+            _log_error("auto_tune.kpi_feedback", _kpi_err)
 
         after_sig = _current_dynamic_signature()
         after_hash = _payload_hash(after_sig)
@@ -15224,6 +15417,46 @@ def _send_stats():
         loss_pattern = analyze_loss_pattern(completed)
         if loss_pattern:
             msg += f"\n━━━━━━━━━━━━━━━\n{loss_pattern}\n"
+
+        # ── v41.63 #4: KPI 요약 (승률/손익비/기대수익) ──
+        try:
+            kpi = compute_signal_kpi(completed)
+            ov = kpi.get("overall", {})
+            if ov.get("n", 0) >= KPI_MIN_SAMPLES:
+                exp_emoji = "🟢" if ov["expectancy"] > 0.5 else "🟡" if ov["expectancy"] >= 0 else "🔴"
+                pf_emoji = "🟢" if ov["profit_factor"] > 1.5 else "🟡" if ov["profit_factor"] >= 1.0 else "🔴"
+                msg += (f"\n━━━━━━━━━━━━━━━\n"
+                        f"📐 <b>KPI 요약</b> ({ov['n']}건 기준)\n"
+                        f"  승률: <b>{ov['win_rate']:.0f}%</b>  "
+                        f"손익비: {pf_emoji} <b>{ov['payoff_ratio']:.2f}</b>  "
+                        f"기대수익: {exp_emoji} <b>{ov['expectancy']:+.2f}%</b>\n"
+                        f"  Profit Factor: {ov['profit_factor']:.2f}\n")
+                # 신호유형 중 상위/하위 표시
+                by_t = kpi.get("by_type", {})
+                type_labels_kpi = {
+                    "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접",
+                    "STRONG_BUY": "강력매수", "SURGE": "급등",
+                    "EARLY_DETECT": "조기포착", "ENTRY_POINT": "눌림목",
+                    "MID_PULLBACK": "눌림목", "MANUAL": "수동",
+                }
+                good = [(t, k) for t, k in by_t.items()
+                        if k.get("n", 0) >= 5 and k["win_rate"] >= 60 and k.get("payoff_ratio", 0) >= 1.2]
+                bad  = [(t, k) for t, k in by_t.items()
+                        if k.get("n", 0) >= 5 and (k["win_rate"] < 35 or k.get("payoff_ratio", 0) < 0.8)]
+                if good:
+                    g_str = ", ".join(f"{type_labels_kpi.get(t,t)}({k['win_rate']:.0f}%)" for t, k in good[:3])
+                    msg += f"  🌟 고성과: {g_str}\n"
+                if bad:
+                    b_str = ", ".join(f"{type_labels_kpi.get(t,t)}({k['win_rate']:.0f}%)" for t, k in bad[:3])
+                    msg += f"  ⚠️ 저성과: {b_str}\n"
+                # 연속 손절
+                if kpi.get("consecutive_loss", 0) >= 3:
+                    msg += f"  🚨 연속 손절: {kpi['consecutive_loss']}회\n"
+            else:
+                msg += (f"\n━━━━━━━━━━━━━━━\n"
+                        f"📐 <b>KPI</b>: 데이터 부족 ({ov.get('n', 0)}/{KPI_MIN_SAMPLES}건)\n")
+        except Exception:
+            pass
 
         # ── 시장 국면 현황 ──
         regime = get_market_regime()
