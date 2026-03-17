@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.68
+버전: v41.69
 날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.69 (2026-03-17): 눌림목 C등급 실알림 억제 — 내부 기록 유지 + 재상승/직접뉴스 예외 허용.
+  [#1] `run_mid_pullback_scan()`에 `MID_PULLBACK` C등급 실알림 억제 로직을 추가.
+       기본은 텔레그램 발송과 진입감시 등록을 생략하고, `save_signal_log()`만 유지해 내부 추적·학습 데이터는 남기도록 정리.
+  [#2] `_should_suppress_mid_pullback_c_alert()` / `_enrich_mid_pullback_direct_news()`를 추가.
+       C등급이어도 `resurge_mode` 또는 직접뉴스 테마가 있으면 예외 허용해, 신세계I&C·폴라리스AI류 재상승 초입은 막지 않도록 보강.
+  [#3] C등급 억제 시에도 동일 쿨다운을 적용해 반복 내부 저장/반복 평가로 인한 잡음 누적을 완화.
+  이유: 눌림목 C등급은 행동성보다 참고성 비중이 큰데도 현재는 텔레그램 알림과 진입감시까지 모두 진행돼 메시지 수가 늘었기 때문.
+  개선점: 눌림목 저품질 알림 수↓, 내부 학습 데이터 유지, 재상승/직접뉴스형 초기 신호 보존.
+  주의점: C등급 눌림목은 기본적으로 외부 알림과 진입감시에서 제외되며, 예외 허용은 `resurge_mode`/직접뉴스 테마에 한정된다.
+
 - v41.68 (2026-03-17): 재상승 포착 보강 + no_ask_liquidity 예외 완화 + 고점 추격식 진입가 갱신 방지.
   [#1] `check_intraday_pullback_breakout()`에 재상승(resurge) 판정을 추가.
        깊은 눌림(기본 15% 이상) 이후 당일 거래량 재유입 + 눌림 회복률 + 저점 대비 반등률을 함께 봐서,
@@ -5687,6 +5697,8 @@ def run_mid_pullback_scan():
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
             continue
         s = _apply_execution_speed_to_signal(s)
+        if str(s.get("grade") or "").upper() == "C":
+            s = _enrich_mid_pullback_direct_news(s)
         _live = _get_live_quote_for_signal(s)
         _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
         _entry = safe_int(s.get("entry_price", 0), 0)
@@ -5714,6 +5726,18 @@ def run_mid_pullback_scan():
                     {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
                 )
                 continue
+        if _should_suppress_mid_pullback_c_alert(s):
+            _log_suppressed_alert(
+                s["code"], s["name"],
+                "눌림목 C등급 실알림 억제",
+                s.get("signal_type", ""),
+                {"score": s.get("score", 0), "grade": s.get("grade", ""), "resurge_mode": bool(s.get("resurge_mode")), "direct_news_hit": bool(s.get("direct_news_hit")), "entry_price": s.get("entry_price", 0)}
+            )
+            save_signal_log(s)
+            _mid_pullback_alert_history[s["code"]] = time.time()
+            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
+            continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
@@ -7671,6 +7695,52 @@ def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -
     if signal.get("direct_news_theme"):
         return True
     return int(signal.get("score", 0) or 0) >= MID_SOFT_ALLOW_MIN_SCORE
+
+
+def _enrich_mid_pullback_direct_news(signal: dict | None) -> dict:
+    signal = signal if isinstance(signal, dict) else {}
+    if str(signal.get("signal_type") or "") != "MID_PULLBACK":
+        return signal
+    if signal.get("direct_news_hit") or signal.get("direct_news_theme"):
+        return signal
+    code = normalize_stock_code(signal.get("code"))
+    if not code:
+        return signal
+    name = _resolve_stock_name(code, signal.get("name", code))
+    direct = _infer_direct_news_theme(code, name)
+    theme = str(direct.get("theme", "") or "").strip()
+    if not theme:
+        return signal
+    signal["direct_news_hit"] = True
+    signal["direct_news_theme"] = theme
+    signal["direct_news_bonus"] = int(direct.get("bonus", 0) or 0)
+    sector_info = signal.get("sector_info") if isinstance(signal.get("sector_info"), dict) else {}
+    if not sector_info:
+        sector_info = {}
+        signal["sector_info"] = sector_info
+    if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+        sector_info["theme"] = theme
+        sector_info["theme_key"] = theme
+        signal["sector_theme"] = theme
+    matched = ", ".join((direct.get("matched") or [])[:3])
+    signal.setdefault("reasons", []).append(
+        f"📰 직접뉴스 예외 허용 [{theme}] — {direct.get('reason', '')}"
+        + (f" ({matched})" if matched else "")
+    )
+    return signal
+
+
+def _should_suppress_mid_pullback_c_alert(signal: dict | None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    if str(signal.get("signal_type") or "") != "MID_PULLBACK":
+        return False
+    if str(signal.get("grade") or "").upper() != "C":
+        return False
+    if signal.get("resurge_mode"):
+        return False
+    if signal.get("direct_news_hit") or signal.get("direct_news_theme"):
+        return False
+    return True
 
 
 def _tracking_active_items(data: dict | None, code: str = "") -> list[tuple[str, dict]]:
