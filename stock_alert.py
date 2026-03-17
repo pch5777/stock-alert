@@ -3,11 +3,33 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.65
+버전: v41.66
 날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.66 (2026-03-17): 진입가 도달 1차/2차 분할진입 구조 + 자금관리 규칙 코드화 + 1종목 집중.
+  [#1] check_entry_watch()의 3회 반복 알림을 1차(초기진입)+2차(추가진입 판단) 2단계 분리 구조로 변경.
+       1차: 신호강도별 권장비중(강한 45%/보통 35%/약한 25%) + 손절가 + 목표가 + 체결속도.
+       2차: 눌림유지/체결속도/손절여유/섹터모멘텀 4개 조건 평가 → 가능/보류/금지 판정.
+       추가비중 + 누적비중 + 평균단가 예상 표시.
+  [#2] _classify_signal_strength() 신규: 등급(A/B/C)+체결속도+점수 기반 '강한/보통/약한' 분류.
+  [#3] ENTRY_SPLIT_RULES 테이블 + _get_entry_split_rule() 신규: 신호강도별 분할비중 규칙.
+       강한: 1차45%/2차30%/여유25%, 보통: 35%/25%/40%, 약한: 25%/0%(2차금지)/75%.
+  [#4] _judge_phase2_entry() 신규: 2차 추가진입 가능 여부를 4개 조건으로 판정.
+       ① 눌림유지 ② 체결속도 악화 없음 ③ 손절가 여유 ④ 섹터 모멘텀 유지.
+       fail 2개↑=금지, 1개=보류, 0개=가능.
+  [#5] REGIME_PARAMS max_positions 전체 1종목으로 변경 (소액 집중 전략).
+  [#6] calc_position_size() 확장: 1종목 집중 + phase1_pct/phase2_pct/strength 반환 추가.
+  [#7] track_signal_results() 손절가 도달 메시지에 "포지션 정리 신호" 감축/청산 가이드 추가.
+       추가매수 금지, 보유분 즉시 정리, 재진입은 새 포착 기준으로만.
+  이유: 투자금 10만원 소액으로 연 30% 이상 수익률을 빠르게 달성하려면 1종목에 집중하고
+       수수료 등 제반비용을 최소화하며 분할진입으로 리스크를 관리해야 하기 때문.
+  개선점: 진입 알림이 행동 가능한 비중 정보 포함↑, 2차 추가진입 판단 자동화↑,
+       1종목 집중으로 분산 손실↓, 손절 시 명확한 정리 가이드↑.
+  주의점: 2차 알림은 약한 신호 시 자동 금지됨. 기존 3회 반복은 2회(1차+2차)로 축소.
+       max_positions=1이므로 동시 보유 종목 제한 강화됨.
+
 - v41.65 (2026-03-17): 신규 이슈주 묻힘 완화 — 직접뉴스 테마 보강 + 섹터 게이트 정렬/판정 수정.
   [#1] `THEME_MAP`에 `AI인프라`, `공공안전AI` 테마를 추가해 신세계I&C(035510) / 폴라리스AI(039980) 같은
        직접 이슈 종목이 `기타`에 묻히지 않고 뉴스 스캔·테마 분류에 바로 연결되도록 보강.
@@ -1284,11 +1306,11 @@ ALERT_COOLDOWN        = 1800
 #         partial_exit_mult(분할청산기준 배수), max_positions(동시보유), overnight_add(야간위험가중)
 REGIME_PARAMS = {
     "bull":   {"score_mult": 1.15, "min_add": -5,  "cooldown": 900,  "pullback_ratio": 0.35,
-               "partial_exit_mult": 0.8, "max_positions": 3, "overnight_add": 0},
+               "partial_exit_mult": 0.8, "max_positions": 1, "overnight_add": 0},
     "normal": {"score_mult": 1.0,  "min_add": 0,   "cooldown": 1800, "pullback_ratio": 0.40,
-               "partial_exit_mult": 1.0, "max_positions": 3, "overnight_add": 0},
+               "partial_exit_mult": 1.0, "max_positions": 1, "overnight_add": 0},
     "bear":   {"score_mult": 0.75, "min_add": 8,   "cooldown": 2700, "pullback_ratio": 0.50,
-               "partial_exit_mult": 1.3, "max_positions": 2, "overnight_add": 15},
+               "partial_exit_mult": 1.3, "max_positions": 1, "overnight_add": 15},
     "crash":  {"score_mult": 0.5,  "min_add": 15,  "cooldown": 3600, "pullback_ratio": 0.55,
                "partial_exit_mult": 1.5, "max_positions": 1, "overnight_add": 25},
 }
@@ -3573,6 +3595,130 @@ def _entry_execution_judgement(metrics: dict | None = None) -> tuple[str, str]:
     if speed_score < 40 or dip_score < 40 or filtered_ratio > 0.75:
         return ("보류 우선", "⚠️ 하락 중 체결 유지 약함 — 진입보류 우선")
     return ("보통", "🟡 체결속도는 보통 수준 — 무리한 추격보다 분할/확인 우선")
+
+
+# ── v41.66: 신호 강도 판정 ──
+def _classify_signal_strength(watch: dict, exec_metrics: dict | None = None) -> str:
+    """신호 강도를 '강한'/'보통'/'약한'으로 분류.
+    기준: 등급(A/B/C) + 체결속도(진입적합/보통/보류) + 포착점수 종합."""
+    grade = str(watch.get("grade", "B")).upper()
+    score = int(watch.get("score", 0) or 0)
+    exec_label, _ = _entry_execution_judgement(exec_metrics)
+    # 등급 기반 기본 강도
+    if grade == "A" and score >= 75:
+        base = "강한"
+    elif grade == "C" or score < 50:
+        base = "약한"
+    else:
+        base = "보통"
+    # 체결속도 보정
+    if exec_label == "보류 우선" and base == "보통":
+        base = "약한"
+    elif exec_label == "진입 적합" and base == "보통":
+        base = "강한"
+    return base
+
+
+# ── v41.66: 1차/2차 분할 비중 규칙 ──
+ENTRY_SPLIT_RULES = {
+    "강한": {"phase1_pct": 45, "phase2_pct": 30, "reserve_pct": 25, "phase2_allowed": True},
+    "보통": {"phase1_pct": 35, "phase2_pct": 25, "reserve_pct": 40, "phase2_allowed": True},
+    "약한": {"phase1_pct": 25, "phase2_pct": 0,  "reserve_pct": 75, "phase2_allowed": False},
+}
+
+def _get_entry_split_rule(strength: str) -> dict:
+    """신호 강도별 분할진입 비중 규칙 반환."""
+    return ENTRY_SPLIT_RULES.get(strength, ENTRY_SPLIT_RULES["보통"])
+
+
+def _calc_avg_entry_price(phase1_price: int, phase2_price: int, phase1_pct: int, phase2_pct: int) -> int:
+    """1차/2차 진입가 기반 평균단가 계산."""
+    total_pct = phase1_pct + phase2_pct
+    if total_pct <= 0:
+        return phase1_price
+    return int((phase1_price * phase1_pct + phase2_price * phase2_pct) / total_pct)
+
+
+# ── v41.66: 2차 추가진입 판단 ──
+def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict | None = None) -> dict:
+    """2차 추가진입 가능/보류/금지 판단.
+    반환: {"decision": "가능"/"보류"/"금지", "reasons": [...], "detail": str}
+    4개 조건: 눌림유지 / 체결속도 / 손절여유 / 섹터모멘텀"""
+    entry = watch.get("entry_price", 0)
+    stop = watch.get("stop_loss", 0)
+    reasons = []
+    fail_count = 0
+    # ① 눌림 유지: 현재가가 진입가 대비 크게 하락하지 않았는지
+    if entry and price:
+        drop_pct = (entry - price) / entry * 100
+        if drop_pct <= 1.5:
+            reasons.append("✅ 눌림 유지 (진입가 대비 -{:.1f}%)".format(drop_pct))
+        elif drop_pct <= 3.0:
+            reasons.append("🟡 소폭 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
+        else:
+            reasons.append("🔴 과도 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
+            fail_count += 1
+    # ② 체결속도 악화 여부
+    exec_label, _ = _entry_execution_judgement(exec_metrics)
+    if exec_label == "진입 적합":
+        reasons.append("✅ 체결속도 양호")
+    elif exec_label == "보류 우선":
+        reasons.append("🔴 체결속도 급약화")
+        fail_count += 1
+    elif exec_label == "참고":
+        reasons.append("🟡 체결속도 샘플 부족")
+    else:
+        reasons.append("🟡 체결속도 보통")
+    # ③ 손절가까지 여유
+    if stop and price and entry:
+        stop_distance_pct = (price - stop) / price * 100
+        if stop_distance_pct >= 2.0:
+            reasons.append(f"✅ 손절가까지 여유 ({stop_distance_pct:.1f}%)")
+        elif stop_distance_pct >= 1.0:
+            reasons.append(f"🟡 손절가 접근 중 ({stop_distance_pct:.1f}%)")
+        else:
+            reasons.append(f"🔴 손절가 근접 ({stop_distance_pct:.1f}%)")
+            fail_count += 1
+    # ④ 섹터/수급 논리 유지
+    sector_ok = True
+    try:
+        _s_theme = watch.get("sector_theme", "")
+        if _s_theme and _s_theme != "기타업종":
+            for _tk, _ti in THEME_MAP.items():
+                if _tk == _s_theme or _s_theme in _ti.get("desc", ""):
+                    _chg_list = []
+                    for _sc, _sn in _ti.get("stocks", [])[:5]:
+                        try:
+                            _sp = get_stock_price(_sc)
+                            _cr = _sp.get("change_rate", 0)
+                            if _cr is not None:
+                                _chg_list.append(float(_cr))
+                            time.sleep(0.03)
+                        except Exception:
+                            continue
+                    if _chg_list and (sum(_chg_list) / len(_chg_list)) <= -1.0:
+                        sector_ok = False
+                    break
+    except Exception:
+        pass
+    if sector_ok:
+        reasons.append("✅ 섹터 모멘텀 유지")
+    else:
+        reasons.append("🔴 섹터 모멘텀 이탈")
+        fail_count += 1
+
+    # 판정
+    if fail_count >= 2:
+        decision = "금지"
+        detail = "구조 악화 — 추가매수 금지, 기존 보유분 유지 또는 감축 검토"
+    elif fail_count == 1:
+        decision = "보류"
+        detail = "일부 조건 미충족 — 추가매수 보류, 상황 관찰"
+    else:
+        decision = "가능"
+        detail = "조건 충족 — 추가진입 가능"
+
+    return {"decision": decision, "reasons": reasons, "detail": detail, "fail_count": fail_count}
 
 
 def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | None = None, fallback_metrics: dict | None = None) -> str:
@@ -8387,6 +8533,13 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
                 if not causes:      causes.append("⚠️ 특이 원인 미감지 (기술적 손절)")
         except Exception: causes = ["조회 실패"]
         cause_block = "\n━━━━━━━━━━━━━━━\n🔍 <b>손절 원인 분석</b>\n" + "\n".join(f"  {c}" for c in causes) + "\n"
+        # v41.66: 손절 시 보유분 정리 가이드 추가
+        cause_block += (
+            "\n🚨 <b>포지션 정리 신호</b>\n"
+            "  → 신규 진입 판단이 아닌 보유분 감축/청산 단계\n"
+            "  → 추가매수 금지, 잔여 보유분 즉시 정리 검토\n"
+            "  → 반등 시 재진입은 새로운 포착 신호 기준으로만\n"
+        )
 
     # ── 분할 청산 가이드 (수익 시) ──
     profit_guide = ""
@@ -10479,7 +10632,8 @@ def check_entry_watch():
                 last_ts      = watch.get("last_notified_ts", 0)
                 notify_count = watch.get("notify_count", 0)
                 cooldown_sec = ENTRY_REWATCH_MINS * 60
-                if notify_count >= 3:
+                # v41.66: 1차(0회)+2차(1회) = 최대 2회 알림
+                if notify_count >= 2:
                     expired.append((log_key, "알림횟수만료", _entry_watch_final_status(watch, "진입미달")))
                     continue
                 if now_ts - last_ts < cooldown_sec: continue
@@ -10549,16 +10703,13 @@ def check_entry_watch():
                 stop_pct  = round((watch["stop_loss"]    - entry) / entry * 100, 1) if entry else 0
                 tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
                 nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
-                count_tag  = f"  ({notify_count+1}/3회)" if notify_count > 0 else ""
 
-                # v40.0-#1: 포착 이유 블록 생성
+                # ── 공통 블록 생성 ──
                 _reasons = watch.get("reasons", [])
                 reasons_block = ""
                 if _reasons:
                     reasons_lines = "\n".join([f"  {r}" for r in _reasons[:3]])
                     reasons_block = f"\n📋 <b>포착 이유</b>\n{reasons_lines}\n"
-
-                # v40.4: 진입가 도달 메시지에는 섹터 모멘텀만 추가 (도달가/도달시각은 미표시)
                 sector_block = ""
                 try:
                     sector_info = calc_sector_momentum(watch["code"], watch["name"])
@@ -10582,7 +10733,6 @@ def check_entry_watch():
                         sector_block = "\n" + "\n".join(_sector_lines) + "\n"
                 except Exception:
                     sector_block = ""
-
                 _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 _similar_stats = _get_similar_pattern_stats(
                     watch["code"],
@@ -10604,25 +10754,104 @@ def check_entry_watch():
                         similar_block = f"{_similar_line}\n\n"
                 except Exception:
                     similar_block = ""
-                send_with_chart_buttons(
-                    f"🔔🔔 <b>[진입가 도달!{count_tag}]</b> 🔔🔔{nxt_notice}\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                    f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
-                    f"{similar_block}"
-                    f"{reasons_block}"
-                    f"{sector_block}"
-                    f"{_entry_exec_block}"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"┌─────────────────────\n"
-                    f"│ ⚡️ <b>지금 진입 구간!</b>\n"
-                    f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
-                    f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
-                    f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
-                    f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
-                    f"└─────────────────────",
-                    watch["code"], watch["name"]
-                )
+
+                # ── v41.66: 1차/2차 분기 ──
+                is_phase1 = (notify_count == 0)
+                is_phase2 = (notify_count == 1)
+
+                # 신호 강도 판정
+                _strength = _classify_signal_strength(watch, _entry_exec_metrics)
+                _split_rule = _get_entry_split_rule(_strength)
+
+                if is_phase1:
+                    # ━━━ 1차 진입가 도달 ━━━
+                    _p1_pct = _split_rule["phase1_pct"]
+                    _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
+                    send_with_chart_buttons(
+                        f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                        f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
+                        f"{similar_block}"
+                        f"{reasons_block}"
+                        f"{sector_block}"
+                        f"{_entry_exec_block}"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"┌─────────────────────\n"
+                        f"│ {_strength_emoji} <b>1차 진입 구간</b>  (신호: {_strength})\n"
+                        f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+                        f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
+                        f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
+                        f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
+                        f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
+                        f"└─────────────────────",
+                        watch["code"], watch["name"]
+                    )
+                    watch["phase1_price"] = price
+                    watch["phase1_pct"] = _p1_pct
+                    watch["signal_strength"] = _strength
+
+                elif is_phase2:
+                    # ━━━ 2차 추가진입 판단 ━━━
+                    _p2_judgement = _judge_phase2_entry(watch, cur, price, _entry_exec_metrics)
+                    _p2_decision = _p2_judgement["decision"]
+                    _p2_reasons = _p2_judgement["reasons"]
+                    _p2_detail = _p2_judgement["detail"]
+
+                    _p1_price = watch.get("phase1_price", entry)
+                    _p1_pct = watch.get("phase1_pct", _split_rule["phase1_pct"])
+
+                    if _p2_decision == "가능" and _split_rule["phase2_allowed"]:
+                        _p2_pct = _split_rule["phase2_pct"]
+                        _total_pct = _p1_pct + _p2_pct
+                        _avg_price = _calc_avg_entry_price(_p1_price, price, _p1_pct, _p2_pct)
+                        _decision_emoji = "✅"
+                        _decision_label = "추가진입: 가능"
+                    elif _p2_decision == "보류":
+                        _p2_pct = 0
+                        _total_pct = _p1_pct
+                        _avg_price = _p1_price
+                        _decision_emoji = "🟡"
+                        _decision_label = "추가진입: 보류"
+                    else:  # 금지 또는 약한 신호 phase2_allowed=False
+                        _p2_pct = 0
+                        _total_pct = _p1_pct
+                        _avg_price = _p1_price
+                        _decision_emoji = "🔴"
+                        _decision_label = "추가진입: 금지"
+
+                    # 손절 조정 여부
+                    _stop_adj = "유지"
+                    if _p2_decision == "가능" and _p2_pct > 0:
+                        _new_stop = int(_avg_price * (1 - abs(stop_pct) / 100)) if stop_pct else watch["stop_loss"]
+                        if _new_stop != watch["stop_loss"]:
+                            _stop_adj = f"조정 ({watch['stop_loss']:,}→{_new_stop:,}원)"
+                        else:
+                            _stop_adj = "유지"
+
+                    _reasons_str = "\n".join([f"  {r}" for r in _p2_reasons])
+                    send_with_chart_buttons(
+                        f"🔔🔔 <b>[2차 진입 판단]</b>{nxt_notice}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                        f"원신호: {sig}  |  도달: {_entry_hit_ts}\n\n"
+                        f"{_entry_exec_block}"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"┌─────────────────────\n"
+                        f"│ {_decision_emoji} <b>{_decision_label}</b>\n"
+                        f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+                        f"│ 💰 권장 추가비중: <b>{_p2_pct}%</b>\n"
+                        f"│ 📊 총 누적 권장비중: <b>{_total_pct}%</b>\n"
+                        f"│ 📐 평균단가 예상: <b>{_avg_price:,}원</b>\n"
+                        f"│ 🛡 손절가: <b>{_stop_adj}</b>\n"
+                        f"├─────────────────────\n"
+                        f"│ <b>판단 근거</b>\n"
+                        f"{_reasons_str}\n"
+                        f"│ → {_p2_detail}\n"
+                        f"└─────────────────────",
+                        watch["code"], watch["name"]
+                    )
+
                 watch['entry_hit'] = True
                 watch['entry_hit_time'] = _entry_hit_ts
                 watch['entry_hit_price'] = price
@@ -10633,7 +10862,8 @@ def check_entry_watch():
                     _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts, log_key=watch.get('signal_log_key'))
                 except Exception:
                     pass
-                print(f"  🎯 진입가 도달 ({notify_count+1}회): {watch['name']} {price:,} / 진입 {entry:,}")
+                _phase_label = "1차" if is_phase1 else "2차"
+                print(f"  🎯 {_phase_label} 진입가 도달: {watch['name']} {price:,} / 진입 {entry:,}")
         except Exception:
             continue
     for item in expired:
@@ -17576,9 +17806,11 @@ def get_us_market_signals() -> dict:
 # ============================================================
 def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
     """
-    신호 등급 + 과거 승률 기반 권장 투자비중 계산.
+    v41.66: 1종목 집중 + 분할진입 비중 계산.
+    투자금 10만원 기준, 1종목 집중 전략.
     켈리 공식: f = (p*b - q) / b  (p=승률, q=1-p, b=손익비)
-    반환: {"pct": float, "amount_guide": str, "kelly": float}
+    반환: {"pct": float, "phase1_pct": int, "phase2_pct": int, "strength": str,
+           "kelly": float, "guide": str, "win_rate": float|None, "samples": int}
     """
     try:
         # 과거 신호 유형별 승률 조회
@@ -17598,19 +17830,28 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
             avg_l = abs(sum(v["pnl_pct"] for v in same_type if v["pnl_pct"] < 0) / max(len(same_type)-wins, 1))
             b     = avg_w / avg_l if avg_l else 2.0
             kelly = max(0, (p * b - (1-p)) / b)
-            kelly = min(kelly * 0.5, 0.20)  # 하프 켈리, 최대 20%
+            kelly = min(kelly * 0.5, 0.25)  # 하프 켈리, 1종목 집중이므로 최대 25%
         else:
             p     = 0.55  # 기본값
-            kelly = 0.08
+            kelly = 0.10
 
-        # 등급별 보정
-        grade_mult = {"A": 1.3, "B": 1.0, "C": 0.7}.get(grade, 1.0)
+        # 등급별 보정 → 신호 강도 결정
+        grade_upper = str(grade or "B").upper()
+        if grade_upper == "A" and score >= 75:
+            strength = "강한"
+        elif grade_upper == "C" or score < 50:
+            strength = "약한"
+        else:
+            strength = "보통"
 
-        # 시장 국면 보정
+        # 분할진입 비중 규칙
+        split_rule = _get_entry_split_rule(strength)
+
+        # 시장 국면 보정 (감축 전용, 1종목이므로 확대는 제한적)
         regime_info  = get_market_regime()
         regime       = regime_info.get("mode", "normal")
         nxt_only     = regime_info.get("nxt_only", False)
-        regime_mult  = {"bull": 1.2, "normal": 1.0, "bear": 0.6, "crash": 0.3}.get(regime, 1.0)
+        regime_mult  = {"bull": 1.0, "normal": 1.0, "bear": 0.7, "crash": 0.4}.get(regime, 1.0)
         # v41.64: NXT 시간대별 포지션 비중 세분화
         if nxt_only:
             _nxt_p = get_nxt_params()
@@ -17619,25 +17860,34 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
             else:
                 regime_mult = max(regime_mult * 0.8, 0.3)
 
-        base_pct = _dynamic.get("position_base_pct", 8.0)
-        final_pct = round(min(base_pct * grade_mult * regime_mult, 20.0), 1)
+        # 1종목 집중 기본: 총 비중 = phase1 + phase2 (비상여유 제외)
+        total_base = split_rule["phase1_pct"] + split_rule["phase2_pct"]
+        final_pct = round(min(total_base * regime_mult, 100.0), 1)
+        phase1_pct = int(split_rule["phase1_pct"] * regime_mult)
+        phase2_pct = int(split_rule["phase2_pct"] * regime_mult) if split_rule["phase2_allowed"] else 0
 
         if regime in ("bear", "crash"):
-            guide = f"⚠️ {regime_label()} — 비중 축소 권장"
-        elif grade == "A" and p >= 0.6:
-            guide = f"💪 고확률 신호 — 적극 진입 고려"
+            guide = f"⚠️ {regime_label()} — 비중 축소, 1종목 집중"
+        elif strength == "강한" and p >= 0.6:
+            guide = f"💪 고확률 신호 — 1종목 적극 진입"
+        elif strength == "약한":
+            guide = f"⚠️ 약한 신호 — 1차만 소량 진입, 2차 금지"
         else:
-            guide = f"📊 표준 비중"
+            guide = f"📊 표준 비중 — 1종목 분할 진입"
 
         return {
-            "pct":    final_pct,
-            "kelly":  round(kelly * 100, 1),
-            "guide":  guide,
-            "win_rate": round(p * 100, 1) if len(same_type) >= 5 else None,
-            "samples":  len(same_type),
+            "pct":       final_pct,
+            "phase1_pct": phase1_pct,
+            "phase2_pct": phase2_pct,
+            "strength":  strength,
+            "kelly":     round(kelly * 100, 1),
+            "guide":     guide,
+            "win_rate":  round(p * 100, 1) if len(same_type) >= 5 else None,
+            "samples":   len(same_type),
         }
     except Exception:
-        return {"pct": 8.0, "kelly": 8.0, "guide": "📊 표준 비중", "win_rate": None, "samples": 0}
+        return {"pct": 35.0, "phase1_pct": 35, "phase2_pct": 0, "strength": "보통",
+                "kelly": 10.0, "guide": "📊 표준 비중", "win_rate": None, "samples": 0}
 
 # ============================================================
 # 📐 ③ 손익비 동적 최적화
