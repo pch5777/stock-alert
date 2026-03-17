@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.64
+버전: v41.65
 날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.65 (2026-03-17): 신규 이슈주 묻힘 완화 — 직접뉴스 테마 보강 + 섹터 게이트 정렬/판정 수정.
+  [#1] `THEME_MAP`에 `AI인프라`, `공공안전AI` 테마를 추가해 신세계I&C(035510) / 폴라리스AI(039980) 같은
+       직접 이슈 종목이 `기타`에 묻히지 않고 뉴스 스캔·테마 분류에 바로 연결되도록 보강.
+  [#2] `DIRECT_NEWS_THEME_RULES`와 `_infer_direct_news_theme()`를 추가해, 종목 개별 뉴스 헤드라인에서
+       데이터센터·소버린AI·AXON·안티드론·오픈AI/BAA 같은 직접 재료를 읽어 테마/보너스를 보강.
+  [#3] `analyze()` / `check_early_detection()`에 직접뉴스 테마 보강을 연결해, 기존 `기타업종` 종목도
+       강한 개별 이슈가 있으면 `sector_theme`와 점수에 반영되도록 정리.
+  [#4] `run_scan()`의 섹터 제한 전에 점수·직접뉴스·비기타 우선 정렬을 추가하고, 섹터 판정을
+       `sector_theme` 우선 → `sector_info.theme` fallback으로 교정. `기타` 버킷은 4개까지 완화.
+  이유: 오늘 신세계I&C는 직접뉴스가 있었는데 정적 테마에 연결되지 못했고, 폴라리스AI는 실제 후보군에 있었지만
+       `기타` 5번째로 밀려 늦게 알림이 갔기 때문. 직접뉴스가 있는 강한 종목을 먼저 통과시키되,
+       무분별한 알림 증가는 막기 위해 `기타`만 제한적으로 완화했다.
+  개선점: 개별 재료주 뉴스 연동력↑, `기타` 버킷 병목↓, 강한 종목의 늦은 통과/누락↓.
+  주의점: 직접뉴스 테마는 키워드 기반 보강이므로, 전혀 새로운 유형의 이슈는 여전히 `기타`로 남을 수 있다.
+
 - v41.64 (2026-03-17): NXT 전용 파라미터 분리 — 시간대별 4단계 차등 적용.
   [#1] NXT_TIME_PARAMS 테이블 추가: pre(08~09)/overlap(09~15:30)/post_early(15:30~17)/post_late(17~20)
        각 시간대별 score_mult/min_add/cooldown_mult/stop_mult/target_mult/position_mult 정의.
@@ -1383,6 +1398,10 @@ THEME_MAP = {
     "AI반도체": {"desc":"AI/반도체 테마","sectors":["반도체","AI","HBM"],
                  "stocks":[("000660","SK하이닉스"),("005930","삼성전자"),("042700","한미반도체"),
                            ("403870","HPSP"),("357780","솔브레인")]},
+    "AI인프라": {"desc":"AI 데이터센터/클라우드 인프라","sectors":["데이터센터","클라우드","IDC","소버린AI","AI인프라","AI팩토리"],
+                 "stocks":[("035510","신세계I&C")]},
+    "공공안전AI": {"desc":"공공안전/안티드론 AI 보안","sectors":["공공안전","안티드론","보안","AXON","액손"],
+                 "stocks":[("039980","폴라리스AI")]},
     "2차전지":  {"desc":"2차전지/배터리 테마","sectors":["배터리","양극재","전해질"],
                  "stocks":[("086520","에코프로"),("247540","에코프로비엠"),("006400","삼성SDI"),
                            ("051910","LG화학"),("373220","LG에너지솔루션")]},
@@ -1396,6 +1415,24 @@ THEME_MAP = {
                  "stocks":[("017800","현대엘리베이터"),("071970","STX중공업"),("298040","효성중공업")]},
     "수주":     {"desc":"대규모 수주/계약","sectors":["조선","건설","방산"],
                  "stocks":[("042660","한화오션"),("009540","HD한국조선해양"),("010140","삼성중공업")]},
+}
+
+DIRECT_NEWS_THEME_RULES = {
+    "AI인프라": {
+        "keywords": ["데이터센터", "data center", "클라우드", "idc", "소버린 ai", "소버린ai", "ai 팩토리", "ai factory", "ai 인프라", "리플렉션ai", "reflection ai"],
+        "bonus": 8,
+        "reason": "데이터센터/소버린AI 직접 뉴스",
+    },
+    "공공안전AI": {
+        "keywords": ["액손", "axon", "안티드론", "anti drone", "드론", "보안솔루션", "공공안전", "fusus", "포토카이트", "body cam", "바디캠"],
+        "bonus": 8,
+        "reason": "공공안전/안티드론 보안 직접 뉴스",
+    },
+    "AI서비스": {
+        "keywords": ["오픈ai", "openai", "baa", "헬스케어", "엔터프라이즈 ai", "vertical ai", "버티컬 ai", "ai 솔루션", "ai 고도화", "생성형 ai"],
+        "bonus": 6,
+        "reason": "AI 서비스/제휴 직접 뉴스",
+    },
 }
 
 DART_KEYWORDS = {
@@ -11834,6 +11871,7 @@ def analyze(stock: dict) -> dict:
     # ── 뉴스 심층 분석 (본문 + Claude API) ──
     news_articles = []
     news_analysis = {}
+    direct_news_hit = False
     try:
         _articles = fetch_news_for_stock(code, stock.get("name", code))
         if _articles:
@@ -11858,6 +11896,22 @@ def analyze(stock: dict) -> dict:
             # 리스크 포인트 있으면 추가 표시
             for rp in deep.get("risk_points", [])[:2]:
                 reasons.append(f"  ⚠️ {rp}")
+
+            direct_theme = _infer_direct_news_theme(code, stock.get("name", code), news_articles)
+            if direct_theme.get("theme") and (signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY", "SURGE") or change_rate >= 7.0):
+                if sector_info.get("theme", "") in ("", "기타업종"):
+                    sector_info["theme"] = direct_theme["theme"]
+                    sector_info["theme_key"] = direct_theme["theme"]
+                direct_bonus = int(direct_theme.get("bonus", 0) or 0)
+                if direct_bonus > 0:
+                    score += direct_bonus
+                direct_news_hit = True
+                _matched = ", ".join(direct_theme.get("matched", [])[:3])
+                reasons.append(
+                    f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
+                    f"{direct_theme.get('reason','')}"
+                    + (f" ({_matched})" if _matched else "")
+                )
     except Exception as _e: _log_error(f"analyze_news({code})", _e)
 
     # ── 지정학 이벤트 보정 ──
@@ -12019,6 +12073,8 @@ def analyze(stock: dict) -> dict:
     return {"code":code,"name":stock.get("name",code),"price":price,
             "change_rate":change_rate,"volume_ratio":vol_ratio,
             "signal_type":signal_type,"score":score,"sector_info":sector_info,
+            "sector_theme": sector_info.get("theme", ""),
+            "direct_news_hit": direct_news_hit,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
@@ -12092,11 +12148,30 @@ def check_early_detection() -> list:
             if z >= VOL_ZSCORE_MIN: early_score+=10; reasons.append(f"📊 거래량 Z-score {z:.1f}σ")
         except Exception: pass
         sector_info = calc_sector_momentum(code, stock.get("name",code))
+        direct_news_hit = False
         if sector_info["bonus"]>0:
             early_score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
             if sector_info.get("rising"):
                 reasons.append("📌 동반 상승: "+"".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
         elif sector_info.get("summary"): reasons.append(sector_info["summary"])
+
+        try:
+            direct_theme = _infer_direct_news_theme(code, stock.get("name", code))
+            if direct_theme.get("theme") and sector_info.get("theme", "") in ("", "기타업종"):
+                sector_info["theme"] = direct_theme["theme"]
+                sector_info["theme_key"] = direct_theme["theme"]
+                direct_bonus = int(direct_theme.get("bonus", 0) or 0)
+                if direct_bonus > 0:
+                    early_score += direct_bonus
+                direct_news_hit = True
+                _matched = ", ".join(direct_theme.get("matched", [])[:3])
+                reasons.append(
+                    f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
+                    f"{direct_theme.get('reason','')}"
+                    + (f" ({_matched})" if _matched else "")
+                )
+        except Exception:
+            pass
 
         # NXT 보정
         try:
@@ -12111,6 +12186,8 @@ def check_early_detection() -> list:
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
                         "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
+                        "sector_theme": sector_info.get("theme", ""),
+                        "direct_news_hit": direct_news_hit,
                         "similar_pattern_stats":similar_pattern_stats,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
@@ -12238,6 +12315,86 @@ def fetch_news_for_stock(code: str, name: str) -> list:
     return news
 
 _news_alert_sent: dict = {}   # code → ts (뉴스 알림 쿨다운, 30분)
+
+def _infer_direct_news_theme(code: str, name: str, articles: list | None = None) -> dict:
+    """종목 개별 뉴스 헤드라인에서 직접 이슈 테마를 추론."""
+    try:
+        items = list(articles or fetch_news_for_stock(code, name) or [])[:3]
+        if not items:
+            return {"theme": "", "bonus": 0, "reason": "", "headline": "", "matched": []}
+
+        normalized = []
+        for item in items:
+            title = str(item.get("title", "") or "").strip()
+            if title:
+                normalized.append(_normalize_news_headline(title))
+        if not normalized:
+            return {"theme": "", "bonus": 0, "reason": "", "headline": "", "matched": []}
+
+        joined = " ".join(normalized)
+        scored = []
+        for theme_name, rule in DIRECT_NEWS_THEME_RULES.items():
+            hits = []
+            for kw in rule.get("keywords", []):
+                nkw = _normalize_news_headline(str(kw))
+                if nkw and nkw in joined:
+                    hits.append(kw)
+            uniq_hits = list(dict.fromkeys(hits))
+            if uniq_hits:
+                scored.append((len(uniq_hits), theme_name, uniq_hits, rule))
+
+        if not scored:
+            return {"theme": "", "bonus": 0, "reason": "", "headline": items[0].get("title", ""), "matched": []}
+
+        scored.sort(key=lambda x: (x[0], x[3].get("bonus", 0)), reverse=True)
+        _, theme_name, hits, rule = scored[0]
+        bonus = int(rule.get("bonus", 0) or 0)
+        if len(hits) >= 3:
+            bonus += 2
+        elif len(hits) >= 2:
+            bonus += 1
+
+        return {
+            "theme": theme_name,
+            "bonus": bonus,
+            "reason": str(rule.get("reason", "") or ""),
+            "headline": str(items[0].get("title", "") or ""),
+            "matched": hits[:4],
+        }
+    except Exception:
+        return {"theme": "", "bonus": 0, "reason": "", "headline": "", "matched": []}
+
+
+def _extract_alert_sector_theme(alert: dict) -> str:
+    try:
+        sec = str(alert.get("sector_theme", "") or "").strip()
+        if not sec:
+            sec = str((alert.get("sector_info") or {}).get("theme", "") or "").strip()
+        if sec in ("", "기타업종", "unknown", "미분류"):
+            return "기타"
+        return sec
+    except Exception:
+        return "기타"
+
+
+def _sector_gate_sort_key(alert: dict) -> tuple:
+    sec = _extract_alert_sector_theme(alert)
+    signal_rank = {
+        "UPPER_LIMIT": 6,
+        "NEAR_UPPER": 5,
+        "STRONG_BUY": 4,
+        "SURGE": 3,
+        "EARLY_DETECT": 2,
+        "ENTRY_POINT": 1,
+    }.get(str(alert.get("signal_type", "") or ""), 0)
+    return (
+        1 if alert.get("direct_news_hit") else 0,
+        0 if sec == "기타" else 1,
+        signal_rank,
+        int(alert.get("score", 0) or 0),
+        float(alert.get("change_rate", 0) or 0),
+        float(alert.get("volume_ratio", 0) or 0),
+    )
 
 # ============================================================
 # 🚨 DART 리스크 차단 + 보유 종목 뉴스 감시 (v33.0)
@@ -17742,13 +17899,18 @@ def run_scan():
                     alerts.append(s); seen.add(s["code"])
 
         # ── v39.3-#9-5: 섹터당 최대 신호 수 제한 (집중도 향상) ──
+        alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
         MAX_SIGNALS_PER_SECTOR = 3
+        MAX_SIGNALS_MISC = 4
         sector_counts = {}
         filtered_alerts = []
         for s in alerts:
-            sec = s.get("sector_theme", "") or "기타"
+            sec = _extract_alert_sector_theme(s)
+            sec_limit = MAX_SIGNALS_MISC if sec == "기타" else MAX_SIGNALS_PER_SECTOR
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
-            if sector_counts[sec] <= MAX_SIGNALS_PER_SECTOR:
+            if sector_counts[sec] <= sec_limit:
+                if not s.get("sector_theme") and sec != "기타":
+                    s["sector_theme"] = sec
                 filtered_alerts.append(s)
             else:
                 print(f"  ⏭ 섹터 제한({sec} {sector_counts[sec]}번째): {s.get('name','')} 생략")
