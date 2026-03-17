@@ -3,11 +3,40 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.66
+버전: v41.67
 날짜: 2026-03-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.68 (2026-03-17): 재상승 포착 보강 + no_ask_liquidity 예외 완화 + 고점 추격식 진입가 갱신 방지.
+  [#1] `check_intraday_pullback_breakout()`에 재상승(resurge) 판정을 추가.
+       깊은 눌림(기본 15% 이상) 이후 당일 거래량 재유입 + 눌림 회복률 + 저점 대비 반등률을 함께 봐서,
+       완전 돌파 전이어도 재상승 초입을 `MID_PULLBACK`으로 포착 가능하게 보강.
+  [#2] 재상승형은 현재가 추격 대신 소폭 눌림 기준 진입가를 계산하도록 `_calc_resurge_entry_price()` 추가.
+       재상승 감지 시 `resurge_mode`, `pullback_reclaim_ratio`, `entry_soft_block_allowed` 메타를 저장.
+  [#3] `run_mid_pullback_scan()` / `check_entry_watch()`에 `no_ask_liquidity` 소프트 예외를 추가.
+       직접뉴스/재상승형 `MID_PULLBACK`은 완전 억제 대신 경고를 남기고 추적을 유지해, 상한가 직전 빈 호가로 인한 전면 누락을 완화.
+  [#4] 대표 진입가 갱신은 `_select_representative_entry_price()`로 통일.
+       `SURGE`/`EARLY_DETECT`/`NEAR_UPPER`/`MID_PULLBACK`/`ENTRY_POINT`는 미체결 상태에서 더 높은 진입가로 덮어쓰지 않고,
+       더 낮아질 때만 하향 갱신하도록 보수화.
+  [#5] `save_signal_log()` / `register_entry_watch()`가 위 대표 진입가 정책을 공유하고,
+       선택된 진입가에 맞춰 손절가·목표가를 재계산하도록 정리.
+  이유: 신세계I&C처럼 눌림목 재상승형이 `no_ask_liquidity`로 통째로 사라지거나,
+       폴라리스AI류가 재포착 시 대표 진입가가 상향돼 꼭대기 추격처럼 보이는 문제를 줄이기 위함.
+  개선점: 깊은 눌림 뒤 재상승 포착률↑, 상한가 근처 빈 호가 전면 누락↓, 고점 추격식 진입가 갱신↓.
+  주의점: `no_ask_liquidity` 완화는 `MID_PULLBACK` 재상승/직접뉴스 계열에만 제한 적용되며,
+       `limit_up_locked`는 여전히 차단된다.
+
+- v41.67 (2026-03-17): 체결속도 최근성/가속도 보강 — 평균치 편향 완화 + 2차 진입 판단 해석력 개선.
+  [#1] `_record_execution_snapshot()`에 `elapsed_sec` / `trade_value_per_sec` 저장을 추가해, 스냅샷 간격 차이로 같은 체결대금이 과대·과소평가되지 않도록 정리.
+  [#2] `get_execution_speed_metrics()`에 `recent_trade_value_per_sec`, `prior_trade_value_per_sec`, `acceleration_ratio`, `freshness_score`, `last_active_age_sec`, `flow_state`를 추가해 최근 체결 가속/둔화와 마지막 유효체결 최근성을 함께 평가하도록 확장.
+  [#3] 체결속도 점수에 `pace_score`(초당 체결대금), `freshness_bonus`, `accel_bonus`, `stale_penalty`를 반영해 평균 체결대금만 높고 최근 흐름이 죽은 종목의 과대평가를 완화.
+  [#4] `_entry_execution_judgement()`를 보강해 최근 유효체결이 오래 끊긴 경우 보류로 낮추고, 예비판단이어도 최근성이 좋은 경우는 '체결 살아있음' 참고 문구를 구분 표시.
+  [#5] `_entry_execution_status_block()` / `_judge_phase2_entry()` / `_apply_execution_speed_to_signal()`에 `가속/유지/둔화`, `최근 유효체결 n초 전` 표기를 추가해 메시지 해석력을 높임.
+  이유: 기존 체결속도는 평균 체결대금 중심이라 최근 체결이 급약화됐는데도 과거 큰 체결 몇 건 때문에 점수가 유지되거나, 반대로 방금 가속이 붙은 종목이 샘플 부족으로 평평하게 보이는 문제가 있었기 때문.
+  개선점: 최근 체결흐름 반영↑, 느려진 종목 과대평가↓, 가속 종목 해석력↑, 2차 진입 판단 품질↑.
+  주의점: 체결속도는 여전히 보조지표이며, 실제 진입 차단이 아니라 포착/진입 판단 보강 용도다.
+
 - v41.66 (2026-03-17): 진입가 도달 1차/2차 분할진입 구조 + 자금관리 규칙 코드화 + 1종목 집중.
   [#1] check_entry_watch()의 3회 반복 알림을 1차(초기진입)+2차(추가진입 판단) 2단계 분리 구조로 변경.
        1차: 신호강도별 권장비중(강한 45%/보통 35%/약한 25%) + 손절가 + 목표가 + 체결속도.
@@ -1397,6 +1426,14 @@ MID_PULLBACK_DAYS_MIN      = 2
 MID_PULLBACK_DAYS_MAX      = 15
 MID_VOL_RECOVERY_MIN       = 1.3
 MID_ALERT_COOLDOWN         = 86400
+MID_RESURGE_MIN_PULLBACK_PCT = 15.0
+MID_RESURGE_MIN_TODAY_CHG    = 3.0
+MID_RESURGE_MIN_VOL_RATIO    = 2.0
+MID_RESURGE_MIN_RECLAIM_RATIO = 0.55
+MID_RESURGE_MIN_BOUNCE_PCT   = 5.0
+MID_RESURGE_ENTRY_DISCOUNT_PCT = 1.1
+MID_SOFT_ALLOW_MIN_SCORE     = 75
+NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK", "ENTRY_POINT"}
 
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
@@ -3338,6 +3375,8 @@ EXEC_SPEED_FILTER_MAX_RATIO = float(os.getenv("EXEC_SPEED_FILTER_MAX_RATIO", "0.
 EXEC_SPEED_SETUP_EXPIRE_SEC = int(os.getenv("EXEC_SPEED_SETUP_EXPIRE_SEC", "1800") or "1800")
 EXEC_SPEED_PREWARM_MAX_SEC   = int(os.getenv("EXEC_SPEED_PREWARM_MAX_SEC",   "120")  or "120")   # 포착 후 워밍 최대 기간(초)
 EXEC_SPEED_PREWARM_MAX_CODES = int(os.getenv("EXEC_SPEED_PREWARM_MAX_CODES", "8")    or "8")     # 동시 워밍 최대 종목 수 (API 부담 제한)
+EXEC_SPEED_RECENT_WINDOW_SEC = int(os.getenv("EXEC_SPEED_RECENT_WINDOW_SEC", "30") or "30")
+EXEC_SPEED_STALE_WARN_SEC = int(os.getenv("EXEC_SPEED_STALE_WARN_SEC", "45") or "45")
 _execution_snapshots: dict = {}
 _exec_speed_prewarm: dict = {}          # code → registered_ts, 포착 직후 스냅샷 사전 누적용
 _execution_setup_watch: dict = {}
@@ -3384,6 +3423,9 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
     prev_vol = safe_int(prev.get("today_vol", 0))
     vol_delta = max(today_vol - prev_vol, 0)
     trade_value_delta = int(vol_delta * price)
+    prev_ts = float(prev.get("ts", 0) or 0)
+    elapsed_sec = max(now_ts - prev_ts, 1.0) if prev_ts > 0 else 0.0
+    trade_value_per_sec = float(trade_value_delta / elapsed_sec) if trade_value_delta > 0 and elapsed_sec > 0 else 0.0
     micro_threshold = _get_exec_speed_micro_trade_threshold(price, market=market, sample_ts=now_ts)
     sample = {
         "ts": now_ts,
@@ -3395,13 +3437,14 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
         "bid_qty": safe_int(payload.get("bid_qty", 0)),
         "vol_delta": vol_delta,
         "trade_value_delta": trade_value_delta,
+        "elapsed_sec": round(elapsed_sec, 2),
+        "trade_value_per_sec": round(trade_value_per_sec, 2),
         "micro_trade": bool(vol_delta > 0 and trade_value_delta < micro_threshold),
     }
     if prev and prev.get("price") == price and prev.get("today_vol") == today_vol:
         return
     buf.append(sample)
     _prune_execution_snapshots(code, now_ts)
-
 
 def get_execution_speed_metrics(code: str, current_price: int | None = None, window_sec: int = EXEC_SPEED_WINDOW_SEC) -> dict:
     code = normalize_stock_code(code)
@@ -3420,6 +3463,14 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
         "amount_per_active": 0,
         "active_ratio": 0.0,
         "avg_bid_ask_ratio": 0.0,
+        "trade_value_per_sec": 0,
+        "recent_trade_value_per_sec": 0,
+        "prior_trade_value_per_sec": 0,
+        "acceleration_ratio": 1.0,
+        "freshness_score": 0,
+        "last_active_age_sec": 999,
+        "recent_valid_samples": 0,
+        "flow_state": "중립",
         "summary": "샘플 부족",
     }
     if not code:
@@ -3448,6 +3499,76 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
     mean_amount = sum(valid_amounts) / max(len(valid_amounts), 1)
     mean_abs_dev = sum(abs(v - mean_amount) for v in valid_amounts) / max(len(valid_amounts), 1)
     consistency = max(0.0, 1.0 - (mean_abs_dev / mean_amount)) if mean_amount > 0 else 0.0
+
+    flow_rates = []
+    prev_ts = None
+    for s in valid:
+        ts = float(s.get("ts", 0) or 0)
+        elapsed = float(s.get("elapsed_sec", 0) or 0)
+        if elapsed <= 0 and prev_ts:
+            elapsed = max(ts - prev_ts, 1.0)
+        rate = float(int(s.get("trade_value_delta", 0) or 0)) / max(elapsed, 1.0) if elapsed > 0 else 0.0
+        flow_rates.append(rate)
+        prev_ts = ts or prev_ts
+    mean_rate = sum(flow_rates) / max(len(flow_rates), 1)
+    out["trade_value_per_sec"] = int(mean_rate)
+
+    recent_window = max(15, min(window_sec, EXEC_SPEED_RECENT_WINDOW_SEC))
+    recent_cutoff = now_ts - recent_window
+    recent_rates = []
+    prior_rates = []
+    recent_valid_samples = 0
+    last_valid_ts = 0.0
+    prev_ts = None
+    for s in valid:
+        ts = float(s.get("ts", 0) or 0)
+        elapsed = float(s.get("elapsed_sec", 0) or 0)
+        if elapsed <= 0 and prev_ts:
+            elapsed = max(ts - prev_ts, 1.0)
+        rate = float(int(s.get("trade_value_delta", 0) or 0)) / max(elapsed, 1.0) if elapsed > 0 else 0.0
+        if ts >= recent_cutoff:
+            recent_rates.append(rate)
+            recent_valid_samples += 1
+        else:
+            prior_rates.append(rate)
+        if ts > last_valid_ts:
+            last_valid_ts = ts
+        prev_ts = ts or prev_ts
+
+    recent_rate = sum(recent_rates) / max(len(recent_rates), 1) if recent_rates else mean_rate
+    prior_rate = sum(prior_rates) / max(len(prior_rates), 1) if prior_rates else mean_rate
+    accel_ratio = recent_rate / max(prior_rate, 1.0) if recent_rate > 0 and prior_rate > 0 else 1.0
+    out["recent_trade_value_per_sec"] = int(recent_rate)
+    out["prior_trade_value_per_sec"] = int(prior_rate)
+    out["acceleration_ratio"] = round(accel_ratio, 2)
+    out["recent_valid_samples"] = recent_valid_samples
+
+    last_active_age_sec = max(0, int(now_ts - last_valid_ts)) if last_valid_ts > 0 else 999
+    out["last_active_age_sec"] = last_active_age_sec
+    if last_active_age_sec <= 10:
+        freshness_score = 100
+    elif last_active_age_sec <= 20:
+        freshness_score = 85
+    elif last_active_age_sec <= 35:
+        freshness_score = 70
+    elif last_active_age_sec <= EXEC_SPEED_STALE_WARN_SEC:
+        freshness_score = 55
+    elif last_active_age_sec <= 70:
+        freshness_score = 35
+    else:
+        freshness_score = 15
+    out["freshness_score"] = freshness_score
+
+    if last_active_age_sec > EXEC_SPEED_STALE_WARN_SEC:
+        flow_state = "정체"
+    elif recent_valid_samples >= 2 and accel_ratio >= 1.25:
+        flow_state = "가속"
+    elif prior_rates and accel_ratio <= 0.80:
+        flow_state = "둔화"
+    else:
+        flow_state = "유지"
+    out["flow_state"] = flow_state
+
     bid_ratios = []
     for s in valid:
         ask_qty = safe_int(s.get("ask_qty", 0), 0)
@@ -3488,11 +3609,40 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
         amount_score = 8
     else:
         amount_score = 4
+
+    if mean_rate >= 8_000_000:
+        pace_score = 15
+    elif mean_rate >= 4_000_000:
+        pace_score = 12
+    elif mean_rate >= 2_000_000:
+        pace_score = 10
+    elif mean_rate >= 1_000_000:
+        pace_score = 8
+    elif mean_rate >= 500_000:
+        pace_score = 5
+    elif mean_rate >= 200_000:
+        pace_score = 3
+    else:
+        pace_score = 0
+
     depth_score = min(len(valid) * 5, 15)
     active_score = min(int(active_ratio * 20), 20)
     consistency_score = min(int(consistency * 15), 15)
     bid_score = min(max(int((avg_bid_ratio - 0.8) * 8), 0), 10)
-    speed_score = max(0, min(100, amount_score + depth_score + active_score + consistency_score + bid_score))
+    freshness_bonus = min(max(int((freshness_score - 30) / 7), -3), 10)
+    if accel_ratio >= 1.45:
+        accel_bonus = 8
+    elif accel_ratio >= 1.18:
+        accel_bonus = 5
+    elif accel_ratio <= 0.65:
+        accel_bonus = -6
+    elif accel_ratio <= 0.85:
+        accel_bonus = -3
+    else:
+        accel_bonus = 0
+    stale_penalty = -8 if last_active_age_sec > 60 else (-4 if last_active_age_sec > EXEC_SPEED_STALE_WARN_SEC else 0)
+
+    speed_score = max(0, min(100, amount_score + pace_score + depth_score + active_score + consistency_score + bid_score + freshness_bonus + accel_bonus + stale_penalty))
     out["execution_speed_score"] = int(speed_score)
 
     suggested_entry = safe_int(last_price, 0)
@@ -3505,12 +3655,13 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
 
     ready_window_min = max(2, EXEC_SPEED_MIN_SAMPLES)
     ready_valid_min = max(2, EXEC_SPEED_MIN_SAMPLES - 1)
+    flow_hint = f" / 흐름 {flow_state} / 최근체결 {last_active_age_sec}초전"
     if len(samples) >= ready_window_min and len(valid) >= ready_valid_min:
         out["ready"] = True
-        out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
+        out["summary"] = f"속도 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점{flow_hint}"
     else:
         out["provisional"] = True
-        out["summary"] = f"예비판단 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점"
+        out["summary"] = f"예비판단 {out['execution_speed_score']}점 / 눌림유지 {out['dip_resilience_score']}점{flow_hint}"
     return out
 
 def _tick_exec_speed_prewarm() -> None:
@@ -3585,17 +3736,27 @@ def _execution_score_label(score: int) -> str:
 
 def _entry_execution_judgement(metrics: dict | None = None) -> tuple[str, str]:
     metrics = metrics or {}
-    if not metrics.get("ready"):
-        return ("참고", "⚠️ 체결속도 샘플 부족 — 진입 시 추가 확인")
     speed_score = int(metrics.get("execution_speed_score", 0) or 0)
     dip_score = int(metrics.get("dip_resilience_score", 0) or 0)
     filtered_ratio = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0)
-    if speed_score >= 75 and dip_score >= 70 and filtered_ratio <= 0.60:
-        return ("진입 적합", "✅ 하락 중에도 체결이 살아 있어 진입 적합")
+    freshness_score = int(metrics.get("freshness_score", 0) or 0)
+    flow_state = str(metrics.get("flow_state", "중립") or "중립")
+    last_active_age_sec = int(metrics.get("last_active_age_sec", 999) or 999)
+
+    if not metrics.get("ready"):
+        if metrics.get("provisional") and speed_score >= 68 and dip_score >= 55 and freshness_score >= 70 and flow_state in {"가속", "유지"}:
+            return ("참고", f"🟡 예비판단상 체결 살아있음 — {flow_state}, 최근 유효체결 {last_active_age_sec}초 전")
+        return ("참고", "⚠️ 체결속도 샘플 부족 — 진입 시 추가 확인")
+
+    if last_active_age_sec > EXEC_SPEED_STALE_WARN_SEC or freshness_score < 40:
+        return ("보류 우선", f"⚠️ 최근 체결이 끊김 — 마지막 유효체결 {last_active_age_sec}초 전")
+    if speed_score >= 75 and dip_score >= 70 and filtered_ratio <= 0.60 and flow_state != "둔화":
+        return ("진입 적합", f"✅ {flow_state} 흐름 유지 — 최근 유효체결 {last_active_age_sec}초 전")
     if speed_score < 40 or dip_score < 40 or filtered_ratio > 0.75:
         return ("보류 우선", "⚠️ 하락 중 체결 유지 약함 — 진입보류 우선")
-    return ("보통", "🟡 체결속도는 보통 수준 — 무리한 추격보다 분할/확인 우선")
-
+    if flow_state == "둔화":
+        return ("보통", f"🟡 체결은 이어지지만 둔화 중 — 최근 유효체결 {last_active_age_sec}초 전")
+    return ("보통", f"🟡 체결속도는 보통 수준 — {flow_state}, 최근 유효체결 {last_active_age_sec}초 전")
 
 # ── v41.66: 신호 강도 판정 ──
 def _classify_signal_strength(watch: dict, exec_metrics: dict | None = None) -> str:
@@ -3648,7 +3809,6 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
     stop = watch.get("stop_loss", 0)
     reasons = []
     fail_count = 0
-    # ① 눌림 유지: 현재가가 진입가 대비 크게 하락하지 않았는지
     if entry and price:
         drop_pct = (entry - price) / entry * 100
         if drop_pct <= 1.5:
@@ -3658,18 +3818,20 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
         else:
             reasons.append("🔴 과도 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
             fail_count += 1
-    # ② 체결속도 악화 여부
+
     exec_label, _ = _entry_execution_judgement(exec_metrics)
+    flow_state = str((exec_metrics or {}).get("flow_state", "중립") or "중립")
+    last_active_age_sec = int((exec_metrics or {}).get("last_active_age_sec", 999) or 999)
     if exec_label == "진입 적합":
-        reasons.append("✅ 체결속도 양호")
+        reasons.append(f"✅ 체결속도 양호 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
     elif exec_label == "보류 우선":
-        reasons.append("🔴 체결속도 급약화")
+        reasons.append(f"🔴 체결속도 급약화 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
         fail_count += 1
     elif exec_label == "참고":
-        reasons.append("🟡 체결속도 샘플 부족")
+        reasons.append(f"🟡 체결속도 예비판단 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
     else:
-        reasons.append("🟡 체결속도 보통")
-    # ③ 손절가까지 여유
+        reasons.append(f"🟡 체결속도 보통 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
+
     if stop and price and entry:
         stop_distance_pct = (price - stop) / price * 100
         if stop_distance_pct >= 2.0:
@@ -3679,7 +3841,7 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
         else:
             reasons.append(f"🔴 손절가 근접 ({stop_distance_pct:.1f}%)")
             fail_count += 1
-    # ④ 섹터/수급 논리 유지
+
     sector_ok = True
     try:
         _s_theme = watch.get("sector_theme", "")
@@ -3707,7 +3869,6 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
         reasons.append("🔴 섹터 모멘텀 이탈")
         fail_count += 1
 
-    # 판정
     if fail_count >= 2:
         decision = "금지"
         detail = "구조 악화 — 추가매수 금지, 기존 보유분 유지 또는 감축 검토"
@@ -3731,6 +3892,8 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
     speed_score = int(base_metrics.get("execution_speed_score", 0) or 0)
     dip_score = int(base_metrics.get("dip_resilience_score", 0) or 0)
     filtered_ratio = float(base_metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
+    flow_state = str(base_metrics.get("flow_state", "중립") or "중립")
+    freshness_age = int(base_metrics.get("last_active_age_sec", 999) or 999)
     speed_label = _execution_score_label(speed_score)
     dip_label = _execution_score_label(dip_score)
     judgement_label, judgement_line = _entry_execution_judgement(base_metrics)
@@ -3740,6 +3903,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
             f"⚡ <b>진입 시 체결속도</b>  {speed_score}점 ({speed_label})\n"
             f"🪨 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🚦 최근 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
             f"🧭 <b>{judgement_label}</b>  — {judgement_line.replace('✅ ', '').replace('⚠️ ', '').replace('🟡 ', '')}\n"
         )
     if current_metrics.get("provisional"):
@@ -3748,6 +3912,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
             f"⚡ <b>진입 시 체결속도</b>  예비판단 {speed_score}점 ({speed_label})\n"
             f"🪨 예비 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 예비 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🚦 최근 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
             f"🧭 <b>참고</b>  — 현재 샘플이 충분하진 않지만 최근 유효 체결 {int(current_metrics.get('valid_samples', 0) or 0)}개 기준 참고값입니다. 진입 전 호가를 한 번 더 확인하세요.\n"
         )
     if fallback_metrics and (fallback_metrics.get("ready") or fallback_metrics.get("provisional")):
@@ -3759,6 +3924,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
             f"📌 {ref_prefix} {ref_mode}  {speed_score}점 ({speed_label})\n"
             f"🪨 {ref_prefix} 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 {ref_prefix} 미세체결 제외  {filtered_ratio:.0f}%\n"
+            f"🚦 {ref_prefix} 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
             f"🧭 <b>참고</b>  — 현재 샘플이 부족해 포착시 체결 기준으로 표시합니다. 진입 전 호가를 한 번 더 확인하세요.\n"
         )
     return (
@@ -3794,8 +3960,11 @@ def _apply_execution_speed_to_signal(s: dict, mode: str | None = None) -> dict:
         filtered_ratio = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0)
         speed_label = _execution_score_label(speed_score)
         dip_label = _execution_score_label(dip_score)
+        flow_state = str(metrics.get("flow_state", "중립") or "중립")
+        freshness_age = int(metrics.get("last_active_age_sec", 999) or 999)
         reasons.append(f"⚡ 체결지속속도 {speed_score}점 ({speed_label})")
         reasons.append(f"🪨 눌림 유지 {dip_score}점 ({dip_label})  (미세체결 제외 {filtered_ratio*100:.0f}%)")
+        reasons.append(f"🚦 최근 체결흐름 {flow_state} / 최근 유효체결 {freshness_age}초 전")
         if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
             s["entry_execution_focus"] = True
             if speed_score >= 75:
@@ -3829,11 +3998,19 @@ def _apply_execution_speed_to_signal(s: dict, mode: str | None = None) -> dict:
             elif speed_score < 35:
                 s["score"] = int(s.get("score", 0) or 0) - 1
     else:
+        flow_state = str(metrics.get("flow_state", "중립") or "중립")
+        freshness_age = int(metrics.get("last_active_age_sec", 999) or 999)
         if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
-            reasons.append("⚡ 체결지속속도 샘플 부족 (참고용)")
+            if metrics.get("provisional"):
+                reasons.append(f"⚡ 체결지속속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state} / 최근 유효체결 {freshness_age}초 전")
+            else:
+                reasons.append("⚡ 체결지속속도 샘플 부족 (참고용)")
             s["entry_execution_focus"] = True
         elif signal_type in ENTRY_EXECUTION_SIGNAL_TYPES:
-            reasons.append("⚡ 체결속도 참고 샘플 부족")
+            if metrics.get("provisional"):
+                reasons.append(f"⚡ 체결속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state}")
+            else:
+                reasons.append("⚡ 체결속도 참고 샘플 부족")
 
     s.pop("execution_setup_required", None)
     if cautions:
@@ -3855,17 +4032,19 @@ def _build_execution_speed_block(s: dict) -> str:
     filtered = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
     speed_score = int(metrics.get('execution_speed_score', 0) or 0)
     dip_score = int(metrics.get('dip_resilience_score', 0) or 0)
+    flow_state = str(metrics.get('flow_state', '중립') or '중립')
+    freshness_age = int(metrics.get('last_active_age_sec', 999) or 999)
     lines = [
         f"⚡ <b>체결지속속도</b>  {speed_score}점 ({_execution_score_label(speed_score)})",
         f"🪨 눌림 유지  {dip_score}점 ({_execution_score_label(dip_score)})",
         f"🧹 미세체결 제외  {filtered:.0f}%",
+        f"🚦 최근 흐름  {flow_state} / 최근 유효체결 {freshness_age}초 전",
     ]
     if s.get("execution_setup_required"):
         lines.append("🧭 하락 중 속도 유지 확인 후 진입가를 확정합니다.")
     elif s.get("entry_execution_focus"):
         lines.append("🧭 포착은 유지하고, 진입가 도달 시 체결 품질을 더 중요하게 봅니다.")
     return "━━━━━━━━━━━━━━━\n" + "\n".join(lines) + "\n"
-
 
 def _register_execution_setup_watch(s: dict) -> None:
     code = normalize_stock_code(s.get("code"))
@@ -5322,10 +5501,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     today_chg    = cur["change_rate"]
     today_vol    = cur["today_vol"]
     vol_ratio    = cur["volume_ratio"]
-
-    # 최소 조건: 오늘 +5% 이상, 거래량 3배 이상
-    if today_chg < 5.0 or vol_ratio < 3.0:
-        return {}
+    intraday_high = safe_int(cur.get("high", today_price), today_price)
 
     # 어제까지 데이터에서 눌림 패턴 확인
     hist = items[:-1]   # 오늘 제외 (어제까지)
@@ -5369,7 +5545,21 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     avg_pb_vol    = sum(pb_vols)/len(pb_vols) if pb_vols else 0
     vol_dried     = avg_pb_vol < avg_surge_vol * 0.7 if avg_surge_vol else False
 
-    # 오늘 돌파 강도
+    breakout_mode = today_price > prev_close and today_chg >= 5.0 and vol_ratio >= 3.0
+    reclaim_ref_price = max(today_price, intraday_high)
+    reclaim_ratio = _calc_pullback_reclaim_ratio(surge_peak_price, pullback_low, reclaim_ref_price)
+    rebound_gain_pct = round((today_price - pullback_low) / pullback_low * 100, 1) if pullback_low else 0.0
+    resurge_mode = (
+        pullback_pct >= MID_RESURGE_MIN_PULLBACK_PCT
+        and today_chg >= MID_RESURGE_MIN_TODAY_CHG
+        and vol_ratio >= MID_RESURGE_MIN_VOL_RATIO
+        and reclaim_ratio >= MID_RESURGE_MIN_RECLAIM_RATIO
+        and rebound_gain_pct >= MID_RESURGE_MIN_BOUNCE_PCT
+    )
+    if not (breakout_mode or resurge_mode):
+        return {}
+
+    # 오늘 돌파/재상승 강도
     z    = get_volume_zscore(code, today_vol)
     rs   = get_relative_strength(today_chg)
     ma20 = sum(d["close"] for d in hist[-20:])/20 if len(hist)>=20 else 0
@@ -5377,7 +5567,10 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
 
     # 스코어
     score = 0; reasons = []
-    reasons.append(f"⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)")
+    if breakout_mode:
+        reasons.append(f"⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)")
+    else:
+        reasons.append(f"♻️ <b>재상승 감지!</b> (깊은 눌림 후 거래대금 재유입)")
     if surge_pct >= 40: score+=25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
     elif surge_pct >= 25: score+=20; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
     else: score+=15; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
@@ -5389,10 +5582,16 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     elif pullback_pct < 15: score+=8; reasons.append(f"🟡 얕은 눌림 ({pullback_pct:.0f}%)")
     else: score+=5; reasons.append(f"🟠 깊은 눌림 ({pullback_pct:.0f}%)")
 
-    # 오늘 돌파 신호 강도
-    if today_chg >= 20: score+=30; reasons.append(f"🚨 오늘 +{today_chg:.0f}% 강력 돌파!")
-    elif today_chg >= 10: score+=20; reasons.append(f"🔥 오늘 +{today_chg:.0f}% 돌파")
-    else: score+=10; reasons.append(f"📈 오늘 +{today_chg:.1f}% 돌파 시작")
+    # 오늘 돌파/재상승 신호 강도
+    if breakout_mode:
+        if today_chg >= 20: score+=30; reasons.append(f"🚨 오늘 +{today_chg:.0f}% 강력 돌파!")
+        elif today_chg >= 10: score+=20; reasons.append(f"🔥 오늘 +{today_chg:.0f}% 돌파")
+        else: score+=10; reasons.append(f"📈 오늘 +{today_chg:.1f}% 돌파 시작")
+    else:
+        if reclaim_ratio >= 0.8: score += 24; reasons.append(f"🚀 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 강함")
+        elif reclaim_ratio >= 0.65: score += 18; reasons.append(f"♻️ 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 진행")
+        else: score += 12; reasons.append(f"🟡 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 초입")
+        reasons.append(f"📈 저점 대비 +{rebound_gain_pct:.1f}% 반등")
 
     if vol_ratio >= 10: score+=20; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 폭발 (5일 평균 대비)")
     elif vol_ratio >= 5: score+=15; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 급증")
@@ -5409,7 +5608,11 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         return {}
 
     grade = "A" if score>=80 else "B" if score>=60 else "C"
-    entry = today_price
+    if resurge_mode and not breakout_mode:
+        entry = _calc_resurge_entry_price(today_price, pullback_low, reclaim_ratio)
+        reasons.append(f"↘️ 재상승형 보수 진입가 {entry:,}원 (현재가 추격 방지)")
+    else:
+        entry = today_price
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
 
     return {
@@ -5419,6 +5622,8 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         "grade": grade, "score": score,
         "surge_pct": surge_pct, "pullback_pct": pullback_pct, "pullback_days": pullback_days,
         "current_pullback": round((surge_peak_price-today_price)/surge_peak_price*100,1),
+        "pullback_reclaim_ratio": reclaim_ratio, "resurge_mode": bool(resurge_mode and not breakout_mode),
+        "entry_soft_block_allowed": bool(resurge_mode),
         "vol_dried": vol_dried, "vol_recovered": True, "is_bullish": True,
         "ma20_dev": ma20_dev, "rs": rs, "vol_zscore": z,
         "similar_pattern_stats": similar_pattern_stats,
@@ -5492,13 +5697,23 @@ def run_mid_pullback_scan():
             except Exception:
                 _blocked_reason = ""
         if _blocked_reason:
-            _log_suppressed_alert(
-                s["code"], s["name"],
-                f"눌림목 진입 신호 차단 ({_blocked_reason})",
-                s.get("signal_type", ""),
-                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
-            )
-            continue
+            if _blocked_reason == "no_ask_liquidity" and _should_soft_allow_no_ask_liquidity(_live or {}, s):
+                s["entry_soft_block_allowed"] = True
+                s.setdefault("reasons", []).append("⚠️ 현재 호가 매도잔량이 얇아 즉시 체결은 불리할 수 있음 — 관찰/재접근 우선")
+                _log_suppressed_alert(
+                    s["code"], s["name"],
+                    f"눌림목 호가경고(soft) ({_blocked_reason})",
+                    s.get("signal_type", ""),
+                    {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+                )
+            else:
+                _log_suppressed_alert(
+                    s["code"], s["name"],
+                    f"눌림목 진입 신호 차단 ({_blocked_reason})",
+                    s.get("signal_type", ""),
+                    {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+                )
+                continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
         register_entry_watch(s)                     # ★ 진입가 감시 등록
@@ -7370,6 +7585,94 @@ def _append_tracking_entry_update(rec: dict | None, old_entry: int, new_entry: i
     rec["last_entry_update_time"] = rec["entry_update_history"][-1].get("updated_at", "")
 
 
+def _calc_pullback_reclaim_ratio(peak_price: int, pullback_low: int, price: int) -> float:
+    peak_price = safe_int(peak_price, 0)
+    pullback_low = safe_int(pullback_low, 0)
+    price = safe_int(price, 0)
+    if peak_price <= 0 or pullback_low <= 0 or peak_price <= pullback_low or price <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, (price - pullback_low) / (peak_price - pullback_low))), 3)
+
+
+def _calc_resurge_entry_price(current_price: int, pullback_low: int, reclaim_ratio: float = 0.0) -> int:
+    current_price = safe_int(current_price, 0)
+    pullback_low = safe_int(pullback_low, 0)
+    reclaim_ratio = max(0.0, min(1.0, float(reclaim_ratio or 0.0)))
+    if current_price <= 0:
+        return 0
+    discount_pct = MID_RESURGE_ENTRY_DISCOUNT_PCT + (0.5 if reclaim_ratio >= 0.7 else 0.0)
+    base_entry = _round_price_down(current_price * (1 - discount_pct / 100.0))
+    if pullback_low > 0:
+        floor_entry = _round_price_down(pullback_low * (1 + 0.025 + min(reclaim_ratio, 0.8) * 0.03))
+        if floor_entry > 0:
+            base_entry = max(base_entry, floor_entry) if base_entry > 0 else floor_entry
+    if base_entry <= 0 or base_entry >= current_price:
+        base_entry = _round_price_down(current_price * 0.99)
+    if base_entry <= 0 or base_entry >= current_price:
+        base_entry = _round_price_down(current_price)
+    return int(base_entry)
+
+
+def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_type: str = "") -> tuple[int, str]:
+    prev_entry = safe_int(prev_entry, 0)
+    next_entry = safe_int(next_entry, 0)
+    sig_type = str(signal_type or "")
+    if prev_entry <= 0:
+        return next_entry, "신규등록"
+    if next_entry <= 0:
+        return prev_entry, "기존유지"
+    if next_entry < prev_entry:
+        return next_entry, "하향갱신"
+    if next_entry > prev_entry and sig_type in NO_CHASE_ENTRY_SIGNAL_TYPES:
+        return prev_entry, "고점추격방지유지"
+    return next_entry, "상향갱신" if next_entry > prev_entry else "기존유지"
+
+
+def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0) -> tuple[int, str]:
+    stock = stock if isinstance(stock, dict) else {}
+    current_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
+    chosen_entry, mode = _select_representative_entry_price(prev_entry, current_entry, stock.get("signal_type", ""))
+    if chosen_entry > 0:
+        stock["entry_price"] = chosen_entry
+        planned_prev = safe_int(stock.get("planned_entry_price", current_entry or chosen_entry), 0)
+        if planned_prev <= 0 or mode == "고점추격방지유지":
+            stock["planned_entry_price"] = chosen_entry
+        else:
+            stock["planned_entry_price"] = min(planned_prev, chosen_entry)
+        try:
+            stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(stock.get("code"), chosen_entry, signal_type=stock.get("signal_type"))
+            if stop_price > 0 and target_price > chosen_entry:
+                stock["stop_loss"] = int(stop_price)
+                stock["target_price"] = int(target_price)
+                stock["stop_pct"] = float(stop_pct)
+                stock["target_pct"] = float(target_pct)
+                stock["atr_used"] = bool(atr_used)
+        except Exception:
+            pass
+    stock["entry_guard_mode"] = mode
+    return chosen_entry, mode
+
+
+def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    sig_type = str(signal.get("signal_type") or "")
+    if sig_type != "MID_PULLBACK":
+        return False
+    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+    bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+    if ask_qty > 0:
+        return False
+    if bid_qty > 0 and float(cur.get("change_rate", 0.0) or 0.0) >= 29.0:
+        return False
+    if signal.get("entry_soft_block_allowed"):
+        return True
+    if signal.get("resurge_mode"):
+        return True
+    if signal.get("direct_news_theme"):
+        return True
+    return int(signal.get("score", 0) or 0) >= MID_SOFT_ALLOW_MIN_SCORE
+
+
 def _tracking_active_items(data: dict | None, code: str = "") -> list[tuple[str, dict]]:
     data = data or {}
     code = normalize_stock_code(code)
@@ -7491,6 +7794,9 @@ def save_signal_log(stock: dict):
             "dip_resilience_score": int(_exec_m.get("dip_resilience_score", 0) or 0),
             "micro_trade_filtered_ratio": float(_exec_m.get("micro_trade_filtered_ratio", 0.0) or 0.0),
             "execution_setup_required": bool(stock.get("execution_setup_required")),
+            "resurge_mode": bool(stock.get("resurge_mode")),
+            "entry_soft_block_allowed": bool(stock.get("entry_soft_block_allowed")),
+            "pullback_reclaim_ratio": float(stock.get("pullback_reclaim_ratio", 0.0) or 0.0),
         }
 
         track_status = "진입준비" if stock.get("execution_setup_required") else "추적중"
@@ -7517,8 +7823,11 @@ def save_signal_log(stock: dict):
             stock["signal_log_key"] = representative_key
             if not rec.get("entry_hit"):
                 prev_entry = safe_int(rec.get("entry_price", 0), 0)
+                _chosen_entry, _entry_guard_mode = _apply_entry_price_guard(stock, prev_entry)
                 next_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
-                _append_tracking_entry_update(rec, prev_entry, next_entry, reason="재포착대표진입갱신")
+                if next_entry != prev_entry:
+                    _append_tracking_entry_update(rec, prev_entry, next_entry, reason="재포착대표진입갱신" if _entry_guard_mode != "고점추격방지유지" else "재포착고점추격방지")
+                rec["last_entry_guard_mode"] = _entry_guard_mode
                 rec["name"] = stock_name
                 rec["signal_type"] = sig_type or rec.get("signal_type", "")
                 rec["score"] = stock.get("score", rec.get("score", 0))
@@ -10104,6 +10413,7 @@ def register_entry_watch(s: dict):
     latest_old_watch = max((w for _, w in old_items), key=lambda x: x.get("registered_ts", 0), default=None)
     previous_entry = safe_int((latest_old_watch or {}).get("entry_price", 0), 0)
     previous_miss_count = safe_int((latest_old_watch or {}).get("miss_count", 0), 0)
+    entry, entry_guard_mode = _apply_entry_price_guard(s, previous_entry)
 
     try:
         sig_data = {}
@@ -10117,7 +10427,9 @@ def register_entry_watch(s: dict):
             rec = sig_data.get(representative_key) or {}
             candidate = _build_tracking_episode_candidate(s, reason="진입감시재등록")
             _append_tracking_episode_candidate(rec, candidate)
-            _append_tracking_entry_update(rec, previous_entry, entry, reason="재포착대표진입갱신")
+            if previous_entry and entry and previous_entry != entry:
+                _append_tracking_entry_update(rec, previous_entry, entry, reason="재포착대표진입갱신" if entry_guard_mode != "고점추격방지유지" else "재포착고점추격방지")
+            rec["last_entry_guard_mode"] = entry_guard_mode
             rec["episode_representative"] = True
             rec["signal_type"] = s.get("signal_type", rec.get("signal_type", ""))
             rec["name"] = stock_name
@@ -10148,7 +10460,10 @@ def register_entry_watch(s: dict):
     for k, watch in old_items:
         old_entry = safe_int((watch or {}).get("entry_price", 0), 0)
         miss_count = safe_int((watch or {}).get("miss_count", 0), 0)
-        print(f"  🔄 대표 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
+        if old_entry and entry_guard_mode == "고점추격방지유지" and entry == old_entry:
+            print(f"  🛡 대표 진입가 유지: {stock_name} {old_entry:,}원 (고점 추격 방지, 미도달 {miss_count}회)")
+        else:
+            print(f"  🔄 대표 진입가 갱신: {stock_name} {old_entry:,}→{entry:,}원 (미도달 {miss_count}회)")
         archived_watch = _entry_watch.pop(k, None)
         if archived_watch:
             _archive_entry_watch_record(k, archived_watch, consume_reason="재포착_대표진입승계", final_status="대표진입승계")
@@ -10174,6 +10489,9 @@ def register_entry_watch(s: dict):
         "change_at_detect": float(s.get("change_rate", 0) or 0),
         "volume_ratio": float(s.get("volume_ratio", 0) or 0),
         "execution_metrics": dict(s.get("execution_metrics") or {}),
+        "resurge_mode": bool(s.get("resurge_mode")),
+        "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
+        "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
         "entry_reference_only": False,
         "entry_reference_market": "",
         "entry_reference_reason": "",
@@ -10671,6 +10989,14 @@ def check_entry_watch():
 
                 _blocked_reason = _detect_entry_block_reason(cur, watch, price, entry)
                 if _blocked_reason:
+                    if _blocked_reason == "no_ask_liquidity" and _should_soft_allow_no_ask_liquidity(cur, watch):
+                        _log_suppressed_alert(
+                            watch["code"], watch["name"],
+                            f"진입호가 경고(soft) ({_blocked_reason})",
+                            watch.get("signal_type", ""),
+                            {"entry_price": entry, "blocked_price": int(price or 0), "change_rate": cur.get("change_rate", 0), "ask_qty": cur.get("ask_qty", 0), "bid_qty": cur.get("bid_qty", 0)}
+                        )
+                        continue
                     watch["entry_blocked"] = True
                     watch["entry_blocked_reason"] = _blocked_reason
                     watch["entry_blocked_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
