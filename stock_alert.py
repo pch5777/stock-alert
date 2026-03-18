@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.73
+버전: v41.74
 날짜: 2026-03-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.74 (2026-03-18): 전 시간대 실시간 랭킹 후보군 강화 — 08:00~10:00은 강하게, 이후 장중은 보수적으로 후보군/직접스캔 보강.
+  [#1] 실시간 랭킹 유니버스 스냅샷(`_get_universe_rank_snapshot`)과 랭킹 후보 수집(`_collect_market_rank_candidates`)을 추가해,
+       상승률·상승 거래량·상승 거래대금 상위 종목의 합집합을 KRX/NXT 시장별로 후보군에 반영하도록 정리.
+  [#2] 장중 시간대를 `focus(08:00~10:00)` / `session(그 외 장중)`으로 나눠, 장초반은 상위 50(부족 시 100)·짧은 TTL,
+       이후는 상위 30·긴 TTL로 운영하는 `시간대 가중형 랭킹 후보군` 구조를 추가.
+  [#3] `refresh_dynamic_candidates()`가 기존 거래량/상한가/NXT 급등 후보 외에 실시간 랭킹 후보군을 함께 흡수하도록 확장하고,
+       `get_all_scan_candidates()`/`run_scan()`도 동일 랭킹 후보를 직접 참고해 장중 강세주가 동적 후보군 갱신 주기를 기다리지 않도록 보강.
+  [#4] `run_scan()`에 시장별 랭킹 직접 스캔 보강을 추가하되, 장초반은 강하게(기본 24개/시장), 이후는 보수적으로(기본 12개/시장) 제한해
+       무작정 종목 수만 늘리지 않고 상위권 진입 종목을 우선 확인하도록 정리.
+  이유: 오늘 로그처럼 장초반뿐 아니라 장중 전반에서 실제로 순위가 올라오는 종목을 후보군이 늦게 반영하거나,
+       기존 거래량/상한가 스캔만으로는 상승 가능 종목을 충분히 넓게 보지 못하는 문제가 있었기 때문.
+  개선점: 실시간 강세주 후보 반영 속도↑, 랭킹 기반 누락↓, NXT 포함 장중 전반의 순위 상승 종목 대응력↑.
+  주의점: 장중 전 시간대에 랭킹 후보를 보되, 08:00~10:00만 가장 강하게 반영하며 이후 시간대는 과열 추격을 막기 위해 보수적으로 제한한다.
+
 - v41.73 (2026-03-18): 장초반 강세주 누락 완화 — no_ask_liquidity 차단 완화 + 뉴스→종목 직접 승격.
   [#1] `run_scan()`의 일반 포착 경로에서 `no_ask_liquidity`를 무조건 차단하지 않고, 직접뉴스/강한 점수/거래량·섹터 근거가 충분한 경우
        관찰 우선 soft 허용으로 통과시키는 `_should_soft_allow_no_ask_liquidity_general()`과 공용 발송 헬퍼를 추가.
@@ -5561,9 +5575,9 @@ def _lookup_name_by_code(code: str, name_hint: str = "") -> str:
 
 def refresh_dynamic_candidates():
     """
-    거래량 상위 50종목을 자동으로 후보군에 편입
+    거래량/상한가/NXT 급등 + 실시간 랭킹 상위 종목을 자동 후보군에 편입
     → THEME_MAP에 없는 종목도 포착 가능
-    매일 장 시작 시 + 1시간마다 갱신
+    → 08:00~10:00은 더 강하게, 이후 장중은 보수적으로 반영
     """
     if not is_any_market_open():
         build_next_open_watchlist(max_codes=30)
@@ -5573,29 +5587,59 @@ def refresh_dynamic_candidates():
     try:
         krx_open = is_market_open()
         nxt_open = is_nxt_open()
+        rank_mode = _get_rank_market_mode() or "session"
+
         vol_stocks = get_volume_surge_stocks() if krx_open else []
         upper_stocks = get_upper_limit_stocks() if krx_open else []
         nxt_stocks = get_nxt_surge_stocks() if nxt_open else []
+        krx_rank_stocks = _collect_market_rank_candidates("KRX", scan_limit=None, force=False) if krx_open else []
+        nxt_rank_stocks = _collect_market_rank_candidates("NXT", scan_limit=None, force=False) if nxt_open else []
+
         candidates = {}
         excluded_cnt = 0
-        for item in vol_stocks + upper_stocks + nxt_stocks:
+        early_rank_cnt = 0
+
+        def _put_candidate(item: dict, desc: str):
+            nonlocal excluded_cnt, early_rank_cnt
             code = item.get("code")
             if not code:
-                continue
+                return
             name = _resolve_stock_name(code, item.get("name", ""))
             if not is_trade_candidate_name(name):
                 excluded_cnt += 1
-                continue
-            desc = "NXT자동편입" if str(item.get("market","")) == "NXT" else "자동편입"
-            candidates[code] = {"name": name, "desc": desc}
+                return
+            if "랭킹후보" in str(desc):
+                early_rank_cnt += 1
+            prev = candidates.get(code)
+            if prev:
+                labels = set(str(prev.get("desc", "")).split(" | ")) | {str(desc)}
+                prev["name"] = name
+                prev["desc"] = " | ".join(sorted(x for x in labels if x))
+            else:
+                candidates[code] = {"name": name, "desc": desc}
+
+        for item in vol_stocks + upper_stocks + nxt_stocks:
+            desc = "NXT자동편입" if str(item.get("market", "")) == "NXT" else "자동편입"
+            _put_candidate(item, desc)
+        for item in krx_rank_stocks:
+            _put_candidate(item, item.get("desc", f"KRX랭킹후보[{rank_mode}]"))
+        for item in nxt_rank_stocks:
+            _put_candidate(item, item.get("desc", f"NXT랭킹후보[{rank_mode}]"))
+
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": info["name"], "desc": info["desc"], "added_ts": time.time()}
             else:
                 _dynamic_candidates[code]["name"] = info["name"]
                 _dynamic_candidates[code]["desc"] = info["desc"]
+                _dynamic_candidates[code]["added_ts"] = time.time()
+
         krx_rank_source = "fallback" if _rank_api_disabled_today() else "api"
-        print(f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 (제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], NXT={len(nxt_stocks)})")
+        print(
+            f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 "
+            f"(제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
+            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}])"
+        )
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
 
@@ -5604,6 +5648,7 @@ def get_all_scan_candidates() -> list:
     THEME_MAP + 동적 후보군 합산 → 중복 제거
     반환: [(code, name, desc), ...]
     """
+    _ensure_dynamic_candidates_fresh()
     seen = set()
     result = []
     # THEME_MAP 우선
@@ -5794,10 +5839,8 @@ def run_mid_pullback_scan():
     if _bot_paused: return
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...", flush=True)
 
-    # 동적 후보군 갱신 (30분마다)
-    if not _dynamic_candidates or time.time() - min(
-            v["added_ts"] for v in _dynamic_candidates.values()) > 1800:
-        refresh_dynamic_candidates()
+    # 동적 후보군 갱신 (장초반 강하게 / 이후 장중 보수적으로)
+    _ensure_dynamic_candidates_fresh()
 
     all_candidates = get_all_scan_candidates()
     signals = []
@@ -5947,7 +5990,16 @@ def get_stock_price(code: str) -> dict:
 # ============================================================
 UNIVERSE_FILE = os.path.join(DATA_DIR, "universe.json")
 _UNIVERSE_CACHE = {"ts": 0.0, "codes": []}
-_UNIVERSE_RANK_CACHE = {"ts": 0.0, "items": [], "KRX_items": [], "NXT_items": []}
+_UNIVERSE_RANK_CACHE = {
+    "ts": 0.0,
+    "items": [],
+    "KRX_items": [],
+    "NXT_items": [],
+    "KRX_snapshot": [],
+    "KRX_snapshot_ts": 0.0,
+    "NXT_snapshot": [],
+    "NXT_snapshot_ts": 0.0,
+}
 
 UNIVERSE_MAX = int(os.getenv("UNIVERSE_MAX", "200") or "200")
 UNIVERSE_CACHE_TTL_SEC = int(os.getenv("UNIVERSE_CACHE_TTL_SEC", "3600") or "3600")
@@ -5956,6 +6008,16 @@ UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")
 UNIVERSE_MIN_PRICE = int(os.getenv("UNIVERSE_MIN_PRICE", "1000") or "1000")
 UNIVERSE_MIN_VOL = int(os.getenv("UNIVERSE_MIN_VOL", "100000") or "100000")
 UNIVERSE_MIN_RSFL = float(os.getenv("UNIVERSE_MIN_RSFL", "5") or "5")
+
+RANK_FOCUS_TOP_N = int(os.getenv("RANK_FOCUS_TOP_N", "50") or "50")
+RANK_FOCUS_EXPANDED_TOP_N = int(os.getenv("RANK_FOCUS_EXPANDED_TOP_N", "100") or "100")
+RANK_SESSION_TOP_N = int(os.getenv("RANK_SESSION_TOP_N", "30") or "30")
+RANK_SESSION_EXPANDED_TOP_N = int(os.getenv("RANK_SESSION_EXPANDED_TOP_N", "50") or "50")
+RANK_FOCUS_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_FOCUS_SCAN_LIMIT_PER_MARKET", "24") or "24")
+RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "12") or "12")
+RANK_FOCUS_REFRESH_SEC = int(os.getenv("RANK_FOCUS_REFRESH_SEC", "300") or "300")
+RANK_SESSION_REFRESH_SEC = int(os.getenv("RANK_SESSION_REFRESH_SEC", "900") or "900")
+RANK_MIN_CHANGE = float(os.getenv("RANK_MIN_CHANGE", "0.1") or "0.1")
 
 def _extract_codes_recursive(obj, out: set, limit: int = 5000):
     if len(out) >= limit:
@@ -5974,6 +6036,56 @@ def _extract_codes_recursive(obj, out: set, limit: int = 5000):
         for v in obj:
             _extract_codes_recursive(v, out, limit)
         return
+
+def _get_rank_market_mode() -> str:
+    """장중 랭킹 후보군 강도: 08:00~10:00은 focus, 그 외 장중은 session."""
+    if not is_any_market_open() or is_holiday():
+        return ""
+    now_t = datetime.now().time()
+    return "focus" if dtime(8, 0) <= now_t <= dtime(10, 0) else "session"
+
+
+def _get_rank_topn(mode: str = "") -> tuple[int, int]:
+    mode = mode or _get_rank_market_mode()
+    if mode == "focus":
+        return RANK_FOCUS_TOP_N, max(RANK_FOCUS_TOP_N, RANK_FOCUS_EXPANDED_TOP_N)
+    if mode == "session":
+        return RANK_SESSION_TOP_N, max(RANK_SESSION_TOP_N, RANK_SESSION_EXPANDED_TOP_N)
+    return RANK_SESSION_TOP_N, max(RANK_SESSION_TOP_N, RANK_SESSION_EXPANDED_TOP_N)
+
+
+def _get_rank_scan_limit(mode: str = "") -> int:
+    mode = mode or _get_rank_market_mode()
+    return RANK_FOCUS_SCAN_LIMIT_PER_MARKET if mode == "focus" else RANK_SESSION_SCAN_LIMIT_PER_MARKET
+
+
+def _get_rank_refresh_ttl_sec(mode: str = "") -> int:
+    mode = mode or _get_rank_market_mode()
+    return RANK_FOCUS_REFRESH_SEC if mode == "focus" else RANK_SESSION_REFRESH_SEC
+
+
+def _dynamic_candidate_ttl_sec() -> int:
+    mode = _get_rank_market_mode()
+    if mode:
+        return _get_rank_refresh_ttl_sec(mode)
+    return 1800
+
+
+def _ensure_dynamic_candidates_fresh() -> None:
+    try:
+        ttl = _dynamic_candidate_ttl_sec()
+        if not _dynamic_candidates:
+            refresh_dynamic_candidates()
+            return
+        oldest = min(float(v.get("added_ts", 0) or 0) for v in _dynamic_candidates.values())
+        if not oldest or time.time() - oldest > ttl:
+            refresh_dynamic_candidates()
+    except Exception:
+        try:
+            refresh_dynamic_candidates()
+        except Exception:
+            pass
+
 
 def _load_universe_codes() -> list:
     now = time.time()
@@ -6122,38 +6234,147 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
     except Exception as e:
         _log_error("update_universe_from_performance", e)
 
-def _rank_from_universe(market: str = "KRX") -> list:
+def _get_universe_rank_snapshot(market: str = "KRX", *, force: bool = False) -> list:
     market = "NXT" if str(market).upper() == "NXT" else "KRX"
-    cache_key = f"{market}_items"
+    snapshot_key = f"{market}_snapshot"
+    ts_key = f"{market}_snapshot_ts"
+    mode = _get_rank_market_mode()
+    ttl = _get_rank_refresh_ttl_sec(mode)
     now = time.time()
-    if now - _UNIVERSE_RANK_CACHE["ts"] < UNIVERSE_RANK_TTL_SEC and _UNIVERSE_RANK_CACHE.get(cache_key):
-        return _UNIVERSE_RANK_CACHE.get(cache_key, [])
+    cached = _UNIVERSE_RANK_CACHE.get(snapshot_key, [])
+    cached_ts = float(_UNIVERSE_RANK_CACHE.get(ts_key, 0.0) or 0.0)
+    if not force and cached and now - cached_ts < ttl:
+        return cached
 
     codes = _load_universe_codes()[:UNIVERSE_MAX]
-    items = []
+    snapshot = []
     for code in codes:
         info = get_nxt_stock_price(code) if market == "NXT" else get_stock_price(code)
         if not info:
             continue
-        if info.get("price", 0) < UNIVERSE_MIN_PRICE:
+        price = int(info.get("price", 0) or 0)
+        today_vol = int(info.get("today_vol", 0) or 0)
+        change_rate = float(info.get("change_rate", 0) or 0)
+        volume_ratio = float(info.get("volume_ratio", 0) or 0)
+        if price < UNIVERSE_MIN_PRICE:
             continue
-        if info.get("today_vol", 0) < UNIVERSE_MIN_VOL:
+        if today_vol < UNIVERSE_MIN_VOL:
             continue
-        if float(info.get("change_rate", 0) or 0) < UNIVERSE_MIN_RSFL:
+        if change_rate < RANK_MIN_CHANGE:
             continue
-
-        items.append({
-            "code": info.get("code",""),
-            "name": info.get("name",""),
-            "price": int(info.get("price",0) or 0),
-            "change_rate": float(info.get("change_rate",0) or 0),
-            "volume_ratio": float(info.get("volume_ratio",0) or 0),
-            "today_vol": int(info.get("today_vol",0) or 0),
+        snapshot.append({
+            "code": info.get("code", "") or code,
+            "name": info.get("name", ""),
+            "price": price,
+            "change_rate": change_rate,
+            "volume_ratio": volume_ratio,
+            "today_vol": today_vol,
+            "trade_amount": int(price * today_vol),
             "market": market,
         })
 
-    items.sort(key=lambda x: (x.get("change_rate",0), x.get("volume_ratio",0), x.get("price",0)), reverse=True)
-    items = items[:30]
+    _UNIVERSE_RANK_CACHE[snapshot_key] = snapshot
+    _UNIVERSE_RANK_CACHE[ts_key] = now
+    return snapshot
+
+
+def _build_rank_candidate_union(snapshot: list, market: str, *, top_n: int, expanded_top_n: int, scan_limit: int | None = None) -> list:
+    positive = [s for s in (snapshot or []) if float(s.get("change_rate", 0) or 0) >= RANK_MIN_CHANGE]
+    if not positive:
+        return []
+
+    def _sorted_lists(n: int):
+        change_top = sorted(positive, key=lambda x: (x.get("change_rate", 0), x.get("trade_amount", 0), x.get("today_vol", 0), x.get("volume_ratio", 0)), reverse=True)[:n]
+        volume_top = sorted(positive, key=lambda x: (x.get("today_vol", 0), x.get("volume_ratio", 0), x.get("trade_amount", 0), x.get("change_rate", 0)), reverse=True)[:n]
+        amount_top = sorted(positive, key=lambda x: (x.get("trade_amount", 0), x.get("change_rate", 0), x.get("today_vol", 0), x.get("volume_ratio", 0)), reverse=True)[:n]
+        return change_top, volume_top, amount_top
+
+    def _merge_rank_lists(n: int):
+        union = {}
+        change_top, volume_top, amount_top = _sorted_lists(n)
+        rank_lists = {
+            "상승률상위": change_top,
+            "상승거래량상위": volume_top,
+            "상승거래대금상위": amount_top,
+        }
+        for label, items in rank_lists.items():
+            for idx, item in enumerate(items, 1):
+                code = str(item.get("code", ""))
+                if not code:
+                    continue
+                rec = union.setdefault(code, {
+                    **item,
+                    "rank_labels": [],
+                    "rank_count": 0,
+                    "best_rank": 9999,
+                    "desc": f"{market}랭킹후보",
+                })
+                if label not in rec["rank_labels"]:
+                    rec["rank_labels"].append(label)
+                    rec["rank_count"] += 1
+                rec["best_rank"] = min(int(rec.get("best_rank", 9999) or 9999), idx)
+        return union
+
+    union = _merge_rank_lists(top_n)
+    min_union = min(top_n, max(20, top_n // 2))
+    if len(union) < min_union and expanded_top_n > top_n:
+        union = _merge_rank_lists(min(expanded_top_n, len(positive)))
+
+    items = list(union.values())
+    for item in items:
+        labels = "/".join(item.get("rank_labels", []))
+        item["desc"] = f"{market}랭킹후보[{labels}]" if labels else f"{market}랭킹후보"
+    items.sort(key=lambda x: (x.get("rank_count", 0), -int(x.get("best_rank", 9999) or 9999), x.get("trade_amount", 0), x.get("change_rate", 0), x.get("today_vol", 0)), reverse=True)
+    if scan_limit:
+        items = items[:scan_limit]
+    return items
+
+
+def _collect_market_rank_candidates(market: str = "KRX", *, scan_limit: int | None = None, force: bool = False) -> list:
+    market = "NXT" if str(market).upper() == "NXT" else "KRX"
+    if market == "KRX" and not is_market_open():
+        return []
+    if market == "NXT" and not is_nxt_open():
+        return []
+    mode = _get_rank_market_mode()
+    top_n, expanded_top_n = _get_rank_topn(mode)
+    snapshot = _get_universe_rank_snapshot(market, force=force)
+    return _build_rank_candidate_union(snapshot, market, top_n=top_n, expanded_top_n=expanded_top_n, scan_limit=scan_limit)
+
+
+def get_market_rank_focus_stocks(*, scan_limit_per_market: int | None = None, force: bool = False) -> list:
+    if not is_any_market_open():
+        return []
+    scan_limit_per_market = scan_limit_per_market or _get_rank_scan_limit()
+    result = []
+    seen = set()
+    if is_market_open():
+        for item in _collect_market_rank_candidates("KRX", scan_limit=scan_limit_per_market, force=force):
+            code = str(item.get("code", ""))
+            if code and code not in seen:
+                seen.add(code)
+                result.append(item)
+    if is_nxt_open():
+        for item in _collect_market_rank_candidates("NXT", scan_limit=scan_limit_per_market, force=force):
+            code = str(item.get("code", ""))
+            if code and code not in seen:
+                seen.add(code)
+                result.append(item)
+    return result
+
+
+def _rank_from_universe(market: str = "KRX") -> list:
+    market = "NXT" if str(market).upper() == "NXT" else "KRX"
+    cache_key = f"{market}_items"
+    mode = _get_rank_market_mode()
+    ttl = _get_rank_refresh_ttl_sec(mode)
+    now = time.time()
+    if now - _UNIVERSE_RANK_CACHE["ts"] < ttl and _UNIVERSE_RANK_CACHE.get(cache_key):
+        return _UNIVERSE_RANK_CACHE.get(cache_key, [])
+
+    top_n, expanded_top_n = _get_rank_topn(mode)
+    snapshot = _get_universe_rank_snapshot(market, force=False)
+    items = _build_rank_candidate_union(snapshot, market, top_n=top_n, expanded_top_n=expanded_top_n, scan_limit=top_n)
 
     max_per_theme = int(os.getenv("UNIVERSE_MAX_PER_THEME", "6") or "6")
     if max_per_theme > 0:
@@ -6169,7 +6390,7 @@ def _rank_from_universe(market: str = "KRX") -> list:
                 continue
             bucket[key] = cnt + 1
             diversified.append(it)
-        items = diversified[:30]
+        items = diversified[:top_n]
 
     _UNIVERSE_RANK_CACHE["ts"] = now
     _UNIVERSE_RANK_CACHE[cache_key] = items
@@ -18809,6 +19030,7 @@ def run_scan():
     mkt_tag    = "KRX+NXT" if krx_open and nxt_open else ("NXT전용" if nxt_open else "KRX")
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 스캔{strict_tag} [{mkt_tag}]...", flush=True)
     try:
+        _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
 
         # KRX 스캔 (장 중에만)
@@ -18846,6 +19068,15 @@ def run_scan():
                 if r and time.time()-_alert_history.get(f"NXT_{r['code']}",0)>get_regime_cooldown():
                     r["market"] = "NXT"
                     alerts.append(r); seen.add(stock["code"])
+
+        # 실시간 랭킹 후보군 직접 스캔 — 장초반은 강하게, 이후 장중은 보수적으로
+        for stock in get_market_rank_focus_stocks():
+            code = stock.get("code")
+            if not code or code in seen:
+                continue
+            r = analyze(stock)
+            if r and time.time()-_alert_history.get((f"NXT_{r['code']}" if r.get("market") == "NXT" else r["code"]),0)>get_regime_cooldown():
+                alerts.append(r); seen.add(code)
 
         # 조기포착·눌림목은 KRX 장중에만 의미 있음
         if krx_open:
