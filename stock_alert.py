@@ -3,11 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.79
-날짜: 2026-03-18
+버전: v41.80
+날짜: 2026-03-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.80 (2026-03-19): 신호 강도 판정 버그 수정 + 동시보유 제한 실적용 + 2차 금지 시 API 절약.
+  [#1] register_entry_watch()에 grade/score 저장 추가.
+       기존: _entry_watch dict에 grade/score 미저장 → _classify_signal_strength()가 항상
+       기본값 "B"/0으로 읽어 score<50 → "약한" 고정 → 1차 비중 25%, 2차 항상 금지.
+       수정: s.get("grade")/s.get("score")를 저장해 실제 등급·점수 기반 강도 판정.
+  [#2] filter_portfolio_signals()에 max_positions 기반 동시 보유 제한 강제 추가.
+       carry_stocks.json에서 현재 보유 종목 수 확인 → max_positions(1) 이상이면
+       기존 보유 종목 재진입 신호만 허용, 신규 종목 포착 억제.
+  [#3] check_entry_watch() 2차 알림에서 phase2_allowed=False(약한 신호)일 때
+       _judge_phase2_entry() 호출 스킵 → 섹터 종목 5개 현재가 조회 절약.
+       즉시 "금지" 판정 + 사유 메시지 발송.
+  이유: [#1]은 분할진입 비중 규칙의 핵심 전제(신호 강도 분류)가 작동하지 않던 버그.
+       [#2]는 1종목 집중 전략이 선언만 되고 실제 필터에서 강제되지 않던 구조적 누락.
+       [#3]은 불필요 API 호출 절약으로 KIS API 분당 호출 한도 보호.
+  개선점: A등급 강한 신호 → 1차 45%/2차 30% 정상 적용↑, 동시보유 1종목 실제 강제↑,
+       약한 신호 2차 알림 시 API 호출 5회 절약↑.
+  주의점: carry_stocks.json이 비어있거나 없으면 carry_count=0으로 안전 처리.
+       기존 보유 종목 코드와 같은 종목의 재포착 신호는 제한 없이 통과.
+
 - v41.79 (2026-03-18): 점수 라벨 2글자 통일 — 전송 직전 공통 후처리로 시장 주도 섹터/뉴스/리스크/랭킹 요약까지 점수-only 표현 제거.
   [#1] `_score_delta_impact_label()`을 `대가/중가/소가/소감/중감/대감` 기준으로 축약하고, `_signal_total_score_label()`도 `최상/강함/양호/보통/약함/위험` 2글자 체계로 통일.
   [#2] `_risk_total_score_label()` / `_decorate_ui_score_line()` / `_decorate_ui_score_text()`를 추가해, `send()`/`edit_message()`뿐 아니라 `_tg_request()`를 타는 직접 전송 메시지의 `±N점`, `N점` 표현에 짧은 해석 라벨을 공통 적용.
@@ -11170,6 +11189,8 @@ def register_entry_watch(s: dict):
         "resurge_mode": bool(s.get("resurge_mode")),
         "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
         "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
+        "grade": str(s.get("grade", "B")),
+        "score": int(s.get("score", 0) or 0),
         "entry_reference_only": False,
         "entry_reference_market": "",
         "entry_reference_reason": "",
@@ -11800,41 +11821,52 @@ def check_entry_watch():
 
                 elif is_phase2:
                     # ━━━ 2차 추가진입 판단 ━━━
-                    _p2_judgement = _judge_phase2_entry(watch, cur, price, _entry_exec_metrics)
-                    _p2_decision = _p2_judgement["decision"]
-                    _p2_reasons = _p2_judgement["reasons"]
-                    _p2_detail = _p2_judgement["detail"]
-
                     _p1_price = watch.get("phase1_price", entry)
                     _p1_pct = watch.get("phase1_pct", _split_rule["phase1_pct"])
 
-                    if _p2_decision == "가능" and _split_rule["phase2_allowed"]:
-                        _p2_pct = _split_rule["phase2_pct"]
-                        _total_pct = _p1_pct + _p2_pct
-                        _avg_price = _calc_avg_entry_price(_p1_price, price, _p1_pct, _p2_pct)
-                        _decision_emoji = "✅"
-                        _decision_label = "추가진입: 가능"
-                    elif _p2_decision == "보류":
-                        _p2_pct = 0
-                        _total_pct = _p1_pct
-                        _avg_price = _p1_price
-                        _decision_emoji = "🟡"
-                        _decision_label = "추가진입: 보류"
-                    else:  # 금지 또는 약한 신호 phase2_allowed=False
+                    # v41.80: 약한 신호(phase2_allowed=False)이면 API 호출 없이 즉시 금지
+                    if not _split_rule["phase2_allowed"]:
                         _p2_pct = 0
                         _total_pct = _p1_pct
                         _avg_price = _p1_price
                         _decision_emoji = "🔴"
                         _decision_label = "추가진입: 금지"
+                        _p2_reasons = ["🔴 약한 신호 — 2차 추가매수 금지 대상"]
+                        _p2_detail = "신호 강도 부족 — 1차 진입분만 유지, 추가매수 불가"
+                        _stop_adj = "유지"
+                    else:
+                        _p2_judgement = _judge_phase2_entry(watch, cur, price, _entry_exec_metrics)
+                        _p2_decision = _p2_judgement["decision"]
+                        _p2_reasons = _p2_judgement["reasons"]
+                        _p2_detail = _p2_judgement["detail"]
 
-                    # 손절 조정 여부
-                    _stop_adj = "유지"
-                    if _p2_decision == "가능" and _p2_pct > 0:
-                        _new_stop = int(_avg_price * (1 - abs(stop_pct) / 100)) if stop_pct else watch["stop_loss"]
-                        if _new_stop != watch["stop_loss"]:
-                            _stop_adj = f"조정 ({watch['stop_loss']:,}→{_new_stop:,}원)"
-                        else:
-                            _stop_adj = "유지"
+                        if _p2_decision == "가능":
+                            _p2_pct = _split_rule["phase2_pct"]
+                            _total_pct = _p1_pct + _p2_pct
+                            _avg_price = _calc_avg_entry_price(_p1_price, price, _p1_pct, _p2_pct)
+                            _decision_emoji = "✅"
+                            _decision_label = "추가진입: 가능"
+                        elif _p2_decision == "보류":
+                            _p2_pct = 0
+                            _total_pct = _p1_pct
+                            _avg_price = _p1_price
+                            _decision_emoji = "🟡"
+                            _decision_label = "추가진입: 보류"
+                        else:  # 금지
+                            _p2_pct = 0
+                            _total_pct = _p1_pct
+                            _avg_price = _p1_price
+                            _decision_emoji = "🔴"
+                            _decision_label = "추가진입: 금지"
+
+                        # 손절 조정 여부
+                        _stop_adj = "유지"
+                        if _p2_decision == "가능" and _p2_pct > 0:
+                            _new_stop = int(_avg_price * (1 - abs(stop_pct) / 100)) if stop_pct else watch["stop_loss"]
+                            if _new_stop != watch["stop_loss"]:
+                                _stop_adj = f"조정 ({watch['stop_loss']:,}→{_new_stop:,}원)"
+                            else:
+                                _stop_adj = "유지"
 
                     _reasons_str = "\n".join([f"  {r}" for r in _p2_reasons])
                     send_with_chart_buttons(
@@ -19540,12 +19572,45 @@ def filter_portfolio_signals(alerts: list) -> list:
     - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
     - 점수 높은 것 1개만 통과 (나머지 제외)
     - 국면별 총 신호 수 제한
+    - v41.80: max_positions 기반 동시 보유 제한 강제
     """
     if not alerts:
         return alerts
 
-    regime    = get_market_regime().get("mode", "normal")
+    regime_info = get_market_regime()
+    regime    = regime_info.get("mode", "normal")
+    rp        = REGIME_PARAMS.get(regime, REGIME_PARAMS["normal"])
+    max_positions = rp.get("max_positions", 1)
     max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
+
+    # v41.80: 이미 보유 중인 종목 수 확인 → max_positions 초과 시 신규 포착 억제
+    try:
+        carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
+        if isinstance(carry, list):
+            carry_count = len(carry)
+        elif isinstance(carry, dict):
+            carry_count = len([v for v in carry.values() if isinstance(v, dict)])
+        else:
+            carry_count = 0
+    except Exception:
+        carry_count = 0
+
+    if carry_count >= max_positions:
+        # 보유 중인 종목과 같은 종목의 재진입 신호만 허용
+        carry_codes = set()
+        try:
+            if isinstance(carry, list):
+                carry_codes = {str(c.get("code", "")) for c in carry if isinstance(c, dict)}
+            elif isinstance(carry, dict):
+                carry_codes = {str(v.get("code", k)) for k, v in carry.items() if isinstance(v, dict)}
+        except Exception:
+            pass
+        before_count = len(alerts)
+        alerts = [a for a in alerts if a.get("code") in carry_codes]
+        if len(alerts) < before_count:
+            print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 신규 {before_count - len(alerts)}개 억제")
+        if not alerts:
+            return alerts
 
     # 점수 내림차순 정렬
     sorted_alerts = sorted(alerts, key=lambda x: x.get("score", 0), reverse=True)
