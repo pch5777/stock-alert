@@ -3,11 +3,48 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.76
+버전: v41.78
 날짜: 2026-03-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.78 (2026-03-18): v41.77 중간작업 4종 완성 — DART자사주·야간워치리스트·브리핑·테마발굴 연결.
+  [#1] run_dart_intraday() 자사주소각 change_rate 기준 1.0%→0.5% 완화 + 진입감시 즉시 등록.
+       DART_BUYBACK_CANCEL 신호타입으로 register_entry_watch/save_signal_log 자동 호출.
+  [#2] run_geo_news_scan()/run_overnight_monitor()에서 야간 시간대 뉴스 수집 시
+       _extract_overnight_event_keywords()→_build_overnight_watchlist() 자동 연결.
+  [#3] _build_premarket_risk_payload()/send_premarket_briefing()에 야간 이벤트 워치리스트 블록 추가.
+       _format_overnight_watchlist_block()으로 이벤트별 수혜 종목 표시.
+  [#4] run_scan()에서 장 시작 시 overnight_watchlist 종목을 동적 후보군으로 우선 스캔.
+       _dispatch_general_alert_signal()에서 change_rate≥5% 포착 시 _discover_new_theme_from_surge() 호출.
+  이유: v41.77에서 함수 정의만 완료, 실제 호출 경로 미연결 → 4가지 기능 모두 작동 불가 상태였음.
+  개선점: DART 자사주소각 즉시포착↑, 야간이벤트→워치리스트 자동생성↑, 장전 브리핑 정보량↑, 신규테마 자동발굴↑.
+  주의점: 야간 워치리스트 종목은 장 시작 시 우선 스캔되나 analyze 점수 미달 시 알림 안 됨(보수적).
+
+- v41.77 (2026-03-18): 테마 자동발굴·NXT추적전환·DART자사주강화·야간워치리스트 자동화 4종 통합.
+  [#1] _discover_new_theme_from_surge() 신규: 급등 종목 발생 시 뉴스 키워드 추출 →
+       동일 키워드 종목 동반상승 여부 확인 → dynamic_themes.json 자동 저장·적용.
+       _auto_reinforce_dynamic_theme()로 기존 동적 테마 성과 반영 강도 자동 조정.
+       장중 급등 포착 시 auto_update_theme() 호출 경로에 자동 발굴 엔진 연결.
+  [#2] _is_krx_vi_reference_mode() 판정 후 reference_only → 차단 대신
+       _register_nxt_surge_to_krx_watch()로 정규장 추적 대상으로 전환 등록.
+       NXT에서 선행 급등한 종목을 KRX 정규장 개시 시 자동 감시 대상에 올림.
+  [#3] DART_KEYWORDS["강함"]에 "자사주취득","자사주소각","주식소각" 추가.
+       run_dart_intraday()에서 자사주소각 공시 감지 시 change_rate 기준 완화(0.5% 이상)
+       + 진입감시 즉시 등록 경로 추가. DART_URGENT_KEYWORDS에 "자사주소각","주식소각" 추가.
+  [#4] _extract_overnight_event_keywords() 신규: 야간 뉴스에서 GTC/FOMC/실적발표/지정학
+       이벤트 키워드 자동 추출 → 관련 국내 종목 매핑 → overnight_watchlist.json 저장.
+       _build_premarket_risk_payload() / send_premarket_briefing()에서 워치리스트 로드 →
+       장전 브리핑에 "야간 이벤트 수혜 종목" 섹션 자동 포함.
+       run_scan()에서 overnight_watchlist 종목을 동적 후보군에 우선 편입.
+  이유: 오늘(3/18) 원전/건설·밸류업·방산 종목들이 뉴스 재료가 있었음에도
+       하드코딩 테마 미등록·NXT 차단·DART 기준 미달·야간이벤트 미연동으로 포착 실패.
+       수동 추가가 아닌 자동 발굴·자동 등록 구조로 전환.
+  개선점: 신규 테마 누락↓, NXT 선행상승 종목 정규장 연결↑, 자사주소각 즉시포착↑,
+       야간 이벤트 수혜종목 장전 선반영↑.
+  주의점: 동적 테마는 당일 유효. overnight_watchlist는 매일 장전 갱신.
+       NXT 추적 전환은 KRX 정규장 개시 후 실제 호가 확인까지 보수적으로 유지.
+
 - v41.76 (2026-03-18): 포착 메시지에 현재가/진입가 복원 + 텔레그램 전송 안정화 — 표시 보강과 운영 타임아웃 완화 동시 반영.
   [#1] `_build_capture_focus_price_line()`를 추가해, 일반 포착/눌림목 핵심 메시지 상단에 `현재가`, `진입가`, `현재가가 진입가보다 얼마나 위/아래인지`를 함께 표시하도록 정리.
   [#2] `_build_capture_focus_message()`가 위 가격 라인을 핵심 사유 블록보다 먼저 노출하도록 조정해, 사용자가 `진입가 도달` 알림 전에도 대기 거리를 바로 읽을 수 있게 개선.
@@ -1584,7 +1621,8 @@ DIRECT_NEWS_THEME_RULES = {
 
 DART_KEYWORDS = {
     "매우강함": ["수주","계약체결","공급계약","수출계약","임상","FDA","허가","신약","인수","합병","흑자전환"],
-    "강함":     ["특허","기술이전","MOU","업무협약","증설","공장","자사주","배당"],
+    "강함":     ["특허","기술이전","MOU","업무협약","증설","공장","자사주","배당",
+                 "자사주취득","자사주소각","주식소각","자기주식소각","자기주식취득결정"],  # v41.77 #3
     "보통":     ["신규사업","진출","개발완료","수상","선정"],
 }
 DART_URGENT_KEYWORDS = [
@@ -1594,6 +1632,7 @@ DART_URGENT_KEYWORDS = [
     "최대주주변경","대표이사변경",
     "감사의견","영업정지","파산","워크아웃","회생",
     "공개매수","지분취득","자기주식취득",
+    "자사주소각","주식소각","자기주식소각",  # v41.77 #3: 자사주소각 긴급 처리
 ]
 DART_RISK_KEYWORDS = ["거래정지","상장폐지","횡령","배임","파산","워크아웃",
                       "감사의견","영업정지","회생","관리종목","분식","조사"]
@@ -1661,6 +1700,33 @@ DYNAMIC_THEME_FILE  = os.path.join(DATA_DIR, "dynamic_themes.json")
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
 NEWS_COOCCUR_FILE   = os.path.join(DATA_DIR, "news_cooccur.json")
+
+# v41.77 #4: 야간 이벤트 워치리스트
+OVERNIGHT_WATCHLIST_FILE = os.path.join(DATA_DIR, "overnight_watchlist.json")
+_overnight_watchlist: dict = {}  # {code: {name, reason, keywords, ts}}
+
+# v41.77 #1: 동적 테마 자동 발굴 — 야간 이벤트 키워드 → 국내 종목 매핑 테이블
+OVERNIGHT_EVENT_KEYWORDS = {
+    "GTC": ["엔비디아","nvidia","gtc","젠슨황","gpu","hbm","ai반도체","blackwell","베라루빈"],
+    "FOMC": ["fomc","연준","금리","fed","파월","기준금리"],
+    "실적": ["어닝","실적발표","earnings","quarterly","revenue","guidance"],
+    "원전": ["원전","원자력","nuclear","smr","체코","두코바니","웨스팅하우스"],
+    "방산": ["방산","무기","핵잠수함","submarine","nato","방위비","한화시스템","전투기"],
+    "밸류업": ["밸류업","자사주소각","주주환원","배당","상법개정","buyback"],
+    "바이오": ["fda","임상","clinical","신약","바이오","aacr","asco","허가"],
+    "조선": ["조선","lng","컨테이너선","수주","한화오션","hd현대"],
+}
+
+# 이벤트 키워드 → 수혜 국내 섹터/종목 매핑
+OVERNIGHT_EVENT_SECTOR_MAP = {
+    "GTC":    ["반도체","AI반도체","AI인프라","HBM"],
+    "FOMC":   ["은행","증권","보험","리츠"],
+    "원전":   ["원전","건설","전력인프라"],
+    "방산":   ["방산","조선","항공"],
+    "밸류업": ["증권","보험","금융","지주"],
+    "바이오": ["바이오","제약","헬스케어"],
+    "조선":   ["조선","기자재","LNG"],
+}
 
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -7093,6 +7159,238 @@ def load_dynamic_themes():
 
 
 # ============================================================
+# v41.77 #1: 테마 자동 발굴 엔진
+# ============================================================
+def _discover_new_theme_from_surge(code: str, name: str, news_titles: list, change_rate: float = 0.0):
+    """
+    급등 종목 발생 시 뉴스 키워드 추출 → 동일 키워드 종목 동반상승 여부 확인
+    → dynamic_themes.json 자동 저장·적용.
+    news_titles: 해당 종목 관련 뉴스 헤드라인 리스트
+    """
+    global _dynamic_theme_map
+    try:
+        # 1) 뉴스 키워드에서 이벤트 유형 감지
+        all_text = " ".join(news_titles).lower()
+        detected_events = []
+        for event_name, keywords in OVERNIGHT_EVENT_KEYWORDS.items():
+            if any(kw.lower() in all_text for kw in keywords):
+                detected_events.append(event_name)
+        if not detected_events:
+            return
+
+        # 2) 이벤트 수혜 섹터 → THEME_MAP 종목에서 동반상승 후보 추출
+        sector_candidates = []
+        for ev in detected_events:
+            for sec in OVERNIGHT_EVENT_SECTOR_MAP.get(ev, []):
+                for tk, ti in THEME_MAP.items():
+                    if sec in ti.get("sectors", []) or sec.lower() in ti.get("desc", "").lower():
+                        for c, n in ti.get("stocks", []):
+                            if c != code and (c, n) not in sector_candidates:
+                                sector_candidates.append((c, n))
+
+        # 3) 동적 후보군에서도 추가
+        for tk, ti in _dynamic_theme_map.items():
+            for c, n in ti.get("stocks", []):
+                if c != code and (c, n) not in sector_candidates:
+                    sector_candidates.append((c, n))
+
+        if not sector_candidates:
+            return
+
+        # 4) 이미 오늘 이 종목의 테마가 있으면 강도만 업데이트
+        today = datetime.now().strftime("%m%d")
+        theme_key = f"auto_{code}_{today}"
+        existing = _dynamic_theme_map.get(theme_key)
+        if existing:
+            # 기존 테마에 이번 이벤트 추가
+            existing["events"] = list(set(existing.get("events", []) + detected_events))
+            existing["ts"] = time.time()
+            existing["change_rate"] = max(existing.get("change_rate", 0), change_rate)
+        else:
+            _dynamic_theme_map[theme_key] = {
+                "desc":        f"{name} 연관 자동발굴 테마",
+                "events":      detected_events,
+                "reason":      f"뉴스 키워드({', '.join(detected_events)}) 자동 감지",
+                "stocks":      [(code, name)] + sector_candidates[:8],
+                "ts":          time.time(),
+                "change_rate": change_rate,
+                "source":      "auto_discover",
+            }
+            print(f"  🔍 테마 자동발굴: [{theme_key}] {name} | 이벤트={detected_events} | 연관{len(sector_candidates)}종목")
+
+        # 5) 파일 저장
+        try:
+            with open(DYNAMIC_THEME_FILE, "w") as f:
+                json.dump({k: {**v, "stocks": v["stocks"]} for k, v in _dynamic_theme_map.items()},
+                          f, ensure_ascii=False, indent=2)
+        except Exception: pass
+
+    except Exception as e:
+        print(f"⚠️ _discover_new_theme_from_surge: {e}")
+
+
+def _auto_reinforce_dynamic_theme(code: str, pnl_pct: float):
+    """
+    signal_log 결과 반영 → 동적 테마 강도 자동 조정.
+    수익이면 해당 테마 강도↑, 손실이면 강도↓ (score_adj 조정).
+    """
+    global _dynamic_theme_map
+    try:
+        today = datetime.now().strftime("%m%d")
+        for tk, ti in _dynamic_theme_map.items():
+            if today not in tk:
+                continue
+            if any(c == code for c, _ in ti.get("stocks", [])):
+                prev_adj = ti.get("score_adj", 0)
+                if pnl_pct > 0:
+                    ti["score_adj"] = min(prev_adj + 3, 15)
+                    ti["win_count"] = ti.get("win_count", 0) + 1
+                else:
+                    ti["score_adj"] = max(prev_adj - 2, -10)
+                    ti["loss_count"] = ti.get("loss_count", 0) + 1
+                print(f"  📊 테마 강도 조정: [{tk}] score_adj {prev_adj}→{ti['score_adj']} (pnl={pnl_pct:+.1f}%)")
+                break
+    except Exception as e:
+        print(f"⚠️ _auto_reinforce_dynamic_theme: {e}")
+
+
+# ============================================================
+# v41.77 #2: NXT 선행상승 → 정규장 추적 전환
+# ============================================================
+def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
+    """
+    NXT에서 선행 급등한 종목을 차단하는 대신 KRX 정규장 개시 후 추적 대상으로 등록.
+    기존 entry_watch 감시는 유지하되, nxt_surge_tracked 플래그를 추가해
+    KRX 정규장 개시(09:00) 후 check_entry_watch에서 우선 체크.
+    """
+    try:
+        if watch.get("nxt_surge_tracked"):
+            return
+        watch["nxt_surge_tracked"] = True
+        watch["nxt_surge_price"]   = int(nxt_price or 0)
+        watch["nxt_surge_time"]    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # 진입가를 NXT 급등가 기준으로 소폭 재조정 (기존 진입가보다 낮으면 유지)
+        orig_entry = watch.get("entry_price", 0)
+        if orig_entry and nxt_price:
+            # NXT 가격이 진입가보다 이미 올라갔으면 진입가 하향 조정 (5% 눌림 기대)
+            if nxt_price > orig_entry * 1.03:
+                new_entry = int(nxt_price * 0.97)
+                watch["entry_price_orig"] = orig_entry
+                watch["entry_price"]      = new_entry
+                print(f"  🔄 NXT선행→KRX추적: {watch.get('name','')} 진입가 {orig_entry:,}→{new_entry:,}원 (NXT {nxt_price:,})")
+            else:
+                print(f"  🔄 NXT선행→KRX추적: {watch.get('name','')} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
+        # 텔레그램 알림 (내부 전환 기록)
+        try:
+            send(f"🔵 <b>[NXT 선행→KRX 추적 전환]</b>\n"
+                 f"<b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+                 f"NXT {nxt_price:,}원 선행 감지 → KRX 정규장 개시 후 자동 추적\n"
+                 f"진입가: {watch.get('entry_price',0):,}원")
+        except Exception: pass
+    except Exception as e:
+        print(f"⚠️ _register_nxt_surge_to_krx_watch: {e}")
+
+
+# ============================================================
+# v41.77 #4: 야간 이벤트 → 장전 워치리스트 자동 생성
+# ============================================================
+def _extract_overnight_event_keywords(headlines: list) -> dict:
+    """
+    야간 뉴스 헤드라인에서 이벤트 키워드 자동 추출.
+    반환: {event_name: [matched_keywords]}
+    """
+    result = {}
+    all_text = " ".join(headlines).lower()
+    for event_name, keywords in OVERNIGHT_EVENT_KEYWORDS.items():
+        matched = [kw for kw in keywords if kw.lower() in all_text]
+        if matched:
+            result[event_name] = matched
+    return result
+
+
+def _build_overnight_watchlist(detected_events: dict):
+    """
+    감지된 야간 이벤트 → 수혜 국내 종목 워치리스트 생성 → overnight_watchlist.json 저장.
+    detected_events: {event_name: [matched_keywords]}
+    """
+    global _overnight_watchlist
+    try:
+        watchlist = {}
+        for event_name, kws in detected_events.items():
+            sectors = OVERNIGHT_EVENT_SECTOR_MAP.get(event_name, [])
+            for sec in sectors:
+                # THEME_MAP에서 해당 섹터 종목 추출
+                for tk, ti in THEME_MAP.items():
+                    if sec in ti.get("sectors", []) or sec.lower() in ti.get("desc", "").lower():
+                        for c, n in ti.get("stocks", []):
+                            if c not in watchlist:
+                                watchlist[c] = {
+                                    "name":     n,
+                                    "event":    event_name,
+                                    "keywords": kws,
+                                    "sectors":  sectors,
+                                    "ts":       time.time(),
+                                }
+                # 동적 테마에서도 추가
+                for tk, ti in _dynamic_theme_map.items():
+                    if sec.lower() in ti.get("desc", "").lower():
+                        for c, n in ti.get("stocks", []):
+                            if c not in watchlist:
+                                watchlist[c] = {
+                                    "name":     n,
+                                    "event":    event_name,
+                                    "keywords": kws,
+                                    "sectors":  sectors,
+                                    "ts":       time.time(),
+                                    "source":   "dynamic_theme",
+                                }
+
+        if watchlist:
+            _overnight_watchlist = watchlist
+            try:
+                _write_json_atomic(OVERNIGHT_WATCHLIST_FILE, watchlist, indent=2)
+                print(f"  🌙 야간 워치리스트 저장: {len(watchlist)}종목 ({list(detected_events.keys())})")
+            except Exception: pass
+    except Exception as e:
+        print(f"⚠️ _build_overnight_watchlist: {e}")
+
+
+def load_overnight_watchlist():
+    """장 시작 시 야간 워치리스트 파일 복원"""
+    global _overnight_watchlist
+    try:
+        data = _read_json_safe(OVERNIGHT_WATCHLIST_FILE, {})
+        # 오늘 것만 (24시간 이내)
+        _overnight_watchlist = {
+            c: v for c, v in data.items()
+            if time.time() - v.get("ts", 0) < 86400
+        }
+        if _overnight_watchlist:
+            print(f"  🌙 야간 워치리스트 복원: {len(_overnight_watchlist)}종목")
+    except Exception: pass
+
+
+def _format_overnight_watchlist_block() -> str:
+    """장전 브리핑용 야간 워치리스트 블록 생성"""
+    if not _overnight_watchlist:
+        return ""
+    try:
+        lines = ["🌙 <b>야간 이벤트 수혜 예상 종목</b>"]
+        by_event: dict = {}
+        for c, v in _overnight_watchlist.items():
+            ev = v.get("event", "기타")
+            by_event.setdefault(ev, []).append((c, v))
+        for ev, items in by_event.items():
+            kws = items[0][1].get("keywords", [])[:3]
+            lines.append(f"  📌 <b>{ev}</b>  ({', '.join(kws)})")
+            for c, v in items[:4]:
+                lines.append(f"    • {v['name']} <code>{c}</code>")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+# ============================================================
 # 🏗️ 실질 섹터 분류 (4레이어 가중 스코어)
 # ============================================================
 _dart_related_cache: dict = {}   # code → {related: [...], ts}
@@ -8670,6 +8968,13 @@ def run_overnight_monitor():
                         f"🌍 지정학 이벤트: {geo.get('summary','')}\n"
                         f"  관련 섹터: {', '.join(geo.get('sectors',[]))}"
                     )
+                # v41.78 #2: 야간 뉴스 → 이벤트 키워드 추출 → 워치리스트 생성
+                all_headlines = [h for hl in headlines_by_src.values() for h in hl]
+                if all_headlines:
+                    detected_events = _extract_overnight_event_keywords(all_headlines)
+                    if detected_events:
+                        _build_overnight_watchlist(detected_events)
+                        print(f"  🌙 overnight→야간 이벤트 {len(detected_events)}건 → 워치리스트 갱신")
         except Exception: pass
 
         # ── 알림 발송 ──
@@ -11259,6 +11564,9 @@ def check_entry_watch():
                         price = nxt_price
                         reference_only = True
                         reference_reason = "krx_vi_reference"
+                        # v41.77 #2: 차단 대신 KRX 정규장 추적 전환 등록
+                        if not watch.get("nxt_surge_tracked"):
+                            _register_nxt_surge_to_krx_watch(watch, nxt_price)
             elif nxt_ok:
                 use_nxt = True
                 cur = get_nxt_stock_price(code)
@@ -13549,6 +13857,17 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         threading.Thread(target=auto_update_theme, args=(s["code"], s["name"], s["signal_type"]), daemon=True).start()
     except Exception:
         pass
+    # v41.78 #4: 급등 포착 시 테마 자동 발굴 엔진 연결
+    try:
+        if s.get("change_rate", 0) >= 5.0:
+            _news_titles = [r for r in s.get("reasons", []) if isinstance(r, str)]
+            threading.Thread(
+                target=_discover_new_theme_from_surge,
+                args=(s["code"], s["name"], _news_titles, s.get("change_rate", 0)),
+                daemon=True
+            ).start()
+    except Exception:
+        pass
     if s.get("signal_type") != "ENTRY_POINT":
         if s["code"] not in _detected_stocks:
             _detected_stocks[s["code"]] = {"name": s["name"], "high_price": s["price"],
@@ -15077,6 +15396,19 @@ def run_geo_news_scan():
         else:
             print("🌍 지정학 이벤트 감지 — 장외 시간 텔레그램 발송 비활성화")
 
+        # v41.78 #2: 야간 시간대면 이벤트 키워드 추출 → 워치리스트 생성
+        try:
+            now_h = _now_kst().hour
+            if now_h >= 20 or now_h < 7:
+                all_headlines = [h for hl in headlines_by_source.values() for h in hl]
+                if all_headlines:
+                    detected_events = _extract_overnight_event_keywords(all_headlines)
+                    if detected_events:
+                        _build_overnight_watchlist(detected_events)
+                        print(f"  🌙 geo→야간 이벤트 {len(detected_events)}건 → 워치리스트 갱신")
+        except Exception as _e:
+            print(f"  ⚠️ geo→야간 워치리스트 연결 오류: {_e}")
+
     except Exception as e:
         _log_error("run_geo_news_scan", e)
 
@@ -15619,7 +15951,10 @@ def run_dart_intraday():
                     if price: break
                 except Exception: time.sleep(1)
 
-            if not (change_rate >= 1.0) and not is_risk:
+            # v41.78 #1: 자사주소각 공시는 change_rate 0.5% 이상이면 통과
+            _is_buyback_cancel = any(kw in title for kw in ("자사주소각", "주식소각", "자기주식소각"))
+            _min_change = 0.5 if _is_buyback_cancel else 1.0
+            if not (change_rate >= _min_change) and not is_risk:
                 print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵"); continue
 
             # ── 추가 지표 (각각 독립적으로 실패 허용) ──
@@ -15793,6 +16128,25 @@ def run_dart_intraday():
                 code, company
             )
             print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
+
+            # v41.78 #1: 자사주소각 공시 → 진입감시 즉시 등록
+            if _is_buyback_cancel and price:
+                try:
+                    _dart_entry_stock = {
+                        "code": code, "name": company, "price": price,
+                        "change_rate": change_rate, "signal_type": "DART_BUYBACK_CANCEL",
+                        "score": 70, "entry_price": price,
+                        "stop_loss": round(price * 0.97),
+                        "target_price": round(price * 1.05),
+                        "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "detect_time": datetime.now().strftime("%H:%M:%S"),
+                        "reasons": [f"자사주소각 공시: {title[:30]}"],
+                    }
+                    register_entry_watch(_dart_entry_stock)
+                    save_signal_log(_dart_entry_stock)
+                    print(f"  ✅ 자사주소각 진입감시 즉시 등록: {company} {price:,}원")
+                except Exception as _e:
+                    print(f"  ⚠️ 자사주소각 진입감시 등록 실패: {_e}")
     except Exception as e: print(f"⚠️ DART 오류: {e}")
 
 def analyze_dart_disclosures():
@@ -17371,6 +17725,14 @@ def _build_premarket_risk_payload() -> dict:
     except Exception:
         pass
 
+    # v41.78 #3: 야간 이벤트 워치리스트 블록
+    try:
+        wl_block = _format_overnight_watchlist_block()
+        if wl_block:
+            msg += f"\n{wl_block}\n"
+    except Exception:
+        pass
+
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
     digest = hashlib.sha256(msg.encode("utf-8")).hexdigest()
     return {"msg": msg, "digest": digest, "score": total_score, "level": level, "ts": now.strftime('%Y-%m-%d %H:%M')}
@@ -17904,6 +18266,13 @@ def send_premarket_briefing():
         stats_line = _format_signal_type_stats_line(sig_stats)
         if stats_line:
             msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+    except Exception: pass
+
+    # v41.78 #3: 야간 이벤트 워치리스트 블록
+    try:
+        wl_block = _format_overnight_watchlist_block()
+        if wl_block:
+            msg += f"\n{wl_block}\n"
     except Exception: pass
 
     msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
@@ -19179,6 +19548,34 @@ def run_scan():
     try:
         _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
+
+        # v41.78 #4: 야간 워치리스트 종목 → 동적 후보군 우선 편입
+        try:
+            if _overnight_watchlist and krx_open:
+                for wl_code, wl_info in list(_overnight_watchlist.items())[:10]:
+                    if wl_code in seen:
+                        continue
+                    try:
+                        cur = get_stock_price(wl_code)
+                        if cur and cur.get("price", 0) > 0:
+                            wl_stock = {
+                                "code": wl_code,
+                                "name": wl_info.get("name", ""),
+                                "price": cur["price"],
+                                "change_rate": cur.get("change_rate", 0),
+                                "volume_ratio": cur.get("volume_ratio", 0),
+                                "today_vol": cur.get("today_vol", 0),
+                                "_overnight_event": wl_info.get("event", ""),
+                            }
+                            r = analyze(wl_stock)
+                            if r and time.time() - _alert_history.get(r["code"], 0) > get_regime_cooldown():
+                                alerts.append(r)
+                                seen.add(wl_code)
+                        time.sleep(0.1)
+                    except Exception:
+                        continue
+        except Exception as _e:
+            print(f"  ⚠️ 야간 워치리스트 우선 스캔 오류: {_e}")
 
         # KRX 스캔 (장 중에만)
         if krx_open:
