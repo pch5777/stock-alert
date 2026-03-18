@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.72
+버전: v41.73
 날짜: 2026-03-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.73 (2026-03-18): 장초반 강세주 누락 완화 — no_ask_liquidity 차단 완화 + 뉴스→종목 직접 승격.
+  [#1] `run_scan()`의 일반 포착 경로에서 `no_ask_liquidity`를 무조건 차단하지 않고, 직접뉴스/강한 점수/거래량·섹터 근거가 충분한 경우
+       관찰 우선 soft 허용으로 통과시키는 `_should_soft_allow_no_ask_liquidity_general()`과 공용 발송 헬퍼를 추가.
+  [#2] `run_news_scan()`에 `뉴스→종목 직접 승격` 경로를 추가해, 테마 반응이 약해도 뉴스에 종목명이 직접 언급되고 장중 가격·거래량 반응이 붙는 종목은
+       일반 포착으로 재분석 후 바로 알림/추적까지 이어지도록 정리.
+  [#3] `analyze_news_theme()`는 기존 테마 알림을 유지하되, 실제 강세주 승격은 `run_news_scan()`의 종목 직결 경로가 보완하도록 역할을 분리.
+  이유: 오늘 로그처럼 장초반 강세주를 이미 감지했는데도 `no_ask_liquidity`로 반복 차단되거나, 뉴스가 테마 반응 부족을 이유로 종목 승격까지 막혀
+       실제 주도주를 놓치는 문제가 컸기 때문.
+  개선점: 장초반 강세주 생존율↑, 뉴스 언급 종목의 직접 승격력↑, 테마가 늦게 붙는 주도주의 누락↓.
+  주의점: soft 허용은 여전히 상한가 잠김(`limit_up_locked`)에는 적용되지 않으며, 뉴스 승격도 가격·거래량 반응이 붙은 종목만 제한적으로 통과한다.
+
 - v41.72 (2026-03-18): 중복 정의 정리 + 기준 파일 동기화 — 최신 정상본 기준으로 코드 블록 단일화.
   [#1] `send_alert()`와 뉴스/섹터 요약 헬퍼 묶음(`_find_cached_deep_news_result`~`_sector_block`)의 동일 중복 정의 2세트를 1세트로 정리.
   [#2] `start_sector_monitor()` 내부 로컬 `_watch_suffix()` 중복 정의를 제거하고 전역 `_watch_suffix()`만 사용하도록 정리.
@@ -1471,6 +1482,13 @@ MID_RESURGE_MIN_RECLAIM_RATIO = 0.55
 MID_RESURGE_MIN_BOUNCE_PCT   = 5.0
 MID_RESURGE_ENTRY_DISCOUNT_PCT = 1.1
 MID_SOFT_ALLOW_MIN_SCORE     = 75
+GENERAL_SOFT_ALLOW_MIN_SCORE = int(os.getenv("GENERAL_SOFT_ALLOW_MIN_SCORE", "72") or "72")
+GENERAL_SOFT_ALLOW_MIN_CHANGE = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_CHANGE", "5.0") or "5.0")
+GENERAL_SOFT_ALLOW_MIN_VOLUME = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_VOLUME", "3.0") or "3.0")
+NEWS_STOCK_PROMOTION_MIN_CHANGE = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_CHANGE", "2.0") or "2.0")
+NEWS_STOCK_PROMOTION_MIN_VOLUME = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_VOLUME", "1.5") or "1.5")
+NEWS_STOCK_PROMOTION_LIMIT = int(os.getenv("NEWS_STOCK_PROMOTION_LIMIT", "3") or "3")
+NEWS_STOCK_PROMOTION_COOLDOWN = int(os.getenv("NEWS_STOCK_PROMOTION_COOLDOWN", "900") or "900")
 NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK", "ENTRY_POINT"}
 
 # ⑮ 이평 괴리율
@@ -1595,6 +1613,7 @@ _alert_history      = {}
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
+_news_stock_alert_history = {}
 _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
@@ -13073,6 +13092,218 @@ def _infer_direct_news_theme(code: str, name: str, articles: list | None = None)
         return {"theme": "", "bonus": 0, "reason": "", "headline": "", "matched": []}
 
 
+def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None = None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    sig_type = str(signal.get("signal_type") or "")
+    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT", "NEAR_UPPER"):
+        return False
+    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+    bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+    if ask_qty > 0:
+        return False
+    try:
+        change_rate = max(float(cur.get("change_rate", 0.0) or 0.0), float(signal.get("change_rate", 0.0) or 0.0))
+    except Exception:
+        change_rate = float(signal.get("change_rate", 0.0) or 0.0)
+    if bid_qty > 0 and change_rate >= 29.0:
+        return False
+    try:
+        vol_ratio = max(float(cur.get("volume_ratio", 0.0) or 0.0), float(signal.get("volume_ratio", 0.0) or 0.0))
+    except Exception:
+        vol_ratio = float(signal.get("volume_ratio", 0.0) or 0.0)
+    score = int(signal.get("score", 0) or 0)
+    direct_news = bool(signal.get("direct_news_hit") or signal.get("direct_news_theme"))
+    sector_bonus = int(((signal.get("sector_info") or {}).get("bonus", 0)) or 0)
+    sector_live = _extract_alert_sector_theme(signal) != "기타"
+    nxt_order_flow = any("NXT 외인+기관 동시매수" in str(r or "") for r in (signal.get("reasons") or []))
+    strong_combo = score >= GENERAL_SOFT_ALLOW_MIN_SCORE and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and (
+        vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
+    )
+    if direct_news and change_rate >= max(2.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 2.0):
+        return True
+    if str(signal.get("market") or "") == "NXT" and score >= GENERAL_SOFT_ALLOW_MIN_SCORE - 5 and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and vol_ratio >= 2.0:
+        return True
+    return strong_combo
+
+
+def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_label: str = "일반 포착") -> bool:
+    if not isinstance(s, dict) or not s.get("code"):
+        return False
+    if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
+        print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
+        return False
+    is_nxt = str(s.get("market") or "") == "NXT"
+    hist_key = hist_key or (f"NXT_{s['code']}" if is_nxt else s["code"])
+    mkt_tag = " 🔵NXT" if is_nxt else ""
+    s = _apply_execution_speed_to_signal(s)
+    _live = _get_live_quote_for_signal(s)
+    _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
+    _entry = safe_int(s.get("entry_price", 0), 0)
+    _blocked_reason = ""
+    if _entry and _live_price and _live_price >= _entry:
+        try:
+            _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
+        except Exception:
+            _blocked_reason = ""
+    if _blocked_reason:
+        if _blocked_reason == "no_ask_liquidity" and _should_soft_allow_no_ask_liquidity_general(_live or {}, s):
+            s["entry_soft_block_allowed"] = True
+            s.setdefault("reasons", []).append("⚠️ 현재 호가 매도잔량이 얇아 즉시 체결은 불리할 수 있음 — 직접뉴스/수급/거래대금 근거로 관찰 우선 통과")
+            _log_suppressed_alert(
+                s["code"], s["name"],
+                f"{source_label} 호가경고(soft) ({_blocked_reason})",
+                s.get("signal_type", ""),
+                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+            )
+        else:
+            _log_suppressed_alert(
+                s["code"], s["name"],
+                f"{source_label} 신호 차단 ({_blocked_reason})",
+                s.get("signal_type", ""),
+                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+            )
+            return False
+    print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
+    send_alert(s)
+    _alert_history[hist_key] = time.time()
+    save_signal_log(s)
+    if s.get("signal_type") == "EARLY_DETECT":
+        save_early_detect(s)
+    register_entry_watch(s)
+    register_top_signal(s)
+    if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
+        _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
+        _sector_retry_snap["_alert_sender"] = "send_alert"
+        start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)
+    try:
+        threading.Thread(target=auto_update_theme, args=(s["code"], s["name"], s["signal_type"]), daemon=True).start()
+    except Exception:
+        pass
+    if s.get("signal_type") != "ENTRY_POINT":
+        if s["code"] not in _detected_stocks:
+            _detected_stocks[s["code"]] = {"name": s["name"], "high_price": s["price"],
+                "entry_price": s["entry_price"], "stop_loss": s["stop_loss"],
+                "target_price": s["target_price"], "detected_at": s["detected_at"], "carry_day": 0}
+        elif s.get("price", 0) > _detected_stocks[s["code"]].get("high_price", 0):
+            _detected_stocks[s["code"]]["high_price"] = s["price"]
+    return True
+
+
+def _headline_mentions_stock_name(headline: str, name: str) -> bool:
+    h = _normalize_news_headline(str(headline or ""))
+    n = _normalize_news_headline(str(name or ""))
+    if not h or not n or len(n) < 2:
+        return False
+    return n in h
+
+
+def _gather_news_stock_candidates(headlines: list[str]) -> list[dict]:
+    if not headlines:
+        return []
+    candidates: dict[str, dict] = {}
+
+    def _add(code: str, name: str, market: str = "", source: str = ""):
+        code = normalize_stock_code(code)
+        name = _resolve_stock_name(code, name)
+        if not code or not name or not is_trade_candidate_name(name):
+            return
+        rec = candidates.setdefault(code, {"code": code, "name": name, "market": market or "", "sources": set()})
+        if market and not rec.get("market"):
+            rec["market"] = market
+        if source:
+            rec["sources"].add(source)
+
+    for theme_key, theme_info in THEME_MAP.items():
+        for code, name in theme_info.get("stocks", []):
+            _add(code, name, source=f"theme:{theme_key}")
+    for code, info in _dynamic_candidates.items():
+        _add(code, info.get("name", ""), source="dynamic")
+    try:
+        if is_market_open():
+            for item in get_volume_surge_stocks()[:50]:
+                _add(item.get("code", ""), item.get("name", ""), market="KRX", source="krx_rank")
+            for item in get_upper_limit_stocks()[:50]:
+                _add(item.get("code", ""), item.get("name", ""), market="KRX", source="krx_chgrate")
+    except Exception:
+        pass
+    try:
+        if is_nxt_open():
+            for item in get_nxt_surge_stocks()[:50]:
+                _add(item.get("code", ""), item.get("name", ""), market="NXT", source="nxt_rank")
+    except Exception:
+        pass
+
+    enriched = []
+    for code, rec in candidates.items():
+        hits = [h for h in headlines if _headline_mentions_stock_name(h, rec.get("name", ""))]
+        if not hits:
+            continue
+        articles = [{"title": h} for h in hits[:3]]
+        direct = _infer_direct_news_theme(code, rec.get("name", code), articles)
+        try:
+            quote = get_nxt_stock_price(code) if rec.get("market") == "NXT" else get_stock_price(code)
+        except Exception:
+            quote = {}
+        if not quote:
+            continue
+        change_rate = float(quote.get("change_rate", 0.0) or 0.0)
+        vol_ratio = float(quote.get("volume_ratio", 0.0) or 0.0)
+        if change_rate < NEWS_STOCK_PROMOTION_MIN_CHANGE and vol_ratio < NEWS_STOCK_PROMOTION_MIN_VOLUME:
+            continue
+        priority = len(hits) * 30 + max(change_rate, 0.0) * 5 + min(max(vol_ratio, 0.0), 10.0) * 3
+        if direct.get("theme"):
+            priority += 12
+        if rec.get("market") == "NXT":
+            priority += 4
+        rec.update({
+            "hits": hits[:3],
+            "hit_count": len(hits),
+            "direct_theme": direct,
+            "price": int(quote.get("price", 0) or 0),
+            "change_rate": change_rate,
+            "volume_ratio": vol_ratio,
+            "today_vol": int(quote.get("today_vol", 0) or 0),
+            "priority": priority,
+            "sources": sorted(rec.get("sources", set())),
+        })
+        enriched.append(rec)
+    enriched.sort(key=lambda x: (x.get("priority", 0), x.get("hit_count", 0), x.get("change_rate", 0.0)), reverse=True)
+    return enriched[:NEWS_STOCK_PROMOTION_LIMIT]
+
+
+def _promote_news_stock_signals(headlines: list[str]) -> list[dict]:
+    promoted = []
+    for cand in _gather_news_stock_candidates(headlines):
+        hist_key = f"NXT_{cand['code']}" if cand.get("market") == "NXT" else cand["code"]
+        if time.time() - _alert_history.get(hist_key, 0) <= get_regime_cooldown():
+            continue
+        if time.time() - _news_stock_alert_history.get(hist_key, 0) < NEWS_STOCK_PROMOTION_COOLDOWN:
+            continue
+        stock = {
+            "code": cand["code"], "name": cand["name"], "price": cand.get("price", 0),
+            "change_rate": cand.get("change_rate", 0.0), "volume_ratio": cand.get("volume_ratio", 0.0),
+            "today_vol": cand.get("today_vol", 0), "market": cand.get("market", "")
+        }
+        signal = analyze(stock)
+        if not signal:
+            continue
+        headline = str((cand.get("hits") or [""])[0] or "").strip()
+        hit_count = int(cand.get("hit_count", 0) or 0)
+        signal["news_stock_promoted"] = True
+        signal["news_stock_hits"] = hit_count
+        signal.setdefault("reasons", []).insert(0, f"📰 뉴스→종목 직접 승격 {hit_count}건 — {headline[:54]}")
+        direct = cand.get("direct_theme") or {}
+        if direct.get("theme") and not signal.get("direct_news_hit"):
+            signal["direct_news_hit"] = True
+            signal["direct_news_theme"] = direct.get("theme", "")
+            signal["direct_news_bonus"] = int(direct.get("bonus", 0) or 0)
+        signal["_header_override"] = "📰 <b>[뉴스→종목 승격]</b>"
+        signal["_news_promotion_source"] = ",".join(cand.get("sources", []))
+        _news_stock_alert_history[hist_key] = time.time()
+        promoted.append(signal)
+    return promoted
+
+
 def _extract_alert_sector_theme(alert: dict) -> str:
     try:
         sec = str(alert.get("sector_theme", "") or "").strip()
@@ -18656,50 +18887,8 @@ def run_scan():
                     continue
                 is_nxt = s.get("market") == "NXT"
                 hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
-                mkt_tag  = " 🔵NXT" if is_nxt else ""
-                s = _apply_execution_speed_to_signal(s)
-                _live = _get_live_quote_for_signal(s)
-                _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
-                _entry = safe_int(s.get("entry_price", 0), 0)
-                _blocked_reason = ""
-                if _entry and _live_price and _live_price >= _entry:
-                    try:
-                        _blocked_reason = _detect_entry_block_reason(_live or {}, {"signal_type": s.get("signal_type", "")}, _live_price, _entry)
-                    except Exception:
-                        _blocked_reason = ""
-                if _blocked_reason:
-                    _log_suppressed_alert(
-                        s["code"], s["name"],
-                        f"일반 포착 신호 차단 ({_blocked_reason})",
-                        s.get("signal_type", ""),
-                        {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
-                    )
+                if not _dispatch_general_alert_signal(s, hist_key=hist_key, source_label="일반 포착"):
                     continue
-                print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
-                send_alert(s); _alert_history[hist_key] = time.time()
-                save_signal_log(s)
-                if s["signal_type"] == "EARLY_DETECT": save_early_detect(s)
-                register_entry_watch(s)
-                register_top_signal(s)
-                # 섹터 재안내: 처음 포착 때 섹터 미반영 종목만 조건부 모니터링
-                if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
-                    _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
-                    _sector_retry_snap["_alert_sender"] = "send_alert"
-                    start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)
-                try:
-                    threading.Thread(
-                        target=auto_update_theme,
-                        args=(s["code"], s["name"], s["signal_type"]),
-                        daemon=True
-                    ).start()
-                except Exception: pass
-                if s["signal_type"] != "ENTRY_POINT":
-                    if s["code"] not in _detected_stocks:
-                        _detected_stocks[s["code"]] = {"name":s["name"],"high_price":s["price"],
-                            "entry_price":s["entry_price"],"stop_loss":s["stop_loss"],
-                            "target_price":s["target_price"],"detected_at":s["detected_at"],"carry_day":0}
-                    elif s["price"] > _detected_stocks[s["code"]]["high_price"]:
-                        _detected_stocks[s["code"]]["high_price"] = s["price"]
                 # sleep 제거: 20초 스캔 주기에서 신호당 1초 블록 불필요
 
         check_execution_setup_watch()  # ★ 체결속도 확인 후 진입 확정 체크
