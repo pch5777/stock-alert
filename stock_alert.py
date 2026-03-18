@@ -8,13 +8,14 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.76 (2026-03-18): 포착 메시지에 현재가/진입가 복원 — 메시지 단순화 이후 진입가 도달 거리 판단이 가능하도록 표시 보강.
+- v41.76 (2026-03-18): 포착 메시지에 현재가/진입가 복원 + 텔레그램 전송 안정화 — 표시 보강과 운영 타임아웃 완화 동시 반영.
   [#1] `_build_capture_focus_price_line()`를 추가해, 일반 포착/눌림목 핵심 메시지 상단에 `현재가`, `진입가`, `현재가가 진입가보다 얼마나 위/아래인지`를 함께 표시하도록 정리.
   [#2] `_build_capture_focus_message()`가 위 가격 라인을 핵심 사유 블록보다 먼저 노출하도록 조정해, 사용자가 `진입가 도달` 알림 전에도 대기 거리를 바로 읽을 수 있게 개선.
-  [#3] 점수 해석 보강 헬퍼 초기화 구간에서 전역 `import re`를 명시해, 메시지 포맷터 로딩 시 `NameError: re`가 발생하지 않도록 정리.
-  이유: 메시지 단순화 이후 `현재가`와 `진입가`가 빠져, 포착 후 사용자가 `진입가 도달`까지 얼마나 남았는지 판단하기 어려웠기 때문.
-  개선점: 진입 대기 거리 해석 속도↑, 포착 직후 행동 판단력↑.
-  주의점: 내부 진입가/손절가 계산식은 그대로이며, 이번 변경은 표시 보강에 한정된다.
+  [#3] 전역 `import re`를 명시해, 점수 해석 정규식 초기화 구간에서 `NameError: re`가 발생하지 않도록 정리.
+  [#4] 텔레그램 공용 HTTP 헬퍼와 요청별 타임아웃/쿨다운 로그를 추가하고, `sendMessage`, `getUpdates`, `sendDocument`, `deleteMessage`, `answerCallbackQuery` 경로를 공용 헬퍼로 통합해 `Read timed out (10s)` 반복 오류를 완화.
+  이유: 메시지 단순화 이후 `현재가`와 `진입가`가 빠져 대기 거리를 판단하기 어려웠고, 동시에 텔레그램 전송 타임아웃이 반복돼 운영 안정성을 해쳤기 때문.
+  개선점: 진입 대기 거리 해석 속도↑, 포착 직후 행동 판단력↑, 텔레그램 전송 안정성↑, 동일 오류 로그 폭주↓.
+  주의점: 내부 진입가/손절가 계산식은 그대로이며, 텔레그램 전송 실패를 100% 제거하는 것이 아니라 네트워크 지연에 더 보수적으로 대응하도록 완화한 것이다.
 
 - v41.75 (2026-03-18): 점수 해석 라벨 추가 — 사용자 메시지에서 점수의 좋고 나쁨을 바로 읽히게 개선.
   [#1] `_score_delta_impact_label()` / `_signal_total_score_label()` / `_decorate_capture_reason_line()`를 추가해, 포착 메시지의 `+30점`, `-8점` 같은 점수에 `강한 가점/감점`, `약한 가점/감점` 해석 라벨을 함께 표기.
@@ -2789,11 +2790,7 @@ def _prune_telegram_backup_messages(state: dict | None = None) -> dict:
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         for mid in delete_ids:
             try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "message_id": mid},
-                    timeout=15,
-                )
+                _tg_request("deleteMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": mid}, timeout=12)
             except Exception:
                 pass
 
@@ -2813,15 +2810,19 @@ def backup_to_telegram() -> bool:
         script_path = os.path.abspath(__file__)
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         with open(script_path, "rb") as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={
+            resp = _tg_http_request(
+                "post",
+                "sendDocument",
+                data_payload={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "caption": f"💾 자동 백업  {BOT_VERSION}  {ts_str}",
                 },
                 files={"document": (f"stock_alert_{BOT_VERSION}_{datetime.now().strftime('%Y%m%d_%H%M')}.py", f)},
-                timeout=30
+                read_timeout=_TG_FILE_READ_TIMEOUT,
+                attempts=2,
             )
+        if resp is None:
+            return False
         ok = resp.status_code == 200
         if ok:
             try:
@@ -11755,6 +11756,82 @@ def _sanitize_telegram_text(text: str | None) -> str | None:
     except Exception:
         return text
 
+_TG_CONNECT_TIMEOUT = float(os.getenv("TG_CONNECT_TIMEOUT", "3.5") or "3.5")
+_TG_READ_TIMEOUT = float(os.getenv("TG_READ_TIMEOUT", "25") or "25")
+_TG_LONGPOLL_READ_TIMEOUT = float(os.getenv("TG_LONGPOLL_READ_TIMEOUT", "8") or "8")
+_TG_FILE_READ_TIMEOUT = float(os.getenv("TG_FILE_READ_TIMEOUT", "45") or "45")
+_TG_ERROR_LOG_COOLDOWN_SEC = int(os.getenv("TG_ERROR_LOG_COOLDOWN_SEC", "120") or "120")
+_tg_error_last_ts: dict[str, float] = {}
+
+
+def _tg_log_once(key: str, message: str) -> None:
+    now_ts = time.time()
+    last_ts = float(_tg_error_last_ts.get(key, 0.0) or 0.0)
+    if now_ts - last_ts >= _TG_ERROR_LOG_COOLDOWN_SEC:
+        print(message)
+        _tg_error_last_ts[key] = now_ts
+
+
+def _tg_timeout_tuple(read_timeout: float | int | None = None) -> tuple[float, float]:
+    rt = float(read_timeout if read_timeout is not None else _TG_READ_TIMEOUT)
+    return (float(_TG_CONNECT_TIMEOUT), max(1.0, rt))
+
+
+def _tg_http_request(
+    http_method: str,
+    api_method: str,
+    *,
+    json_payload: dict | None = None,
+    data_payload: dict | None = None,
+    files: dict | None = None,
+    params: dict | None = None,
+    read_timeout: float | int | None = None,
+    attempts: int = 1,
+    quiet: bool = False,
+):
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{api_method}"
+    timeout = _tg_timeout_tuple(read_timeout)
+    tries = max(1, int(attempts or 1))
+    for attempt in range(1, tries + 1):
+        try:
+            if http_method.lower() == "get":
+                return requests.get(url, params=params, timeout=timeout)
+            return requests.post(url, json=json_payload, data=data_payload, files=files, params=params, timeout=timeout)
+        except requests.exceptions.ReadTimeout as e:
+            if attempt < tries:
+                time.sleep(0.6 * attempt)
+                continue
+            if not quiet:
+                _tg_log_once(f"{api_method}:read_timeout", f"⚠️ 텔레그램 {api_method} 읽기 지연: {e}")
+            return None
+        except requests.exceptions.ConnectTimeout as e:
+            if not quiet:
+                _tg_log_once(f"{api_method}:connect_timeout", f"⚠️ 텔레그램 {api_method} 연결 지연: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            if not quiet:
+                _tg_log_once(f"{api_method}:request_error", f"⚠️ 텔레그램 {api_method} 오류: {e}")
+            return None
+        except Exception as e:
+            if not quiet:
+                _tg_log_once(f"{api_method}:exception", f"⚠️ 텔레그램 {api_method} 오류: {e}")
+            return None
+    return None
+
+
+def _tg_request(method: str, payload: dict, timeout: int | float = 10) -> dict | None:
+    """Telegram Bot API 요청. 성공 시 response json 반환, 실패 시 None."""
+    r = _tg_http_request("post", method, json_payload=payload, read_timeout=timeout, attempts=1)
+    if r is None:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
 def send_with_chart_buttons(text: str, code: str, name: str):
     """
     텍스트 메시지 + 인라인 키보드 버튼(네이버 차트 링크) 전송
@@ -11767,36 +11844,7 @@ def send_with_chart_buttons(text: str, code: str, name: str):
             {"text": f"📈 {safe_name} 차트 보기 (네이버)", "url": naver},
         ]]
     }
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         _sanitize_telegram_text(text),
-                "parse_mode":   "HTML",
-                "reply_markup": keyboard,
-            },
-            timeout=10
-        )
-    except Exception as e:
-        print(f"⚠️ 텔레그램 오류: {e}")
-
-def _tg_request(method: str, payload: dict, timeout: int = 10) -> dict | None:
-    """Telegram Bot API 요청. 성공 시 response json 반환, 실패 시 None."""
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
-            json=payload,
-            timeout=timeout,
-        )
-        # Telegram은 실패 시에도 JSON을 주는 경우가 많음
-        try:
-            return r.json()
-        except Exception:
-            return None
-    except Exception as e:
-        print(f"⚠️ 텔레그램 오류: {e}")
-        return None
+    send(text, reply_markup=keyboard)
 
 def send(text: str, *, reply_markup: dict | None = None) -> int | None:
     """메시지 전송. 성공 시 message_id 반환."""
@@ -15806,31 +15854,17 @@ def _send_menu(title: str = ""):
             ],
         ]
     }
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       _sanitize_telegram_text(menu_title),
-                "parse_mode": "HTML",
-                "reply_markup": keyboard,
-            },
-            timeout=10
-        )
-    except Exception as e:
-        print(f"⚠️ 메뉴 발송 오류: {e}")
+    mid = send(menu_title, reply_markup=keyboard)
+    if mid is None:
         send(menu_title)   # 버튼 실패 시 텍스트로 폴백
 
 def _handle_callback(callback_id: str, data: str):
     """인라인 버튼 콜백 처리"""
     # 버튼 누름 확인 응답 (텔레그램 필수)
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=5
-        )
-    except Exception: pass
+        _tg_request("answerCallbackQuery", {"callback_query_id": callback_id}, timeout=5)
+    except Exception:
+        pass
 
     cmd_map = {
         "cmd_status":  "/status",
@@ -15851,9 +15885,21 @@ def _handle_callback(callback_id: str, data: str):
 def poll_telegram_commands():
     global _tg_offset, _bot_paused
     try:
-        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                            params={"offset":_tg_offset,"timeout":2},timeout=4)
-        for update in resp.json().get("result",[]):
+        resp = _tg_http_request(
+            "get",
+            "getUpdates",
+            params={"offset": _tg_offset, "timeout": 2},
+            read_timeout=_TG_LONGPOLL_READ_TIMEOUT,
+            attempts=1,
+            quiet=True,
+        )
+        if resp is None:
+            return
+        try:
+            updates = (resp.json() or {}).get("result", [])
+        except Exception:
+            updates = []
+        for update in updates:
             _tg_offset = update["update_id"]+1
 
             # ── 인라인 버튼 콜백 처리 ──
