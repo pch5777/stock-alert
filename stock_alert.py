@@ -3,11 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.78
+버전: v41.79
 날짜: 2026-03-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.79 (2026-03-18): 시장 주도 섹터 테마 버킷 정제 — 정적 테마/동적 테마 멤버 혼입 차단.
+  [#1] `_get_market_leader_theme_members()` 신규: 시장 주도 섹터용 멤버를 테마 소스별로 정제.
+       정적 테마(`THEME_MAP`)는 해당 정적 테마 종목만, 동적 테마는 동일 동적 테마 소속 종목만 멤버로 사용.
+  [#2] `_build_market_leading_sector_payload()`가 기존 `peers` 전체 병합 대신 위 정제 멤버만 버킷에 편입하도록 수정.
+       동적 테마/업종코드/KIS 유사종목이 정적 테마 버킷 리더를 오염시키지 않게 정리.
+  [#3] 시장 주도 섹터에서 리더/동반주 계산이 테마명과 동일 출처 종목 기준으로만 이뤄지게 보수화.
+  이유: `AI반도체` 메시지에 대우건설처럼 테마와 무관한 종목이 리더로 섞여 사용자 해석을 왜곡했기 때문.
+  개선점: 테마 메시지 정합성↑, 리더 신뢰도↑, 동적/정적 테마 혼입 오판↓.
+  주의점: 멤버를 보수적으로 줄였기 때문에 일부 섹터는 예전보다 구성 종목 수가 적게 보일 수 있음.
+
 - v41.78 (2026-03-18): v41.77 중간작업 4종 완성 — DART자사주·야간워치리스트·브리핑·테마발굴 연결.
   [#1] run_dart_intraday() 자사주소각 change_rate 기준 1.0%→0.5% 완화 + 진입감시 즉시 등록.
        DART_BUYBACK_CANCEL 신호타입으로 register_entry_watch/save_signal_log 자동 호출.
@@ -7587,6 +7597,39 @@ def get_theme_sector_stocks(code: str) -> tuple:
 
     peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
     return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
+
+
+def _get_market_leader_theme_members(seed_code: str, seed_name: str, theme_name: str, peers_all: dict) -> dict:
+    """시장 주도 섹터용 멤버를 테마 출처별로 정제해 반환."""
+    members = {}
+    code = str(seed_code or "").strip()
+    seed_name = _resolve_stock_name(code, seed_name or "")
+    if not code or not theme_name or theme_name == "기타업종":
+        return members
+
+    static_theme_stocks = THEME_MAP.get(theme_name, {}).get("stocks", []) if theme_name in THEME_MAP else []
+    static_theme_codes = {str(c).strip(): str(n).strip() for c, n in static_theme_stocks}
+
+    if static_theme_codes:
+        if code in static_theme_codes and is_trade_candidate_name(seed_name):
+            members[code] = static_theme_codes.get(code) or seed_name
+        for peer_code, (peer_name, src, rsn) in (peers_all or {}).items():
+            peer_code = str(peer_code or "").strip()
+            if not peer_code or src != "테마" or rsn != theme_name:
+                continue
+            if peer_code in static_theme_codes and is_trade_candidate_name(peer_name):
+                members.setdefault(peer_code, static_theme_codes.get(peer_code) or str(peer_name))
+        return members
+
+    if is_trade_candidate_name(seed_name):
+        members[code] = seed_name
+    for peer_code, (peer_name, src, rsn) in (peers_all or {}).items():
+        peer_code = str(peer_code or "").strip()
+        if not peer_code or src != "동적테마" or rsn != theme_name:
+            continue
+        if is_trade_candidate_name(peer_name):
+            members.setdefault(peer_code, str(peer_name))
+    return members
 
 
 # ════════════════════════════════════════════════════════════
@@ -17918,17 +17961,17 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
             strong_seed_cnt += 1
         if chg >= 29.0:
             upper_seed_cnt += 1
-        theme_name, peers, _ = get_theme_sector_stocks(code)
+        theme_name, peers, peers_all = get_theme_sector_stocks(code)
         if not theme_name or theme_name == "기타업종":
             continue
         bucket = candidate_themes.setdefault(theme_name, {"members": {}, "seed_codes": set()})
         nm = _resolve_stock_name(code, item.get("name", ""))
-        if is_trade_candidate_name(nm):
-            bucket["members"][code] = nm
+        theme_members = _get_market_leader_theme_members(code, nm, theme_name, peers_all)
+        if len(theme_members) < 2:
+            continue
+        if code in theme_members:
             bucket["seed_codes"].add(code)
-        for peer_code, peer_name in peers[:5]:
-            if peer_code == code:
-                continue
+        for peer_code, peer_name in list(theme_members.items())[:6]:
             bucket["members"].setdefault(peer_code, peer_name)
     if upper_seed_cnt >= 1 or strong_seed_cnt >= 2:
         event_mode = True
