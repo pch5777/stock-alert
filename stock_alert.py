@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.74
+버전: v41.76
 날짜: 2026-03-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.76 (2026-03-18): 포착 메시지에 현재가/진입가 복원 — 메시지 단순화 이후 진입가 도달 거리 판단이 가능하도록 표시 보강.
+  [#1] `_build_capture_focus_price_line()`를 추가해, 일반 포착/눌림목 핵심 메시지 상단에 `현재가`, `진입가`, `현재가가 진입가보다 얼마나 위/아래인지`를 함께 표시하도록 정리.
+  [#2] `_build_capture_focus_message()`가 위 가격 라인을 핵심 사유 블록보다 먼저 노출하도록 조정해, 사용자가 `진입가 도달` 알림 전에도 대기 거리를 바로 읽을 수 있게 개선.
+  이유: 메시지 단순화 이후 `현재가`와 `진입가`가 빠져, 포착 후 사용자가 `진입가 도달`까지 얼마나 남았는지 판단하기 어려웠기 때문.
+  개선점: 진입 대기 거리 해석 속도↑, 포착 직후 행동 판단력↑.
+  주의점: 내부 진입가/손절가 계산식은 그대로이며, 이번 변경은 표시 보강에 한정된다.
+
+- v41.75 (2026-03-18): 점수 해석 라벨 추가 — 사용자 메시지에서 점수의 좋고 나쁨을 바로 읽히게 개선.
+  [#1] `_score_delta_impact_label()` / `_signal_total_score_label()` / `_decorate_capture_reason_line()`를 추가해, 포착 메시지의 `+30점`, `-8점` 같은 점수에 `강한 가점/감점`, `약한 가점/감점` 해석 라벨을 함께 표기.
+  [#2] `_build_capture_focus_reasons()` / `_build_capture_focus_sector_block()`에 위 라벨을 연결해, 거래량·수급·지지선·섹터 보너스 같은 점수 항목이 숫자만 보이지 않도록 정리.
+  [#3] `send_alert()` 컴팩트 모드의 총점 표시에 `_signal_total_score_label()`을 붙여, 총점이 `강함/양호/보통/약함` 중 어느 수준인지 즉시 보이게 개선.
+  이유: 사용자 메시지에 점수만 있으면 숫자의 상대적 의미를 알기 어려워, 알림을 받아도 좋은지 나쁜지 해석 시간이 걸렸기 때문.
+  개선점: 모바일 가독성↑, 점수 해석 속도↑, 행동 판단 속도↑.
+  주의점: 내부 점수 계산식은 그대로이며, 이번 변경은 표시 해석 보강에 한정된다.
+
 - v41.74 (2026-03-18): 전 시간대 실시간 랭킹 후보군 강화 — 08:00~10:00은 강하게, 이후 장중은 보수적으로 후보군/직접스캔 보강.
   [#1] 실시간 랭킹 유니버스 스냅샷(`_get_universe_rank_snapshot`)과 랭킹 후보 수집(`_collect_market_rank_candidates`)을 추가해,
        상승률·상승 거래량·상승 거래대금 상위 종목의 합집합을 KRX/NXT 시장별로 후보군에 반영하도록 정리.
@@ -12186,7 +12201,8 @@ def _build_sector_summary_block(s: dict) -> str:
     bonus = int(si.get('bonus', 0) or 0)
     summary = str(si.get('summary', '') or '').strip()
     rising = si.get('rising', []) or []
-    lines = [f"🏭 <b>섹터 모멘텀</b> [{theme}]" + (f"  +{bonus}점" if bonus > 0 else "")]
+    _bonus_tag = f"  +{bonus}점 ({_score_delta_impact_label(bonus)})" if bonus > 0 else ""
+    lines = [f"🏭 <b>섹터 모멘텀</b> [{theme}]" + _bonus_tag]
     if summary:
         lines.append(f"  {summary}")
     if rising:
@@ -12298,7 +12314,7 @@ def send_alert(s: dict):
         rr     = round((target-entry)/(entry-stop),1) if entry and stop and entry>stop else 0
         compact_text = (
             f"{lvl_icon}{emoji} {name_dot}<b>{s['name']}</b>  {s['change_rate']:+.1f}%  "
-            f"{s['score']}점{nxt_badge}\n"
+            f"{s['score']}점 ({_signal_total_score_label(s['score'])}){nxt_badge}\n"
             f"진입 {entry:,} | 손절 {stop:,} | 목표 {target:,}  RR {rr:.1f}"
         )
         send_by_level(compact_text, level, s["code"], s["name"])
@@ -12430,6 +12446,67 @@ def _is_capture_focus_reason(txt: str) -> bool:
     return False
 
 
+_CAPTURE_SIGNED_POINT_RE = re.compile(r'(?P<value>[+-]\d+)점(?!\s*[([<])')
+
+
+def _score_delta_impact_label(delta: int) -> str:
+    d = int(delta or 0)
+    if d >= 25:
+        return '매우 강한 가점'
+    if d >= 15:
+        return '강한 가점'
+    if d >= 8:
+        return '의미 있는 가점'
+    if d >= 1:
+        return '약한 가점'
+    if d <= -15:
+        return '매우 강한 감점'
+    if d <= -8:
+        return '강한 감점'
+    if d <= -1:
+        return '약한 감점'
+    return ''
+
+
+def _signal_total_score_label(score: int) -> str:
+    s = int(score or 0)
+    if s >= 100:
+        return '최상'
+    if s >= 85:
+        return '강함'
+    if s >= 70:
+        return '양호'
+    if s >= 55:
+        return '보통'
+    if s >= 40:
+        return '약함'
+    return '매우 약함'
+
+
+def _decorate_capture_reason_line(txt: str) -> str:
+    line = str(txt or '').strip()
+    if not line:
+        return ''
+
+    def _signed_repl(match: re.Match) -> str:
+        raw = match.group('value')
+        label = _score_delta_impact_label(int(raw))
+        return f"{raw}점 ({label})" if label else match.group(0)
+
+    line = _CAPTURE_SIGNED_POINT_RE.sub(_signed_repl, line)
+    line = re.sub(
+        r'(체결지속속도\s+)(\d+)점(?!\s*\()',
+        lambda m: f"{m.group(1)}{m.group(2)}점 ({_execution_score_label(int(m.group(2)))})",
+        line,
+    )
+    line = re.sub(
+        r'(눌림 유지\s+)(\d+)점(?!\s*\()',
+        lambda m: f"{m.group(1)}{m.group(2)}점 ({_execution_score_label(int(m.group(2)))})",
+        line,
+    )
+    return line
+
+
 def _build_capture_focus_reasons(s: dict) -> list[str]:
     lines = []
     seen = set()
@@ -12440,7 +12517,7 @@ def _build_capture_focus_reasons(s: dict) -> list[str]:
         if txt in seen:
             continue
         seen.add(txt)
-        lines.append(txt)
+        lines.append(_decorate_capture_reason_line(txt))
     return lines
 
 
@@ -12469,6 +12546,25 @@ def _build_capture_focus_sector_block(s: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_capture_focus_price_line(s: dict) -> str:
+    price = int(s.get('price', 0) or 0)
+    entry = int(s.get('entry_price', 0) or 0)
+    if not price and not entry:
+        return ''
+    if price and entry:
+        diff_pct = ((price - entry) / entry * 100) if entry else 0.0
+        if abs(diff_pct) < 0.05:
+            gap_text = '진입가 도달'
+        elif diff_pct > 0:
+            gap_text = f'현재는 진입가보다 <b>+{diff_pct:.1f}% 위</b>'
+        else:
+            gap_text = f'현재는 진입가보다 <b>{diff_pct:.1f}% 아래</b>'
+        return f"💵 현재가 <b>{price:,}원</b> | 🎯 진입가 <b>{entry:,}원</b> | {gap_text}"
+    if price:
+        return f"💵 현재가 <b>{price:,}원</b>"
+    return f"🎯 진입가 <b>{entry:,}원</b>"
+
+
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
     parts = [
         header_line,
@@ -12476,8 +12572,11 @@ def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, 
         '━━━━━━━━━━━━━━━',
         f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>",
     ]
+    price_line = _build_capture_focus_price_line(s)
     focus_reasons = _build_capture_focus_reasons(s)
     sector_block = _build_capture_focus_sector_block(s)
+    if price_line:
+        parts.append(price_line)
     if focus_reasons:
         parts.append('━━━━━━━━━━━━━━━')
         parts.extend(focus_reasons)
