@@ -8,15 +8,13 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.79 (2026-03-18): 시장 주도 섹터 테마 버킷 정제 — 정적 테마/동적 테마 멤버 혼입 차단.
-  [#1] `_get_market_leader_theme_members()` 신규: 시장 주도 섹터용 멤버를 테마 소스별로 정제.
-       정적 테마(`THEME_MAP`)는 해당 정적 테마 종목만, 동적 테마는 동일 동적 테마 소속 종목만 멤버로 사용.
-  [#2] `_build_market_leading_sector_payload()`가 기존 `peers` 전체 병합 대신 위 정제 멤버만 버킷에 편입하도록 수정.
-       동적 테마/업종코드/KIS 유사종목이 정적 테마 버킷 리더를 오염시키지 않게 정리.
-  [#3] 시장 주도 섹터에서 리더/동반주 계산이 테마명과 동일 출처 종목 기준으로만 이뤄지게 보수화.
-  이유: `AI반도체` 메시지에 대우건설처럼 테마와 무관한 종목이 리더로 섞여 사용자 해석을 왜곡했기 때문.
-  개선점: 테마 메시지 정합성↑, 리더 신뢰도↑, 동적/정적 테마 혼입 오판↓.
-  주의점: 멤버를 보수적으로 줄였기 때문에 일부 섹터는 예전보다 구성 종목 수가 적게 보일 수 있음.
+- v41.79 (2026-03-18): 점수 라벨 2글자 통일 — 전송 직전 공통 후처리로 시장 주도 섹터/뉴스/리스크/랭킹 요약까지 점수-only 표현 제거.
+  [#1] `_score_delta_impact_label()`을 `대가/중가/소가/소감/중감/대감` 기준으로 축약하고, `_signal_total_score_label()`도 `최상/강함/양호/보통/약함/위험` 2글자 체계로 통일.
+  [#2] `_risk_total_score_label()` / `_decorate_ui_score_line()` / `_decorate_ui_score_text()`를 추가해, `send()`/`edit_message()`뿐 아니라 `_tg_request()`를 타는 직접 전송 메시지의 `±N점`, `N점` 표현에 짧은 해석 라벨을 공통 적용.
+  [#3] 포착 메시지뿐 아니라 `시장 주도 섹터`, `뉴스 요약`, `장전 리스크 평가`, `랭킹/요약` 경로까지 점수-only 표현이 남지 않도록 전송 경로를 단일 후처리 구조로 정리.
+  이유: 포착 메시지 일부만 점수 라벨이 붙고 다른 알림은 숫자만 남아 있어, 사용자가 `좋은 점수인지/나쁜 점수인지`를 메시지별로 다르게 해석해야 했기 때문.
+  개선점: 전 메시지 점수 해석 일관성↑, 모바일 가독성↑, 시장 주도 섹터/리스크 메시지 판단 속도↑.
+  주의점: 내부 점수 계산식은 그대로이고, 이번 변경은 전송 직전 표시 해석 통일에 한정된다.
 
 - v41.78 (2026-03-18): v41.77 중간작업 4종 완성 — DART자사주·야간워치리스트·브리핑·테마발굴 연결.
   [#1] run_dart_intraday() 자사주소각 change_rate 기준 1.0%→0.5% 완화 + 진입감시 즉시 등록.
@@ -7599,39 +7597,6 @@ def get_theme_sector_stocks(code: str) -> tuple:
     return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
 
 
-def _get_market_leader_theme_members(seed_code: str, seed_name: str, theme_name: str, peers_all: dict) -> dict:
-    """시장 주도 섹터용 멤버를 테마 출처별로 정제해 반환."""
-    members = {}
-    code = str(seed_code or "").strip()
-    seed_name = _resolve_stock_name(code, seed_name or "")
-    if not code or not theme_name or theme_name == "기타업종":
-        return members
-
-    static_theme_stocks = THEME_MAP.get(theme_name, {}).get("stocks", []) if theme_name in THEME_MAP else []
-    static_theme_codes = {str(c).strip(): str(n).strip() for c, n in static_theme_stocks}
-
-    if static_theme_codes:
-        if code in static_theme_codes and is_trade_candidate_name(seed_name):
-            members[code] = static_theme_codes.get(code) or seed_name
-        for peer_code, (peer_name, src, rsn) in (peers_all or {}).items():
-            peer_code = str(peer_code or "").strip()
-            if not peer_code or src != "테마" or rsn != theme_name:
-                continue
-            if peer_code in static_theme_codes and is_trade_candidate_name(peer_name):
-                members.setdefault(peer_code, static_theme_codes.get(peer_code) or str(peer_name))
-        return members
-
-    if is_trade_candidate_name(seed_name):
-        members[code] = seed_name
-    for peer_code, (peer_name, src, rsn) in (peers_all or {}).items():
-        peer_code = str(peer_code or "").strip()
-        if not peer_code or src != "동적테마" or rsn != theme_name:
-            continue
-        if is_trade_candidate_name(peer_name):
-            members.setdefault(peer_code, str(peer_name))
-    return members
-
-
 # ════════════════════════════════════════════════════════════
 # 🌍 J: 해외 선물→섹터 연동 (v39.0)
 # ════════════════════════════════════════════════════════════
@@ -12174,6 +12139,14 @@ def _tg_http_request(
 
 def _tg_request(method: str, payload: dict, timeout: int | float = 10) -> dict | None:
     """Telegram Bot API 요청. 성공 시 response json 반환, 실패 시 None."""
+    try:
+        if isinstance(payload, dict):
+            if isinstance(payload.get('text'), str):
+                payload['text'] = _decorate_ui_score_text(payload['text'])
+            if isinstance(payload.get('caption'), str):
+                payload['caption'] = _decorate_ui_score_text(payload['caption'])
+    except Exception:
+        pass
     r = _tg_http_request("post", method, json_payload=payload, read_timeout=timeout, attempts=1)
     if r is None:
         return None
@@ -12199,7 +12172,8 @@ def send_with_chart_buttons(text: str, code: str, name: str):
 
 def send(text: str, *, reply_markup: dict | None = None) -> int | None:
     """메시지 전송. 성공 시 message_id 반환."""
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _sanitize_telegram_text(text), "parse_mode": "HTML"}
+    decorated_text = _decorate_ui_score_text(text)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": _sanitize_telegram_text(decorated_text), "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     res = _tg_request("sendMessage", payload)
@@ -12263,7 +12237,8 @@ def install_excepthook() -> None:
     sys.excepthook = _handler
 
 def edit_message(message_id: int, text: str, *, reply_markup: dict | None = None) -> bool:
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    decorated_text = _decorate_ui_score_text(text)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": decorated_text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     res = _tg_request("editMessageText", payload)
@@ -12853,19 +12828,17 @@ _CAPTURE_SIGNED_POINT_RE = re.compile(r'(?P<value>[+-]\d+)점(?!\s*[([<])')
 def _score_delta_impact_label(delta: int) -> str:
     d = int(delta or 0)
     if d >= 25:
-        return '매우 강한 가점'
-    if d >= 15:
-        return '강한 가점'
-    if d >= 8:
-        return '의미 있는 가점'
+        return '대가'
+    if d >= 10:
+        return '중가'
     if d >= 1:
-        return '약한 가점'
+        return '소가'
     if d <= -15:
-        return '매우 강한 감점'
+        return '대감'
     if d <= -8:
-        return '강한 감점'
+        return '중감'
     if d <= -1:
-        return '약한 감점'
+        return '소감'
     return ''
 
 
@@ -12881,8 +12854,62 @@ def _signal_total_score_label(score: int) -> str:
         return '보통'
     if s >= 40:
         return '약함'
-    return '매우 약함'
+    return '위험'
 
+
+
+
+def _risk_total_score_label(score: int) -> str:
+    s = int(score or 0)
+    if s >= 50:
+        return '위험'
+    if s >= 20:
+        return '경계'
+    return '안정'
+
+
+def _ui_total_score_label_for_line(line: str, score: int) -> str:
+    txt = str(line or '')
+    stripped = txt.strip()
+    if (
+        '리스크' in txt or 'VIX' in txt or '국내 추세 붕괴' in txt or '지정학' in txt
+        or stripped.startswith(('💧', '🌍', '📉'))
+    ):
+        return _risk_total_score_label(score)
+    if any(key in txt for key in ('체결지속속도', '눌림 유지', '예비판단')):
+        return _execution_score_label(score)
+    return _signal_total_score_label(score)
+
+
+_UI_SIGNED_POINT_RE = re.compile(r'(?P<value>[+-]\d+)점(?:\s*\([^\)\n]{1,20}\))?')
+_UI_UNSIGNED_POINT_RE = re.compile(r'(?<![+\-\d])(?P<value>\d+)점(?:\s*\([^\)\n]{1,20}\))?(?!\s*[>%])')
+
+
+def _decorate_ui_score_line(line: str) -> str:
+    raw = str(line or '')
+    if '점' not in raw:
+        return raw
+
+    def _signed_repl(match: re.Match) -> str:
+        value = int(match.group('value'))
+        label = _score_delta_impact_label(value)
+        return f"{value:+d}점({label})" if label else f"{value:+d}점"
+
+    out = _UI_SIGNED_POINT_RE.sub(_signed_repl, raw)
+
+    def _unsigned_repl(match: re.Match) -> str:
+        value = int(match.group('value'))
+        label = _ui_total_score_label_for_line(out, value)
+        return f"{value}점({label})" if label else f"{value}점"
+
+    out = _UI_UNSIGNED_POINT_RE.sub(_unsigned_repl, out)
+    return out
+
+
+def _decorate_ui_score_text(text: str) -> str:
+    if not text or '점' not in str(text):
+        return text
+    return '\n'.join(_decorate_ui_score_line(line) for line in str(text).split('\n'))
 
 def _decorate_capture_reason_line(txt: str) -> str:
     line = str(txt or '').strip()
@@ -17961,17 +17988,17 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
             strong_seed_cnt += 1
         if chg >= 29.0:
             upper_seed_cnt += 1
-        theme_name, peers, peers_all = get_theme_sector_stocks(code)
+        theme_name, peers, _ = get_theme_sector_stocks(code)
         if not theme_name or theme_name == "기타업종":
             continue
         bucket = candidate_themes.setdefault(theme_name, {"members": {}, "seed_codes": set()})
         nm = _resolve_stock_name(code, item.get("name", ""))
-        theme_members = _get_market_leader_theme_members(code, nm, theme_name, peers_all)
-        if len(theme_members) < 2:
-            continue
-        if code in theme_members:
+        if is_trade_candidate_name(nm):
+            bucket["members"][code] = nm
             bucket["seed_codes"].add(code)
-        for peer_code, peer_name in list(theme_members.items())[:6]:
+        for peer_code, peer_name in peers[:5]:
+            if peer_code == code:
+                continue
             bucket["members"].setdefault(peer_code, peer_name)
     if upper_seed_cnt >= 1 or strong_seed_cnt >= 2:
         event_mode = True
