@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.80
+버전: v41.81
 날짜: 2026-03-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+- v41.81 (2026-03-19): [익영업일 갭상승 선진입 후보] 공용 추적 저장 플래그 버그 수정.
+  [#1] `check_preclose_gap_entry_watch()`에서 `peak_price` 상향 갱신 시 잘못된 로컬 변수 `changed_active`를 쓰던 부분을 공용 저장 플래그 `changed`로 교체.
+       기존: 가격이 최초 기준가보다 높아지는 순간 `NameError`가 발생할 수 있었고, broad except에 묻혀 KRX/NXT 공용 선진입 추적이 조용히 건너뛰어질 수 있었음.
+       수정: peak_price 갱신이 정상 저장되고, 이후 선진입가 도달·체결속도 확인·후속 watch 등록 흐름이 계속 이어지도록 정리.
+  이유: `[익영업일 갭상승 선진입 후보]`는 KRX 14:45와 NXT 19:20이 같은 `check_preclose_gap_entry_watch()`를 타므로, 공용 추적부 런타임 오류를 먼저 제거해야 둘 다 정상화되기 때문.
+  개선점: KRX/NXT 공용 선진입 추적 안정성↑, peak_price 저장 일관성↑, 조용한 skip 리스크↓.
+  주의점: 이번 버전은 후보 선별식/메시지 포맷/시간대 로직을 건드리지 않고 공용 추적부 버그만 최소 수정한 핫픽스다.
+
 - v41.80 (2026-03-19): 신호 강도 판정 버그 수정 + 동시보유 제한 실적용 + 2차 금지 시 API 절약.
   [#1] register_entry_watch()에 grade/score 저장 추가.
        기존: _entry_watch dict에 grade/score 미저장 → _classify_signal_strength()가 항상
@@ -5242,7 +5250,7 @@ def check_preclose_gap_entry_watch() -> None:
             changed = True
             if price > int(watch.get("peak_price", 0) or 0):
                 watch["peak_price"] = price
-                changed_active = True
+                changed = True
             if price > int(watch.get("entry_price", 0) or 0):
                 continue
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
