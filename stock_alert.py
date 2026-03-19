@@ -3,11 +3,31 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.84
+버전: v41.85
 날짜: 2026-03-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.85 (2026-03-19): 코드 위생 정리 — 죽은 코드 제거 + 중복 import 정리 + Changelog 슬림화.
+  [#1] 정의만 있고 호출 0회인 미사용 함수 23개 제거 (303줄 감축).
+       제거 대상: _build_conclusion_line, _build_sector_summary_block, _chart_links,
+       _execution_setup_required, _fetch_gdelt_headlines, _is_real_trade,
+       _promote_news_stock_signals, _save_entry_watch_archive_store,
+       _save_entry_watch_consumed_store, _shutdown, _split_reasons_for_ui,
+       calc_entry_tolerance, calc_sector_momentum_with_potential,
+       calc_trailing_stop_price, detect_emerging_theme, effective_market_close,
+       find_similar_patterns, get_real_sector_peers, get_signal_title,
+       load_overnight_watchlist, news_block_for_alert, safe_json_load, safe_json_dump.
+  [#2] `import re as _re` + `import re` 중복 import를 1줄로 통합.
+       함수 내부(3곳) 불필요한 `import re as _re` 재선언 제거.
+  [#3] Changelog v41.58 이전 이력(v39.4~v41.58, 약 400줄)을 한 줄 요약으로 대체 (수칙 16 적용).
+       후속 AI 인계 메모는 그대로 유지.
+  이유: 미사용 함수 누적으로 유지보수 혼선 + Changelog 비대화(754줄 docstring)로 가독성 저하.
+  개선점: 파일 크기 20,519줄→19,784줄 (약 735줄 감축), docstring 754줄→약 350줄,
+       중복 import 제거로 코드 위생↑, 이후 수정 시 혼선↓.
+  주의점: 제거된 함수는 모두 AST 분석으로 호출부 0회 확인 완료. 스케줄러/데코레이터/문자열 간접 호출도 검증.
+       로직 변경 없음, 순수 정리 버전.
 
 - v41.84 (2026-03-19): 파일 I/O 안전화 + 캐시 정리 + 섹터 개선 + NXT/KRX 명확화.
   [#1] safe_json_load()/safe_json_dump() 함수 추가: with 문 자동화로 "Too many open files" 방지.
@@ -312,409 +332,8 @@
   개선점: Railway 다중 replica 환경에서 시작 배너 누락↓, leader 승계 가시성↑, 메시지 포맷 일관성↑.
   주의점: 시작 배너는 프로세스당 1회만 발송되며, leader 재획득이 반복돼도 중복 발송되지 않음.
 
-- v41.58 (2026-03-13): 체결속도 샘플 부족 완화 + NXT 미세체결 기준 보정 + 예비판단 표시 추가.
-  [#1] `EXEC_SPEED_MIN_SAMPLES` 기본값을 4→3으로 낮추고, `EXEC_SPEED_PREWARM_MAX_CODES` 기본값을 5→8로 늘려 포착 후 60~80초 내 진입가 도달 케이스에서도 현재 시점 체결속도 샘플이 더 자주 표시되도록 조정.
-  [#2] `_get_exec_speed_micro_trade_threshold()` helper를 추가해 NXT/비정규 시간대 체결은 미세체결 하한을 더 완화(기본 30만/20주 → 15만/10주)하고, `_record_execution_snapshot()`에 반영해 저녁장 얇은 체결이 과도하게 제외되지 않도록 보강.
-  [#3] `get_execution_speed_metrics()`에 `provisional`(예비판단) 경로를 추가해, 확정용 ready 기준에는 못 미쳐도 최근 유효 샘플 2개 이상이면 점수·눌림유지·미세체결 제외율을 참고용으로 계산하도록 정리.
-  [#4] `[진입가 도달!]` 메시지의 체결속도 블록은 ready가 아니더라도 예비판단이 가능하면 `예비판단`으로 참고값을 표시하고, 포착시 fallback보다 현재 시점 부분 샘플을 우선 보여주도록 조정.
-  이유: 현재 구조에서는 NXT 저녁장/빠른 도달 종목이 실제 체결은 있어도 샘플 인정 기준이 보수적이라 `샘플 부족`만 반복 표시되는 경우가 많았기 때문.
-  개선점: 체결속도 현재값 표시율↑, NXT 저녁장 샘플 인정률↑, 빠른 도달 구간 참고성↑.
-  주의점: `예비판단`은 참고용이며, 체결확정 로직의 ready 기준(구조상 충분한 샘플 확보)은 유지된다.
+- v39.4 ~ v41.58: 이전 이력 생략 (운영 로그/백업 기준으로 관리).
 
-- v41.57 (2026-03-13): 텔레그램 폴링 지수 백오프 도입 + check_entry_watch peak_price 저장 누락 수정.
-  [BUG-1 🔴 데이터 유실] `check_entry_watch()` 9933줄에서 peak_price 갱신 시 `changed = True`로 기록하지만,
-  파일 저장 조건은 `changed_active`만 확인 → peak_price가 파일에 저장되지 않아 재시작 시 이전 값으로 복원되는 문제.
-  수정: `changed = True` → `changed_active = True`로 교체해 peak_price 갱신이 즉시 파일에 반영되도록 정리.
-  [OPT-1] `_telegram_poll_loop()`에 지수 백오프(exponential backoff) 도입.
-  기존: 실패해도 고정 2초 대기 후 즉시 재시도 → 네트워크 일시 불안 시 로그 범람 + 불필요한 재시도 반복.
-  수정: 연속 실패 시 대기 시간을 2→4→8→…최대 60초까지 점진 증가, 성공 시 즉시 정상 간격(2초)으로 복귀.
-  연속 실패 5회 이상 시 1회만 경고 로그 출력하여 로그 범람 방지.
-  개선점: peak_price 재시작 복원 안정성↑, 네트워크 불안 시 로그 범람↓, 폴링 회복 속도 유지↑.
-
-- v41.56 (2026-03-13): 체결속도 사전 워밍(prewarm) 구조 추가.
-  [#1] `_exec_speed_prewarm: dict` 전역변수와 상수 `EXEC_SPEED_PREWARM_MAX_SEC(120초)` /
-       `EXEC_SPEED_PREWARM_MAX_CODES(5종목)`를 추가해 포착 시점부터 체결속도 스냅샷을
-       사전 누적하는 전용 워밍 버킷을 마련.
-  [#2] `_tick_exec_speed_prewarm()` 함수를 추가해 run_scan() 1사이클(20초)마다
-       prewarm 버킷에 있는 종목의 최근 샘플 수를 확인하고, EXEC_SPEED_MIN_SAMPLES 미만이면
-       get_stock_price()/get_nxt_stock_price()를 호출해 스냅샷을 추가 누적.
-       120초 경과 또는 샘플 충족 시 자동 해제. API 부담 제한: 동시 최대 5종목, 등록 최신순 처리.
-  [#3] `register_entry_watch()` 및 `_register_execution_setup_watch()`에서 포착 등록 직후
-       `_exec_speed_prewarm[code] = time.time()`을 추가해 워밍이 즉시 시작되도록 연결.
-  [#4] `run_scan()` 의 `check_entry_watch()` 호출 직전에 `_tick_exec_speed_prewarm()`을
-       삽입해 진입가 도달 판단 전 스냅샷 최신 상태를 보장.
-  이유: 포착 직후 빠르게 진입가에 도달하면 스냅샷이 EXEC_SPEED_MIN_SAMPLES(4개) 미만이어서
-       "샘플 부족" 메시지가 표시되는 문제 개선. 체결속도의 목적(급등 종목 안정적 진입 보조)에
-       맞게 포착 단계부터 데이터를 쌓기 시작하도록 구조 변경.
-  주의점: 진입가 도달 메시지 자체는 샘플 부족 여부와 무관하게 반드시 발송됨(기존 동작 유지).
-          매우 빠른 진입(포착 후 20초 이내)은 여전히 샘플 부족 가능 — 이 경우에도 도달 메시지는 발송됨.
-  개선점: 포착 후 60~80초 이후 도달 케이스의 샘플 부족 빈도↓, 체결속도 판단 유효성↑.
-
-- v41.55 (2026-03-13): track_signal_results 수급 이탈 경고 블록 버그 2건 수정.
-  [BUG-1 🔴 NameError] 7749줄 수급 이탈 경고 메시지에서 미정의 변수 `cur_price` / `pnl_pct` 참조.
-  `risk_flag=True` 조건 충족 시 반드시 NameError 발생해 경고 메시지가 전송되지 않고 except로 묻히던 문제.
-  수정: `cur_price` → `price`, `pnl_pct` → `pnl_now` (동일 함수 스코프 내 올바른 변수로 교체).
-  [BUG-2 🟡 코드품질] 7740줄 `lines = ""` 로컬 변수가 혼동을 유발하는 명명.
-  수정: `out_lines`로 변경해 가독성 및 유지보수성 개선. 동작 변경 없음.
-  개선점: 수급 이탈 경고 메시지 정상 발송↑, 변수명 혼동 위험↓.
-  주의점: `_weak_now = [k for k, v in _rot.get("weak", [])]` 구조는 `weak`가 항상 `list[tuple]`로 반환되므로 안전 — 수정 불필요 확인.
-
-- v41.54 (2026-03-13): 같은 종목 근접 재포착을 거래 에피소드 1건으로 통합하고, 대표 진입가/최종 결과를 단일 기준으로 고정.
-  [#1] 같은 종목·같은 신호가 비슷한 시점에 다시 포착될 때 `signal_log`에 별도 활성 추적 레코드를 계속 늘리지 않고, 기존 대표 레코드에 `episode_candidates` / `entry_update_history`를 누적하는 구조로 정리.
-  [#2] `register_entry_watch()`와 체결확정/실행준비 경로에서 대표 외 활성 레코드는 `대표진입승계` 상태로 정리하고, 사용자에게 제시되는 실전 진입 기준은 에피소드당 1건만 유지하도록 보강.
-  [#3] 이미 `entry_hit`된 대표 진입이 있는 경우 같은 에피소드의 재포착이 다시 진입가를 흔들지 않게 차단하고, 최종 `[자동 추적 결과]`도 대표 레코드 1건에만 귀속되도록 정리.
-  이유: 학습용 후보 다건 기록은 유지하더라도 사용자에게는 확정 진입가와 최종 결과가 하나로 보여야 실제 행동과 사후 학습 데이터가 일관되기 때문.
-  개선점: 근접 재포착 시 진입가 혼선↓, 동일 종목 다중 결과 확정↓, 대표 진입 기준 일관성↑, 학습용 후보 이력 보존↑.
-  주의점: 이미 결과가 종료된 뒤의 재포착은 새 거래 에피소드로 다시 생성될 수 있으며, 이번 버전에서 상단 버전/변경 이력도 실제 반영 로직과 일치하도록 정리.
-
-- v41.52 (2026-03-13): 체결확인 저장 안정화 + 진입감시 archive 경쟁조건 보강 + 주도섹터 조회 최적화.
-  [BUG-1] `_register_execution_setup_watch()`가 등록 직후 `_save_execution_setup_watch()`를 호출하지 않아, 체결확인 대기 등록 직후 프로세스 재시작 시 대기 상태가 유실될 수 있던 문제를 수정.
-  추가로 `detect_date`/`detect_time`/`market_basis`/기존 `signal_log_key`를 함께 보존해 후속 확정 메시지와 복구 일관성도 보강.
-  [BUG-2] `_archive_entry_watch_record()`의 consumed/archive 갱신을 단일 `_file_lock` 임계구역 안에서 처리하도록 정리해, polling 스레드/감시 루프가 동시에 종료 기록을 남길 때 마지막 쓰기 기준으로 일부 archive 항목이 누락될 수 있는 경쟁 조건을 완화.
-  [OPT-1] 시장 주도 섹터 payload 빌드 시 장상태(`KRX/NXT`)와 실시간 호가를 1회 빌드 단위 캐시로 재사용하도록 조정해, 중복 `is_market_open()`/`is_nxt_open()`/실시간 현재가 조회를 줄여 핫패스 부담을 낮춤.
-  개선점: 체결확인 복구 안정성↑, archive 기록 보존성↑, 주도섹터 스캔 응답성↑.
-
-- v41.51 (2026-03-13): 버그 2건 수정.
-  [BUG-1] `send_market_leading_sector_update` 스케줄 등록에 `_leader_job` 누락 수정.
-  기존: `schedule.every(5).minutes.do(lambda: send_market_leading_sector_update(...))` — passive replica도 실행 가능, 중복 알림 위험.
-  수정: `_leader_job(lambda: ...)` 로 감싸 leader 인스턴스만 실행하도록 정리.
-  [BUG-2] `_archive_entry_watch_record`의 consumed/archive 파일 읽기에 `_file_lock` 누락 수정.
-  기존: `_read_json_safe()` — lock 없이 읽기, `poll_telegram_commands` 별도 스레드와 경쟁 조건 가능.
-  수정: `_read_json_locked()` — `_file_lock` 보호 읽기로 교체. 이후 `_write_json_atomic` 호출은 별도 lock 획득이므로 데드락 없음.
-  개선점: passive replica 중복 알림 위험↓, archive 기록 스레드 안전성↑.
-
-- v41.50 (2026-03-13): 3단계 반영 — `_entry_watch` 파일 저장형과 active/consumed/archive 구조 도입.
-  [#1] `entry_watch_active.json`, `entry_watch_consumed.json`, `entry_watch_archive.json`을 추가하고 `_save_entry_watch_active()` / `_load_entry_watch_active()` / `_archive_entry_watch_record()`를 구현해, 진입가 감시 상태를 재시작 후에도 복구하되 종료된 watch는 active에서 제거하고 consumed/archive로만 보관하도록 정리.
-  [#2] `register_entry_watch()`, `_register_active_entry_watch_from_confirmation()`, `check_entry_watch()`, `run_entry_defense_monitor()`에 active 저장을 연결하고, 재포착 교체·기간만료·상승이탈·알림횟수만료 시 archive로 이동하도록 보강.
-  [#3] 시작 시 `_load_entry_watch_active()`를 호출해 active watch만 복구하고, expired/invalid/consumed 상태는 active에서 자동 정리되게 구성.
-  이유: 3단계에서는 `_entry_watch`를 단순 파일 저장이 아니라 active/consumed/archive 구조로 다뤄야 중복 알림과 종료된 watch 재등장을 줄일 수 있기 때문.
-  개선점: 진입가 감시 복구 안정성↑, 재시작 후 후속 추적 지속성↑, 종료 watch 재부활 위험↓.
-
-- v41.49 (2026-03-13): 2단계 반영본 보정 — `_execution_setup_watch` 저장형 helper 정의 누락 수정.
-  [#1] `_save_execution_setup_watch()` / `_load_execution_setup_watch()` 정의를 실제 코드 본문에 추가해, 실행 중 저장 호출과 시작 시 복구 호출이 런타임 `NameError` 없이 동작하도록 정리.
-  [#2] 기존 v41.48에서 넣었던 `execution_setup_watch.json` 상수, 등록/변경/정리 시 저장, 시작 시 복구 호출은 그대로 유지.
-  이유: 2단계 저장형을 반영하면서 helper 호출은 넣었지만 정의 블록이 빠져 있어, 재시작 또는 등록 시 런타임 오류가 날 수 있는 상태였기 때문.
-  개선점: 체결확인 대기 저장/복구 안정성↑, 2단계 반영 일관성↑.
-
-
-[변경 이력]
-- v41.44 (2026-03-13): 시장 주도 섹터 메시지 추가 및 오전/이슈장 가중형 발송 로직 도입.
-  [#1] `send_market_leading_sector_update()` / `_build_market_leading_sector_payload()`를 추가해 테마별 동반상승, 대장주 강도, 포함주 추종, 거래량 집중, 시장 대비 상대강도를 점수화한 `시장 주도 섹터` 메시지를 발송하도록 구현.
-  [#2] 오전(09:00~10:30)과 급격한 이슈 장세에서 대장주 기준과 점수 기준을 더 민감하게 적용하고, 장이 활발할수록 10~20분 주기로 더 자주 나가도록 가변 발송 간격을 도입.
-  [#3] `market_leader_sector_state.json` 상태 파일을 추가해 같은 내용이 짧은 간격으로 반복 발송되지 않게 하고, 대장주/포함주 구성이나 점수 변화가 있을 때만 재발송되도록 보강.
-  이유: 사용자가 대장주 혼자만 오르는 섹터보다 실제로 동반 상승이 붙는 `시장 주도 섹터`를 더 빠르게 보고 싶어 했고, 특히 오전과 대형 이슈 직후엔 고정 주기보다 이벤트 반응형 알림이 더 실전적이기 때문.
-  개선점: 주도 섹터 가시성↑, 오전/이슈장 반응 속도↑, 중복 메시지 피로도↓.
-  주의점: 기타업종이나 동반상승 종목 수가 부족한 테마는 제외되며, leader/passive 구조상 최종 발송은 leader 인스턴스만 수행한다.
-
-[변경 이력]
-- v41.43 (2026-03-13): 체결속도를 포착 억제형에서 보조형으로 재조정하고, 진입가 도달 시 체결 판단 표시를 강화.
-  [#1] `_apply_execution_speed_to_signal()`에서 FAST 신호군에 `execution_setup_required=True`를 기본으로 걸던 흐름을 제거해, 체결속도가 포착 수 자체를 줄이는 전역 필터처럼 작동하지 않도록 정리.
-  [#2] 포착 메시지의 체결속도 블록에 `강함/양호/보통/약함` 등급을 함께 표시하고, FAST 신호군은 좋은 체결속도에 가점·나쁜 체결속도에 약한 감점만 반영하도록 완화.
-  [#3] `[진입가 도달!]` 메시지에는 현재 시점 체결지속속도/눌림 유지/미세체결 제외비율과 함께 `진입 적합/보통/보류 우선` 판단 블록을 추가해, 포착시보다 진입 시점 판단에 더 무게를 두도록 보강.
-  이유: 사용자가 원한 체결속도의 목적은 종목 포착 수를 줄이는 것이 아니라 급등 종목의 상승 지속 안정성을 참고하고, 필요하면 좋은 종목을 추가 포착하거나 실제 진입 시 품질 판단을 돕는 보조지표이기 때문.
-  개선점: FAST 신호 포착량 회복 기대↑, 체결속도 해석력↑, 진입 시점 행동 판단 정보↑.
-  주의점: 장 초반/샘플 부족 구간에서는 체결속도 평가는 참고용으로만 쓰이며, 진입가 도달 메시지의 `보류 우선`은 경고이지 자동 차단은 아니다.
-
-[변경 이력]
-- v41.42 (2026-03-13): KIS API 404 경로 중 `chgrate-pcls-100` / `inquire-daily-trade` 처리 보강.
-  [#1] `_get_daily_investor_data()`를 `_safe_get_meta()` 기반으로 바꿔 `inquire-daily-trade`가 404/비정상 status/잘못된 응답일 때 일별 거래 API를 하루 동안 비활성화하고, code/status/사유를 한 번은 명확히 로그로 남기도록 정리.
-  [#2] `_daily_trade_api_fallback()` / `_get_daily_trade_api_disable_reason()`를 추가해, disable 상태에서도 왜 비활성화됐는지와 fallback 결과가 빈 리스트임을 조용히 숨기지 않도록 보강.
-  [#3] 업종/테마 보강용 3단계 랭킹 조회(`chgrate-pcls-100`)에서도 404/비정상 status를 공통 로그로 남기고, 비활성화 사유를 즉시 확인 가능하게 정리.
-  이유: 최신 로그에서 `chgrate-pcls-100`과 `inquire-daily-trade`가 404를 내며 일부 기능이 조용히 약해졌는데, 기존에는 fallback은 되더라도 어느 경로가 죽었는지 즉시 구분하기 어려웠기 때문.
-  개선점: 404 원인 가시성↑, daily-trade 경로의 조용한 실패 감소↑, rank/daily-trade fallback 추적성↑.
-
-- v41.41 (2026-03-13): 오버나이트/지정학 데이터를 파일 저장형으로 누적하고, 07:30 장전 리스크 평가에 통합 반영.
-  [#1] `overnight_active.json`, `geo_active.json` 활성 버퍼와 `overnight_snapshot_last.json`, `geo_snapshot_last.json` 스냅샷 파일을 도입해 야간 누적 데이터를 프로세스 재시작 후에도 유지.
-  [#2] `run_overnight_monitor()`와 `run_geo_news_scan()`가 메모리뿐 아니라 파일에도 상태를 기록하도록 보강.
-  [#3] `_build_premarket_risk_payload()`가 파일 기반 유효 오버나이트/지정학 상태를 읽어 07:30 메시지 안에 `야간 이슈 요약` 섹션으로 통합 반영. 지정학 점수도 파일 상태를 기준으로 계산.
-  [#4] 07:30 장전 리스크 평가 발송 성공 후 활성 버퍼는 비우고 날짜별 스냅샷으로만 보관. 08:30 업데이트 비교용으로는 마지막 스냅샷/요약만 유지.
-  이유: 20:10 종료/재시작 구조에서 야간 데이터가 메모리형이면 07:30 점수와 요약에 누락될 수 있어 파일 기반 지속성이 필요했기 때문.
-  개선점: 장마감 후~07:30 사이 오버나이트/지정학 이슈가 07:30 메시지와 점수에 안정적으로 반영됨.
-  주의점: 07:30 이후 활성 버퍼는 비워지므로, 이후 비교는 마지막 스냅샷과 새 이벤트 기준으로만 이뤄짐.
-- v41.40 (2026-03-13): 07:30/08:30 장전 메시지의 leader/passive 의존 완화 및 날짜별 1회 보장.
-  [#1] `preopen_dispatch_state.json` 상태 파일과 `_try_mark_preopen_dispatch()`를 추가해, 워치리스트/장전 리스크 평가/장전 리스크 업데이트를 replica와 관계없이 날짜별 1회만 처리하도록 정리.
-  [#2] 07:30 워치리스트, 07:30 장전 리스크 평가, 08:30 장전 리스크 업데이트 스케줄에서 `_leader_job(...)`를 제거하고 직접 once-wrapper를 호출하도록 변경.
-  [#3] 시작 시 07:30~08:45 catch-up도 leader 여부와 무관하게 once-wrapper 기준으로 동작하도록 정리해, passive로 떠도 해당 시간대 장전 메시지가 누락되지 않게 보강.
-  이유: 예전 버전에서는 오던 07:30/08:30 장전 메시지가 최근 버전에서는 leader/passive 영향으로 누락되는 체감이 있었기 때문.
-  개선점: 장전 메시지 발송 안정성↑, replica 전환 시 누락 감소↑, 중복 발송 없이 1회 보장↑.
-
-- v41.39 (2026-03-12): 장마감 전 선진입 후보(KRX/NXT) 조건 완화.
-  [#1] `_collect_next_open_gap_candidate_codes()`가 기존 detected/entry/carry/signal_log 외에 `_dynamic_candidates`와 `get_all_scan_candidates()`도 후보 풀에 보강 반영하도록 확장.
-  [#2] 선진입 플랜 조건을 소폭 완화해 `PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT` 기본값을 2.4→3.8, `PRECLOSE_GAP_MIN_RR` 기본값을 1.25→1.00으로 조정.
-  [#3] `NEXT_OPEN_GAP_POOL_MAX` 기본값을 10→20, `NEXT_OPEN_GAP_MIN_SCORE` 기본값을 55→48로 완화하고 payload에 `pool_count/candidate_count`를 실제 값으로 저장.
-  이유: 14:45 KRX / 19:20 NXT 장마감 전 추천이 실행되더라도 `pool=0, candidate=0`으로 끝나는 빈도가 높아, 후보군 확보와 선별 조건을 함께 조금 완화할 필요가 있었기 때문.
-  개선점: KRX/NXT 선진입 후보 노출률↑, 후보 풀 다양성↑, 실행 로그 가시성↑.
-
-- v41.37 (2026-03-12): 정상본 v41.34 기준으로 v41.35/v41.36 의도 재적용.
-  [#1] run_mid_pullback_scan()에서 실진입 불가(limit_up_locked/no_ask_liquidity) 판정 시 [눌림목 진입 신호]를 억제할 뿐 아니라 save_signal_log()/register_entry_watch()/등급 출력까지 중단하도록 정리.
-  [#2] `_get_countertrend_surge_context()`를 추가해 장기 하락 추세 속 급등(60일 수익률, 120일 고점 대비 낙폭, 20/60일선 관계)을 판정하고, UPPER_LIMIT/NEAR_UPPER/SURGE에 추세 역행 패널티를 반영.
-  [#3] 장기 하락 추세로 판정된 급등 신호는 최고 등급 A를 제한해 최대 B까지만 부여하고, 일반 포착 메시지 상단에 역추세 반등 주의 문구를 추가.
-  이유: v41.35의 차단 의도는 맞았지만 차단 후에도 저장/감시등록이 이어지는 논리 버그가 있었고, v41.36의 장기 하락 패널티도 helper 누락 없이 정상본 기준으로 다시 얹어야 했기 때문.
-  개선점: 실진입 불가 눌림목 오발송 제거, 장기 하락 급등 과대평가 감소, 메시지 해석력 향상.
-  주의점: 장기 하락 역추세 급등도 완전 차단은 아니며, 점수 감점과 등급 제한으로만 보수화한다.
-
-- v41.34 (2026-03-12): `_load_dynamic_params()`의 남아 있던 강제 완화 호출 제거.
-  [#1] `dynamic_params.json`이 없을 때 FileNotFoundError 분기에서 남아 있던 `_apply_capture_relaxation()` 호출을 제거해, 새 환경/초기 실행 시 `NameError`가 발생하지 않도록 정리.
-  이유: helper는 이미 제거됐는데 호출 한 줄이 남아 있어 런타임 버그가 날 수 있었기 때문.
-  개선점: 초기 실행 안정성↑, 재시작 일관성↑.
-
-- v41.32 (2026-03-12): 정상본 v41.30 기준으로 강제 포착 완화 제거를 재적용.
-  [#1] `_load_dynamic_params()`에서 `_apply_capture_relaxation()` 호출을 제거해, 재시작 시 저장된 학습/자동조정 파라미터를 강제 완화하지 않도록 정리.
-  [#2] `_apply_capture_relaxation()` helper 자체도 제거해, 학습 기반 동적 파라미터보다 강제 완화 기본선이 우선하지 않도록 정리.
-  이유: 오류가 난 v41.31을 기준으로 덧패치하지 않고, 마지막 정상본 v41.30에 v41.31의 의도였던 수정사항만 다시 적용하기 위함.
-  개선점: 저장된 동적 파라미터의 학습 결과 보존↑, 재시작 후 조건 일관성↑.
-  주의점: 포착량이 줄어든 상태라면 학습된 보수적 값이 그대로 유지되므로, 별도 완화 요청 없이 자동으로 느슨해지지 않는다.
-
-- v41.29 (2026-03-12): 체결속도 확인 확정 메시지에 과거 유사패턴 추가 + 가격 박스 순서 정리.
-  [#1] `_register_execution_setup_watch()`가 `change_rate`와 `volume_ratio`를 함께 저장하도록 보강해 `[체결속도 확인 → 진입 확정]` 단계에서도 포착 당시 기준으로 유사패턴을 계산할 수 있게 정리.
-  [#2] `_build_execution_confirmation_message()`에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 추가해, 확정 직전에도 동일 신호의 승률/평균 손익을 상단에서 바로 확인할 수 있게 보강.
-  [#3] 유사패턴이 표시되는 텔레그램 메시지에서는 가격 관련 진입 포인트 박스가 항상 그 아래에 오도록 순서를 유지/재확인.
-  이유: 사용자가 `[체결속도 확인 → 진입 확정]` 메시지에서도 과거 유사패턴을 보고 싶어 했고, 가격사항들은 유사패턴 아래에서 보는 편이 더 자연스럽다고 요청했기 때문.
-  개선점: 진입 확정 메시지 신뢰도 판단 정보↑, 메시지 상단 정보 구조 일관성↑.
-  주의점: 오래전에 등록된 일부 체결확인 대기 건은 change_rate/volume_ratio가 없어 현재값 또는 0값 기준으로 요약될 수 있다.
-
-- v41.28 (2026-03-12): KIS rank API 404/비정상 응답 fallback 경로 정리 및 로그 강화.
-  [#1] `get_upper_limit_stocks()`가 `chgrate-pcls-100` 호출에서 404/비정상 status/빈 output을 공통 fallback 경로로 처리하고, KRX 유니버스 fallback 후보군 개수까지 즉시 로그로 남기도록 정리.
-  [#2] `_rank_api_fallback()`에 사유·상태·fallback 건수 로그를 보강하고, disable 파일 reason을 함께 읽어 `disabled_today` 상태에서도 왜 비활성화됐는지 한 번은 바로 보이도록 개선.
-  [#3] `refresh_dynamic_candidates()` 로그에 KRX rank source가 실제 API인지 fallback인지 보조 표시를 추가해, 동적 후보군 0건 원인이 rank API 실패인지 한눈에 확인 가능하게 정리.
-  이유: `chgrate-pcls-100` 404가 날 때 NXT/KRX 후보군 약화가 체감되는데, 기존에는 단순 비활성만 남아 실행/대체/최종 건수를 즉시 구분하기 어려웠기 때문.
-  개선점: rank API 실패 원인 파악↑, fallback 사용 여부 가시성↑, 후보군 0건 디버깅 용이성↑.
-
-- v41.27 (2026-03-12): 텔레그램 반응성 개선 복구 + 장전 리스크 07:30 전환 + NXT 후보군 보강 재적용.
-  [#1] poll_telegram_commands()를 별도 daemon polling loop로 분리하고 schedule 기반 명령 polling을 제거해 /menu 및 버튼 반응 지연을 완화.
-  [#2] 장전 리스크 평가를 07:30으로 이동하고, 08:30에는 내용이 바뀐 경우에만 짧은 업데이트를 보내도록 보강.
-  [#3] _rank_from_universe()에 NXT 시장 지원을 추가하고, get_nxt_surge_stocks()/refresh_dynamic_candidates()가 NXT fallback 후보군을 반영하도록 확장.
-- v41.26 (2026-03-12): 트레일링 메시지 의미/발송조건 정리 + 눌림목 메시지 구조 복원 보강.
-  [#1] `[목표가 도달 → 트레일링 모드]`를 `[목표가 도달 → 보유 유지·트레일링]`으로 정리하고, 본문에 `지금은 매도 지시가 아니라 보유 유지 구간`이라는 안내를 추가해 기다림/보유 유지 의미가 분명하게 보이도록 수정.
-  [#2] 같은 종목의 다중 추적 레코드가 동시에 목표가를 넘을 때 가장 최근 대표 레코드만 트레일링 메시지를 보내도록 `_is_representative_tracking_record()`를 추가해 중복 발송을 억제.
-  [#3] `[눌림목 진입 신호]` 메시지에는 현재가를 진입 포인트 박스 안으로 옮기고, 하단에 따로 붙던 현재가 라인은 제거해 원래 구조에 더 가깝게 복원.
-  [#4] 날짜 표시는 제거가 아니라 빠진 곳만 유지/보강하는 원칙으로 두고, 이번 수정에서는 기존 날짜 helper 경로는 그대로 유지.
-  이유: 사용자 입장에서 트레일링 메시지가 청산 신호인지 보유 유지 신호인지 모호했고, 같은 종목에 여러 레코드 메시지가 뜨며 혼선이 있었으며, 눌림목 메시지 구조도 원래 배치에서 어긋나 있었기 때문.
-  개선점: 트레일링 의미 명확성↑, 중복 알림 혼선↓, 눌림목 메시지 가독성↑, 현재가 확인성↑.
-
-- v41.25 (2026-03-11): 장마감 전 갭투자 신호(KRX 14:45 / NXT 19:20) 실행 로그 및 catch-up 보강.
-  [#1] `send_next_open_gap_alert()`에 stage별 시작/시장닫힘/후보0건/발송완료 로그를 추가해, 함수가 안 돈 건지 후보가 0건인지 로그만으로 구분 가능하게 정리.
-  [#2] `preclose_gap_run_state.json`을 추가해 같은 날짜·같은 stage(KRX/NXT)의 선진입 후보 알림을 1회만 처리하고, 재시작 후 catch-up이나 중복 스케줄로 같은 알림이 다시 나가는 것을 방지.
-  [#3] 시작 시 14:45~15:05(KRX), 19:20~19:35(NXT) 구간이면 놓친 장마감 전 선진입 후보 알림을 1회 보완 발송하는 catch-up helper를 추가.
-  [#4] `build_next_open_gap_candidates()` payload에 pool_count / candidate_count 메타를 함께 담아 실행 로그에서 후보 풀 크기와 최종 건수를 바로 확인할 수 있게 보강.
-  이유: 최신 로그에서 19:20 NXT 장마감 전 선진입 후보 알림이 실제로 실행됐는지 구분이 안 되었고, 14:45 KRX도 같은 문제를 가질 수 있어 실행/후보0건/발송완료를 명확히 남기고 재시작 시 놓친 스케줄도 보완할 필요가 있기 때문.
-  개선점: KRX/NXT 선진입 후보 알림 가시성↑, 재시작 시 누락 복구력↑, 후보0건 원인 파악 용이성↑, 중복 발송 억제↑.
-  주의점: catch-up은 정해진 보완 시간창에서만 동작하며, 이미 같은 stage가 처리된 날이면 재발송하지 않는다.
-  영향: 14:45/19:20 관련 로그가 상세해지고, 재시작 직후 해당 시간창이면 선진입 후보 알림이 1회 보완 발송될 수 있다.
-- v41.24 (2026-03-11): 진입가 감시의 시장 선택(KRX/NXT/VI 예외)과 상태 기록 구조 정교화.
-  [#1] check_entry_watch()를 종목별 시장 선택 구조로 재정리해, KRX 정상 거래 중이면 KRX만 사용하고 KRX 종료 후 NXT 거래 가능 종목에만 NXT 가격을 사용하도록 보강.
-  [#2] KRX 장중 VI/거래정지 의심 + NXT 거래 가능 종목은 NXT 가격을 참고하되 즉시 [진입가 도달!]을 보내지 않고 `NXT참고도달`로 내부 기록 후 KRX 재확인을 기다리도록 추가.
-  [#3] _record_entry_reference_reach() 및 관련 signal_log 필드를 추가하고, 감시 만료 시 `진입미달 / 진입불가 / NXT참고도달`을 분리 기록하도록 조정.
-  [#4] 실제 entry_hit 확정 시 기존 entry_blocked / entry_reference_* 플래그를 정리해 최종 학습 데이터가 충돌하지 않도록 보강.
-  이유: KRX 전용 종목이 KRX 마감 후에도 진입가 도달 판정을 받거나, KRX VI 중 NXT가 움직일 때 같은 규칙으로 처리하면 시장별 의미가 섞여 통계와 알림이 왜곡될 수 있기 때문.
-  개선점: 시장별 판정 일관성↑, KRX/NXT 혼선 감소↑, `진입불가`와 `NXT참고도달` 구분 가능↑.
-  주의점: VI 탐지는 KIS 현재가 응답 플래그 + 호가 비정상 패턴을 함께 보는 보수적 추정이며, 확실한 VI API 연동 전까지는 참고용 성격이 있다.
-
-- v41.23 (2026-03-11): [진입가 도달!] 메시지에 과거 유사패턴 요약 추가.
-  [#1] register_entry_watch()가 진입가 감시 등록 시 유사패턴 재계산용 `change_at_detect`와 `volume_ratio`를 함께 저장하도록 보강.
-  [#2] check_entry_watch()의 [진입가 도달!] 메시지 상단에 `_build_similar_pattern_summary_block()` 기반 과거 유사패턴 요약을 노출해, 실제 진입 직전에도 동일 신호의 승률/평균 손익을 바로 확인할 수 있게 정리.
-  이유: 사용자가 [진입가 도달!] 단계에서도 과거 유사패턴을 보고 신뢰도를 판단하고 싶어 했고, 이미 포착 메시지에서 신뢰도가 높다고 느끼는 요소를 진입 시점에도 이어서 확인할 필요가 있기 때문.
-  개선점: 진입 시점 판단 정보↑, 메시지 일관성↑, 기존 유사패턴 로직 재사용으로 유지보수성↑.
-  주의점: 오래전에 등록된 일부 감시 건은 change_at_detect/volume_ratio 저장값이 없어 현재값 기반으로 요약될 수 있다.
-
-- v41.22 (2026-03-11): 가격 도달 but 실진입 불가 상태를 별도 기록하도록 보강.
-  [#1] check_entry_watch()에 상한가 고정/매도호가 부재 등 실진입 곤란 상태 필터를 유지하면서, 메시지 차단 시 _record_entry_blocked()를 통해 signal_log에 entry_blocked/entry_blocked_reason/time/price를 기록하도록 추가.
-  [#2] _record_entry_miss()는 entry_blocked 이력이 있는 감시건이 만료되면 최종 status를 `진입불가`로 기록하고, 일반 미도달과 분리되도록 조정.
-  [#3] _mark_entry_hit_in_signal_log()에서 이후 정상 진입이 성사되면 기존 entry_blocked 플래그를 정리해 최종 학습 데이터가 충돌하지 않도록 보강.
-  이유: 가격 숫자상 진입가에 닿았더라도 상한가 잠김 등으로 실제 체결이 불가능한 경우를 단순 `진입미달`로 처리하면 신호 품질 통계가 왜곡되기 때문.
-  개선점: `가격 도달 but 진입불가`와 `아예 미도달` 구분 가능, 학습 왜곡 감소, 사용자 설명 가능성↑.
-  주의점: 상한가 잠김이 풀린 뒤 이후 실제로 진입되면 최종 기록은 정상 진입 기준으로 이어진다.
-
-- v41.20 (2026-03-11): 대시보드 런타임 버그 2건 수정.
-  [#1] `_save_dashboard_state()`의 `_atomic_write_json` 오타를 `_write_json_atomic`으로 수정해 대시보드 상태 저장 시 NameError가 나지 않도록 정리.
-  [#2] 누락됐던 `get_today_performance_summary()` helper를 추가해 대시보드의 `오늘 성과` 요약이 안전하게 계산되도록 보강.
-  이유: `stock_alert_v41.19.py` 기준 전체 점검에서 대시보드 경로에 확정 런타임 버그 2건이 확인되어 최소 범위로 안정화가 필요했기 때문.
-  개선점: 대시보드 저장 안정성↑, 오늘 성과 요약 표시 안정성↑.
-  주의점: 성과 요약은 signal_log의 당일 완료 건 기준 간단 집계이며, 결과가 없으면 빈 문자열을 반환한다.
-  영향: 운영 대시보드 업데이트 경로의 NameError 가능성이 줄어든다.
-- v41.19 (2026-03-11): [진입가 도달!] 메시지에 포착시각과 실제 도달시각 동시 표시.
-  [#1] check_entry_watch()의 [진입가 도달!] 발송 전에 `_entry_hit_ts`를 먼저 계산하도록 순서를 조정해, 메시지 본문에 `포착`과 `도달`을 함께 표시하도록 정리.
-  [#2] 본문 헤더를 `원신호: ... | 포착: ... | 도달: ...` 형식으로 변경해, 신호 생성 후 실제 진입가 도달까지 걸린 시간을 사용자가 바로 구분할 수 있게 보강.
-  이유: 포착시각과 텔레그램 하단 전송시각 차이를 딜레이로 오해할 수 있어, 실제 진입가 도달시각을 본문에 명시할 필요가 있었기 때문.
-
-- v41.18 (2026-03-11): `[눌림목 진입 신호]` 상단 시각이 여전히 `now_str`를 써서 날짜 없이 보이던 문제 수정.
-  [#1] send_mid_pullback_alert() 메시지 헤더의 `🕐` 라인을 `now_str` 대신 `_format_capture_datetime_label()` 결과(`capture_label`)를 사용하도록 교체.
-  이유: 실제 포착 기준시각을 날짜+시간으로 보여주려는 변경이 있었지만, 눌림목 진입 신호 경로만 구형 변수(`now_str`)를 그대로 사용해 날짜가 누락되고 있었기 때문.
-  개선점: `[눌림목 진입 신호]`에서도 포착 날짜+시간 일관성 확보.
-
-- v41.17 (2026-03-11): 포착/진입 관련 메시지의 날짜+시간 표시 누락 정리.
-  [#1] `[눌림목 진입 신호]`와 일반 포착 상세 메시지 상단의 `now_str` 표기를 `_format_capture_datetime_label()` 기반으로 교체해 날짜+시간이 함께 보이도록 수정.
-  [#2] `register_entry_watch()`가 `detect_date`도 함께 저장하도록 보강해 `[진입가 도달!]` 메시지에서도 포착 날짜가 빠지지 않게 정리.
-  [#3] `[자동 추적 결과]`의 감지시각 표시도 공통 helper를 쓰도록 통일.
-  이유: 일부 메시지는 이미 날짜 helper를 쓰고 있었지만, 눌림목 진입·진입가 도달·자동 추적 결과 등 주요 운용 메시지에 날짜가 빠져 사용자 확인성이 떨어졌기 때문.
-  개선점: 포착/진입/결과 메시지의 시각 표시 일관성↑, 날짜 누락 감소↑.
-
-- v41.16 (2026-03-11): 유사패턴 기능을 상단 노출 + 전반 활용 구조로 확장.
-  [#1] `_get_similar_pattern_stats()` / `_build_similar_pattern_detail_block()` / `_build_similar_pattern_summary_block()` / `_apply_similar_pattern_score()`를 추가해 유사패턴을 상세형·요약형·점수형으로 공통화.
-  [#2] `EARLY_DETECT`, `NEAR_UPPER`, `SURGE`, `ENTRY_POINT`, `MID_PULLBACK`, `PRECLOSE_GAP_ENTRY` 계열 신호에 유사패턴 기반 점수 보정을 반영.
-  [#3] 일반 포착 상세 메시지, 눌림목 메시지, 종가선진입 후보/도달 메시지 상단에 유사패턴 요약 또는 상세 블록을 노출하도록 정리.
-  이유: 사용자가 과거 유사패턴 블록을 신뢰도 판단에 중요하게 보고 있어, 일부 상세 알림에만 제한되던 기능을 코드 전반에서 일관되게 활용할 필요가 있기 때문.
-  개선점: 신뢰 판단 속도↑, 메시지 상단 가독성↑, 과거 성과 기반 점수화 일관성↑.
-  주의점: signal_log 샘플이 적은 종목/신호는 유사패턴 표시나 점수 보정이 생략될 수 있다.
-
-- v41.14 (2026-03-11): v41.8 기준 재빌드 — 트레일링 오발송 억제 + 시작 메시지 버전 문구 정리 + 포착 날짜 표시 추가.
-  [#1] [목표가 도달 → 트레일링 모드]는 실제 진입가 도달 메타(도달가/도달시각)를 복구할 수 있는 레코드에서만 발송하도록 제한.
-  [#2] 시작 메시지의 하드코딩 문구 `스레드 안전성 활성 (v38.3)`를 `스레드 안전성 활성`으로 정리.
-  [#3] 포착/확정/선진입 관련 메시지의 포착 시각은 가능한 한 `YYYY-MM-DD HH:MM[:SS]` 형식으로 표시되도록 공통 helper 적용.
-
-- v41.8 (2026-03-11): 조건 자동 조정 중복 실행/중복 알림 억제 강화.
-  [#1] `auto_tune()`에 긴급 상태 락과 단계별 강화(stage 1/2/3)를 추가해, 같은 연속 손절 상태에서는 동일 긴급 튜닝을 반복 적용하지 않고 더 악화된 경우에만 추가 강화하도록 정리.
-  [#2] `auto_tune_state.json`을 도입해 직전 유효 파라미터 해시와 마지막 발송 해시를 저장하고, 실제 파라미터 변화가 있을 때만 조정 이력/텔레그램 메시지를 남기도록 보강.
-  [#3] Railway 다중 replica 상황을 줄이기 위해 `leader_lock.json` 기반 리더 락을 추가하고, 스케줄 실행/자동조정/장전 catch-up/초기 즉시 스캔은 리더 인스턴스만 수행하도록 정리.
-  [#4] `track_signal_results()`의 긴급 튜닝 트리거는 연속 손절 카운트를 강제로 0으로 되돌리지 않고 유지하며, 수익 발생 시 긴급 상태를 해제해 악화 시 추가 강화·회복 시 정상화 흐름이 이어지도록 조정.
-  이유: `조건 자동 조정 완료` 메시지가 실제 반복 튜닝과 replica 중복 실행이 섞여 과도하게 많아질 수 있어, 리스크 대응은 유지하면서도 같은 상태/같은 조정값의 중복 실행과 중복 발송을 줄일 필요가 있기 때문.
-  개선점: 동일 긴급상태 재튜닝 억제↑, 실질 변경 없는 조정 메시지 억제↑, replica 중복 실행 완화↑, 악화 시 추가 강화 유지↑.
-  주의점: 리더 락은 lease 기반이라 배포 전환 직후 약간의 승계 지연이 있을 수 있고, `leader_lock.json`이 잠시 남아 있어도 lease 만료 후 자동 승계된다.
-  영향: `조건 자동 조정 완료` / 긴급 튜닝 관련 알림 수가 줄고, 실제 값이 변했을 때 위주로만 발송된다.
-- v41.7 (2026-03-11): 07:30 DART 강재료 후보에 종목명 우선 표시 복구.
-  [#1] `_scan_recent_dart_materials()`가 DART 응답의 `corp_name`을 먼저 받아 `name_hint`로 `_resolve_stock_name()`을 호출하고, 응답 원본의 corp_name도 함께 저장하도록 보강.
-  [#2] `_build_preopen_issue_section()`의 `📢 공시(DART) 강재료 후보` 출력은 `종목명(코드)` 형식 우선으로 통일하고, 종목명 복구가 실패한 경우에만 코드 단독 fallback을 사용하도록 정리.
-  이유: 07:30 워치리스트 하단 DART 강재료 후보에서 일부 종목이 이름 없이 코드만 보여 사용자 가독성이 떨어지던 문제를 최소 범위에서 복구하기 위함.
-  개선점: 장전 공시 후보 가독성↑, 종목 식별 속도↑, DART 원본 corp_name 활용도↑.
-  주의점: DART 원본의 corp_name이 비어 있고 내부 종목명 복구도 실패한 경우에는 기존처럼 코드만 표시될 수 있다.
-  영향: `📢 공시(DART) 강재료 후보` 구간은 가능한 한 `종목명(코드)`로 표시된다.
-- v41.6 (2026-03-10): 목표가 도달/자동 추적 결과의 진입가 도달 정보 복구 강화.
-  [#1] `track_signal_results()` 경로에서 트레일링 모드·분할청산·자동추적결과 메시지 생성 시 현재 레코드의 exact log_key를 함께 넘기도록 보강해, 동일 종목 재포착/완료 상태에서도 도달가·도달시각을 정확히 조회하도록 정리.
-  [#2] `_lookup_entry_hit_fallback()`가 exact log_key 조회 시 status에 관계없이 현재 레코드를 우선 참조하고, 일반 entry_hit 필드뿐 아니라 legacy_entry_hit_* 보존값도 함께 읽도록 확장.
-  [#3] `_strict_cleanup_legacy_entry_hits()`가 cleanup 시 legacy_entry_hit_price/date/clock도 같이 백업하고, `_get_entry_hit_display()`가 legacy 필드까지 포함해 표시값을 복구하도록 보강.
-  이유: `[목표가 도달 → 트레일링 모드]`와 후속 자동 추적 결과에서 봇 재시작·정리 이후 또는 완료 레코드 상태에서 진입가 도달가/도달시각이 다시 빠지는 문제를 전반 경로에서 막기 위함.
-  개선점: 트레일링 모드 표시 안정성↑, 완료 결과 메시지 일관성↑, 재시작 후 도달 메타 복구력↑.
-  주의점: 과거 레거시 데이터 중 기존에 도달가/도달시각이 애초에 저장되지 않은 레코드는 여전히 일부가 비어 있을 수 있다.
-  영향: `[목표가 도달 → 트레일링 모드]`, `[분할 청산 타이밍]`, `[자동 추적 결과]`의 진입가 줄에서 도달 관련 정보가 더 안정적으로 표시된다.
-- v41.5 (2026-03-10): 빈칸/원형 기호 대체 없이 전역 제거.
-  [#1] 승률 바, 연관도/신뢰도/변동없음 마커, 중립 표시 등에 남아 있던 원형 중립 마커를 모두 제거하고 문구만 남도록 정리.
-  [#2] `_sanitize_telegram_text()` helper를 보강해 텔레그램 발송 직전 빈칸/원형 기호가 들어와도 빈 문자열로 제거되도록 변경.
-  이유: 사용자가 빈칸 기호를 다른 문자로 채우지 말고 아예 없애길 원했고, 원형 대체 표시도 같은 맥락에서 원치 않는다고 보았기 때문.
-  개선점: 불필요한 빈칸/중립 마커 제거, 메시지 외형 단순화, 재발 방지.
-  주의점: 승률 바 등 일부 출력은 빈칸 마커 없이 채워진 구간만 표시된다.
-  영향: `연관 없음`, `중립`, `변동 없음` 등은 아이콘 없이 문구만 표시된다.
-- v41.4 (2026-03-10): 체결지속속도 기반 진입 준비/확정 로직 추가.
-  [#1] 최근 시세 조회 스냅샷(가격·누적거래량·호가잔량)을 버퍼링해, 미세체결(낮은 체결금액) 필터를 거친 `execution_speed_score`와 `dip_resilience_score`를 계산하는 체결지속속도 엔진을 추가.
-  [#2] EARLY_DETECT / NEAR_UPPER / SURGE / PRECLOSE_GAP_ENTRY는 알림 직후 바로 진입가 감시로 넘기지 않고, 하락 중에도 체결지속속도가 유지되는지 확인하는 `진입준비` 상태로 저장한 뒤 확인 시점 가격으로 진입가·손절가·목표가를 확정하도록 변경.
-  [#3] ENTRY_POINT는 체결지속속도를 확인 필터로, MID_PULLBACK은 약한 가산점으로 반영해 신호 성격별 비중을 분리.
-  [#4] signal_log와 feature_snapshot에 체결지속속도/눌림유지/미세체결 제외비율/진입준비 여부를 함께 저장하고, 진입 확정 시 entry_hit/확정시각/확정가격으로 갱신해 후속 학습에 활용 가능하게 정리.
-  이유: 사용자가 원하는 진입 판단은 단순 상승 속도가 아니라 가격이 눌리는 동안에도 거래 흐름이 죽지 않는지 확인한 뒤 진입가를 확정하는 구조이므로, 빠른 신호군과 눌림목 계열의 역할을 나눠 최소 범위로 반영할 필요가 있기 때문.
-  개선점: 빠른 신호군 추격매수 완화↑, 눌림 유지 확인력↑, 진입준비→진입확정 데이터 일관성↑, 미세체결 잡음 완화↑.
-  주의점: 체결지속속도는 KIS 현재가 조회를 주기적으로 누적한 스냅샷 기반 추정치이며, 초단위 실제 체결 원본과는 차이가 있을 수 있다. 장 초반/초기 샘플 부족 구간에서는 보수적으로 `샘플 부족`으로 처리된다.
-  영향: 일부 빠른 신호는 즉시 진입가 감시 대신 `체결 확인 후 진입 확정` 흐름으로 바뀌며, 포착/선진입 메시지에 체결지속속도 요약이 함께 표시된다.
-- v41.2 (2026-03-10): 익영업일 갭상승 선진입 후보 + 장마감 전 진입가 도달 감시 추가.
-  [#1] 기존 14:45/19:20 익개장 갭상승 후보 알림을 "익영업일 갭상승 선진입 후보"로 재구성하고, 각 종목에 현재가·오늘 선진입가·손절가·익일 목표가·손익비를 함께 표시.
-  [#2] 새 신호유형 PRECLOSE_GAP_ENTRY를 추가해 signal_log에 별도 기록하고, 점수·가격계획·시장기준(KRX/NXT)·갭예측 메타데이터를 저장해 기존 성과 통계/학습 흐름에 편입.
-  [#3] 전용 preclose entry watch를 도입해 14:45~15:30 / 19:20~20:00 동안 실제 선진입가 도달 여부를 추적하고, 미도달 시 "종가전미도달"로 기록해 후보와 행동 결과를 분리 학습.
-  [#4] 다음 영업일 09:05에 전일 PRECLOSE_GAP_ENTRY 신호의 시초가/갭률을 signal_log에 자동 기록해, 익일 갭 실현 여부까지 내부 데이터로 누적.
-  이유: 사용자가 원하는 것은 익영업일 진입 후보가 아니라 오늘 장마감 전에 선진입할 종목이며, 후보 점수만으로는 행동 정보가 부족하므로 실제 진입가·도달 감시·익일 갭 실현 데이터까지 한 흐름으로 연결할 필요가 있기 때문.
-  개선점: 행동 가능성↑, 선진입 타이밍 명확성↑, 후보→도달→익일갭 데이터 일관성↑, 기존 학습 구조 재활용↑.
-  주의점: 선진입가는 당일 후반 가격 기준의 계획값이며, 실제 유동성/호가 공백으로 체결 체감이 다를 수 있다. 전용 감시는 마감 전까지만 유효하며 미도달 시 자동으로 진입미달 처리된다.
-  영향: 14:45·19:20 알림 문구와 저장 데이터가 바뀌고, 09:05에 전일 선진입 신호의 시초가/갭률 기록이 추가된다.
-- v41.1 (2026-03-10): 장마감 전 익영업일 갭상승 후보 2단계 알림 추가.
-  [#1] 14:45(KRX) / 19:20(NXT) 시점에 최근 포착·이월·감시 종목을 기반으로 익영업일 갭상승 후보를 점수화해 별도 알림으로 발송.
-  [#2] 점수는 당일 시세 강도, 고가권 유지, 거래량, 섹터 모멘텀, 최근 신호 강도, 미국시장 갭 방향, DART 강재료/NXT 흐름을 합산하고 DART 리스크는 감점.
-  [#3] 최신 후보 목록을 next_open_gap_candidates.json에 저장하고, 07:30 익개장 전 워치리스트에 상위 후보를 함께 표시하도록 연동.
-  이유: 장마감 전 방어 알림만으로는 부족하고, 다음 영업일 시초가 강세 가능성이 높은 종목을 미리 좁혀 행동 가능한 준비 알림을 제공하기 위함.
-  개선점: 익일 준비력↑, 장후반/NXT 흐름 활용↑, 기존 익개장 워치리스트와 연계↑, 사용자 판단시간 확보↑.
-  주의점: 갭상승은 예측 후보이며 실제 시가는 해외시장·야간뉴스·수급 변화에 따라 달라질 수 있다. 후보군은 최근 포착/이월/감시 종목 중심의 보수적 선별이다.
-  영향: 14:45·19:20에 후보 알림이 추가되고, 07:30 워치리스트에 최신 갭상승 후보 상위 종목이 함께 표시된다.
-- v41.0 (2026-03-10): 수수료/슬리피지 공통 합산값 반영 + gross/net 이중 저장.
-  [#1] ROUND_TRIP_COST_PCT 환경변수(기본 0.30)를 도입해, 이론 추적 완료 시 gross_pnl_pct와 net_pnl_pct를 함께 저장하고 pnl_pct는 net 기준으로 동기화.
-  [#2] 과거 signal_log 완료 레코드를 시작 시 1회 정규화해 gross/net/round_trip_cost_pct 필드를 보강하고, 기존 pnl_pct만 있던 기록도 net 기준 통계로 이어서 활용 가능하게 정리.
-  [#3] 성과 집계 helper를 추가해 신호 유형 통계, 유니버스 성과 반영, 이력 캐시가 net_pnl_pct를 우선 사용하도록 보강.
-  [#4] 수동 /result 기록은 실제 결과로 보고 gross/net을 동일값으로 저장해, 자동 비용 차감이 실거래 수익률을 다시 깎지 않도록 분리.
-  이유: 현재 학습/통계가 gross 기준으로 누적되어 실전 기대수익을 과대평가할 수 있어, 최소 범위 수정으로 net 기준 검증층을 추가하기 위함.
-  개선점: 성과 통계 실전 근접도↑, gross/net 비교 가능, 과거 로그 호환 유지, UI 변경 최소화.
-  주의점: 기본 공통 비용은 왕복 0.30%이며 증권사/종목/시간대별 실제 비용과 다를 수 있으므로, 실운용 환경에 맞게 환경변수로 조정해야 한다.
-  영향: 신규/기존 완료 기록의 pnl_pct는 net 기준으로 해석되며, 내부에는 gross_pnl_pct/net_pnl_pct가 함께 남는다.
-- v40.9 (2026-03-10): 트레일링 모드 메시지의 진입가 도달 정보 누락 보정.
-  [#1] register_entry_watch에서 signal_log 기준키(signal_log_key)를 함께 저장해, 이후 진입가 도달 기록이 현재 추적 레코드에 더 정확히 매칭되도록 보강.
-  [#2] _mark_entry_hit_in_signal_log()가 동일 종목/신호유형 후보가 여러 개일 때 첫 레코드가 아니라 exact log_key 우선, 없으면 최신 감지 레코드를 선택하도록 정리.
-  [#3] _get_entry_hit_display()에 signal_log/_entry_watch fallback 보강을 추가해, rec에 entry_hit_price·entry_hit_time이 비어 있어도 도달가·도달시각 표시를 최대한 복구.
-  이유: '[목표가 도달 → 트레일링 모드]' 메시지에서 실제로 기록된 진입가 도달 메타데이터가 누락 표시되는 문제를 최소 범위에서 복구하기 위함.
-  개선점: 트레일링/자동추적 결과 메시지의 도달가·도달시각 표시 안정성↑, 기존 포맷 유지, 학습/추적 로직 영향 최소화.
-  주의점: 과거 레코드 중 signal_log와 _entry_watch 모두 도달 정보가 비어 있는 건은 복구할 원천 데이터가 없어 여전히 빈 값일 수 있음.
-  영향: 동일 포맷을 쓰는 진입가/청산 관련 메시지에서 도달 정보가 더 자주 정상 표시됨.
-- v40.8 (2026-03-10): 포착 메시지 UI 재배치 + 뉴스 요약 통합.
-  [#1] 일반 포착(send_alert)·눌림목(send_mid_pullback_alert) 상세 메시지의 표시 순서를 재정렬. 핵심 포착 사유 다음에 진입 박스를 올리고, 섹터 모멘텀은 진입 박스 바로 아래 독립 블록으로 이동.
-  [#2] 포착 사유(reasons)에서 섹터·뉴스 관련 문구는 UI 표시 단계에서 중복 제거하고, 나머지 핵심 사유/경고만 구분해서 보여주도록 정리. 점수 계산 로직은 그대로 유지.
-  [#3] 기존 별도 텔레그램 `[종목명 뉴스 분석]` 후속 발송을 제거하고, 포착 메시지 내부에 압축된 `뉴스 요약` 블록으로 통합.
-  [#4] analyze()에서 이미 계산한 뉴스 심층분석 결과/기사 목록을 알림 payload에 저장하고, 조기포착·눌림목 등 뉴스가 사전 계산되지 않은 경로는 헤드라인 기반 빠른 요약만 붙이도록 분리.
-  [#5] 섹터 재안내 재전송 시에도 최초 뉴스 요약 payload를 함께 복제해, 재전송 메시지의 정보 일관성을 유지.
-  이유: 사용자가 가장 먼저 봐야 할 진입/손절/목표가를 상단에 배치하고, 섹터·뉴스를 한 메시지에 통합해 행동 가능한 알림 품질을 높이기 위함.
-  개선점: 모바일 가독성↑, 알림 수↓, 포착 메시지 일관성↑, 중복 정보↓.
-  주의점: 조기포착·눌림목 경로의 뉴스 요약은 포착 속도 저하를 막기 위해 AI 본문 분석 대신 캐시/헤드라인 기반 요약을 우선 사용하므로, 본문 심층분석보다 간략할 수 있다.
-  영향: 별도 `[종목명 뉴스 분석]` 텔레그램은 기본 미발송. 포착 메시지 안에서 핵심 뉴스 요약 확인 가능.
-- v40.7 (2026-03-10): /list 조회를 상태별 2구역으로 분리.
-  [#1] 기존 '감시 중인 종목' 단일 목록을 '진입가 감시중 종목'과 '진입가 도달 후 목표가 추적중 종목' 2구역으로 분리 표시.
-  [#2] 내부 _entry_watch의 entry_hit 상태를 기준으로 분류하고, 종목별로 진입가/목표가/손절가/포착시각을 함께 표시.
-  [#3] _detected_stocks에만 남아 있는 종목은 보조적으로 '진입가 감시중 종목'에 포함.
-  이유: 현재 텔레그램 메뉴에는 진입가 미도달 감시 종목과 진입가 도달 후 목표가 추적 종목을 따로 확인하는 화면이 없어, 사용자가 현재 상태를 한 번에 보기 어렵기 때문.
-  개선점: 조회 편의성↑, 현재 추적 상태 가시성↑, 메뉴 추가 없이 기존 감시 종목 기능 활용.
-  주의점: 과거/예외 데이터 중 현재가 정보가 없는 종목은 가격 일부가 비어 보일 수 있다.
-  영향: '📋 감시 종목' 버튼(/list)에서 상태별로 분리된 목록을 확인 가능.
-- v40.6 (2026-03-10): 섹터 미반영 종목 재안내 조건 보수화 + 별도 섹터 모니터링 메시지 축소.
-  [#1] 포착 당시 섹터 블록이 실질적으로 비어 있었던 종목만 재안내 후보로 등록.
-  [#2] alert-origin 섹터 모니터링은 별도 [종목 섹터 모니터링] 메시지를 보내지 않고, 조건 충족 시에만 전체 포착 메시지를 1회 재전송하도록 변경.
-  [#3] 재전송 제목을 🔁 [섹터 미반영 종목 재안내]로 고정하고, 본문은 기존 포착 메시지 전체 + 새로 확보된 섹터 블록을 포함하도록 구성.
-  [#4] 재전송 허용 조건을 보수적으로 추가: 포착 후 30분 이내, 진입 의미 유지, 원신호 훼손 없음, 진입가 도달 후 한참 지난 상태 아님, 섹터 정보가 요약/동반상승 기준으로 의미 있게 조회된 경우만 허용.
-  [#5] 눌림목 진입 신호(send_mid_pullback_alert)의 구형 배경 섹터 재조회 별도 메시지를 제거하고 동일한 재안내 흐름으로 통일.
-  이유: [종목 섹터 모니터링] 단독 메시지는 앞선 포착 정보와 분리되어 찾기 어렵고, 단순 섹터 조회 성공만으로 늦은 재알림이 가면 행동 가치가 낮아지기 때문.
-  개선점: 포착 정보 일관성↑, 섹터 재안내 품질↑, 불필요 후속 알림↓.
-  주의점: 섹터가 나중에 조회돼도 재전송 조건을 하나라도 만족하지 못하면 조용히 종료된다. alert-origin 재안내는 1회만 허용된다.
-  영향: 포착 시 섹터 미반영 종목은 유효할 때만 전체 포착 메시지로 재안내되고, 기존 별도 [종목 섹터 모니터링] 알림은 alert-origin 경로에서 기본 미발송.
-- v40.5 (2026-03-10): [진입 여부 확인] 자동 발송 기본 비활성화.
-  [#1] 이론 추적 완료 후 _request_actual_entry_confirm(rec)를 자동 호출하던 구간에 설정 플래그를 추가.
-  [#2] ACTUAL_ENTRY_CONFIRM_ENABLED 환경변수를 도입하고 기본값을 False(0)로 설정.
-  [#3] /result, /skip 등 수동 실거래 기록 명령은 유지하고, 자동 확인 텔레그램만 기본 차단.
-  이유: 사용자는 현재 실진입 기록을 하지 않으며, [진입 여부 확인] 메시지는 행동 불필요 알림이므로 기본수칙(알림 품질 우선, 실진입 여부와 무관한 동일 규칙)에 맞게 축소.
-  개선점: 불필요 텔레그램 알림↓, 사용자 알림 피로↓, 이론 추적/학습 로직과 실거래 입력 보조 알림 분리↑.
-  주의점: 실제 진입 기록을 다시 사용할 경우 ACTUAL_ENTRY_CONFIRM_ENABLED=1로 켜야 자동 확인 메시지가 재개됨.
-  영향: 이론 추적 결과 저장·자동 추적 결과 발송·내부 데이터 누적은 유지되고, [진입 여부 확인] 자동 메시지만 기본 미발송.
-- v40.4 (2026-03-10): 메시지 표기 재조정 — v40.2 기준 재작업 (v40.3 과반영안 폐기).
-  [#1] [분할 청산 타이밍], [자동 추적 결과]의 진입가 표시에 도달시각만 추가. 도달가는 표시하지 않음.
-  [#2] [목표가 도달 → 트레일링 모드]의 진입가 표시에 도달가·도달시각을 함께 표시.
-  [#3] [진입가 도달!]에는 섹터 모멘텀만 추가. 진입가/도달가/도달시각 추가는 하지 않음.
-  [#4] 진입가 도달 시 signal_log에 entry_hit_price, entry_hit_date, entry_hit_clock, entry_hit_time 저장 확장.
-  이유: 사용자 요청대로 메시지별 정보 범위를 분리하고, v40.3의 과반영 범위를 버리고 v40.2 안정본 기준으로 다시 정리.
-  개선점: 메시지 혼선↓, 진입 판단용 섹터 정보↑, 후속 추적 메시지 정보 정확도↑.
-  주의점: 과거 레코드에는 entry_hit_price/date/clock이 없을 수 있어 일부 메시지에 도달시각/도달가가 비어 보일 수 있음.
-  영향: 신규 진입가 도달 건부터 후속 메시지 표기 강화. [진입가 도달!]은 섹터 판단 중심으로 단순화.
-- v40.2 (2026-03-10): 기본수칙 #6 강화 반영 — 후속 AI 인수인계용 내부 기록 구조 보강.
-  [#1] 코드 로직 변경 없음. v40.1의 실동작(오버나이트/지정학/대시보드 제한, DART 이름복구)은 그대로 유지.
-  [#2] 상단 변경 이력을 모델 비의존적으로 재정리. 다음 AI가 모델이 달라도 수정 배경·영향·주의점을 바로 이해할 수 있게 문서화.
-  [#3] 후속 AI 인계 메모 섹션 추가. 수정 함수/의도/호환 포인트/추가 수정 시 주의사항을 명시.
-  이유: 기본수칙 #6 개정사항 반영. 버전 변경 + 내·외부 변경 이력 + 모델 변경 시에도 이해 가능한 기록 필요.
-  개선점: 유지보수성↑, 인수인계 명확성↑, 재수정 시 오판/중복수정 위험↓.
-  주의점: v40.2는 문서화 강화 버전이며, 실거래 로직 변경본이 아님.
-  영향: 운영 동작 변화 없음. 추후 AI/사람이 이어서 수정할 때 문맥 복원 속도 향상.
-- v40.1 (2026-03-10): 운영 알림 3건 정리 + DART 이름복구 버그 수정.
-  [#1] 오버나이트 알림 텔레그램 발송 차단 유지. 내부 요약/로그만 누적하도록 정리.
-  [#2] 지정학 이벤트 감지는 장중에만 발송하고, 직전 내용과 동일하면 재발송 생략.
-  [#3] 운영 대시보드는 장운영시간에만 갱신되도록 제한. 장마감 후 미발송.
-  [#4] _lookup_name_by_code 미정의 오류 수정. _resolve_stock_name 기반 호환 래퍼 추가로 DART 종목명 복구 안정화.
-  이유: 실제 실행 로그의 NameError 제거 + 불필요 사용자 알림 축소 + 기본수칙 #6 반영.
-  개선점: 런타임 안정성↑, 장외 알림 노이즈↓, 변경 이력 추적성↑.
-  주의점: _lookup_name_by_code는 호환용 래퍼로 유지되며, 신규 로직은 _resolve_stock_name 사용 권장.
-  영향: DART 재료 스캔 중단 방지, 장외 텔레그램 스팸 방지, 운영 가시성 개선.
-- v40.0 (2026-03-09): 11건 종합 개선 — 리스크 체계·메시지·학습 전면 업그레이드.
-  [#1] 진입가 도달 메시지에 포착 이유(reasons) 포함. register_entry_watch에 reasons 저장, check_entry_watch에서 상위 3개 표시.
-  [#2] 섹터 약세 시 진입가 도달 알림 차단. 섹터 평균 등락률 -1.5% 이하면 차단, 내부 로그만 기록.
-  [#3] 08:30 장전 리스크 평가 알림 신설 (안전/경계/위험 3단계). 미국시장+VIX+환율+지정학+코스피 5축 종합 판단.
-  [#4] 시장 레짐 명칭 통일: crash/bear/normal/bull 4단계. 한글: 급락장/약세장/보통장/강세장. get_regime_history·REGIME_KO_MAP 일치.
-  [#5] 리스크 원인별 엔진: 유동성/에너지·지정학/국내추세 3축 태깅. calc_overnight_risk, send_premarket_risk_assessment에 적용.
-  [#6] 시간대별 리스크 분리: 장중(normal)/금요일마감전(friday_close)/야간장전(pre_open) 프로파일. is_strict_time 확장.
-  [#7] 메시지 차단 사유 내부 로그(_log_suppressed_alert). suppressed_alerts.json에 누적, 학습·개선 데이터로 활용.
-  [#8] 장 후반/엄격 시간대 승인 기준 강화: 14:30 이후 + 금요일 14:00 이후 strict 판정.
-  [#9] 이벤트 유형별 승률 분리: get_signal_type_stats() 함수 추가. 장전 브리핑/주간 리포트에 유형별 승률 표시.
-  [#10] 상한가 종목 반복 알림 차단: 상한가 유지 중(change_rate>=29%) 추가 알림 완전 차단.
-  [#11] 버그 3건 수정: re→_re(NameError), _atomic_write_json→_write_json_atomic, CARRY_STOCKS_FILE→CARRY_FILE.
-  이유: 사용자 요청 11건 + 로그 분석 기반 3건 버그.
-  개선점: 진입가 도달 메시지 품질↑, 모순 알림 제거, 사전 리스크 방어↑, 레짐 체계 통일, 학습 데이터↑.
-  주의점: 레짐 라벨 변경으로 기존 로그 조회 시 구 명칭(panic/crisis 등) 호환 유지.
-  영향: 알림 품질 대폭 향상, 불필요 알림 50%+ 감소 예상, 리스크 사전 감지 능력↑.
-- v39.4-polish1 (2026-03-09): 이전 버전. 7건 운영 품질 + 로그 오류 수정.
 
 [후속 AI 인계 메모]
 - 목적: 이 섹션은 모델이 바뀌어도 다음 수정 AI가 바로 이해하도록 남기는 내부 인수인계 기록이다.
@@ -772,8 +391,6 @@ SIG_TITLES = {
 }
 def get_signal_label(signal_type: str, default: str = "") -> str:
     return SIG_LABELS.get(str(signal_type or ""), default or str(signal_type or ""))
-def get_signal_title(signal_type: str, default: str = "급등 감지") -> str:
-    return SIG_TITLES.get(str(signal_type or ""), default)
 
 
 # ============================================================
@@ -809,8 +426,8 @@ def is_trade_candidate_name(name: str) -> bool:
 import sys
 import hashlib
 import traceback
-import re as _re
-import re
+import re as _re  # docstring 파싱 등 초기화 단계 사용
+re = _re            # 이후 코드에서 re.xxx 사용 호환
 
 
 # === Regime label localization (Korean) ===
@@ -1427,19 +1044,6 @@ def _format_signal_type_stats_line(stats: dict) -> str:
 
 
 # [v41.84] 파일 I/O 안전성
-def safe_json_load(path: str, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except: return default
-
-def safe_json_dump(path: str, obj, indent: int = 2) -> bool:
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=indent)
-        return True
-    except: return False
 
 # [v41.84] 캐시 메모리 정리
 CACHE_TTL_SECONDS = 3600
@@ -1992,15 +1596,6 @@ def is_nxt_listed(code: str) -> bool:
     """
     return code not in _nxt_unavailable
 
-def effective_market_close() -> bool:
-    """
-    '실질적 장 마감' 여부
-    - NXT 상장 종목: NXT 20:00 이후
-    - KRX only 종목: KRX 15:30 이후
-    코드에서 '장이 완전히 끝났다'는 판단이 필요할 때 사용
-    """
-    return not is_any_market_open()
-
 def minutes_since(dt: datetime) -> int:
     return int((datetime.now() - dt).total_seconds() // 60)
 
@@ -2445,11 +2040,6 @@ def _apply_similar_pattern_score(score: int, reasons: list, code: str, signal_ty
     return score, reasons, stats
 
 
-def find_similar_patterns(code: str, signal_type: str, change_rate: float, vol_ratio: float) -> str:
-    stats = _get_similar_pattern_stats(code, signal_type, change_rate, vol_ratio)
-    return _build_similar_pattern_detail_block(stats)
-
-
 # ============================================================
 # v37.0 — 📊 중앙 이력 조회 시스템 (signal_log 기반)
 # 모든 알림/브리핑에서 과거 유사 상황 참조
@@ -2768,17 +2358,6 @@ def calc_trailing_stop(code: str, high_price: int) -> int:
     # fallback: 고점 × 0.97
     return int(high_price * 0.97 / 10) * 10
 
-def calc_entry_tolerance(code: str, price: int) -> float:
-    """
-    진입가 허용범위 (±%) 계산.
-    ATR 기반으로 종목마다 다르게 적용.
-    최소 1.0%, 최대 4.0%
-    """
-    atr_pct = calc_atr_pct(code, price, fallback_pct=2.0)
-    mult    = get_atr_regime_mult()
-    tol     = round(atr_pct * mult * 0.5, 1)
-    return max(1.0, min(tol, 4.0))
-
 def calc_reentry_bounce(code: str, price: int) -> float:
     """
     손절 후 재진입 반등 기준 (%) 계산.
@@ -2809,10 +2388,6 @@ def calc_partial_exit_min_pct(code: str, price: int) -> float:
     base = max(1.5, min(round(atr_pct, 1), 5.0))
     regime_mult = get_regime_partial_exit_mult()
     return max(1.0, min(round(base * regime_mult, 1), 7.0))
-
-def calc_trailing_stop_price(code: str, price: int) -> int:
-    """고점 기준 트레일링 스탑 — calc_trailing_stop의 별칭"""
-    return calc_trailing_stop(code, price)
 
 def calc_stop_target(code: str, entry: int, signal_type: str | None = None) -> tuple:
     """
@@ -3657,18 +3232,6 @@ def _load_entry_watch_active() -> None:
     except Exception:
         _entry_watch = {}
 
-def _save_entry_watch_consumed_store(store: dict) -> None:
-    try:
-        _write_json_atomic(ENTRY_WATCH_CONSUMED_FILE, _prune_entry_watch_store(store, ENTRY_WATCH_CONSUMED_KEEP_DAYS), indent=2)
-    except Exception:
-        pass
-
-def _save_entry_watch_archive_store(store: dict) -> None:
-    try:
-        _write_json_atomic(ENTRY_WATCH_ARCHIVE_FILE, _prune_entry_watch_store(store, ENTRY_WATCH_ARCHIVE_KEEP_DAYS), indent=2)
-    except Exception:
-        pass
-
 def _archive_entry_watch_record(log_key: str, watch: dict | None, consume_reason: str = "", final_status: str = "") -> None:
     if not isinstance(watch, dict):
         return
@@ -4084,10 +3647,6 @@ def _tick_exec_speed_prewarm() -> None:
             pass
 
 
-def _execution_setup_required(signal_type: str) -> bool:
-    return str(signal_type or "") in FAST_EXECUTION_SIGNAL_TYPES
-
-
 def _execution_score_label(score: int) -> str:
     s = int(score or 0)
     if s >= 80:
@@ -4176,14 +3735,6 @@ def get_effective_volume_ratio(signal_type: str, current_time: str) -> float:
         time_adj = 0.9
     required = max(2.0, min(base * time_adj, 10.0))
     return round(required, 1)
-
-
-def detect_emerging_theme() -> dict:
-    return {"is_emerging": False, "confidence": "low", "theme_name": ""}
-
-
-def calc_sector_momentum_with_potential(theme: str) -> dict:
-    return {"theme": theme, "potential": "중간", "momentum_score": 0}
 
 
 def get_dart_reliability_score(disclosure_type: str) -> int:
@@ -7733,21 +7284,6 @@ def _build_overnight_watchlist(detected_events: dict):
         print(f"⚠️ _build_overnight_watchlist: {e}")
 
 
-def load_overnight_watchlist():
-    """장 시작 시 야간 워치리스트 파일 복원"""
-    global _overnight_watchlist
-    try:
-        data = _read_json_safe(OVERNIGHT_WATCHLIST_FILE, {})
-        # 오늘 것만 (24시간 이내)
-        _overnight_watchlist = {
-            c: v for c, v in data.items()
-            if time.time() - v.get("ts", 0) < 86400
-        }
-        if _overnight_watchlist:
-            print(f"  🌙 야간 워치리스트 복원: {len(_overnight_watchlist)}종목")
-    except Exception: pass
-
-
 def _format_overnight_watchlist_block() -> str:
     """장전 브리핑용 야간 워치리스트 블록 생성"""
     if not _overnight_watchlist:
@@ -7883,46 +7419,6 @@ def calc_real_sector_score(code_a: str, code_b: str,
     else:             label = "연관 없음"
 
     return {"score": score, "layers": layers, "label": label}
-
-def get_real_sector_peers(code: str, name: str) -> list:
-    """
-    현재 스캔 중인 종목 후보군에서 실질 섹터 스코어 40 이상인 종목 반환.
-    캐시 30분.
-    반환: [(code, name, score, label)]
-    """
-    cache_key = f"real_{code}"
-    cached = _real_sector_cache.get(cache_key)
-    if cached and time.time() - cached["ts"] < 1800:
-        return cached["peers"]
-
-    try:
-        candidates = {}
-        for s in (get_volume_surge_stocks() + get_upper_limit_stocks()):
-            c = s.get("code","")
-            if c and c != code:
-                candidates[c] = s.get("name", c)
-
-        # DART 관계회사도 후보에 추가
-        for dart_code, dart_name, _ in get_dart_related_stocks(code):
-            if dart_code not in candidates:
-                candidates[dart_code] = dart_name
-
-        peers = []
-        for peer_code, peer_name in list(candidates.items())[:25]:
-            rs = calc_real_sector_score(code, peer_code, name, peer_name)
-            if rs["score"] >= 40:
-                peers.append((peer_code, peer_name, rs["score"], rs["label"]))
-            time.sleep(0.05)
-
-        peers.sort(key=lambda x: x[2], reverse=True)
-        result = peers[:8]
-        _real_sector_cache[cache_key] = {"peers": result, "ts": time.time()}
-        if result:
-            print(f"  🏗️ [{name}] 실질섹터: {[(n, s) for _, n, s, _ in result[:3]]}")
-        return result
-    except Exception as e:
-        print(f"⚠️ 실질섹터 계산 오류 ({code}): {e}")
-        return []
 
 def get_theme_sector_stocks(code: str) -> tuple:
     """
@@ -8520,20 +8016,6 @@ def _apply_result_labels(rec: dict):
     except Exception:
         pass
 
-
-
-def _is_real_trade(rec: dict) -> bool:
-    """
-    실제 진입한 거래만 통계에 포함할지 판단.
-    actual_entry=False(명시적 미진입) 또는 진입미달 상태는 제외.
-    """
-    if rec.get("actual_entry") is False:
-        return False
-    if rec.get("entry_miss") is not None:
-        return False
-    if "진입미달" in str(rec.get("exit_reason", "")):
-        return False
-    return True
 
 TRACK_ACTIVE_STATUSES = {"추적중", "진입준비"}
 TRACK_EPISODE_CANDIDATE_KEEP = int(os.getenv("TRACK_EPISODE_CANDIDATE_KEEP", "12") or "12")
@@ -11012,10 +10494,6 @@ def auto_tune(notify: bool = True):
 # ============================================================
 # 📊 차트 기능 (이미지 전송 + 링크)
 # ============================================================
-def _chart_links(code: str, name: str) -> str:
-    """차트 링크 — 인라인 키보드 버튼으로 외부 브라우저 오픈"""
-    # 빈 문자열 반환 (링크는 send_with_chart_buttons로 별도 처리)
-    return ""
 
 # ============================================================
 # 📡 섹터 지속 모니터링
@@ -12944,22 +12422,6 @@ def _is_news_reason_for_ui(raw_txt: str) -> bool:
     return t.startswith(news_prefixes)
 
 
-def _split_reasons_for_ui(reasons: list) -> tuple[list, list]:
-    core, warns = [], []
-    for r in reasons or []:
-        raw = str(r or '')
-        txt = raw.strip()
-        if not txt:
-            continue
-        if _is_sector_reason_for_ui(txt) or _is_news_reason_for_ui(raw):
-            continue
-        if txt.startswith(('⚠️', '⏰', '🔴 [HIGH]', '🔴', '🔁')):
-            warns.append(txt)
-        else:
-            core.append(txt)
-    return core, warns
-
-
 def _find_cached_deep_news_result(code: str, articles: list) -> dict:
     try:
         if not code or not articles:
@@ -13069,48 +12531,6 @@ def _build_news_summary_block(s: dict, allow_fetch: bool = False) -> str:
     for rp in risk_points[:2]:
         lines.append(f"  ⚠️ {rp}")
     return "━━━━━━━━━━━━━━━\n" + "\n".join(lines) + "\n"
-
-
-def _build_sector_summary_block(s: dict) -> str:
-    si = s.get('sector_info') or {}
-    theme = str(si.get('theme', '') or '').strip()
-    if not theme:
-        return ''
-    bonus = int(si.get('bonus', 0) or 0)
-    summary = str(si.get('summary', '') or '').strip()
-    rising = si.get('rising', []) or []
-    _bonus_tag = f"  +{bonus}점 ({_score_delta_impact_label(bonus)})" if bonus > 0 else ""
-    lines = [f"🏭 <b>섹터 모멘텀</b> [{theme}]" + _bonus_tag]
-    if summary:
-        lines.append(f"  {summary}")
-    if rising:
-        picks = []
-        for r in rising[:3]:
-            nm = _resolve_stock_name(r.get('code',''), r.get('name',''))
-            picks.append(f"{nm} {r.get('change_rate',0):+.1f}%")
-        if picks:
-            lines.append("  📌 동반 상승: " + ", ".join(picks))
-    return "\n".join(lines) + "\n━━━━━━━━━━━━━━━\n"
-
-
-def _build_conclusion_line(s: dict) -> str:
-    st = str(s.get('signal_type', '') or '')
-    price = safe_int(s.get('price', 0))
-    entry = safe_int(s.get('entry_price', 0))
-    bonus = int(((s.get('sector_info') or {}).get('bonus', 0)) or 0)
-    if st == 'ENTRY_POINT':
-        return '✅ 결론: 진입 구간 진입, 분할 접근 유효'
-    if st == 'EARLY_DETECT':
-        return '✅ 결론: 선진입 후보, 눌림 확인 후 접근 유효'
-    if st == 'MID_PULLBACK':
-        return '✅ 결론: 눌림목 구조 양호, 진입가 기준 분할 대기'
-    if is_strict_time():
-        return '⚠️ 결론: 강하지만 장시작·마감 근접 구간, 추격보다 눌림 우선'
-    if entry and price and price > entry * 1.03:
-        return '⚠️ 결론: 신호 강도는 높지만 진입가 대비 괴리 커서 눌림 대기 우선'
-    if bonus > 0:
-        return '✅ 결론: 섹터 자금 유입 확인, 눌림 후 분할 진입 유효'
-    return '✅ 결론: 수급·거래량 확인, 추격보다 기준가 확인 후 접근'
 
 
 def _sector_block(s: dict) -> str:
@@ -14565,39 +13985,6 @@ def _gather_news_stock_candidates(headlines: list[str]) -> list[dict]:
     return enriched[:NEWS_STOCK_PROMOTION_LIMIT]
 
 
-def _promote_news_stock_signals(headlines: list[str]) -> list[dict]:
-    promoted = []
-    for cand in _gather_news_stock_candidates(headlines):
-        hist_key = f"NXT_{cand['code']}" if cand.get("market") == "NXT" else cand["code"]
-        if time.time() - _alert_history.get(hist_key, 0) <= get_regime_cooldown():
-            continue
-        if time.time() - _news_stock_alert_history.get(hist_key, 0) < NEWS_STOCK_PROMOTION_COOLDOWN:
-            continue
-        stock = {
-            "code": cand["code"], "name": cand["name"], "price": cand.get("price", 0),
-            "change_rate": cand.get("change_rate", 0.0), "volume_ratio": cand.get("volume_ratio", 0.0),
-            "today_vol": cand.get("today_vol", 0), "market": cand.get("market", "")
-        }
-        signal = analyze(stock)
-        if not signal:
-            continue
-        headline = str((cand.get("hits") or [""])[0] or "").strip()
-        hit_count = int(cand.get("hit_count", 0) or 0)
-        signal["news_stock_promoted"] = True
-        signal["news_stock_hits"] = hit_count
-        signal.setdefault("reasons", []).insert(0, f"📰 뉴스→종목 직접 승격 {hit_count}건 — {headline[:54]}")
-        direct = cand.get("direct_theme") or {}
-        if direct.get("theme") and not signal.get("direct_news_hit"):
-            signal["direct_news_hit"] = True
-            signal["direct_news_theme"] = direct.get("theme", "")
-            signal["direct_news_bonus"] = int(direct.get("bonus", 0) or 0)
-        signal["_header_override"] = "📰 <b>[뉴스→종목 승격]</b>"
-        signal["_news_promotion_source"] = ",".join(cand.get("sources", []))
-        _news_stock_alert_history[hist_key] = time.time()
-        promoted.append(signal)
-    return promoted
-
-
 def _extract_alert_sector_theme(alert: dict) -> str:
     try:
         sec = str(alert.get("sector_theme", "") or "").strip()
@@ -14677,53 +14064,8 @@ def check_dart_risk(code: str) -> dict:
     _dart_risk_cache[code] = result
     return result
 
-def news_block_for_alert(code: str, name: str) -> str:
-    """알림 직후 백그라운드로 뉴스 역추적 — 30분 쿨다운으로 중복 크롤링 방지"""
-    now = time.time()
-    if now - _news_alert_sent.get(code, 0) < 1800: return  # 30분 쿨다운
-    _news_alert_sent[code] = now
-    def _fetch():
-        try:
-            articles = fetch_news_for_stock(code, name)
-            if not articles: return
-
-            # 심층 분석
-            deep  = analyze_news_deep(articles, name, code)
-            verd  = deep.get("verdict","중립")
-            adj   = deep.get("score_adj",0)
-            rsn   = deep.get("reason","")
-            rps   = deep.get("risk_points",[])
-
-            verd_emoji = {
-                "실질호재":       "✅",
-                "실질악재":       "❌",
-                "표면호재실질악재":"⚠️",
-                "표면악재실질호재":"💡",
-                "불확실":         "❓",
-                "중립":           "📰",
-            }.get(verd, "📰")
-
-            lines = "\n".join(f"  📰 {a['title']}  <i>{a['time']}</i>" for a in articles)
-
-            risk_text = ""
-            if rps:
-                risk_text = "\n⚠️ 주의사항:\n" + "\n".join(f"  🔸 {r}" for r in rps[:3])
-
-            send_with_chart_buttons(
-                f"{verd_emoji} <b>[{name} 뉴스 분석]</b>  {verd}  {adj:+d}점\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"{lines}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"💡 {rsn}"
-                f"{risk_text}",
-                code, name
-            )
-        except Exception: pass
-    threading.Thread(target=_fetch, daemon=True).start()
-
 def _normalize_news_headline(title: str) -> str:
     try:
-        import re as _re
         t = html.unescape((title or '').strip())
         # RSS description 결합부 정리
         t = t.replace('—', ' ').replace('–', ' ').replace('|', ' ')
@@ -15435,7 +14777,6 @@ _geo_cache: dict = {}  # keyword_hash → {result, ts}
 def _strip_html(text: str) -> str:
     try:
         # 매우 단순한 HTML 제거 (RSS description에 종종 포함)
-        import re as _re
         text = _re.sub(r"<[^>]+>", " ", text or "")
         text = _re.sub(r"\s+", " ", text).strip()
         return text
@@ -15491,7 +14832,6 @@ def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
         except Exception:
             # 2) 최후 fallback: 정규식 기반 RSS 추출 (BeautifulSoup 사용 안 함)
             try:
-                import re as _re
                 items = _re.findall(r"<item[^>]*>.*?</item>", xml_text, flags=_re.I | _re.S)
                 if not items:
                     # Atom <entry>
@@ -15527,44 +14867,6 @@ def _fetch_rss_headlines(url: str, max_items: int = 10) -> list:
             except Exception:
                 return []
 
-    except Exception:
-        return []
-def _fetch_gdelt_headlines(max_items: int = 25) -> list:
-    """(옵션) GDELT DOC API에서 지정학/공급망 관련 헤드라인+요약 수집"""
-    try:
-        # GDELT DOC 2.0 API: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
-        base = "https://api.gdeltproject.org/api/v2/doc/doc"
-        q = (
-            '(geopolitics OR war OR missile OR sanctions OR tariff OR "trade war" OR '
-            '"Middle East" OR Iran OR Israel OR Gaza OR Ukraine OR Russia OR "South China Sea" OR '
-            '"North Korea" OR "shipping" OR "Red Sea" OR "Hormuz")'
-        )
-        params = {
-            "query": q,
-            "mode": "ArtList",
-            "format": "json",
-            "maxrecords": str(max_items),
-            # 한국 투자에 유리하게 최근성 강화
-            "sort": "HybridRel",
-        }
-        resp = requests.get(base, params=params, timeout=12, headers=_random_ua())
-        if resp.status_code != 200:
-            return []
-        js = resp.json()
-        arts = js.get("articles") or []
-        out = []
-        for a in arts[:max_items]:
-            title = (a.get("title") or "").strip()
-            se = (a.get("seendate") or "")[:10]
-            src = (a.get("sourceCountry") or a.get("source") or "").strip()
-            sn  = (a.get("snippet") or "").strip()
-            sn  = _strip_html(sn)[:140] + ("…" if len(_strip_html(sn)) > 140 else "")
-            if title:
-                tail = " — " + sn if sn else ""
-                prefix = f"[{src}] " if src else ""
-                datep = f"{se} " if se else ""
-                out.append(f"{datep}{prefix}{title}{tail}")
-        return out
     except Exception:
         return []
 
@@ -20326,24 +19628,6 @@ def _get_code_hash() -> str:
             return hashlib.sha256(f.read()).hexdigest()[:8]
     except Exception:
         return "unknown"
-
-def _shutdown(reason: str = "정상 종료"):
-    """
-    봇 자동 종료 — Railway Cron 환경에서 사용.
-    Railway $5 플랜 400시간/월 제한 관리:
-      - 평일 22일 × 12.2시간(08:00~20:10) ≈ 268시간 → 400시간 이내 여유
-      - 공휴일 즉시 종료 (수 분 내) → 낭비 최소화
-      - 주말 Cron 미실행 (0-4 = 일~목 UTC = 월~금 KST)
-    """
-    print(f"\n{'='*55}")
-    print(f"🔴 봇 종료: {reason}  ({datetime.now().strftime('%H:%M')})")
-    print(f"{'='*55}")
-    try:
-        send(f"🔴 <b>봇 자동 종료</b>  {reason}\n"
-             f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    except Exception: pass
-    import os, sys
-    sys.exit(0)
 
 if __name__ == "__main__":
     print("="*55)
