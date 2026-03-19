@@ -3,30 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.85
+버전: v41.86
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v41.85 (2026-03-20): 미정의 상수 2건 NameError 수정 + 코드 위생 정리.
-  [#1] `_exec_speed_cache` 모듈 레벨 선언 누락 수정.
-       v41.84에서 `clean_expired_cache()`/`reset_daily_caches()`가 참조하지만
-       모듈 레벨 초기 선언이 빠져 있어 스케줄러 호출 시 NameError → 메인 루프 5초마다 반복 오류.
-       `clean_expired_cache()` 내부에 캐시 값 타입 방어(isinstance dict) 추가.
-  [#2] `MAX_TELEGRAM_BACKUPS = 5` 모듈 레벨 상수 추가.
-       `backup_to_telegram()`/`_prune_telegram_backup_messages()` 등에서 참조하지만
-       정의가 없어 자동 백업 스케줄 트리거 시 NameError → 메인 루프 완전 마비(1001회/84분).
-  [#3] `KRX_TIME_PARAMS` dict 추가.
-       `get_market_params("KRX", slot)`에서 참조하지만 `NXT_TIME_PARAMS`만 정의되어 있었음.
-       KRX 정규장은 시간대 차등 없이 기본값(mult=1.0) 단일 슬롯.
-  [#4] 미사용 함수 23개 제거 (303줄 감축) — AST 분석으로 호출부 0회 확인.
+- v41.86 (2026-03-20): 고아 추적 종목 자동 만료 시스템 도입.
+  [#1] `_is_orphan_tracking()` / `_get_valid_tracking()` / `purge_orphan_tracking()` 신규.
+       entry/stop/target이 모두 0인 채 "추적중"으로 남은 종목(고아)을 판별·필터·일괄 만료.
+       TRACK_MAX_DAYS(5일) 경과 시 "시간초과/고아추적_자동만료"로 강제 종료.
+  [#2] 코드 전체에서 "추적중" 목록 조회 7곳에 `_get_valid_tracking()` / `_is_orphan_tracking()` 적용.
+       적용 대상: send_overnight_risk_alerts, _send_pending_result_reminder,
+       poll_telegram_commands(/weekly, /daily), _send_stats, on_market_close,
+       _build_premarket_risk_payload.
+  [#3] 봇 시작 시 `purge_orphan_tracking(notify=True)` 자동 호출로 기존 고아 일괄 정리.
+  [#4] track_signal_results() 내부에도 고아 감지 시 만료 처리 추가 (장중 실시간 정리).
+  이유: 스피어 등 entry/stop/target 미설정 종목이 "추적중"으로 영구 잔류하여
+       오버나이트 위험 알림·장전 메시지·장마감 성과에 며칠째 반복 노출.
+  개선점: 고아 종목 자동 정리↑, 오버나이트/장전/장마감 메시지 품질↑, 추적 목록 정확성↑.
+  주의점: 고아 만료 대상은 entry/stop/target 모두 0인 경우에만 적용.
+       만료된 레코드는 status="시간초과"로 변경되어 TRACK_ACTIVE_STATUSES에서 제외 →
+       같은 종목이 이후 다시 포착되면 새 레코드로 정상 등록됨 (신규 포착 차단 없음).
+
+- v41.85 (2026-03-20): 미정의 상수 3건 NameError 수정 + 코드 위생 정리.
+  [#1] `_exec_speed_cache` 모듈 레벨 선언 누락 수정 → 메인 루프 NameError 해소.
+  [#2] `MAX_TELEGRAM_BACKUPS = 5` 상수 추가 → 백업 스케줄 NameError 해소.
+  [#3] `KRX_TIME_PARAMS` dict 추가 → get_market_params NameError 방지.
+  [#4] 미사용 함수 23개 제거 (303줄 감축).
   [#5] `import re` 중복 import 통합 + 함수 내부 재선언 3곳 제거.
   [#6] Changelog v41.58 이전 이력을 한 줄 요약으로 대체 (수칙 16).
-  이유: [#1]은 3/19 10:11부터, [#2]는 3/19 21:28(KST 06:28)부터 봇 완전 마비.
-       [#2]로 인해 3/20 07:30 장전 메시지 발송 실패.
-  개선점: 메인 루프 오류 해소↑, 장전 메시지 정상화↑, 파일 크기 감축↑.
-  주의점: [#1~#3]은 v41.84 원본부터 존재한 미정의 상수. [#4~#6]은 로직 변경 없는 순수 정리.
 
 - v41.84 (2026-03-19): 파일 I/O 안전화 + 캐시 정리 + 섹터 개선 + NXT/KRX 명확화.
   [#1] safe_json_load()/safe_json_dump() 함수 추가: with 문 자동화로 "Too many open files" 방지.
@@ -8034,6 +8040,58 @@ TRACK_EPISODE_CANDIDATE_KEEP = int(os.getenv("TRACK_EPISODE_CANDIDATE_KEEP", "12
 TRACK_ENTRY_UPDATE_HISTORY_KEEP = int(os.getenv("TRACK_ENTRY_UPDATE_HISTORY_KEEP", "8") or "8")
 
 
+# [v41.85] 고아 추적 판별 및 정리
+def _is_orphan_tracking(rec: dict) -> bool:
+    """entry/stop/target이 모두 0인 '추적중' 레코드인지 판별."""
+    if rec.get("status") != "추적중":
+        return False
+    return (not rec.get("entry_price") and
+            not rec.get("stop_price") and
+            not rec.get("target_price"))
+
+
+def _get_valid_tracking(data: dict) -> list:
+    """signal_log에서 고아를 제외한 유효 추적중 레코드만 반환."""
+    return [v for v in data.values()
+            if v.get("status") == "추적중" and not _is_orphan_tracking(v)]
+
+
+def purge_orphan_tracking(notify: bool = False) -> int:
+    """signal_log 전체에서 고아 추적 종목을 일괄 만료 처리. 봇 시작 시 호출."""
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+    except Exception:
+        return 0
+    today = datetime.now().strftime("%Y%m%d")
+    purged = 0
+    for log_key, rec in data.items():
+        if not isinstance(rec, dict):
+            continue
+        if not _is_orphan_tracking(rec):
+            continue
+        detect_date = rec.get("detect_date", "")
+        try:
+            elapsed = (datetime.strptime(today, "%Y%m%d") -
+                       datetime.strptime(detect_date, "%Y%m%d")).days if detect_date else 999
+        except Exception:
+            elapsed = 999
+        if elapsed >= TRACK_MAX_DAYS:
+            rec["status"] = TRACK_TIMEOUT_RESULT
+            rec["exit_date"] = today
+            rec["exit_reason"] = "고아추적_자동만료"
+            rec["pnl_pct"] = 0.0
+            purged += 1
+            print(f"  🗑 고아 추적 만료: {rec.get('name', rec.get('code', log_key))} ({elapsed}일 경과)")
+    if purged:
+        try:
+            _write_json_atomic(SIGNAL_LOG_FILE, data)
+        except Exception:
+            pass
+        if notify:
+            print(f"  🗑 고아 추적 총 {purged}건 자동 만료")
+    return purged
+
+
 def _extract_signal_detect_datetime(stock: dict | None) -> datetime:
     stock = stock or {}
     detected_at = stock.get("detected_at")
@@ -8547,7 +8605,7 @@ def send_overnight_risk_alerts():
         try:
             data = _read_json_locked(SIGNAL_LOG_FILE)
         except Exception: pass
-        tracking = [v for v in data.values() if v.get("status") == "추적중"]
+        tracking = _get_valid_tracking(data)  # [v41.85] 고아 추적 제외
         if not tracking: return
 
         high_risk = []
@@ -8896,6 +8954,7 @@ def _send_pending_result_reminder():
         pending = [
             v for v in data.values()
             if v.get("status") == "추적중"
+            and not _is_orphan_tracking(v)
             and v.get("detect_date") == today
         ]
         if not pending:
@@ -8994,7 +9053,23 @@ def track_signal_results():
             target       = rec.get("target_price", 0)
             detect_date  = rec.get("detect_date", today)
 
-            if not entry or not stop or not target: continue
+            # [v41.85] 고아 추적 종목 자동 만료: entry/stop/target이 없으면 판정 불가
+            # → TRACK_MAX_DAYS 경과 시 "시간초과"로 강제 종료, 미경과 시 skip
+            if not entry or not stop or not target:
+                try:
+                    elapsed_orphan = (datetime.strptime(today, "%Y%m%d") -
+                                     datetime.strptime(detect_date, "%Y%m%d")).days
+                except Exception:
+                    elapsed_orphan = 0
+                if elapsed_orphan >= TRACK_MAX_DAYS:
+                    rec["status"] = TRACK_TIMEOUT_RESULT
+                    rec["exit_date"] = today
+                    rec["exit_reason"] = "고아추적_자동만료"
+                    rec["pnl_pct"] = 0.0
+                    _tracking_notified.add(log_key)
+                    updated = True
+                    print(f"  🗑 고아 추적 자동 만료: {rec.get('name', code)} (entry/stop/target 미설정, {elapsed_orphan}일 경과)")
+                continue
 
             # 경과 일수 계산
             try:
@@ -9605,6 +9680,14 @@ def load_carry_stocks():
              "\n".join([f"• {v['name']} ({k})" for k,v in list(_detected_stocks.items())[:6]]) +
              ("\n  ..." if len(_detected_stocks) > 6 else "") +
              "\n\n📡 스캔 재개")
+
+    # [v41.85] 고아 추적 종목 일괄 정리 (봇 시작 시 1회)
+    try:
+        _orphan_count = purge_orphan_tracking(notify=True)
+        if _orphan_count:
+            print(f"🗑 봇 시작 시 고아 추적 {_orphan_count}건 자동 만료")
+    except Exception as _oe:
+        print(f"⚠️ 고아 추적 정리 오류: {_oe}")
 
     # ③ 컴팩트 모드 복원
     _load_compact_mode()
@@ -16366,7 +16449,8 @@ def poll_telegram_commands():
                                     and v.get("status") in ["수익","손실","본전"]]
                     week_tracking = [v for v in data.values()
                                      if this_mon <= v.get("detect_date","") <= this_fri
-                                     and v.get("status") == "추적중"]
+                                     and v.get("status") == "추적중"
+                                     and not _is_orphan_tracking(v)]
                     if not week_done and not week_tracking:
                         send("📅 이번 주 신호 없음"); continue
                     msg = f"📅 <b>이번 주 잠정 성과</b>  {this_mon[4:6]}/{this_mon[6:]} ~ {this_fri[4:6]}/{this_fri[6:]}\n━━━━━━━━━━━━━━━\n"
@@ -16409,9 +16493,9 @@ def poll_telegram_commands():
                     }
                     today_recs   = [v for v in data.values() if v.get("detect_date") == today]
                     done_today   = [v for v in today_recs if v.get("status") != "추적중"]
-                    tracking_today = [v for v in today_recs if v.get("status") == "추적중"]
+                    tracking_today = [v for v in today_recs if v.get("status") == "추적중" and not _is_orphan_tracking(v)]
                     # 이월 추적 중 포함
-                    all_tracking = [v for v in data.values() if v.get("status") == "추적중"]
+                    all_tracking = _get_valid_tracking(data)
 
                     if not today_recs and not all_tracking:
                         send(f"📊 {today_str} 오늘 신호 없음"); continue
@@ -17085,7 +17169,7 @@ def _send_stats():
 
         # ── 이론 완료 (전체 — 봇 학습 + 신호 품질 평가용) ──
         completed      = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
-        tracking       = [v for v in data.values() if v.get("status") == "추적중"]
+        tracking       = _get_valid_tracking(data)
         # ── 실제 진입 (내 수익 통계용 — /result 또는 /진입 확인분만) ──
         actual_entered = [v for v in data.values()
                           if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
@@ -17363,7 +17447,7 @@ def on_market_close():
         today_recs   = [v for v in data.values() if v.get("detect_date") == today]
         done_today   = [v for v in today_recs if v.get("status") != "추적중"]
         # 전체 추적 중 (날짜 무관)
-        all_tracking = [v for v in data.values() if v.get("status") == "추적중"]
+        all_tracking = _get_valid_tracking(data)
 
         sig_labels = {
             "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
@@ -17628,7 +17712,7 @@ def _build_premarket_risk_payload() -> dict:
 
     try:
         data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
-        tracking = [v for v in data.values() if v.get("status") == "추적중"]
+        tracking = _get_valid_tracking(data)
         if tracking and level in ("경계", "위험"):
             msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
             for rec in tracking[:5]:
