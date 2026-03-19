@@ -3,18 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.81
+버전: v41.82
 날짜: 2026-03-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.81 (2026-03-19): [익영업일 갭상승 선진입 후보] 공용 추적 저장 플래그 버그 수정.
-  [#1] `check_preclose_gap_entry_watch()`에서 `peak_price` 상향 갱신 시 잘못된 로컬 변수 `changed_active`를 쓰던 부분을 공용 저장 플래그 `changed`로 교체.
-       기존: 가격이 최초 기준가보다 높아지는 순간 `NameError`가 발생할 수 있었고, broad except에 묻혀 KRX/NXT 공용 선진입 추적이 조용히 건너뛰어질 수 있었음.
-       수정: peak_price 갱신이 정상 저장되고, 이후 선진입가 도달·체결속도 확인·후속 watch 등록 흐름이 계속 이어지도록 정리.
-  이유: `[익영업일 갭상승 선진입 후보]`는 KRX 14:45와 NXT 19:20이 같은 `check_preclose_gap_entry_watch()`를 타므로, 공용 추적부 런타임 오류를 먼저 제거해야 둘 다 정상화되기 때문.
-  개선점: KRX/NXT 공용 선진입 추적 안정성↑, peak_price 저장 일관성↑, 조용한 skip 리스크↓.
-  주의점: 이번 버전은 후보 선별식/메시지 포맷/시간대 로직을 건드리지 않고 공용 추적부 버그만 최소 수정한 핫픽스다.
+- v41.82 (2026-03-19): 약한 신호 1차 행동 알림 차단 + 관찰 전용 전환.
+  [#1] `ENTRY_SPLIT_RULES`의 `약한` 구간을 `1차 0% / 2차 0% / reserve 100%`로 조정.
+       `calc_position_size()` 가이드도 `관찰 전용`으로 변경해, 원래 2차 금지 대상 신호가
+       1차 실진입 비중으로 사용자에게 보이지 않도록 정렬.
+  [#2] `check_entry_watch()` 1차 도달 분기에서 `약한` 신호는 사용자 알림을 보내지 않고
+       `_log_suppressed_alert()` + signal_log 정책제외 기록 후 즉시 감시 종료하도록 보강.
+       KRX/NXT 공통 도달 경로에 적용돼 `[1차 진입가 도달]`→`[2차 진입 판단 금지]` 혼선을 차단.
+  [#3] `_record_entry_policy_filtered()`를 추가해, 약한 신호 1차 제외 사유/시각/가격을
+       signal_log에 `정책제외` 상태로 남기고 내부 학습·추적 데이터는 유지하도록 정리.
+  이유: 사용자 기준에서 원래 2차 추가매수 금지 대상인 약한 신호가 1차 행동 알림으로 올라오면,
+       이후 2차 금지 메시지가 정상 작동하더라도 실전 체감상 손실 종목만 늦게 확인하는 구조가 되기 때문.
+  개선점: 1차 행동 알림 품질↑, 2차 금지 메시지 혼선↓, KRX/NXT 공통 진입 판단 일관성↑.
+  주의점: 약한 신호는 사용자 행동 알림에서 제외되지만 suppressed_alerts/signal_log 내부 기록은 유지된다.
 
 - v41.80 (2026-03-19): 신호 강도 판정 버그 수정 + 동시보유 제한 실적용 + 2차 금지 시 API 절약.
   [#1] register_entry_watch()에 grade/score 저장 추가.
@@ -4064,7 +4070,7 @@ def _classify_signal_strength(watch: dict, exec_metrics: dict | None = None) -> 
 ENTRY_SPLIT_RULES = {
     "강한": {"phase1_pct": 45, "phase2_pct": 30, "reserve_pct": 25, "phase2_allowed": True},
     "보통": {"phase1_pct": 35, "phase2_pct": 25, "reserve_pct": 40, "phase2_allowed": True},
-    "약한": {"phase1_pct": 25, "phase2_pct": 0,  "reserve_pct": 75, "phase2_allowed": False},
+    "약한": {"phase1_pct": 0,  "phase2_pct": 0,  "reserve_pct": 100, "phase2_allowed": False},
 }
 
 def _get_entry_split_rule(strength: str) -> dict:
@@ -5250,7 +5256,7 @@ def check_preclose_gap_entry_watch() -> None:
             changed = True
             if price > int(watch.get("peak_price", 0) or 0):
                 watch["peak_price"] = price
-                changed = True
+                changed_active = True
             if price > int(watch.get("entry_price", 0) or 0):
                 continue
             metrics = get_execution_speed_metrics(watch.get("code"), current_price=price)
@@ -11244,6 +11250,42 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
         print(f"⚠️ 진입불가 기록 오류: {e}")
 
 
+def _record_entry_policy_filtered(watch: dict, reason: str, filtered_price: int, final_status: str = "정책제외"):
+    """정책상 사용자 행동 알림에서 제외한 진입감시건을 signal_log에 기록."""
+    try:
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        filtered_date, filtered_clock = (now_s.split(' ', 1) + [""])[:2]
+        updated = False
+        for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
+            if (rec.get("code") == watch.get("code")
+                    and rec.get("status") in ("추적중", "진입준비")
+                    and rec.get("signal_type") == watch.get("signal_type")):
+                rec["status"] = str(final_status or "정책제외")
+                rec["pnl_pct"] = 0.0
+                rec["exit_reason"] = f"{final_status}_{reason}" if reason else str(final_status or "정책제외")
+                rec["entry_policy_filtered"] = True
+                rec["entry_policy_reason"] = str(reason or "")
+                rec["entry_policy_time"] = now_s
+                rec["entry_policy_date"] = filtered_date
+                rec["entry_policy_clock"] = filtered_clock
+                rec["entry_policy_price"] = int(filtered_price or 0)
+                updated = True
+                break
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        print(f"  👀 정책제외 기록: {watch.get('name','')} {reason} @ {int(filtered_price or 0):,}")
+    except Exception as e:
+        print(f"⚠️ 정책제외 기록 오류: {e}")
+
+
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
     """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
     try:
@@ -11721,14 +11763,6 @@ def check_entry_watch():
                     )
                     continue
 
-                watch["last_notified_ts"] = now_ts
-                watch["notify_count"]     = notify_count + 1
-                watch["entry_reference_only"] = False
-                watch["entry_reference_market"] = ""
-                watch["entry_reference_reason"] = ""
-                watch["entry_reference_time"] = ""
-                watch["entry_reference_price"] = 0
-                changed_active = True
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
@@ -11798,6 +11832,40 @@ def check_entry_watch():
                 # 신호 강도 판정
                 _strength = _classify_signal_strength(watch, _entry_exec_metrics)
                 _split_rule = _get_entry_split_rule(_strength)
+
+                if is_phase1 and _strength == "약한":
+                    _policy_reason = "약한 신호 1차 진입 제외"
+                    watch["signal_strength"] = _strength
+                    watch["entry_policy_filtered"] = True
+                    watch["entry_policy_reason"] = "weak_signal_phase1"
+                    watch["entry_policy_time"] = _entry_hit_ts
+                    watch["entry_policy_price"] = int(price or 0)
+                    changed_active = True
+                    _record_entry_policy_filtered(watch, _policy_reason, price, final_status="정책제외")
+                    _log_suppressed_alert(
+                        watch["code"], watch["name"],
+                        _policy_reason,
+                        watch.get("signal_type", ""),
+                        {
+                            "entry_price": entry,
+                            "filtered_price": int(price or 0),
+                            "signal_strength": _strength,
+                            "grade": watch.get("grade", ""),
+                            "score": watch.get("score", 0),
+                            "market": "NXT" if use_nxt else "KRX",
+                        }
+                    )
+                    expired.append((log_key, "정책제외_약한신호", "정책제외"))
+                    continue
+
+                watch["last_notified_ts"] = now_ts
+                watch["notify_count"]     = notify_count + 1
+                watch["entry_reference_only"] = False
+                watch["entry_reference_market"] = ""
+                watch["entry_reference_reason"] = ""
+                watch["entry_reference_time"] = ""
+                watch["entry_reference_price"] = 0
+                changed_active = True
 
                 if is_phase1:
                     # ━━━ 1차 진입가 도달 ━━━
@@ -19427,7 +19495,7 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
         elif strength == "강한" and p >= 0.6:
             guide = f"💪 고확률 신호 — 1종목 적극 진입"
         elif strength == "약한":
-            guide = f"⚠️ 약한 신호 — 1차만 소량 진입, 2차 금지"
+            guide = f"👀 약한 신호 — 관찰 전용, 실진입 제외"
         else:
             guide = f"📊 표준 비중 — 1종목 분할 진입"
 
