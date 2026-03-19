@@ -3,24 +3,29 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.82
+버전: v41.83
 날짜: 2026-03-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
-- v41.82 (2026-03-19): 약한 신호 1차 행동 알림 차단 + 관찰 전용 전환.
-  [#1] `ENTRY_SPLIT_RULES`의 `약한` 구간을 `1차 0% / 2차 0% / reserve 100%`로 조정.
-       `calc_position_size()` 가이드도 `관찰 전용`으로 변경해, 원래 2차 금지 대상 신호가
-       1차 실진입 비중으로 사용자에게 보이지 않도록 정렬.
-  [#2] `check_entry_watch()` 1차 도달 분기에서 `약한` 신호는 사용자 알림을 보내지 않고
-       `_log_suppressed_alert()` + signal_log 정책제외 기록 후 즉시 감시 종료하도록 보강.
-       KRX/NXT 공통 도달 경로에 적용돼 `[1차 진입가 도달]`→`[2차 진입 판단 금지]` 혼선을 차단.
-  [#3] `_record_entry_policy_filtered()`를 추가해, 약한 신호 1차 제외 사유/시각/가격을
-       signal_log에 `정책제외` 상태로 남기고 내부 학습·추적 데이터는 유지하도록 정리.
-  이유: 사용자 기준에서 원래 2차 추가매수 금지 대상인 약한 신호가 1차 행동 알림으로 올라오면,
-       이후 2차 금지 메시지가 정상 작동하더라도 실전 체감상 손실 종목만 늦게 확인하는 구조가 되기 때문.
-  개선점: 1차 행동 알림 품질↑, 2차 금지 메시지 혼선↓, KRX/NXT 공통 진입 판단 일관성↑.
-  주의점: 약한 신호는 사용자 행동 알림에서 제외되지만 suppressed_alerts/signal_log 내부 기록은 유지된다.
+
+- v41.83 (2026-03-19): 진입 근거 재검증 + 거래량 동적 기준 + 유동성/수급/DART 메타 보강 + 바닥 재상승 보조판정.
+  [#1] `check_entry_watch()`에 `_record_entry_dropped()`/`should_skip_expiration_for_dart_watch()`를 연결해,
+       진입가 도달 시점에 신호강도 재약화·거래량 급감(포착 대비 50%↓)이면 내부 기록 후 감시 종료하도록 보강.
+       DART 기반 워치는 `shareholder_confirmation_date`가 남아 있으면 근거 재검증 탈락을 면제.
+  [#2] `get_effective_volume_ratio()`/`check_liquidity()`를 추가해 `analyze()`의 거래량 기준을 신호유형×시간대별 동적으로 적용하고,
+       호가 유동성이 빈약한 종목은 포착 전 보수적으로 차단하도록 정리.
+  [#3] `analyze()`에 체결속도 강도, 외국인/기관 부호 전환, 직접뉴스×신호유형, 공매도 저비중(+5) 가점을 통합하고,
+       외국인+기관 동시 순매수 가점은 +30으로 상향. 이동평균 정배열 기준은 `5일선>20일선`으로 완화.
+  [#4] `register_entry_watch()`와 active watch 복원 경로에 `signal_strength_at_detect`/`execution_speed_at_detect`/
+       `pullback_ratio_at_register`/`volume_ratio_at_detect`/`dart_reliability_score`/`shareholder_confirmation_date`/
+       `low_price_time` 등 메타데이터를 저장해 후속 판정 근거를 보존.
+  [#5] 약한 신호는 이전 사용자 지시대로 `관찰 전용`을 유지하고, 1차 행동 알림 대신 `정책제외`로 내부 기록 후 종료.
+       추가로 `confirm_bottom_and_signal()` 보조판정을 붙여 1차 도달 시 바닥 확인/재상승 후보를 짧게 후속 안내.
+  이유: 1차 도달 후 근거가 이미 약화된 종목·유동성 부족 종목을 늦게 알리는 문제를 줄이고,
+       KIS 실시간 데이터 기준으로 포착 품질과 후속 판단 근거를 한 단계 더 보수적으로 맞추기 위해.
+  개선점: 포착 품질↑, 진입 도달 후 탈락 사유 추적↑, DART 워치 보존력↑, 장중/NXT 공통 판단 일관성↑.
+  주의점: 바닥 재상승 판정은 보조 메시지이며 기존 1차/2차 구조를 대체하지 않는다. DART 보호는 `shareholder_confirmation_date`가 실제 저장된 건에만 적용된다.
 
 - v41.80 (2026-03-19): 신호 강도 판정 버그 수정 + 동시보유 제한 실적용 + 2차 금지 시 API 절약.
   [#1] register_entry_watch()에 grade/score 저장 추가.
@@ -2149,10 +2154,10 @@ def calc_ma_trend(items: list) -> dict:
     ma_s = sum(closes[-s:]) / s
     ma_m = sum(closes[-m:]) / m
     ma_l = sum(closes[-l:]) / l
-    aligned   = ma_s > ma_m > ma_l          # 정배열
-    partially = ma_s > ma_m or ma_m > ma_l  # 부분 정배열
+    aligned   = ma_s > ma_m               # v41.83: 정배열 기준 완화 (5일선 > 20일선)
+    partially = (ma_s > ma_m) or (ma_m > ma_l)
     if aligned:
-        desc = f"✅ 정배열 ({s}>{m}>{l}일)"
+        desc = f"✅ 정배열 ({s}>{m}일)"
     elif partially:
         desc = f"🟡 부분정배열"
     else:
@@ -3270,6 +3275,14 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     if not is_bullish and not vol_recovered:
         return {}
 
+    try:
+        sentiment = detect_foreign_institution_turnaround(code)
+        if sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"):
+            score += int(sentiment.get("score_bonus", 0) or 0)
+            reasons.append(f"🔄 외국인 음→양 전환 + 기관 순매수 (+{int(sentiment.get('score_bonus', 0) or 0)}점)")
+    except Exception:
+        pass
+
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
         score, reasons, code, "MID_PULLBACK", today_chg, round(today_vol / avg_surge_vol, 1) if avg_surge_vol else 0, weight_mode="weak"
     )
@@ -3565,6 +3578,16 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("notify_count", safe_int(watch.get("notify_count", 0), 0))
             watch.setdefault("miss_count", safe_int(watch.get("miss_count", 0), 0))
             watch.setdefault("peak_price", safe_int(watch.get("peak_price", 0), 0))
+            watch.setdefault("low_price", safe_int(watch.get("low_price", watch.get("entry_price", 0)), 0))
+            watch.setdefault("low_price_time", str(watch.get("low_price_time", "") or ""))
+            watch.setdefault("volume_at_low", safe_int(watch.get("volume_at_low", 0), 0))
+            watch.setdefault("volume_ratio_at_detect", float(watch.get("volume_ratio_at_detect", watch.get("volume_ratio", 0)) or 0))
+            watch.setdefault("signal_strength_at_detect", str(watch.get("signal_strength_at_detect", "") or ""))
+            watch.setdefault("execution_speed_at_detect", int(watch.get("execution_speed_at_detect", 0) or 0))
+            watch.setdefault("pullback_ratio_at_register", float(watch.get("pullback_ratio_at_register", watch.get("pullback_reclaim_ratio", 0.0)) or 0.0))
+            watch.setdefault("source", str(watch.get("source", "") or ""))
+            watch.setdefault("dart_reliability_score", int(watch.get("dart_reliability_score", 0) or 0))
+            watch.setdefault("shareholder_confirmation_date", str(watch.get("shareholder_confirmation_date", "") or ""))
             watch.setdefault("entry_reference_only", False)
             watch.setdefault("entry_reference_market", "")
             watch.setdefault("entry_reference_reason", "")
@@ -4063,7 +4086,261 @@ def _classify_signal_strength(watch: dict, exec_metrics: dict | None = None) -> 
         base = "약한"
     elif exec_label == "진입 적합" and base == "보통":
         base = "강한"
+
     return base
+
+
+_fi_turnaround_cache: dict[str, dict] = {}
+
+
+def get_effective_volume_ratio(signal_type: str, current_time: str) -> float:
+    """신호타입 × 시간대별 동적 거래량 기준."""
+    base_vol = {
+        "UPPER_LIMIT": 3.0,
+        "NEAR_UPPER": 5.0,
+        "SURGE": 7.0,
+        "EXECUTION_SPEED": 5.0,
+        "DEFAULT": 5.0,
+    }
+    base = float(base_vol.get(str(signal_type or ""), base_vol["DEFAULT"]))
+    time_str = str(current_time or "")
+    if " " in time_str:
+        time_str = time_str.split(" ")[-1]
+    try:
+        hour = int((time_str or "00:00:00").split(":")[0])
+    except Exception:
+        hour = datetime.now().hour
+    if 9 <= hour < 10:
+        time_adj = 1.3
+    elif 10 <= hour < 14:
+        time_adj = 1.0
+    elif 14 <= hour < 15:
+        time_adj = 0.85
+    else:
+        time_adj = 0.9
+    required = max(2.0, min(base * time_adj, 10.0))
+    return round(required, 1)
+
+
+def detect_emerging_theme() -> dict:
+    return {"is_emerging": False, "confidence": "low", "theme_name": ""}
+
+
+def calc_sector_momentum_with_potential(theme: str) -> dict:
+    return {"theme": theme, "potential": "중간", "momentum_score": 0}
+
+
+def get_dart_reliability_score(disclosure_type: str) -> int:
+    score_map = {
+        "회사합병결정": 3,
+        "이사회의견서정정": 2,
+        "첨부정정": 2,
+        "자사주소각": 2,
+        "주식소각": 2,
+        "자기주식소각": 2,
+        "유상증자": 1,
+        "무상증자": 1,
+        "기타": 0,
+    }
+    title = str(disclosure_type or "")
+    for key, value in score_map.items():
+        if key != "기타" and key in title:
+            return value
+    return score_map["기타"]
+
+
+def detect_foreign_institution_turnaround(code: str) -> dict:
+    now_ts = time.time()
+    out = {"foreign_turnaround": False, "institution_buying": False, "score_bonus": 0}
+    try:
+        inv = get_investor_trend(code)
+        foreign_now = safe_int(inv.get("foreign_net", 0), 0)
+        institution_now = safe_int(inv.get("institution_net", 0), 0)
+        prev = _fi_turnaround_cache.get(code, {}) if isinstance(_fi_turnaround_cache, dict) else {}
+        prev_foreign = safe_int(prev.get("foreign_net", 0), 0)
+        prev_ts = float(prev.get("ts", 0) or 0)
+        foreign_turnaround = prev_ts > 0 and (now_ts - prev_ts) <= 1800 and prev_foreign < 0 < foreign_now
+        institution_buying = institution_now > 0
+        out = {
+            "foreign_turnaround": foreign_turnaround,
+            "institution_buying": institution_buying,
+            "score_bonus": 10 if (foreign_turnaround and institution_buying) else 0,
+            "foreign_net": foreign_now,
+            "institution_net": institution_now,
+        }
+        _fi_turnaround_cache[code] = {"foreign_net": foreign_now, "institution_net": institution_now, "ts": now_ts}
+    except Exception:
+        pass
+    return out
+
+
+def check_liquidity(code: str, max_spread: int = 500, quote: dict | None = None) -> bool:
+    try:
+        q = dict(quote or {})
+        if not q:
+            q = get_stock_price(code)
+        bid = safe_int(q.get("bid_price", 0), 0)
+        ask = safe_int(q.get("ask_price", 0), 0)
+        bid_qty = safe_int(q.get("bid_qty", 0), 0)
+        ask_qty = safe_int(q.get("ask_qty", 0), 0)
+        if bid and ask:
+            spread = ask - bid
+            if spread > max_spread or spread < 0:
+                return False
+            return True
+        if bid_qty <= 0 and ask_qty <= 0:
+            return True
+        if bid_qty <= 0 or ask_qty <= 0:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def should_skip_expiration_for_dart_watch(watch: dict) -> bool:
+    try:
+        source = str(watch.get("source", "") or "")
+        if source not in ("DART", "DART_MERGER", "MERGER_ANNOUNCEMENT"):
+            return False
+        shareholder_date = str(watch.get("shareholder_confirmation_date", "") or "")
+        if not shareholder_date:
+            return False
+        target_date = datetime.strptime(shareholder_date, "%Y-%m-%d").date()
+        return (target_date - datetime.now().date()).days >= 0
+    except Exception:
+        return False
+
+
+def get_rsi_5min(code: str) -> float:
+    try:
+        mins = _get_minute_data(code, count=30)
+        closes = [safe_int(x.get("close", 0), 0) for x in mins if safe_int(x.get("close", 0), 0) > 0]
+        if len(closes) < 15:
+            return float(calc_indicators(code).get("rsi", 50) or 50)
+        gains, losses = [], []
+        for prev, cur in zip(closes[:-1], closes[1:]):
+            diff = cur - prev
+            gains.append(max(diff, 0))
+            losses.append(abs(min(diff, 0)))
+        period = min(14, len(gains))
+        avg_gain = sum(gains[-period:]) / max(period, 1)
+        avg_loss = sum(losses[-period:]) / max(period, 1)
+        if avg_loss <= 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
+    except Exception:
+        return 50.0
+
+
+def get_current_volume(code: str) -> int:
+    try:
+        return safe_int(get_stock_price(code).get("today_vol", 0), 0)
+    except Exception:
+        return 0
+
+
+def get_macd_histogram(code: str) -> float:
+    try:
+        mins = _get_minute_data(code, count=60)
+        closes = [float(safe_int(x.get("close", 0), 0)) for x in mins if safe_int(x.get("close", 0), 0) > 0]
+        if len(closes) < 35:
+            return 0.0
+        def _ema(seq, period):
+            k = 2 / (period + 1)
+            ema = seq[0]
+            out = []
+            for val in seq:
+                ema = val * k + ema * (1 - k)
+                out.append(ema)
+            return out
+        ema12 = _ema(closes, 12)
+        ema26 = _ema(closes, 26)
+        macd = [a - b for a, b in zip(ema12, ema26)]
+        signal = _ema(macd, 9)
+        return round(macd[-1] - signal[-1], 4)
+    except Exception:
+        return 0.0
+
+
+def detect_hammer_or_bullish_engulfing(code: str) -> bool:
+    try:
+        mins = _get_minute_data(code, count=3)
+        if len(mins) < 2:
+            return False
+        last = mins[-1]
+        prev = mins[-2]
+        prev_open = safe_int(prev.get("open", 0), 0)
+        prev_close = safe_int(prev.get("close", 0), 0)
+        last_open = safe_int(last.get("open", 0), 0)
+        last_close = safe_int(last.get("close", 0), 0)
+        body = abs(last_close - last_open)
+        prev_body = abs(prev_close - prev_open)
+        hammer_like = last_close >= last_open and body <= max(int(last_close * 0.01), 50)
+        bullish_engulf = prev_close < prev_open and last_close > last_open and last_open <= prev_close and last_close >= prev_open and body >= prev_body
+        return hammer_like or bullish_engulf
+    except Exception:
+        return False
+
+
+def confirm_bottom_and_signal(watch: dict, current_price: int, current_data: dict) -> dict:
+    result = {
+        "is_bottom_confirmed": False,
+        "should_send_signal": False,
+        "signal_type": None,
+        "reason": "",
+    }
+    try:
+        volume_ratio = float(current_data.get("volume_ratio", watch.get("volume_ratio", 0)) or 0.0)
+        exec_metrics = dict(current_data.get("execution_metrics") or watch.get("execution_metrics") or {})
+        strength = _classify_signal_strength(watch, exec_metrics)
+        low_price_time = watch.get("low_price_time") or ""
+        if isinstance(low_price_time, datetime):
+            low_dt = low_price_time
+        else:
+            try:
+                low_dt = datetime.strptime(str(low_price_time), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                low_dt = datetime.now()
+        essential_check = {
+            "volume": volume_ratio >= 2.5,
+            "strength": strength in ("강한",),
+            "time": (datetime.now() - low_dt).total_seconds() <= 1800,
+        }
+        if not all(essential_check.values()):
+            result["reason"] = "필수조건 미충족"
+            return result
+        result["is_bottom_confirmed"] = True
+        bonus_score = 0
+        sentiment = detect_foreign_institution_turnaround(watch.get("code", ""))
+        if sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"):
+            bonus_score += 3
+        if int(watch.get("dart_reliability_score", 0) or 0) > 0:
+            bonus_score += 2
+        if check_liquidity(watch.get("code", ""), max_spread=300, quote=current_data):
+            bonus_score += 2
+        if get_rsi_5min(watch.get("code", "")) <= 30:
+            bonus_score += 2
+        vol_now = get_current_volume(watch.get("code", ""))
+        vol_prev_low = safe_int(watch.get("volume_at_low", vol_now), vol_now)
+        if vol_now and vol_prev_low and vol_now < vol_prev_low * 0.7:
+            bonus_score += 2
+        if get_macd_histogram(watch.get("code", "")) > 0:
+            bonus_score += 1
+        if detect_hammer_or_bullish_engulfing(watch.get("code", "")):
+            bonus_score += 1
+        if bonus_score >= 3:
+            result["should_send_signal"] = True
+            result["signal_type"] = "entry_signal"
+            result["reason"] = f"바닥 확인 + 재상승 신호 ({bonus_score}점)"
+        else:
+            result["should_send_signal"] = True
+            result["signal_type"] = "watch_alert"
+            result["reason"] = f"바닥 형성 확인, 재상승 대기중 ({bonus_score}점)"
+        return result
+    except Exception as e:
+        result["reason"] = f"오류: {e}"
+        return result
 
 
 # ── v41.66: 1차/2차 분할 비중 규칙 ──
@@ -6093,6 +6370,8 @@ def get_stock_price(code: str) -> dict:
         "open": int(o.get("stck_oprc",0)),
         "ask_qty": int(o.get("askp_rsqn1",0)),
         "bid_qty": int(o.get("bidp_rsqn1",0)),
+        "ask_price": int(o.get("askp1",0) or 0),
+        "bid_price": int(o.get("bidp1",0) or 0),
         "prev_close": int(o.get("stck_sdpr",0)),
         "bstp_code": o.get("bstp_cls_code",""),
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
@@ -6781,6 +7060,8 @@ def get_nxt_stock_price(code: str) -> dict:
         "today_vol": int(o.get("acml_vol",0)),
         "ask_qty": int(o.get("askp_rsqn1",0) or 0),
         "bid_qty": int(o.get("bidp_rsqn1",0) or 0),
+        "ask_price": int(o.get("askp1",0) or 0),
+        "bid_price": int(o.get("bidp1",0) or 0),
         "open": int(o.get("stck_oprc",0) or 0),
         "market": "NXT",
     }
@@ -11195,16 +11476,26 @@ def register_entry_watch(s: dict):
         "registered_ts": time.time(),
         "expire_ts": time.time() + 86400 * MAX_CARRY_DAYS,
         "peak_price": s.get("price", 0),
+        "low_price": safe_int(s.get("price", entry), entry),
+        "low_price_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "volume_at_low": safe_int(s.get("today_vol", 0), 0),
         "reasons": (s.get("reasons") or [])[:5],
         "sector_theme": s.get("sector_info", {}).get("theme", ""),
         "change_at_detect": float(s.get("change_rate", 0) or 0),
         "volume_ratio": float(s.get("volume_ratio", 0) or 0),
+        "volume_ratio_at_detect": float(s.get("volume_ratio", 0) or 0),
         "execution_metrics": dict(s.get("execution_metrics") or {}),
+        "execution_speed_at_detect": int((s.get("execution_metrics") or {}).get("execution_speed_score", 0) or 0),
+        "signal_strength_at_detect": str(s.get("signal_strength") or (s.get("position") or {}).get("strength") or _classify_signal_strength(s, dict(s.get("execution_metrics") or {}))),
         "resurge_mode": bool(s.get("resurge_mode")),
         "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
         "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
+        "pullback_ratio_at_register": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
         "grade": str(s.get("grade", "B")),
         "score": int(s.get("score", 0) or 0),
+        "source": str(s.get("source", "") or ""),
+        "dart_reliability_score": int(s.get("dart_reliability_score", 0) or 0),
+        "shareholder_confirmation_date": str(s.get("shareholder_confirmation_date", "") or ""),
         "entry_reference_only": False,
         "entry_reference_market": "",
         "entry_reference_reason": "",
@@ -11250,8 +11541,8 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
         print(f"⚠️ 진입불가 기록 오류: {e}")
 
 
-def _record_entry_policy_filtered(watch: dict, reason: str, filtered_price: int, final_status: str = "정책제외"):
-    """정책상 사용자 행동 알림에서 제외한 진입감시건을 signal_log에 기록."""
+
+def _record_entry_policy_filtered(watch: dict, reason: str, filtered_price: int):
     try:
         data = {}
         try:
@@ -11260,30 +11551,58 @@ def _record_entry_policy_filtered(watch: dict, reason: str, filtered_price: int,
             pass
         target_log_key = str(watch.get("signal_log_key") or "").strip()
         now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        filtered_date, filtered_clock = (now_s.split(' ', 1) + [""])[:2]
         updated = False
         for log_key, rec in data.items():
             if target_log_key and log_key != target_log_key:
                 continue
-            if (rec.get("code") == watch.get("code")
-                    and rec.get("status") in ("추적중", "진입준비")
-                    and rec.get("signal_type") == watch.get("signal_type")):
-                rec["status"] = str(final_status or "정책제외")
-                rec["pnl_pct"] = 0.0
-                rec["exit_reason"] = f"{final_status}_{reason}" if reason else str(final_status or "정책제외")
-                rec["entry_policy_filtered"] = True
-                rec["entry_policy_reason"] = str(reason or "")
-                rec["entry_policy_time"] = now_s
-                rec["entry_policy_date"] = filtered_date
-                rec["entry_policy_clock"] = filtered_clock
-                rec["entry_policy_price"] = int(filtered_price or 0)
-                updated = True
-                break
+            if str(rec.get("code") or "") != str(watch.get("code") or ""):
+                continue
+            if rec.get("status") not in ("추적중", "진입준비"):
+                continue
+            rec["status"] = "정책제외"
+            rec["policy_filtered"] = True
+            rec["policy_filtered_reason"] = str(reason or "")
+            rec["policy_filtered_time"] = now_s
+            rec["policy_filtered_price"] = int(filtered_price or 0)
+            updated = True
+            break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        print(f"  👀 정책제외 기록: {watch.get('name','')} {reason} @ {int(filtered_price or 0):,}")
+        print(f"  📴 정책제외 기록: {watch.get('name','')} {reason} @ {int(filtered_price or 0):,}")
     except Exception as e:
         print(f"⚠️ 정책제외 기록 오류: {e}")
+
+
+def _record_entry_dropped(watch: dict, reason: str, current_price: int):
+    try:
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        updated = False
+        for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
+            if str(rec.get("code") or "") != str(watch.get("code") or ""):
+                continue
+            if rec.get("status") not in ("추적중", "진입준비"):
+                continue
+            rec["status"] = "근거탈락"
+            rec["entry_drop_reason"] = str(reason or "")
+            rec["entry_drop_time"] = now_s
+            rec["entry_drop_price"] = int(current_price or 0)
+            rec["signal_strength_at_detect"] = watch.get("signal_strength_at_detect", rec.get("signal_strength_at_detect", ""))
+            rec["volume_ratio_at_detect"] = float(watch.get("volume_ratio_at_detect", rec.get("volume_ratio_at_detect", 0)) or 0)
+            updated = True
+            break
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        print(f"  🗑 근거약화 탈락 기록: {watch.get('name','')} {reason} @ {int(current_price or 0):,}")
+    except Exception as e:
+        print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
@@ -11659,6 +11978,12 @@ def check_entry_watch():
             if price > watch.get("peak_price", 0):
                 watch["peak_price"] = price
                 changed_active = True
+            low_price = safe_int(watch.get("low_price", 0), 0)
+            if low_price <= 0 or price <= low_price:
+                watch["low_price"] = int(price or 0)
+                watch["low_price_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                watch["volume_at_low"] = safe_int(cur.get("today_vol", watch.get("volume_at_low", 0)), safe_int(watch.get("volume_at_low", 0), 0))
+                changed_active = True
             if watch.get("entry_hit_locked"):
                 continue
 
@@ -11708,6 +12033,20 @@ def check_entry_watch():
                     continue
                 if now_ts - last_ts < cooldown_sec: continue
 
+                _entry_exec_metrics = _entry_exec_metrics if isinstance(locals().get("_entry_exec_metrics"), dict) else get_execution_speed_metrics(watch["code"], current_price=price)
+                if not should_skip_expiration_for_dart_watch(watch):
+                    strength_now = _classify_signal_strength(watch, _entry_exec_metrics)
+                    vol_now = float(cur.get("volume_ratio", watch.get("volume_ratio", 0)) or 0)
+                    vol_at_detect = float(watch.get("volume_ratio_at_detect", watch.get("volume_ratio", vol_now)) or vol_now)
+                    if strength_now == "약한":
+                        _record_entry_dropped(watch, "근거약화_신호강도약함", price)
+                        expired.append((log_key, "근거약화_신호강도약함", "근거탈락"))
+                        continue
+                    if vol_at_detect > 0 and vol_now < vol_at_detect * 0.5:
+                        _record_entry_dropped(watch, "근거약화_거래량폭락", price)
+                        expired.append((log_key, "근거약화_거래량폭락", "근거탈락"))
+                        continue
+
                 # v40.0-#2: 섹터 약세 시 진입가 도달 알림 차단 (내부 로그만)
                 _sector_blocked = False
                 try:
@@ -11725,7 +12064,7 @@ def check_entry_watch():
                                         time.sleep(0.05)
                                     except Exception:
                                         continue
-                                if _chg_list and (sum(_chg_list) / len(_chg_list)) <= -1.5:
+                                if _chg_list and (sum(_chg_list) / len(_chg_list)) <= -3.0:
                                     _sector_blocked = True
                                     _log_suppressed_alert(
                                         watch["code"], watch["name"],
@@ -11763,6 +12102,14 @@ def check_entry_watch():
                     )
                     continue
 
+                watch["last_notified_ts"] = now_ts
+                watch["notify_count"]     = notify_count + 1
+                watch["entry_reference_only"] = False
+                watch["entry_reference_market"] = ""
+                watch["entry_reference_reason"] = ""
+                watch["entry_reference_time"] = ""
+                watch["entry_reference_price"] = 0
+                changed_active = True
                 sig_labels = {
                     "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
                     "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
@@ -11834,38 +12181,15 @@ def check_entry_watch():
                 _split_rule = _get_entry_split_rule(_strength)
 
                 if is_phase1 and _strength == "약한":
-                    _policy_reason = "약한 신호 1차 진입 제외"
-                    watch["signal_strength"] = _strength
-                    watch["entry_policy_filtered"] = True
-                    watch["entry_policy_reason"] = "weak_signal_phase1"
-                    watch["entry_policy_time"] = _entry_hit_ts
-                    watch["entry_policy_price"] = int(price or 0)
-                    changed_active = True
-                    _record_entry_policy_filtered(watch, _policy_reason, price, final_status="정책제외")
                     _log_suppressed_alert(
                         watch["code"], watch["name"],
-                        _policy_reason,
+                        "1차 정책제외 (약한 신호 관찰 전용)",
                         watch.get("signal_type", ""),
-                        {
-                            "entry_price": entry,
-                            "filtered_price": int(price or 0),
-                            "signal_strength": _strength,
-                            "grade": watch.get("grade", ""),
-                            "score": watch.get("score", 0),
-                            "market": "NXT" if use_nxt else "KRX",
-                        }
+                        {"entry_price": entry, "filtered_price": int(price or 0), "strength": _strength}
                     )
+                    _record_entry_policy_filtered(watch, "약한신호_관찰전용", price)
                     expired.append((log_key, "정책제외_약한신호", "정책제외"))
                     continue
-
-                watch["last_notified_ts"] = now_ts
-                watch["notify_count"]     = notify_count + 1
-                watch["entry_reference_only"] = False
-                watch["entry_reference_market"] = ""
-                watch["entry_reference_reason"] = ""
-                watch["entry_reference_time"] = ""
-                watch["entry_reference_price"] = 0
-                changed_active = True
 
                 if is_phase1:
                     # ━━━ 1차 진입가 도달 ━━━
@@ -11894,6 +12218,20 @@ def check_entry_watch():
                     watch["phase1_price"] = price
                     watch["phase1_pct"] = _p1_pct
                     watch["signal_strength"] = _strength
+                    _bottom_check = confirm_bottom_and_signal(
+                        watch,
+                        price,
+                        {"volume_ratio": cur.get("volume_ratio", 0), "execution_metrics": _entry_exec_metrics, **dict(cur or {})},
+                    )
+                    if _bottom_check.get("is_bottom_confirmed") and _bottom_check.get("should_send_signal"):
+                        _bottom_title = "✅ 바닥 확인 + 재상승 신호" if _bottom_check.get("signal_type") == "entry_signal" else "👀 바닥 형성 확인"
+                        send_with_chart_buttons(
+                            f"{_bottom_title}{nxt_notice}\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                            f"{_bottom_check.get('reason','')}",
+                            watch["code"], watch["name"]
+                        )
 
                 elif is_phase2:
                     # ━━━ 2차 추가진입 판단 ━━━
@@ -13210,10 +13548,17 @@ def analyze(stock: dict) -> dict:
         score+=15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type="SURGE"
     else: return {}
 
-    if vol_ratio >= VOLUME_SURGE_RATIO*2:
-        score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (5일 평균 대비)")
-    elif vol_ratio >= VOLUME_SURGE_RATIO:
-        score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (5일 평균 대비)")
+    current_time = datetime.now().strftime("%H:%M:%S")
+    required_vol = get_effective_volume_ratio(signal_type, current_time)
+    if vol_ratio < required_vol:
+        return {}
+    if not check_liquidity(code, quote=stock):
+        return {}
+
+    if vol_ratio >= required_vol*2:
+        score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
+    elif vol_ratio >= required_vol:
+        score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (동적기준 {required_vol:.1f}배 대비)")
 
     _chg_bucket = _feature_change_bucket(change_rate)
     _vol_bucket = _feature_volume_bucket(vol_ratio)
@@ -13242,8 +13587,8 @@ def analyze(stock: dict) -> dict:
                 score += 30; signal_type = "STRONG_BUY"
                 reasons.append(f"💎 외국인+기관 매수 / 개인 매도 (최강 수급구도) +30점")
             elif f_net > 0 and i_net > 0:
-                score += 25; signal_type = "STRONG_BUY"
-                reasons.append(f"✅ 외국인+기관 동시 순매수 +25점")
+                score += 30; signal_type = "STRONG_BUY"
+                reasons.append(f"✅ 외국인+기관 동시 순매수 +30점")
             elif f_net > 0:
                 score += 10; reasons.append(f"🟡 외국인 순매수 ({f_net:+,}주) +10점")
             elif i_net > 0:
@@ -13273,6 +13618,18 @@ def analyze(stock: dict) -> dict:
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
         score, reasons, code, signal_type, change_rate, vol_ratio, weight_mode="strong"
     )
+
+    try:
+        _exec_metrics = get_execution_speed_metrics(code, current_price=price)
+        _exec_strength = _execution_score_label(int(_exec_metrics.get("execution_speed_score", 0) or 0))
+        if _exec_strength == "강함":
+            score += 15
+            reasons.append("⚡ 체결속도 강함 +15점")
+        elif _exec_strength == "양호":
+            score += 5
+            reasons.append("⚡ 체결속도 양호 +5점")
+    except Exception:
+        pass
 
     countertrend_ctx = {"is_countertrend": False}
     if signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "SURGE"):
@@ -13415,7 +13772,10 @@ def analyze(stock: dict) -> dict:
     short_ratio = 0.0  # v37.0: 초기화
     try:
         short_ratio = get_short_sell_ratio(code)
-        if short_ratio >= 10:
+        if short_ratio < 3.0:
+            score += 5
+            reasons.append(f"🛡 공매도 잔고 {short_ratio:.1f}% — 저부담 +5점")
+        elif short_ratio >= 10:
             score -= 10
             reasons.append(f"⚠️ 공매도 잔고 {short_ratio:.1f}% — 반등 시 숏커버 기대 가능")
         elif short_ratio >= 5:
@@ -13496,6 +13856,17 @@ def analyze(stock: dict) -> dict:
                     + (f" ({_matched})" if _matched else "")
                 )
     except Exception as _e: _log_error(f"analyze_news({code})", _e)
+
+    try:
+        if direct_news_hit:
+            if signal_type in ("UPPER_LIMIT", "SURGE"):
+                score += 10
+                reasons.append("📰 직접뉴스 × 급등 시그널 +10점")
+            elif signal_type == "STRONG_BUY":
+                score += 8
+                reasons.append("📰 직접뉴스 × 강력매수 시그널 +8점")
+    except Exception:
+        pass
 
     # ── 지정학 이벤트 보정 ──
     try:
@@ -16318,6 +16689,9 @@ def run_dart_intraday():
                         "target_price": round(price * 1.05),
                         "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "detect_time": datetime.now().strftime("%H:%M:%S"),
+                        "source": "DART",
+                        "dart_reliability_score": get_dart_reliability_score(title),
+                        "shareholder_confirmation_date": "",
                         "reasons": [f"자사주소각 공시: {title[:30]}"],
                     }
                     register_entry_watch(_dart_entry_stock)
@@ -19495,7 +19869,7 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
         elif strength == "강한" and p >= 0.6:
             guide = f"💪 고확률 신호 — 1종목 적극 진입"
         elif strength == "약한":
-            guide = f"👀 약한 신호 — 관찰 전용, 실진입 제외"
+            guide = f"⚠️ 약한 신호 — 관찰 전용, 실진입 제외"
         else:
             guide = f"📊 표준 비중 — 1종목 분할 진입"
 
