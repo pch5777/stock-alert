@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.92
+버전: v41.93
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.93 (2026-03-20): 고점추격방지 경과 완화 + 장식 아이콘 상태 3색 전환.
+  [#1] `_select_representative_entry_price()`에 경과일수/미도달횟수/괴리율 기반 완화 추가.
+       기존: next_entry > prev_entry이면 무조건 "고점추격방지유지" → 진입가 동결.
+       수정: 2일 이상 경과 OR 미도달 3회 이상 OR 괴리율 15% 이상이면 상향 갱신 허용.
+       `_apply_entry_price_guard()`에 detect_date/miss_count 파라미터 추가, 호출부 2곳 연결.
+  [#2] 장식 아이콘 245줄을 상태 3색 체계(🔴좋음/🟡보통/🔵나쁨) + 카테고리 텍스트로 변환.
+       🏭→🔴[섹터], 👑→🔴[대장], 📈→🔴, 📉→🔵, 💥→🔴, 🛡→🔵[손절],
+       📰→맥락별+[뉴스], 🌐→맥락별+[해외], 🧠→맥락별+[나스닥] 등.
+       유지: 🎯🏆🚨🔔❌✅⚠️ + 시스템 아이콘 23종.
+  이유: [#1] SK증권 사례 — 3/17 진입가 2,080이 3일째 고정, 오늘 저가 2,125에서 45원 차이로 미도달.
+       이후 재포착(81점 A등급)해도 진입가 갱신 불가 → 상승이탈 반복.
+  개선점: 오래된 진입가 자동 갱신↑, 현실 괴리 방지↑, 아이콘 즉시 판단↑.
+  주의점: [#1] 완화 조건(2일/3회/15%)은 보수적 기준. 당일 고점추격방지는 기존대로 유지.
 
 - v41.92 (2026-03-20): 장식 아이콘 → 상태(🔴🟡🔵) + 카테고리 텍스트 전환.
   [#1] 사용자 메시지의 장식 아이콘 245줄을 상태 3색 체계로 통일.
@@ -8327,7 +8341,8 @@ def _calc_resurge_entry_price(current_price: int, pullback_low: int, reclaim_rat
     return int(base_entry)
 
 
-def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_type: str = "") -> tuple[int, str]:
+def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_type: str = "",
+                                       detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
     prev_entry = safe_int(prev_entry, 0)
     next_entry = safe_int(next_entry, 0)
     sig_type = str(signal_type or "")
@@ -8338,14 +8353,33 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
     if next_entry < prev_entry:
         return next_entry, "하향갱신"
     if next_entry > prev_entry and sig_type in NO_CHASE_ENTRY_SIGNAL_TYPES:
+        # [v41.92] 고점추격방지 완화: 2일 이상 경과 또는 미도달 3회 이상이면 상향 허용
+        try:
+            if detect_date:
+                elapsed = (datetime.strptime(datetime.now().strftime("%Y%m%d"), "%Y%m%d") -
+                           datetime.strptime(detect_date, "%Y%m%d")).days
+            else:
+                elapsed = 0
+        except Exception:
+            elapsed = 0
+        # 진입가 괴리율 확인: 현재 next_entry가 prev_entry보다 20% 이상 위면 현실 괴리
+        gap_pct = (next_entry - prev_entry) / prev_entry * 100 if prev_entry else 0
+        if elapsed >= 2 or miss_count >= 3 or gap_pct >= 15:
+            reason = f"경과완화({elapsed}일/{miss_count}회/괴리{gap_pct:.0f}%)"
+            return next_entry, reason
         return prev_entry, "고점추격방지유지"
     return next_entry, "상향갱신" if next_entry > prev_entry else "기존유지"
 
 
-def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0) -> tuple[int, str]:
+def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0, detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
     stock = stock if isinstance(stock, dict) else {}
     current_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
-    chosen_entry, mode = _select_representative_entry_price(prev_entry, current_entry, stock.get("signal_type", ""))
+    _det_date = detect_date or str(stock.get("detect_date", "") or "")
+    _miss_cnt = miss_count or safe_int(stock.get("miss_count", 0), 0)
+    chosen_entry, mode = _select_representative_entry_price(
+        prev_entry, current_entry, stock.get("signal_type", ""),
+        detect_date=_det_date, miss_count=_miss_cnt
+    )
     if chosen_entry > 0:
         stock["entry_price"] = chosen_entry
         planned_prev = safe_int(stock.get("planned_entry_price", current_entry or chosen_entry), 0)
@@ -8583,7 +8617,11 @@ def save_signal_log(stock: dict):
             stock["signal_log_key"] = representative_key
             if not rec.get("entry_hit"):
                 prev_entry = safe_int(rec.get("entry_price", 0), 0)
-                _chosen_entry, _entry_guard_mode = _apply_entry_price_guard(stock, prev_entry)
+                _chosen_entry, _entry_guard_mode = _apply_entry_price_guard(
+                    stock, prev_entry,
+                    detect_date=str(rec.get("detect_date", "") or ""),
+                    miss_count=safe_int(rec.get("miss_count", 0), 0)
+                )
                 next_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
                 if next_entry != prev_entry:
                     _append_tracking_entry_update(rec, prev_entry, next_entry, reason="재포착대표진입갱신" if _entry_guard_mode != "고점추격방지유지" else "재포착고점추격방지")
@@ -11182,7 +11220,12 @@ def register_entry_watch(s: dict):
     latest_old_watch = max((w for _, w in old_items), key=lambda x: x.get("registered_ts", 0), default=None)
     previous_entry = safe_int((latest_old_watch or {}).get("entry_price", 0), 0)
     previous_miss_count = safe_int((latest_old_watch or {}).get("miss_count", 0), 0)
-    entry, entry_guard_mode = _apply_entry_price_guard(s, previous_entry)
+    _prev_detect_date = str((latest_old_watch or {}).get("detect_date", "") or "")
+    entry, entry_guard_mode = _apply_entry_price_guard(
+        s, previous_entry,
+        detect_date=_prev_detect_date,
+        miss_count=previous_miss_count
+    )
 
     try:
         sig_data = {}
