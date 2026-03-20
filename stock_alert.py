@@ -3,23 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.89
+버전: v41.90
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v41.89 (2026-03-20): 눌림목 상한가 도달/잠김 종목 진입차단 강화.
-  [#1] `_get_effective_change_rate()`를 추가해 KIS `change_rate`뿐 아니라 `prev_close` 대비 실계산 등락률도 함께 보도록 보강.
-       API 반올림/표기 오차로 29%대 후반 상한가 종목이 약하게 인식되는 누락을 줄임.
-  [#2] `_detect_entry_block_reason()`에서 `MID_PULLBACK`은 현재가가 상한가 수준(실계산 포함)에 도달하면
-       매도잔량 유무와 무관하게 `upper_limit_reached`로 차단하도록 강화.
-       기존 `limit_up_locked`/`no_ask_liquidity` 차단은 그대로 유지.
-  [#3] 이 차단은 `run_mid_pullback_scan()` 초기 실알림과 `check_entry_watch()` 진입가 도달 판정 양쪽에 공통 적용된다.
-  이유: 태웅 사례처럼 현재가=진입가이면서 이미 상한가 도달 상태인 종목이 `눌림목 진입 신호`로 남아
-       실제 행동 불가능한 알림 품질을 떨어뜨리는 문제를 줄이기 위해.
-  개선점: 상한가 도달/잠김 상태의 눌림목 오알림↓, 실제 행동 가능한 눌림목 알림 품질↑.
-  주의점: 본 차단은 `MID_PULLBACK`에만 보수 적용된다. 일반 급등/상한가 감지 신호 자체를 막지는 않는다.
+- v41.90 (2026-03-20): NXT 전환 변화정보를 1차 진입가 도달 알림으로 이동 + 진입가 조정률(%) 표시.
+  [#1] `register_entry_watch()` / active watch 복원 경로에 `grade_at_detect`를 저장·복원해
+       포착 당시 등급과 현재 등급을 비교 가능하게 정리.
+  [#2] `_register_nxt_surge_to_krx_watch()`의 외부 텔레그램 `NXT 선행→KRX 추적 전환` 알림을 제거하고,
+       전환 시 발생한 진입가 재조정(`entry_price_orig`)·등급 재평가 결과는 watch 메타에만 보존.
+  [#3] `check_entry_watch()`의 `[1차 진입가 도달]` 메시지에 `🔄 NXT 반영 변화` 블록을 추가해,
+       `등급 변화: B → A`, `진입가 조정: 34,300원 → 35,300원 (+2.9%)`처럼
+       실제 행동 시점에만 변화 정보를 보여주도록 변경.
+  이유: `NXT 전환` 자체는 행동성이 약하고, 사용자는 `진입가 도달` 시점에야
+       왜 이전 B등급 종목이 지금은 진입 후보가 됐는지 한 번에 판단할 수 있어야 함.
+  개선점: 불필요한 상태 알림↓, 진입 판단 근거(등급 상향/진입가 재조정) 해석력↑.
+  주의점: 변화가 없으면 `NXT 반영 변화` 블록은 표시되지 않음.
 
 - v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
   [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
@@ -3265,6 +3266,8 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("signal_strength_at_detect", str(watch.get("signal_strength_at_detect", "") or ""))
             watch.setdefault("execution_speed_at_detect", int(watch.get("execution_speed_at_detect", 0) or 0))
             watch.setdefault("pullback_ratio_at_register", float(watch.get("pullback_ratio_at_register", watch.get("pullback_reclaim_ratio", 0.0)) or 0.0))
+            watch.setdefault("grade", str(watch.get("grade", "B") or "B").upper())
+            watch.setdefault("grade_at_detect", str(watch.get("grade_at_detect", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper())
             watch.setdefault("source", str(watch.get("source", "") or ""))
             watch.setdefault("dart_reliability_score", int(watch.get("dart_reliability_score", 0) or 0))
             watch.setdefault("shareholder_confirmation_date", str(watch.get("shareholder_confirmation_date", "") or ""))
@@ -7267,6 +7270,31 @@ def _auto_reinforce_dynamic_theme(code: str, pnl_pct: float):
 # ============================================================
 # v41.77 #2: NXT 선행상승 → 정규장 추적 전환
 # ============================================================
+def _format_nxt_transition_delta_block(watch: dict) -> str:
+    """NXT→KRX 전환 과정에서 생긴 등급/진입가 변화를 1차 진입 알림용으로 포맷."""
+    try:
+        lines = []
+        detect_grade = str(watch.get("grade_at_detect", watch.get("grade", "")) or "").upper()
+        current_grade = str(watch.get("grade", detect_grade) or detect_grade).upper()
+        if detect_grade and current_grade and detect_grade != current_grade:
+            lines.append(f"  • 등급 변화: <b>{detect_grade}</b> → <b>{current_grade}</b>")
+
+        orig_entry = safe_int(watch.get("entry_price_orig", 0), 0)
+        current_entry = safe_int(watch.get("entry_price", 0), 0)
+        if orig_entry > 0 and current_entry > 0 and orig_entry != current_entry:
+            pct = ((current_entry - orig_entry) / orig_entry) * 100
+            lines.append(
+                f"  • 진입가 조정: <b>{orig_entry:,}원</b> → <b>{current_entry:,}원</b> "
+                f"(<b>{pct:+.1f}%</b>)"
+            )
+
+        if not lines:
+            return ""
+        return "\n🔄 <b>NXT 반영 변화</b>\n" + "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
 def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
     """
     NXT에서 선행 급등한 종목을 차단하는 대신 KRX 정규장 개시 후 추적 대상으로 등록.
@@ -7295,6 +7323,7 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
 
         # [v41.88] NXT 전환 시 grade/score 재계산
         prev_grade = str(watch.get("grade", "B")).upper()
+        watch.setdefault("grade_at_detect", prev_grade)
         try:
             _reeval = analyze_mid_pullback(code, name)
             if not _reeval:
@@ -7314,14 +7343,18 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
         except Exception as _re:
             print(f"  ⚠️ NXT전환 등급 재평가 실패: {_re}")
 
-        # 텔레그램 알림 (내부 전환 기록)
+        # 외부 알림은 보내지 않고 내부 로그만 유지
         try:
             _grade_display = str(watch.get("grade", "B")).upper()
-            send(f"📡 <b>[NXT 선행→KRX 추적 전환]</b>\n"
-                 f"<b>{name}</b>  <code>{code}</code>\n"
-                 f"NXT {nxt_price:,}원 선행 감지 → KRX 정규장 개시 후 자동 추적\n"
-                 f"진입가: {watch.get('entry_price',0):,}원  등급: {_grade_display}")
-        except Exception: pass
+            _orig_entry = safe_int(watch.get("entry_price_orig", 0), 0)
+            _cur_entry = safe_int(watch.get("entry_price", 0), 0)
+            if _orig_entry and _cur_entry and _orig_entry != _cur_entry:
+                _delta_pct = ((_cur_entry - _orig_entry) / _orig_entry) * 100
+                print(f"  📡 NXT전환 내부기록: {name} 등급 {_grade_display}, 진입가 {_orig_entry:,}→{_cur_entry:,}원 ({_delta_pct:+.1f}%)")
+            else:
+                print(f"  📡 NXT전환 내부기록: {name} 등급 {_grade_display}, 진입가 {_cur_entry:,}원")
+        except Exception:
+            pass
     except Exception as e:
         print(f"⚠️ _register_nxt_surge_to_krx_watch: {e}")
 
@@ -11208,7 +11241,8 @@ def register_entry_watch(s: dict):
         "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
         "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
         "pullback_ratio_at_register": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
-        "grade": str(s.get("grade", "B")),
+        "grade": str(s.get("grade", "B")).upper(),
+        "grade_at_detect": str(s.get("grade", "B")).upper(),
         "score": int(s.get("score", 0) or 0),
         "source": str(s.get("source", "") or ""),
         "dart_reliability_score": int(s.get("dart_reliability_score", 0) or 0),
@@ -11322,33 +11356,16 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
-def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
-    """KIS 표기 등락률 + 전일종가 대비 실계산 등락률 중 더 보수적인 값을 사용."""
+def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
+    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
     try:
         change_rate = float(cur.get("change_rate", 0.0) or 0.0)
     except Exception:
         change_rate = 0.0
-    prev_close = safe_int(cur.get("prev_close", 0), 0)
-    live_price = safe_int(price or cur.get("price", 0), 0)
-    if prev_close > 0 and live_price > 0:
-        try:
-            calc_rate = ((live_price - prev_close) / prev_close) * 100.0
-            change_rate = max(change_rate, calc_rate)
-        except Exception:
-            pass
-    return float(change_rate or 0.0)
-
-
-def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
-    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
-    change_rate = _get_effective_change_rate(cur, price=price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     sig_type = str(watch.get("signal_type") or "")
-    upper_touch = change_rate >= 29.8
-    upper_like = upper_touch or sig_type in ("UPPER_LIMIT",)
-    if sig_type == "MID_PULLBACK" and entry > 0 and price >= entry and upper_touch:
-        return "upper_limit_reached"
+    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
@@ -11905,6 +11922,7 @@ def check_entry_watch():
                         similar_block = f"{_similar_line}\n\n"
                 except Exception:
                     similar_block = ""
+                nxt_delta_block = _format_nxt_transition_delta_block(watch)
 
                 # ── v41.66: 1차/2차 분기 ──
                 is_phase1 = (notify_count == 0)
@@ -11937,6 +11955,7 @@ def check_entry_watch():
                         f"{similar_block}"
                         f"{reasons_block}"
                         f"{sector_block}"
+                        f"{nxt_delta_block}"
                         f"{_entry_exec_block}"
                         f"━━━━━━━━━━━━━━━\n"
                         f"┌─────────────────────\n"
