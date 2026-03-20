@@ -3,11 +3,45 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.93
+버전: v41.95
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.95 (2026-03-20): 눌림목 패턴등급/실행등급 분리 저장 — 태웅 재포착 취지 유지 + 표시 등급 일관성 복원.
+  [#1] `_mid_pullback_alert_history`를 `{ts, pattern_grade, execution_grade}` 형태로 확장.
+       `run_mid_pullback_scan()`의 쿨다운 상향 판단은 `pattern_grade` 기준으로만 비교해
+       태웅처럼 raw 패턴이 `B→A`로 강해진 종목의 재포착 경로는 유지.
+       표시/정렬/실알림은 `execution_grade`(=`grade`)를 계속 사용.
+  [#2] `_register_nxt_surge_to_krx_watch()`는 NXT→KRX 재평가 시
+       raw 패턴 재평가 후 `sector bonus + execution grade`까지 다시 적용해
+       `pattern_grade`, `execution_grade`, `grade`를 함께 갱신.
+       쿨다운 리셋은 `pattern_grade` 상향일 때만, 사용자 표시 등급은 `execution_grade` 기준 유지.
+  [#3] `register_entry_watch()` / `_load_entry_watch_active()` / `save_signal_log()`에
+       `pattern_grade`, `execution_grade`, `pattern_grade_at_detect`, `execution_grade_at_detect` 저장 추가.
+       `_format_nxt_transition_delta_block()`의 `등급 변화`는 `execution_grade_at_detect → execution_grade` 기준으로 표시.
+  이유: v41.94에서 실행등급 보정 후 `태웅 재포착(B→A)` 개선 취지는 살아 있었지만,
+       쿨다운/NXT 상향 판단은 raw grade, 저장·표시는 execution grade를 써서 기준 층이 섞였음.
+  개선점: 태웅 같은 패턴 상향 재포착 유지↑, 실행등급 과장↓, 쿨다운/표시/로그 일관성↑.
+  주의점: `MID_PULLBACK`은 앞으로 `pattern_grade`와 `execution_grade`를 함께 봐야 함.
+
+- v41.94 (2026-03-20): 눌림목 실행등급 보정 — 패턴 A를 그대로 실전 A로 보내지 않도록 보수화.
+  [#1] `_get_mid_pullback_execution_profile()` / `_apply_mid_pullback_execution_grade()` 추가.
+       MID_PULLBACK는 패턴 점수 외에 `섹터 확증`, `직접 뉴스`, `외국인·기관 수급`,
+       `상대강도`, `거래량 Z-score`, `재상승`, `장중 돌파`를 실행 확증으로 분리 계산.
+       A등급은 `핵심 확증 1개 이상 + 총 실행 확증 2개 이상`일 때만 유지.
+       미충족 시 A→B 또는 C, B도 실행 확증이 없으면 C로 강등.
+  [#2] `run_mid_pullback_scan()` 정렬 기준을 `grade 우선 → score`로 변경해,
+       실행 보정으로 C가 된 종목이 raw score만으로 상위 3개를 점유하지 못하게 조정.
+  [#3] 눌림목 포착 메시지 보강.
+       `_build_mid_pullback_state_line()`는 등급별로 `1차 진입 가능/검토/관찰 우선`을 구분하고,
+       `_build_mid_pullback_execution_note_line()`으로 `패턴 A → 현재 B/C` 보정 이유를 노출.
+       `_build_mid_pullback_reason_summary()`는 `1차 급등 n%`보다 `당일 양봉/20일선 회복/눌림 구조 양호`를 우선 요약.
+  이유: `A등급 + 섹터 확증 약함(기타업종)`처럼 패턴 점수만 높은 눌림목이 실전 진입급처럼 보였고,
+       실제 승률 체감도 낮아 행동 가능한 알림 품질이 떨어졌음.
+  개선점: 패턴형 눌림목 오탐↓, 실전형 눌림목만 A/B 유지↑, 포착 메시지 해석력↑.
+  주의점: 눌림목 알림 수는 줄어들 수 있으며, 직접 뉴스/수급/섹터 확증이 없는 패턴형 종목은 C로 내려가 내부기록 위주로 남음.
 
 - v41.93 (2026-03-20): 고점추격방지 경과 완화 + 장식 아이콘 상태 3색 전환.
   [#1] `_select_representative_entry_price()`에 경과일수/미도달횟수/괴리율 기반 완화 추가.
@@ -1486,7 +1520,7 @@ _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
 _bot_paused         = False
-_mid_pullback_alert_history = {}
+_mid_pullback_alert_history = {}  # code → {ts, pattern_grade, execution_grade, grade(호환용)}
 _early_feedback     = {"total": 0, "success": 0}
 _early_price_min_dynamic  = EARLY_PRICE_MIN
 _early_volume_min_dynamic = EARLY_VOLUME_MIN
@@ -3056,6 +3090,100 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "market_regime_mode": _regime.get("mode", "normal"),
     }
 
+
+def _get_mid_pullback_execution_profile(signal: dict | None) -> dict:
+    signal = signal if isinstance(signal, dict) else {}
+    reasons = [str(r or "") for r in (signal.get("reasons") or [])]
+    sector_info = signal.get("sector_info") or {}
+    theme = str(sector_info.get("theme", "") or "").strip()
+    bonus = int(sector_info.get("bonus", 0) or 0)
+    rising = sector_info.get("rising", []) or []
+    rising_count = len(rising)
+
+    sector_ok = theme not in ("", "기타업종", "unknown", "미분류") and (bonus > 0 or rising_count > 0)
+    news_ok = bool(signal.get("direct_news_hit") or signal.get("direct_news_theme"))
+    orderflow_ok = any(any(key in reason for key in ("외국인 음→양 전환 + 기관 순매수", "외국인+기관", "NXT 외인+기관 동시매수")) for reason in reasons)
+    rs_ok = float(signal.get("rs", 0) or 0) >= float(RS_MIN or 0)
+    vol_ok = float(signal.get("vol_zscore", 0) or 0) >= float(VOL_ZSCORE_MIN or 0)
+    resurge_ok = bool(signal.get("resurge_mode")) or any(any(key in reason for key in ("재상승", "회복률", "바닥 확인")) for reason in reasons)
+    intraday_ok = bool(signal.get("is_intraday"))
+
+    labels = []
+    core_labels = []
+    if sector_ok:
+        labels.append("섹터")
+        core_labels.append("섹터")
+    if news_ok:
+        labels.append("뉴스")
+        core_labels.append("뉴스")
+    if orderflow_ok:
+        labels.append("수급")
+        core_labels.append("수급")
+    if rs_ok:
+        labels.append("상대강도")
+    if vol_ok:
+        labels.append("거래량")
+    if resurge_ok:
+        labels.append("재상승")
+    if intraday_ok:
+        labels.append("장중돌파")
+
+    return {
+        "confirm_count": len(labels),
+        "core_confirm_count": len(core_labels),
+        "labels": labels,
+        "core_labels": core_labels,
+        "sector_ok": sector_ok,
+        "news_ok": news_ok,
+        "orderflow_ok": orderflow_ok,
+        "rs_ok": rs_ok,
+        "vol_ok": vol_ok,
+        "resurge_ok": resurge_ok,
+        "intraday_ok": intraday_ok,
+    }
+
+
+def _apply_mid_pullback_execution_grade(signal: dict | None) -> dict:
+    signal = dict(signal or {})
+    if str(signal.get("signal_type") or "") != "MID_PULLBACK":
+        return signal
+
+    original_grade = str(signal.get("grade") or "").upper()
+    if original_grade not in ("A", "B", "C"):
+        return signal
+
+    profile = _get_mid_pullback_execution_profile(signal)
+    signal["pattern_grade"] = signal.get("pattern_grade") or original_grade
+    signal["execution_confirm_count"] = int(profile.get("confirm_count", 0) or 0)
+    signal["execution_core_confirm_count"] = int(profile.get("core_confirm_count", 0) or 0)
+    signal["execution_confirm_labels"] = list(profile.get("labels") or [])
+
+    new_grade = original_grade
+    adjust_reason = ""
+
+    if original_grade == "A":
+        if profile["core_confirm_count"] >= 1 and profile["confirm_count"] >= 2:
+            new_grade = "A"
+        elif profile["confirm_count"] >= 2:
+            new_grade = "B"
+            adjust_reason = "핵심 확증 부족"
+        elif profile["confirm_count"] >= 1:
+            new_grade = "B"
+            adjust_reason = "실행 확증 부족"
+        else:
+            new_grade = "C"
+            adjust_reason = "실행 확증 없음"
+    elif original_grade == "B":
+        if profile["confirm_count"] < 1:
+            new_grade = "C"
+            adjust_reason = "실행 확증 없음"
+
+    signal["execution_grade"] = new_grade
+    signal["grade"] = new_grade
+    signal["execution_grade_adjusted"] = (new_grade != original_grade)
+    signal["execution_grade_reason"] = adjust_reason
+    return signal
+
 # ============================================================
 # 눌림목 스캐너 후보군 자동 확장
 # ============================================================
@@ -3307,8 +3435,12 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("signal_strength_at_detect", str(watch.get("signal_strength_at_detect", "") or ""))
             watch.setdefault("execution_speed_at_detect", int(watch.get("execution_speed_at_detect", 0) or 0))
             watch.setdefault("pullback_ratio_at_register", float(watch.get("pullback_ratio_at_register", watch.get("pullback_reclaim_ratio", 0.0)) or 0.0))
-            watch.setdefault("grade", str(watch.get("grade", "B") or "B").upper())
-            watch.setdefault("grade_at_detect", str(watch.get("grade_at_detect", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper())
+            watch.setdefault("pattern_grade", str(watch.get("pattern_grade", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper())
+            watch.setdefault("execution_grade", str(watch.get("execution_grade", watch.get("grade", watch.get("pattern_grade", "B"))) or watch.get("grade", watch.get("pattern_grade", "B")) or "B").upper())
+            watch["grade"] = str(watch.get("execution_grade", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper()
+            watch.setdefault("pattern_grade_at_detect", str(watch.get("pattern_grade_at_detect", watch.get("pattern_grade", watch.get("grade", "B"))) or watch.get("pattern_grade", watch.get("grade", "B")) or "B").upper())
+            watch.setdefault("execution_grade_at_detect", str(watch.get("execution_grade_at_detect", watch.get("grade_at_detect", watch.get("execution_grade", watch.get("grade", "B")))) or watch.get("grade_at_detect", watch.get("execution_grade", watch.get("grade", "B"))) or "B").upper())
+            watch.setdefault("grade_at_detect", str(watch.get("execution_grade_at_detect", watch.get("grade_at_detect", watch.get("grade", "B"))) or watch.get("grade_at_detect", watch.get("grade", "B")) or "B").upper())
             watch.setdefault("source", str(watch.get("source", "") or ""))
             watch.setdefault("dart_reliability_score", int(watch.get("dart_reliability_score", 0) or 0))
             watch.setdefault("shareholder_confirmation_date", str(watch.get("shareholder_confirmation_date", "") or ""))
@@ -5953,10 +6085,12 @@ def run_mid_pullback_scan():
         _prev_cooldown = _mid_pullback_alert_history.get(code)
         if isinstance(_prev_cooldown, dict):
             _prev_ts = _prev_cooldown.get("ts", 0)
-            _prev_grade = _prev_cooldown.get("grade", "C")
+            _prev_pattern_grade = str(_prev_cooldown.get("pattern_grade", _prev_cooldown.get("grade", "C")) or _prev_cooldown.get("grade", "C") or "C").upper()
+            _prev_execution_grade = str(_prev_cooldown.get("execution_grade", _prev_cooldown.get("grade", "C")) or _prev_cooldown.get("grade", "C") or "C").upper()
         else:
             _prev_ts = float(_prev_cooldown or 0)
-            _prev_grade = "C"
+            _prev_pattern_grade = "C"
+            _prev_execution_grade = "C"
         _in_cooldown = (time.time() - _prev_ts) < MID_ALERT_COOLDOWN
         if _in_cooldown:
             # 쿨다운 내라도 등급 상향 가능성 확인을 위해 분석은 진행
@@ -5965,13 +6099,13 @@ def run_mid_pullback_scan():
                 if not _peek:
                     _peek = check_intraday_pullback_breakout(code, name)
                 if _peek:
-                    _peek_grade = str(_peek.get("grade", "C")).upper()
+                    _peek_pattern_grade = str(_peek.get("pattern_grade", _peek.get("grade", "C")) or _peek.get("grade", "C") or "C").upper()
                     _grade_order = {"A": 3, "B": 2, "C": 1}
-                    if _grade_order.get(_peek_grade, 0) > _grade_order.get(_prev_grade, 0):
-                        print(f"  🔄 등급 상향 감지: {name} {_prev_grade}→{_peek_grade} — 쿨다운 리셋")
+                    if _grade_order.get(_peek_pattern_grade, 0) > _grade_order.get(_prev_pattern_grade, 0):
+                        print(f"  🔄 패턴등급 상향 감지: {name} {_prev_pattern_grade}→{_peek_pattern_grade} — 쿨다운 리셋")
                         # 쿨다운 리셋, 아래 분석으로 계속 진행
                     else:
-                        continue  # 등급 동일/하향 → 쿨다운 유지
+                        continue  # 패턴등급 동일/하향 → 쿨다운 유지
                 else:
                     continue
             except Exception:
@@ -5988,6 +6122,7 @@ def run_mid_pullback_scan():
                 result["sector_info"] = sector_info
                 _w_sec = _dynamic.get("feat_w_sector", 1.0)
                 result["score"] += int(sector_info.get("bonus", 0) * _w_sec)
+                result = _apply_mid_pullback_execution_grade(result)
                 signals.append(result)
             time.sleep(0.3)
         except Exception as e:
@@ -5998,7 +6133,8 @@ def run_mid_pullback_scan():
         print("  → 눌림목 조건 충족 종목 없음")
         return
 
-    signals.sort(key=lambda x: x["score"], reverse=True)
+    _mid_grade_rank = {"A": 3, "B": 2, "C": 1}
+    signals.sort(key=lambda x: (_mid_grade_rank.get(str(x.get("grade", "")).upper(), 0), x.get("score", 0)), reverse=True)
     for s in signals[:3]:
         if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
@@ -6041,7 +6177,12 @@ def run_mid_pullback_scan():
                 {"score": s.get("score", 0), "grade": s.get("grade", ""), "resurge_mode": bool(s.get("resurge_mode")), "direct_news_hit": bool(s.get("direct_news_hit")), "entry_price": s.get("entry_price", 0)}
             )
             save_signal_log(s)
-            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "grade": str(s.get("grade", "C")).upper()}
+            _mid_pullback_alert_history[s["code"]] = {
+                "ts": time.time(),
+                "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+                "execution_grade": str(s.get("execution_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+                "grade": str(s.get("execution_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+            }
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
             print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
             continue
@@ -6052,7 +6193,12 @@ def run_mid_pullback_scan():
             _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
             _sector_retry_snap["_alert_sender"] = "mid_pullback"
             start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)  # ★ 섹터 재안내 조건부 모니터링
-        _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "grade": str(s.get("grade", "C")).upper()}
+        _mid_pullback_alert_history[s["code"]] = {
+            "ts": time.time(),
+            "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+            "execution_grade": str(s.get("execution_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+            "grade": str(s.get("execution_grade", s.get("grade", "C")) or s.get("grade", "C") or "C").upper(),
+        }
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
 
@@ -7315,8 +7461,8 @@ def _format_nxt_transition_delta_block(watch: dict) -> str:
     """NXT→KRX 전환 과정에서 생긴 등급/진입가 변화를 1차 진입 알림용으로 포맷."""
     try:
         lines = []
-        detect_grade = str(watch.get("grade_at_detect", watch.get("grade", "")) or "").upper()
-        current_grade = str(watch.get("grade", detect_grade) or detect_grade).upper()
+        detect_grade = str(watch.get("execution_grade_at_detect", watch.get("grade_at_detect", watch.get("grade", ""))) or "").upper()
+        current_grade = str(watch.get("execution_grade", watch.get("grade", detect_grade)) or detect_grade).upper()
         if detect_grade and current_grade and detect_grade != current_grade:
             lines.append(f"  • 등급 변화: <b>{detect_grade}</b> → <b>{current_grade}</b>")
 
@@ -7363,30 +7509,52 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
                 print(f"  🔄 NXT선행→KRX추적: {name} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
 
         # [v41.88] NXT 전환 시 grade/score 재계산
-        prev_grade = str(watch.get("grade", "B")).upper()
-        watch.setdefault("grade_at_detect", prev_grade)
+        prev_pattern_grade = str(watch.get("pattern_grade", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper()
+        prev_execution_grade = str(watch.get("execution_grade", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper()
+        watch.setdefault("pattern_grade_at_detect", prev_pattern_grade)
+        watch.setdefault("execution_grade_at_detect", str(watch.get("grade_at_detect", prev_execution_grade) or prev_execution_grade).upper())
+        watch.setdefault("grade_at_detect", str(watch.get("execution_grade_at_detect", prev_execution_grade) or prev_execution_grade).upper())
         try:
             _reeval = analyze_mid_pullback(code, name)
             if not _reeval:
                 _reeval = check_intraday_pullback_breakout(code, name)
             if _reeval:
-                new_grade = str(_reeval.get("grade", prev_grade)).upper()
+                _reeval["theme_desc"] = watch.get("theme_desc", "")
+                _sector_info = calc_sector_momentum(code, name)
+                _reeval["sector_info"] = _sector_info
+                _w_sec = _dynamic.get("feat_w_sector", 1.0)
+                _reeval["score"] += int((_sector_info or {}).get("bonus", 0) * _w_sec)
+                _reeval = _apply_mid_pullback_execution_grade(_reeval)
+
+                new_pattern_grade = str(_reeval.get("pattern_grade", _reeval.get("grade", prev_pattern_grade)) or _reeval.get("grade", prev_pattern_grade) or prev_pattern_grade).upper()
+                new_execution_grade = str(_reeval.get("execution_grade", _reeval.get("grade", prev_execution_grade)) or _reeval.get("grade", prev_execution_grade) or prev_execution_grade).upper()
                 new_score = int(_reeval.get("score", watch.get("score", 0)) or 0)
-                watch["grade"] = new_grade
+
+                watch["pattern_grade"] = new_pattern_grade
+                watch["execution_grade"] = new_execution_grade
+                watch["grade"] = new_execution_grade
                 watch["score"] = new_score
-                if new_grade != prev_grade:
-                    print(f"  📊 NXT전환 등급 재평가: {name} {prev_grade}→{new_grade} ({new_score}점)")
-                    # 등급 상향 시 눌림목 쿨다운 리셋
-                    _grade_order = {"A": 3, "B": 2, "C": 1}
-                    if _grade_order.get(new_grade, 0) > _grade_order.get(prev_grade, 0):
-                        _mid_pullback_alert_history.pop(code, None)
-                        print(f"  🔄 쿨다운 리셋: {name} (등급 상향 {prev_grade}→{new_grade})")
+                watch["sector_info"] = _sector_info
+                watch["execution_grade_reason"] = str(_reeval.get("execution_grade_reason", watch.get("execution_grade_reason", "")) or "")
+                watch["execution_confirm_count"] = int(_reeval.get("execution_confirm_count", watch.get("execution_confirm_count", 0)) or 0)
+                watch["execution_core_confirm_count"] = int(_reeval.get("execution_core_confirm_count", watch.get("execution_core_confirm_count", 0)) or 0)
+                watch["execution_confirm_labels"] = list(_reeval.get("execution_confirm_labels", watch.get("execution_confirm_labels", [])) or [])
+
+                if new_pattern_grade != prev_pattern_grade:
+                    print(f"  📊 NXT전환 패턴등급 재평가: {name} {prev_pattern_grade}→{new_pattern_grade} ({new_score}점)")
+                if new_execution_grade != prev_execution_grade:
+                    print(f"  📊 NXT전환 실행등급 재평가: {name} {prev_execution_grade}→{new_execution_grade} ({new_score}점)")
+
+                _grade_order = {"A": 3, "B": 2, "C": 1}
+                if _grade_order.get(new_pattern_grade, 0) > _grade_order.get(prev_pattern_grade, 0):
+                    _mid_pullback_alert_history.pop(code, None)
+                    print(f"  🔄 쿨다운 리셋: {name} (패턴등급 상향 {prev_pattern_grade}→{new_pattern_grade})")
         except Exception as _re:
             print(f"  ⚠️ NXT전환 등급 재평가 실패: {_re}")
 
         # 외부 알림은 보내지 않고 내부 로그만 유지
         try:
-            _grade_display = str(watch.get("grade", "B")).upper()
+            _grade_display = str(watch.get("execution_grade", watch.get("grade", "B")) or watch.get("grade", "B") or "B").upper()
             _orig_entry = safe_int(watch.get("entry_price_orig", 0), 0)
             _cur_entry = safe_int(watch.get("entry_price", 0), 0)
             if _orig_entry and _cur_entry and _orig_entry != _cur_entry:
@@ -8612,6 +8780,8 @@ def save_signal_log(stock: dict):
             rec["signal_type_history"] = sig_hist[-TRACK_EPISODE_CANDIDATE_KEEP:]
             rec["latest_signal_score"] = stock.get("score", rec.get("score", 0))
             rec["latest_signal_grade"] = stock.get("grade", rec.get("grade", "B"))
+            rec["latest_signal_pattern_grade"] = stock.get("pattern_grade", rec.get("latest_signal_pattern_grade", stock.get("grade", rec.get("grade", "B"))))
+            rec["latest_signal_execution_grade"] = stock.get("execution_grade", rec.get("latest_signal_execution_grade", stock.get("grade", rec.get("grade", "B"))))
             rec["episode_representative"] = True
             rec["log_key"] = representative_key
             stock["signal_log_key"] = representative_key
@@ -8629,7 +8799,9 @@ def save_signal_log(stock: dict):
                 rec["name"] = stock_name
                 rec["signal_type"] = sig_type or rec.get("signal_type", "")
                 rec["score"] = stock.get("score", rec.get("score", 0))
-                rec["grade"] = stock.get("grade", rec.get("grade", "B"))
+                rec["pattern_grade"] = stock.get("pattern_grade", rec.get("pattern_grade", stock.get("grade", rec.get("grade", "B"))))
+                rec["execution_grade"] = stock.get("execution_grade", rec.get("execution_grade", stock.get("grade", rec.get("grade", "B"))))
+                rec["grade"] = stock.get("execution_grade", stock.get("grade", rec.get("grade", "B")))
                 rec["market_regime"] = MARKET_REGIME.get("label", "unknown")
                 rec["market_regime_det"] = market_regime_details()
                 rec["geo_sector_bias"] = globals().get('GEO_SECTOR_BIAS', {})
@@ -8676,9 +8848,13 @@ def save_signal_log(stock: dict):
             "signal_type": sig_type,
             "signal_type_history": [sig_type] if sig_type else [],
             "score": stock.get("score", 0),
-            "grade": stock.get("grade", "B"),
+            "pattern_grade": stock.get("pattern_grade", stock.get("grade", "B")),
+            "execution_grade": stock.get("execution_grade", stock.get("grade", "B")),
+            "grade": stock.get("execution_grade", stock.get("grade", "B")),
             "latest_signal_score": stock.get("score", 0),
-            "latest_signal_grade": stock.get("grade", "B"),
+            "latest_signal_grade": stock.get("execution_grade", stock.get("grade", "B")),
+            "latest_signal_pattern_grade": stock.get("pattern_grade", stock.get("grade", "B")),
+            "latest_signal_execution_grade": stock.get("execution_grade", stock.get("grade", "B")),
             "market_regime": MARKET_REGIME.get("label", "unknown"),
             "market_regime_det": market_regime_details(),
             "geo_sector_bias": globals().get('GEO_SECTOR_BIAS', {}),
@@ -11311,8 +11487,12 @@ def register_entry_watch(s: dict):
         "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
         "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
         "pullback_ratio_at_register": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
-        "grade": str(s.get("grade", "B")).upper(),
-        "grade_at_detect": str(s.get("grade", "B")).upper(),
+        "pattern_grade": str(s.get("pattern_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
+        "execution_grade": str(s.get("execution_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
+        "pattern_grade_at_detect": str(s.get("pattern_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
+        "execution_grade_at_detect": str(s.get("execution_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
+        "grade": str(s.get("execution_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
+        "grade_at_detect": str(s.get("execution_grade", s.get("grade", "B")) or s.get("grade", "B") or "B").upper(),
         "score": int(s.get("score", 0) or 0),
         "source": str(s.get("source", "") or ""),
         "dart_reliability_score": int(s.get("dart_reliability_score", 0) or 0),
@@ -13221,12 +13401,26 @@ def _build_mid_pullback_state_line(s: dict) -> str:
     entry = int(s.get('entry_price', 0) or 0)
     if not price or not entry:
         return ''
+    grade = str(s.get('grade', '') or '').upper()
     diff_pct = ((price - entry) / entry * 100) if entry else 0.0
     if diff_pct <= 0.05:
-        return '🎯 현재 판단: 1차 진입 가능'
+        if grade == 'A':
+            return '🎯 현재 판단: 1차 진입 가능'
+        if grade == 'B':
+            return '🟡 현재 판단: 1차 진입 검토'
+        return '⏳ 현재 판단: 관찰 우선'
     if diff_pct >= 1.5:
         return '⚠️ 현재 판단: 추격보다 눌림 대기'
     return '⏳ 현재 판단: 진입가 대기'
+
+
+def _build_mid_pullback_execution_note_line(s: dict) -> str:
+    pattern_grade = str(s.get('pattern_grade', '') or '').upper()
+    current_grade = str(s.get('grade', '') or '').upper()
+    if not pattern_grade or not current_grade or pattern_grade == current_grade:
+        return ''
+    note = str(s.get('execution_grade_reason', '') or '').strip() or '실행 확증 부족'
+    return f"⚠️ 실행 보정: 패턴 {pattern_grade} → 현재 {current_grade} ({note})"
 
 
 def _summarize_capture_reason_label(raw: str) -> str:
@@ -13237,6 +13431,12 @@ def _summarize_capture_reason_label(raw: str) -> str:
         return '거래량 회복'
     if '재상승' in t or '회복률' in t or '바닥 확인' in t:
         return '바닥 재상승'
+    if '당일 양봉' in t:
+        return '당일 양봉'
+    if '20일선 회복' in t:
+        return '20일선 회복'
+    if '건강한 눌림' in t or '황금 눌림' in t or '얕은 눌림' in t or '깊은 눌림' in t:
+        return '눌림 구조 양호'
     if '외국인+기관' in t:
         return '수급 동시 유입'
     if '외국인 순매수' in t or '기관 순매수' in t or 'NXT 외인+기관 동시매수' in t:
@@ -13247,6 +13447,8 @@ def _summarize_capture_reason_label(raw: str) -> str:
         return '진입가 위치 양호'
     if '뉴스' in t or '공시' in t:
         return '직접 뉴스 연관'
+    if '1차 급등' in t:
+        return ''
     t = re.sub(r'^[^0-9A-Za-z가-힣]+', '', t)
     return t[:18]
 
@@ -13262,6 +13464,12 @@ def _build_mid_pullback_reason_summary(s: dict) -> str:
 
     if any('거래량' in str(r or '') for r in raw_reasons):
         _push('거래량 회복')
+    if bool(s.get('is_bullish')) or any('당일 양봉' in str(r or '') for r in raw_reasons):
+        _push('당일 양봉')
+    if any('20일선 회복' in str(r or '') for r in raw_reasons) or float(s.get('ma20_dev', 0) or 0) >= 0:
+        _push('20일선 회복')
+    if bool(s.get('vol_dried')) or any(any(key in str(r or '') for key in ('건강한 눌림', '황금 눌림', '얕은 눌림', '깊은 눌림')) for r in raw_reasons):
+        _push('눌림 구조 양호')
     if bool(s.get('resurge_mode')) or any(any(key in str(r or '') for key in ('재상승', '회복률', '바닥 확인')) for r in raw_reasons):
         _push('바닥 재상승')
     if bool(s.get('direct_news_hit')) or any(any(key in str(r or '') for key in ('뉴스', '공시')) for r in raw_reasons):
@@ -13327,12 +13535,15 @@ def _build_mid_pullback_capture_message(s: dict, header_line: str, capture_label
     ]
     price_line = _build_capture_focus_price_line_compact(s)
     state_line = _build_mid_pullback_state_line(s)
+    execution_note = _build_mid_pullback_execution_note_line(s)
     reason_summary = _build_mid_pullback_reason_summary(s)
     sector_strength = _build_mid_pullback_sector_strength_line(s)
     if price_line:
         parts.append(price_line)
     if state_line:
         parts.append(state_line)
+    if execution_note:
+        parts.append(execution_note)
     detail_lines = [line for line in (reason_summary, sector_strength) if line]
     if detail_lines:
         parts.append('━━━━━━━━━━━━━━━')
