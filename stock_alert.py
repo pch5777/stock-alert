@@ -22,6 +22,19 @@
   개선점: 불필요한 상태 알림↓, 진입 판단 근거(등급 상향/진입가 재조정) 해석력↑.
   주의점: 변화가 없으면 `NXT 반영 변화` 블록은 표시되지 않음.
 
+- v41.89 (2026-03-20): 눌림목 상한가 도달/잠김 진입불가 차단 강화.
+  [#1] `_get_effective_change_rate()`를 추가해 KIS `change_rate`뿐 아니라 `prev_close` 대비 실계산 등락률을 함께 반영.
+       API 반올림/지연으로 `change_rate`가 낮게 보이는 경우에도 현재가 기준 상한가 수준을 더 보수적으로 판별.
+  [#2] `_detect_entry_block_reason()`를 보강해 `MID_PULLBACK`/`ENTRY_POINT` 신호는
+       상한가 잠김뿐 아니라 상한가 도달 자체도 `upper_limit_reached`로 차단하도록 강화.
+       기존 `limit_up_locked`/`no_ask_liquidity` 차단은 다른 신호유형에 그대로 유지.
+  [#3] `run_mid_pullback_scan()` / `check_entry_watch()` 두 경로 모두 같은 차단 함수를 사용하도록 유지해,
+       눌림목 실알림 직전과 진입가 도달 직전에서 동일 기준으로 재차 검증.
+  이유: 태웅 사례 — `현재가=진입가`로 보이더라도 이미 상한가 수준이면 실질 진입이 어려워,
+       눌림목 행동 알림으로 보내면 사용자가 진입 가능한 신호로 오해할 수 있었음.
+  개선점: 상한가/잠김 상태의 눌림목 오알림↓, 실진입 가능 종목 중심의 알림 품질↑.
+  주의점: 상한가 차단 강화는 눌림목(`MID_PULLBACK`/`ENTRY_POINT`) 경로에만 우선 적용.
+
 - v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
   [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
        `_mid_pullback_alert_history`를 `{ts, grade}` 형태로 변경해 이전 등급 추적.
@@ -11356,16 +11369,33 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
+def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
+    """KIS 응답 change_rate와 전일종가 대비 실계산 등락률 중 상방 기준을 보수적으로 사용."""
+    try:
+        api_change = float(cur.get("change_rate", 0.0) or 0.0)
+    except Exception:
+        api_change = 0.0
+    price = safe_int(price or cur.get("price", 0), 0)
+    prev_close = safe_int(cur.get("prev_close", 0), 0)
+    if price > 0 and prev_close > 0:
+        try:
+            calc_change = ((price - prev_close) / prev_close) * 100.0
+            return max(api_change, calc_change)
+        except Exception:
+            return api_change
+    return api_change
+
+
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
     """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
-    try:
-        change_rate = float(cur.get("change_rate", 0.0) or 0.0)
-    except Exception:
-        change_rate = 0.0
+    change_rate = _get_effective_change_rate(cur, price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
-    sig_type = str(watch.get("signal_type") or "")
-    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
+    sig_type = str(watch.get("signal_type") or "").upper()
+    upper_like = (change_rate >= 29.8) or sig_type in ("UPPER_LIMIT",)
+
+    if sig_type in ("MID_PULLBACK", "ENTRY_POINT") and upper_like:
+        return "upper_limit_reached"
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
