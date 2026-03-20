@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.91
+버전: v41.92
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.92 (2026-03-20): 장식 아이콘 → 상태(🔴🟡🔵) + 카테고리 텍스트 전환.
+  [#1] 사용자 메시지의 장식 아이콘 245줄을 상태 3색 체계로 통일.
+       좋음(🔴): 🏭강함→🔴[섹터], 👑→🔴[대장], 📈→🔴, 💥→🔴, 💪→🔴, 🚀→🔴,
+                 💎→🔴, 🔥→🔴, 📢→🔴[공시], 🔔(유지).
+       보통(🟡): 📌→🟡, ⚡→🟡[체결], 🌍→🟡[지정학], 🎯(유지), ⚠️(유지).
+       나쁨(🔵): 📉→🔵, 🛡→🔵[손절], 🚨(유지), ❌(유지).
+       맥락별: 🌐(해외), 🧠(나스닥), 📰(뉴스) → 좋음/보통/나쁨 자동 판별.
+       뉴스 아이콘은 맥락별 🔴/🟡/🔵 + [뉴스] 텍스트 병기.
+  [#2] 유지 대상: 🎯🏆🚨🔔❌✅⚠️ (기능별 아이콘 원래대로).
+  [#3] 시스템 아이콘 유지: 📊📡📋📂💾🤖⚙🔗📅🕐🔍🧹🚦🧭🔁📍🔊📐🗑🔧🌙💰🔄.
+  [#4] 내부 print 로그 아이콘은 미변환 (텔레그램 미전송).
+  이유: 장식 아이콘이 내용의 좋고/나쁨을 표현하지 못해 모바일에서 즉시 판단 어려움.
+  개선점: 아이콘 색상만으로 긍정/중립/부정 즉시 인식↑, 카테고리는 텍스트로 구분↑.
+  주의점: 내부 점수 계산/로직 변경 없음. 표시 계층만 수정.
 
 - v41.91 (2026-03-20): 눌림목 진입 신호 본문 재정리 — 현재 판단/핵심 근거/섹터 확증 중심으로 압축.
   [#1] `send_mid_pullback_alert()`를 전용 본문 빌더 `_build_mid_pullback_capture_message()`로 분리해
@@ -1898,9 +1913,9 @@ def calc_bollinger(items: list, period: int = None, k: float = 2.0) -> dict:
     pct_b  = round((cur - lower) / (upper - lower), 2) if upper != lower else 0.5
     breakout = cur >= upper
     if breakout:
-        desc = f"🚀 상단 돌파 (밴드폭 {(upper-lower)/mid*100:.1f}%)"
+        desc = f"🔴 상단 돌파 (밴드폭 {(upper-lower)/mid*100:.1f}%)"
     elif pct_b >= 0.8:
-        desc = f"🔥 상단 근접 ({pct_b*100:.0f}%)"
+        desc = f"🔴 상단 근접 ({pct_b*100:.0f}%)"
     elif pct_b <= 0.2:
         desc = f"🎯 하단 근접 ({pct_b*100:.0f}%) — 반등 가능"
     else:
@@ -1962,7 +1977,7 @@ def calc_indicators(code: str) -> dict:
         if w_bb > 0:
             if bb.get("breakout"):
                 score_adj += int(15 * w_bb)
-                reasons.append(f"🚀 볼린저 상단 돌파 +{int(15*w_bb)}점")
+                reasons.append(f"🔴 볼린저 상단 돌파 +{int(15*w_bb)}점")
             elif bb.get("pct_b", 0.5) <= 0.2:
                 score_adj += int(8 * w_bb)
                 reasons.append(f"🎯 볼린저 하단 근접 +{int(8*w_bb)}점")
@@ -2298,8 +2313,8 @@ def get_weekly_comparison(week_records: list) -> str:
     wr_diff  = w_wr - all_wr
     avg_diff = round(w_avg - all_avg, 1)
 
-    wr_icon  = "📈" if wr_diff > 0 else ("📉" if wr_diff < 0 else "➡️")
-    avg_icon = "📈" if avg_diff > 0 else ("📉" if avg_diff < 0 else "➡️")
+    wr_icon  = "🔴" if wr_diff > 0 else ("🔵" if wr_diff < 0 else "➡️")
+    avg_icon = "🔴" if avg_diff > 0 else ("🔵" if avg_diff < 0 else "➡️")
 
     return (f"\n📊 <b>역대 대비</b>  (전체 {len(completed)}건)\n"
             f"  {wr_icon} 승률: 이번주 {w_wr}% vs 역대 {all_wr}%  ({wr_diff:+d}%p)\n"
@@ -2901,9 +2916,9 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     grade   = "C"
 
     # 1차 급등 강도
-    if surge_pct >= 40:   score += 25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
-    elif surge_pct >= 25: score += 20; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
-    else:                 score += 15; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
+    if surge_pct >= 40:   score += 25; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}% (강력)")
+    elif surge_pct >= 25: score += 20; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}%")
+    else:                 score += 15; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}%")
 
     # 눌림 품질 (건강한 눌림일수록 높은 점수)
     if vol_dried:
@@ -2924,7 +2939,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         score += 10; reasons.append("🕯 당일 양봉 확인")
     if vol_recovered:
         vol_ratio_vs_pb = round(today_vol / avg_pullback_vol, 1) if avg_pullback_vol else 0
-        score += 15; reasons.append(f"💥 거래량 회복 (눌림 평균 대비 {vol_ratio_vs_pb:.1f}배)")
+        score += 15; reasons.append(f"🔴 거래량 회복 (눌림 평균 대비 {vol_ratio_vs_pb:.1f}배)")
     if ma20_recovering:
         score += 10; reasons.append(f"📊 20일선 회복 중 (현재 {ma20_dev:+.1f}%)")
 
@@ -2934,7 +2949,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
                        / (items[-2]["close"] or today_close) * 100, 2)
     rs = get_relative_strength(today_chg)
     if rs >= RS_MIN:
-        score += 10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배 (코스피 {kospi_chg:+.1f}%)")
+        score += 10; reasons.append(f"🔴 코스피 상대강도 {rs:.1f}배 (코스피 {kospi_chg:+.1f}%)")
 
     # ━━━ 4-2: 거래량 Z-score ⑰ ━━━
     z = get_volume_zscore(code, today_vol)
@@ -2972,7 +2987,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         sentiment = detect_foreign_institution_turnaround(code)
         if sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"):
             score += int(sentiment.get("score_bonus", 0) or 0)
-            reasons.append(f"🔄 외국인 음→양 전환 + 기관 순매수 (+{int(sentiment.get('score_bonus', 0) or 0)}점)")
+            reasons.append(f"🔴 외국인 음→양 전환 + 기관 순매수 (+{int(sentiment.get('score_bonus', 0) or 0)}점)")
     except Exception:
         pass
 
@@ -4134,7 +4149,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
     if current_metrics.get("ready"):
         return (
             "━━━━━━━━━━━━━━━\n"
-            f"⚡ <b>진입 시 체결속도</b>  {speed_score}점 ({speed_label})\n"
+            f"🟡 [체결] <b>진입 시 체결속도</b>  {speed_score}점 ({speed_label})\n"
             f"🪨 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 미세체결 제외  {filtered_ratio:.0f}%\n"
             f"🚦 최근 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
@@ -4143,7 +4158,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
     if current_metrics.get("provisional"):
         return (
             "━━━━━━━━━━━━━━━\n"
-            f"⚡ <b>진입 시 체결속도</b>  예비판단 {speed_score}점 ({speed_label})\n"
+            f"🟡 [체결] <b>진입 시 체결속도</b>  예비판단 {speed_score}점 ({speed_label})\n"
             f"🪨 예비 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 예비 미세체결 제외  {filtered_ratio:.0f}%\n"
             f"🚦 최근 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
@@ -4154,8 +4169,8 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
         ref_mode = "예비판단" if fallback_metrics.get("provisional") and not fallback_metrics.get("ready") else "체결속도"
         return (
             "━━━━━━━━━━━━━━━\n"
-            f"⚡ <b>진입 시 체결속도</b>  현재 샘플 부족 (참고)\n"
-            f"📌 {ref_prefix} {ref_mode}  {speed_score}점 ({speed_label})\n"
+            f"🟡 [체결] <b>진입 시 체결속도</b>  현재 샘플 부족 (참고)\n"
+            f"🟡 {ref_prefix} {ref_mode}  {speed_score}점 ({speed_label})\n"
             f"🪨 {ref_prefix} 눌림 유지  {dip_score}점 ({dip_label})\n"
             f"🧹 {ref_prefix} 미세체결 제외  {filtered_ratio:.0f}%\n"
             f"🚦 {ref_prefix} 흐름  {flow_state}  / 최근 유효체결 {freshness_age}초 전\n"
@@ -4163,7 +4178,7 @@ def _entry_execution_status_block(code: str, price: int = 0, metrics: dict | Non
         )
     return (
         "━━━━━━━━━━━━━━━\n"
-        f"⚡ <b>진입 시 체결속도</b>  샘플 부족 ({judgement_label})\n"
+        f"🟡 [체결] <b>진입 시 체결속도</b>  샘플 부족 ({judgement_label})\n"
         f"{judgement_line}\n"
     )
 
@@ -4196,7 +4211,7 @@ def _apply_execution_speed_to_signal(s: dict, mode: str | None = None) -> dict:
         dip_label = _execution_score_label(dip_score)
         flow_state = str(metrics.get("flow_state", "중립") or "중립")
         freshness_age = int(metrics.get("last_active_age_sec", 999) or 999)
-        reasons.append(f"⚡ 체결지속속도 {speed_score}점 ({speed_label})")
+        reasons.append(f"🟡 [체결] 체결지속속도 {speed_score}점 ({speed_label})")
         reasons.append(f"🪨 눌림 유지 {dip_score}점 ({dip_label})  (미세체결 제외 {filtered_ratio*100:.0f}%)")
         reasons.append(f"🚦 최근 체결흐름 {flow_state} / 최근 유효체결 {freshness_age}초 전")
         if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
@@ -4236,15 +4251,15 @@ def _apply_execution_speed_to_signal(s: dict, mode: str | None = None) -> dict:
         freshness_age = int(metrics.get("last_active_age_sec", 999) or 999)
         if signal_type in FAST_EXECUTION_SIGNAL_TYPES:
             if metrics.get("provisional"):
-                reasons.append(f"⚡ 체결지속속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state} / 최근 유효체결 {freshness_age}초 전")
+                reasons.append(f"🟡 [체결] 체결지속속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state} / 최근 유효체결 {freshness_age}초 전")
             else:
-                reasons.append("⚡ 체결지속속도 샘플 부족 (참고용)")
+                reasons.append("🟡 [체결] 체결지속속도 샘플 부족 (참고용)")
             s["entry_execution_focus"] = True
         elif signal_type in ENTRY_EXECUTION_SIGNAL_TYPES:
             if metrics.get("provisional"):
-                reasons.append(f"⚡ 체결속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state}")
+                reasons.append(f"🟡 [체결] 체결속도 예비 {int(metrics.get('execution_speed_score', 0) or 0)}점 / 흐름 {flow_state}")
             else:
-                reasons.append("⚡ 체결속도 참고 샘플 부족")
+                reasons.append("🟡 [체결] 체결속도 참고 샘플 부족")
 
     s.pop("execution_setup_required", None)
     if cautions:
@@ -4261,7 +4276,7 @@ def _build_execution_speed_block(s: dict) -> str:
         return ""
     if not metrics.get("ready"):
         if s.get("entry_execution_focus") or s.get("execution_setup_required"):
-            return "━━━━━━━━━━━━━━━\n⚡ <b>체결지속속도</b>  샘플 부족 (참고)\n🧭 진입가 도달 시 체결 유지 여부를 다시 확인합니다.\n"
+            return "━━━━━━━━━━━━━━━\n🟡 [체결] <b>체결지속속도</b>  샘플 부족 (참고)\n🧭 진입가 도달 시 체결 유지 여부를 다시 확인합니다.\n"
         return ""
     filtered = float(metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0) * 100.0
     speed_score = int(metrics.get('execution_speed_score', 0) or 0)
@@ -4269,7 +4284,7 @@ def _build_execution_speed_block(s: dict) -> str:
     flow_state = str(metrics.get('flow_state', '중립') or '중립')
     freshness_age = int(metrics.get('last_active_age_sec', 999) or 999)
     lines = [
-        f"⚡ <b>체결지속속도</b>  {speed_score}점 ({_execution_score_label(speed_score)})",
+        f"🟡 [체결] <b>체결지속속도</b>  {speed_score}점 ({_execution_score_label(speed_score)})",
         f"🪨 눌림 유지  {dip_score}점 ({_execution_score_label(dip_score)})",
         f"🧹 미세체결 제외  {filtered:.0f}%",
         f"🚦 최근 흐름  {flow_state} / 최근 유효체결 {freshness_age}초 전",
@@ -4340,7 +4355,7 @@ def _register_execution_setup_watch(s: dict) -> None:
     }
     _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
     _save_execution_setup_watch()
-    print(f"  ⚡ 체결확인 대기 등록: {s.get('name', code)} [{s.get('signal_type','')}] 예상진입 {safe_int(s.get('entry_price',0),0):,}원")
+    print(f"  🟡 [체결] 체결확인 대기 등록: {s.get('name', code)} [{s.get('signal_type','')}] 예상진입 {safe_int(s.get('entry_price',0),0):,}원")
 
 
 def _update_signal_log_execution_confirmed(log_key: str | None, watch: dict, entry_price: int, stop_price: int, target_price: int,
@@ -4448,7 +4463,7 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     )
     pattern_summary = _build_similar_pattern_summary_block(pattern_stats)
     lines = [
-        "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
+        "🟡 [체결] <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
         f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
         f"원신호: {sig_label}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
@@ -4457,14 +4472,14 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
         lines.append(pattern_summary)
     lines.extend([
         "━━━━━━━━━━━━━━━",
-        f"⚡ 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
+        f"🟡 [체결] 체결지속속도 {int(metrics.get('execution_speed_score', 0) or 0)}점",
         f"🪨 눌림 유지 {int(metrics.get('dip_resilience_score', 0) or 0)}점",
         "━━━━━━━━━━━━━━━",
         "┌─────────────────────",
-        "│ ⚡️ <b>하락 중 속도 유지 확인</b>",
+        "│ 🟡 [체결]️ <b>하락 중 속도 유지 확인</b>",
         f"│ 📍 현재가  <b>{hit_price:,}원</b>",
         f"│ 🎯 확정 진입가  <b>{entry_price:,}원</b>",
-        f"│ 🛡 손절가  <b>{stop_price:,}원</b>  ({stop_pct:+.1f}%)",
+        f"│ 🔵 [손절] 손절가  <b>{stop_price:,}원</b>  ({stop_pct:+.1f}%)",
         f"│ 🏆 목표가  <b>{target_price:,}원</b>  ({target_pct:+.1f}%)",
         f"│ ⚖️ 손익비  <b>{rr_text}</b>",
         "└─────────────────────",
@@ -4526,7 +4541,7 @@ def check_execution_setup_watch() -> None:
                 _build_execution_confirmation_message(watch, entry_price, stop_price, target_price, price, hit_time, metrics),
                 watch.get("code", ""), watch.get("name", "")
             )
-            print(f"  ⚡ 진입 확정: {watch.get('name','')} {price:,} / 확정진입 {entry_price:,}")
+            print(f"  🟡 [체결] 진입 확정: {watch.get('name','')} {price:,} / 확정진입 {entry_price:,}")
             expired.append(key)
         except Exception:
             continue
@@ -4792,25 +4807,25 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
     cautions = []
 
     if change_rate >= 20:
-        score += 20; reasons.append("🔥 강한 시세 유지 +20")
+        score += 20; reasons.append("🔴 강한 시세 유지 +20")
     elif change_rate >= 12:
-        score += 16; reasons.append("🔥 장후반 강세 유지 +16")
+        score += 16; reasons.append("🔴 장후반 강세 유지 +16")
     elif change_rate >= 6:
-        score += 10; reasons.append("📈 종가 강도 우수 +10")
+        score += 10; reasons.append("🔴 종가 강도 우수 +10")
     elif change_rate >= 3:
-        score += 5; reasons.append("📈 종가 강도 양호 +5")
+        score += 5; reasons.append("🔴 종가 강도 양호 +5")
 
     if price and high:
         close_ratio = price / max(high, 1)
         if close_ratio >= 0.99:
-            score += 9; reasons.append("📌 고가권 유지 +9")
+            score += 9; reasons.append("🟡 고가권 유지 +9")
         elif close_ratio >= 0.975:
-            score += 5; reasons.append("📌 고가 근처 유지 +5")
+            score += 5; reasons.append("🟡 고가 근처 유지 +5")
 
     if volume_ratio >= 10:
-        score += 12; reasons.append(f"💥 거래량 {volume_ratio:.1f}배 +12")
+        score += 12; reasons.append(f"🔴 거래량 {volume_ratio:.1f}배 +12")
     elif volume_ratio >= 4:
-        score += 8; reasons.append(f"💥 거래량 {volume_ratio:.1f}배 +8")
+        score += 8; reasons.append(f"🔴 거래량 {volume_ratio:.1f}배 +8")
     elif volume_ratio >= 2:
         score += 4; reasons.append(f"📊 거래량 {volume_ratio:.1f}배 +4")
 
@@ -4820,15 +4835,15 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         sector_info = {}
     sector_bonus = int(sector_info.get("bonus", 0) or 0)
     if sector_bonus >= 20:
-        score += 12; reasons.append("🏭 섹터 모멘텀 강함 +12")
+        score += 12; reasons.append("🔴 [섹터] 섹터 모멘텀 강함 +12")
     elif sector_bonus >= 10:
-        score += 8; reasons.append("🏭 섹터 모멘텀 우호 +8")
+        score += 8; reasons.append("🔴 [섹터] 섹터 모멘텀 우호 +8")
     elif sector_bonus >= 5:
-        score += 4; reasons.append("🏭 섹터 동조화 +4")
+        score += 4; reasons.append("🟡 [섹터] 섹터 동조화 +4")
 
     leader = sector_info.get("leader") or {}
     if leader and str(leader.get("code", "")) == str(code):
-        score += 4; reasons.append("👑 섹터 대장주 +4")
+        score += 4; reasons.append("🔴 [대장] 섹터 대장주 +4")
 
     if latest_rec:
         rec_score = int(latest_rec.get("score", 0) or 0)
@@ -4847,17 +4862,17 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
 
     gap_signal = str(us.get("gap_signal", "flat") or "flat")
     if gap_signal == "gap_up":
-        score += 6; reasons.append("🌐 미국시장 갭상승 우호 +6")
+        score += 6; reasons.append("🔴 [해외] 미국시장 갭상승 우호 +6")
     elif gap_signal == "gap_down":
-        score -= 6; cautions.append("🌐 미국시장 갭하락 경계 -6")
+        score -= 6; cautions.append("🔵 [해외] 미국시장 갭하락 경계 -6")
     nasdaq_chg = float(us.get("nasdaq_chg", 0.0) or 0.0)
     if nasdaq_chg >= 1.0:
-        score += 2; reasons.append("🧠 나스닥 강세 +2")
+        score += 2; reasons.append("🔴 [나스닥] 나스닥 강세 +2")
     elif nasdaq_chg <= -1.5:
-        score -= 2; cautions.append("🧠 나스닥 약세 -2")
+        score -= 2; cautions.append("🔵 [나스닥] 나스닥 약세 -2")
 
     if code in strong_dart_codes:
-        score += 8; reasons.append("📢 강재료 공시 +8")
+        score += 8; reasons.append("🔴 [공시] 강재료 공시 +8")
     try:
         dart_risk = check_dart_risk(code)
         if isinstance(dart_risk, dict) and dart_risk.get("is_risk"):
@@ -5163,10 +5178,10 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
         f"{reasons_block}"
         f"━━━━━━━━━━━━━━━\n"
         f"┌─────────────────────\n"
-        f"│ ⚡️ <b>오늘 선진입 구간 도달</b>\n"
+        f"│ 🟡 [체결]️ <b>오늘 선진입 구간 도달</b>\n"
         f"│ 📍 현재가  <b>{hit_price:,}원</b>\n"
         f"│ 🎯 선진입가  <b>{entry:,}원</b>\n"
-        f"│ 🛡 손절가  <b>{stop:,}원</b>  ({stop_pct:+.1f}%)\n"
+        f"│ 🔵 [손절] 손절가  <b>{stop:,}원</b>  ({stop_pct:+.1f}%)\n"
         f"│ 🏆 익일 목표  <b>{target:,}원</b>  ({target_pct:+.1f}%)\n"
         f"│ ⚖️ 손익비  <b>1 : {rr:.1f}</b>\n"
         f"└─────────────────────\n"
@@ -5385,7 +5400,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
             register_preclose_gap_watch(item, siglog_key)
 
     msg = (
-        f"🚀 <b>[익영업일 갭상승 선진입 후보]</b>  {payload.get('time','')}\n"
+        f"🔴 <b>[익영업일 갭상승 선진입 후보]</b>  {payload.get('time','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🕒 {payload.get('stage_label','')}  ·  {payload.get('market_basis','KRX')} 기준\n"
     )
@@ -5395,9 +5410,9 @@ def send_next_open_gap_alert(stage: str = "krx"):
         if sim_summary:
             msg += f"  {sim_summary}\n"
         msg += (
-            f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
+            f"  🟡 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
             f"  🎯 오늘 선진입가 {int(item.get('entry_price',0) or 0):,}원  (현재 대비 {float(item.get('entry_away_pct',0.0) or 0.0):.1f}%)\n"
-            f"  🛡 손절가 {int(item.get('stop_loss',0) or 0):,}원  ({float(item.get('stop_pct',0.0) or 0.0):+.1f}%)\n"
+            f"  🔵 [손절] 손절가 {int(item.get('stop_loss',0) or 0):,}원  ({float(item.get('stop_pct',0.0) or 0.0):+.1f}%)\n"
             f"  🏆 익일 목표 {int(item.get('target_price',0) or 0):,}원  ({float(item.get('target_pct',0.0) or 0.0):+.1f}%)\n"
             f"  ⚖️ 손익비 1 : {float(item.get('rr',0.0) or 0.0):.1f}  ·  {item.get('market_note','KRX 기준')}\n"
         )
@@ -5408,7 +5423,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
     us = get_us_market_signals() or {}
     summary = str(us.get("summary", "") or "").splitlines()[0].strip()
     if summary:
-        msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
+        msg += f"\n━━━━━━━━━━━━━━━\n🔴 [해외] {summary}\n"
     msg += "⚠️ 예상 선진입가 근처에서 하락 중 체결속도 유지가 확인된 종목만 실제 진입으로 확정합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand))
@@ -5476,7 +5491,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
             # 상승 섹터만 상위 3개
             ups = [sd for sd in sec_dirs if str(sd.get("direction","")) in ("상승","up","positive","bull")]
             if ups:
-                lines.append("🌍 이슈(지정학) 기반 유리 섹터")
+                lines.append("🟡 [지정학] 이슈(지정학) 기반 유리 섹터")
                 for sd in ups[:3]:
                     sec = sd.get("sector","")
                     reason = (sd.get("reason","") or "").strip()
@@ -5491,7 +5506,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
         # 2) DART 강재료(전일~금일)
         darts = _scan_recent_dart_materials(days_back=1, max_items=5)
         if darts:
-            lines.append("📢 공시(DART) 강재료 후보")
+            lines.append("🔴 [공시] 공시(DART) 강재료 후보")
             for d in darts[:5]:
                 code = normalize_stock_code(d.get("code") or "") or str(d.get("code") or "").strip()
                 nm = str(d.get("name") or d.get("corp_name") or "").strip()
@@ -5527,7 +5542,7 @@ def send_preopen_watchlist():
             gap_data = _read_json_safe(NEXT_OPEN_GAP_FILE, {})
             gap_cands = gap_data.get("candidates") if isinstance(gap_data, dict) else None
             if gap_cands:
-                msg += f"\n\n🚀 전일 종가 선진입 후보 [{str(gap_data.get('stage_label','최신'))}]\n"
+                msg += f"\n\n🔴 전일 종가 선진입 후보 [{str(gap_data.get('stage_label','최신'))}]\n"
                 for idx, item in enumerate(gap_cands[:5], 1):
                     msg += (
                         f"  {idx}) {item.get('name','')}({item.get('code','')}) {int(item.get('score',0) or 0)}점"
@@ -5833,12 +5848,12 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     # 스코어
     score = 0; reasons = []
     if breakout_mode:
-        reasons.append(f"⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)")
+        reasons.append(f"🟡 [체결]️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)")
     else:
         reasons.append(f"♻️ <b>재상승 감지!</b> (깊은 눌림 후 거래대금 재유입)")
-    if surge_pct >= 40: score+=25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
-    elif surge_pct >= 25: score+=20; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
-    else: score+=15; reasons.append(f"📈 1차 급등 {surge_pct:.0f}%")
+    if surge_pct >= 40: score+=25; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}% (강력)")
+    elif surge_pct >= 25: score+=20; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}%")
+    else: score+=15; reasons.append(f"🔴 1차 급등 {surge_pct:.0f}%")
 
     if vol_dried: score+=15; reasons.append(f"✅ 눌림 중 거래량 감소 확인 (건강한 조정)")
     else: score+=8; reasons.append(f"🟡 눌림 {pullback_pct:.0f}% ({pullback_days}일간)")
@@ -5850,20 +5865,20 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     # 오늘 돌파/재상승 신호 강도
     if breakout_mode:
         if today_chg >= 20: score+=30; reasons.append(f"🚨 오늘 +{today_chg:.0f}% 강력 돌파!")
-        elif today_chg >= 10: score+=20; reasons.append(f"🔥 오늘 +{today_chg:.0f}% 돌파")
-        else: score+=10; reasons.append(f"📈 오늘 +{today_chg:.1f}% 돌파 시작")
+        elif today_chg >= 10: score+=20; reasons.append(f"🔴 오늘 +{today_chg:.0f}% 돌파")
+        else: score+=10; reasons.append(f"🔴 오늘 +{today_chg:.1f}% 돌파 시작")
     else:
-        if reclaim_ratio >= 0.8: score += 24; reasons.append(f"🚀 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 강함")
+        if reclaim_ratio >= 0.8: score += 24; reasons.append(f"🔴 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 강함")
         elif reclaim_ratio >= 0.65: score += 18; reasons.append(f"♻️ 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 진행")
         else: score += 12; reasons.append(f"🟡 눌림 회복률 {reclaim_ratio*100:.0f}% — 재상승 초입")
-        reasons.append(f"📈 저점 대비 +{rebound_gain_pct:.1f}% 반등")
+        reasons.append(f"🔴 저점 대비 +{rebound_gain_pct:.1f}% 반등")
 
-    if vol_ratio >= 10: score+=20; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 폭발 (5일 평균 대비)")
-    elif vol_ratio >= 5: score+=15; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 급증")
+    if vol_ratio >= 10: score+=20; reasons.append(f"🔴 거래량 {vol_ratio:.0f}배 폭발 (5일 평균 대비)")
+    elif vol_ratio >= 5: score+=15; reasons.append(f"🔴 거래량 {vol_ratio:.0f}배 급증")
     else: score+=8; reasons.append(f"📊 거래량 {vol_ratio:.1f}배")
 
     if z >= VOL_ZSCORE_MIN: score+=10; reasons.append(f"📊 거래량 Z-score {z:.1f}σ")
-    if rs >= RS_MIN: score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
+    if rs >= RS_MIN: score+=10; reasons.append(f"🔴 코스피 상대강도 {rs:.1f}배")
     if ma20_dev > 0: score+=5; reasons.append(f"📐 20일선 돌파 (+{ma20_dev:.1f}%)")
 
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
@@ -6032,7 +6047,7 @@ def send_mid_pullback_alert(s: dict):
     s["name"] = stock_name
     grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(s.get("grade"), "📊")
     grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(s.get("grade"), "")
-    intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
+    intraday_tag = "  🟡 [체결]️ 장중 돌파" if s.get("is_intraday") else ""
     header_override = str(s.get("_header_override", "") or "").strip()
     header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
     capture_label = _format_capture_datetime_label(
@@ -6330,7 +6345,7 @@ def update_universe_from_performance(days: int = 30, max_codes: int = 300) -> No
         _write_json_atomic(UNIVERSE_FILE, {"codes": merged[:max_codes]})
         # cache reset
         _UNIVERSE_CACHE["ts"] = 0.0
-        print(f"🧠 universe.json 자동 갱신: {len(merged[:max_codes])}종목 (최근 {days}일 성과 기반)")
+        print(f"🟡 [나스닥] universe.json 자동 갱신: {len(merged[:max_codes])}종목 (최근 {days}일 성과 기반)")
     except Exception as e:
         _log_error("update_universe_from_performance", e)
 
@@ -6980,7 +6995,7 @@ def get_sector_stocks_from_kis(code: str) -> list:
             except Exception: pass
 
         _sector_cache[code] = {"sector": bstp_name, "stocks": stocks, "ts": time.time()}
-        print(f"  🏭 [{bstp_name}] 동업종 {len(stocks)}개 조회됨 (업종코드: {bstp_code})")
+        print(f"  🟡 [섹터] [{bstp_name}] 동업종 {len(stocks)}개 조회됨 (업종코드: {bstp_code})")
         return stocks
     except Exception as e:
         print(f"⚠️ 섹터 조회 오류 ({code}): {e}")
@@ -7447,7 +7462,7 @@ def _format_overnight_watchlist_block() -> str:
             by_event.setdefault(ev, []).append((c, v))
         for ev, items in by_event.items():
             kws = items[0][1].get("keywords", [])[:3]
-            lines.append(f"  📌 <b>{ev}</b>  ({', '.join(kws)})")
+            lines.append(f"  🟡 <b>{ev}</b>  ({', '.join(kws)})")
             for c, v in items[:4]:
                 lines.append(f"    • {v['name']} <code>{c}</code>")
         return "\n".join(lines)
@@ -7754,8 +7769,8 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 
     rising = [r for r in results if r["weak"]]
     flat   = [r for r in results if not r["weak"]]
-    if bonus == 0:            summary = f"📉 섹터 반응 없음 ({theme_name}: {react_cnt}/{total})"
-    elif react_ratio >= 1.0:  summary = f"🔥 섹터 전체 동반 상승! ({theme_name}: {react_cnt}/{total})"
+    if bonus == 0:            summary = f"🔵 섹터 반응 없음 ({theme_name}: {react_cnt}/{total})"
+    elif react_ratio >= 1.0:  summary = f"🔴 섹터 전체 동반 상승! ({theme_name}: {react_cnt}/{total})"
     elif react_ratio >= 0.5:  summary = f"✅ 섹터 절반 이상 반응 ({theme_name}: {react_cnt}/{total})"
     else:                     summary = f"🟡 섹터 일부 반응 ({theme_name}: {react_cnt}/{total})"
     # B: 섹터 점수 표시
@@ -7763,7 +7778,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
         summary += f"  💰 자금집중도 {sector_score:.0%}"
     # C: 대장주 표시
     if leader:
-        summary += f"  👑 대장 {leader['name']}({leader['cr']:+.1f}%)"
+        summary += f"  🔴 [대장] 대장 {leader['name']}({leader['cr']:+.1f}%)"
 
     # ── NXT 섹터 동향 보정 ──
     # 섹터 내 종목들의 NXT 외인 동향이 일치할수록 신뢰도 ↑
@@ -7795,7 +7810,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
     commodity_bias = _get_commodity_sector_adj(theme_name)
     bonus = int(bonus + commodity_bias)
     if commodity_bias != 0:
-        summary += f"  🌐 원자재연동 {commodity_bias:+d}점"
+        summary += f"  🔴 [해외] 원자재연동 {commodity_bias:+d}점"
     return {"bonus":bonus,"theme":theme_name,"summary":summary,
             "rising":rising,"flat":flat,"detail":results,"sources":sources,
             "leader":leader,"sector_score":sector_score}
@@ -8399,7 +8414,7 @@ def _enrich_mid_pullback_direct_news(signal: dict | None) -> dict:
         signal["sector_theme"] = theme
     matched = ", ".join((direct.get("matched") or [])[:3])
     signal.setdefault("reasons", []).append(
-        f"📰 직접뉴스 예외 허용 [{theme}] — {direct.get('reason', '')}"
+        f"🔴 [뉴스] 직접뉴스 예외 허용 [{theme}] — {direct.get('reason', '')}"
         + (f" ({matched})" if matched else "")
     )
     return signal
@@ -8761,7 +8776,7 @@ def send_overnight_risk_alerts():
                     f"  {risk['reason']}\n")
             # v40.0-#5: 리스크 원인별 표시
             for c in risk.get("causes", [])[:2]:
-                c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+                c_emoji = {"liquidity": "💧", "energy_geo": "🟡 [지정학]", "domestic_trend": "🔵"}.get(c["type"], "⚠️")
                 msg += f"  {c_emoji} {c['label']}: {c['detail']}\n"
 
         # v37.0: 오버나이트 보유 과거 통계 + 현재 국면 이력
@@ -9028,7 +9043,7 @@ def run_overnight_monitor():
                 geo = analyze_geopolitical_event(headlines_by_src)
                 if geo.get("detected") and geo.get("uncertainty") in ("high", "mid"):
                     alerts.append(
-                        f"🌍 지정학 이벤트: {geo.get('summary','')}\n"
+                        f"🟡 [지정학] 지정학 이벤트: {geo.get('summary','')}\n"
                         f"  관련 섹터: {', '.join(geo.get('sectors',[]))}"
                     )
                 # v41.78 #2: 야간 뉴스 → 이벤트 키워드 추출 → 워치리스트 생성
@@ -9258,7 +9273,7 @@ def track_signal_results():
                                 "━━━━━━━━━━━━━━━\n"
                                 f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
                                 "━━━━━━━━━━━━━━━\n"
-                                "⚡ <b>즉시 매도 검토 권장</b>\n"
+                                "🟡 [체결] <b>즉시 매도 검토 권장</b>\n"
                                 f"💡 /result {code} 로 결과 기록"
                             )
                             send_with_chart_buttons(_msg, code, _rec_name)
@@ -9286,7 +9301,7 @@ def track_signal_results():
                                     "━━━━━━━━━━━━━━━\n"
                                     f"🟡 <b>{_rec_name}</b>  <code>{code}</code>\n"
                                     "━━━━━━━━━━━━━━━\n"
-                                    f"📰 뉴스 판단: {_verd}  ({_nadj:+d}점)\n"
+                                    f"🟡 [뉴스] 뉴스 판단: {_verd}  ({_nadj:+d}점)\n"
                                     f"{_rps}\n"
                                     "━━━━━━━━━━━━━━━\n"
                                     f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
@@ -9331,7 +9346,7 @@ def track_signal_results():
                         f"🔴 <b>{rec['name']}</b>  <code>{code}</code>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {target_progress_pct:.0f}%)\n"
-                        f"📌 분할 기준: <b>+{half_pct:.1f}% 이상</b> 달성 시 1차 익절 검토\n"
+                        f"🟡 분할 기준: <b>+{half_pct:.1f}% 이상</b> 달성 시 1차 익절 검토\n"
                         f"✅ 현재 상태: 기준 대비 <b>{pnl_now-half_pct:+.1f}%p</b>\n"
                         f"📍 현재가: <b>{price:,}원</b>\n"
                         f"{entry_hit_line}\n"
@@ -9392,7 +9407,7 @@ def track_signal_results():
                         _tracking_notified.add(_theme_warn_key)
                         t_chg = _rot.get("themes", {}).get(_tkey, 0)
                         send_with_chart_buttons(
-                            f"🔄 <b>[{name}] 테마 약세 전환 경고</b>\n"
+                            f"🔴 <b>[{name}] 테마 약세 전환 경고</b>\n"
                             f"  [{_tkey}] 현재 {t_chg:+.1f}% — 테마 식는 중\n"
                             f"  현재 수익 {pnl_now:+.1f}% — 익절 고려 권장",
                             code, name
@@ -9464,8 +9479,8 @@ def track_signal_results():
                                 f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"✅ 지금은 <b>매도 지시가 아니라 보유 유지 구간</b>입니다\n"
-                                f"📈 잔량은 추가 상승을 추적합니다\n"
-                                f"📉 고점 대비 -3% 하락 시 <b>최종 청산</b>",
+                                f"🔴 잔량은 추가 상승을 추적합니다\n"
+                                f"🔵 고점 대비 -3% 하락 시 <b>최종 청산</b>",
                                 code, rec["name"]
                             )
                         else:
@@ -9538,9 +9553,9 @@ def track_signal_results():
                     if old_n > 50:
                         _dynamic["min_score_normal"] = max(old_n - 3, 50)
                         _dynamic["min_score_strict"] = max(old_s - 3, 60)
-                        print(f"  🔥 연속 수익 {_consecutive_win_count}회 → 공격 모드: 최소점수 {old_n}→{_dynamic['min_score_normal']}")
+                        print(f"  🔴 연속 수익 {_consecutive_win_count}회 → 공격 모드: 최소점수 {old_n}→{_dynamic['min_score_normal']}")
                         try:
-                            send(f"🔥 <b>연속 수익 {_consecutive_win_count}회!</b>\n"
+                            send(f"🔴 <b>연속 수익 {_consecutive_win_count}회!</b>\n"
                                  f"신호 기준 완화: {old_n}→{_dynamic['min_score_normal']}점\n"
                                  f"더 많은 신호를 포착합니다")
                         except Exception: pass
@@ -9572,7 +9587,7 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
     if reason == "목표가":
         emoji = "🎯✅"; title = "목표가 달성!"
     elif reason == "손절가":
-        emoji = "🛡🔵"; title = "손절가 도달"
+        emoji = "🔵 [손절]🔵"; title = "손절가 도달"
     elif reason == TRACK_TIMEOUT_RESULT:
         emoji = "⏱"; title = f"{TRACK_MAX_DAYS}일 경과 결과"
     else:
@@ -9586,7 +9601,7 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
         "STRONG_BUY":"강력매수",
     }
     sig_label = sig_labels.get(sig_type, sig_type)
-    theme_tag = f"\n🏭 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
+    theme_tag = f"\n🟡 [섹터] 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
     mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
 
     # ── 손절 원인 분석 ──
@@ -9606,7 +9621,7 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
                 elif f_net < 0:    causes.append(f"🔵 외국인 순매도 ({f_net:+,}주)")
                 if i_net < -3000:  causes.append(f"🔵 기관 대량 매도 ({i_net:+,}주)")
                 elif i_net < 0:    causes.append(f"🔵 기관 순매도 ({i_net:+,}주)")
-                if vr and vr < 0.5: causes.append(f"📉 거래량 급감 ({vr:.1f}배 — 매수세 소멸)")
+                if vr and vr < 0.5: causes.append(f"🔵 거래량 급감 ({vr:.1f}배 — 매수세 소멸)")
                 if vr and vr > 5:   causes.append(f"🌊 거래량 급증 속 하락 (세력 매도 가능성)")
                 if not causes:      causes.append("⚠️ 특이 원인 미감지 (기술적 손절)")
         except Exception: causes = ["조회 실패"]
@@ -9729,12 +9744,12 @@ def check_reentry_watch():
                     f"원신호: {sig}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"📍 손절가:  {w['stop_price']:,}원\n"
-                    f"📈 현재가:  <b>{price:,}원</b>  (+{bounce:.1f}% 반등)\n"
+                    f"🔴 현재가:  <b>{price:,}원</b>  (+{bounce:.1f}% 반등)\n"
                     f"🔊 거래량:  {vr:.1f}배 (회복)\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"┌─────────────────────\n"
                     f"│ 🎯 재진입가  <b>{price:,}원</b>\n"
-                    f"│ 🛡 손절가   <b>{stop_new:,}원</b>  (-{sp:.1f}%)\n"
+                    f"│ 🔵 [손절] 손절가   <b>{stop_new:,}원</b>  (-{sp:.1f}%)\n"
                     f"│ 🏆 목표가   <b>{target_new:,}원</b>  (+{tp:.1f}%)\n"
                     f"│ 손익비:    {rr:.1f} : 1\n"
                     f"└─────────────────────\n"
@@ -10218,7 +10233,7 @@ def _check_strategy_health(kpi: dict, notify: bool = True) -> list:
                 continue
             if sig_kpi["win_rate"] < 30:
                 changes.append(
-                    f"📉 {sig_type} 승률 {sig_kpi['win_rate']:.0f}% "
+                    f"🔵 {sig_type} 승률 {sig_kpi['win_rate']:.0f}% "
                     f"(n={sig_kpi['n']}) → 기준 강화 필요"
                 )
             elif sig_kpi["win_rate"] > 70 and sig_kpi.get("payoff_ratio", 1) >= 1.5:
@@ -10314,7 +10329,7 @@ def auto_tune(notify: bool = True):
                     _dynamic["atr_target_mult"]  = new_atr_t
 
                     changes.append(
-                        f"🧠 <b>성능 기반 튜닝</b> (최근 {TUNE_LOOKBACK_DAYS}일 / n={best.get('_n','?')})\n"
+                        f"🟡 [나스닥] <b>성능 기반 튜닝</b> (최근 {TUNE_LOOKBACK_DAYS}일 / n={best.get('_n','?')})\n"
                         f"- score {best.get('_score','?')} 기준 best params로 스무딩 적용\n"
                         f"- min_score: {cur_min_n}/{cur_min_s} → {new_min_n}/{new_min_s}\n"
                         f"- atr_stop/target: {cur_atr_s} / {cur_atr_t} → {new_atr_s} / {new_atr_t}"
@@ -10460,10 +10475,10 @@ def auto_tune(notify: bool = True):
             old_bonus   = _dynamic["themed_score_bonus"]
             if gap > 0.20:
                 _dynamic["themed_score_bonus"] = min(old_bonus + 5, 25)
-                changes.append(f"🏭 테마 보너스 강화: {old_bonus}→{_dynamic['themed_score_bonus']}점")
+                changes.append(f"🟡 [섹터] 테마 보너스 강화: {old_bonus}→{_dynamic['themed_score_bonus']}점")
             elif gap < -0.10 and old_bonus > 5:
                 _dynamic["themed_score_bonus"] = max(old_bonus - 3, 5)
-                changes.append(f"🏭 테마 보너스 축소: {old_bonus}→{_dynamic['themed_score_bonus']}점")
+                changes.append(f"🟡 [섹터] 테마 보너스 축소: {old_bonus}→{_dynamic['themed_score_bonus']}점")
 
         # ── ⑧-1 오버나이트 신호/결과 분석 ──
         overnight_recs = [r for r in completed if r.get("feature_flags", {}).get("gap_signal") in ["gap_up", "gap_down", "flat"]]
@@ -10585,7 +10600,7 @@ def auto_tune(notify: bool = True):
                 if new_w != old_w:
                     geo_weights[sec] = new_w
                     changes.append(
-                        f"🌍 지정학 섹터[{sec}] 배율 조정: {old_w:.2f}→{new_w:.2f} "
+                        f"🟡 [지정학] 지정학 섹터[{sec}] 배율 조정: {old_w:.2f}→{new_w:.2f} "
                         f"(평균 {avg_sec:+.1f}% vs 전체 {global_avg:+.1f}%)"
                     )
             _dynamic["geo_sector_weights"] = geo_weights
@@ -10655,7 +10670,7 @@ def auto_tune(notify: bool = True):
                     bump = 3 if exp < -1.0 else 2
                     _dynamic["min_score_normal"] = min(old_n + bump, 85)
                     changes.append(
-                        f"📉 기대수익 {exp:+.2f}% → 최소점수 +{bump}점 "
+                        f"🔵 기대수익 {exp:+.2f}% → 최소점수 +{bump}점 "
                         f"({old_n}→{_dynamic['min_score_normal']})"
                     )
                 elif exp > 1.5 and _dynamic["min_score_normal"] > 55:
@@ -10672,7 +10687,7 @@ def auto_tune(notify: bool = True):
 
         if after_hash == before_hash:
             _save_auto_tune_state(tune_state)
-            print(f"  🧠 자동 조정: 유효 파라미터 변경 없음 ({len(completed)}건 분석)")
+            print(f"  🟡 [나스닥] 자동 조정: 유효 파라미터 변경 없음 ({len(completed)}건 분석)")
             return
 
         tune_log = {}
@@ -10963,14 +10978,14 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                     tag = f"🆕 {len(new_rising)}종목 추가" if new_rising and info["alert_count"] > 1 else f"#{info['alert_count']}회 업데이트"
 
 
-                    lines = f"🏭 <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
+                    lines = f"🟡 [섹터] <b>섹터 모멘텀</b> [{theme}]  {tag}\n"
                     lines += _sector_origin_line(code, info)
                     lines += f"  {summary}\n" if summary else ""
                     leader = si.get("leader")
                     leader_code = leader["code"] if isinstance(leader, dict) else None
                     if leader and isinstance(leader, dict):
                         lines += (f"  ━━━━━━━━━━━━━\n"
-                                  f"  👑 <b>대장: {leader['name']}</b>  "
+                                  f"  🔴 [대장] <b>대장: {leader['name']}</b>  "
                                   f"<b>{leader.get('cr',0):+.1f}%</b>  "
                                   f"거래량 {leader.get('vr',0):.1f}배  "
                                   f"점수 {leader.get('score',0):.2f}\n"
@@ -10989,7 +11004,7 @@ def start_sector_monitor(code: str, name: str, origin_signal: str = "", detect_t
                     if bonus > 0:
                         lines += f"  💡 섹터 가산점: +{bonus}점\n"
                     send_with_chart_buttons(
-                        f"🏭 <b>[{name} 섹터 모니터링]</b>\n━━━━━━━━━━━━━━━\n{lines}",
+                        f"🟡 [섹터] <b>[{name} 섹터 모니터링]</b>\n━━━━━━━━━━━━━━━\n{lines}",
                         code, name
                     )
             except Exception as e:
@@ -11108,7 +11123,7 @@ def send_top_signals():
         msg += (
             f"\n{medal} <b>{t['name']}</b>  {sig}  {t['score']}점{nxt_tag}\n"
             f"   포착: {t['detected_at']}\n"
-            f"   🎯 진입 {entry:,}  🛡 손절 {stop:,}  🏆 목표 {target:,}\n"
+            f"   🎯 진입 {entry:,}  🔵 [손절] 손절 {stop:,}  🏆 목표 {target:,}\n"
             f"   손익비: {rr:.1f}:1\n"
         )
     msg += "\n━━━━━━━━━━━━━━━\n💡 점수·NXT·손익비 종합 순위"
@@ -11758,7 +11773,7 @@ def check_entry_watch():
             if diff_pct >= _escape_pct:
                 _record_entry_miss(watch, "상승이탈", price)
                 send_with_chart_buttons(
-                    f"📈 <b>[진입가 이탈]</b>\n"
+                    f"🔴 <b>[진입가 이탈]</b>\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"<b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                     f"진입가 {entry:,}원에서 +{diff_pct:.1f}% 상승 이탈\n"
@@ -11898,9 +11913,9 @@ def check_entry_watch():
                     _rising = sector_info.get("rising", []) or []
                     _sector_lines = []
                     if _theme:
-                        _sector_lines.append(f"🏭 <b>섹터 모멘텀</b> [{_theme}]")
+                        _sector_lines.append(f"🟡 [섹터] <b>섹터 모멘텀</b> [{_theme}]")
                     elif _summary or _rising:
-                        _sector_lines.append("🏭 <b>섹터 모멘텀</b>")
+                        _sector_lines.append("🟡 [섹터] <b>섹터 모멘텀</b>")
                     if _summary:
                         _sector_lines.append(f"  {_summary}")
                     if _rising:
@@ -11908,7 +11923,7 @@ def check_entry_watch():
                             f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
                             for r in _rising[:4]
                         ])
-                        _sector_lines.append(f"  📌 동반 상승: {_co_rise}")
+                        _sector_lines.append(f"  🟡 동반 상승: {_co_rise}")
                     if _sector_lines:
                         sector_block = "\n" + "\n".join(_sector_lines) + "\n"
                 except Exception:
@@ -11958,7 +11973,7 @@ def check_entry_watch():
                 if is_phase1:
                     # ━━━ 1차 진입가 도달 ━━━
                     _p1_pct = _split_rule["phase1_pct"]
-                    _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
+                    _strength_emoji = {"강한": "🔴", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
                     send_with_chart_buttons(
                         f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
                         f"━━━━━━━━━━━━━━━\n"
@@ -11975,7 +11990,7 @@ def check_entry_watch():
                         f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
                         f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
                         f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
-                        f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
+                        f"│ 🔵 [손절] 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
                         f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
                         f"└─────────────────────",
                         watch["code"], watch["name"]
@@ -12061,7 +12076,7 @@ def check_entry_watch():
                         f"│ 💰 권장 추가비중: <b>{_p2_pct}%</b>\n"
                         f"│ 📊 총 누적 권장비중: <b>{_total_pct}%</b>\n"
                         f"│ 📐 평균단가 예상: <b>{_avg_price:,}원</b>\n"
-                        f"│ 🛡 손절가: <b>{_stop_adj}</b>\n"
+                        f"│ 🔵 [손절] 손절가: <b>{_stop_adj}</b>\n"
                         f"├─────────────────────\n"
                         f"│ <b>판단 근거</b>\n"
                         f"{_reasons_str}\n"
@@ -12148,10 +12163,10 @@ def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> 
                 adj = int(geo.get("score_adj",0) or 0)
                 if unc == "high" and adj <= -5:
                     score += 20
-                    reasons.append("🌍 지정학 불확실성(HIGH) — 시장 리스크오프 가능")
+                    reasons.append("🟡 [지정학] 지정학 불확실성(HIGH) — 시장 리스크오프 가능")
                 elif adj <= -8:
                     score += 15
-                    reasons.append("🌍 지정학 이벤트 — 변동성 확대 가능")
+                    reasons.append("🟡 [지정학] 지정학 이벤트 — 변동성 확대 가능")
         except Exception:
             pass
 
@@ -12165,7 +12180,7 @@ def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> 
                         hits.append(kw)
             if hits:
                 score += 15
-                reasons.append(f"📰 부정 키워드 감지: {', '.join(hits[:4])}")
+                reasons.append(f"🔵 [뉴스] 부정 키워드 감지: {', '.join(hits[:4])}")
         except Exception:
             pass
 
@@ -12177,14 +12192,14 @@ def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> 
                 pnl = (price - entry) / entry * 100
                 if pnl <= -DEFENSE_LOSS_WARN_PCT:
                     score += 20
-                    reasons.append(f"📉 진입가 대비 {pnl:.1f}% (방어 필요)")
+                    reasons.append(f"🔵 진입가 대비 {pnl:.1f}% (방어 필요)")
                 elif pnl >= DEFENSE_PROFIT_LOCK_PCT:
                     score += 10
-                    reasons.append(f"📈 진입가 대비 +{pnl:.1f}% (익절 방어 권장)")
+                    reasons.append(f"🔴 진입가 대비 +{pnl:.1f}% (익절 방어 권장)")
                 # 손절선 근접
                 if stop_loss and price <= stop_loss * 1.01:
                     score += 20
-                    reasons.append("🛡 손절선 근접(1% 이내)")
+                    reasons.append("🔵 [손절] 손절선 근접(1% 이내)")
         except Exception:
             pass
 
@@ -12243,8 +12258,8 @@ def run_entry_defense_monitor():
                 guide.append("✅ <b>수익 방어</b>: 1차 분할익절(예: 30~50%) + 잔량은 <b>진입가/단기저점 이탈 시 정리</b>")
                 guide.append("✅ <b>트레일링</b>: 전일저가 또는 5분 저점 기준으로 손절선을 끌어올리기")
             else:
-                guide.append("🛡 <b>손실 방어</b>: 손절선 엄수(이탈 시 기계적으로 정리) + 무리한 물타기 금지")
-                guide.append("🛡 <b>리스크 발생</b>: 변동성 확대 구간이므로 진입/추가매수는 보수적으로")
+                guide.append("🔵 [손절] <b>손실 방어</b>: 손절선 엄수(이탈 시 기계적으로 정리) + 무리한 물타기 금지")
+                guide.append("🔵 [손절] <b>리스크 발생</b>: 변동성 확대 구간이므로 진입/추가매수는 보수적으로")
 
             # 마감 임박 추가 코멘트
             if is_nxt_open() and not is_market_open():
@@ -12252,7 +12267,7 @@ def run_entry_defense_monitor():
             else:
                 guide.append("⏳ <b>장마감 임박</b>: 뉴스/공시 충격은 익일 갭으로 이어질 수 있어 방어 우선")
             parts = [
-                f"🛡 <b>[손익 방어 알림]</b> (리스크 {risk_score}/100)",
+                f"🔵 [손절] <b>[손익 방어 알림]</b> (리스크 {risk_score}/100)",
                 "━━━━━━━━━━━━━━━",
                 f"<b>{name}</b>  <code>{code}</code>",
                 f"현재가 <b>{price:,}</b> / 진입 {entry:,}  ({pnl:+.1f}%)",
@@ -12376,7 +12391,7 @@ def send_with_chart_buttons(text: str, code: str, name: str):
     naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
     keyboard = {
         "inline_keyboard": [[
-            {"text": f"📈 {safe_name} 차트 보기 (네이버)", "url": naver},
+            {"text": f"🔴 {safe_name} 차트 보기 (네이버)", "url": naver},
         ]]
     }
     send(text, reply_markup=keyboard)
@@ -12536,7 +12551,7 @@ def update_dashboard(force: bool = False) -> None:
         perf = ""
 
     text = (
-        "📌 <b>운영 대시보드</b>\n"
+        "🟡 <b>운영 대시보드</b>\n"
         f"• 레짐: <b>{regime}</b>{det_txt}\n"
         f"• 진입 감시: <b>{tracked_n}</b> 종목\n"
     )
@@ -12629,7 +12644,7 @@ def _is_sector_reason_for_ui(txt: str) -> bool:
     t = str(txt or '').strip()
     if not t:
         return False
-    if t.startswith('📌 동반 상승:'):
+    if t.startswith('🟡 동반 상승:'):
         return True
     sector_markers = (
         '섹터 전체 동반 상승',
@@ -12648,7 +12663,7 @@ def _is_news_reason_for_ui(raw_txt: str) -> bool:
     if raw.startswith('  ⚠️ '):
         return True
     news_prefixes = (
-        '📰 뉴스 ', '🔍 뉴스 ', '💡 표면악재실질호재', '⚠️ 표면호재실질악재'
+        '🔵 [뉴스] 뉴스 ', '🔍 뉴스 ', '💡 표면악재실질호재', '⚠️ 표면호재실질악재'
     )
     return t.startswith(news_prefixes)
 
@@ -12742,13 +12757,13 @@ def _build_news_summary_block(s: dict, allow_fetch: bool = False) -> str:
     key_event = str((analysis or {}).get('key_event', '') or '').strip()
     risk_points = [str(x).strip() for x in ((analysis or {}).get('risk_points', []) or []) if str(x).strip()]
     conf = str((analysis or {}).get('confidence', 'low') or 'low')
-    conf_icon = {'high': '🔍', 'mid': '📰', 'low': '📰'}.get(conf, '📰')
+    conf_icon = {'high': '🔍', 'mid': '🟡 [뉴스]', 'low': '🟡 [뉴스]'}.get(conf, '🟡 [뉴스]')
 
     label = verd + (f' {adj:+d}점' if adj else '')
     if key_event:
         label += f' · {key_event}'
 
-    lines = [f"📰 <b>뉴스 요약</b> [{label}]"]
+    lines = [f"🟡 [뉴스] <b>뉴스 요약</b> [{label}]"]
     if reason:
         lines.append(f"  {conf_icon} {reason}")
 
@@ -12778,16 +12793,16 @@ def _sector_block(s: dict) -> str:
     sources = si.get("sources", {})
 
     if not detail and not summary:
-        return f"🏭 <b>섹터 모멘텀</b> [{theme}]  업종 조회 실패\n━━━━━━━━━━━━━━━\n\n"
+        return f"🟡 [섹터] <b>섹터 모멘텀</b> [{theme}]  업종 조회 실패\n━━━━━━━━━━━━━━━\n\n"
 
     bonus_tag = f"  +{bonus}점" if bonus > 0 else ""
-    block = f"🏭 <b>섹터 모멘텀</b> [{theme}]{bonus_tag}\n"
+    block = f"🟡 [섹터] <b>섹터 모멘텀</b> [{theme}]{bonus_tag}\n"
 
     # 왜 이 종목들이 묶였는지 표시
     if "동적테마" in sources:
         block += f"  🔗 연관 근거: 가격 상관관계·뉴스 공동언급\n"
     if "테마" in sources:
-        block += f"  📌 테마 등록 종목\n"
+        block += f"  🟡 테마 등록 종목\n"
     if "업종코드" in sources and len(sources) == 1:
         block += f"  📂 동일 업종 분류\n"
 
@@ -12797,7 +12812,7 @@ def _sector_block(s: dict) -> str:
     for r in rising[:5]:
         src_tag  = " 🔗" if r.get("source") == "동적테마" else ""
         vol_tag  = f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio", 0) >= 2 else ""
-        block   += f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
+        block   += f"  🔴 {_resolve_stock_name(r['code'], r.get('name',''))} <b>{r['change_rate']:+.1f}%</b>{vol_tag}{src_tag}\n"
 
     for r in flat[:3]:
         src_tag = " 🔗" if r.get("source") == "동적테마" else ""
@@ -12823,8 +12838,8 @@ def send_alert(s: dict):
     except Exception:
         pass
 
-    emoji = {"UPPER_LIMIT":"🚨","NEAR_UPPER":"🔥","STRONG_BUY":"💎",
-             "SURGE":"📈","ENTRY_POINT":"🎯","EARLY_DETECT":"🔍"}.get(s["signal_type"],"📊")
+    emoji = {"UPPER_LIMIT":"🚨","NEAR_UPPER":"🔴","STRONG_BUY":"🔴",
+             "SURGE":"🔴","ENTRY_POINT":"🎯","EARLY_DETECT":"🔍"}.get(s["signal_type"],"📊")
     title = {"UPPER_LIMIT":"상한가 감지","NEAR_UPPER":"상한가 근접","STRONG_BUY":"강력 매수 신호",
              "SURGE":"급등 감지","ENTRY_POINT":"★ 눌림목 진입 시점 ★",
              "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
@@ -12880,9 +12895,9 @@ def send_alert(s: dict):
         rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
             f"┌─────────────────────\n"
-            f"│ ⚡️ <b>지금 진입 구간!</b>\n"
+            f"│ 🟡 [체결]️ <b>지금 진입 구간!</b>\n"
             f"│ 🎯 진입가  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
-            f"│ 🛡 손절가  <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🔵 [손절] 손절가  <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가  <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
             f"│ ⚖️ 손익비  <b>{rr_text}</b>\n"
             f"└─────────────────────"
@@ -12891,9 +12906,9 @@ def send_alert(s: dict):
         rr_text = _calc_rr_text(entry, stop, target)
         entry_block = (
             f"┌─────────────────────\n"
-            f"│ ⚡️ <b>선진입 고려!</b>\n"
+            f"│ 🟡 [체결]️ <b>선진입 고려!</b>\n"
             f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
-            f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🔵 [손절] 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
             f"│ ⚖️ 손익비   <b>{rr_text}</b>\n"
             f"└─────────────────────"
@@ -12906,7 +12921,7 @@ def send_alert(s: dict):
             f"┌─────────────────────\n"
             f"│ {wait_msg}\n"
             f"│ 🎯 목표진입  <b>{entry:,}원</b>  ← 현재 {diff_from_entry:+.1f}%\n"
-            f"│ 🛡 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+            f"│ 🔵 [손절] 손절가   <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
             f"│ 🏆 목표가   <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}\n"
             f"│ ⚖️ 손익비   <b>{rr_text}</b>\n"
             f"└─────────────────────"
@@ -12963,13 +12978,13 @@ def _is_capture_focus_reason(txt: str) -> bool:
     if '학습 보정' in t:
         return False
     if t.startswith((
-        '📈 급등 ', '🔥 상한가 근접', '🚨 상한가 도달',
-        '💥 거래량 ', '📊 거래량 ',
-        '💎 외국인+기관 매수 / 개인 매도', '✅ 외국인+기관 동시 순매수',
+        '🔴 급등 ', '🔴 상한가 근접', '🚨 상한가 도달',
+        '🔴 거래량 ', '📊 거래량 ',
+        '🔴 외국인+기관 매수 / 개인 매도', '✅ 외국인+기관 동시 순매수',
         '🟡 외국인 순매수', '🟡 기관 순매수',
         '🔴 NXT 외인+기관 동시매수',
         '✅ 진입가 ',
-        '🚦 최근 체결흐름 ', '⚡ 체결지속속도 '
+        '🚦 최근 체결흐름 ', '🟡 [체결] 체결지속속도 '
     )):
         return True
     return False
@@ -13026,7 +13041,7 @@ def _ui_total_score_label_for_line(line: str, score: int) -> str:
     stripped = txt.strip()
     if (
         '리스크' in txt or 'VIX' in txt or '국내 추세 붕괴' in txt or '지정학' in txt
-        or stripped.startswith(('💧', '🌍', '📉'))
+        or stripped.startswith(('💧', '🟡 [지정학]', '🔵'))
     ):
         return _risk_total_score_label(score)
     if any(key in txt for key in ('체결지속속도', '눌림 유지', '예비판단')):
@@ -13113,14 +13128,14 @@ def _build_capture_focus_sector_block(s: dict) -> str:
     flat = si.get('flat', []) or []
     sources = si.get('sources', {}) or {}
 
-    lines = [f"🏭 <b>섹터 모멘텀</b> [{theme}]" + (f"  +{bonus}점" if bonus > 0 else "")]
+    lines = [f"🟡 [섹터] <b>섹터 모멘텀</b> [{theme}]" + (f"  +{bonus}점" if bonus > 0 else "")]
     if '동적테마' in sources:
         lines.append('  🔗 연관 근거: 가격 상관관계·뉴스 공동언급')
     if summary:
         lines.append(f'  {summary}')
     for r in rising[:2]:
         src_tag = ' 🔗' if r.get('source') == '동적테마' else ''
-        lines.append(f"  📈 {_resolve_stock_name(r.get('code',''), r.get('name',''))} <b>{float(r.get('change_rate',0) or 0):+.1f}%</b>{src_tag}")
+        lines.append(f"  🔴 {_resolve_stock_name(r.get('code',''), r.get('name',''))} <b>{float(r.get('change_rate',0) or 0):+.1f}%</b>{src_tag}")
     for r in flat[:1]:
         src_tag = ' 🔗' if r.get('source') == '동적테마' else ''
         lines.append(f"  ➖ {_resolve_stock_name(r.get('code',''), r.get('name',''))} {float(r.get('change_rate',0) or 0):+.1f}%{src_tag}")
@@ -13227,7 +13242,7 @@ def _build_mid_pullback_reason_summary(s: dict) -> str:
 
     if not labels:
         return ''
-    return f"📌 핵심 근거: {' + '.join(labels[:2])}"
+    return f"🟡 핵심 근거: {' + '.join(labels[:2])}"
 
 
 def _build_mid_pullback_sector_strength_line(s: dict) -> str:
@@ -13238,7 +13253,7 @@ def _build_mid_pullback_sector_strength_line(s: dict) -> str:
     rising_count = len(rising)
 
     if theme == '기타업종':
-        return '🏭 섹터 확증: 약함 (기타업종)'
+        return '🟡 [섹터] 섹터 확증: 약함 (기타업종)'
     if bonus >= 5 or rising_count >= 3:
         details = []
         if bonus > 0:
@@ -13247,7 +13262,7 @@ def _build_mid_pullback_sector_strength_line(s: dict) -> str:
             details.append(f'동반 상승 {rising_count}종목')
         if not details:
             details.append(theme)
-        return f"🏭 섹터 확증: 강함 ({', '.join(details)})"
+        return f"🔴 [섹터] 섹터 확증: 강함 ({', '.join(details)})"
     if bonus > 0 or rising_count >= 1:
         details = []
         if bonus > 0:
@@ -13256,8 +13271,8 @@ def _build_mid_pullback_sector_strength_line(s: dict) -> str:
             details.append(f'동반 상승 {rising_count}종목')
         if not details:
             details.append(theme)
-        return f"🏭 섹터 확증: 보통 ({', '.join(details)})"
-    return f"🏭 섹터 확증: 약함 ({theme})"
+        return f"🟡 [섹터] 섹터 확증: 보통 ({', '.join(details)})"
+    return f"🟡 [섹터] 섹터 확증: 약함 ({theme})"
 
 
 def _build_mid_pullback_capture_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
@@ -13386,9 +13401,9 @@ def analyze(stock: dict) -> dict:
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
     elif change_rate >= UPPER_LIMIT_THRESHOLD:
-        score+=25; reasons.append(f"🔥 상한가 근접 (+{change_rate:.1f}%)"); signal_type="NEAR_UPPER"
+        score+=25; reasons.append(f"🔴 상한가 근접 (+{change_rate:.1f}%)"); signal_type="NEAR_UPPER"
     elif change_rate >= PRICE_SURGE_MIN:
-        score+=15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type="SURGE"
+        score+=15; reasons.append(f"🔴 급등 +{change_rate:.1f}%"); signal_type="SURGE"
     else: return {}
 
     current_time = datetime.now().strftime("%H:%M:%S")
@@ -13399,7 +13414,7 @@ def analyze(stock: dict) -> dict:
         return {}
 
     if vol_ratio >= required_vol*2:
-        score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
+        score+=30; reasons.append(f"🔴 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
     elif vol_ratio >= required_vol:
         score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (동적기준 {required_vol:.1f}배 대비)")
 
@@ -13409,7 +13424,7 @@ def analyze(stock: dict) -> dict:
     _vol_adj = int(_dynamic.get("feature_volume_adj", {}).get(_vol_bucket, 0) or 0)
     if _chg_adj:
         score += _chg_adj
-        reasons.append(f"📈 변동률 학습 보정 [{_chg_bucket}] {_chg_adj:+d}점")
+        reasons.append(f"🔴 변동률 학습 보정 [{_chg_bucket}] {_chg_adj:+d}점")
     if _vol_adj:
         score += _vol_adj
         reasons.append(f"📊 거래량 학습 보정 [{_vol_bucket}] {_vol_adj:+d}점")
@@ -13417,7 +13432,7 @@ def analyze(stock: dict) -> dict:
     # 코스피 상대강도 ⑯
     rs = get_relative_strength(change_rate)
     if rs >= RS_MIN:
-        score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
+        score+=10; reasons.append(f"🔴 코스피 상대강도 {rs:.1f}배")
 
     if score >= 25:
         try:
@@ -13428,7 +13443,7 @@ def analyze(stock: dict) -> dict:
             # 3자 구도 우선 체크
             if f_net > 0 and i_net > 0 and r_net < 0:
                 score += 30; signal_type = "STRONG_BUY"
-                reasons.append(f"💎 외국인+기관 매수 / 개인 매도 (최강 수급구도) +30점")
+                reasons.append(f"🔴 외국인+기관 매수 / 개인 매도 (최강 수급구도) +30점")
             elif f_net > 0 and i_net > 0:
                 score += 30; signal_type = "STRONG_BUY"
                 reasons.append(f"✅ 외국인+기관 동시 순매수 +30점")
@@ -13467,10 +13482,10 @@ def analyze(stock: dict) -> dict:
         _exec_strength = _execution_score_label(int(_exec_metrics.get("execution_speed_score", 0) or 0))
         if _exec_strength == "강함":
             score += 15
-            reasons.append("⚡ 체결속도 강함 +15점")
+            reasons.append("🟡 [체결] 체결속도 강함 +15점")
         elif _exec_strength == "양호":
             score += 5
-            reasons.append("⚡ 체결속도 양호 +5점")
+            reasons.append("🟡 [체결] 체결속도 양호 +5점")
     except Exception:
         pass
 
@@ -13532,9 +13547,9 @@ def analyze(stock: dict) -> dict:
                 _j_adj = max(_j_adj, 4); _j_reason = f"🛢️ 유가{_oil:.1f}% → {_theme} 비용 완화"
             # 금리 상승 → 은행·보험 호재, 성장주·바이오 부담
             if _tnx >= 4.8 and _theme in ("은행","보험","금융"):
-                _j_adj = max(_j_adj, 4); _j_reason = f"📈 10Y{_tnx:.1f}% → {_theme} 금리 호재"
+                _j_adj = max(_j_adj, 4); _j_reason = f"🔴 10Y{_tnx:.1f}% → {_theme} 금리 호재"
             elif _tnx >= 4.8 and _theme in ("바이오","AI반도체","2차전지","성장"):
-                _j_adj = min(_j_adj, -3); _j_reason = f"📈 10Y{_tnx:.1f}% → {_theme} 금리 부담"
+                _j_adj = min(_j_adj, -3); _j_reason = f"🔴 10Y{_tnx:.1f}% → {_theme} 금리 부담"
             if _j_adj != 0:
                 score += _j_adj
                 reasons.append(_j_reason)
@@ -13563,7 +13578,7 @@ def analyze(stock: dict) -> dict:
     if sector_info["bonus"]>0:
         score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
         if sector_info.get("rising"):
-            reasons.append("📌 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
+            reasons.append("🟡 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
     elif sector_info.get("summary"):
         reasons.append(sector_info["summary"])
 
@@ -13584,7 +13599,7 @@ def analyze(stock: dict) -> dict:
         return {}   # 급락장: 상한가/강력매수만 허용
     if score < min_score: return {}
     if regime_mode != "normal":
-        reasons.append(f"🌐 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
+        reasons.append(f"🔴 [해외] 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
 
     # ── 미국 시장 점수 보정 ──
     us = {}  # v37.0: 초기화 (end-of-function 중복 fetch 제거)
@@ -13617,13 +13632,13 @@ def analyze(stock: dict) -> dict:
         short_ratio = get_short_sell_ratio(code)
         if short_ratio < 3.0:
             score += 5
-            reasons.append(f"🛡 공매도 잔고 {short_ratio:.1f}% — 저부담 +5점")
+            reasons.append(f"🔵 [손절] 공매도 잔고 {short_ratio:.1f}% — 저부담 +5점")
         elif short_ratio >= 10:
             score -= 10
             reasons.append(f"⚠️ 공매도 잔고 {short_ratio:.1f}% — 반등 시 숏커버 기대 가능")
         elif short_ratio >= 5:
             score -= 5
-            reasons.append(f"📉 공매도 잔고 {short_ratio:.1f}% — 주의")
+            reasons.append(f"🔵 공매도 잔고 {short_ratio:.1f}% — 주의")
     except Exception: pass
 
     # ── 외국인+기관 연속 순매수 보정 ──
@@ -13667,7 +13682,7 @@ def analyze(stock: dict) -> dict:
             adj  = int(deep.get("score_adj", 0) or 0)
             verd = deep.get("verdict", "중립")
             conf = deep.get("confidence", "low")
-            conf_emoji = {"high":"🔍","mid":"📰","low":"📰"}.get(conf,"📰")
+            conf_emoji = {"high":"🔍","mid":"🟡 [뉴스]","low":"🟡 [뉴스]"}.get(conf,"🟡 [뉴스]")
 
             if adj != 0:
                 score += adj
@@ -13694,7 +13709,7 @@ def analyze(stock: dict) -> dict:
                 direct_news_hit = True
                 _matched = ", ".join(direct_theme.get("matched", [])[:3])
                 reasons.append(
-                    f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
+                    f"🔴 [뉴스] 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
                     f"{direct_theme.get('reason','')}"
                     + (f" ({_matched})" if _matched else "")
                 )
@@ -13704,10 +13719,10 @@ def analyze(stock: dict) -> dict:
         if direct_news_hit:
             if signal_type in ("UPPER_LIMIT", "SURGE"):
                 score += 10
-                reasons.append("📰 직접뉴스 × 급등 시그널 +10점")
+                reasons.append("🔴 [뉴스] 직접뉴스 × 급등 시그널 +10점")
             elif signal_type == "STRONG_BUY":
                 score += 8
-                reasons.append("📰 직접뉴스 × 강력매수 시그널 +8점")
+                reasons.append("🔴 [뉴스] 직접뉴스 × 강력매수 시그널 +8점")
     except Exception:
         pass
 
@@ -13741,12 +13756,12 @@ def analyze(stock: dict) -> dict:
                             score += adj_weighted
                             _geo_adj_applied = adj_weighted
                             reasons.append(
-                                f"🌍 [{sec_name}] {_arrow}  "
+                                f"🟡 [지정학] [{sec_name}] {_arrow}  "
                                 f"({sd.get('reason','')}) {adj_weighted:+d}점"
                             )
                         elif _dir != "중립":
                             reasons.append(
-                                f"🌍 [{sec_name}] {_arrow}  ({sd.get('reason','')})"
+                                f"🟡 [지정학] [{sec_name}] {_arrow}  ({sd.get('reason','')})"
                             )
                         matched = True
                         break
@@ -13761,7 +13776,7 @@ def analyze(stock: dict) -> dict:
                         score += geo_adj
                         _geo_adj_applied = geo_adj
                         reasons.append(
-                            f"🌍 지정학 관련 섹터 {unc_label.get(geo_unc,'')} {geo_adj:+d}점"
+                            f"🟡 [지정학] 지정학 관련 섹터 {unc_label.get(geo_unc,'')} {geo_adj:+d}점"
                         )
     except Exception as _e: _log_error(f"analyze_geo({code})", _e)
 
@@ -13932,13 +13947,13 @@ def check_early_detection() -> list:
         hoga_text = f"{bid_qty/ask_qty:.1f}배" if ask_qty > 0 else "압도적"
         prev_upper = was_upper_limit_yesterday(code)
         early_score = 85 + (10 if prev_upper else 0)
-        reasons = [f"🔍 조기 포착!",f"📈 현재 +{change_rate:.1f}%",
-                   f"💥 거래량 {vol_ratio:.1f}배 (5일 평균 대비)",
+        reasons = [f"🔍 조기 포착!",f"🔴 현재 +{change_rate:.1f}%",
+                   f"🔴 거래량 {vol_ratio:.1f}배 (5일 평균 대비)",
                    f"📊 매수/매도 잔량 {hoga_text}",f"✅ 2분 연속 상승 확인"]
         if prev_upper: reasons.append("🔁 전일 상한가 → 연속 상한가 가능성")
         # 코스피 상대강도
         rs = get_relative_strength(change_rate)
-        if rs >= RS_MIN: early_score+=10; reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
+        if rs >= RS_MIN: early_score+=10; reasons.append(f"🔴 코스피 상대강도 {rs:.1f}배")
         # 거래량 Z-score
         try:
             z = get_volume_zscore(code, detail.get("today_vol",0))
@@ -13949,7 +13964,7 @@ def check_early_detection() -> list:
         if sector_info["bonus"]>0:
             early_score+=sector_info["bonus"]; reasons.append(sector_info["summary"])
             if sector_info.get("rising"):
-                reasons.append("📌 동반 상승: "+"".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
+                reasons.append("🟡 동반 상승: "+"".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info["rising"][:4]]))
         elif sector_info.get("summary"): reasons.append(sector_info["summary"])
 
         try:
@@ -13963,7 +13978,7 @@ def check_early_detection() -> list:
                 direct_news_hit = True
                 _matched = ", ".join(direct_theme.get("matched", [])[:3])
                 reasons.append(
-                    f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
+                    f"🔴 [뉴스] 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
                     f"{direct_theme.get('reason','')}"
                     + (f" ({_matched})" if _matched else "")
                 )
@@ -14004,8 +14019,8 @@ def check_early_detection() -> list:
             pre_score = 70
             pre_reasons = [
                 f"🌅 장 전 NXT 선포착!",
-                f"📈 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
-                f"💥 NXT 거래량 {vr:.1f}배",
+                f"🔴 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
+                f"🔴 NXT 거래량 {vr:.1f}배",
             ]
             if nxt.get("inv_bullish"):
                 pre_score += 15
@@ -14058,7 +14073,7 @@ def check_pullback_signals() -> list:
                 carry_text = f" (이월 {carry}일차)" if carry>0 else ""
                 entry_score = 95
                 entry_reasons = [f"🎯 눌림목{carry_text}",
-                                            f"📌 고점 {high:,}원 → 현재 {price:,}원 (-{pullback:.1f}%)",
+                                            f"🟡 고점 {high:,}원 → 현재 {price:,}원 (-{pullback:.1f}%)",
                                             f"⏱ 급등 후 {minutes_since(detected_at)}분 경과"]
                 entry_score, entry_reasons, similar_pattern_stats = _apply_similar_pattern_score(
                     entry_score, entry_reasons, code, "ENTRY_POINT", cur.get("change_rate",0), 0, weight_mode="confirm"
@@ -14756,7 +14771,7 @@ def detect_force_pattern(code: str, name: str,
         elif f_net >= 50000 and i_net < 0:
             patterns.append({
                 "type":       "foreign_smart_money",
-                "label":      "🌐 외국인 주도 매수",
+                "label":      "🟡 [해외] 외국인 주도 매수",
                 "confidence": "high",
                 "score_adj":  +10,
                 "detail":     (f"외국인 +{f_net:,}주 / 기관 {i_net:,}주 — "
@@ -14768,7 +14783,7 @@ def detect_force_pattern(code: str, name: str,
         if f_net >= 30000 and i_net >= 30000 and r_net < 0:
             patterns.append({
                 "type":       "institutional_vs_retail",
-                "label":      "💎 기관+외국인 동시 매수 / 개인 매도",
+                "label":      "🔴 기관+외국인 동시 매수 / 개인 매도",
                 "confidence": "high",
                 "score_adj":  +12,
                 "detail":     (f"외국인 +{f_net:,}주 + 기관 +{i_net:,}주 매수 "
@@ -15119,7 +15134,7 @@ def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
         if r["date"] and len(r["date"]) == 8:
             d_str = f"({r['date'][4:6]}/{r['date'][6:8]})"
         pnl_str = f"{r['pnl']:+.1f}%"
-        geo_mark = "🌍" if r["geo"] else ""
+        geo_mark = "🟡 [지정학]" if r["geo"] else ""
         examples.append(f"{_resolve_stock_name(r['code'], r.get('name',''))}{geo_mark} {pnl_str}{d_str}")
 
     line2 = "│     " + " | ".join(examples) if examples else ""
@@ -15496,7 +15511,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         resp_json = safe_json_response(resp)
         if not resp_json:
             # HTTP 오류/빈 응답 → 키워드 fallback (로그만, 알림 X)
-            print(f"  🌍 지정학 API: HTTP 빈 응답 → 키워드 fallback")
+            print(f"  🟡 [지정학] 지정학 API: HTTP 빈 응답 → 키워드 fallback")
             sectors = _map_geo_sectors(detected_kws)
             sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
             result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
@@ -15510,7 +15525,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         raw  = raw.replace("```json","").replace("```","").strip()
         if not raw:
             # v38.5: API 응답은 있으나 텍스트 비어있음 → 조용한 fallback (ValueError 제거)
-            print(f"  🌍 지정학 API: 텍스트 비어있음 → 키워드 fallback")
+            print(f"  🟡 [지정학] 지정학 API: 텍스트 비어있음 → 키워드 fallback")
             sectors = _map_geo_sectors(detected_kws)
             sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
             result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
@@ -15554,7 +15569,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             GEO_SECTOR_BIAS.update(bias)
         except Exception:
             pass
-        print(f"  🌍 지정학 분석: {result['uncertainty']} 불확실성 / 섹터: {result['sectors']}")
+        print(f"  🟡 [지정학] 지정학 분석: {result['uncertainty']} 불확실성 / 섹터: {result['sectors']}")
         return result
 
     except Exception as e:
@@ -15607,13 +15622,13 @@ def run_geo_news_scan():
         # 텔레그램 알림 (1시간 쿨다운)
         # v38.4: 공휴일/주말에는 내부 데이터만 저장, 사용자 알림 차단 (기본수칙 #16)
         if is_holiday():
-            print(f"  🌍 지정학 감지(대기모드): {geo.get('uncertainty','')} — 내부 저장만")
+            print(f"  🟡 [지정학] 지정학 감지(대기모드): {geo.get('uncertainty','')} — 내부 저장만")
             return
         last_sent = _geo_event_state.get("last_sent_ts", 0)
         if time.time() - last_sent < 3600:
             return
         unc_emoji = {"high": "🔵", "mid": "🟡", "low": "🔴"}
-        msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
+        msg  = (f"🟡 [지정학] <b>지정학 이벤트 감지</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"{unc_emoji.get(geo['uncertainty'],'🟡')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
 
@@ -15648,7 +15663,7 @@ def run_geo_news_scan():
                 _hist_str = _get_geo_sector_history(_sec, _stocks) if _stocks else ""
                 msg += (f"┌ {_icon} <b>{_sec}</b>{_adj_str}\n"
                         f"│  {sd.get('reason','')}\n"
-                        + (f"│  📌 {_stk_str}\n" if _stk_str else "")
+                        + (f"│  🟡 {_stk_str}\n" if _stk_str else "")
                         + (f"{_hist_str}\n" if _hist_str else "")
                         + "└─────────────\n")
             msg += "\n"
@@ -15662,13 +15677,13 @@ def run_geo_news_scan():
             last_sent_msg = str(_geo_event_state.get("last_sent_msg", "") or "")
             msg_compare = "\n".join(line.rstrip() for line in msg.strip().splitlines())
             if last_sent_msg == msg_compare:
-                print("🌍 지정학 이벤트 감지 — 장중 동일 내용 재발송 생략")
+                print("🟡 [지정학] 지정학 이벤트 감지 — 장중 동일 내용 재발송 생략")
                 return
             send(msg)
             _geo_event_state["last_sent_ts"] = time.time()
             _geo_event_state["last_sent_msg"] = msg_compare
         else:
-            print("🌍 지정학 이벤트 감지 — 장외 시간 텔레그램 발송 비활성화")
+            print("🟡 [지정학] 지정학 이벤트 감지 — 장외 시간 텔레그램 발송 비활성화")
 
         # v41.78 #2: 야간 시간대면 이벤트 키워드 추출 → 워치리스트 생성
         try:
@@ -15956,7 +15971,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
             "ts":          time.time(),
         }
         _deep_news_cache[cache_key] = result
-        print(f"  📰 심층분석 [{stock_name}]: {result['verdict']} {int(result['score_adj'] or 0):+d}점")
+        print(f"  🟡 [뉴스] 심층분석 [{stock_name}]: {result['verdict']} {int(result['score_adj'] or 0):+d}점")
         return result
 
     except Exception as e:
@@ -16105,7 +16120,7 @@ def analyze_news_theme(headlines: list = None) -> list:
     if headlines is None:                      # 직접 호출 시에만 크롤링
         headlines = fetch_all_news()
     if not headlines: return []
-    print(f"  📰 뉴스 {len(headlines)}건 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스)")
+    print(f"  🟡 [뉴스] 뉴스 {len(headlines)}건 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스)")
     for theme_key, theme_info in THEME_MAP.items():
         if time.time() - _news_alert_history.get(theme_key,0) < 14400: continue
         matched = [h for h in headlines if theme_key in h or any(s in h for s in theme_info.get("sectors",[]))]
@@ -16140,7 +16155,7 @@ def analyze_news_theme(headlines: list = None) -> list:
     return signals
 
 def send_news_theme_alert(signal: dict):
-    emoji = {"매우강함":"🔥","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"📢")
+    emoji = {"매우강함":"🔴","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"🔴 [공시]")
     react_pct = int(signal["react_ratio"]*100)
 
     rising_lines = []
@@ -16150,7 +16165,7 @@ def send_news_theme_alert(signal: dict):
         rising_lines.append(
             f"  {marker} <b>{s['name']}</b> {s['change_rate']:+.1f}%"
             + (f" 🔊{s['volume_ratio']:.0f}x" if s.get("vol_on") else "")
-            + (" 🚀" if s.get("surging") else "")
+            + (" 🔴" if s.get("surging") else "")
             + wsuf
         )
     rising_block = ("\n".join(rising_lines) + ("\n" if rising_lines else ""))
@@ -16163,10 +16178,10 @@ def send_news_theme_alert(signal: dict):
     not_yet_block = ("\n".join(not_yet_lines) + ("\n" if not_yet_lines else ""))
     send(f"{emoji} <b>[뉴스+주가 연동]</b>  {signal['signal_strength']}\n"
          f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-         f"📰 <b>{signal['theme_desc']}</b>\n💬 {signal['headline']}...\n\n"
+         f"🟡 [뉴스] <b>{signal['theme_desc']}</b>\n💬 {signal['headline']}...\n\n"
          f"━━━━━━━━━━━━━━━\n"
-         f"🏭 섹터 반응: <b>{len(signal['rising'])}/{signal['total']}개</b> ({react_pct}%)  +{signal['sector_bonus']}점\n\n"
-         +(f"🔥 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
+         f"🟡 [섹터] 섹터 반응: <b>{len(signal['rising'])}/{signal['total']}개</b> ({react_pct}%)  +{signal['sector_bonus']}점\n\n"
+         +(f"🔴 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
          +(f"🎯 <b>아직 안 오른 종목 (추격 기회)</b>\n{not_yet_block}\n" if not_yet_block else "")
          +"━━━━━━━━━━━━━━━")
 
@@ -16257,7 +16272,7 @@ def run_dart_intraday():
                 r_net = inv.get("retail_net",      0)
                 # 3자 구도 표시
                 if   f_net > 0 and i_net > 0 and r_net < 0:
-                    inv_text = "\n💎 외국인+기관 매수 / 개인 매도 (최강 수급)"
+                    inv_text = "\n🔴 외국인+기관 매수 / 개인 매도 (최강 수급)"
                 elif f_net > 0 and i_net > 0:
                     inv_text = "\n✅ 외국인+기관 동시 순매수"
                 elif f_net > 0:
@@ -16298,7 +16313,7 @@ def run_dart_intraday():
                 start_sector_monitor(code, company, "DISCLOSURE", datetime.now().strftime("%H:%M:%S"), False)
 
             # ── 이모지 및 등급 ──
-            emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
+            emoji = "🚨" if is_risk else ("🔴" if change_rate >= 10.0 else "🔴 [공시]")
             tag   = "⚠️ 위험 공시" if is_risk else "✅ 주요 공시"
             all_kw = list(dict.fromkeys(matched_urgent + matched_pos))
 
@@ -16306,14 +16321,14 @@ def run_dart_intraday():
             if price:
                 vol_str    = f"<b>{vol_ratio:.1f}배</b> (5일 평균 대비)" if vol_ratio else "조회 중"
                 zscore_str = f"  📊 Z={z:.1f}σ" if z >= VOL_ZSCORE_MIN else ""
-                rs_str     = f"  💪 RS={rs:.1f}x" if rs >= RS_MIN else ""
+                rs_str     = f"  🔴 RS={rs:.1f}x" if rs >= RS_MIN else ""
                 ma_str     = f"  📐 20일선 {ma20_dev:+.1f}%" if ma20_dev else ""
                 prev_str   = "\n🔁 전일 상한가 종목" if prev_upper else ""
                 price_block = (
                     f"\n━━━━━━━━━━━━━━━\n"
                     f"💰 현재가: <b>{price:,}원</b>  (<b>{change_rate:+.1f}%</b>)\n"
                     f"📊 거래량: {vol_str}{zscore_str}\n"
-                    f"📈 코스피 상대강도: {rs_str if rs_str else '—'}{ma_str}"
+                    f"🔴 코스피 상대강도: {rs_str if rs_str else '—'}{ma_str}"
                     f"{inv_text}{prev_str}"
                 )
             else:
@@ -16324,7 +16339,7 @@ def run_dart_intraday():
                 stop_block = (
                     f"\n━━━━━━━━━━━━━━━\n"
                     f"🎯 진입가: <b>{entry:,}원</b>\n"
-                    f"🛡 손절가: <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
+                    f"🔵 [손절] 손절가: <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
                     f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
                 )
             else:
@@ -16339,16 +16354,16 @@ def run_dart_intraday():
             if detail:
                 react_cnt    = len(rising)
                 total_cnt    = len(detail)
-                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
+                sector_block = f"\n━━━━━━━━━━━━━━━\n🟡 [섹터] 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
                 sector_block += "".join([
-                    f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
+                    f"  🔴 {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
                     + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
                     for r in rising[:4]
                 ])
                 for r in flat[:2]:
                     sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
             elif theme:
-                sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
+                sector_block = f"\n━━━━━━━━━━━━━━━\n🟡 [섹터] 섹터 [{theme}]: 동업종 조회 중\n"
                 # v39.4-#7: 배경 재조회 (DART 알림용)
                 def _dart_sector_retry(_code, _name, _theme):
                     time.sleep(30)
@@ -16356,9 +16371,9 @@ def run_dart_intraday():
                         si2 = calc_sector_momentum(_code, _name)
                         if si2.get("rising"):
                             _l = si2.get("leader")
-                            _msg = f"🏭 <b>섹터 [{_theme}] 조회 완료</b>\n  {si2.get('summary','')}\n"
+                            _msg = f"🟡 [섹터] <b>섹터 [{_theme}] 조회 완료</b>\n  {si2.get('summary','')}\n"
                             if _l and isinstance(_l, dict):
-                                _msg += f"  👑 <b>대장: {_l['name']}</b> {_l.get('cr',0):+.1f}%\n"
+                                _msg += f"  🔴 [대장] <b>대장: {_l['name']}</b> {_l.get('cr',0):+.1f}%\n"
                             send(_msg)
                     except Exception: pass
                 threading.Thread(target=_dart_sector_retry, args=(code, company, theme), daemon=True).start()
@@ -16392,7 +16407,7 @@ def run_dart_intraday():
                 f"━━━━━━━━━━━━━━━\n"
                 f"{'🔵' if is_risk else '🟡'} <b>{company}</b>  <code>{code}</code>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"📌 {title}\n"
+                f"🟡 {title}\n"
                 f"🔑 키워드: {', '.join(all_kw)}"
                 f"{deep_block}"
                 f"{price_block}"
@@ -16446,7 +16461,7 @@ def analyze_dart_disclosures():
         msg = f"📋 <b>내일 주목 종목 - DART 분석</b>\n🗓 {today[:4]}.{today[4:6]}.{today[6:]}\n━━━━━━━━━━━━━━━\n\n"
         for i,item in enumerate(scored[:5],1):
             e = {"매우강함":"🔵","강함":"🟡","보통":"🔴"}.get(item["strength"],"")
-            msg += f"{i}. {e} <b>{item['company']}</b> ({item['code']})\n   📌 {item['title']}\n   🔑 {', '.join(item['matched'])}\n   ⭐ {item['score']}점\n\n"
+            msg += f"{i}. {e} <b>{item['company']}</b> ({item['code']})\n   🟡 {item['title']}\n   🔑 {', '.join(item['matched'])}\n   ⭐ {item['score']}점\n\n"
         send(msg+"━━━━━━━━━━━━━━━\n⚠️ 내일 장 시작 전 확인 후 진입 판단")
     except Exception as e: print(f"⚠️ DART 분석 오류: {e}")
 
@@ -16461,7 +16476,7 @@ def _send_menu(title: str = ""):
     버튼을 누르면 해당 명령어 텍스트가 채팅창에 입력됨
     (텔레그램 callback_query 방식 대신 switch_inline_query_current_chat 사용)
     """
-    menu_title = title or "📌 <b>명령어 메뉴</b>  — 버튼을 눌러 실행하세요"
+    menu_title = title or "🟡 <b>명령어 메뉴</b>  — 버튼을 눌러 실행하세요"
     keyboard = {
         "inline_keyboard": [
             [
@@ -16472,7 +16487,7 @@ def _send_menu(title: str = ""):
             [
                 {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
                 {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
-                {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
+                {"text": "🔴 승률 통계",       "callback_data": "cmd_stats"},
             ],
             [
                 {"text": "🟡 NXT 현황",        "callback_data": "cmd_nxt"},
@@ -16590,7 +16605,7 @@ def poll_telegram_commands():
                             if target > 0:
                                 details.append(f"🏆 목표가 {target:,}원")
                             if stop > 0:
-                                details.append(f"🛡 손절가 {stop:,}원")
+                                details.append(f"🔵 [손절] 손절가 {stop:,}원")
                             if details:
                                 line += "\n  " + "  |  ".join(details)
                             if detect_time:
@@ -16699,7 +16714,7 @@ def poll_telegram_commands():
                         else:
                             top = sorted(stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:7]
                             lines = "\n".join(
-                                f"  {'📈' if s['change_rate']>0 else '📉'} {s['name']} "
+                                f"  {'🔴' if s['change_rate']>0 else '🔵'} {s['name']} "
                                 f"<b>{s['change_rate']:+.1f}%</b>  🔊{s.get('volume_ratio',0):.0f}x"
                                 for s in top
                             )
@@ -16851,11 +16866,11 @@ def poll_telegram_commands():
                     "daily - 📊 오늘 일일 성과 즉시 조회\n"
                     "nxt - 🟡 NXT 넥스트레이드 실시간 동향\n"
                     "week - 📅 이번 주 잠정 성과 조회\n"
-                    "stats - 📈 신호 유형별 승률 통계\n"
+                    "stats - 🔴 신호 유형별 승률 통계\n"
                     "compact - 🗜 컴팩트·상세 알림 모드 전환\n"
                     "stop - ⏸ 알림 일시 정지\n"
                     "resume - ▶️ 알림 재개\n"
-                    "menu - 📌 버튼 메뉴 열기\n"
+                    "menu - 🟡 버튼 메뉴 열기\n"
                     "result - ✍️ 수익률 수동 기록 (예: result 대주산업 +12.5)"
                     "</code>\n"
                     "━━━━━━━━━━━━━━━\n"
@@ -16867,7 +16882,7 @@ def poll_telegram_commands():
 
             # ── /geo — 지정학 분석 수동 실행 ──
             elif text == "/geo":
-                send("🌍 지정학 뉴스 분석 중... (10~20초 소요)")
+                send("🟡 [지정학] 지정학 뉴스 분석 중... (10~20초 소요)")
                 def _run_geo():
                     try:
                         headlines_by_src = _fetch_multi_source_headlines()
@@ -16881,7 +16896,7 @@ def poll_telegram_commands():
                             send("✅ 지정학 이벤트 없음 — 현재 안전 상태")
                             return
                         unc_emoji = {"high":"🔵","mid":"🟡","low":"🔴"}.get(geo.get("uncertainty","mid"),"🟡")
-                        msg = (f"🌍 <b>지정학 분석 결과</b>\n"
+                        msg = (f"🟡 [지정학] <b>지정학 분석 결과</b>\n"
                                f"━━━━━━━━━━━━━━━\n"
                                f"{unc_emoji} 불확실성: <b>{geo.get('uncertainty','?').upper()}</b>\n\n")
                         if geo.get("entities"):
@@ -16909,7 +16924,7 @@ def poll_telegram_commands():
                                 _hist2_str = _get_geo_sector_history(_sec2, _stocks2) if _stocks2 else ""
                                 msg += (f"┌ {_icon2} <b>{_sec2}</b>{_adj2_str}\n"
                                         f"│  {sd.get('reason','')}\n"
-                                        + (f"│  📌 {_stk2_str}\n" if _stk2_str else "")
+                                        + (f"│  🟡 {_stk2_str}\n" if _stk2_str else "")
                                         + (f"{_hist2_str}\n" if _hist2_str else "")
                                         + "└─────────────\n")
                             msg += "\n"
@@ -16931,7 +16946,7 @@ def poll_telegram_commands():
                     us = get_us_market_signals()
                     gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
                     regime_kor = {"panic":"🔵 급락장","risk_off":"🔵 약세장","neutral":"🔴 보통장","risk_on":"🔴 강세장","crash":"🔵 급락장","bear":"🔵 약세장","bull":"🔴 강세장"}
-                    msg = (f"🌐 <b>미국 시장 현황</b>\n"
+                    msg = (f"🟡 [해외] <b>미국 시장 현황</b>\n"
                            f"━━━━━━━━━━━━━━━\n"
                            f"나스닥선물: {us.get('nasdaq_chg',0):+.2f}%\n"
                            f"VIX 공포지수: {us.get('vix',0):.1f}\n"
@@ -17084,7 +17099,7 @@ def _handle_entry_confirm_command(raw: str):
              f"🔴 <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
              f"━━━━━━━━━━━━━━━\n"
              f"📍 실제 진입가: <b>{entry_p:,}원</b>\n"
-             f"🛡 손절가:  <b>{stop_p:,}원</b>  ({stop_pct:+.1f}%)\n"
+             f"🔵 [손절] 손절가:  <b>{stop_p:,}원</b>  ({stop_pct:+.1f}%)\n"
              f"🏆 목표가:  <b>{target_p:,}원</b>  ({tgt_pct:+.1f}%)\n"
              f"━━━━━━━━━━━━━━━\n"
              f"이 기준으로 자동 추적을 시작합니다.\n"
@@ -17303,7 +17318,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
             risk_score += 10; reasons.append(f"🟡 VIX {vix:.0f} (불안)")
 
         if short_r >= 10:
-            risk_score += 15; reasons.append(f"📉 공매도 {short_r:.1f}%")
+            risk_score += 15; reasons.append(f"🔵 공매도 {short_r:.1f}%")
         elif short_r >= 5:
             risk_score += 7; reasons.append(f"⚠️ 공매도 {short_r:.1f}%")
 
@@ -17455,9 +17470,9 @@ def _send_stats():
 
         type_labels = {
             "UPPER_LIMIT":  "🚨 상한가",
-            "NEAR_UPPER":   "🔥 상한가근접",
-            "STRONG_BUY":   "💎 강력매수",
-            "SURGE":        "📈 급등",
+            "NEAR_UPPER":   "🔴 상한가근접",
+            "STRONG_BUY":   "🔴 강력매수",
+            "SURGE":        "🔴 급등",
             "EARLY_DETECT": "🔍 조기포착",
             "ENTRY_POINT":  "🎯 눌림목",
             "MID_PULLBACK": "🏆 눌림목",
@@ -17567,7 +17582,7 @@ def _send_stats():
             themed_win = sum(1 for v in themed if v["pnl_pct"] > 0) / len(themed) * 100
             msg += (f"\n━━━━━━━━━━━━━━━\n"
                     f"🔍 단독 상승:  승률 {solo_win:.0f}%  평균 {solo_avg:+.1f}% ({len(solo)}건)\n"
-                    f"🏭 테마 동반:  승률 {themed_win:.0f}%  평균 {themed_avg:+.1f}% ({len(themed)}건)\n")
+                    f"🟡 [섹터] 테마 동반:  승률 {themed_win:.0f}%  평균 {themed_avg:+.1f}% ({len(themed)}건)\n")
 
         # ── 시간대별 승률 분석 ──
         slot_stats = analyze_timeslot_winrate(completed)
@@ -17634,7 +17649,7 @@ def _send_stats():
         rlabels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
         mult_map = {"bull":"기준 완화 (×1.15)","normal":"표준","bear":"기준 강화 (×0.75)","crash":"급락장 — 상한가만 허용"}
         msg += (f"\n━━━━━━━━━━━━━━━\n"
-                f"🌐 <b>현재 시장 국면</b>: {rlabels.get(rmode,'보통장')}\n"
+                f"🟡 [해외] <b>현재 시장 국면</b>: {rlabels.get(rmode,'보통장')}\n"
                 f"  코스피 당일 {regime.get('chg_1d',0):+.1f}%  |  5일 {regime.get('chg_5d',0):+.1f}%\n"
                 f"  신호 기준: {mult_map.get(rmode,'표준')}\n")
 
@@ -17787,7 +17802,7 @@ def on_market_close():
             total_avg  = sum(v.get("pnl_pct",0) for v in all_done) / len(all_done)
             total_rate = round(total_win / len(all_done) * 100)
             msg += (f"\n━━━━━━━━━━━━━━━\n"
-                    f"📈 <b>누적 성과</b>  {len(all_done)}건\n"
+                    f"🔴 <b>누적 성과</b>  {len(all_done)}건\n"
                     f"  승률 <b>{total_rate}%</b>  평균 <b>{total_avg:+.1f}%</b>\n")
 
     except Exception as e:
@@ -17945,7 +17960,7 @@ def _build_premarket_risk_payload() -> dict:
         level = "안전"; level_emoji = "🔴"; action = "정상 운영"
 
     msg = (
-        f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
+        f"🔵 [손절] <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
         f"💡 권장: <b>{action}</b>\n"
@@ -17954,7 +17969,7 @@ def _build_premarket_risk_payload() -> dict:
     if causes:
         msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
         for c in causes[:3]:
-            c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+            c_emoji = {"liquidity": "💧", "energy_geo": "🟡 [지정학]", "domestic_trend": "🔵"}.get(c["type"], "⚠️")
             msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
 
     try:
@@ -17968,15 +17983,15 @@ def _build_premarket_risk_payload() -> dict:
                 msg += f"  {line}\n"
             if geo_summary:
                 sec_txt = f"  |  관련 섹터: {', '.join(geo_sectors[:4])}" if geo_sectors else ""
-                msg += f"  🌍 지정학 {geo_unc.upper()}: {geo_summary}{sec_txt}\n"
+                msg += f"  🟡 [지정학] 지정학 {geo_unc.upper()}: {geo_summary}{sec_txt}\n"
             elif geo_history:
                 for line in geo_history[-3:]:
-                    msg += f"  🌍 {line}\n"
+                    msg += f"  🟡 [지정학] {line}\n"
     except Exception:
         pass
 
     msg += (
-        f"\n🌐 <b>미국 시장</b>\n"
+        f"\n🟡 [해외] <b>미국 시장</b>\n"
         f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n"
     )
     if kospi_5d != 0:
@@ -17999,7 +18014,7 @@ def _build_premarket_risk_payload() -> dict:
         sig_stats = get_signal_type_stats()
         stats_line = _format_signal_type_stats_line(sig_stats)
         if stats_line:
-            msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+            msg += f"\n🔴 <b>유형별 승률</b>\n  {stats_line}\n"
     except Exception:
         pass
 
@@ -18271,7 +18286,7 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     top = sectors[:profile["max_sections"]]
     market_heat = min(100, int(len(sectors) * 12 + strong_seed_cnt * 10 + upper_seed_cnt * 15 + max(s.get("score", 0) for s in top) * 0.2))
     interval_min = 10 if market_heat >= 70 or event_mode else 15 if market_heat >= 45 else 20
-    title_icon = "🔥" if max(s.get("score", 0) for s in top) >= 75 else "📈"
+    title_icon = "🔴" if max(s.get("score", 0) for s in top) >= 75 else "🔴"
     mode_line = "🟡 NXT (넥스트레이드) 주도" if nxt_open and not market_open else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🔴 장중 주도"
     lines = [
         f"{title_icon} <b>[시장 주도 섹터]</b>",
@@ -18281,17 +18296,17 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     digest_parts = []
     for sec in top:
         leader = sec["leader"]
-        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
-        lines.append(f"👑 {leader['name']} {leader['change_rate']:+.1f}%")
+        lines.append(f"🟡 [섹터] <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
+        lines.append(f"🔴 [대장] {leader['name']} {leader['change_rate']:+.1f}%")
         fol = "  ".join(f"{q['name']} {q['change_rate']:+.1f}%" for q in sec.get("followers", [])[:4])
         if fol:
-            lines.append(f"📈 {fol}")
+            lines.append(f"🔴 {fol}")
         lines.append("")
         digest_parts.append(sec['theme'])
         digest_parts.append(f"{leader['code']}:{leader['change_rate']:.1f}")
         digest_parts.extend(f"{q['code']}:{q['change_rate']:.1f}" for q in sec.get('followers', [])[:4])
     lines.append("━━━━━━━━━━━━━━━")
-    lines.append(f"💥 시장 활력 {market_heat}점  |  다음 재평가 {interval_min}분")
+    lines.append(f"🔴 시장 활력 {market_heat}점  |  다음 재평가 {interval_min}분")
     msg = "\n".join(lines).strip()
     digest = hashlib.sha256("|".join(digest_parts).encode("utf-8")).hexdigest()
     return {
@@ -18378,7 +18393,7 @@ def send_premarket_briefing():
         us = get_us_market_signals()
         if us.get("summary"):
             gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
-            msg += (f"\n🌐 <b>미국 시장</b>\n"
+            msg += (f"\n🔴 [해외] <b>미국 시장</b>\n"
                     f"  {us['summary']}\n"
                     f"  {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n")
         # 오버나이트 중 발생한 이벤트 요약 (파일 기반 상태 우선)
@@ -18398,7 +18413,7 @@ def send_premarket_briefing():
         geo_unc = geo_state.get("uncertainty", "low")
         if geo_sum:
             unc_emoji = {"high": "🔵", "mid": "🟡", "low": "🔴"}.get(geo_unc, "🟡")
-            msg += (f"\n🌍 <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
+            msg += (f"\n🟡 [지정학] <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
                     f"  {geo_sum}\n"
                     f"  관련 섹터: {', '.join(geo_sec)}\n")
     except Exception:
@@ -18464,7 +18479,7 @@ def send_premarket_briefing():
                    if any(kw in i.get("report_nm","")
                           for kw in ["유상증자","무상증자","합병","분할","실적","배당","자사주"])]
             if hot:
-                msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
+                msg += f"\n🟡 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
                 for h in hot[:4]:
                     msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
     except Exception: pass
@@ -18501,7 +18516,7 @@ def send_premarket_briefing():
             for s in hot_nxt:
                 cr  = s.get("change_rate", 0)
                 vr  = s.get("volume_ratio", 0)
-                dot = "📈" if cr > 0 else "📉"
+                dot = "🔴" if cr > 0 else "🔵"
                 vt  = f" 🔊{vr:.0f}x" if vr >= 3 else ""
                 msg += f"  {dot} {s['name']} <b>{cr:+.1f}%</b>{vt}\n"
 
@@ -18534,7 +18549,7 @@ def send_premarket_briefing():
         elif rmode == "bull":
             regime_warn = "\n🔴 <b>상승장 모드</b> — 신호 기준 완화, 적극 대응 가능"
         msg += (f"\n━━━━━━━━━━━━━━━\n"
-                f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
+                f"🟡 [해외] 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
                 f"{regime_warn}\n")
     except Exception: pass
 
@@ -18543,7 +18558,7 @@ def send_premarket_briefing():
         sig_stats = get_signal_type_stats()
         stats_line = _format_signal_type_stats_line(sig_stats)
         if stats_line:
-            msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+            msg += f"\n🔴 <b>유형별 승률</b>\n  {stats_line}\n"
     except Exception: pass
 
     # v41.78 #3: 야간 이벤트 워치리스트 블록
@@ -18612,7 +18627,7 @@ def send_weekly_report():
         if solo_pnls and themed_pnls:
             compare = (f"\n🔍 단독:  승률 {sum(1 for p in solo_pnls if p>0)/len(solo_pnls)*100:.0f}%"
                        f"  평균 {sum(solo_pnls)/len(solo_pnls):+.1f}%  ({len(solo_pnls)}건)\n"
-                       f"🏭 테마:  승률 {sum(1 for p in themed_pnls if p>0)/len(themed_pnls)*100:.0f}%"
+                       f"🟡 [섹터] 테마:  승률 {sum(1 for p in themed_pnls if p>0)/len(themed_pnls)*100:.0f}%"
                        f"  평균 {sum(themed_pnls)/len(themed_pnls):+.1f}%  ({len(themed_pnls)}건)")
 
         report_text = (
@@ -18752,7 +18767,7 @@ def _notify_regime_change(prev_mode: str, new_mode: str):
 
         rp = REGIME_PARAMS.get(new_mode, REGIME_PARAMS["normal"])
         msg = (
-            f"🔄 <b>시장 레짐 전환</b>\n"
+            f"🔴 <b>시장 레짐 전환</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"{prev_label} → {new_label}\n\n"
             f"📊 <b>자동 조정 파라미터</b>\n"
@@ -18765,7 +18780,7 @@ def _notify_regime_change(prev_mode: str, new_mode: str):
             f"  • 야간 위험 가중: {rp['overnight_add']:+d}점\n"
         )
         send(msg)
-        print(f"  🔄 레짐 전환 알림: {prev_mode} → {new_mode}")
+        print(f"  🔴 레짐 전환 알림: {prev_mode} → {new_mode}")
     except Exception as e:
         _log_error("_notify_regime_change", e)
 
@@ -18982,7 +18997,7 @@ def detect_pre_dart_volume(code: str, name: str) -> dict:
             else:
                 # 공시 나온 후 거래량 → 일반 반응
                 result.update({"detected": False, "vol_ratio": vol_ratio,
-                                "score_adj": 3, "reason": f"📢 공시 후 거래량 반응 {vol_ratio:.1f}배"})
+                                "score_adj": 3, "reason": f"🔴 [공시] 공시 후 거래량 반응 {vol_ratio:.1f}배"})
 
         _pre_dart_cache[code] = result
     except Exception as e:
@@ -19518,7 +19533,7 @@ def get_us_market_signals() -> dict:
         })
         MARKET_REGIME.update(compute_market_regime(nasdaq_chg, vix, dxy))
         _us_cache.update(result)
-        print(f"  🌐 미국 시장: {summary}")
+        print(f"  🟡 [해외] 미국 시장: {summary}")
 
     except Exception as e:
         _log_error("get_us_market_signals", e)
@@ -19593,7 +19608,7 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
         if regime in ("bear", "crash"):
             guide = f"⚠️ {regime_label()} — 비중 축소, 1종목 집중"
         elif strength == "강한" and p >= 0.6:
-            guide = f"💪 고확률 신호 — 1종목 적극 진입"
+            guide = f"🔴 고확률 신호 — 1종목 적극 진입"
         elif strength == "약한":
             guide = f"⚠️ 약한 신호 — 관찰 전용, 실진입 제외"
         else:
@@ -19981,7 +19996,7 @@ def run_scan():
         _tick_exec_speed_prewarm()     # ★ 체결속도 사전 워밍 — 진입가 도달 전 샘플 최신화
         check_entry_watch()     # ★ 진입가 도달 체크
         check_preclose_gap_entry_watch()  # ★ 장마감 전 선진입가 도달 체크
-        run_entry_defense_monitor()  # 🛡 장마감 손익 방어 가이드
+        run_entry_defense_monitor()  # 🔵 [손절] 장마감 손익 방어 가이드
         check_reentry_watch()   # ★ 손절 후 재진입 감시
         track_signal_results()  # ★ 추적 중 신호 결과 체크
     except Exception as e: _log_error("run_scan", e, critical=True)
