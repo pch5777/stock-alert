@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.87
+버전: v41.88
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
+  [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
+       `_mid_pullback_alert_history`를 `{ts, grade}` 형태로 변경해 이전 등급 추적.
+       쿨다운 내 분석을 1회 실행하되, 등급 동일/하향이면 기존 쿨다운 유지.
+  [#2] `_register_nxt_surge_to_krx_watch()`에서 NXT→KRX 전환 시 grade/score 재계산.
+       `analyze_mid_pullback()` / `check_intraday_pullback_breakout()` 재호출로 최신 등급 반영.
+       등급 상향 시 눌림목 쿨다운도 리셋하여 재알림 경로 열림.
+       텔레그램 전환 알림에 등급 표시 추가.
+  이유: 태웅 사례 — 전날 B등급 포착 후 다음날 NXT에서 상승 지속했으나
+       24시간 쿨다운 + NXT전환 등급 미갱신으로 A등급 재알림 불가 → 진입 기회 놓침.
+  개선점: 상승 지속 종목 등급 상향 시 적극 진입 유도↑, NXT전환 등급 정확성↑.
+  주의점: 쿨다운 내 등급 확인을 위한 추가 분석 1회 발생 (API 호출 소폭 증가).
+       등급 동일/하향 시에는 기존 쿨다운 그대로 유지.
 
 - v41.87 (2026-03-20): 메시지 아이콘 3색 체계 통일 (🔴좋음/🟡보통/🔵나쁨).
   [#1] 전체 메시지 아이콘을 3색 신호등 체계로 통일.
@@ -5879,8 +5893,33 @@ def run_mid_pullback_scan():
 
     for code, name, theme_desc in all_candidates:
         name = _resolve_stock_name(code, name)
-        if time.time() - _mid_pullback_alert_history.get(code, 0) < MID_ALERT_COOLDOWN:
-            continue
+        # [v41.88] 쿨다운 체크: 등급 상향 시 리셋 허용
+        _prev_cooldown = _mid_pullback_alert_history.get(code)
+        if isinstance(_prev_cooldown, dict):
+            _prev_ts = _prev_cooldown.get("ts", 0)
+            _prev_grade = _prev_cooldown.get("grade", "C")
+        else:
+            _prev_ts = float(_prev_cooldown or 0)
+            _prev_grade = "C"
+        _in_cooldown = (time.time() - _prev_ts) < MID_ALERT_COOLDOWN
+        if _in_cooldown:
+            # 쿨다운 내라도 등급 상향 가능성 확인을 위해 분석은 진행
+            try:
+                _peek = analyze_mid_pullback(code, name)
+                if not _peek:
+                    _peek = check_intraday_pullback_breakout(code, name)
+                if _peek:
+                    _peek_grade = str(_peek.get("grade", "C")).upper()
+                    _grade_order = {"A": 3, "B": 2, "C": 1}
+                    if _grade_order.get(_peek_grade, 0) > _grade_order.get(_prev_grade, 0):
+                        print(f"  🔄 등급 상향 감지: {name} {_prev_grade}→{_peek_grade} — 쿨다운 리셋")
+                        # 쿨다운 리셋, 아래 분석으로 계속 진행
+                    else:
+                        continue  # 등급 동일/하향 → 쿨다운 유지
+                else:
+                    continue
+            except Exception:
+                continue
         try:
             # ① 일봉 기준 눌림목
             result = analyze_mid_pullback(code, name)
@@ -5946,7 +5985,7 @@ def run_mid_pullback_scan():
                 {"score": s.get("score", 0), "grade": s.get("grade", ""), "resurge_mode": bool(s.get("resurge_mode")), "direct_news_hit": bool(s.get("direct_news_hit")), "entry_price": s.get("entry_price", 0)}
             )
             save_signal_log(s)
-            _mid_pullback_alert_history[s["code"]] = time.time()
+            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "grade": str(s.get("grade", "C")).upper()}
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
             print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
             continue
@@ -5957,7 +5996,7 @@ def run_mid_pullback_scan():
             _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
             _sector_retry_snap["_alert_sender"] = "mid_pullback"
             start_sector_monitor(s["code"], s["name"], s.get("signal_type",""), s.get("detect_time",""), True, alert_snapshot=_sector_retry_snap)  # ★ 섹터 재안내 조건부 모니터링
-        _mid_pullback_alert_history[s["code"]] = time.time()
+        _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "grade": str(s.get("grade", "C")).upper()}
         tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
         print(f"  ✓ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점")
 
@@ -7228,6 +7267,8 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
         watch["nxt_surge_tracked"] = True
         watch["nxt_surge_price"]   = int(nxt_price or 0)
         watch["nxt_surge_time"]    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        code = watch.get("code", "")
+        name = watch.get("name", "")
         # 진입가를 NXT 급등가 기준으로 소폭 재조정 (기존 진입가보다 낮으면 유지)
         orig_entry = watch.get("entry_price", 0)
         if orig_entry and nxt_price:
@@ -7236,15 +7277,38 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
                 new_entry = int(nxt_price * 0.97)
                 watch["entry_price_orig"] = orig_entry
                 watch["entry_price"]      = new_entry
-                print(f"  🔄 NXT선행→KRX추적: {watch.get('name','')} 진입가 {orig_entry:,}→{new_entry:,}원 (NXT {nxt_price:,})")
+                print(f"  🔄 NXT선행→KRX추적: {name} 진입가 {orig_entry:,}→{new_entry:,}원 (NXT {nxt_price:,})")
             else:
-                print(f"  🔄 NXT선행→KRX추적: {watch.get('name','')} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
+                print(f"  🔄 NXT선행→KRX추적: {name} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
+
+        # [v41.88] NXT 전환 시 grade/score 재계산
+        prev_grade = str(watch.get("grade", "B")).upper()
+        try:
+            _reeval = analyze_mid_pullback(code, name)
+            if not _reeval:
+                _reeval = check_intraday_pullback_breakout(code, name)
+            if _reeval:
+                new_grade = str(_reeval.get("grade", prev_grade)).upper()
+                new_score = int(_reeval.get("score", watch.get("score", 0)) or 0)
+                watch["grade"] = new_grade
+                watch["score"] = new_score
+                if new_grade != prev_grade:
+                    print(f"  📊 NXT전환 등급 재평가: {name} {prev_grade}→{new_grade} ({new_score}점)")
+                    # 등급 상향 시 눌림목 쿨다운 리셋
+                    _grade_order = {"A": 3, "B": 2, "C": 1}
+                    if _grade_order.get(new_grade, 0) > _grade_order.get(prev_grade, 0):
+                        _mid_pullback_alert_history.pop(code, None)
+                        print(f"  🔄 쿨다운 리셋: {name} (등급 상향 {prev_grade}→{new_grade})")
+        except Exception as _re:
+            print(f"  ⚠️ NXT전환 등급 재평가 실패: {_re}")
+
         # 텔레그램 알림 (내부 전환 기록)
         try:
+            _grade_display = str(watch.get("grade", "B")).upper()
             send(f"📡 <b>[NXT 선행→KRX 추적 전환]</b>\n"
-                 f"<b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+                 f"<b>{name}</b>  <code>{code}</code>\n"
                  f"NXT {nxt_price:,}원 선행 감지 → KRX 정규장 개시 후 자동 추적\n"
-                 f"진입가: {watch.get('entry_price',0):,}원")
+                 f"진입가: {watch.get('entry_price',0):,}원  등급: {_grade_display}")
         except Exception: pass
     except Exception as e:
         print(f"⚠️ _register_nxt_surge_to_krx_watch: {e}")
