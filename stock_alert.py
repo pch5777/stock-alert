@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.86
+버전: v41.87
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.87 (2026-03-20): 메시지 아이콘 3색 체계 통일 (🔴좋음/🟡보통/🔵나쁨).
+  [#1] 전체 메시지 아이콘을 3색 신호등 체계로 통일.
+       🔴=좋음(상승/수익/강함/매수), 🟡=보통(보합/경계/관망), 🔵=나쁨(하락/손실/약함/매도).
+  [#2] 기존 매핑: 🟢(좋음)→🔴, 🔴(나쁨)→🔵, 🟡 유지, 🟠→맥락별 🟡 또는 🔵.
+  [#3] NXT 시장 표시(기존 🔵)를 좋음/보통/나쁨 규칙에 통일.
+       NXT 매수/강세→🔴, NXT 매도/둔화→🔵, NXT 시스템 라벨→📡.
+  [#4] 변환 범위: 코드 영역 155줄, docstring/changelog/주석은 미변경.
+  이유: 색상별 의미가 혼재(🔴=나쁨, 🟢=좋음, 🔵=NXT 등)되어 모바일에서 즉시 판단 어려움.
+  개선점: 아이콘만으로 좋음/보통/나쁨 즉시 인식↑, NXT 표시 일관성↑.
+  주의점: 내부 점수 계산/로직은 변경 없음. 표시(UI) 계층만 수정.
+       ✅/⚠️/🚨/💡/🎯 등 기능별 아이콘은 기존 유지.
 
 - v41.86 (2026-03-20): 고아 추적 종목 자동 만료 시스템 도입.
   [#1] `_is_orphan_tracking()` / `_get_valid_tracking()` / `purge_orphan_tracking()` 신규.
@@ -795,7 +807,7 @@ def _send_startup_banner_once() -> bool:
             f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
             f"📅 {BOT_DATE}  🔑 <code>{code_hash}</code>\n\n"
             "✅ 한국투자증권 API 연결\n"
-            "🔵 NXT(넥스트레이드) 연동 활성\n"
+            "🟡 NXT(넥스트레이드) 연동 활성\n"
             "🔒 스레드 안전성 활성\n\n"
             "<b>📡 스캔 주기</b>\n"
             "• 급등/상한가 스캔: <b>20초</b>\n"
@@ -1042,7 +1054,7 @@ def _format_signal_type_stats_line(stats: dict) -> str:
     parts = []
     for sig, s in sorted(stats.items(), key=lambda x: -x[1]["count"]):
         label = label_map.get(sig, sig)
-        emoji = "🟢" if s["win_rate"] >= 60 else ("🟡" if s["win_rate"] >= 40 else "🔴")
+        emoji = "🔴" if s["win_rate"] >= 60 else ("🟡" if s["win_rate"] >= 40 else "🔵")
         parts.append(f"{emoji}{label} {s['win_rate']}%({s['count']}건)")
     return "  ".join(parts[:5])
 
@@ -1392,7 +1404,7 @@ def _log_error(func_name: str, e: Exception, critical: bool = False):
     print(f"⚠️ [{func_name}] {type(e).__name__}: {e} (누적 {cnt}회)", flush=True)
     if critical or cnt in (5, 20, 100):
         try:
-            send(f"🔴 <b>반복 오류 감지</b>\n"
+            send(f"🔵 <b>반복 오류 감지</b>\n"
                  f"함수: <code>{func_name}</code>  누적 {cnt}회\n"
                  f"오류: {type(e).__name__}: {str(e)[:100]}")
         except Exception: pass
@@ -1823,7 +1835,7 @@ def calc_ma_trend(items: list) -> dict:
     elif partially:
         desc = f"🟡 부분정배열"
     else:
-        desc = f"🔴 역배열"
+        desc = f"🔵 역배열"
     return {"aligned": aligned, "partial": partially,
             "short": round(ma_s), "mid": round(ma_m), "long": round(ma_l), "desc": desc}
 
@@ -2001,7 +2013,7 @@ def _build_similar_pattern_detail_block(stats: dict | None) -> str:
     same_stock = stats.get("same_stock") or {}
     if same_stock:
         s_wr = int(same_stock.get("win_rate", 0) or 0)
-        s_emoji = "🟢" if s_wr >= 60 else ("🟡" if s_wr >= 40 else "🔴")
+        s_emoji = "🔴" if s_wr >= 60 else ("🟡" if s_wr >= 40 else "🔵")
         lines.append(
             f"  {s_emoji} <b>{same_stock.get('name','')} 전적</b>: {int(same_stock.get('count',0) or 0)}건 "
             f"승률 {s_wr}% 평균 {float(same_stock.get('avg_pnl',0.0) or 0.0):+.1f}%"
@@ -2010,7 +2022,7 @@ def _build_similar_pattern_detail_block(stats: dict | None) -> str:
     similar = stats.get("similar") or {}
     if similar:
         wr = int(similar.get("win_rate", 0) or 0)
-        bar = "🟢" * max(1, wr // 20) if wr > 0 else ""
+        bar = "🔴" * max(1, wr // 20) if wr > 0 else ""
         lines.append(
             f"  {bar} {similar.get('label','유사 조건')} {int(similar.get('count',0) or 0)}건  승률 {wr}%  평균 {float(similar.get('avg_pnl',0.0) or 0.0):+.1f}%"
             f"\n  최고 {float(similar.get('best_pnl',0.0) or 0.0):+.1f}%  최저 {float(similar.get('worst_pnl',0.0) or 0.0):+.1f}%"
@@ -2095,7 +2107,7 @@ def _format_history_stats(records: list, label: str = "과거 이력") -> str:
     wins   = sum(1 for r in records if r["pnl_pct"] > 0)
     avg    = round(sum(r["pnl_pct"] for r in records) / total, 1)
     wr     = round(wins / total * 100)
-    emoji  = "🟢" if wr >= 60 else ("🟡" if wr >= 40 else "🔴")
+    emoji  = "🔴" if wr >= 60 else ("🟡" if wr >= 40 else "🔵")
     return f"{emoji} {label}: {total}건 중 {wins}건↑ ({wr}%) 평균{avg:+.1f}%"
 
 def _format_recent_examples(records: list, max_n: int = 3) -> str:
@@ -2675,7 +2687,7 @@ def _clear_all_cache():
     if _nxt_unavailable_reset_week != this_week:
         _nxt_unavailable.clear()
         _nxt_unavailable_reset_week = this_week
-        print("  🔵 NXT 비상장 캐시 주간 초기화")
+        print("  📡 NXT 비상장 캐시 주간 초기화")
     _early_cache.clear();        _news_reverse_cache.clear()
     _sector_monitor.clear();     _pending_info_alerts.clear()
     _kospi_cache["ts"] = 0;      _kospi_cache["change"] = 0.0
@@ -2866,7 +2878,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     elif 10 <= pullback_pct < 15:
         score += 8;  reasons.append(f"🟡 얕은 눌림 ({pullback_pct:.0f}%)")
     else:
-        score += 5;  reasons.append(f"🟠 깊은 눌림 ({pullback_pct:.0f}%)")
+        score += 5;  reasons.append(f"🟡 깊은 눌림 ({pullback_pct:.0f}%)")
 
     # 재상승 신호
     if is_bullish:
@@ -3997,7 +4009,7 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
         elif drop_pct <= 3.0:
             reasons.append("🟡 소폭 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
         else:
-            reasons.append("🔴 과도 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
+            reasons.append("🔵 과도 하락 (진입가 대비 -{:.1f}%)".format(drop_pct))
             fail_count += 1
 
     exec_label, _ = _entry_execution_judgement(exec_metrics)
@@ -4006,7 +4018,7 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
     if exec_label == "진입 적합":
         reasons.append(f"✅ 체결속도 양호 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
     elif exec_label == "보류 우선":
-        reasons.append(f"🔴 체결속도 급약화 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
+        reasons.append(f"🔵 체결속도 급약화 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
         fail_count += 1
     elif exec_label == "참고":
         reasons.append(f"🟡 체결속도 예비판단 ({flow_state}, 최근 유효체결 {last_active_age_sec}초 전)")
@@ -4020,7 +4032,7 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
         elif stop_distance_pct >= 1.0:
             reasons.append(f"🟡 손절가 접근 중 ({stop_distance_pct:.1f}%)")
         else:
-            reasons.append(f"🔴 손절가 근접 ({stop_distance_pct:.1f}%)")
+            reasons.append(f"🔵 손절가 근접 ({stop_distance_pct:.1f}%)")
             fail_count += 1
 
     sector_ok = True
@@ -4047,7 +4059,7 @@ def _judge_phase2_entry(watch: dict, cur: dict, price: int, exec_metrics: dict |
     if sector_ok:
         reasons.append("✅ 섹터 모멘텀 유지")
     else:
-        reasons.append("🔴 섹터 모멘텀 이탈")
+        reasons.append("🔵 섹터 모멘텀 이탈")
         fail_count += 1
 
     if fail_count >= 2:
@@ -4397,7 +4409,7 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     lines = [
         "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
-        f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
+        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
         f"원신호: {sig_label}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
     ]
     if pattern_summary:
@@ -4819,7 +4831,7 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
             krx_ref = get_stock_price(code) or {}
             krx_change = float(krx_ref.get("change_rate", change_rate) or change_rate)
             if change_rate >= krx_change + 1.0:
-                score += 5; reasons.append(f"🔵 NXT 추가 강세 +5 ({change_rate:+.1f}%)")
+                score += 5; reasons.append(f"🔴 NXT 추가 강세 +5 ({change_rate:+.1f}%)")
             elif change_rate <= krx_change - 1.0:
                 score -= 4; cautions.append(f"🔵 NXT 탄력 둔화 -4 ({change_rate:+.1f}%)")
         except Exception:
@@ -5095,7 +5107,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     rr = float(watch.get("rr", 0.0) or 0.0)
     stop_pct = round((stop - entry) / entry * 100, 1) if entry else 0.0
     target_pct = round((target - entry) / entry * 100, 1) if entry else 0.0
-    market_tag = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
+    market_tag = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
     reasons_block = ""
     if watch.get("reasons"):
         reasons_block = "\n" + "\n".join(f"  {r}" for r in list(watch.get("reasons") or [])[:3]) + "\n"
@@ -5104,7 +5116,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     send_with_chart_buttons(
         f"🎯 <b>[선진입가 도달!]</b>{market_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
         f"{pattern_summary_block}"
         f"원신호: 종가선진입  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  {watch.get('market_basis','KRX')}\n"
         f"{reasons_block}"
@@ -5792,7 +5804,7 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
 
     if 15 <= pullback_pct <= 30: score+=15; reasons.append(f"🎯 황금 눌림 구간 ({pullback_pct:.0f}%)")
     elif pullback_pct < 15: score+=8; reasons.append(f"🟡 얕은 눌림 ({pullback_pct:.0f}%)")
-    else: score+=5; reasons.append(f"🟠 깊은 눌림 ({pullback_pct:.0f}%)")
+    else: score+=5; reasons.append(f"🟡 깊은 눌림 ({pullback_pct:.0f}%)")
 
     # 오늘 돌파/재상승 신호 강도
     if breakout_mode:
@@ -6609,13 +6621,13 @@ KRX_TIME_PARAMS = {
 NXT_TIME_PARAMS = {
     "pre":        {"score_mult": 0.85, "min_add": 10, "cooldown_mult": 1.5,
                    "stop_mult": 1.3,  "target_mult": 0.75, "position_mult": 0.6,
-                   "label": "🔵 NXT 장전 (08~09)"},
+                   "label": "📡 NXT 장전 (08~09)"},
     "overlap":    {"score_mult": 1.0,  "min_add": 0,  "cooldown_mult": 1.0,
                    "stop_mult": 1.0,  "target_mult": 1.0,  "position_mult": 1.0,
                    "label": "⚪ KRX+NXT 병행"},
     "post_early": {"score_mult": 0.90, "min_add": 5,  "cooldown_mult": 1.3,
                    "stop_mult": 1.2,  "target_mult": 0.85, "position_mult": 0.7,
-                   "label": "🔵 NXT 장후 초반 (15:30~17)"},
+                   "label": "📡 NXT 장후 초반 (15:30~17)"},
     "post_late":  {"score_mult": 0.75, "min_add": 12, "cooldown_mult": 2.0,
                    "stop_mult": 1.5,  "target_mult": 0.65, "position_mult": 0.5,
                    "label": "🌙 NXT 야간 (17~20)"},
@@ -6773,31 +6785,31 @@ def nxt_score_bonus(code: str) -> tuple:
 
     if nxt["inv_bullish"]:
         delta += 15
-        reasons.append(f"🔵 NXT 외인+기관 동시매수 ({nxt['foreign_net']:+,}주)")
+        reasons.append(f"🔴 NXT 외인+기관 동시매수 ({nxt['foreign_net']:+,}주)")
     elif nxt["foreign_net"] > 0:
         delta += 7
-        reasons.append(f"🔵 NXT 외인 순매수 ({nxt['foreign_net']:+,}주)")
+        reasons.append(f"🔴 NXT 외인 순매수 ({nxt['foreign_net']:+,}주)")
     elif nxt["institution_net"] > 0:
         delta += 5
-        reasons.append(f"🔵 NXT 기관 순매수 ({nxt['institution_net']:+,}주)")
+        reasons.append(f"🔴 NXT 기관 순매수 ({nxt['institution_net']:+,}주)")
 
     if nxt["inv_bearish"]:
         delta -= 15
-        reasons.append(f"🔴 NXT 외인+기관 동시매도 ({nxt['foreign_net']:+,}주)")
+        reasons.append(f"🔵 NXT 외인+기관 동시매도 ({nxt['foreign_net']:+,}주)")
     elif nxt["foreign_net"] < -3000:
         delta -= 10
-        reasons.append(f"🔴 NXT 외인 대량매도 ({nxt['foreign_net']:+,}주)")
+        reasons.append(f"🔵 NXT 외인 대량매도 ({nxt['foreign_net']:+,}주)")
 
     if nxt["vol_surge"] and delta > 0:
         delta += 5
-        reasons.append(f"🔵 NXT 거래량 급증 ({nxt['volume_ratio']:.1f}배)")
+        reasons.append(f"🔴 NXT 거래량 급증 ({nxt['volume_ratio']:.1f}배)")
 
     if nxt["vs_krx_pct"] > 1.0:
         delta += 5
-        reasons.append(f"🔵 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% (내일 갭상 주목)")
+        reasons.append(f"🔴 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% (내일 갭상 주목)")
     elif nxt["vs_krx_pct"] < -1.0:
         delta -= 5
-        reasons.append(f"🔴 NXT 디스카운트 {nxt['vs_krx_pct']:.1f}%")
+        reasons.append(f"🔵 NXT 디스카운트 {nxt['vs_krx_pct']:.1f}%")
 
     return delta, "\n".join(reasons)
 
@@ -7229,7 +7241,7 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
                 print(f"  🔄 NXT선행→KRX추적: {watch.get('name','')} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
         # 텔레그램 알림 (내부 전환 기록)
         try:
-            send(f"🔵 <b>[NXT 선행→KRX 추적 전환]</b>\n"
+            send(f"📡 <b>[NXT 선행→KRX 추적 전환]</b>\n"
                  f"<b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
                  f"NXT {nxt_price:,}원 선행 감지 → KRX 정규장 개시 후 자동 추적\n"
                  f"진입가: {watch.get('entry_price',0):,}원")
@@ -7431,8 +7443,8 @@ def calc_real_sector_score(code_a: str, code_b: str,
             layers["뉴스동시언급"] = f"{cooccur_a[code_b]}회 (+10점)"
     except Exception: pass
 
-    if score >= 60:   label = "🔴 강한 연관"
-    elif score >= 40: label = "🟠 보통 연관"
+    if score >= 60:   label = "🔵 강한 연관"
+    elif score >= 40: label = "🟡 보통 연관"
     elif score >= 20: label = "🟡 약한 연관"
     else:             label = "연관 없음"
 
@@ -7646,10 +7658,10 @@ def calc_sector_momentum(code: str, name: str) -> dict:
             except Exception: continue
         if nxt_bullish_cnt >= 2:
             bonus = min(bonus + 10, 30)
-            summary += f"  🔵 NXT {nxt_bullish_cnt}종목 외인+기관 매수"
+            summary += f"  🔴 NXT {nxt_bullish_cnt}종목 외인+기관 매수"
         elif nxt_bearish_cnt >= 2:
             bonus = max(bonus - 10, 0)
-            summary += f"  🔴 NXT {nxt_bearish_cnt}종목 외인+기관 매도"
+            summary += f"  🔵 NXT {nxt_bearish_cnt}종목 외인+기관 매도"
 
     # 소스별 분류 (알림에 '왜 묶였는지' 표시용)
     sources = {}
@@ -8623,7 +8635,7 @@ def send_overnight_risk_alerts():
         msg = "🌙 <b>오버나이트 위험 알림</b>\n━━━━━━━━━━━━━━━\n"
         for rec, risk in high_risk:
             pnl_str = f"{rec.get('pnl_pct',0):+.1f}%"
-            msg += (f"{'🔴' if risk['level']=='high' else '🟡'} "
+            msg += (f"{'🔵' if risk['level']=='high' else '🟡'} "
                     f"<b>{rec['name']}</b>  현재 {pnl_str}\n"
                     f"  {risk['reason']}\n")
             # v40.0-#5: 리스크 원인별 표시
@@ -8845,7 +8857,7 @@ def run_overnight_monitor():
 
         if cur_rank > prev_rank and cur_regime != _overnight_state["alerted_regime"]:
             _overnight_state["alerted_regime"] = cur_regime
-            regime_label = {"risk_off": "🟠 약세장", "panic": "🔴 급락장"}
+            regime_label = {"risk_off": "🔵 약세장", "panic": "🔵 급락장"}
             alerts.append(
                 f"⚠️ 미국 시장 국면 악화: {regime_label.get(cur_regime, cur_regime)}\n"
                 f"  나스닥 {nasdaq_chg:+.1f}%  VIX {cur_vix:.0f}"
@@ -8853,21 +8865,21 @@ def run_overnight_monitor():
         elif cur_rank < prev_rank and cur_regime != _overnight_state["alerted_regime"]:
             _overnight_state["alerted_regime"] = cur_regime
             alerts.append(
-                f"✅ 미국 시장 국면 개선: 🟢 강세장 전환\n"
+                f"✅ 미국 시장 국면 개선: 🔴 강세장 전환\n"
                 f"  나스닥 {nasdaq_chg:+.1f}%  VIX {cur_vix:.0f}"
             )
 
         # ── VIX 급등 단독 감지 (국면 변화 없어도) ──
         if cur_vix >= 30 and prev_vix < 30:
-            alerts.append(f"🔴 VIX 공포 구간 진입: {cur_vix:.0f} (이전 {prev_vix:.0f})")
+            alerts.append(f"🔵 VIX 공포 구간 진입: {cur_vix:.0f} (이전 {prev_vix:.0f})")
         elif cur_vix >= 25 and prev_vix < 25:
-            alerts.append(f"🟠 VIX 불안 구간 진입: {cur_vix:.0f}")
+            alerts.append(f"🟡 VIX 불안 구간 진입: {cur_vix:.0f}")
 
         # ── 나스닥 급락 단독 감지 ──
         if nasdaq_chg <= -3.0 and prev_rank < 3:
-            alerts.append(f"🔴 나스닥 급락 {nasdaq_chg:+.1f}% — 내일 갭하락 주의")
+            alerts.append(f"🔵 나스닥 급락 {nasdaq_chg:+.1f}% — 내일 갭하락 주의")
         elif nasdaq_chg >= 2.0 and prev_rank > 0:
-            alerts.append(f"🟢 나스닥 강세 {nasdaq_chg:+.1f}% — 내일 갭상승 기대")
+            alerts.append(f"🔴 나스닥 강세 {nasdaq_chg:+.1f}% — 내일 갭상승 기대")
 
         # ── 상태 업데이트 ──
         _overnight_state["last_us_regime"] = cur_regime
@@ -8968,7 +8980,7 @@ def _send_pending_result_reminder():
         _tracking_notified.add(reminder_key)
 
         nxt_running = is_nxt_open()
-        timing_note = ("🔵 NXT 마감(20:00) 후에도 NXT 상장 종목은 자동 감시됩니다."
+        timing_note = ("📡 NXT 마감(20:00) 후에도 NXT 상장 종목은 자동 감시됩니다."
                        if nxt_running else
                        "💡 내일도 자동 추적됩니다. (최대 5일)")
 
@@ -8992,7 +9004,7 @@ def _send_pending_result_reminder():
                 else:
                     cur_p = get_stock_price(code).get("price", 0)
                 cur_pnl = round((cur_p - entry) / entry * 100, 1) if entry and cur_p else 0
-                pnl_emoji = "🟢" if cur_pnl >= 0 else "🔴"
+                pnl_emoji = "🔴" if cur_pnl >= 0 else "🔵"
                 cur_str = f"  현재 {cur_p:,}원  {pnl_emoji}{cur_pnl:+.1f}%"
             except Exception:
                 cur_str = ""
@@ -9119,7 +9131,7 @@ def track_signal_results():
                             _msg = (
                                 "🚨 <b>[보유 종목 악재 공시 감지]</b>\n"
                                 "━━━━━━━━━━━━━━━\n"
-                                f"🔴 <b>{_rec_name}</b>  <code>{code}</code>\n"
+                                f"🔵 <b>{_rec_name}</b>  <code>{code}</code>\n"
                                 "━━━━━━━━━━━━━━━\n"
                                 f"📋 공시: {_d['title']}\n"
                                 "━━━━━━━━━━━━━━━\n"
@@ -9195,7 +9207,7 @@ def track_signal_results():
                     send_with_chart_buttons(
                         f"💡 <b>[분할 청산 타이밍]</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                        f"🔴 <b>{rec['name']}</b>  <code>{code}</code>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"현재 <b>+{pnl_now:.1f}%</b>  (목표의 {target_progress_pct:.0f}%)\n"
                         f"📌 분할 기준: <b>+{half_pct:.1f}% 이상</b> 달성 시 1차 익절 검토\n"
@@ -9232,11 +9244,11 @@ def track_signal_results():
                                             if p.get("score_adj", 0) < 0]
                             out_lines = ""
                             for op in out_patterns[:3]:
-                                ce = {"high":"🔴","mid":"🟡","low":""}.get(op.get("confidence","low"),"")
+                                ce = {"high":"🔵","mid":"🟡","low":""}.get(op.get("confidence","low"),"")
                                 ck = {"high":"신뢰높음","mid":"참고용"}.get(op.get("confidence",""),"참고용")
                                 out_lines += f"  {ce} {op['label']} [{ck}]\n  └ {op['detail']}\n"
                             send(
-                                f"🔴 <b>[수급 이탈 경고]  {name}</b>\n"
+                                f"🔵 <b>[수급 이탈 경고]  {name}</b>\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"{out_lines}"
                                 f"현재가: {price:,}원  ({pnl_now:+.1f}%)\n"
@@ -9274,7 +9286,7 @@ def track_signal_results():
                         if _risk["level"] == "high":
                             _tracking_notified.add(_risk_key)
                             send_with_chart_buttons(
-                                f"🔴 <b>[{name}] 오버나이트 위험 긴급 알림</b>\n"
+                                f"🔵 <b>[{name}] 오버나이트 위험 긴급 알림</b>\n"
                                 f"  {_risk['reason']}\n"
                                 f"  현재 {pnl_now:+.1f}% — 마감 전 매도 고려",
                                 code, name
@@ -9326,7 +9338,7 @@ def track_signal_results():
                             send_with_chart_buttons(
                                 f"🎯 <b>[목표가 도달 → 보유 유지·트레일링]</b>\n"
                                 f"━━━━━━━━━━━━━━━\n"
-                                f"🟢 <b>{rec['name']}</b>  <code>{code}</code>\n"
+                                f"🔴 <b>{rec['name']}</b>  <code>{code}</code>\n"
                                 f"{entry_hit_line}\n"
                                 f"현재가 <b>{price:,}원</b>  목표가 {target:,}원\n"
                                 f"━━━━━━━━━━━━━━━\n"
@@ -9439,13 +9451,13 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
     if reason == "목표가":
         emoji = "🎯✅"; title = "목표가 달성!"
     elif reason == "손절가":
-        emoji = "🛡🔴"; title = "손절가 도달"
+        emoji = "🛡🔵"; title = "손절가 도달"
     elif reason == TRACK_TIMEOUT_RESULT:
         emoji = "⏱"; title = f"{TRACK_MAX_DAYS}일 경과 결과"
     else:
         emoji = "📊"; title = "결과 확정"
 
-    pnl_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+    pnl_emoji = "✅" if pnl > 0 else ("🔵" if pnl < 0 else "➖")
     sig_labels = {
         "UPPER_LIMIT":"상한가", "NEAR_UPPER":"상한가근접",
         "SURGE":"급등", "EARLY_DETECT":"조기포착",
@@ -9469,10 +9481,10 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
                 i_net = inv.get("institution_net", 0)
                 vr    = cur.get("volume_ratio", 0)
 
-                if f_net < -5000:  causes.append(f"🔴 외국인 대량 매도 ({f_net:+,}주)")
-                elif f_net < 0:    causes.append(f"🟠 외국인 순매도 ({f_net:+,}주)")
-                if i_net < -3000:  causes.append(f"🔴 기관 대량 매도 ({i_net:+,}주)")
-                elif i_net < 0:    causes.append(f"🟠 기관 순매도 ({i_net:+,}주)")
+                if f_net < -5000:  causes.append(f"🔵 외국인 대량 매도 ({f_net:+,}주)")
+                elif f_net < 0:    causes.append(f"🔵 외국인 순매도 ({f_net:+,}주)")
+                if i_net < -3000:  causes.append(f"🔵 기관 대량 매도 ({i_net:+,}주)")
+                elif i_net < 0:    causes.append(f"🔵 기관 순매도 ({i_net:+,}주)")
                 if vr and vr < 0.5: causes.append(f"📉 거래량 급감 ({vr:.1f}배 — 매수세 소멸)")
                 if vr and vr > 5:   causes.append(f"🌊 거래량 급증 속 하락 (세력 매도 가능성)")
                 if not causes:      causes.append("⚠️ 특이 원인 미감지 (기술적 손절)")
@@ -9580,7 +9592,7 @@ def check_reentry_watch():
             if not price: continue
 
             bounce = (price - w["stop_price"]) / w["stop_price"] * 100
-            mkt_tag = " 🔵NXT" if not krx_ok and nxt_ok else ""
+            mkt_tag = " 🟡NXT" if not krx_ok and nxt_ok else ""
             _reentry_min = calc_reentry_bounce(code, price)
             if bounce >= _reentry_min and vr >= REENTRY_VOL_MIN:
                 sig_labels = {"UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접",
@@ -9910,7 +9922,7 @@ def analyze_loss_pattern(completed: list) -> str:
     if len(losses) < 3:
         return ""
 
-    lines = [f"🔴 <b>손실 패턴 분석</b>  ({len(losses)}건)"]
+    lines = [f"🔵 <b>손실 패턴 분석</b>  ({len(losses)}건)"]
 
     # 손절 이유 분포
     reasons = {}
@@ -10967,7 +10979,7 @@ def send_top_signals():
     for i, t in enumerate(top5, 1):
         medal   = medals[i-1]
         sig     = sig_labels.get(t["signal_type"], t["signal_type"])
-        nxt_tag = f"  🔵NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
+        nxt_tag = f"  🟡NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
         entry   = t.get("entry_price", 0)
         stop    = t.get("stop_loss", 0)
         target  = t.get("target_price", 0)
@@ -11748,7 +11760,7 @@ def check_entry_watch():
                 diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
                 stop_pct  = round((watch["stop_loss"]    - entry) / entry * 100, 1) if entry else 0
                 tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
-                nxt_notice = "\n🔵 <b>NXT 기준 가격</b>" if use_nxt else ""
+                nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
 
                 # ── 공통 블록 생성 ──
                 _reasons = watch.get("reasons", [])
@@ -11827,7 +11839,7 @@ def check_entry_watch():
                     send_with_chart_buttons(
                         f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                        f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                         f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
                         f"{similar_block}"
                         f"{reasons_block}"
@@ -11857,7 +11869,7 @@ def check_entry_watch():
                         send_with_chart_buttons(
                             f"{_bottom_title}{nxt_notice}\n"
                             f"━━━━━━━━━━━━━━━\n"
-                            f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                             f"{_bottom_check.get('reason','')}",
                             watch["code"], watch["name"]
                         )
@@ -11872,9 +11884,9 @@ def check_entry_watch():
                         _p2_pct = 0
                         _total_pct = _p1_pct
                         _avg_price = _p1_price
-                        _decision_emoji = "🔴"
+                        _decision_emoji = "🔵"
                         _decision_label = "추가진입: 금지"
-                        _p2_reasons = ["🔴 약한 신호 — 2차 추가매수 금지 대상"]
+                        _p2_reasons = ["🔵 약한 신호 — 2차 추가매수 금지 대상"]
                         _p2_detail = "신호 강도 부족 — 1차 진입분만 유지, 추가매수 불가"
                         _stop_adj = "유지"
                     else:
@@ -11899,7 +11911,7 @@ def check_entry_watch():
                             _p2_pct = 0
                             _total_pct = _p1_pct
                             _avg_price = _p1_price
-                            _decision_emoji = "🔴"
+                            _decision_emoji = "🔵"
                             _decision_label = "추가진입: 금지"
 
                         # 손절 조정 여부
@@ -11915,7 +11927,7 @@ def check_entry_watch():
                     send_with_chart_buttons(
                         f"🔔🔔 <b>[2차 진입 판단]</b>{nxt_notice}\n"
                         f"━━━━━━━━━━━━━━━\n"
-                        f"🟢 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                        f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                         f"원신호: {sig}  |  도달: {_entry_hit_ts}\n\n"
                         f"{_entry_exec_block}"
                         f"━━━━━━━━━━━━━━━\n"
@@ -12112,7 +12124,7 @@ def run_entry_defense_monitor():
 
             # 마감 임박 추가 코멘트
             if is_nxt_open() and not is_market_open():
-                guide.append("🔵 <b>NXT 단독 시간</b>: 유동성 얇음 → 슬리피지/급변 가능, 보수적 대응 권장")
+                guide.append("📡 <b>NXT 단독 시간</b>: 유동성 얇음 → 슬리피지/급변 가능, 보수적 대응 권장")
             else:
                 guide.append("⏳ <b>장마감 임박</b>: 뉴스/공시 충격은 익일 갭으로 이어질 수 있어 방어 우선")
             parts = [
@@ -12459,7 +12471,7 @@ def flush_info_alerts():
     if len(to_send) == 1:
         send(to_send[0]["text"])
     else:
-        combined = f"🔵 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
+        combined = f"🟡 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
         for a in to_send:
             first_line = a["text"].split("\n")[0][:60]
             combined  += f"• {first_line}\n"
@@ -12694,13 +12706,13 @@ def send_alert(s: dict):
              "EARLY_DETECT":"★ 조기 포착 - 선진입 기회 ★"}.get(s["signal_type"],"급등 감지")
 
     level    = get_alert_level(s["signal_type"], s.get("score",0), s.get("nxt_delta",0))
-    nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
-    lvl_icon  = {"CRITICAL":"🔴","NORMAL":"🟡","INFO":"🔵"}.get(level,"🟡")
+    nxt_badge = "\n🟡 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
+    lvl_icon  = {"CRITICAL":"🔵","NORMAL":"🟡","INFO":"🟡"}.get(level,"🟡")
 
     # ── 컴팩트 모드 ──
     if _compact_mode:
-        name_dot = {"UPPER_LIMIT":"🔴","NEAR_UPPER":"🟠","STRONG_BUY":"🟢",
-                    "SURGE":"🟡","EARLY_DETECT":"🔵","ENTRY_POINT":"🟣"}.get(s["signal_type"],"")
+        name_dot = {"UPPER_LIMIT":"🔵","NEAR_UPPER":"🟡","STRONG_BUY":"🔴",
+                    "SURGE":"🟡","EARLY_DETECT":"🟡","ENTRY_POINT":"🟣"}.get(s["signal_type"],"")
         entry  = s.get("entry_price", 0)
         stop   = s.get("stop_loss", 0)
         target = s.get("target_price", 0)
@@ -12715,11 +12727,11 @@ def send_alert(s: dict):
 
     # ── 상세 모드 (기존) ──
     name_dot = {
-        "UPPER_LIMIT": "🔴",
-        "NEAR_UPPER":  "🟠",
-        "STRONG_BUY":  "🟢",
+        "UPPER_LIMIT": "🔵",
+        "NEAR_UPPER":  "🟡",
+        "STRONG_BUY":  "🔴",
         "SURGE":       "🟡",
-        "EARLY_DETECT":"🔵",
+        "EARLY_DETECT":"🟡",
         "ENTRY_POINT": "🟣",
     }.get(s["signal_type"], "")
 
@@ -12777,7 +12789,7 @@ def send_alert(s: dict):
         )
 
     # NXT 여부 (상세 모드용 - 컴팩트는 위에서 처리됨)
-    nxt_badge = "\n🔵 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
+    nxt_badge = "\n🟡 <b>NXT (넥스트레이드) 거래</b>" if s.get("market") == "NXT" else ""
 
 
     # 보조지표 + 포지션 사이징 + 유사패턴 블록
@@ -12831,7 +12843,7 @@ def _is_capture_focus_reason(txt: str) -> bool:
         '💥 거래량 ', '📊 거래량 ',
         '💎 외국인+기관 매수 / 개인 매도', '✅ 외국인+기관 동시 순매수',
         '🟡 외국인 순매수', '🟡 기관 순매수',
-        '🔵 NXT 외인+기관 동시매수',
+        '🔴 NXT 외인+기관 동시매수',
         '✅ 진입가 ',
         '🚦 최근 체결흐름 ', '⚡ 체결지속속도 '
     )):
@@ -13109,7 +13121,7 @@ def analyze(stock: dict) -> dict:
     if _regime_mode != "normal":
         reasons.append(f"🌎 {regime_label()} 필터: 최소점수 +{_regime_min_add}점 / 점수배율 x{_regime_mult:.2f}")
     if _nxt_params and stock.get("market") == "NXT" and _nxt_params.get("min_add", 0) > 0:
-        reasons.append(f"🔵 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
+        reasons.append(f"🟡 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
 
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
@@ -13321,9 +13333,9 @@ def analyze(stock: dict) -> dict:
         us_adj = us.get("score_adj", 0)
         if us_adj != 0:
             score = max(0, score + us_adj)
-            us_label = {"panic":"🔴 미국 급락장","risk_off":"🟠 미국 약세장",
-                        "neutral":"🔵 미국 보통장","risk_on":"🟢 미국 강세장"}
-            reasons.append(f"{us_label.get(us.get('us_regime','neutral'),'🔵')} ({us_adj:+d}점)")
+            us_label = {"panic":"🔵 미국 급락장","risk_off":"🔵 미국 약세장",
+                        "neutral":"🔴 미국 보통장","risk_on":"🔴 미국 강세장"}
+            reasons.append(f"{us_label.get(us.get('us_regime','neutral'),'🟡')} ({us_adj:+d}점)")
         if us.get("gap_signal") == "gap_down":
             reasons.append("⬇️ 내일 갭하락 가능성 (미국 약세)")
         elif us.get("gap_signal") == "gap_up":
@@ -13363,11 +13375,11 @@ def analyze(stock: dict) -> dict:
         if f_days >= 3 and i_days >= 3:
             adj = min((f_days + i_days) * 2, 20)
             score += adj
-            reasons.append(f"🔵 외국인 {f_days}일+기관 {i_days}일 동시 연속매수 (+{adj}점)")
+            reasons.append(f"🔴 외국인 {f_days}일+기관 {i_days}일 동시 연속매수 (+{adj}점)")
         elif f_days >= 3:
             adj = min(f_days * 3, 15)
             score += adj
-            reasons.append(f"🔵 외국인 {f_days}일 연속 순매수 (+{adj}점)")
+            reasons.append(f"🔴 외국인 {f_days}일 연속 순매수 (+{adj}점)")
         elif i_days >= 3:
             adj = min(i_days * 2, 10)
             score += adj
@@ -13375,11 +13387,11 @@ def analyze(stock: dict) -> dict:
         elif f_days <= -3:
             adj = min(abs(f_days) * 3, 15)
             score -= adj
-            reasons.append(f"🔴 외국인 {abs(f_days)}일 연속 순매도 (-{adj}점)")
+            reasons.append(f"🔵 외국인 {abs(f_days)}일 연속 순매도 (-{adj}점)")
         elif i_days <= -3:
             adj = min(abs(i_days) * 2, 10)
             score -= adj
-            reasons.append(f"🔴 기관 {abs(i_days)}일 연속 순매도 (-{adj}점)")
+            reasons.append(f"🔵 기관 {abs(i_days)}일 연속 순매도 (-{adj}점)")
     except Exception: pass
 
     # ── 뉴스 심층 분석 (본문 + Claude API) ──
@@ -13445,7 +13457,7 @@ def analyze(stock: dict) -> dict:
             si           = stock.get("sector_info") or {}
             stock_sector = si.get("theme", "") or si.get("sector", "")
             geo_unc      = _geo_event_state.get("uncertainty", "low")
-            unc_label    = {"high":"🔴","mid":"🟠","low":"🟢"}
+            unc_label    = {"high":"🔵","mid":"🟡","low":"🔴"}
 
             # sector_directions 있으면 섹터별 개별 보정
             sec_dirs = _geo_event_state.get("sector_directions", [])
@@ -13573,7 +13585,7 @@ def analyze(stock: dict) -> dict:
             score += fp_adj
         for p in fp.get("patterns", []):
             if p.get("score_adj", 0) != 0 or p.get("confidence") == "high":
-                conf_emoji = {"high":"🔴","mid":"🟡","low":""}.get(p["confidence"],"")
+                conf_emoji = {"high":"🔵","mid":"🟡","low":""}.get(p["confidence"],"")
                 reasons.append(
                     f"{conf_emoji} [{p['confidence'].upper()}] {p['label']} "
                     f"{int(p['score_adj'] or 0):+d}점 — {p['detail']}"
@@ -13737,10 +13749,10 @@ def check_early_detection() -> list:
             ]
             if nxt.get("inv_bullish"):
                 pre_score += 15
-                pre_reasons.append(f"🔵 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
+                pre_reasons.append(f"🔴 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
             if nxt.get("vs_krx_pct", 0) > 0.5:
                 pre_score += 10
-                pre_reasons.append(f"🔵 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
+                pre_reasons.append(f"🔴 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
             if pre_score < 75: continue
 
             entry = price
@@ -13932,7 +13944,7 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         return False
     is_nxt = str(s.get("market") or "") == "NXT"
     hist_key = hist_key or (f"NXT_{s['code']}" if is_nxt else s["code"])
-    mkt_tag = " 🔵NXT" if is_nxt else ""
+    mkt_tag = " 🟡NXT" if is_nxt else ""
     s = _apply_execution_speed_to_signal(s)
     _live = _get_live_quote_for_signal(s)
     _live_price = safe_int((_live or {}).get("price", s.get("price", 0)), 0)
@@ -14530,7 +14542,7 @@ def detect_force_pattern(code: str, name: str,
         elif f_net <= -50000 and i_net <= -50000:
             patterns.append({
                 "type":       "smart_money_out",
-                "label":      "🔴 외국인+기관 동시 이탈",
+                "label":      "🔵 외국인+기관 동시 이탈",
                 "confidence": "high",
                 "score_adj":  -12,
                 "detail":     (f"외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도"),
@@ -14662,7 +14674,7 @@ def detect_force_pattern(code: str, name: str,
     total_adj = max(-20, min(total_adj, 20))  # -20~+20 범위 제한
 
     # 신뢰도별 이모지 및 설명
-    CONF_EMOJI = {"high": "🔴", "mid": "🟡", "low": ""}
+    CONF_EMOJI = {"high": "🔵", "mid": "🟡", "low": ""}
     CONF_KOR   = {"high": "신뢰높음", "mid": "참고용", "low": "참고용"}
 
     summary_lines = []
@@ -14838,7 +14850,7 @@ def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
     recent = sorted(matched, key=lambda x: x["date"], reverse=True)[:3]
 
     # 포맷팅
-    win_emoji = "🟢" if win_rate >= 60 else ("🟡" if win_rate >= 40 else "🔴")
+    win_emoji = "🔴" if win_rate >= 60 else ("🟡" if win_rate >= 40 else "🔵")
     line1 = f"│  {win_emoji} 과거 유사: {total}건 중 {wins}건↑ ({win_rate}%) 평균{avg_pnl:+.1f}%"
 
     examples = []
@@ -15340,15 +15352,15 @@ def run_geo_news_scan():
         last_sent = _geo_event_state.get("last_sent_ts", 0)
         if time.time() - last_sent < 3600:
             return
-        unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
+        unc_emoji = {"high": "🔵", "mid": "🟡", "low": "🔴"}
         msg  = (f"🌍 <b>지정학 이벤트 감지</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"{unc_emoji.get(geo['uncertainty'],'🟠')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
+                f"{unc_emoji.get(geo['uncertainty'],'🟡')} 불확실성: <b>{geo['uncertainty'].upper()}</b>\n\n")
 
         if geo.get("entities"):
             msg += "<b>주체별 입장</b>\n"
             for e in geo["entities"][:5]:
-                stance_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
+                stance_emoji = {"긍정":"🔴","부정":"🔵","중립":"🟡"}.get(e.get("stance","중립"),"🟡")
                 msg += f"  {stance_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
             msg += "\n"
 
@@ -15514,7 +15526,7 @@ def eval_retail_signal(code: str,
     if regime in ("bear", "crash") and cap_size == "small":
         return {
             "score_adj":  -12,
-            "label":      "🔴 개인만 매수 / 기관+외국인 이탈 (약세장+소형주)",
+            "label":      "🔵 개인만 매수 / 기관+외국인 이탈 (약세장+소형주)",
             "detail":     (f"약세장 소형주 + 외국인 {f_net:,}주 + 기관 {i_net:,}주 동시 매도 — "
                            f"개인 역방향 수급, 추가 하락 위험"),
             "confidence": "high",
@@ -16001,7 +16013,7 @@ def run_dart_intraday():
                     else:
                         inv_text = "\n⚠️ 개인만 매수 / 기관+외국인 이탈 (맥락 주의)"
                 elif f_net < 0 and i_net < 0:
-                    inv_text = "\n🔴 외국인+기관 동시 순매도"
+                    inv_text = "\n🔵 외국인+기관 동시 순매도"
             except Exception: pass
 
             # ATR 손절·목표가
@@ -16118,7 +16130,7 @@ def run_dart_intraday():
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"{'🔴' if is_risk else '🟡'} <b>{company}</b>  <code>{code}</code>\n"
+                f"{'🔵' if is_risk else '🟡'} <b>{company}</b>  <code>{code}</code>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"📌 {title}\n"
                 f"🔑 키워드: {', '.join(all_kw)}"
@@ -16173,7 +16185,7 @@ def analyze_dart_disclosures():
         if not scored[:5]: send("📋 <b>오늘 주목할 공시 없음</b>"); return
         msg = f"📋 <b>내일 주목 종목 - DART 분석</b>\n🗓 {today[:4]}.{today[4:6]}.{today[6:]}\n━━━━━━━━━━━━━━━\n\n"
         for i,item in enumerate(scored[:5],1):
-            e = {"매우강함":"🔴","강함":"🟡","보통":"🟢"}.get(item["strength"],"")
+            e = {"매우강함":"🔵","강함":"🟡","보통":"🔴"}.get(item["strength"],"")
             msg += f"{i}. {e} <b>{item['company']}</b> ({item['code']})\n   📌 {item['title']}\n   🔑 {', '.join(item['matched'])}\n   ⭐ {item['score']}점\n\n"
         send(msg+"━━━━━━━━━━━━━━━\n⚠️ 내일 장 시작 전 확인 후 진입 판단")
     except Exception as e: print(f"⚠️ DART 분석 오류: {e}")
@@ -16203,7 +16215,7 @@ def _send_menu(title: str = ""):
                 {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
             ],
             [
-                {"text": "🔵 NXT 현황",        "callback_data": "cmd_nxt"},
+                {"text": "🟡 NXT 현황",        "callback_data": "cmd_nxt"},
                 {"text": "⏸ 알림 정지",        "callback_data": "cmd_stop"},
                 {"text": "▶️ 알림 재개",        "callback_data": "cmd_resume"},
             ],
@@ -16278,7 +16290,7 @@ def poll_telegram_commands():
             if text == "/status":
                 rate_str = (f"\n📊 EARLY 성공률: {_early_feedback['success']}/{_early_feedback['total']} "
                             f"({_early_feedback.get('rate',0)*100:.0f}%)") if _early_feedback.get("total",0)>=5 else ""
-                nxt_str  = f"\n🔵 NXT: {'운영 중' if is_nxt_open() else '마감'}"
+                nxt_str  = f"\n🟡 NXT: {'운영 중' if is_nxt_open() else '마감'}"
                 send(f"🤖 <b>봇 상태</b>  {BOT_VERSION}  {'⏸ 일시정지' if _bot_paused else '▶️ 실행 중'}\n"
                      f"🕐 {datetime.now().strftime('%H:%M:%S')}  📅 {BOT_DATE}\n"
                      f"📡 장 {'열림' if is_market_open() else '닫힘'}{nxt_str}\n"
@@ -16418,12 +16430,12 @@ def poll_telegram_commands():
             # ── /nxt — NXT 현재 동향 즉시 조회 ──
             elif text == "/nxt":
                 if not is_nxt_open():
-                    send("🔵 NXT 현재 마감 중 (08:00~20:00 운영)")
+                    send("🟡 NXT 현재 마감 중 (08:00~20:00 운영)")
                 else:
                     try:
                         stocks = get_nxt_surge_stocks()
                         if not stocks:
-                            send("🔵 NXT 현재 급등 종목 없음")
+                            send("🟡 NXT 현재 급등 종목 없음")
                         else:
                             top = sorted(stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:7]
                             lines = "\n".join(
@@ -16431,7 +16443,7 @@ def poll_telegram_commands():
                                 f"<b>{s['change_rate']:+.1f}%</b>  🔊{s.get('volume_ratio',0):.0f}x"
                                 for s in top
                             )
-                            send(f"🔵 <b>NXT 실시간 동향</b>  {datetime.now().strftime('%H:%M')}\n"
+                            send(f"🟡 <b>NXT 실시간 동향</b>  {datetime.now().strftime('%H:%M')}\n"
                                  f"━━━━━━━━━━━━━━━\n{lines}")
                     except Exception as e:
                         send(f"⚠️ NXT 조회 오류: {e}")
@@ -16461,7 +16473,7 @@ def poll_telegram_commands():
                         msg += (f"\n✅ <b>확정</b>  {len(week_done)}건\n"
                                 f"  승률 {wins/len(week_done)*100:.0f}%  평균 {avg_pnl:+.1f}%\n")
                         for v in sorted(week_done, key=lambda x: x.get("pnl_pct",0), reverse=True)[:5]:
-                            dot = "✅" if v["pnl_pct"]>0 else "🔴"
+                            dot = "✅" if v["pnl_pct"]>0 else "🔵"
                             msg += f"  {dot} {v['name']} {v['pnl_pct']:+.1f}%\n"
                     if week_tracking:
                         msg += f"\n⏳ <b>추적 중</b>  {len(week_tracking)}건\n"
@@ -16472,7 +16484,7 @@ def poll_telegram_commands():
                                 entry = v.get("entry_price",0)
                                 if price and entry:
                                     pnl = (price-entry)/entry*100
-                                    dot = "🟢" if pnl>=0 else "🟠"
+                                    dot = "🔴" if pnl>=0 else "🟡"
                                     msg += f"  {dot} {v['name']} {pnl:+.1f}% (잠정)\n"
                             except Exception: continue
                     send(msg)
@@ -16514,7 +16526,7 @@ def poll_telegram_commands():
                                 f"  수익 {wins}건  손실 {losses}건\n")
                         for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
                             pnl  = v.get("pnl_pct", 0)
-                            dot  = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+                            dot  = "✅" if pnl > 0 else ("🔵" if pnl < 0 else "➖")
                             sig  = sig_labels.get(v.get("signal_type",""), "")
                             msg += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {sig}\n"
                     else:
@@ -16534,11 +16546,11 @@ def poll_telegram_commands():
                                 entry = v.get("entry_price", 0)
                                 if price and entry:
                                     pnl = (price - entry) / entry * 100
-                                    nxt_tag = " 🔵" if is_nxt_open() and is_nxt_listed(v.get("code","")) else ""
+                                    nxt_tag = " 🟡" if is_nxt_open() and is_nxt_listed(v.get("code","")) else ""
                                     rows.append((pnl, v["name"], nxt_tag))
                             except Exception: continue
                         for pnl, name, nxt_tag in sorted(rows, key=lambda x: x[0], reverse=True):
-                            dot = "🟢" if pnl >= 0 else "🟠"
+                            dot = "🔴" if pnl >= 0 else "🟡"
                             msg += f"  {dot} {name} <b>{pnl:+.1f}%</b>{nxt_tag}\n"
 
                     send(msg)
@@ -16577,7 +16589,7 @@ def poll_telegram_commands():
                     "list - 📋 현재 감시 중인 종목 목록\n"
                     "top - 🏆 오늘의 최우선 종목 TOP 5\n"
                     "daily - 📊 오늘 일일 성과 즉시 조회\n"
-                    "nxt - 🔵 NXT 넥스트레이드 실시간 동향\n"
+                    "nxt - 🟡 NXT 넥스트레이드 실시간 동향\n"
                     "week - 📅 이번 주 잠정 성과 조회\n"
                     "stats - 📈 신호 유형별 승률 통계\n"
                     "compact - 🗜 컴팩트·상세 알림 모드 전환\n"
@@ -16608,14 +16620,14 @@ def poll_telegram_commands():
                         if not geo.get("detected"):
                             send("✅ 지정학 이벤트 없음 — 현재 안전 상태")
                             return
-                        unc_emoji = {"high":"🔴","mid":"🟠","low":"🟢"}.get(geo.get("uncertainty","mid"),"🟠")
+                        unc_emoji = {"high":"🔵","mid":"🟡","low":"🔴"}.get(geo.get("uncertainty","mid"),"🟡")
                         msg = (f"🌍 <b>지정학 분석 결과</b>\n"
                                f"━━━━━━━━━━━━━━━\n"
                                f"{unc_emoji} 불확실성: <b>{geo.get('uncertainty','?').upper()}</b>\n\n")
                         if geo.get("entities"):
                             msg += "<b>주체별 입장</b>\n"
                             for e in geo["entities"][:6]:
-                                s_emoji = {"긍정":"🟢","부정":"🔴","중립":"🔵"}.get(e.get("stance","중립"),"🔵")
+                                s_emoji = {"긍정":"🔴","부정":"🔵","중립":"🟡"}.get(e.get("stance","중립"),"🟡")
                                 msg += f"  {s_emoji} {e.get('name','')} — {e.get('stance','')} ({e.get('reason','')})\n"
                             msg += "\n"
                         # /geo 핸들러 — sector_directions 없으면 fallback 생성
@@ -16658,13 +16670,13 @@ def poll_telegram_commands():
                     _us_cache.clear()  # 캐시 무효화 → 강제 갱신
                     us = get_us_market_signals()
                     gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
-                    regime_kor = {"panic":"🔴 급락장","risk_off":"🟠 약세장","neutral":"🔵 보통장","risk_on":"🟢 강세장","crash":"🔴 급락장","bear":"🟠 약세장","bull":"🟢 강세장"}
+                    regime_kor = {"panic":"🔵 급락장","risk_off":"🔵 약세장","neutral":"🔴 보통장","risk_on":"🔴 강세장","crash":"🔵 급락장","bear":"🔵 약세장","bull":"🔴 강세장"}
                     msg = (f"🌐 <b>미국 시장 현황</b>\n"
                            f"━━━━━━━━━━━━━━━\n"
                            f"나스닥선물: {us.get('nasdaq_chg',0):+.2f}%\n"
                            f"VIX 공포지수: {us.get('vix',0):.1f}\n"
                            f"달러인덱스: {us.get('dxy',0):.2f}\n"
-                           f"시장 국면: {regime_kor.get(us.get('us_regime','neutral'),'🔵 중립')}\n"
+                           f"시장 국면: {regime_kor.get(us.get('us_regime','neutral'),'🟡 중립')}\n"
                            f"갭 예측: {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n"
                            f"점수 보정: {int(us.get('score_adj',0) or 0):+d}점")
                     send(msg)
@@ -16733,7 +16745,7 @@ def _request_actual_entry_confirm(rec: dict):
     pnl     = rec.get("pnl_pct", 0)
     sig     = rec.get("signal_type", "")
     pnl_str = f"+{pnl:.1f}%" if pnl >= 0 else f"{pnl:.1f}%"
-    emoji   = "✅" if pnl > 0 else "🔴"
+    emoji   = "✅" if pnl > 0 else "🔵"
     msg = (
         f"❓ <b>[진입 여부 확인]</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -16809,7 +16821,7 @@ def _handle_entry_confirm_command(raw: str):
         tgt_pct   = round((target_p - entry_p) / entry_p * 100, 1) if entry_p else 0
         send(f"✅ <b>[진입 확정]</b>\n"
              f"━━━━━━━━━━━━━━━\n"
-             f"🟢 <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
+             f"🔴 <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
              f"━━━━━━━━━━━━━━━\n"
              f"📍 실제 진입가: <b>{entry_p:,}원</b>\n"
              f"🛡 손절가:  <b>{stop_p:,}원</b>  ({stop_pct:+.1f}%)\n"
@@ -16892,7 +16904,7 @@ def _handle_result_command(raw: str):
         pnl_str    = parts[2].replace("%","")
         pnl        = float(pnl_str)
 
-        result_emoji = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+        result_emoji = "✅" if pnl > 0 else ("🔵" if pnl < 0 else "➖")
         status       = "수익" if pnl > 0 else ("손실" if pnl < 0 else "본전")
         today        = datetime.now().strftime("%Y%m%d")
         matched_name = None
@@ -17018,17 +17030,17 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         # NXT 시간대 → 거래량 얇아서 변동성 추가
         nxt_only = is_nxt_open() and not is_market_open()
         if nxt_only:
-            risk_score += 10; reasons.append("🔵 NXT 단독 시간대 (유동성 낮음)")
+            risk_score += 10; reasons.append("📡 NXT 단독 시간대 (유동성 낮음)")
 
         if us_regime == "panic":
-            risk_score += 40; reasons.append("🔴 미국 급락장")
+            risk_score += 40; reasons.append("🔵 미국 급락장")
         elif us_regime == "risk_off":
-            risk_score += 20; reasons.append("🟠 미국 약세장")
+            risk_score += 20; reasons.append("🔵 미국 약세장")
 
         if vix >= 30:
-            risk_score += 20; reasons.append(f"🔴 VIX {vix:.0f} (공포)")
+            risk_score += 20; reasons.append(f"🔵 VIX {vix:.0f} (공포)")
         elif vix >= 25:
-            risk_score += 10; reasons.append(f"🟠 VIX {vix:.0f} (불안)")
+            risk_score += 10; reasons.append(f"🟡 VIX {vix:.0f} (불안)")
 
         if short_r >= 10:
             risk_score += 15; reasons.append(f"📉 공매도 {short_r:.1f}%")
@@ -17050,7 +17062,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         if _on_regime_add > 0:
             risk_score += _on_regime_add
             _on_regime_mode = _dynamic.get("regime_mode", "normal")
-            _on_labels = {"bear": "🟠 하락장", "crash": "🔴 급락장"}
+            _on_labels = {"bear": "🔵 하락장", "crash": "🔵 급락장"}
             reasons.append(f"{_on_labels.get(_on_regime_mode, '')} 레짐 가중 +{_on_regime_add}점")
 
         if   risk_score >= 50: level = "high"
@@ -17070,7 +17082,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
         overnight_lines = _get_effective_overnight_lines(now)
         causes = _classify_risk_causes(us, geo_state, kospi_5d)
 
-        level_emoji = {"high": "🔴 위험", "mid": "🟡 경계", "low": "🟢 안전"}
+        level_emoji = {"high": "🔵 위험", "mid": "🟡 경계", "low": "🔴 안전"}
         return {
             "level":  level,
             "score":  risk_score,
@@ -17273,7 +17285,7 @@ def _send_stats():
             avg  = sum(pnls) / len(pnls)
             best = max(pnls); worst = min(pnls)
             label = type_labels.get(t, t)
-            bar   = "🟢" * int(rate/20)
+            bar   = "🔴" * int(rate/20)
             # 청산 이유 분포
             reasons = {}
             for r in recs:
@@ -17307,7 +17319,7 @@ def _send_stats():
                 st  = slot_stats[slot]
                 adj = _dynamic["timeslot_score_adj"].get(slot, 0)
                 adj_str = f"  [+{adj}점 보정 중]" if adj > 0 else ""
-                bar = "🟢" * int(st["rate"] / 20)
+                bar = "🔴" * int(st["rate"] / 20)
                 msg += (f"  {slot}: {bar}  승률 {st['rate']:.0f}%  "
                         f"평균 {st['avg']:+.1f}%  ({st['total']}건){adj_str}\n")
 
@@ -17321,8 +17333,8 @@ def _send_stats():
             kpi = compute_signal_kpi(completed)
             ov = kpi.get("overall", {})
             if ov.get("n", 0) >= KPI_MIN_SAMPLES:
-                exp_emoji = "🟢" if ov["expectancy"] > 0.5 else "🟡" if ov["expectancy"] >= 0 else "🔴"
-                pf_emoji = "🟢" if ov["profit_factor"] > 1.5 else "🟡" if ov["profit_factor"] >= 1.0 else "🔴"
+                exp_emoji = "🔴" if ov["expectancy"] > 0.5 else "🟡" if ov["expectancy"] >= 0 else "🔵"
+                pf_emoji = "🔴" if ov["profit_factor"] > 1.5 else "🟡" if ov["profit_factor"] >= 1.0 else "🔵"
                 msg += (f"\n━━━━━━━━━━━━━━━\n"
                         f"📐 <b>KPI 요약</b> ({ov['n']}건 기준)\n"
                         f"  승률: <b>{ov['win_rate']:.0f}%</b>  "
@@ -17359,7 +17371,7 @@ def _send_stats():
         # ── 시장 국면 현황 ──
         regime = get_market_regime()
         rmode  = regime.get("mode", "normal")
-        rlabels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+        rlabels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
         mult_map = {"bull":"기준 완화 (×1.15)","normal":"표준","bear":"기준 강화 (×0.75)","crash":"급락장 — 상한가만 허용"}
         msg += (f"\n━━━━━━━━━━━━━━━\n"
                 f"🌐 <b>현재 시장 국면</b>: {rlabels.get(rmode,'보통장')}\n"
@@ -17425,7 +17437,7 @@ def on_market_close():
         for c in krx_only: _reentry_watch.pop(c, None)
         print(f"  🔄 KRX 재진입 감시 {len(krx_only)}건 만료 (15:30)")
     if nxt_remain:
-        print(f"  🔵 NXT 재진입 감시 {len(nxt_remain)}건 유지 (→20:00)")
+        print(f"  🟡 NXT 재진입 감시 {len(nxt_remain)}건 유지 (→20:00)")
 
     carry_list = []
     for code, info in list(_detected_stocks.items()):
@@ -17468,7 +17480,7 @@ def on_market_close():
                     f"  |  수익 {wins}건  손실 {losses}건\n")
             for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
                 pnl   = v.get("pnl_pct", 0)
-                dot   = "✅" if pnl > 0 else ("🔴" if pnl < 0 else "➖")
+                dot   = "✅" if pnl > 0 else ("🔵" if pnl < 0 else "➖")
                 label = sig_labels.get(v.get("signal_type",""), "")
                 theme = f"[{v['sector_theme']}]" if v.get("sector_bonus",0) > 0 else "[단독]"
                 msg  += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label} {theme}\n"
@@ -17495,9 +17507,9 @@ def on_market_close():
                         days_ago = (datetime.strptime(today, "%Y%m%d") -
                                     datetime.strptime(v.get("detect_date", today), "%Y%m%d")).days
                         day_tag  = f" {days_ago}일째" if days_ago > 0 else " 오늘"
-                        dot      = "🟢" if pnl >= 0 else "🟠"
+                        dot      = "🔴" if pnl >= 0 else "🟡"
                         label    = sig_labels.get(v.get("signal_type",""), "")
-                        nxt_tag  = " 🔵NXT" if is_nxt_open() else ""
+                        nxt_tag  = " 🟡NXT" if is_nxt_open() else ""
                         tracking_results.append((pnl, f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label}{day_tag}{nxt_tag}\n"))
                     time.sleep(0.1)
                 except Exception: continue
@@ -17666,11 +17678,11 @@ def _build_premarket_risk_payload() -> dict:
         parts.append("📅 금요일 (주말 오버나이트 리스크)")
 
     if total_score >= 50:
-        level = "위험"; level_emoji = "🔴"; action = "신규 진입 축소 / 기존 포지션 정리 검토"
+        level = "위험"; level_emoji = "🔵"; action = "신규 진입 축소 / 기존 포지션 정리 검토"
     elif total_score >= 25:
         level = "경계"; level_emoji = "🟡"; action = "신규 진입 보수적 / 손절 타이트하게"
     else:
-        level = "안전"; level_emoji = "🟢"; action = "정상 운영"
+        level = "안전"; level_emoji = "🔴"; action = "정상 운영"
 
     msg = (
         f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
@@ -18000,7 +18012,7 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     market_heat = min(100, int(len(sectors) * 12 + strong_seed_cnt * 10 + upper_seed_cnt * 15 + max(s.get("score", 0) for s in top) * 0.2))
     interval_min = 10 if market_heat >= 70 or event_mode else 15 if market_heat >= 45 else 20
     title_icon = "🔥" if max(s.get("score", 0) for s in top) >= 75 else "📈"
-    mode_line = "🔵 NXT (넥스트레이드) 주도" if nxt_open and not market_open else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🟢 장중 주도"
+    mode_line = "🟡 NXT (넥스트레이드) 주도" if nxt_open and not market_open else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🔴 장중 주도"
     lines = [
         f"{title_icon} <b>[시장 주도 섹터]</b>",
         f"🕐 {now_dt.strftime('%Y-%m-%d %H:%M:%S')}  |  {mode_line}",
@@ -18125,7 +18137,7 @@ def send_premarket_briefing():
         geo_sec = geo_state.get("sectors", [])
         geo_unc = geo_state.get("uncertainty", "low")
         if geo_sum:
-            unc_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}.get(geo_unc, "🟠")
+            unc_emoji = {"high": "🔵", "mid": "🟡", "low": "🔴"}.get(geo_unc, "🟡")
             msg += (f"\n🌍 <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
                     f"  {geo_sum}\n"
                     f"  관련 섹터: {', '.join(geo_sec)}\n")
@@ -18140,9 +18152,9 @@ def send_premarket_briefing():
         if strong or weak:
             msg += "\n🔄 <b>테마 로테이션</b>\n"
             for k, v in strong:
-                msg += f"  🟢 {k} 강세 ({v:+.1f}%)\n"
+                msg += f"  🔴 {k} 강세 ({v:+.1f}%)\n"
             for k, v in weak:
-                msg += f"  🔴 {k} 약세 ({v:+.1f}%)\n"
+                msg += f"  🔵 {k} 약세 ({v:+.1f}%)\n"
     except Exception: pass
 
     # ── ① 이월 감시 종목 ──
@@ -18155,7 +18167,7 @@ def send_premarket_briefing():
                 entry = info.get("entry_price", 0)
                 if price and entry:
                     pnl = round((price - entry) / entry * 100, 1)
-                    dot = "🟢" if pnl >= 0 else "🔴"
+                    dot = "🔴" if pnl >= 0 else "🔵"
                     msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
                     # v37.0: 동일 종목 과거 전적
                     _tr = get_stock_track_record(code, info.get("name",""))
@@ -18225,7 +18237,7 @@ def send_premarket_briefing():
         if nxt_stocks:
             # 변동률 상위 5개
             hot_nxt = sorted(nxt_stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:5]
-            msg += f"\n🔵 <b>NXT 장전 동향</b>  (KRX 개장 전)\n"
+            msg += f"\n📡 <b>NXT 장전 동향</b>  (KRX 개장 전)\n"
             for s in hot_nxt:
                 cr  = s.get("change_rate", 0)
                 vr  = s.get("volume_ratio", 0)
@@ -18246,21 +18258,21 @@ def send_premarket_briefing():
             if nxt_foreign_buys:
                 msg += f"\n  💡 외인 선취매 주목:\n"
                 for nm, fn, cr in sorted(nxt_foreign_buys, key=lambda x: -x[1])[:3]:
-                    msg += f"    🔵 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
+                    msg += f"    🟡 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
     except Exception: pass
 
     # ── 시장 국면 브리핑 ──
     try:
         regime = get_market_regime()
         rmode  = regime.get("mode", "normal")
-        rlabels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
+        rlabels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
         regime_warn = ""
         if rmode == "crash":
             regime_warn = "\n⚠️ <b>급락장 모드</b> — 상한가 신호만 발송됩니다"
         elif rmode == "bear":
-            regime_warn = "\n🟠 <b>하락장 모드</b> — 신호 기준 강화, 포지션 축소 권장"
+            regime_warn = "\n🔵 <b>하락장 모드</b> — 신호 기준 강화, 포지션 축소 권장"
         elif rmode == "bull":
-            regime_warn = "\n🟢 <b>상승장 모드</b> — 신호 기준 완화, 적극 대응 가능"
+            regime_warn = "\n🔴 <b>상승장 모드</b> — 신호 기준 완화, 적극 대응 가능"
         msg += (f"\n━━━━━━━━━━━━━━━\n"
                 f"🌐 시장 국면: <b>{rlabels.get(rmode,'보통장')}</b>"
                 f"{regime_warn}\n")
@@ -18474,7 +18486,7 @@ def _notify_regime_change(prev_mode: str, new_mode: str):
             return   # 이미 같은 전환 알림 발송함
         _last_regime_notify_mode = new_mode
 
-        labels = {"bull": "🟢 상승장", "normal": "🔵 보통장", "bear": "🟠 하락장", "crash": "🔴 급락장"}
+        labels = {"bull": "🔴 상승장", "normal": "🟡 보통장", "bear": "🔵 하락장", "crash": "🔵 급락장"}
         prev_label = labels.get(prev_mode, prev_mode)
         new_label  = labels.get(new_mode, new_mode)
 
@@ -18600,8 +18612,8 @@ def get_market_regime() -> dict:
 
 def regime_label() -> str:
     r = get_market_regime()
-    labels = {"bull":"🟢 상승장","normal":"🔵 보통장","bear":"🟠 하락장","crash":"🔴 급락장"}
-    return labels.get(r.get("mode","normal"), "🔵 보통장")
+    labels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
+    return labels.get(r.get("mode","normal"), "🟡 보통장")
 
 def regime_message_line() -> str:
     """텔레그램 표시용 시장 상태 요약."""
@@ -18615,7 +18627,7 @@ def regime_message_line() -> str:
             parts.append("NXT단독")
         return "🌎 시장 상태: " + " / ".join([p for p in parts if p])
     except Exception:
-        return "🌎 시장 상태: 🔵 보통장"
+        return "🌎 시장 상태: 🟡 보통장"
 
 
 # ============================================================
@@ -19038,8 +19050,8 @@ def get_korea_etf_signals() -> dict:
         else:
             tone, market_adj = "neutral", 0
 
-        tone_map = {"strong_up":"🟢 강세", "up":"🟢 우호", "slight_up":"🟩 소폭 우호",
-                    "neutral":"중립", "slight_down":"🟧 소폭 경계", "down":"🟠 경계", "strong_down":"🔴 약세"}
+        tone_map = {"strong_up":"🔴 강세", "up":"🔴 우호", "slight_up":"🟩 소폭 우호",
+                    "neutral":"중립", "slight_down":"🟧 소폭 경계", "down":"🟡 경계", "strong_down":"🔵 약세"}
         summary = f"{tone_map.get(tone, '중립')} EWY {ewy:+.1f}% / FLKR {flkr:+.1f}%"
         result.update({
             "ts": time.time(),
@@ -19218,7 +19230,7 @@ def get_us_market_signals() -> dict:
             score_adj -= 1
 
         # ── 요약 문자열 ──
-        regime_emoji = {"panic":"🔴","risk_off":"🟠","neutral":"🔵","risk_on":"🟢"}
+        regime_emoji = {"panic":"🔵","risk_off":"🟡","neutral":"🟡","risk_on":"🔴"}
         gap_emoji    = {"gap_up":"⬆️","flat":"➡️","gap_down":"⬇️"}
         # 핵심 3개 + 추가 지표 압축
         extra_parts = []
@@ -19228,7 +19240,7 @@ def get_us_market_signals() -> dict:
         if tnx: extra_parts.append(f"10Y{tnx:.2f}%")
         if sp500_chg: extra_parts.append(f"S&P{sp500_chg:+.1f}%")
         extra_str = "  ".join(extra_parts)
-        summary = (f"{regime_emoji.get(us_regime,'🔵')} 나스닥선물 {nasdaq_chg:+.1f}%  "
+        summary = (f"{regime_emoji.get(us_regime,'🟡')} 나스닥선물 {nasdaq_chg:+.1f}%  "
                    f"VIX {vix:.0f}  DXY {dxy:.1f}  "
                    f"갭예측 {gap_emoji.get(gap_signal,'➡️')} {gap_signal}")
         if extra_str:
@@ -19843,7 +19855,7 @@ if __name__ == "__main__":
         lambda: (
             _clear_reentry_watch_all(),
             _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
-            print("🔵 NXT 마감(20:00) — 재진입 감시 전체 초기화")
+            print("📡 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() else None
     ))
     # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
