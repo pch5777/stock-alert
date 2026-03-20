@@ -3,24 +3,50 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.99
+버전: v41.91
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v41.99 (2026-03-21): 눌림목 4분류 + 유형별 A조건 도입.
-  [#1] `MID_PULLBACK`을 `월·주 추세형 / 일봉 추세형 / 갭 후 첫 눌림형 / 분봉 재개형`으로 분류하는
-       `_classify_mid_pullback_setup()`을 추가해, 기존 "눌림목"을 하나로 보지 않고 구조를 나눠 저장.
-  [#2] `_apply_mid_pullback_execution_grade()`를 추가해 유형별 실행 A조건을 분리.
-       특히 `기타업종/섹터 약함`, 장마감 근접, 재개 확증 부족 상태에선 raw A라도 실행등급을 B/C로 보수화.
-  [#3] `run_mid_pullback_scan()` / `_register_nxt_surge_to_krx_watch()`가 `pattern_grade`와 `execution_grade`를
-       함께 갱신·저장하도록 정리해, 태웅 같은 raw B→A 재포착은 유지하면서 사용자 표시 등급만 보수적으로 분리.
-  [#4] 포착 메시지/로그/진입감시에 `mid_pullback_bucket`, `pattern_grade`, `execution_grade`를 같이 남겨
-       이후 `/stats`와 수동 검토에서 어떤 눌림 유형이 실제로 먹히는지 역추적 가능하게 정리.
-  이유: 눌림목은 월·주·일·분 단위 구조가 다른데도 기존엔 하나의 점수식으로만 다뤄, `A등급`이 실전 진입감과 자주 어긋났기 때문.
-  개선점: 눌림목 해석력↑, `A등급(최우선)` 과대노출↓, 태웅형 raw 상향 재포착 유지, 유형별 사후통계 기반 마련.
-  주의점: 이번 버전은 점수식 전체 교체가 아니라 `MID_PULLBACK` 해석/등급 계층을 추가한 구조화 버전이다.
+- v41.91 (2026-03-21): 변경이력 정합성 복원 + v41.89/v41.90 누락 기능 재적용.
+  [#1] `_get_effective_change_rate()`를 추가하고 `_detect_entry_block_reason()`를 확장해,
+       `MID_PULLBACK`/`ENTRY_POINT` 계열은 상한가 잠김뿐 아니라 상한가 도달 자체도 `upper_limit_reached`로 차단.
+       KIS `change_rate`와 `prev_close` 대비 실계산 등락률 중 보수적인 값을 함께 사용.
+  [#2] `_register_nxt_surge_to_krx_watch()`의 외부 텔레그램 전환 알림을 제거하고 내부 로그만 유지.
+       대신 `register_entry_watch()` / `_load_entry_watch_active()`에 `entry_price_at_detect` / `execution_grade_at_detect` / `pattern_grade_at_detect`를 저장하고,
+       `check_entry_watch()`의 `[1차 진입가 도달]`에 `_format_nxt_transition_delta_block()`을 연결해 `등급 변화`, `진입가 조정(+/-%)`을 조건부 표시.
+  이유: v41.88부터 시작한 수정 대화 기준으로는 `v41.89`/`v41.90` 이력이 빠져 있었고,
+       실제 코드에도 상한가 도달 차단과 NXT 중간알림 정리/1차 도달 변화표시가 누락된 상태였음.
+  개선점: 변경이력 스킵 복원↑, 눌림목 상한가 오알림 차단↑, NXT 전환 중간알림 소음↓, 1차 진입가 도달 해석력↑.
+  주의점: 이번 버전은 기존 `v41.90` 구조(눌림목 4분류 + pattern/execution grade + auto_tune)를 유지한 채 누락분을 복원한 통합 정합성 버전.
+
+- v41.90 (2026-03-21): 눌림목 4분류 + 유형별 실행 A게이트 + 자동교정 루프 추가.
+  [#1] `_classify_mid_pullback_setup()` / `_finalize_mid_pullback_signal()`를 추가해 `MID_PULLBACK`을
+       `월·주 추세형 / 일봉 추세형 / 갭 후 첫 눌림형 / 분봉 재개형`으로 분류하고,
+       `pattern_grade`(재포착 기준)와 `execution_grade`(표시/실행 기준)를 함께 저장.
+  [#2] `_apply_mid_pullback_execution_grade()`에 유형별 A조건과 KRX/NXT 장마감 근접 보수 게이트를 연결.
+       섹터/재상승/장중돌파/수급전환/상대강도/거래량Z/거래량회복/당일양봉 등을 합산해
+       실행 확증이 부족하면 `A→B/C`, `B→C`로 하향.
+  [#3] `run_mid_pullback_scan()` / `_register_nxt_surge_to_krx_watch()` / `save_signal_log()` / `register_entry_watch()`를
+       `pattern_grade`/`execution_grade`/`mid_pullback_bucket` 기준으로 정리하고,
+       `_mid_pullback_alert_history`도 `{ts, pattern_grade, execution_grade, grade}` 형태로 확장.
+  [#4] `auto_tune()`에 눌림목 유형별 A게이트 자동교정을 추가.
+       최근 결과를 보고 `mid_pullback_bucket_a_confirm_min`, `mid_pullback_bucket_b_confirm_min`,
+       `mid_pullback_close_window_min_krx`, `mid_pullback_close_window_min_nxt`, `mid_pullback_close_gate_level`을 장마감 후 자동 조정.
+  이유: 눌림목은 월·주·일·분 구조가 다른데 기존 로직은 하나의 A/B/C로만 판단해
+       `A등급(최우선)` 과대평가와 태웅형 재포착 요구를 동시에 만족시키기 어려웠음.
+  개선점: 태웅형 raw 상향 재포착은 유지하면서도 유형·시간대별로 실행 A를 자동 보수화.
+  주의점: 이번 버전은 점수식 전체 교체가 아니라 `MID_PULLBACK` 해석/실행 계층과 자동교정 루프를 추가한 구조화 버전.
+
+- v41.89 (2026-03-20): 눌림목 상한가 도달/잠김 진입 차단 보강.
+  [#1] `_get_effective_change_rate()`를 도입해 KIS `change_rate`뿐 아니라 `prev_close` 대비 실계산 등락률을 함께 반영.
+  [#2] `_detect_entry_block_reason()`를 확장해 `MID_PULLBACK`/`ENTRY_POINT` 계열은 상한가 잠김(`limit_up_locked`)뿐 아니라
+       상한가 도달 자체(`upper_limit_reached`)도 진입불가로 차단하고, `no_ask_liquidity` soft 허용은 기존 예외 조건에서만 유지.
+  [#3] `run_mid_pullback_scan()` / `check_entry_watch()`의 진입가 도달 직전 차단 경로가 위 기준을 공통 사용하도록 정리.
+  이유: 태웅·태광 같은 사례에서 `현재가=진입가`지만 이미 상한가 또는 실질 체결 곤란 상태인 종목이 눌림목 진입 신호로 노출되는 문제가 있었음.
+  개선점: 눌림목 상한가 오알림↓, 실진입 가능성 기준 일관성↑.
+  주의점: 일반 급등 포착 신호를 광범위하게 막는 것이 아니라, `MID_PULLBACK`/`ENTRY_POINT` 계열 진입 차단에만 보수 강화.
 
 - v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
   [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
@@ -2775,259 +2801,236 @@ def get_volume_zscore(code: str, today_vol: int) -> float:
     return round((today_vol - mean) / std, 2) if std > 0 else 0.0
 
 # ============================================================
-# ⑭ 눌림목 핵심 분석 함수
+# ⑭ 눌림목 실행 계층 / 분류 헬퍼
 # ============================================================
+MID_PULLBACK_BUCKET_LABELS = {
+    "weekly_monthly_trend": "월·주 추세형",
+    "daily_trend": "일봉 추세형",
+    "gap_first_pullback": "갭 후 첫 눌림형",
+    "intraday_reclaim": "분봉 재개형",
+}
+
+MID_PULLBACK_BUCKET_A_GUIDE = {
+    "weekly_monthly_trend": "섹터/수급/거래량 중 2개 이상 확증",
+    "daily_trend": "섹터 또는 재상승 포함 3개 이상 확증",
+    "gap_first_pullback": "갭 유지 + 거래량/섹터 포함 3개 이상 확증",
+    "intraday_reclaim": "장중 재개 + 거래량/섹터/수급 포함 4개 이상 확증",
+}
+
 def _mid_pullback_grade_from_score(score: int) -> str:
     s = int(score or 0)
     if s >= 80:
         return "A"
     if s >= 60:
         return "B"
-    if s >= 45:
-        return "C"
-    return ""
+    return "C"
 
 
 def _grade_rank(grade: str) -> int:
-    return {"A": 3, "B": 2, "C": 1}.get(str(grade or "").upper(), 0)
+    return {"A": 3, "B": 2, "C": 1}.get(str(grade or "C").upper(), 0)
 
 
-def _calc_close_sma(items: list, period: int) -> float:
-    vals = [float((row or {}).get("close", 0) or 0) for row in (items or []) if float((row or {}).get("close", 0) or 0) > 0]
-    if len(vals) < period or period <= 0:
-        return 0.0
-    return sum(vals[-period:]) / period
-
-
-def _classify_mid_pullback_setup(items: list, today: dict, *, prev_close: int = 0, surge_pct: float = 0.0,
-                                 pullback_pct: float = 0.0, pullback_days: int = 0, is_intraday: bool = False,
-                                 resurge_mode: bool = False, reclaim_ratio: float = 0.0) -> dict:
-    today = today or {}
-    close_price = float(today.get("close", 0) or today.get("price", 0) or 0)
-    open_price = float(today.get("open", close_price) or close_price)
-    ma20 = _calc_close_sma(items, 20)
-    ma60 = _calc_close_sma(items, 60)
-    ma120 = _calc_close_sma(items, 120)
-    gap_open_pct = round(((open_price - prev_close) / prev_close) * 100, 1) if prev_close else 0.0
-    weekly_up = bool(ma20 and ma60 and close_price >= ma20 and ma20 >= ma60)
-    monthly_up = bool(ma60 and ma120 and close_price >= ma60 and ma60 >= ma120)
-
-    bucket = 'daily_trend'
-    label = '일봉 추세형'
-    note = '일봉 추세 지속 속 눌림 후 재개 확인'
-
-    if is_intraday:
-        bucket = 'intraday_reclaim'
-        label = '분봉 재개형'
-        note = '장중 되돌림 후 분봉 재개/체결 회복 확인형'
-    elif gap_open_pct >= float(_dynamic.get('mid_pullback_gap_open_min', 2.0) or 2.0) and pullback_days <= 5:
-        bucket = 'gap_first_pullback'
-        label = '갭 후 첫 눌림형'
-        note = '갭 상승 이후 첫 되돌림을 버티는지 확인하는 구조'
-    elif monthly_up and weekly_up and surge_pct >= 25 and pullback_days >= 3:
-        bucket = 'multi_tf_trend'
-        label = '월·주 추세형'
-        note = '상위 추세 지속 속 일봉 눌림 재개 구조'
-
-    return {
-        'mid_pullback_bucket': bucket,
-        'mid_pullback_bucket_label': label,
-        'mid_pullback_bucket_note': note,
-        'gap_open_pct': gap_open_pct,
-        'weekly_uptrend_ok': weekly_up,
-        'monthly_uptrend_ok': monthly_up,
-        'reclaim_ratio': float(reclaim_ratio or 0.0),
-        'resurge_mode': bool(resurge_mode),
-        'a_gate_hint': {
-            'multi_tf_trend': '섹터/상대강도 붙은 상위추세 눌림',
-            'daily_trend': '섹터 + 거래량/상대강도 동반 일봉 눌림',
-            'gap_first_pullback': '갭 보존 + 섹터 + 거래량 동반',
-            'intraday_reclaim': '장중 재개 + 회복률 + 거래량 동반',
-        }.get(bucket, '실행 확증 동반 눌림'),
-    }
-
-
-def _get_mid_pullback_close_window_info(signal: dict | None = None) -> dict:
-    signal = signal if isinstance(signal, dict) else {}
-    now = datetime.now()
-    market = 'NONE'
-    window_min = 0
-    close_dt = None
-    if is_market_open():
-        market = 'KRX'
-        window_min = int(_dynamic.get('mid_pullback_close_krx_window_min', 20) or 20)
-        close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    elif is_nxt_open():
-        market = 'NXT'
-        window_min = int(_dynamic.get('mid_pullback_close_nxt_window_min', 30) or 30)
-        close_dt = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    if not close_dt:
-        return {'market': market, 'minutes_to_close': 999, 'is_near_close': False, 'window_min': window_min}
-    mins = max(0, int((close_dt - now).total_seconds() // 60))
-    return {'market': market, 'minutes_to_close': mins, 'is_near_close': mins <= window_min, 'window_min': window_min}
-
-
-def _get_mid_pullback_execution_profile(signal: dict | None) -> dict:
-    signal = signal if isinstance(signal, dict) else {}
-    sector_info = signal.get('sector_info') or {}
-    theme = str(sector_info.get('theme', '') or '').strip()
-    bonus = int(sector_info.get('bonus', 0) or 0)
-    reasons = [str(r or '') for r in (signal.get('reasons') or [])]
-
-    sector_ok = theme not in ('', '기타업종', 'unknown', '미분류') and bonus > 0
-    news_ok = bool(signal.get('direct_news_hit') or signal.get('direct_news_theme'))
-    orderflow_ok = any(('외국인' in r and '기관' in r) or '최강 수급구도' in r for r in reasons)
-    rs_ok = float(signal.get('rs', 0) or 0) >= float(RS_MIN or 0)
-    vol_ok = float(signal.get('vol_zscore', 0) or 0) >= float(VOL_ZSCORE_MIN or 0)
-    recovery_ok = bool(signal.get('vol_recovered'))
-    bullish_ok = bool(signal.get('is_bullish'))
-    ma_ok = float(signal.get('ma20_dev', -99) or -99) >= 0
-    resurge_ok = bool(signal.get('resurge_mode')) or float(signal.get('pullback_reclaim_ratio', 0.0) or 0.0) >= float(_dynamic.get('mid_pullback_intraday_reclaim_min', 0.55) or 0.55)
-    intraday_ok = bool(signal.get('is_intraday'))
-
-    labels = []
-    core = []
-    def _add(label, core_hit=False):
-        if label not in labels:
-            labels.append(label)
-        if core_hit and label not in core:
-            core.append(label)
-
-    if sector_ok:
-        _add('섹터', True)
-    if news_ok:
-        _add('뉴스', True)
-    if orderflow_ok:
-        _add('수급', True)
-    if rs_ok:
-        _add('상대강도')
-    if vol_ok:
-        _add('거래량Z')
-    if recovery_ok:
-        _add('거래량회복')
-    if bullish_ok:
-        _add('당일양봉')
-    if ma_ok:
-        _add('20일선')
-    if resurge_ok:
-        _add('재상승')
-    if intraday_ok:
-        _add('장중재개')
-
-    return {
-        'labels': labels,
-        'core_labels': core,
-        'confirm_count': len(labels),
-        'core_confirm_count': len(core),
-        'sector_ok': sector_ok,
-        'news_ok': news_ok,
-        'orderflow_ok': orderflow_ok,
-        'rs_ok': rs_ok,
-        'vol_ok': vol_ok,
-        'recovery_ok': recovery_ok,
-        'resurge_ok': resurge_ok,
-    }
-
-
-def _apply_mid_pullback_execution_grade(signal: dict | None) -> dict:
-    signal = signal if isinstance(signal, dict) else {}
-    if str(signal.get('signal_type', '')).upper() != 'MID_PULLBACK':
-        return signal
-    pattern_grade = str(signal.get('pattern_grade') or signal.get('grade') or 'C').upper()
-    signal['pattern_grade'] = pattern_grade
-    profile = _get_mid_pullback_execution_profile(signal)
-    close_info = _get_mid_pullback_close_window_info(signal)
-    bucket = str(signal.get('mid_pullback_bucket') or 'daily_trend')
-    total = int(profile.get('confirm_count', 0) or 0)
-    core = int(profile.get('core_confirm_count', 0) or 0)
-    sector_ok = bool(profile.get('sector_ok'))
-
-    a_ok = False
-    if bucket == 'multi_tf_trend':
-        a_ok = sector_ok and total >= 3 and (profile.get('rs_ok') or profile.get('vol_ok') or profile.get('orderflow_ok'))
-    elif bucket == 'daily_trend':
-        a_ok = sector_ok and total >= 4 and (profile.get('rs_ok') or profile.get('vol_ok')) and profile.get('recovery_ok')
-    elif bucket == 'gap_first_pullback':
-        a_ok = sector_ok and total >= 4 and float(signal.get('gap_open_pct', 0.0) or 0.0) >= float(_dynamic.get('mid_pullback_gap_open_min', 2.0) or 2.0) and float(signal.get('volume_ratio', 0) or 0) >= 2.0
-    elif bucket == 'intraday_reclaim':
-        a_ok = sector_ok and total >= 4 and profile.get('resurge_ok') and float(signal.get('pullback_reclaim_ratio', 0.0) or 0.0) >= float(_dynamic.get('mid_pullback_intraday_reclaim_min', 0.55) or 0.55)
-
-    new_grade = pattern_grade
-    adjust_reason = ''
-    if pattern_grade == 'A':
-        if a_ok:
-            new_grade = 'A'
-        elif total >= 2:
-            new_grade = 'B'
-            adjust_reason = '유형별 A조건 미충족'
-        else:
-            new_grade = 'C'
-            adjust_reason = '실행 확증 부족'
-    elif pattern_grade == 'B':
-        if total < 1:
-            new_grade = 'C'
-            adjust_reason = '실행 확증 없음'
-
-    if close_info.get('is_near_close'):
-        if new_grade == 'A':
-            new_grade = 'B'
-            adjust_reason = f"{close_info.get('market')} 마감근접"
-        elif new_grade == 'B' and bucket in ('gap_first_pullback', 'intraday_reclaim') and total < 3:
-            new_grade = 'C'
-            adjust_reason = f"{close_info.get('market')} 마감근접"
-
-    signal['execution_grade'] = new_grade
-    signal['grade'] = new_grade
-    signal['execution_confirm_count'] = total
-    signal['execution_core_confirm_count'] = core
-    signal['execution_confirm_labels'] = list(profile.get('labels') or [])
-    signal['close_window_market'] = close_info.get('market', '')
-    signal['close_window_minutes'] = int(close_info.get('minutes_to_close', 999) or 999)
-    signal['close_window_flag'] = bool(close_info.get('is_near_close'))
-    signal['execution_grade_adjusted'] = new_grade != pattern_grade
-    signal['execution_grade_reason'] = adjust_reason
-    if adjust_reason:
-        signal['execution_grade_note'] = f"⚠️ 실행 보정: 패턴 {pattern_grade} → 현재 {new_grade} ({adjust_reason})"
+def _classify_mid_pullback_setup(*, is_intraday: bool = False, resurge_mode: bool = False,
+                                 pullback_days: int = 0, surge_pct: float = 0.0,
+                                 pullback_pct: float = 0.0, gap_pct: float = 0.0) -> dict:
+    if bool(is_intraday):
+        bucket = "intraday_reclaim"
+    elif abs(float(gap_pct or 0.0)) >= 3.0 and int(pullback_days or 0) <= 4:
+        bucket = "gap_first_pullback"
+    elif int(pullback_days or 0) >= 8 or float(surge_pct or 0.0) >= 45.0 or float(pullback_pct or 0.0) >= 25.0:
+        bucket = "weekly_monthly_trend"
     else:
-        signal.pop('execution_grade_note', None)
-    return signal
+        bucket = "daily_trend"
+    label = MID_PULLBACK_BUCKET_LABELS.get(bucket, "일봉 추세형")
+    note_map = {
+        "weekly_monthly_trend": "상위 추세 지속 속 눌림 후 재개",
+        "daily_trend": "일봉 추세 지속 속 눌림 재개",
+        "gap_first_pullback": "갭 발생 뒤 첫 눌림 재접근",
+        "intraday_reclaim": "장중 눌림 뒤 체결 재개",
+    }
+    return {
+        "mid_pullback_bucket": bucket,
+        "mid_pullback_bucket_label": label,
+        "mid_pullback_bucket_note": note_map.get(bucket, ""),
+        "mid_pullback_a_guide": MID_PULLBACK_BUCKET_A_GUIDE.get(bucket, "확증 3개 이상"),
+    }
 
 
-def _finalize_mid_pullback_signal(signal: dict | None) -> dict:
-    signal = signal if isinstance(signal, dict) else {}
-    if str(signal.get('signal_type', '')).upper() != 'MID_PULLBACK':
-        return signal
-    signal['pattern_grade'] = _mid_pullback_grade_from_score(int(signal.get('score', 0) or 0)) or str(signal.get('grade', 'C')).upper()
-    if not signal.get('mid_pullback_bucket'):
-        signal['mid_pullback_bucket'] = 'daily_trend'
-        signal['mid_pullback_bucket_label'] = '일봉 추세형'
-        signal['mid_pullback_bucket_note'] = '일봉 추세 지속 속 눌림 후 재개 확인'
-        signal['a_gate_hint'] = '섹터 + 거래량/상대강도 동반 일봉 눌림'
-    signal = _apply_mid_pullback_execution_grade(signal)
-    return signal
+def _get_mid_pullback_close_window_info(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or datetime.now()
+    stage = ""
+    close_hhmm = None
+    if is_market_open():
+        stage = "KRX"
+        close_hhmm = 1530
+    elif is_nxt_open():
+        stage = "NXT"
+        close_hhmm = 2000
+    if not stage or close_hhmm is None:
+        return {"stage": "", "is_close_window": False, "remain_min": 999, "window_min": 0, "penalty": 0}
+    now_hhmm = now_dt.hour * 100 + now_dt.minute
+    if now_hhmm > close_hhmm:
+        remain_min = 0
+    else:
+        ch, cm = divmod(close_hhmm, 100)
+        close_dt = now_dt.replace(hour=ch, minute=cm, second=0, microsecond=0)
+        remain_min = max(0, int((close_dt - now_dt).total_seconds() // 60))
+    window_key = "mid_pullback_close_window_min_krx" if stage == "KRX" else "mid_pullback_close_window_min_nxt"
+    window_min = int(_dynamic.get(window_key, 20 if stage == "KRX" else 25) or 0)
+    gate_level = int(_dynamic.get("mid_pullback_close_gate_level", 1) or 0)
+    is_close_window = remain_min <= max(0, window_min)
+    penalty = gate_level if is_close_window else 0
+    return {
+        "stage": stage,
+        "is_close_window": is_close_window,
+        "remain_min": remain_min,
+        "window_min": window_min,
+        "penalty": penalty,
+    }
 
 
-def _inject_mid_pullback_focus_lines(signal: dict | None) -> dict:
-    signal = signal if isinstance(signal, dict) else {}
-    if str(signal.get('signal_type', '')).upper() != 'MID_PULLBACK':
-        return signal
-    reasons = [str(r or '') for r in (signal.get('reasons') or [])]
-    def _prepend(line: str):
-        if line and line not in reasons:
-            reasons.insert(0, line)
-    bucket_label = str(signal.get('mid_pullback_bucket_label', '') or '').strip()
-    gate_hint = str(signal.get('a_gate_hint', '') or '').strip()
-    if gate_hint:
-        _prepend(f"🎯 A 조건: {gate_hint}")
-    if bucket_label:
-        _prepend(f"🧭 눌림 유형: {bucket_label}")
-    note = str(signal.get('execution_grade_note', '') or '').strip()
-    if note and note not in reasons:
-        reasons.append(note)
-    signal['reasons'] = reasons
-    return signal
+def _get_mid_pullback_bucket_thresholds(bucket: str) -> tuple[int, int]:
+    base_a = {
+        "weekly_monthly_trend": 2,
+        "daily_trend": 3,
+        "gap_first_pullback": 3,
+        "intraday_reclaim": 4,
+    }
+    base_b = {
+        "weekly_monthly_trend": 1,
+        "daily_trend": 2,
+        "gap_first_pullback": 2,
+        "intraday_reclaim": 2,
+    }
+    a_map = _safe_nested_dict(_dynamic, "mid_pullback_bucket_a_confirm_min", base_a)
+    b_map = _safe_nested_dict(_dynamic, "mid_pullback_bucket_b_confirm_min", base_b)
+    a_min = int(a_map.get(bucket, base_a.get(bucket, 3)) or base_a.get(bucket, 3))
+    b_min = int(b_map.get(bucket, base_b.get(bucket, 1)) or base_b.get(bucket, 1))
+    return max(1, a_min), max(0, b_min)
 
 
+def _get_mid_pullback_execution_profile(result: dict) -> dict:
+    sector_info = result.get("sector_info") or {}
+    sector_bonus = int(sector_info.get("bonus", 0) or 0)
+    core_hits = []
+    support_hits = []
+    if sector_bonus >= 3:
+        core_hits.append("섹터강함")
+    elif sector_bonus > 0:
+        support_hits.append("섹터보통")
+    if bool(result.get("direct_news_hit")):
+        core_hits.append("직접뉴스")
+    if bool(result.get("resurge_mode")):
+        core_hits.append("재상승")
+    if bool(result.get("is_intraday")):
+        core_hits.append("장중돌파")
+    if bool(result.get("turnaround_confirmed")):
+        support_hits.append("수급전환")
+    if float(result.get("rs", 0) or 0) >= RS_MIN:
+        support_hits.append("상대강도")
+    if float(result.get("vol_zscore", 0) or 0) >= VOL_ZSCORE_MIN:
+        support_hits.append("거래량Z")
+    if bool(result.get("vol_recovered")):
+        support_hits.append("거래량회복")
+    if bool(result.get("is_bullish")):
+        support_hits.append("당일양봉")
+    if float(result.get("volume_ratio", 0) or 0) >= 3.0:
+        support_hits.append("거래량3배")
+    if float(result.get("ma20_dev", -99) or -99) >= 0:
+        support_hits.append("20일선회복")
+    close_info = _get_mid_pullback_close_window_info()
+    if close_info.get("is_close_window"):
+        support_hits.append(f"{close_info.get('stage','')}마감근접")
+    core_hits = list(dict.fromkeys(core_hits))
+    support_hits = list(dict.fromkeys(support_hits))
+    total_hits = list(dict.fromkeys(core_hits + support_hits))
+    return {
+        "core_hits": core_hits,
+        "support_hits": support_hits,
+        "total_hits": total_hits,
+        "core_count": len(core_hits),
+        "total_count": len(total_hits),
+        "sector_bonus": sector_bonus,
+        "close_info": close_info,
+        "close_penalty": int(close_info.get("penalty", 0) or 0),
+    }
+
+
+def _is_mid_pullback_meta_reason(line: str) -> bool:
+    t = str(line or "").strip()
+    return t.startswith(("🧭 눌림 유형:", "🎯 실행 A 조건:", "⚠️ 실행 보정:", "🕒 장마감 근접:"))
+
+
+def _apply_mid_pullback_execution_grade(result: dict) -> dict:
+    if not isinstance(result, dict) or str(result.get("signal_type", "")).upper() != "MID_PULLBACK":
+        return result
+    pattern_grade = str(result.get("pattern_grade") or result.get("grade") or "C").upper()
+    bucket = str(result.get("mid_pullback_bucket") or "daily_trend")
+    profile = _get_mid_pullback_execution_profile(result)
+    close_penalty = int(profile.get("close_penalty", 0) or 0)
+    a_min, b_min = _get_mid_pullback_bucket_thresholds(bucket)
+    req_a = a_min + close_penalty
+    req_b = b_min + (1 if close_penalty >= 2 else 0)
+    core_count = int(profile.get("core_count", 0) or 0)
+    total_count = int(profile.get("total_count", 0) or 0)
+    execution_grade = pattern_grade
+    if pattern_grade == "A":
+        if core_count >= 1 and total_count >= req_a:
+            execution_grade = "A"
+        elif total_count >= max(req_b, req_a - 1):
+            execution_grade = "B"
+        else:
+            execution_grade = "C"
+    elif pattern_grade == "B":
+        execution_grade = "B" if total_count >= req_b else "C"
+    else:
+        execution_grade = "C"
+
+    reasons = [r for r in list(result.get("reasons") or []) if not _is_mid_pullback_meta_reason(r)]
+    bucket_label = str(result.get("mid_pullback_bucket_label") or MID_PULLBACK_BUCKET_LABELS.get(bucket, "일봉 추세형"))
+    reasons.append(f"🧭 눌림 유형: {bucket_label}")
+    reasons.append(f"🎯 실행 A 조건: {MID_PULLBACK_BUCKET_A_GUIDE.get(bucket, '확증 3개 이상')}")
+    close_info = profile.get("close_info") or {}
+    if close_info.get("is_close_window"):
+        reasons.append(f"🕒 장마감 근접: {close_info.get('stage','')} {int(close_info.get('remain_min', 0) or 0)}분 전")
+    if execution_grade != pattern_grade:
+        reason_labels = profile.get("core_hits") or profile.get("support_hits") or []
+        note_reason = ", ".join(reason_labels[:2]) if reason_labels else "실행확증 부족"
+        reasons.append(f"⚠️ 실행 보정: 패턴 {pattern_grade} → 현재 {execution_grade} ({note_reason})")
+    result["reasons"] = reasons
+    result["pattern_grade"] = pattern_grade
+    result["execution_grade"] = execution_grade
+    result["execution_profile"] = profile
+    result["grade"] = execution_grade
+    result["mid_close_stage"] = close_info.get("stage", "")
+    result["mid_close_window_active"] = bool(close_info.get("is_close_window"))
+    result["mid_close_remain_min"] = int(close_info.get("remain_min", 999) or 999)
+    result["mid_execution_confirm_count"] = total_count
+    result["mid_execution_core_count"] = core_count
+    return result
+
+
+def _finalize_mid_pullback_signal(result: dict) -> dict:
+    if not isinstance(result, dict) or str(result.get("signal_type", "")).upper() != "MID_PULLBACK":
+        return result
+    ctx = _classify_mid_pullback_setup(
+        is_intraday=bool(result.get("is_intraday")),
+        resurge_mode=bool(result.get("resurge_mode")),
+        pullback_days=int(result.get("pullback_days", 0) or 0),
+        surge_pct=float(result.get("surge_pct", 0.0) or 0.0),
+        pullback_pct=float(result.get("pullback_pct", 0.0) or 0.0),
+        gap_pct=float(result.get("gap_pct", 0.0) or 0.0),
+    )
+    result.update(ctx)
+    pattern_score = int(result.get("pattern_score_base", result.get("score", 0)) or 0)
+    result["pattern_score_base"] = pattern_score
+    result["pattern_grade"] = _mid_pullback_grade_from_score(pattern_score)
+    return _apply_mid_pullback_execution_grade(result)
+
+
+# ============================================================
+# ⑭ 눌림목 핵심 분석 함수
+# ============================================================
 def analyze_mid_pullback(code: str, name: str) -> dict:
     """
     퀀트펀드 눌림목 모멘텀 분석 (AQR 방식 응용)
@@ -3238,16 +3241,6 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     # 손절·목표가
     entry = today_close
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
-    _ctx = _classify_mid_pullback_setup(
-        items, today,
-        prev_close=prev_close,
-        surge_pct=surge_pct,
-        pullback_pct=pullback_pct,
-        pullback_days=pullback_days,
-        is_intraday=False,
-        resurge_mode=False,
-        reclaim_ratio=0.0,
-    )
 
     return {
         "code": code, "name": name,
@@ -3274,15 +3267,6 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "detected_at":   datetime.now(),
         "market_regime_label": regime_label(),
         "market_regime_mode": _regime.get("mode", "normal"),
-        "pattern_grade": grade,
-        "execution_grade": grade,
-        "gap_open_pct": _ctx.get("gap_open_pct", 0.0),
-        "mid_pullback_bucket": _ctx.get("mid_pullback_bucket", "daily_trend"),
-        "mid_pullback_bucket_label": _ctx.get("mid_pullback_bucket_label", "일봉 추세형"),
-        "mid_pullback_bucket_note": _ctx.get("mid_pullback_bucket_note", ""),
-        "weekly_uptrend_ok": _ctx.get("weekly_uptrend_ok", False),
-        "monthly_uptrend_ok": _ctx.get("monthly_uptrend_ok", False),
-        "a_gate_hint": _ctx.get("a_gate_hint", ""),
     }
 
 # ============================================================
@@ -3539,6 +3523,10 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("source", str(watch.get("source", "") or ""))
             watch.setdefault("dart_reliability_score", int(watch.get("dart_reliability_score", 0) or 0))
             watch.setdefault("shareholder_confirmation_date", str(watch.get("shareholder_confirmation_date", "") or ""))
+            watch.setdefault("entry_price_at_detect", safe_int(watch.get("entry_price_at_detect", watch.get("entry_price", 0)), 0))
+            watch.setdefault("pattern_grade_at_detect", str(watch.get("pattern_grade_at_detect", watch.get("pattern_grade", watch.get("grade", ""))) or ""))
+            watch.setdefault("execution_grade_at_detect", str(watch.get("execution_grade_at_detect", watch.get("execution_grade", watch.get("grade", ""))) or ""))
+            watch.setdefault("grade_at_detect", str(watch.get("grade_at_detect", watch.get("execution_grade_at_detect", watch.get("grade", ""))) or ""))
             watch.setdefault("entry_reference_only", False)
             watch.setdefault("entry_reference_market", "")
             watch.setdefault("entry_reference_reason", "")
@@ -6129,16 +6117,6 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         return {}
 
     grade = "A" if score>=80 else "B" if score>=60 else "C"
-    _ctx = _classify_mid_pullback_setup(
-        hist + [today], today,
-        prev_close=prev_close,
-        surge_pct=surge_pct,
-        pullback_pct=pullback_pct,
-        pullback_days=pullback_days,
-        is_intraday=True,
-        resurge_mode=bool(resurge_mode and not breakout_mode),
-        reclaim_ratio=reclaim_ratio,
-    )
     if resurge_mode and not breakout_mode:
         entry = _calc_resurge_entry_price(today_price, pullback_low, reclaim_ratio)
         reasons.append(f"↘️ 재상승형 보수 진입가 {entry:,}원 (현재가 추격 방지)")
@@ -6146,11 +6124,12 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         entry = today_price
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
 
-    return {
+    result = {
         "code": code, "name": _resolve_stock_name(code, name, cur), "price": today_price, "change_rate": today_chg,
         "volume_ratio": vol_ratio, "signal_type": "MID_PULLBACK",
         "is_intraday": True,   # 장중 돌파 표시
         "grade": grade, "score": score,
+        "pattern_score_base": score,
         "surge_pct": surge_pct, "pullback_pct": pullback_pct, "pullback_days": pullback_days,
         "current_pullback": round((surge_peak_price-today_price)/surge_peak_price*100,1),
         "pullback_reclaim_ratio": reclaim_ratio, "resurge_mode": bool(resurge_mode and not breakout_mode),
@@ -6160,17 +6139,10 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         "similar_pattern_stats": similar_pattern_stats,
         "entry_price": entry, "stop_loss": stop, "target_price": target,
         "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
+        "gap_pct": round(((today_price - prev_close) / prev_close) * 100, 1) if prev_close else 0.0,
         "reasons": reasons, "detected_at": datetime.now(),
-        "pattern_grade": grade,
-        "execution_grade": grade,
-        "gap_open_pct": _ctx.get("gap_open_pct", 0.0),
-        "mid_pullback_bucket": _ctx.get("mid_pullback_bucket", "intraday_reclaim"),
-        "mid_pullback_bucket_label": _ctx.get("mid_pullback_bucket_label", "분봉 재개형"),
-        "mid_pullback_bucket_note": _ctx.get("mid_pullback_bucket_note", ""),
-        "weekly_uptrend_ok": _ctx.get("weekly_uptrend_ok", False),
-        "monthly_uptrend_ok": _ctx.get("monthly_uptrend_ok", False),
-        "a_gate_hint": _ctx.get("a_gate_hint", ""),
     }
+    return _finalize_mid_pullback_signal(result)
 
 # ============================================================
 # 눌림목 스캐너 — THEME_MAP + 동적 후보군 전체 스캔
@@ -6199,7 +6171,7 @@ def run_mid_pullback_scan():
         _prev_cooldown = _mid_pullback_alert_history.get(code)
         if isinstance(_prev_cooldown, dict):
             _prev_ts = _prev_cooldown.get("ts", 0)
-            _prev_grade = str(_prev_cooldown.get("pattern_grade") or _prev_cooldown.get("grade") or "C").upper()
+            _prev_grade = str(_prev_cooldown.get("pattern_grade") or _prev_cooldown.get("grade", "C") or "C").upper()
         else:
             _prev_ts = float(_prev_cooldown or 0)
             _prev_grade = "C"
@@ -6211,13 +6183,12 @@ def run_mid_pullback_scan():
                 if not _peek:
                     _peek = check_intraday_pullback_breakout(code, name)
                 if _peek:
-                    _peek["sector_info"] = calc_sector_momentum(code, name)
-                    _w_sec = _dynamic.get("feat_w_sector", 1.0)
-                    _peek["score"] += int((_peek.get("sector_info") or {}).get("bonus", 0) * _w_sec)
                     _peek = _finalize_mid_pullback_signal(_peek)
                     _peek_grade = str(_peek.get("pattern_grade", _peek.get("grade", "C"))).upper()
-                    if _grade_rank(_peek_grade) > _grade_rank(_prev_grade):
+                    _grade_order = {"A": 3, "B": 2, "C": 1}
+                    if _grade_order.get(_peek_grade, 0) > _grade_order.get(_prev_grade, 0):
                         print(f"  🔄 등급 상향 감지: {name} {_prev_grade}→{_peek_grade} — 쿨다운 리셋")
+                        # 쿨다운 리셋, 아래 분석으로 계속 진행
                     else:
                         continue  # 등급 동일/하향 → 쿨다운 유지
                 else:
@@ -6237,7 +6208,6 @@ def run_mid_pullback_scan():
                 _w_sec = _dynamic.get("feat_w_sector", 1.0)
                 result["score"] += int(sector_info.get("bonus", 0) * _w_sec)
                 result = _finalize_mid_pullback_signal(result)
-                result = _inject_mid_pullback_focus_lines(result)
                 signals.append(result)
             time.sleep(0.3)
         except Exception as e:
@@ -6309,15 +6279,11 @@ def run_mid_pullback_scan():
 def send_mid_pullback_alert(s: dict):
     stock_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = stock_name
-    display_grade = str(s.get("grade", "C") or "C").upper()
-    pattern_grade = str(s.get("pattern_grade", display_grade) or display_grade).upper()
-    grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(display_grade, "📊")
-    grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(display_grade, "")
+    grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(s.get("grade"), "📊")
+    grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(s.get("grade"), "")
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     header_override = str(s.get("_header_override", "") or "").strip()
     header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
-    if pattern_grade != display_grade and not s.get("_header_override"):
-        header_line += f"  <i>(패턴 {pattern_grade})</i>"
     capture_label = _format_capture_datetime_label(
         detected_at=s.get("detected_at"),
         detect_date=s.get("detect_date", ""),
@@ -7579,6 +7545,10 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
         watch["nxt_surge_time"]    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         code = watch.get("code", "")
         name = watch.get("name", "")
+        watch.setdefault("entry_price_at_detect", safe_int(watch.get("entry_price", 0), 0))
+        watch.setdefault("pattern_grade_at_detect", str(watch.get("pattern_grade", watch.get("grade", "B")) or "B"))
+        watch.setdefault("execution_grade_at_detect", str(watch.get("execution_grade", watch.get("grade", "B")) or "B"))
+        watch.setdefault("grade_at_detect", str(watch.get("execution_grade_at_detect", watch.get("grade", "B")) or "B"))
         # 진입가를 NXT 급등가 기준으로 소폭 재조정 (기존 진입가보다 낮으면 유지)
         orig_entry = watch.get("entry_price", 0)
         if orig_entry and nxt_price:
@@ -7591,7 +7561,7 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
             else:
                 print(f"  🔄 NXT선행→KRX추적: {name} 진입가 유지 {orig_entry:,}원 (NXT {nxt_price:,})")
 
-        # [v41.99] NXT 전환 시 pattern/execution grade 재평가
+        # [v41.90] NXT 전환 시 pattern/execution grade 재계산
         prev_pattern = str(watch.get("pattern_grade", watch.get("grade", "B"))).upper()
         prev_exec = str(watch.get("execution_grade", watch.get("grade", "B"))).upper()
         try:
@@ -7599,9 +7569,9 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
             if not _reeval:
                 _reeval = check_intraday_pullback_breakout(code, name)
             if _reeval:
-                _reeval["sector_info"] = calc_sector_momentum(code, name)
-                _w_sec = _dynamic.get("feat_w_sector", 1.0)
-                _reeval["score"] += int((_reeval.get("sector_info") or {}).get("bonus", 0) * _w_sec)
+                _sector = calc_sector_momentum(code, name)
+                _reeval["sector_info"] = _sector
+                _reeval["score"] += int((_sector.get("bonus", 0) or 0) * _dynamic.get("feat_w_sector", 1.0))
                 _reeval = _finalize_mid_pullback_signal(_reeval)
                 new_pattern = str(_reeval.get("pattern_grade", prev_pattern)).upper()
                 new_exec = str(_reeval.get("grade", prev_exec)).upper()
@@ -7611,22 +7581,16 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
                 watch["grade"] = new_exec
                 watch["score"] = new_score
                 watch["mid_pullback_bucket"] = _reeval.get("mid_pullback_bucket", watch.get("mid_pullback_bucket", ""))
+                watch["mid_pullback_bucket_label"] = _reeval.get("mid_pullback_bucket_label", watch.get("mid_pullback_bucket_label", ""))
                 if new_exec != prev_exec or new_pattern != prev_pattern:
                     print(f"  📊 NXT전환 등급 재평가: {name} 패턴 {prev_pattern}→{new_pattern} / 실행 {prev_exec}→{new_exec} ({new_score}점)")
                 if _grade_rank(new_pattern) > _grade_rank(prev_pattern):
                     _mid_pullback_alert_history.pop(code, None)
-                    print(f"  🔄 쿨다운 리셋: {name} (패턴등급 상향 {prev_pattern}→{new_pattern})")
+                    print(f"  🔄 쿨다운 리셋: {name} (패턴 상향 {prev_pattern}→{new_pattern})")
         except Exception as _re:
             print(f"  ⚠️ NXT전환 등급 재평가 실패: {_re}")
 
-        # 텔레그램 알림 (내부 전환 기록)
-        try:
-            _grade_display = str(watch.get("execution_grade", watch.get("grade", "B"))).upper()
-            send(f"📡 <b>[NXT 선행→KRX 추적 전환]</b>\n"
-                 f"<b>{name}</b>  <code>{code}</code>\n"
-                 f"NXT {nxt_price:,}원 선행 감지 → KRX 정규장 개시 후 자동 추적\n"
-                 f"진입가: {watch.get('entry_price',0):,}원  등급: {_grade_display}")
-        except Exception: pass
+        print(f"  📡 NXT선행→KRX추적 등록: {name} (진입가 {int(watch.get('entry_price', 0) or 0):,}원 / 실행등급 {str(watch.get('execution_grade', watch.get('grade', 'B'))).upper()})")
     except Exception as e:
         print(f"⚠️ _register_nxt_surge_to_krx_watch: {e}")
 
@@ -8311,6 +8275,9 @@ def _get_params_snapshot() -> dict:
             "atr_stop_mult", "atr_target_mult",
             "early_price_min", "early_volume_min",
             "mid_surge_min_pct", "mid_pullback_min", "mid_pullback_max",
+            "mid_pullback_bucket_a_confirm_min", "mid_pullback_bucket_b_confirm_min",
+            "mid_pullback_close_window_min_krx", "mid_pullback_close_window_min_nxt",
+            "mid_pullback_close_gate_level",
             "themed_score_bonus",
             # 가중치(기여도 튜닝용)
             "feat_w_rsi", "feat_w_ma", "feat_w_bb", "feat_w_sector", "feat_w_nxt", "feat_w_geo",
@@ -8805,6 +8772,13 @@ def save_signal_log(stock: dict):
             "mid_pullback_bucket": str(stock.get("mid_pullback_bucket", "") or ""),
             "pattern_grade": str(stock.get("pattern_grade", stock.get("grade", "")) or ""),
             "execution_grade": str(stock.get("grade", "") or ""),
+            "mid_close_stage": str(stock.get("mid_close_stage", "") or ""),
+            "mid_close_window": bool(stock.get("mid_close_window_active")),
+            "mid_close_remain_min": int(stock.get("mid_close_remain_min", 999) or 999),
+            "mid_execution_confirm_count": int(stock.get("mid_execution_confirm_count", 0) or 0),
+            "entry_price_at_detect": int(stock.get("entry_price_at_detect", stock.get("entry_price", 0)) or 0),
+            "pattern_grade_at_detect": str(stock.get("pattern_grade_at_detect", stock.get("pattern_grade", stock.get("grade", ""))) or ""),
+            "execution_grade_at_detect": str(stock.get("execution_grade_at_detect", stock.get("grade", "")) or ""),
         }
 
         track_status = "진입준비" if stock.get("execution_setup_required") else "추적중"
@@ -8840,9 +8814,6 @@ def save_signal_log(stock: dict):
                 rec["signal_type"] = sig_type or rec.get("signal_type", "")
                 rec["score"] = stock.get("score", rec.get("score", 0))
                 rec["grade"] = stock.get("grade", rec.get("grade", "B"))
-                rec["pattern_grade"] = stock.get("pattern_grade", rec.get("pattern_grade", rec.get("grade", "B")))
-                rec["execution_grade"] = stock.get("grade", rec.get("execution_grade", rec.get("grade", "B")))
-                rec["mid_pullback_bucket"] = stock.get("mid_pullback_bucket", rec.get("mid_pullback_bucket", ""))
                 rec["market_regime"] = MARKET_REGIME.get("label", "unknown")
                 rec["market_regime_det"] = market_regime_details()
                 rec["geo_sector_bias"] = globals().get('GEO_SECTOR_BIAS', {})
@@ -8862,6 +8833,9 @@ def save_signal_log(stock: dict):
                 rec["korea_etf_snapshot"] = korea_etf_snapshot
                 rec["execution_setup_required"] = bool(stock.get("execution_setup_required"))
                 rec["planned_entry_price"] = safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0)
+                rec["pattern_grade"] = str(stock.get("pattern_grade", stock.get("grade", rec.get("pattern_grade", "B"))))
+                rec["execution_grade"] = str(stock.get("grade", rec.get("execution_grade", rec.get("grade", "B"))))
+                rec["mid_pullback_bucket"] = str(stock.get("mid_pullback_bucket", rec.get("mid_pullback_bucket", "")) or "")
                 rec["status"] = track_status
                 rec["max_price"] = max(safe_int(rec.get("max_price", 0), 0), safe_int(stock.get("price", 0), 0))
                 min_prev = safe_int(rec.get("min_price", stock.get("price", 0)), safe_int(stock.get("price", 0), 0))
@@ -8890,11 +8864,11 @@ def save_signal_log(stock: dict):
             "signal_type_history": [sig_type] if sig_type else [],
             "score": stock.get("score", 0),
             "grade": stock.get("grade", "B"),
-            "pattern_grade": stock.get("pattern_grade", stock.get("grade", "B")),
-            "execution_grade": stock.get("grade", "B"),
-            "mid_pullback_bucket": stock.get("mid_pullback_bucket", ""),
             "latest_signal_score": stock.get("score", 0),
             "latest_signal_grade": stock.get("grade", "B"),
+            "pattern_grade": str(stock.get("pattern_grade", stock.get("grade", "B"))),
+            "execution_grade": str(stock.get("grade", "B")),
+            "mid_pullback_bucket": str(stock.get("mid_pullback_bucket", "") or ""),
             "market_regime": MARKET_REGIME.get("label", "unknown"),
             "market_regime_det": market_regime_details(),
             "geo_sector_bias": globals().get('GEO_SECTOR_BIAS', {}),
@@ -10111,10 +10085,21 @@ _dynamic = {
     "mid_pullback_min":   MID_PULLBACK_MIN,
     "mid_pullback_max":   MID_PULLBACK_MAX,
     "mid_vol_recovery":   MID_VOL_RECOVERY_MIN,
-    "mid_pullback_close_krx_window_min": 20,
-    "mid_pullback_close_nxt_window_min": 30,
-    "mid_pullback_gap_open_min": 2.0,
-    "mid_pullback_intraday_reclaim_min": 0.55,
+    "mid_pullback_bucket_a_confirm_min": {
+        "weekly_monthly_trend": 2,
+        "daily_trend": 3,
+        "gap_first_pullback": 3,
+        "intraday_reclaim": 4,
+    },
+    "mid_pullback_bucket_b_confirm_min": {
+        "weekly_monthly_trend": 1,
+        "daily_trend": 2,
+        "gap_first_pullback": 2,
+        "intraday_reclaim": 2,
+    },
+    "mid_pullback_close_window_min_krx": 20,
+    "mid_pullback_close_window_min_nxt": 25,
+    "mid_pullback_close_gate_level": 1,
     # 급등 진입
     "min_score_normal":   56,
     "min_score_strict":   66,
@@ -10515,6 +10500,80 @@ def _check_strategy_health(kpi: dict, notify: bool = True) -> list:
     return changes
 
 
+def _auto_tune_mid_pullback_bucket_params(mid_recs: list) -> list:
+    changes = []
+    if len(mid_recs) < max(MIN_SAMPLES, 6):
+        return changes
+
+    base_a = {
+        "weekly_monthly_trend": 2,
+        "daily_trend": 3,
+        "gap_first_pullback": 3,
+        "intraday_reclaim": 4,
+    }
+    base_b = {
+        "weekly_monthly_trend": 1,
+        "daily_trend": 2,
+        "gap_first_pullback": 2,
+        "intraday_reclaim": 2,
+    }
+    labels = MID_PULLBACK_BUCKET_LABELS
+    a_map = _safe_nested_dict(_dynamic, "mid_pullback_bucket_a_confirm_min", base_a)
+    b_map = _safe_nested_dict(_dynamic, "mid_pullback_bucket_b_confirm_min", base_b)
+
+    for bucket, label in labels.items():
+        subset = [r for r in mid_recs if str(r.get("mid_pullback_bucket", "") or "daily_trend") == bucket]
+        if len(subset) < 4:
+            continue
+        win = sum(1 for r in subset if r.get("pnl_pct", 0) > 0) / len(subset)
+        avg = sum(float(r.get("pnl_pct", 0) or 0) for r in subset) / len(subset)
+        old_a = int(a_map.get(bucket, base_a.get(bucket, 3)) or base_a.get(bucket, 3))
+        old_b = int(b_map.get(bucket, base_b.get(bucket, 1)) or base_b.get(bucket, 1))
+        new_a, new_b = old_a, old_b
+        if win < 0.40 or avg < -0.5:
+            new_a = min(old_a + 1, 5)
+            new_b = min(old_b + 1, max(4, new_a))
+        elif win > 0.68 and avg > 0.8:
+            new_a = max(old_a - 1, 1)
+            new_b = max(old_b - 1, 0)
+        if (new_a, new_b) != (old_a, old_b):
+            a_map[bucket] = new_a
+            b_map[bucket] = new_b
+            changes.append(
+                f"🏷️ 눌림목 유형[{label}] A/B 게이트 조정: {old_a}/{old_b}→{new_a}/{new_b} "
+                f"(승률 {win*100:.0f}%, 평균 {avg:+.1f}%, n={len(subset)})"
+            )
+
+    _dynamic["mid_pullback_bucket_a_confirm_min"] = a_map
+    _dynamic["mid_pullback_bucket_b_confirm_min"] = b_map
+
+    close_rows = [r for r in mid_recs if bool((r.get("feature_snapshot") or {}).get("mid_close_window"))]
+    for stage, key, default_window in (("KRX", "mid_pullback_close_window_min_krx", 20), ("NXT", "mid_pullback_close_window_min_nxt", 25)):
+        subset = [r for r in close_rows if str((r.get("feature_snapshot") or {}).get("mid_close_stage", "") or "") == stage]
+        if len(subset) < 4:
+            continue
+        win = sum(1 for r in subset if r.get("pnl_pct", 0) > 0) / len(subset)
+        avg = sum(float(r.get("pnl_pct", 0) or 0) for r in subset) / len(subset)
+        old_window = int(_dynamic.get(key, default_window) or default_window)
+        new_window = old_window
+        old_gate = int(_dynamic.get("mid_pullback_close_gate_level", 1) or 1)
+        new_gate = old_gate
+        if win < 0.40 or avg < -0.7:
+            new_window = min(old_window + 5, 45)
+            new_gate = min(old_gate + 1, 3)
+        elif win > 0.68 and avg > 0.8:
+            new_window = max(old_window - 5, 5)
+            new_gate = max(old_gate - 1, 0)
+        if new_window != old_window:
+            _dynamic[key] = new_window
+            changes.append(f"🕒 눌림목 마감보수[{stage}] 윈도우 조정: {old_window}→{new_window}분 (승률 {win*100:.0f}%, n={len(subset)})")
+        if new_gate != old_gate:
+            _dynamic["mid_pullback_close_gate_level"] = new_gate
+            changes.append(f"🕒 눌림목 마감보수 게이트: {old_gate}→{new_gate} (stage {stage}, 평균 {avg:+.1f}%)")
+
+    return changes
+
+
 def auto_tune(notify: bool = True):
     """
     signal_log.json 기반으로 신호 유형별 성과를 분석해서
@@ -10676,6 +10735,7 @@ def auto_tune(notify: bool = True):
                 _dynamic["mid_pullback_min"]  = max(old_min - 2.0, 8.0)
                 changes.append(f"🏆 눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
+            changes.extend(_auto_tune_mid_pullback_bucket_params(mid_recs))
 
         # ── ④ 최소 점수 조정 ──
         if len(completed) >= MIN_SAMPLES:
@@ -11526,11 +11586,15 @@ def register_entry_watch(s: dict):
         "entry_soft_block_allowed": bool(s.get("entry_soft_block_allowed")),
         "pullback_reclaim_ratio": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
         "pullback_ratio_at_register": float(s.get("pullback_reclaim_ratio", 0.0) or 0.0),
-        "grade": str(s.get("grade", "B")),
         "pattern_grade": str(s.get("pattern_grade", s.get("grade", "B"))),
         "execution_grade": str(s.get("grade", "B")),
+        "entry_price_at_detect": int(entry or 0),
+        "pattern_grade_at_detect": str(s.get("pattern_grade", s.get("grade", "B"))),
+        "execution_grade_at_detect": str(s.get("grade", "B")),
+        "grade_at_detect": str(s.get("grade", "B")),
         "mid_pullback_bucket": str(s.get("mid_pullback_bucket", "") or ""),
         "mid_pullback_bucket_label": str(s.get("mid_pullback_bucket_label", "") or ""),
+        "grade": str(s.get("grade", "B")),
         "score": int(s.get("score", 0) or 0),
         "source": str(s.get("source", "") or ""),
         "dart_reliability_score": int(s.get("dart_reliability_score", 0) or 0),
@@ -11644,18 +11708,34 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
+def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
+    """KIS change_rate와 전일종가 대비 실계산 등락률 중 절대값이 큰 값을 사용."""
+    try:
+        api_rate = float(cur.get("change_rate", 0.0) or 0.0)
+    except Exception:
+        api_rate = 0.0
+    prev_close = safe_int(cur.get("prev_close", 0), 0)
+    current_price = safe_int(price or cur.get("price", 0), 0)
+    calc_rate = 0.0
+    if prev_close > 0 and current_price > 0:
+        try:
+            calc_rate = ((current_price - prev_close) / prev_close) * 100.0
+        except Exception:
+            calc_rate = 0.0
+    return calc_rate if abs(calc_rate) > abs(api_rate) else api_rate
+
+
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
     """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
-    try:
-        change_rate = float(cur.get("change_rate", 0.0) or 0.0)
-    except Exception:
-        change_rate = 0.0
+    change_rate = _get_effective_change_rate(cur, price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
-    sig_type = str(watch.get("signal_type") or "")
-    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
+    sig_type = str(watch.get("signal_type") or "").upper()
+    upper_like = change_rate >= 29.0 or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
+    if upper_like and sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
+        return "upper_limit_reached"
     if upper_like and ask_qty <= 0:
         return "no_ask_liquidity"
     return ""
@@ -11963,6 +12043,22 @@ def _is_representative_tracking_record(data: dict | None, log_key: str, rec: dic
     best_key, _ = max(same, key=lambda kv: _tracking_record_sort_key(kv[1]))
     return best_key == log_key
 
+def _format_nxt_transition_delta_block(watch: dict) -> str:
+    lines = []
+    base_grade = str(watch.get("execution_grade_at_detect") or watch.get("grade_at_detect") or watch.get("grade") or "").upper()
+    cur_grade = str(watch.get("execution_grade") or watch.get("grade") or "").upper()
+    if base_grade and cur_grade and base_grade != cur_grade:
+        lines.append(f"- 등급 변화: {base_grade} → {cur_grade}")
+    base_entry = safe_int(watch.get("entry_price_at_detect", watch.get("entry_price_orig", watch.get("entry_price", 0))), 0)
+    cur_entry = safe_int(watch.get("entry_price", 0), 0)
+    if base_entry > 0 and cur_entry > 0 and base_entry != cur_entry:
+        pct = ((cur_entry - base_entry) / base_entry) * 100.0
+        lines.append(f"- 진입가 조정: {base_entry:,}원 → {cur_entry:,}원 ({pct:+.1f}%)")
+    if not lines:
+        return ""
+    return "🔄 <b>NXT 반영 변화</b>\n" + "\n".join(lines) + "\n\n"
+
+
 def check_entry_watch():
     if not _entry_watch: return
     expired: list[tuple[str, str, str]] = []
@@ -12234,12 +12330,13 @@ def check_entry_watch():
                     # ━━━ 1차 진입가 도달 ━━━
                     _p1_pct = _split_rule["phase1_pct"]
                     _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
+                    _nxt_delta_block = _format_nxt_transition_delta_block(watch)
                     send_with_chart_buttons(
                         f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                         f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
-                        f"{similar_block}"
+                        f"{_nxt_delta_block}{similar_block}"
                         f"{reasons_block}"
                         f"{sector_block}"
                         f"{_entry_exec_block}"
@@ -13244,7 +13341,7 @@ def _is_capture_focus_reason(txt: str) -> bool:
         '🔴 NXT 외인+기관 동시매수',
         '✅ 진입가 ',
         '🚦 최근 체결흐름 ', '⚡ 체결지속속도 ',
-        '🧭 눌림 유형: ', '🎯 A 조건: ', '⚠️ 실행 보정: '
+        '🧭 눌림 유형:', '🎯 실행 A 조건:', '⚠️ 실행 보정:', '🕒 장마감 근접:'
     )):
         return True
     return False
