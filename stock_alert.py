@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.88
+버전: v41.89
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.89 (2026-03-20): 눌림목 상한가 도달/잠김 종목 진입차단 강화.
+  [#1] `_get_effective_change_rate()`를 추가해 KIS `change_rate`뿐 아니라 `prev_close` 대비 실계산 등락률도 함께 보도록 보강.
+       API 반올림/표기 오차로 29%대 후반 상한가 종목이 약하게 인식되는 누락을 줄임.
+  [#2] `_detect_entry_block_reason()`에서 `MID_PULLBACK`은 현재가가 상한가 수준(실계산 포함)에 도달하면
+       매도잔량 유무와 무관하게 `upper_limit_reached`로 차단하도록 강화.
+       기존 `limit_up_locked`/`no_ask_liquidity` 차단은 그대로 유지.
+  [#3] 이 차단은 `run_mid_pullback_scan()` 초기 실알림과 `check_entry_watch()` 진입가 도달 판정 양쪽에 공통 적용된다.
+  이유: 태웅 사례처럼 현재가=진입가이면서 이미 상한가 도달 상태인 종목이 `눌림목 진입 신호`로 남아
+       실제 행동 불가능한 알림 품질을 떨어뜨리는 문제를 줄이기 위해.
+  개선점: 상한가 도달/잠김 상태의 눌림목 오알림↓, 실제 행동 가능한 눌림목 알림 품질↑.
+  주의점: 본 차단은 `MID_PULLBACK`에만 보수 적용된다. 일반 급등/상한가 감지 신호 자체를 막지는 않는다.
 
 - v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
   [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
@@ -11310,16 +11322,33 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
-def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
-    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
+def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
+    """KIS 표기 등락률 + 전일종가 대비 실계산 등락률 중 더 보수적인 값을 사용."""
     try:
         change_rate = float(cur.get("change_rate", 0.0) or 0.0)
     except Exception:
         change_rate = 0.0
+    prev_close = safe_int(cur.get("prev_close", 0), 0)
+    live_price = safe_int(price or cur.get("price", 0), 0)
+    if prev_close > 0 and live_price > 0:
+        try:
+            calc_rate = ((live_price - prev_close) / prev_close) * 100.0
+            change_rate = max(change_rate, calc_rate)
+        except Exception:
+            pass
+    return float(change_rate or 0.0)
+
+
+def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
+    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
+    change_rate = _get_effective_change_rate(cur, price=price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     sig_type = str(watch.get("signal_type") or "")
-    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
+    upper_touch = change_rate >= 29.8
+    upper_like = upper_touch or sig_type in ("UPPER_LIMIT",)
+    if sig_type == "MID_PULLBACK" and entry > 0 and price >= entry and upper_touch:
+        return "upper_limit_reached"
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
