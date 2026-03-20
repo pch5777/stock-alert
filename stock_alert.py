@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.90
+버전: v41.91
 날짜: 2026-03-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.91 (2026-03-20): 눌림목 진입 신호 본문 재정리 — 현재 판단/핵심 근거/섹터 확증 중심으로 압축.
+  [#1] `send_mid_pullback_alert()`를 전용 본문 빌더 `_build_mid_pullback_capture_message()`로 분리해
+       제목은 `[눌림목 진입 신호]`를 유지하고, 본문은 `현재가/진입가` + `현재 판단` + `핵심 근거` + `섹터 확증`만 보이도록 정리.
+  [#2] 기존 포착 메시지의 `현재는 진입가보다 ±x.x%`, `진입가 도달` 문구는 눌림목 포착 알림에서 제거하고,
+       `🎯 현재 판단: 1차 진입 가능` / `⏳ 진입가 대기` / `⚠️ 추격보다 눌림 대기`처럼 행동 해석형 문구로 교체.
+  [#3] `reasons` / `resurge_mode` / `direct_news_hit` / `sector_info`를 요약해
+       `📌 핵심 근거: 거래량 회복 + 바닥 재상승`, `🏭 섹터 확증: 약함 (기타업종)`처럼 한 줄 해석으로 표기.
+  이유: 눌림목 포착 알림이 `진입가 도달`처럼 읽히면서 `[1차 진입가 도달]`과 의미가 겹치고,
+       A등급이어도 왜 볼 만한지 근거가 얇아 실제 진입 판단에 도움이 부족했음.
+  개선점: 포착 알림과 행동 알림 역할 분리↑, A등급 해석력↑, `기타업종` 같은 약한 섹터도 과장 없이 노출.
+  주의점: 이번 변경은 `[눌림목 진입 신호]` 본문에만 적용되며, `[1차 진입가 도달]`/`[2차 진입 판단]` 구조는 유지.
 
 - v41.90 (2026-03-20): NXT 전환 변화정보를 1차 진입가 도달 알림으로 이동 + 진입가 조정률(%) 표시.
   [#1] `register_entry_watch()` / active watch 복원 경로에 `grade_at_detect`를 저장·복원해
@@ -21,19 +33,6 @@
        왜 이전 B등급 종목이 지금은 진입 후보가 됐는지 한 번에 판단할 수 있어야 함.
   개선점: 불필요한 상태 알림↓, 진입 판단 근거(등급 상향/진입가 재조정) 해석력↑.
   주의점: 변화가 없으면 `NXT 반영 변화` 블록은 표시되지 않음.
-
-- v41.89 (2026-03-20): 눌림목 상한가 도달/잠김 진입불가 차단 강화.
-  [#1] `_get_effective_change_rate()`를 추가해 KIS `change_rate`뿐 아니라 `prev_close` 대비 실계산 등락률을 함께 반영.
-       API 반올림/지연으로 `change_rate`가 낮게 보이는 경우에도 현재가 기준 상한가 수준을 더 보수적으로 판별.
-  [#2] `_detect_entry_block_reason()`를 보강해 `MID_PULLBACK`/`ENTRY_POINT` 신호는
-       상한가 잠김뿐 아니라 상한가 도달 자체도 `upper_limit_reached`로 차단하도록 강화.
-       기존 `limit_up_locked`/`no_ask_liquidity` 차단은 다른 신호유형에 그대로 유지.
-  [#3] `run_mid_pullback_scan()` / `check_entry_watch()` 두 경로 모두 같은 차단 함수를 사용하도록 유지해,
-       눌림목 실알림 직전과 진입가 도달 직전에서 동일 기준으로 재차 검증.
-  이유: 태웅 사례 — `현재가=진입가`로 보이더라도 이미 상한가 수준이면 실질 진입이 어려워,
-       눌림목 행동 알림으로 보내면 사용자가 진입 가능한 신호로 오해할 수 있었음.
-  개선점: 상한가/잠김 상태의 눌림목 오알림↓, 실진입 가능 종목 중심의 알림 품질↑.
-  주의점: 상한가 차단 강화는 눌림목(`MID_PULLBACK`/`ENTRY_POINT`) 경로에만 우선 적용.
 
 - v41.88 (2026-03-20): 눌림목 등급 상향 시 쿨다운 리셋 + NXT→KRX 전환 등급 재평가.
   [#1] `run_mid_pullback_scan()` 쿨다운(24h) 내라도 등급이 상향(예: B→A)되면 리셋하여 재알림.
@@ -6041,7 +6040,7 @@ def send_mid_pullback_alert(s: dict):
         detect_date=s.get("detect_date", ""),
         detect_time=s.get("detect_time", "")
     ) or _format_capture_datetime_label(detected_at=datetime.now())
-    message = _build_capture_focus_message(s, header_line, capture_label, name_dot="🟣")
+    message = _build_mid_pullback_capture_message(s, header_line, capture_label, name_dot="🟣")
     send_with_chart_buttons(message, s["code"], stock_name)
 
 
@@ -11369,33 +11368,16 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
 
 
-def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
-    """KIS 응답 change_rate와 전일종가 대비 실계산 등락률 중 상방 기준을 보수적으로 사용."""
-    try:
-        api_change = float(cur.get("change_rate", 0.0) or 0.0)
-    except Exception:
-        api_change = 0.0
-    price = safe_int(price or cur.get("price", 0), 0)
-    prev_close = safe_int(cur.get("prev_close", 0), 0)
-    if price > 0 and prev_close > 0:
-        try:
-            calc_change = ((price - prev_close) / prev_close) * 100.0
-            return max(api_change, calc_change)
-        except Exception:
-            return api_change
-    return api_change
-
-
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
     """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
-    change_rate = _get_effective_change_rate(cur, price)
+    try:
+        change_rate = float(cur.get("change_rate", 0.0) or 0.0)
+    except Exception:
+        change_rate = 0.0
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
-    sig_type = str(watch.get("signal_type") or "").upper()
-    upper_like = (change_rate >= 29.8) or sig_type in ("UPPER_LIMIT",)
-
-    if sig_type in ("MID_PULLBACK", "ENTRY_POINT") and upper_like:
-        return "upper_limit_reached"
+    sig_type = str(watch.get("signal_type") or "")
+    upper_like = (change_rate >= 29.0) or sig_type in ("UPPER_LIMIT",)
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
@@ -13162,6 +13144,142 @@ def _build_capture_focus_price_line(s: dict) -> str:
     if price:
         return f"💵 현재가 <b>{price:,}원</b>"
     return f"🎯 진입가 <b>{entry:,}원</b>"
+
+
+def _build_capture_focus_price_line_compact(s: dict) -> str:
+    price = int(s.get('price', 0) or 0)
+    entry = int(s.get('entry_price', 0) or 0)
+    if not price and not entry:
+        return ''
+    if price and entry:
+        return f"💵 현재가 <b>{price:,}원</b> | 🎯 진입가 <b>{entry:,}원</b>"
+    if price:
+        return f"💵 현재가 <b>{price:,}원</b>"
+    return f"🎯 진입가 <b>{entry:,}원</b>"
+
+
+def _build_mid_pullback_state_line(s: dict) -> str:
+    price = int(s.get('price', 0) or 0)
+    entry = int(s.get('entry_price', 0) or 0)
+    if not price or not entry:
+        return ''
+    diff_pct = ((price - entry) / entry * 100) if entry else 0.0
+    if diff_pct <= 0.05:
+        return '🎯 현재 판단: 1차 진입 가능'
+    if diff_pct >= 1.5:
+        return '⚠️ 현재 판단: 추격보다 눌림 대기'
+    return '⏳ 현재 판단: 진입가 대기'
+
+
+def _summarize_capture_reason_label(raw: str) -> str:
+    t = re.sub(r'<[^>]+>', '', str(raw or '')).strip()
+    if not t:
+        return ''
+    if '거래량' in t:
+        return '거래량 회복'
+    if '재상승' in t or '회복률' in t or '바닥 확인' in t:
+        return '바닥 재상승'
+    if '외국인+기관' in t:
+        return '수급 동시 유입'
+    if '외국인 순매수' in t or '기관 순매수' in t or 'NXT 외인+기관 동시매수' in t:
+        return '수급 유입'
+    if '체결지속속도' in t or '체결흐름' in t:
+        return '체결 흐름 양호'
+    if '진입가 ' in t:
+        return '진입가 위치 양호'
+    if '뉴스' in t or '공시' in t:
+        return '직접 뉴스 연관'
+    t = re.sub(r'^[^0-9A-Za-z가-힣]+', '', t)
+    return t[:18]
+
+
+def _build_mid_pullback_reason_summary(s: dict) -> str:
+    raw_reasons = list(s.get('reasons', []) or [])
+    labels = []
+
+    def _push(label: str):
+        label = str(label or '').strip()
+        if label and label not in labels:
+            labels.append(label)
+
+    if any('거래량' in str(r or '') for r in raw_reasons):
+        _push('거래량 회복')
+    if bool(s.get('resurge_mode')) or any(any(key in str(r or '') for key in ('재상승', '회복률', '바닥 확인')) for r in raw_reasons):
+        _push('바닥 재상승')
+    if bool(s.get('direct_news_hit')) or any(any(key in str(r or '') for key in ('뉴스', '공시')) for r in raw_reasons):
+        _push('직접 뉴스 연관')
+    if any('외국인+기관' in str(r or '') for r in raw_reasons):
+        _push('수급 동시 유입')
+    elif any(any(key in str(r or '') for key in ('외국인 순매수', '기관 순매수', 'NXT 외인+기관 동시매수')) for r in raw_reasons):
+        _push('수급 유입')
+    if any(any(key in str(r or '') for key in ('체결지속속도', '체결흐름')) for r in raw_reasons):
+        _push('체결 흐름 양호')
+    if any('진입가 ' in str(r or '') for r in raw_reasons):
+        _push('진입가 위치 양호')
+
+    if len(labels) < 2:
+        for raw in raw_reasons:
+            label = _summarize_capture_reason_label(raw)
+            if label and label not in labels:
+                labels.append(label)
+            if len(labels) >= 2:
+                break
+
+    if not labels:
+        return ''
+    return f"📌 핵심 근거: {' + '.join(labels[:2])}"
+
+
+def _build_mid_pullback_sector_strength_line(s: dict) -> str:
+    si = s.get('sector_info') or {}
+    theme = str(si.get('theme', '') or '').strip() or '기타업종'
+    bonus = int(si.get('bonus', 0) or 0)
+    rising = si.get('rising', []) or []
+    rising_count = len(rising)
+
+    if theme == '기타업종':
+        return '🏭 섹터 확증: 약함 (기타업종)'
+    if bonus >= 5 or rising_count >= 3:
+        details = []
+        if bonus > 0:
+            details.append(f'+{bonus}점')
+        if rising_count > 0:
+            details.append(f'동반 상승 {rising_count}종목')
+        if not details:
+            details.append(theme)
+        return f"🏭 섹터 확증: 강함 ({', '.join(details)})"
+    if bonus > 0 or rising_count >= 1:
+        details = []
+        if bonus > 0:
+            details.append(f'+{bonus}점')
+        if rising_count > 0:
+            details.append(f'동반 상승 {rising_count}종목')
+        if not details:
+            details.append(theme)
+        return f"🏭 섹터 확증: 보통 ({', '.join(details)})"
+    return f"🏭 섹터 확증: 약함 ({theme})"
+
+
+def _build_mid_pullback_capture_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
+    parts = [
+        header_line,
+        f"🕐 {capture_label}",
+        '━━━━━━━━━━━━━━━',
+        f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>",
+    ]
+    price_line = _build_capture_focus_price_line_compact(s)
+    state_line = _build_mid_pullback_state_line(s)
+    reason_summary = _build_mid_pullback_reason_summary(s)
+    sector_strength = _build_mid_pullback_sector_strength_line(s)
+    if price_line:
+        parts.append(price_line)
+    if state_line:
+        parts.append(state_line)
+    detail_lines = [line for line in (reason_summary, sector_strength) if line]
+    if detail_lines:
+        parts.append('━━━━━━━━━━━━━━━')
+        parts.extend(detail_lines)
+    return "\n".join([p for p in parts if p]).rstrip()
 
 
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
