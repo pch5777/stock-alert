@@ -3,22 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.92
+버전: v41.91
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v41.92 (2026-03-21): 크래시 로그 실기록 복원 + 코드 위생 정리.
-  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exc()`에서
-       `traceback.format_exception(exc_type, exc, tb)` 기반으로 수정해,
-       미처리 예외 시 로그 파일에 `NoneType: None` 대신 실제 traceback이 남도록 복원.
-  [#2] `_decorate_ui_score_line()` / `_decorate_capture_reason_line()`의 지역 helper명을 분리해
-       점검 시 중복 정의처럼 보이던 `_signed_repl()` 재사용을 제거.
-  [#3] `_map_geo_sectors()`의 함수 내부 `import re`를 제거해 기존 전역 정규식 모듈 사용으로 정리.
-  이유: 크래시가 나도 저장 로그가 비어 분석이 어려울 수 있었고, 동일 이름 지역 helper/함수 내부 import가 점검 노이즈를 만들고 있었음.
-  개선점: 크래시 원인 추적력↑, 코드 점검 가독성↑, 중복 오인 요소↓.
-  주의점: 신호 계산식/알림 정책/진입 판단 로직은 변경하지 않음.
+- v41.93 (2026-03-21): /stats 눌림목 bucket 진단 출력 추가.
+  [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해, `signal_log` 완료 건 중
+       `mid_pullback_bucket`별 승률/평균손익/손익비/기대수익/A·B·C 분포를 함께 계산하도록 확장.
+  [#2] `/stats`(`_send_stats()`)에 `눌림목 bucket 진단` 섹션을 추가해
+       `월·주 추세형 / 일봉 추세형 / 갭 후 첫 눌림형 / 분봉 재개형`별 실제 성과를 한눈에 보이도록 출력.
+  [#3] bucket 데이터가 적을 때는 `데이터 부족`으로 안내하고, 샘플이 쌓이면 고성과/저성과 bucket을 함께 표시.
+  이유: 자동교정은 bucket 기준으로 이미 돌고 있었지만, 사용자가 `/stats`에서 어떤 bucket이 실제로 돈이 되는지 바로 보기 어려웠음.
+  개선점: 눌림목 유형별 성과 해석력↑, bucket별 허용/차단 판단 속도↑, auto_tune 결과 검증 가시성↑.
+  주의점: 신호 계산식/알림 정책/진입 판단 로직은 변경하지 않고, `signal_log` 기반 진단 출력만 추가.
 
 - v41.91 (2026-03-21): 변경이력 정합성 복원 + v41.89/v41.90 누락 기능 재적용.
   [#1] changelog를 `v41.88 → v41.89 → v41.90 → v41.91` 순으로 복원하고,
@@ -10358,6 +10357,29 @@ def analyze_loss_pattern(completed: list) -> str:
 # ============================================================
 # 📊 v41.63: signal_log 피드백 루프 — KPI 자동 분석 + 전략 건강도 판정
 # ============================================================
+def _extract_mid_pullback_bucket(rec: dict) -> str:
+    if not isinstance(rec, dict):
+        return ""
+    bucket = str(rec.get("mid_pullback_bucket", "") or "").strip()
+    if bucket:
+        return bucket
+    feature_snapshot = rec.get("feature_snapshot") or {}
+    if isinstance(feature_snapshot, dict):
+        bucket = str(feature_snapshot.get("mid_pullback_bucket", "") or "").strip()
+        if bucket:
+            return bucket
+    return ""
+
+
+def _calc_mid_pullback_grade_mix(recs: list) -> dict:
+    mix = {"A": 0, "B": 0, "C": 0}
+    for rec in recs:
+        grade = str(rec.get("execution_grade", rec.get("grade", "")) or "").upper()
+        if grade in mix:
+            mix[grade] += 1
+    return mix
+
+
 KPI_MIN_SAMPLES = int(os.getenv("KPI_MIN_SAMPLES", "10") or "10")
 
 def compute_signal_kpi(completed: list | None = None) -> dict:
@@ -10369,6 +10391,7 @@ def compute_signal_kpi(completed: list | None = None) -> dict:
       "by_type": {signal_type: {...}},
       "by_regime": {regime: {...}},
       "by_slot": {timeslot: {...}},
+      "by_mid_pullback_bucket": {bucket: {...}},
       "consecutive_loss": int,
     }
     """
@@ -10428,6 +10451,20 @@ def compute_signal_kpi(completed: list | None = None) -> dict:
         slot = _get_timeslot(v.get("time", "10:00:00"))
         by_slot.setdefault(slot, []).append(v)
     result["by_slot"] = {s: _calc_kpi(recs) for s, recs in by_slot.items()}
+
+    # 눌림목 bucket별
+    by_mid_pullback_bucket = {}
+    for v in completed:
+        bucket = _extract_mid_pullback_bucket(v)
+        if not bucket:
+            continue
+        by_mid_pullback_bucket.setdefault(bucket, []).append(v)
+    result["by_mid_pullback_bucket"] = {}
+    for bucket, recs in by_mid_pullback_bucket.items():
+        info = _calc_kpi(recs)
+        info["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+        info["grade_mix"] = _calc_mid_pullback_grade_mix(recs)
+        result["by_mid_pullback_bucket"][bucket] = info
 
     # 연속 손절 카운트
     sorted_recs = sorted(completed, key=lambda x: x.get("exit_date", "") + x.get("exit_time", ""))
@@ -12788,6 +12825,7 @@ _last_crash_ts: float = 0.0
 
 def install_excepthook() -> None:
     """Unhandled 예외를 파일로 저장하고(영구저장), 텔레그램 알림을 쿨다운(기본 30분)으로 제한."""
+    import sys, time, traceback as _tb
     from pathlib import Path
 
     def _handler(exc_type, exc, tb):
@@ -12801,7 +12839,7 @@ def install_excepthook() -> None:
             fname = f"crash_{ts}.txt"
             fpath = crash_dir / fname
             with open(fpath, "w", encoding="utf-8") as f:
-                f.write(''.join(traceback.format_exception(exc_type, exc, tb)))
+                f.write(_tb.format_exc())
             print(f"🚨 Unhandled exception saved: {fpath}", flush=True)
 
             # 2) cooldown notify
@@ -13427,12 +13465,12 @@ def _decorate_ui_score_line(line: str) -> str:
     if '점' not in raw:
         return raw
 
-    def _replace_ui_signed_score(match: re.Match) -> str:
+    def _signed_repl(match: re.Match) -> str:
         value = int(match.group('value'))
         label = _score_delta_impact_label(value)
         return f"{value:+d}점({label})" if label else f"{value:+d}점"
 
-    out = _UI_SIGNED_POINT_RE.sub(_replace_ui_signed_score, raw)
+    out = _UI_SIGNED_POINT_RE.sub(_signed_repl, raw)
 
     def _unsigned_repl(match: re.Match) -> str:
         value = int(match.group('value'))
@@ -13453,12 +13491,12 @@ def _decorate_capture_reason_line(txt: str) -> str:
     if not line:
         return ''
 
-    def _replace_capture_signed_score(match: re.Match) -> str:
+    def _signed_repl(match: re.Match) -> str:
         raw = match.group('value')
         label = _score_delta_impact_label(int(raw))
         return f"{raw}점 ({label})" if label else match.group(0)
 
-    line = _CAPTURE_SIGNED_POINT_RE.sub(_replace_capture_signed_score, line)
+    line = _CAPTURE_SIGNED_POINT_RE.sub(_signed_repl, line)
     line = re.sub(
         r'(체결지속속도\s+)(\d+)점(?!\s*\()',
         lambda m: f"{m.group(1)}{m.group(2)}점 ({_execution_score_label(int(m.group(2)))})",
@@ -15557,6 +15595,7 @@ def _detect_geo_keywords(headlines_flat: list) -> list:
 
 def _map_geo_sectors(detected_kws: list) -> list:
     """감지된 키워드 → 관련 섹터 자동 매핑"""
+    import re
     sectors = []
     for pattern, sec_list in _GEO_SECTOR_MAP.items():
         for kw in detected_kws:
@@ -17872,6 +17911,51 @@ def _send_stats():
             else:
                 msg += (f"\n━━━━━━━━━━━━━━━\n"
                         f"📐 <b>KPI</b>: 데이터 부족 ({ov.get('n', 0)}/{KPI_MIN_SAMPLES}건)\n")
+        except Exception:
+            pass
+
+        # ── 눌림목 bucket 진단 ──
+        try:
+            by_bucket = kpi.get("by_mid_pullback_bucket", {}) if 'kpi' in locals() else {}
+            bucket_rows = [(bucket, info) for bucket, info in by_bucket.items() if info.get("n", 0) >= 3]
+            if bucket_rows:
+                bucket_rows.sort(
+                    key=lambda kv: (
+                        -float(kv[1].get("expectancy", 0) or 0),
+                        -float(kv[1].get("avg_pnl", 0) or 0),
+                        -int(kv[1].get("n", 0) or 0),
+                    )
+                )
+                msg += f"\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
+                for bucket, info in bucket_rows[:4]:
+                    grade_mix = info.get("grade_mix", {}) if isinstance(info.get("grade_mix", {}), dict) else {}
+                    grade_mix_str = f"A/B/C {int(grade_mix.get('A', 0) or 0)}/{int(grade_mix.get('B', 0) or 0)}/{int(grade_mix.get('C', 0) or 0)}"
+                    diag_emoji = "🔴" if info.get("expectancy", 0) > 0.5 else "🟡" if info.get("expectancy", 0) >= 0 else "🔵"
+                    msg += (
+                        f"  {diag_emoji} {info.get('label', MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))}: "
+                        f"승률 {info.get('win_rate', 0):.0f}%  평균 {info.get('avg_pnl', 0):+.1f}%  "
+                        f"기대 {info.get('expectancy', 0):+.2f}%  손익비 {info.get('payoff_ratio', 0):.2f}  "
+                        f"({int(info.get('n', 0) or 0)}건, {grade_mix_str})\n"
+                    )
+                good_buckets = [
+                    info.get("label", MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))
+                    for bucket, info in bucket_rows
+                    if info.get("n", 0) >= 4 and info.get("win_rate", 0) >= 60 and info.get("expectancy", 0) > 0
+                ]
+                bad_buckets = [
+                    info.get("label", MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))
+                    for bucket, info in bucket_rows
+                    if info.get("n", 0) >= 4 and (info.get("win_rate", 0) < 40 or info.get("expectancy", 0) < 0)
+                ]
+                if good_buckets:
+                    msg += f"  🌟 고성과 bucket: {', '.join(good_buckets[:2])}\n"
+                if bad_buckets:
+                    msg += f"  ⚠️ 저성과 bucket: {', '.join(bad_buckets[:2])}\n"
+            elif by_bucket:
+                msg += (
+                    f"\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
+                    f"  표본 부족: bucket별 완료 건이 아직 3건 미만이에요.\n"
+                )
         except Exception:
             pass
 
