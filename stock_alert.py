@@ -3,12 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.96
+버전: v41.97
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.97 (2026-03-21): `/list` 진입가 옆에 현재가 대비 괴리율 표시 추가.
+  [#1] `_format_watch_list_entry_vs_current()`를 추가해 현재가가 있을 때 `진입가` 라인 옆에
+       `현재가 대비 +/-%`를 일관된 부호 규칙으로 표시하도록 정리.
+  [#2] `/list`의 `진입가 감시중 종목` / `목표가 추적중 종목`에서 `🎯 진입가` 표시에
+       `(<현재가 대비 ±x.x%>)`를 함께 붙이도록 수정.
+  이유: `/list`에서 현재가와 진입가를 눈으로 다시 계산해야 해 대기 거리와 체결 후 위치를 즉시 판단하기 어려웠음.
+  개선점: 진입 괴리 해석 속도↑, `/list` 실전 판단력↑.
+  주의점: 표시 계층만 보강하며 진입/알림 정책은 변경하지 않음.
 
 - v41.96 (2026-03-21): `/list` 감시 종목 현황에 종목별 현재가 표시 추가.
   [#1] `_get_watch_list_current_price()`를 추가해 `/list`에서 종목별 현재가를 KRX/NXT 상태에 맞게 조회하고,
@@ -11477,6 +11486,18 @@ def _watch_suffix(peer_code: str, peer_price: int) -> str:
     except Exception:
         return ""
 
+def _format_watch_list_entry_vs_current(entry_price: int, current_price: int) -> str:
+    """`/list`에서 현재가 기준 진입가 괴리율 표기."""
+    try:
+        entry = safe_int(entry_price, 0)
+        current = safe_int(current_price, 0)
+        if entry <= 0 or current <= 0:
+            return ""
+        gap_pct = (entry / current - 1.0) * 100.0
+        return f" (현재가 대비 {gap_pct:+.1f}%)"
+    except Exception:
+        return ""
+
 def _get_watch_list_current_price(code: str, rec: dict | None = None, quote_cache: dict | None = None) -> dict:
     """`/list` 감시 종목 현황용 현재가 조회."""
     try:
@@ -17072,7 +17093,8 @@ def poll_telegram_commands():
                             if cur_price > 0:
                                 details.append(f"📍 현재가 {cur_price:,}원")
                             if entry > 0:
-                                details.append(f"🎯 진입가 {entry:,}원")
+                                entry_gap = _format_watch_list_entry_vs_current(entry, cur_price)
+                                details.append(f"🎯 진입가 {entry:,}원{entry_gap}")
                             if target > 0:
                                 details.append(f"🏆 목표가 {target:,}원")
                             if stop > 0:
