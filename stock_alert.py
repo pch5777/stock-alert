@@ -3,12 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.95
+버전: v41.96
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.96 (2026-03-21): `/list` 감시 종목 현황에 종목별 현재가 표시 추가.
+  [#1] `_get_watch_list_current_price()`를 추가해 `/list`에서 종목별 현재가를 KRX/NXT 상태에 맞게 조회하고,
+       `last_price/current_price`가 있으면 fallback으로 재사용하도록 정리.
+  [#2] `감시 종목 현황`의 `진입가 감시중 종목` / `목표가 추적중 종목` / 보조 감시종목 라인에
+       `📍 현재가`를 함께 표시하도록 정리.
+  이유: `/list` 메시지에 진입가·목표가·손절가만 있고 현재가가 없어, 감시 종목별 대기 거리와 현재 위치를 즉시 판단하기 어려웠음.
+  개선점: 감시 종목 현황 해석력↑, 수동 점검 속도↑.
+  주의점: 이번 버전은 `/list` 표시 계층만 보강하며 진입/알림 정책은 변경하지 않음.
 
 - v41.95 (2026-03-21): crash logger 실복구 + `/stats` 실진입 눌림목 bucket 진단 추가.
   [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exception(exc_type, exc, tb)` 기반으로 수정해
@@ -11468,6 +11477,47 @@ def _watch_suffix(peer_code: str, peer_price: int) -> str:
     except Exception:
         return ""
 
+def _get_watch_list_current_price(code: str, rec: dict | None = None, quote_cache: dict | None = None) -> dict:
+    """`/list` 감시 종목 현황용 현재가 조회."""
+    try:
+        code = normalize_stock_code(code)
+        if not code:
+            return {}
+        cache = quote_cache if isinstance(quote_cache, dict) else None
+        if cache is not None and code in cache:
+            return cache.get(code) or {}
+
+        rec = rec if isinstance(rec, dict) else {}
+        fallback_price = safe_int(rec.get("last_price", 0) or rec.get("current_price", 0) or rec.get("price", 0), 0)
+        fallback_market = str(rec.get("market") or "").strip()
+        out = {}
+
+        try:
+            if is_market_open():
+                cur = get_stock_price(code) or {}
+            elif is_nxt_open():
+                cur = get_nxt_stock_price(code) if is_nxt_listed(code) else {}
+                if not safe_int(cur.get("price", 0), 0):
+                    cur = get_stock_price(code) or {}
+            else:
+                cur = get_stock_price(code) or {}
+            price = safe_int(cur.get("price", 0), 0)
+            market = str(cur.get("market") or fallback_market or "").strip()
+            if price > 0:
+                out = {"price": price, "market": market}
+        except Exception:
+            out = {}
+
+        if not out and fallback_price > 0:
+            out = {"price": fallback_price, "market": fallback_market}
+
+        if cache is not None:
+            cache[code] = out
+        return out
+    except Exception:
+        return {}
+
+
 def register_top_signal(s: dict):
     """신호 발생마다 오늘의 최우선 종목 풀에 추가 (점수 높은 종목 유지)"""
     code  = s.get("code","")
@@ -16996,6 +17046,7 @@ def poll_telegram_commands():
                 active_lines = []
                 seen_pending = set()
                 seen_active = set()
+                quote_cache = {}
 
                 # 1) 현재 핵심 기준: _entry_watch 상태
                 try:
@@ -17011,11 +17062,15 @@ def poll_telegram_commands():
                             detect_time = str(watch.get("detect_time") or "").strip()
                             miss_count = int(watch.get("miss_count", 0) or 0)
                             hit = bool(watch.get("entry_hit"))
+                            cur_info = _get_watch_list_current_price(code, watch, quote_cache)
+                            cur_price = safe_int(cur_info.get("price", 0), 0)
 
                             line = f"• <b>{name}</b> ({code})"
                             if miss_count > 0:
                                 line += f" — 재포착 {miss_count}회"
                             details = []
+                            if cur_price > 0:
+                                details.append(f"📍 현재가 {cur_price:,}원")
                             if entry > 0:
                                 details.append(f"🎯 진입가 {entry:,}원")
                             if target > 0:
@@ -17049,9 +17104,13 @@ def poll_telegram_commands():
                                 continue
                             name = rec.get("name") or _resolve_stock_name(code) or code
                             carry_day = int(rec.get("carry_day", 0) or 0)
+                            cur_info = _get_watch_list_current_price(code, rec, quote_cache)
+                            cur_price = safe_int(cur_info.get("price", 0), 0)
                             line = f"• <b>{name}</b> ({code})"
                             if carry_day > 0:
                                 line += f" — {carry_day}일차"
+                            if cur_price > 0:
+                                line += f"\n  📍 현재가 {cur_price:,}원"
                             pending_lines.append(line)
                             seen_pending.add(code)
                         except Exception:
