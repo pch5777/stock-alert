@@ -1,19 +1,32 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.91
+버전: v41.92
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+- v41.92 (2026-03-21): 크래시 로그 실기록 복원 + 코드 위생 정리.
+  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exc()`에서
+       `traceback.format_exception(exc_type, exc, tb)` 기반으로 수정해,
+       미처리 예외 시 로그 파일에 `NoneType: None` 대신 실제 traceback이 남도록 복원.
+  [#2] `_decorate_ui_score_line()` / `_decorate_capture_reason_line()`의 지역 helper명을 분리해
+       점검 시 중복 정의처럼 보이던 `_signed_repl()` 재사용을 제거.
+  [#3] `_map_geo_sectors()`의 함수 내부 `import re`를 제거해 기존 전역 정규식 모듈 사용으로 정리.
+  이유: 크래시가 나도 저장 로그가 비어 분석이 어려울 수 있었고, 동일 이름 지역 helper/함수 내부 import가 점검 노이즈를 만들고 있었음.
+  개선점: 크래시 원인 추적력↑, 코드 점검 가독성↑, 중복 오인 요소↓.
+  주의점: 신호 계산식/알림 정책/진입 판단 로직은 변경하지 않음.
+
 - v41.91 (2026-03-21): 변경이력 정합성 복원 + v41.89/v41.90 누락 기능 재적용.
-  [#1] `_get_effective_change_rate()`를 추가하고 `_detect_entry_block_reason()`를 확장해,
+  [#1] changelog를 `v41.88 → v41.89 → v41.90 → v41.91` 순으로 복원하고,
+       `00_BASELINE_POINTER.txt` / `01_HANDOFF.md` / `02_START_CHAT_UTF8_BOM.md`를 현재 기준과 다시 동기화.
+  [#2] `_get_effective_change_rate()`를 추가하고 `_detect_entry_block_reason()`를 확장해,
        `MID_PULLBACK`/`ENTRY_POINT` 계열은 상한가 잠김뿐 아니라 상한가 도달 자체도 `upper_limit_reached`로 차단.
        KIS `change_rate`와 `prev_close` 대비 실계산 등락률 중 보수적인 값을 함께 사용.
-  [#2] `_register_nxt_surge_to_krx_watch()`의 외부 텔레그램 전환 알림을 제거하고 내부 로그만 유지.
+  [#3] `_register_nxt_surge_to_krx_watch()`의 외부 텔레그램 전환 알림을 제거하고 내부 로그만 유지.
        대신 `register_entry_watch()` / `_load_entry_watch_active()`에 `entry_price_at_detect` / `execution_grade_at_detect` / `pattern_grade_at_detect`를 저장하고,
        `check_entry_watch()`의 `[1차 진입가 도달]`에 `_format_nxt_transition_delta_block()`을 연결해 `등급 변화`, `진입가 조정(+/-%)`을 조건부 표시.
   이유: v41.88부터 시작한 수정 대화 기준으로는 `v41.89`/`v41.90` 이력이 빠져 있었고,
@@ -12775,7 +12788,6 @@ _last_crash_ts: float = 0.0
 
 def install_excepthook() -> None:
     """Unhandled 예외를 파일로 저장하고(영구저장), 텔레그램 알림을 쿨다운(기본 30분)으로 제한."""
-    import sys, time, traceback as _tb
     from pathlib import Path
 
     def _handler(exc_type, exc, tb):
@@ -12789,7 +12801,7 @@ def install_excepthook() -> None:
             fname = f"crash_{ts}.txt"
             fpath = crash_dir / fname
             with open(fpath, "w", encoding="utf-8") as f:
-                f.write(_tb.format_exc())
+                f.write(''.join(traceback.format_exception(exc_type, exc, tb)))
             print(f"🚨 Unhandled exception saved: {fpath}", flush=True)
 
             # 2) cooldown notify
@@ -13415,12 +13427,12 @@ def _decorate_ui_score_line(line: str) -> str:
     if '점' not in raw:
         return raw
 
-    def _signed_repl(match: re.Match) -> str:
+    def _replace_ui_signed_score(match: re.Match) -> str:
         value = int(match.group('value'))
         label = _score_delta_impact_label(value)
         return f"{value:+d}점({label})" if label else f"{value:+d}점"
 
-    out = _UI_SIGNED_POINT_RE.sub(_signed_repl, raw)
+    out = _UI_SIGNED_POINT_RE.sub(_replace_ui_signed_score, raw)
 
     def _unsigned_repl(match: re.Match) -> str:
         value = int(match.group('value'))
@@ -13441,12 +13453,12 @@ def _decorate_capture_reason_line(txt: str) -> str:
     if not line:
         return ''
 
-    def _signed_repl(match: re.Match) -> str:
+    def _replace_capture_signed_score(match: re.Match) -> str:
         raw = match.group('value')
         label = _score_delta_impact_label(int(raw))
         return f"{raw}점 ({label})" if label else match.group(0)
 
-    line = _CAPTURE_SIGNED_POINT_RE.sub(_signed_repl, line)
+    line = _CAPTURE_SIGNED_POINT_RE.sub(_replace_capture_signed_score, line)
     line = re.sub(
         r'(체결지속속도\s+)(\d+)점(?!\s*\()',
         lambda m: f"{m.group(1)}{m.group(2)}점 ({_execution_score_label(int(m.group(2)))})",
@@ -15545,7 +15557,6 @@ def _detect_geo_keywords(headlines_flat: list) -> list:
 
 def _map_geo_sectors(detected_kws: list) -> list:
     """감지된 키워드 → 관련 섹터 자동 매핑"""
-    import re
     sectors = []
     for pattern, sec_list in _GEO_SECTOR_MAP.items():
         for kw in detected_kws:
