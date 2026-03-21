@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
@@ -9,48 +9,45 @@
 
 [변경 이력]
 
-- v41.95 (2026-03-21): crash logger 실복구 + changelog 정합성 복원 + /stats 실진입 bucket 진단 추가.
-  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exception(exc_type, exc, tb)` 기반으로 실제 복구해,
-       미처리 예외 시 `NoneType: None` 대신 실제 traceback이 파일에 남도록 정리.
-  [#2] `_map_geo_sectors()` 내부 불필요한 함수 내부 `import re`를 제거해,
-       changelog에 적힌 코드 위생 상태와 실코드가 다시 일치하도록 복원.
-  [#3] `_send_stats()`에 `actual_entry=True` 완료 건 기준의 `실진입 눌림목 bucket 진단`을 추가하고,
-       `compute_signal_kpi()`가 임의 손익 필드(`pnl_field`)를 받아 이론 수익률과 실제 수익률 bucket 성과를 같은 계산식으로 비교할 수 있게 확장.
-  이유: v41.94 기준 점검에서 crash logger와 `_map_geo_sectors()`가 changelog 설명과 실코드가 어긋나 있었고,
-       `/stats`도 이론 bucket 성과는 보이지만 실제 진입 기준 bucket 성과는 바로 보이지 않았음.
-  개선점: 크래시 추적 신뢰성↑, changelog 신뢰성↑, 실제 진입 bucket 해석력↑.
-  주의점: 진입/알림 정책은 변경하지 않고 예외 로그/코드 위생/진단 출력만 보강.
 
-- v41.94 (2026-03-21): 지정학 AI 신규 섹터 자동 흡수 + 종목 매핑 확장.
-  [#1] `_normalize_geo_sector_name()` / `_split_geo_sector_tokens()` / `_derive_geo_sector_stocks()`를 추가해,
-       지정학 섹터명을 `·`, `/`, `및`, `와/과`, 괄호 기준으로 분해하고 `_GEO_SECTOR_STOCKS`/`THEME_MAP`/`_dynamic_theme_map`/이유문 내 종목명까지 함께 탐색하도록 확장.
-  [#2] `_get_geo_sector_stocks()`를 위 확장 로직 기반으로 재구성해,
-       AI가 새 섹터명(예: 복합 섹터/세부 섹터)을 반환해도 기존 섹터 토큰과 테마 설명에서 관련 종목을 더 안정적으로 찾도록 보강.
-  [#3] `_remember_geo_sector_candidates()`를 추가하고 `analyze_geopolitical_event()`의 AI/fallback 결과에 연결해,
-       새 지정학 섹터명이 나오면 당일 동적 테마로 자동 저장하여 이후 `/geo`/지정학 알림에서도 같은 섹터명을 재사용할 수 있게 정리.
-  이유: 지정학 분석은 AI가 새로운 한국 섹터명을 반환할 수 있지만, 종목 매핑은 주로 고정 섹터명 위주라 신규/복합 섹터의 종목·과거이력 표시가 약했음.
-  개선점: 신규 지정학 섹터 수용력↑, 복합 섹터 종목 매핑 안정성↑, `/geo`/정기 지정학 알림의 관련 종목·과거 유사 이력 가시성↑.
-  주의점: 지정학 알림의 방향 점수식과 기존 fallback 섹터 규칙은 유지하고, 신규/복합 섹터의 종목 연결층만 확장.
+- v41.95 (2026-03-21): crash logger 실복구 + `/stats` 실진입 눌림목 bucket 진단 추가.
+  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exception(exc_type, exc, tb)` 기반으로 수정해
+       실제 미처리 예외 traceback이 파일에 그대로 남도록 복구.
+  [#2] `compute_signal_kpi(completed, pnl_field=...)`로 확장하고 `_send_stats()`에
+       `actual_entry=True` + `actual_pnl` 완료건 기준 `🪙 실진입 눌림목 bucket` 섹션을 추가.
+       bucket별 승률 / 평균손익 / 손익비 / 기대수익 / 실행등급 분포를 함께 표시.
+  이유: 실진입 관점에서 어떤 눌림목 bucket이 실제 돈이 되는지 바로 확인할 수 있어야 하고,
+       crash file에 `NoneType: None`만 남는 상태는 정상본으로 둘 수 없었음.
+  개선점: 예외 추적력↑, 실진입 bucket 해석력↑.
+  주의점: 이번 버전은 진입/알림 정책을 바꾸지 않고 진단/기록 계층만 보강.
 
-- v41.93 (2026-03-21): /stats 눌림목 bucket 진단 출력 추가.
-  [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해,
-       `signal_log` 완료 건 중 `mid_pullback_bucket`별 승률/평균손익/손익비/기대수익/A·B·C 분포를 함께 계산하도록 확장.
-  [#2] `/stats`(`_send_stats()`)에 `눌림목 bucket 진단` 섹션을 추가해
-       `월·주 추세형 / 일봉 추세형 / 갭 후 첫 눌림형 / 분봉 재개형`별 실제 성과를 한눈에 보이도록 출력.
-  [#3] bucket 데이터가 적을 때는 `표본 부족`으로 안내하고, 샘플이 쌓이면 `고성과 bucket` / `저성과 bucket` 요약도 함께 표시.
-  이유: 자동교정은 bucket 기준으로 이미 돌고 있었지만, 사용자가 `/stats`에서 어떤 bucket이 실제로 돈이 되는지 바로 보기 어려웠음.
-  개선점: 눌림목 유형별 성과 해석력↑, bucket별 허용/차단 판단 속도↑, auto_tune 결과 검증 가시성↑.
-  주의점: 신호 계산식/알림 정책/진입 판단 로직은 변경하지 않고, `signal_log` 기반 진단 출력만 추가.
+- v41.94 (2026-03-21): 지정학 신규/복합 섹터 동적 흡수 + 관련 종목 매핑 확장.
+  [#1] `_normalize_geo_sector_name()` / `_split_geo_sector_tokens()` / `_derive_geo_sector_stocks()` /
+       `_remember_geo_sector_candidates()`를 추가.
+       AI가 반환한 신규/복합 지정학 섹터명을 분해·정규화해 `_GEO_SECTOR_STOCKS`, `THEME_MAP`, `_dynamic_theme_map`,
+       reason 문장 안 직접 언급 종목명까지 함께 탐색해 관련 종목 후보를 유도.
+  [#2] `analyze_geopolitical_event()` 성공/실패 fallback 경로에서 `sector_directions`를 동적 테마로 저장해,
+       같은 날 반복되는 신규 섹터명도 `📌 관련 종목`과 과거 유사 이력 조회에 더 잘 연결되도록 정리.
+  이유: 지정학 분석은 AI가 새 섹터명을 만들 수 있는데, 기존 종목 매핑은 고정 섹터명 위주라 연결력이 약했음.
+  개선점: 지정학 신규 섹터 종목 연결력↑, `/geo`/정기 지정학 메시지 해석력↑.
+  주의점: 지정학 점수식/방향 규칙은 바꾸지 않고 종목 연결층만 확장.
 
-- v41.92 (2026-03-21): 크래시 로그 실기록 복원 + 점검 노이즈성 중복 정리.
-  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exception(exc_type, exc, tb)` 기반으로 정리해,
-       미처리 예외 시 로그 파일에 `NoneType: None` 대신 실제 traceback이 남도록 복원.
-  [#2] `_decorate_ui_score_line()` / `_decorate_capture_reason_line()` 내부 지역 helper명을 분리해
-       점검 시 중복 정의처럼 보이던 지역 `_signed_repl()` 재사용을 제거.
-  [#3] `_map_geo_sectors()` 내부 불필요한 `import re`를 제거해 함수 내부 중복 import 노이즈를 정리.
-  이유: 실제 크래시 상황에서 로그 파일 정보가 약하고, 점검 과정에서 지역 helper명/내부 import가 중복처럼 보여 검증 노이즈가 있었음.
-  개선점: 크래시 추적력↑, 점검 가독성↑, 코드 위생↑.
-  주의점: 알림 정책/진입 로직/신호 계산식은 변경하지 않음.
+- v41.93 (2026-03-21): `/stats` 눌림목 bucket 진단 추가.
+  [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해
+       `weekly_monthly_trend / daily_trend / gap_first_pullback / intraday_reclaim` bucket별
+       승률 / 평균손익 / 기대수익 / 손익비 / 실행등급 분포를 계산.
+  [#2] `_send_stats()`에 `🧪 눌림목 bucket 진단` 섹션을 추가해,
+       bucket별 표본·성과·고성과/저성과 bucket 요약을 바로 확인할 수 있게 정리.
+  이유: 내부 자동교정은 bucket 기준으로 돌고 있었지만, 운영자가 `/stats`에서 어떤 bucket이 실제로 좋은지 바로 보기 어려웠음.
+  개선점: 눌림목 유형별 운영 판단력↑, auto_tune 해석력↑.
+  주의점: 이번 버전은 신호 계산식이 아니라 진단 출력 계층 보강.
+
+- v41.92 (2026-03-21): crash logger/코드 위생 정리.
+  [#1] `_map_geo_sectors()`가 함수 내부 `import re` 대신 전역 `_re`를 사용하도록 정리.
+  [#2] crash logger 정합성 복구를 위한 기반 정리.
+  이유: changelog에 적힌 정리 상태와 실코드가 어긋나 있었음.
+  개선점: 코드 위생↑.
+  주의점: 기능 변화는 크지 않으며 이후 정합성 복구 버전의 전단계 성격.
 
 - v41.91 (2026-03-21): 변경이력 정합성 복원 + v41.89/v41.90 누락 기능 재적용.
   [#1] changelog를 `v41.88 → v41.89 → v41.90 → v41.91` 순으로 복원하고,
@@ -10392,12 +10389,12 @@ def analyze_loss_pattern(completed: list) -> str:
 # ============================================================
 KPI_MIN_SAMPLES = int(os.getenv("KPI_MIN_SAMPLES", "10") or "10")
 
+
 def compute_signal_kpi(completed: list | None = None, pnl_field: str = "pnl_pct") -> dict:
     """
     signal_log 기반 승률/손익비/기대수익 KPI 자동 계산.
     v41.63 #1: 신호유형별·레짐별·시간대별 세분화 KPI.
-    v41.93 #1: 눌림목 bucket별 성과 KPI 추가.
-    v41.95 #3: 임의 손익 필드 기반 KPI 계산 지원(actual_pnl 등).
+    v41.93/v41.95: 눌림목 bucket 및 실진입(actual_pnl) KPI 지원.
     반환: {
       "overall": {win_rate, avg_pnl, profit_factor, payoff_ratio, expectancy, n},
       "by_type": {signal_type: {...}},
@@ -10417,14 +10414,18 @@ def compute_signal_kpi(completed: list | None = None, pnl_field: str = "pnl_pct"
 
     def _calc_kpi(recs: list) -> dict:
         if not recs:
-            return {
-                "win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
-                "payoff_ratio": 0, "expectancy": 0, "n": 0,
-                "execution_grade_counts": {"A": 0, "B": 0, "C": 0},
-            }
-
-        n = len(recs)
-        pnls = [float(r.get(pnl_field, 0) or 0) for r in recs]
+            return {"win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
+                    "payoff_ratio": 0, "expectancy": 0, "n": 0}
+        pnls = []
+        for r in recs:
+            try:
+                pnls.append(float(r.get(pnl_field, 0) or 0))
+            except Exception:
+                pnls.append(0.0)
+        n = len(pnls)
+        if not n:
+            return {"win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
+                    "payoff_ratio": 0, "expectancy": 0, "n": 0}
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p < 0]
         win_rate = len(wins) / n * 100 if n else 0
@@ -10435,13 +10436,6 @@ def compute_signal_kpi(completed: list | None = None, pnl_field: str = "pnl_pct"
         profit_factor = round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 99.0
         loss_rate = 1 - len(wins) / n if n else 0
         expectancy = round((len(wins) / n * avg_win - loss_rate * avg_loss) if n else 0, 2)
-
-        grade_counts = {"A": 0, "B": 0, "C": 0}
-        for r in recs:
-            grade = str(r.get("execution_grade") or r.get("grade") or "").strip().upper()
-            if grade in grade_counts:
-                grade_counts[grade] += 1
-
         return {
             "win_rate": round(win_rate, 1),
             "avg_pnl": round(avg_pnl, 2),
@@ -10449,7 +10443,6 @@ def compute_signal_kpi(completed: list | None = None, pnl_field: str = "pnl_pct"
             "payoff_ratio": payoff_ratio,
             "expectancy": expectancy,
             "n": n,
-            "execution_grade_counts": grade_counts,
         }
 
     result = {"overall": _calc_kpi(completed)}
@@ -10472,46 +10465,40 @@ def compute_signal_kpi(completed: list | None = None, pnl_field: str = "pnl_pct"
         by_slot.setdefault(slot, []).append(v)
     result["by_slot"] = {s: _calc_kpi(recs) for s, recs in by_slot.items()}
 
-    bucket_order = [
-        "weekly_monthly_trend",
-        "daily_trend",
-        "gap_first_pullback",
-        "intraday_reclaim",
-    ]
-    bucket_groups = {}
+    by_bucket = {}
     for v in completed:
-        bucket = str(v.get("mid_pullback_bucket") or "").strip()
+        bucket = str(v.get("mid_pullback_bucket", "") or "")
         if not bucket:
             continue
-        bucket_groups.setdefault(bucket, []).append(v)
+        by_bucket.setdefault(bucket, []).append(v)
 
-    bucket_stats = {}
-    for bucket in bucket_order:
-        recs = bucket_groups.get(bucket, [])
-        if not recs:
-            continue
-        stats = _calc_kpi(recs)
-        stats["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
-        bucket_stats[bucket] = stats
-    for bucket, recs in bucket_groups.items():
-        if bucket in bucket_stats:
-            continue
-        stats = _calc_kpi(recs)
-        stats["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
-        bucket_stats[bucket] = stats
-    result["by_mid_pullback_bucket"] = bucket_stats
+    bucket_result = {}
+    for bucket, recs in by_bucket.items():
+        entry = _calc_kpi(recs)
+        grade_dist = {"A": 0, "B": 0, "C": 0}
+        for r in recs:
+            grade = str(r.get("execution_grade") or r.get("grade") or "").upper()
+            if grade in grade_dist:
+                grade_dist[grade] += 1
+        entry["execution_grade_dist"] = grade_dist
+        bucket_result[bucket] = entry
+    result["by_mid_pullback_bucket"] = bucket_result
 
-    sort_value = pnl_field if pnl_field else "pnl_pct"
     sorted_recs = sorted(completed, key=lambda x: x.get("exit_date", "") + x.get("exit_time", ""))
     consec = 0
     for r in reversed(sorted_recs):
-        if float(r.get(sort_value, 0) or 0) < 0:
+        try:
+            pnl_val = float(r.get(pnl_field, 0) or 0)
+        except Exception:
+            pnl_val = 0.0
+        if pnl_val < 0:
             consec += 1
         else:
             break
     result["consecutive_loss"] = consec
 
     return result
+
 
 def _check_strategy_health(kpi: dict, notify: bool = True) -> list:
     """
@@ -12857,6 +12844,7 @@ _CRASH_NOTIFY_COOLDOWN_SEC = int(os.getenv("CRASH_NOTIFY_COOLDOWN_SEC", "1800") 
 _last_crash_sig: str | None = None
 _last_crash_ts: float = 0.0
 
+
 def install_excepthook() -> None:
     """Unhandled 예외를 파일로 저장하고(영구저장), 텔레그램 알림을 쿨다운(기본 30분)으로 제한."""
     import sys, time, traceback as _tb
@@ -12865,8 +12853,7 @@ def install_excepthook() -> None:
     def _handler(exc_type, exc, tb):
         global _last_crash_sig, _last_crash_ts
         try:
-            # 1) crash log file
-            data_dir = DATA_DIR  # already resolved earlier
+            data_dir = DATA_DIR
             crash_dir = Path(data_dir) / "crash_logs"
             crash_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -12876,7 +12863,6 @@ def install_excepthook() -> None:
                 f.write("".join(_tb.format_exception(exc_type, exc, tb)))
             print(f"🚨 Unhandled exception saved: {fpath}", flush=True)
 
-            # 2) cooldown notify
             sig = f"{exc_type.__name__}:{str(exc)[:200]}"
             now = time.time()
             if (_last_crash_sig != sig) or (now - _last_crash_ts > _CRASH_NOTIFY_COOLDOWN_SEC):
@@ -12894,13 +12880,13 @@ def install_excepthook() -> None:
         except Exception:
             pass
 
-        # keep default printing
         try:
             sys.__excepthook__(exc_type, exc, tb)
         except Exception:
             pass
 
     sys.excepthook = _handler
+
 
 def edit_message(message_id: int, text: str, *, reply_markup: dict | None = None) -> bool:
     decorated_text = _decorate_ui_score_text(text)
@@ -15336,199 +15322,138 @@ _GEO_SECTOR_STOCKS: dict = {
     "반도체·디스플레이": [("000660","SK하이닉스"), ("005930","삼성전자"), ("034220","LG디스플레이"), ("042700","한미반도체")],
 }
 
-_GEO_SECTOR_SPLIT_RE = _re.compile(r"[·/,|+]+|\s*\([^)]*\)\s*|\s*(?:및|와|과|and|&|→)\s*", _re.I)
-
 
 def _normalize_geo_sector_name(sector_name: str) -> str:
-    try:
-        sec = str(sector_name or "").strip()
-        sec = sec.replace("／", "/").replace("ㆍ", "·")
-        sec = _re.sub(r"\s+", " ", sec)
-        return sec
-    except Exception:
-        return str(sector_name or "").strip()
+    text = str(sector_name or "").strip()
+    if not text:
+        return ""
+    text = text.replace("ㆍ", "·").replace("&", "·").replace("+", "·")
+    text = _re.sub(r"\s*/\s*", "·", text)
+    text = _re.sub(r"\s*(및|와|과)\s*", "·", text)
+    text = _re.sub(r"\s+", " ", text).strip(" ·")
+    return text
 
 
 def _split_geo_sector_tokens(sector_name: str) -> list:
-    sec = _normalize_geo_sector_name(sector_name)
-    if not sec:
+    normalized = _normalize_geo_sector_name(sector_name)
+    if not normalized:
         return []
-    parts = [sec]
-    try:
-        parts.extend(tok.strip() for tok in _GEO_SECTOR_SPLIT_RE.split(sec) if tok.strip())
-    except Exception:
-        pass
-    tokens = []
-    for tok in parts:
-        tok = tok.strip(" ()[]{}")
-        if len(tok) < 2:
-            continue
-        if tok not in tokens:
-            tokens.append(tok)
-    return tokens
-
-
-def _derive_geo_sector_stocks(sector_name: str, extra_text: str = "", max_n: int = 8) -> list:
-    """
-    지정학 섹터명에서 관련 종목을 최대한 보수적으로 추론.
-    - 고정 섹터 직접 매핑
-    - 복합/신규 섹터 토큰 매칭
-    - THEME_MAP / 동적 테마의 sectors/desc/reason 매칭
-    - 섹터 이유문에 직접 언급된 종목명 반영
-    """
-    sec = _normalize_geo_sector_name(sector_name)
-    if not sec:
-        return []
-
-    tokens = _split_geo_sector_tokens(sec)
-    extra_text = str(extra_text or "")
-    result = []
+    clean = _re.sub(r"[\(\)\[\]]", "·", normalized)
+    parts = [p.strip() for p in clean.split("·") if p.strip()]
+    out = []
     seen = set()
+    for token in [normalized] + parts:
+        token = token.strip()
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _derive_geo_sector_stocks(sector_name: str, reason: str = "", max_n: int = 5) -> list:
+    normalized = _normalize_geo_sector_name(sector_name)
+    tokens = _split_geo_sector_tokens(normalized)
+    if not tokens:
+        return []
+
+    seen_codes = set()
+    results = []
 
     def _add_stock(code, name):
         code = str(code or "").strip()
         name = str(name or "").strip()
-        if not code or not name or code in seen:
+        if not code or not name or code in seen_codes:
             return
-        seen.add(code)
-        result.append((code, name))
+        seen_codes.add(code)
+        results.append((code, name))
 
-    def _merge_stocks(stocks):
-        for item in stocks or []:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                _add_stock(item[0], item[1])
-            elif isinstance(item, dict):
-                _add_stock(item.get("code", ""), item.get("name", ""))
-            if len(result) >= max_n:
-                return
-
-    # 1) 고정 섹터 직접/부분 매칭
-    if sec in _GEO_SECTOR_STOCKS:
-        _merge_stocks(_GEO_SECTOR_STOCKS.get(sec, []))
+    for token in tokens:
+        for c, n in _GEO_SECTOR_STOCKS.get(token, []):
+            _add_stock(c, n)
     for key, stocks in _GEO_SECTOR_STOCKS.items():
-        if key == sec:
-            continue
-        if key in sec or sec in key or any(tok in key or key in tok for tok in tokens):
-            _merge_stocks(stocks)
-            if len(result) >= max_n:
-                return result[:max_n]
+        if any(key in token or token in key for token in tokens):
+            for c, n in stocks:
+                _add_stock(c, n)
 
-    def _theme_matches(theme_key: str, theme_info: dict) -> bool:
-        theme_desc = _normalize_geo_sector_name(theme_info.get("desc", ""))
-        theme_reason = _normalize_geo_sector_name(theme_info.get("reason", ""))
-        theme_sectors = [_normalize_geo_sector_name(s) for s in theme_info.get("sectors", []) if str(s or "").strip()]
-        haystacks = [theme_key or "", theme_desc, theme_reason] + theme_sectors
-        if sec in theme_sectors:
-            return True
-        for hs in haystacks:
-            hs = str(hs or "").strip()
-            if not hs:
-                continue
-            if sec in hs or hs in sec:
-                return True
-            if any(tok in hs or hs in tok for tok in tokens):
-                return True
-        return False
-
-    # 2) THEME_MAP / 동적 테마에서 확장 매칭
     for theme_key, theme_info in THEME_MAP.items():
-        if _theme_matches(str(theme_key), theme_info):
-            _merge_stocks(theme_info.get("stocks", []))
-            if len(result) >= max_n:
-                return result[:max_n]
+        sectors = [str(s) for s in theme_info.get("sectors", [])]
+        hay = [theme_key, str(theme_info.get("desc", ""))] + sectors
+        if any(any(token in h or h in token for h in hay if h) for token in tokens):
+            for c, n in theme_info.get("stocks", []):
+                _add_stock(c, n)
 
-    for theme_key, theme_info in _dynamic_theme_map.items():
-        if _theme_matches(str(theme_key), theme_info):
-            _merge_stocks(theme_info.get("stocks", []))
-            if len(result) >= max_n:
-                return result[:max_n]
-
-    # 3) 이유문에 직접 언급된 종목명 반영
-    if extra_text:
-        known = {}
-        for stocks in _GEO_SECTOR_STOCKS.values():
-            for code, name in stocks:
-                known[code] = name
-        for theme_info in THEME_MAP.values():
-            for code, name in theme_info.get("stocks", []):
-                known[code] = name
-        for theme_info in _dynamic_theme_map.values():
-            for item in theme_info.get("stocks", []):
+    for tk, ti in _dynamic_theme_map.items():
+        sectors = [str(s) for s in ti.get("sectors", [])]
+        hay = [tk, str(ti.get("desc", "")), str(ti.get("reason", ""))] + sectors
+        if any(any(token in h or h in token for h in hay if h) for token in tokens):
+            for item in ti.get("stocks", []):
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    known[str(item[0])] = str(item[1])
-        for code, info in _dynamic_candidates.items():
-            nm = str(info.get("name", "") or "").strip()
-            if nm:
-                known[str(code)] = nm
-        for code, name in known.items():
-            if name and name in extra_text:
-                _add_stock(code, name)
-                if len(result) >= max_n:
-                    break
+                    _add_stock(item[0], item[1])
 
-    return result[:max_n]
+    reason_text = str(reason or "")
+    if reason_text:
+        candidate_pool = []
+        for stocks in _GEO_SECTOR_STOCKS.values():
+            candidate_pool.extend(stocks)
+        for ti in THEME_MAP.values():
+            candidate_pool.extend(ti.get("stocks", []))
+        for ti in _dynamic_theme_map.values():
+            candidate_pool.extend([tuple(x[:2]) for x in ti.get("stocks", []) if isinstance(x, (list, tuple)) and len(x) >= 2])
+        seen_names = set()
+        for c, n in candidate_pool:
+            if n in seen_names:
+                continue
+            seen_names.add(n)
+            if n and n in reason_text:
+                _add_stock(c, n)
+
+    return results[:max_n]
 
 
-def _remember_geo_sector_candidates(sec_dirs: list, detected_kws: list | None = None):
-    """
-    AI가 새/복합 지정학 섹터명을 반환했을 때 당일 동적 테마로 흡수.
-    기존 하드코딩 섹터는 그대로 두고, 신규/복합 섹터의 관련 종목 연결층만 보강한다.
-    """
+def _remember_geo_sector_candidates(sec_dirs: list):
     global _dynamic_theme_map
+    if not sec_dirs:
+        return
+    today = datetime.now().strftime("%m%d")
     changed = False
-    today = _now_kst().strftime("%m%d")
-    detected_kws = list(detected_kws or [])[:5]
-
-    for sd in sec_dirs or []:
-        sec = _normalize_geo_sector_name(sd.get("sector", ""))
-        if not sec:
+    for sd in sec_dirs:
+        sector = _normalize_geo_sector_name(sd.get("sector", ""))
+        if not sector:
             continue
-        if sec in _GEO_SECTOR_STOCKS:
-            continue
-
-        stocks = _derive_geo_sector_stocks(sec, sd.get("reason", ""), max_n=8)
+        reason = str(sd.get("reason", "") or "")
+        stocks = _derive_geo_sector_stocks(sector, reason=reason, max_n=8)
         if not stocks:
             continue
-
-        alias_tokens = _split_geo_sector_tokens(sec)
-        theme_key = f"geo_{today}_{hashlib.md5(sec.encode('utf-8')).hexdigest()[:8]}"
+        theme_key = f"geo_{today}_{_re.sub(r'[^0-9A-Za-z가-힣]+', '_', sector)[:40]}"
         existing = _dynamic_theme_map.get(theme_key, {})
-
         merged = []
-        seen_codes = set()
+        seen = set()
         for item in list(existing.get("stocks", [])) + stocks:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                code, name = str(item[0]), str(item[1])
-            elif isinstance(item, dict):
-                code, name = str(item.get("code", "")), str(item.get("name", ""))
-            else:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
-            if not code or code in seen_codes:
+            c, n = str(item[0]), str(item[1])
+            if not c or c in seen:
                 continue
-            seen_codes.add(code)
-            merged.append((code, name))
-
-        reason_parts = ["지정학 AI 섹터 자동흡수"]
-        if sd.get("reason"):
-            reason_parts.append(str(sd.get("reason", "")).strip())
+            seen.add(c)
+            merged.append((c, n))
+        sectors = []
+        for token in _split_geo_sector_tokens(sector):
+            if token not in sectors:
+                sectors.append(token)
         _dynamic_theme_map[theme_key] = {
-            "desc": f"{sec} 지정학 연관",
-            "reason": " | ".join(p for p in reason_parts if p),
-            "sectors": alias_tokens,
-            "stocks": merged[:8],
-            "events": detected_kws,
+            "desc": f"{sector} 연관 지정학 테마",
+            "reason": reason or str(sd.get("direction", "") or "지정학 섹터"),
+            "stocks": merged,
+            "sectors": sectors,
             "ts": time.time(),
-            "source": "geo_sector_ai",
+            "source": "geo_sector",
         }
         changed = True
-
     if changed:
         try:
-            _write_json_atomic(
-                DYNAMIC_THEME_FILE,
-                {k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()},
-                indent=2,
-            )
+            with open(DYNAMIC_THEME_FILE, "w", encoding="utf-8") as f:
+                json.dump({k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()},
+                          f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -15536,10 +15461,10 @@ def _remember_geo_sector_candidates(sec_dirs: list, detected_kws: list | None = 
 def _get_geo_sector_stocks(sector_name: str, max_n: int = 3) -> list:
     """
     섹터명으로 관련 종목 조회.
-    고정 섹터 직접 매핑 + 복합/신규 섹터 토큰 매칭 + THEME_MAP/동적 테마 확장 매칭.
+    _GEO_SECTOR_STOCKS 직접 매핑 + THEME_MAP + 동적 지정학 테마까지 단계적으로 반영.
     returns: [(code, name), ...]
     """
-    return _derive_geo_sector_stocks(sector_name, "", max_n=max_n)
+    return _derive_geo_sector_stocks(sector_name, max_n=max_n)
 
 
 def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
@@ -15806,16 +15731,19 @@ def _detect_geo_keywords(headlines_flat: list) -> list:
                 detected.append(kw)
     return detected
 
+
 def _map_geo_sectors(detected_kws: list) -> list:
     """감지된 키워드 → 관련 섹터 자동 매핑"""
     sectors = []
     for pattern, sec_list in _GEO_SECTOR_MAP.items():
         for kw in detected_kws:
-            if re.search(pattern, kw):
+            if _re.search(pattern, kw):
                 for s in sec_list:
-                    if s not in sectors:
+                    s = _normalize_geo_sector_name(s)
+                    if s and s not in sectors:
                         sectors.append(s)
     return sectors
+
 
 def _build_fallback_sector_directions(detected_kws: list, sectors: list) -> list:
     """
@@ -15932,7 +15860,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         score_adj = -5 if len(detected_kws) >= 3 else 0
         # 키워드로 기본 섹터 방향 추론
         sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
-        _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
+        _remember_geo_sector_candidates(sec_dirs_fb)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
                 "sector_directions": sec_dirs_fb,
                 "score_adj": score_adj, "summary": f"⚠️ 지정학 이벤트 감지: {', '.join(detected_kws[:3])}",
@@ -15998,11 +15926,11 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             print(f"  🌍 지정학 API: HTTP 빈 응답 → 키워드 fallback")
             sectors = _map_geo_sectors(detected_kws)
             sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+            _remember_geo_sector_candidates(sec_dirs_fb)
             result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
-            _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
             _geo_cache[cache_key] = result_fb
             return result_fb
         raw  = extract_ai_text(resp_json)
@@ -16013,11 +15941,11 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             print(f"  🌍 지정학 API: 텍스트 비어있음 → 키워드 fallback")
             sectors = _map_geo_sectors(detected_kws)
             sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+            _remember_geo_sector_candidates(sec_dirs_fb)
             result_fb = {"detected": True, "uncertainty": "mid", "sectors": sectors,
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
-            _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
             _geo_cache[cache_key] = result_fb
             return result_fb
         data = json.loads(raw)
@@ -16025,6 +15953,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         # sector_directions → sectors 리스트도 같이 추출
         sec_dirs = data.get("sector_directions", [])
         sectors  = [s["sector"] for s in sec_dirs] if sec_dirs else _map_geo_sectors(detected_kws)
+        _remember_geo_sector_candidates(sec_dirs)
 
         result = {
             "detected":          True,
@@ -16037,7 +15966,6 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             "kws":               detected_kws[:5],
             "ts":                time.time(),
         }
-        _remember_geo_sector_candidates(sec_dirs, detected_kws)
         _geo_cache[cache_key] = result
         # [v37.10-all5] 섹터 방향을 점수 보정용 전역 상태로 반영
         try:
@@ -16064,7 +15992,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         # fallback
         sectors = _map_geo_sectors(detected_kws)
         sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
-        _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
+        _remember_geo_sector_candidates(sec_dirs_fb)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
                 "sector_directions": sec_dirs_fb,
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
@@ -18091,6 +18019,7 @@ def _send_stats():
         if loss_pattern:
             msg += f"\n━━━━━━━━━━━━━━━\n{loss_pattern}\n"
 
+
         # ── v41.63 #4: KPI 요약 (승률/손익비/기대수익) ──
         try:
             kpi = compute_signal_kpi(completed)
@@ -18104,7 +18033,6 @@ def _send_stats():
                         f"손익비: {pf_emoji} <b>{ov['payoff_ratio']:.2f}</b>  "
                         f"기대수익: {exp_emoji} <b>{ov['expectancy']:+.2f}%</b>\n"
                         f"  Profit Factor: {ov['profit_factor']:.2f}\n")
-                # 신호유형 중 상위/하위 표시
                 by_t = kpi.get("by_type", {})
                 type_labels_kpi = {
                     "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접",
@@ -18114,120 +18042,976 @@ def _send_stats():
                 }
                 good = [(t, k) for t, k in by_t.items()
                         if k.get("n", 0) >= 5 and k["win_rate"] >= 60 and k.get("payoff_ratio", 0) >= 1.2]
-                bad  = [(t, k) for t, k in by_t.items()
-                        if k.get("n", 0) >= 5 and (k["win_rate"] < 35 or k.get("payoff_ratio", 0) < 0.8)]
+                bad = [(t, k) for t, k in by_t.items()
+                       if k.get("n", 0) >= 5 and (k["win_rate"] < 35 or k.get("payoff_ratio", 0) < 0.8)]
                 if good:
                     g_str = ", ".join(f"{type_labels_kpi.get(t,t)}({k['win_rate']:.0f}%)" for t, k in good[:3])
                     msg += f"  🌟 고성과: {g_str}\n"
                 if bad:
                     b_str = ", ".join(f"{type_labels_kpi.get(t,t)}({k['win_rate']:.0f}%)" for t, k in bad[:3])
                     msg += f"  ⚠️ 저성과: {b_str}\n"
-                # 연속 손절
                 if kpi.get("consecutive_loss", 0) >= 3:
                     msg += f"  🚨 연속 손절: {kpi['consecutive_loss']}회\n"
             else:
                 msg += (f"\n━━━━━━━━━━━━━━━\n"
                         f"📐 <b>KPI</b>: 데이터 부족 ({ov.get('n', 0)}/{KPI_MIN_SAMPLES}건)\n")
-        except Exception:
-            pass
 
-        try:
-            actual_completed_kpi = []
-            for v in actual_entered:
-                actual_rec = dict(v)
-                actual_rec["pnl_pct"] = float(v.get("actual_pnl", 0) or 0)
-                actual_completed_kpi.append(actual_rec)
-            actual_kpi = compute_signal_kpi(actual_completed_kpi, pnl_field="pnl_pct") if actual_completed_kpi else {}
-
-            bucket_stats = kpi.get("by_mid_pullback_bucket", {}) if "kpi" in locals() else {}
-            if bucket_stats:
-                bucket_order = [
-                    "weekly_monthly_trend",
-                    "daily_trend",
-                    "gap_first_pullback",
-                    "intraday_reclaim",
-                ]
-                msg += f"\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
-                printed = False
-                qualified = []
-                weak = []
-                for bucket in bucket_order:
-                    bk = bucket_stats.get(bucket)
-                    label = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
-                    if not bk:
-                        msg += f"  {label}: 표본 부족 (0건)\n"
-                        continue
-                    n = int(bk.get("n", 0) or 0)
-                    if n < 3:
-                        msg += f"  {label}: 표본 부족 ({n}건)\n"
-                        continue
-                    printed = True
-                    wr = float(bk.get("win_rate", 0) or 0)
-                    avg = float(bk.get("avg_pnl", 0) or 0)
-                    exp = float(bk.get("expectancy", 0) or 0)
-                    pr = float(bk.get("payoff_ratio", 0) or 0)
-                    grades = bk.get("execution_grade_counts", {}) or {}
-                    grade_str = f"A:{int(grades.get('A',0) or 0)} B:{int(grades.get('B',0) or 0)} C:{int(grades.get('C',0) or 0)}"
-                    exp_emoji = "🔴" if exp > 0.5 else "🟡" if exp >= 0 else "🔵"
-                    msg += (
-                        f"  {label}: 승률 {wr:.0f}%  평균 {avg:+.1f}%  "
-                        f"손익비 {pr:.2f}  {exp_emoji} 기대 {exp:+.2f}%  ({n}건)\n"
-                        f"    실행등급 분포 {grade_str}\n"
-                    )
-                    if n >= 5 and wr >= 60 and pr >= 1.2 and exp > 0:
-                        qualified.append(f"{label}({wr:.0f}%)")
-                    if n >= 5 and (wr < 35 or pr < 0.8 or exp < 0):
-                        weak.append(f"{label}({wr:.0f}%)")
-                if not printed:
-                    msg += "  표본 부족 — 완료 데이터 누적 후 재확인\n"
-                if qualified:
-                    msg += f"  🌟 고성과 bucket: {', '.join(qualified[:3])}\n"
-                if weak:
-                    msg += f"  ⚠️ 저성과 bucket: {', '.join(weak[:3])}\n"
-
-            actual_bucket_stats = actual_kpi.get("by_mid_pullback_bucket", {}) if actual_kpi else {}
-            if actual_bucket_stats:
-                bucket_order = [
-                    "weekly_monthly_trend",
-                    "daily_trend",
-                    "gap_first_pullback",
-                    "intraday_reclaim",
-                ]
-                msg += f"\n🪙 <b>실진입 눌림목 bucket</b>\n"
-                actual_printed = False
-                actual_good = []
-                actual_bad = []
-                for bucket in bucket_order:
-                    bk = actual_bucket_stats.get(bucket)
-                    label = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+            bucket_kpi = kpi.get("by_mid_pullback_bucket", {})
+            if bucket_kpi:
+                msg += "\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
+                high_buckets = []
+                low_buckets = []
+                for bucket in ["weekly_monthly_trend", "daily_trend", "gap_first_pullback", "intraday_reclaim"]:
+                    bk = bucket_kpi.get(bucket)
                     if not bk:
                         continue
-                    n = int(bk.get("n", 0) or 0)
+                    label = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+                    n = bk.get("n", 0)
                     if n < 2:
                         msg += f"  {label}: 표본 부족 ({n}건)\n"
                         continue
-                    actual_printed = True
-                    wr = float(bk.get("win_rate", 0) or 0)
-                    avg = float(bk.get("avg_pnl", 0) or 0)
-                    exp = float(bk.get("expectancy", 0) or 0)
-                    pr = float(bk.get("payoff_ratio", 0) or 0)
-                    msg += (
-                        f"  {label}: 승률 {wr:.0f}%  평균 {avg:+.1f}%  손익비 {pr:.2f}  기대 {exp:+.2f}%  ({n}건)\n"
-                    )
-                    if n >= 3 and wr >= 60 and pr >= 1.0 and exp > 0:
-                        actual_good.append(f"{label}({wr:.0f}%)")
-                    if n >= 3 and (wr < 35 or pr < 0.8 or exp < 0):
-                        actual_bad.append(f"{label}({wr:.0f}%)")
-                if not actual_printed:
-                    msg += "  표본 부족 — 실진입 결과 누적 후 재확인\n"
-                if actual_good:
-                    msg += f"  🌟 실진입 고성과: {", ".join(actual_good[:3])}\n"
-                if actual_bad:
-                    msg += f"  ⚠️ 실진입 저성과: {", ".join(actual_bad[:3])}\n"
+                    grade_dist = bk.get("execution_grade_dist", {}) or {}
+                    grade_str = " ".join(f"{g}{grade_dist.get(g,0)}" for g in ("A", "B", "C") if grade_dist.get(g, 0)) or "-"
+                    emoji = "🔴" if bk.get("expectancy", 0) > 0.5 else "🟡" if bk.get("expectancy", 0) >= 0 else "🔵"
+                    msg += (f"  {emoji} {label}: 승률 {bk['win_rate']:.0f}%  평균 {bk['avg_pnl']:+.1f}%  "
+                            f"손익비 {bk['payoff_ratio']:.2f}  기대 {bk['expectancy']:+.2f}%  ({n}건) [{grade_str}]\n")
+                    if n >= 3 and bk.get("win_rate", 0) >= 60 and bk.get("expectancy", 0) > 0:
+                        high_buckets.append(label)
+                    if n >= 3 and (bk.get("win_rate", 0) < 35 or bk.get("expectancy", 0) < 0):
+                        low_buckets.append(label)
+                if high_buckets:
+                    msg += f"  🌟 고성과 bucket: {', '.join(high_buckets[:3])}\n"
+                if low_buckets:
+                    msg += f"  ⚠️ 저성과 bucket: {', '.join(low_buckets[:3])}\n"
+
+            actual_bucket_recs = [v for v in actual_entered if v.get("mid_pullback_bucket")]
+            if actual_bucket_recs:
+                actual_kpi = compute_signal_kpi(actual_bucket_recs, pnl_field="actual_pnl")
+                actual_bucket_kpi = actual_kpi.get("by_mid_pullback_bucket", {})
+                if actual_bucket_kpi:
+                    msg += "\n━━━━━━━━━━━━━━━\n🪙 <b>실진입 눌림목 bucket</b>\n"
+                    high_actual = []
+                    low_actual = []
+                    for bucket in ["weekly_monthly_trend", "daily_trend", "gap_first_pullback", "intraday_reclaim"]:
+                        bk = actual_bucket_kpi.get(bucket)
+                        if not bk:
+                            continue
+                        label = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+                        n = bk.get("n", 0)
+                        if n < 2:
+                            msg += f"  {label}: 표본 부족 ({n}건)\n"
+                            continue
+                        grade_dist = bk.get("execution_grade_dist", {}) or {}
+                        grade_str = " ".join(f"{g}{grade_dist.get(g,0)}" for g in ("A", "B", "C") if grade_dist.get(g, 0)) or "-"
+                        emoji = "🔴" if bk.get("expectancy", 0) > 0.5 else "🟡" if bk.get("expectancy", 0) >= 0 else "🔵"
+                        msg += (f"  {emoji} {label}: 승률 {bk['win_rate']:.0f}%  평균 {bk['avg_pnl']:+.1f}%  "
+                                f"손익비 {bk['payoff_ratio']:.2f}  기대 {bk['expectancy']:+.2f}%  ({n}건) [{grade_str}]\n")
+                        if n >= 3 and bk.get("win_rate", 0) >= 60 and bk.get("expectancy", 0) > 0:
+                            high_actual.append(label)
+                        if n >= 3 and (bk.get("win_rate", 0) < 35 or bk.get("expectancy", 0) < 0):
+                            low_actual.append(label)
+                    if high_actual:
+                        msg += f"  🌟 실진입 고성과: {', '.join(high_actual[:3])}\n"
+                    if low_actual:
+                        msg += f"  ⚠️ 실진입 저성과: {', '.join(low_actual[:3])}\n"
         except Exception:
             pass
 
         # ── 시장 국면 현황 ──
+        regime = get_market_regime()
+        rmode  = regime.get("mode", "normal")
+        rlabels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
+        mult_map = {"bull":"기준 완화 (×1.15)","normal":"표준","bear":"기준 강화 (×0.75)","crash":"급락장 — 상한가만 허용"}
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"🌐 <b>현재 시장 국면</b>: {rlabels.get(rmode,'보통장')}\n"
+                f"  코스피 당일 {regime.get('chg_1d',0):+.1f}%  |  5일 {regime.get('chg_5d',0):+.1f}%\n"
+                f"  신호 기준: {mult_map.get(rmode,'표준')}\n")
+
+        # ── 포지션 사이징 요약 ──
+        if completed:
+            a_recs = [v for v in completed if v.get("grade","B") == "A"]
+            b_recs = [v for v in completed if v.get("grade","B") == "B"]
+            if a_recs:
+                a_avg = sum(v["pnl_pct"] for v in a_recs) / len(a_recs)
+                a_win = sum(1 for v in a_recs if v["pnl_pct"] > 0) / len(a_recs) * 100
+                msg += (f"\n━━━━━━━━━━━━━━━\n"
+                        f"💰 <b>등급별 성과</b>\n"
+                        f"  A등급: {len(a_recs)}건  승률 {a_win:.0f}%  평균 {a_avg:+.1f}%\n")
+            if b_recs:
+                b_avg = sum(v["pnl_pct"] for v in b_recs) / len(b_recs)
+                b_win = sum(1 for v in b_recs if v["pnl_pct"] > 0) / len(b_recs) * 100
+                msg += f"  B등급: {len(b_recs)}건  승률 {b_win:.0f}%  평균 {b_avg:+.1f}%\n"
+
+        # ── 현재 _dynamic 파라미터 요약 ──
+        msg += (f"\n━━━━━━━━━━━━━━━\n"
+                f"⚙️ <b>현재 자동 조정 파라미터</b>\n"
+                f"  최소점수: {_dynamic['min_score_normal']}점 (엄격: {_dynamic['min_score_strict']}점)\n"
+                f"  RSI 과매수 기준: {_dynamic['rsi_overbuy']:.0f}\n"
+                f"  ATR 손절:{_dynamic['atr_stop_mult']} / 목표:{_dynamic.get('atr_target_mult', ATR_TARGET_MULT)}\n"
+                f"  포지션 기본비중: {_dynamic.get('position_base_pct',8.0)}%\n")
+
+        # ── 기능별 기여도 현황 ──
+        feat_labels = {
+            "feat_w_rsi":    "RSI 필터",
+            "feat_w_ma":     "이동평균",
+            "feat_w_bb":     "볼린저밴드",
+            "feat_w_sector": "섹터모멘텀",
+            "feat_w_nxt":    "NXT 보정",
+            "feat_w_geo":    "지정학 보정",
+        }
+        msg += f"\n━━━━━━━━━━━━━━━\n🔧 <b>기능별 가중치</b> (auto_tune 자동 조정)\n"
+        for fk, flabel in feat_labels.items():
+            w = _dynamic.get(fk, 1.0)
+            if w >= 1.2:   status = "🔺 강화"
+            elif w >= 0.8: status = "✅ 정상"
+            elif w >= 0.4: status = "🔻 약화"
+            else:           status = "⛔ 거의 비활성"
+            bar = "█" * int(w * 5) + "░" * max(0, 5 - int(w * 5))
+            msg += f"  {flabel}: {bar} {w:.1f}  {status}\n"
+
+        send(msg)
+    except Exception as e:
+        send(f"⚠️ 통계 오류: {e}")
+
+# ============================================================
+# 장 마감
+# ============================================================
+def on_market_close():
+    # [v37.10-all5] 성과 기반 유니버스 자동 갱신(장 마감)
+    update_universe_from_performance(days=int(os.getenv('UNIVERSE_PERF_DAYS','30') or '30'), max_codes=int(os.getenv('UNIVERSE_PERF_MAX','300') or '300'))
+    # 재진입 감시 — KRX only 종목만 초기화, NXT 상장 종목은 20:00까지 유지
+    nxt_remain = {c: w for c, w in _reentry_watch.items() if is_nxt_listed(c)}
+    krx_only   = {c: w for c, w in _reentry_watch.items() if not is_nxt_listed(c)}
+    if krx_only:
+        for c in krx_only: _reentry_watch.pop(c, None)
+        print(f"  🔄 KRX 재진입 감시 {len(krx_only)}건 만료 (15:30)")
+    if nxt_remain:
+        print(f"  🟡 NXT 재진입 감시 {len(nxt_remain)}건 유지 (→20:00)")
+
+    carry_list = []
+    for code, info in list(_detected_stocks.items()):
+        carry_day = info.get("carry_day",0)
+        if carry_day >= MAX_CARRY_DAYS: del _detected_stocks[code]; continue
+        _detected_stocks[code]["carry_day"]   = carry_day+1
+        _detected_stocks[code]["detected_at"] = datetime.now()
+        carry_list.append(f"• {info['name']} ({code}) - {carry_day+1}일차")
+    save_carry_stocks()
+    auto_tune(notify=True)
+    _send_pending_result_reminder()   # ★ 오늘 미입력 종목 알림
+
+    today = datetime.now().strftime("%Y%m%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        data = {}
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+
+        today_recs   = [v for v in data.values() if v.get("detect_date") == today]
+        done_today   = [v for v in today_recs if v.get("status") != "추적중"]
+        # 전체 추적 중 (날짜 무관)
+        all_tracking = _get_valid_tracking(data)
+
+        sig_labels = {
+            "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
+            "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
+            "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
+        }
+
+        msg = f"🔔 <b>장 마감 리포트</b>  {today_str}\n━━━━━━━━━━━━━━━\n"
+
+        # ── 오늘 확정 결과 ──
+        if done_today:
+            wins   = sum(1 for v in done_today if v.get("pnl_pct",0) > 0)
+            losses = sum(1 for v in done_today if v.get("pnl_pct",0) < 0)
+            win_rate = round(wins / len(done_today) * 100) if done_today else 0
+            avg_pnl  = sum(v.get("pnl_pct",0) for v in done_today) / len(done_today)
+            msg += (f"\n📊 <b>오늘 확정 결과</b>  ({len(done_today)}건)\n"
+                    f"  승률 <b>{win_rate}%</b>  평균 <b>{avg_pnl:+.1f}%</b>"
+                    f"  |  수익 {wins}건  손실 {losses}건\n")
+            for v in sorted(done_today, key=lambda x: x.get("pnl_pct",0), reverse=True):
+                pnl   = v.get("pnl_pct", 0)
+                dot   = "✅" if pnl > 0 else ("🔵" if pnl < 0 else "➖")
+                label = sig_labels.get(v.get("signal_type",""), "")
+                theme = f"[{v['sector_theme']}]" if v.get("sector_bonus",0) > 0 else "[단독]"
+                msg  += f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label} {theme}\n"
+        else:
+            msg += "\n📊 오늘 확정된 신호 없음\n"
+
+        # ── 전체 추적 중 (오늘 + 이월) 잠정 수익률 ──
+        if all_tracking:
+            msg += f"\n⏳ <b>추적 중</b>  ({len(all_tracking)}건)\n"
+            tracking_results = []
+            for v in all_tracking:
+                try:
+                    # 장 마감 후면 NXT 가격 우선 사용
+                    price = 0
+                    if is_nxt_open():
+                        nxt_p = get_nxt_stock_price(v["code"])
+                        price = nxt_p.get("price", 0)
+                    if not price:
+                        cur   = get_stock_price(v["code"])
+                        price = cur.get("price", 0)
+                    entry = v.get("entry_price", 0)
+                    if price and entry:
+                        pnl      = round((price - entry) / entry * 100, 1)
+                        days_ago = (datetime.strptime(today, "%Y%m%d") -
+                                    datetime.strptime(v.get("detect_date", today), "%Y%m%d")).days
+                        day_tag  = f" {days_ago}일째" if days_ago > 0 else " 오늘"
+                        dot      = "🔴" if pnl >= 0 else "🟡"
+                        label    = sig_labels.get(v.get("signal_type",""), "")
+                        nxt_tag  = " 🟡NXT" if is_nxt_open() else ""
+                        tracking_results.append((pnl, f"  {dot} {v['name']} <b>{pnl:+.1f}%</b>  {label}{day_tag}{nxt_tag}\n"))
+                    time.sleep(0.1)
+                except Exception: continue
+            # 수익률 높은 순 정렬
+            for _, line in sorted(tracking_results, key=lambda x: x[0], reverse=True):
+                msg += line
+
+        if carry_list:
+            msg += f"\n📂 <b>이월 종목</b>  ({len(carry_list)}개)\n" + "\n".join(carry_list) + "\n"
+
+        # ── 누적 성과 요약 (전체 완료 건) ──
+        all_done = [v for v in data.values() if v.get("status") in ["수익","손실","본전"]]
+        if len(all_done) >= 5:
+            total_win  = sum(1 for v in all_done if v.get("pnl_pct",0) > 0)
+            total_avg  = sum(v.get("pnl_pct",0) for v in all_done) / len(all_done)
+            total_rate = round(total_win / len(all_done) * 100)
+            msg += (f"\n━━━━━━━━━━━━━━━\n"
+                    f"📈 <b>누적 성과</b>  {len(all_done)}건\n"
+                    f"  승률 <b>{total_rate}%</b>  평균 <b>{total_avg:+.1f}%</b>\n")
+
+    except Exception as e:
+        msg = (f"🔔 <b>장 마감</b>  {today_str}\n"
+               f"감시 종목: <b>{len(_detected_stocks)}개</b>\n"
+               f"⚠️ 리포트 오류: {e}\n")
+        if carry_list:
+            msg += f"\n📂 <b>이월</b> ({len(carry_list)}개)\n" + "\n".join(carry_list)
+
+    send(msg)
+    analyze_dart_disclosures()
+
+    # 금요일 장 마감 = 주간 리포트 (금요일이 공휴일이라 목요일에 마감하는 경우도 처리)
+    now = datetime.now()
+    is_friday = now.weekday() == 4
+    next_day_holiday = is_holiday((now + timedelta(days=1)).strftime("%Y%m%d"))
+    is_last_trading_day = is_friday or (now.weekday() == 3 and next_day_holiday)
+    if is_last_trading_day:
+        send_weekly_report()
+
+    # v38.3-D2: 에러 일일 요약
+    _send_error_daily_summary()
+
+
+def _send_error_daily_summary():
+    """v38.3-D2: 당일 에러를 카테고리별 집계해 텔레그램 발송."""
+    global _error_daily_counts, _error_daily_samples
+    try:
+        if not _error_daily_counts:
+            print("✅ 오늘 에러 0건"); return
+        total = sum(_error_daily_counts.values())
+        sorted_errs = sorted(_error_daily_counts.items(), key=lambda x: -x[1])[:10]
+        lines = [f"• <code>{fn}</code>: {cnt}회\n  └ {_error_daily_samples.get(fn,'')[:60]}"
+                 for fn, cnt in sorted_errs]
+        send(f"📊 <b>일일 에러 요약</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
+             f"━━━━━━━━━━━━━━━\n총 에러: <b>{total}건</b> / {len(_error_daily_counts)}개 함수\n"
+             f"━━━━━━━━━━━━━━━\n" + "\n".join(lines))
+        _error_daily_counts = {}; _error_daily_samples = {}
+    except Exception as e:
+        print(f"⚠️ 에러 요약 발송 실패: {e}")
+
+
+# ============================================================
+# v40.0-#3: 장 시작 전 리스크 평가 알림 (08:30)
+# v40.0-#5: 리스크 원인별 엔진 (유동성/에너지·지정학/국내추세)
+# v40.0-#6: 시간대별 리스크 프로파일
+# ============================================================
+def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> list:
+    """v40.0-#5: 리스크를 원인별로 분류.
+    반환: [{"type": str, "label": str, "score": int, "detail": str}, ...]
+    """
+    causes = []
+    try:
+        # ① 유동성 쇼크 (VIX/DXY/환율)
+        vix = float(us.get("vix", 20) or 20)
+        dxy = float(us.get("dxy", 104) or 104)
+        krw = float(us.get("krw_usd", 0) or 0)
+        krw_chg = float(us.get("krw_usd_chg", 0) or 0)
+        liq_score = 0
+        liq_parts = []
+        if vix >= 30:
+            liq_score += 40; liq_parts.append(f"VIX {vix:.0f} 공포")
+        elif vix >= 25:
+            liq_score += 20; liq_parts.append(f"VIX {vix:.0f} 불안")
+        if dxy >= 107:
+            liq_score += 15; liq_parts.append(f"달러 {dxy:.1f} 강세")
+        if krw >= 1400:
+            liq_score += 25; liq_parts.append(f"원화 {krw:.0f}원 위기")
+        elif krw_chg >= 0.8:
+            liq_score += 10; liq_parts.append(f"원화 급락 {krw_chg:+.1f}%")
+        if liq_score > 0:
+            causes.append({
+                "type": "liquidity", "label": "유동성 쇼크",
+                "score": liq_score, "detail": " / ".join(liq_parts)
+            })
+
+        # ② 에너지·지정학 쇼크
+        oil_chg = float(us.get("oil_chg", 0) or 0)
+        gold_chg = float(us.get("gold_chg", 0) or 0)
+        geo_active = bool(geo_state.get("active") and time.time() - float(geo_state.get("ts", 0) or 0) < 14400)
+        geo_unc = str(geo_state.get("uncertainty", "low") or "low")
+        eg_score = 0
+        eg_parts = []
+        if abs(oil_chg) >= 4.0:
+            eg_score += 20; eg_parts.append(f"유가 {oil_chg:+.1f}%")
+        elif abs(oil_chg) >= 2.0:
+            eg_score += 8; eg_parts.append(f"유가 {oil_chg:+.1f}%")
+        if gold_chg >= 2.0:
+            eg_score += 10; eg_parts.append(f"금 {gold_chg:+.1f}% (안전자산)")
+        if geo_active:
+            geo_add = {"high": 30, "mid": 15, "low": 5}.get(geo_unc, 5)
+            eg_score += geo_add
+            eg_parts.append(f"지정학 {geo_unc.upper()}")
+        if eg_score > 0:
+            causes.append({
+                "type": "energy_geo", "label": "에너지·지정학 쇼크",
+                "score": eg_score, "detail": " / ".join(eg_parts)
+            })
+
+        # ③ 국내 추세 붕괴
+        nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+        dom_score = 0
+        dom_parts = []
+        if kospi_5d <= -7.0:
+            dom_score += 40; dom_parts.append(f"코스피 5일 {kospi_5d:+.1f}% 급락")
+        elif kospi_5d <= -3.0:
+            dom_score += 20; dom_parts.append(f"코스피 5일 {kospi_5d:+.1f}% 하락")
+        if nasdaq_chg <= -3.0:
+            dom_score += 25; dom_parts.append(f"나스닥 {nasdaq_chg:+.1f}% 급락")
+        elif nasdaq_chg <= -1.5:
+            dom_score += 10; dom_parts.append(f"나스닥 {nasdaq_chg:+.1f}%")
+        if dom_score > 0:
+            causes.append({
+                "type": "domestic_trend", "label": "국내 추세 붕괴",
+                "score": dom_score, "detail": " / ".join(dom_parts)
+            })
+    except Exception:
+        pass
+    return sorted(causes, key=lambda x: -x["score"])
+
+
+def _build_premarket_risk_payload() -> dict:
+    us = get_us_market_signals()
+    total_score = 0
+    parts = []
+
+    nasdaq_chg = float(us.get("nasdaq_chg", 0) or 0)
+    vix = float(us.get("vix", 20) or 20)
+    gap_signal = us.get("gap_signal", "flat")
+
+    kospi_5d = 0.0
+    now = _now_kst()
+    geo_state = _get_effective_geo_state(now) or {}
+    overnight_lines = _get_effective_overnight_lines(now)
+    try:
+        items = get_daily_data("0001", 10)
+        closes = [i["close"] for i in items if i.get("close")]
+        if len(closes) >= 5:
+            kospi_5d = (closes[-1] - closes[-5]) / closes[-5] * 100
+    except Exception:
+        pass
+
+    causes = _classify_risk_causes(us, geo_state, kospi_5d)
+    total_score = sum(c["score"] for c in causes)
+
+    if now.weekday() == 4:
+        total_score += 10
+        parts.append("📅 금요일 (주말 오버나이트 리스크)")
+
+    if total_score >= 50:
+        level = "위험"; level_emoji = "🔵"; action = "신규 진입 축소 / 기존 포지션 정리 검토"
+    elif total_score >= 25:
+        level = "경계"; level_emoji = "🟡"; action = "신규 진입 보수적 / 손절 타이트하게"
+    else:
+        level = "안전"; level_emoji = "🔴"; action = "정상 운영"
+
+    msg = (
+        f"🛡 <b>장전 리스크 평가</b>  {now.strftime('%Y-%m-%d %H:%M')}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 오늘 리스크 등급: {level_emoji} <b>{level}</b> ({total_score}점)\n"
+        f"💡 권장: <b>{action}</b>\n"
+    )
+
+    if causes:
+        msg += f"\n🔍 <b>리스크 원인 분석</b>\n"
+        for c in causes[:3]:
+            c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+            msg += f"  {c_emoji} {c['label']}: {c['detail']} ({c['score']}점)\n"
+
+    try:
+        geo_summary = str(geo_state.get("summary", "") or "")
+        geo_unc = str(geo_state.get("uncertainty", "low") or "low")
+        geo_sectors = list(geo_state.get("sectors") or [])
+        geo_history = list(geo_state.get("history_lines") or [])
+        if overnight_lines or geo_summary or geo_history:
+            msg += f"\n🌙 <b>야간 이슈 요약</b>\n"
+            for line in list(overnight_lines or [])[-5:]:
+                msg += f"  {line}\n"
+            if geo_summary:
+                sec_txt = f"  |  관련 섹터: {', '.join(geo_sectors[:4])}" if geo_sectors else ""
+                msg += f"  🌍 지정학 {geo_unc.upper()}: {geo_summary}{sec_txt}\n"
+            elif geo_history:
+                for line in geo_history[-3:]:
+                    msg += f"  🌍 {line}\n"
+    except Exception:
+        pass
+
+    msg += (
+        f"\n🌐 <b>미국 시장</b>\n"
+        f"  나스닥 {nasdaq_chg:+.1f}%  VIX {vix:.0f}  갭예측 {gap_signal}\n"
+    )
+    if kospi_5d != 0:
+        msg += f"  코스피 5일: {kospi_5d:+.1f}%\n"
+
+    try:
+        data = _read_json_locked(os.path.join(DATA_DIR, "signal_log.json"))
+        tracking = _get_valid_tracking(data)
+        if tracking and level in ("경계", "위험"):
+            msg += f"\n⚠️ <b>추적 중 {len(tracking)}건 — 진입가 도달 종목 주의</b>\n"
+            for rec in tracking[:5]:
+                entry_p = rec.get("entry_price", 0)
+                _name = rec.get("name", rec.get("code", ""))
+                sig = get_signal_label(rec.get("signal_type", ""), "")
+                msg += f"  • {_name} (진입 {entry_p:,}원) [{sig}]\n"
+    except Exception:
+        pass
+
+    try:
+        sig_stats = get_signal_type_stats()
+        stats_line = _format_signal_type_stats_line(sig_stats)
+        if stats_line:
+            msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
+    except Exception:
+        pass
+
+    # v41.78 #3: 야간 이벤트 워치리스트 블록
+    try:
+        wl_block = _format_overnight_watchlist_block()
+        if wl_block:
+            msg += f"\n{wl_block}\n"
+    except Exception:
+        pass
+
+    msg += f"\n━━━━━━━━━━━━━━━\n⏰ 09:00 장 시작"
+    digest = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    return {"msg": msg, "digest": digest, "score": total_score, "level": level, "ts": now.strftime('%Y-%m-%d %H:%M')}
+
+def _save_premarket_risk_payload(payload: dict):
+    try:
+        _write_json_atomic(PREMARKET_RISK_LAST_FILE, payload, indent=2)
+    except Exception:
+        pass
+
+def _try_mark_preopen_dispatch(kind: str, now_dt: datetime | None = None) -> bool:
+    now_dt = now_dt or _now_kst()
+    day_key = now_dt.strftime("%Y-%m-%d")
+    key = f"{day_key}:{kind}"
+    try:
+        with _file_lock:
+            state = {}
+            if os.path.isfile(PREOPEN_DISPATCH_STATE_FILE):
+                try:
+                    with open(PREOPEN_DISPATCH_STATE_FILE, "r", encoding="utf-8") as f:
+                        state = json.load(f) or {}
+                except Exception:
+                    state = {}
+            if key in state:
+                return False
+            # prune old entries (keep recent 14 days)
+            cutoff = (now_dt - timedelta(days=14)).strftime("%Y-%m-%d")
+            pruned = {}
+            for k, v in state.items():
+                day = str(k).split(":", 1)[0]
+                if day >= cutoff:
+                    pruned[k] = v
+            pruned[key] = {
+                "ts": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "instance": _INSTANCE_ID,
+            }
+            _atomic_write_bytes(PREOPEN_DISPATCH_STATE_FILE, json.dumps(pruned, ensure_ascii=False, indent=2).encode("utf-8"))
+            return True
+    except Exception as e:
+        print(f"⚠️ 장전 디스패치 상태 기록 실패({kind}): {e}")
+        return True
+
+def _send_preopen_watchlist_once():
+    if not _try_mark_preopen_dispatch("watchlist_0730"):
+        print("ℹ️ 07:30 워치리스트 이미 처리됨")
+        return
+    send_preopen_watchlist()
+
+def _send_premarket_risk_assessment_once():
+    if not _try_mark_preopen_dispatch("risk_full_0730"):
+        print("ℹ️ 07:30 장전 리스크 평가 이미 처리됨")
+        return
+    send_premarket_risk_assessment()
+
+def _send_premarket_risk_update_once():
+    if not _try_mark_preopen_dispatch("risk_update_0830"):
+        print("ℹ️ 08:30 장전 리스크 업데이트 이미 처리됨")
+        return
+    send_premarket_risk_update_if_changed()
+
+def _market_leader_profile(now_dt: datetime | None = None) -> dict:
+    now_dt = now_dt or _now_kst()
+    hhmm = now_dt.strftime("%H:%M")
+    is_morning_open = "09:00" <= hhmm < "09:30"
+    is_morning = "09:30" <= hhmm < "10:30"
+    # 오전/이슈장엔 더 빨리 잡히게, 일반장도 지나치게 높지 않게 조정
+    leader_min = 4.0 if is_morning_open else 5.5 if is_morning else 6.5
+    score_min = 54 if is_morning_open else 60 if is_morning else 64
+    follow_min = 0.8 if is_morning_open else 1.2 if is_morning else 1.6
+    max_sections = 4 if is_morning_open or is_morning else 3
+    return {
+        "leader_min": leader_min,
+        "score_min": score_min,
+        "follow_min": follow_min,
+        "max_sections": max_sections,
+        "is_morning_open": is_morning_open,
+        "is_morning": is_morning,
+    }
+
+
+def _read_market_leader_state() -> dict:
+    state = _read_json_safe(MARKET_LEADER_STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _save_market_leader_state(state: dict):
+    try:
+        _write_json_atomic(MARKET_LEADER_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
+    except Exception as e:
+        print(f"⚠️ 시장 주도 섹터 상태 저장 실패: {e}")
+
+
+def _collect_market_leader_seed_stocks(market_open: bool | None = None, nxt_open: bool | None = None) -> list:
+    market_open = is_market_open() if market_open is None else bool(market_open)
+    nxt_open = is_nxt_open() if nxt_open is None else bool(nxt_open)
+    seeds = []
+    try:
+        if market_open:
+            seeds.extend(get_upper_limit_stocks()[:8])
+            seeds.extend(get_volume_surge_stocks()[:16])
+        if nxt_open:
+            seeds.extend(get_nxt_surge_stocks()[:10])
+        for item in list(_dynamic_candidates or [])[:24]:
+            if isinstance(item, dict):
+                seeds.append(item)
+        try:
+            for item in list(get_all_scan_candidates() or [])[:24]:
+                if isinstance(item, dict):
+                    seeds.append(item)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"⚠️ 시장 주도 섹터 seed 수집 오류: {e}")
+    seen = set()
+    merged = []
+    for item in seeds:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code", "") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        merged.append(item)
+    return merged
+
+
+def _get_market_leader_live_quote(code: str, name: str = "", market_open: bool | None = None, nxt_open: bool | None = None) -> dict:
+    market_open = is_market_open() if market_open is None else bool(market_open)
+    nxt_open = is_nxt_open() if nxt_open is None else bool(nxt_open)
+    market = ""
+    try:
+        if nxt_open and not market_open and is_nxt_listed(code):
+            market = "NXT"
+    except Exception:
+        market = ""
+    q = _get_live_quote_for_signal({"code": code, "name": name, "market": market})
+    if not q:
+        return {}
+    q = dict(q)
+    q["market"] = market or str(q.get("market", "") or "")
+    return q
+
+
+def _calc_market_leader_sector_score(quotes: list, leader: dict, follow_min: float, market_chg: float) -> tuple[float, int, float, float]:
+    risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= follow_min]
+    breadth_ratio = len(risers) / max(1, len(quotes))
+    breadth_score = 35.0 * breadth_ratio
+    leader_score = min(25.0, max(0.0, safe_float(leader.get("change_rate", 0))))
+    follow_rates = [safe_float(q.get("change_rate", 0)) for q in risers if str(q.get("code", "")) != str(leader.get("code", ""))]
+    follow_avg = sum(follow_rates) / len(follow_rates) if follow_rates else 0.0
+    follow_score = min(20.0, max(0.0, follow_avg * 2.5))
+    flow_avg = sum(max(0.0, safe_float(q.get("volume_ratio", 0))) for q in quotes) / max(1, len(quotes))
+    flow_score = min(10.0, max(0.0, flow_avg * 2.0))
+    avg_change = sum(safe_float(q.get("change_rate", 0)) for q in risers) / max(1, len(risers)) if risers else 0.0
+    relative_score = min(10.0, max(0.0, (avg_change - market_chg) * 2.0))
+    total = breadth_score + leader_score + follow_score + flow_score + relative_score
+    return round(total, 1), len(risers), round(avg_change, 1), round(flow_avg, 1)
+
+
+def _build_market_leading_sector_payload(force: bool = False) -> dict:
+    market_open = is_market_open()
+    nxt_open = is_nxt_open()
+    if not (market_open or nxt_open):
+        return {}
+    now_dt = _now_kst()
+    profile = _market_leader_profile(now_dt)
+    seeds = _collect_market_leader_seed_stocks(market_open=market_open, nxt_open=nxt_open)
+    if not seeds:
+        print("ℹ️ 시장 주도 섹터 생략 — seed 0건")
+        return {}
+    market_chg = get_kospi_change()
+    candidate_themes = {}
+    strong_seed_cnt = 0
+    upper_seed_cnt = 0
+    event_mode = False
+    for item in seeds[:24]:
+        code = str(item.get("code", "") or "").strip()
+        if not code:
+            continue
+        chg = safe_float(item.get("change_rate", 0))
+        vr = safe_float(item.get("volume_ratio", 0))
+        if chg >= 8.0 and vr >= 5.0:
+            strong_seed_cnt += 1
+        if chg >= 29.0:
+            upper_seed_cnt += 1
+        theme_name, peers, _ = get_theme_sector_stocks(code)
+        if not theme_name or theme_name == "기타업종":
+            continue
+        bucket = candidate_themes.setdefault(theme_name, {"members": {}, "seed_codes": set()})
+        nm = _resolve_stock_name(code, item.get("name", ""))
+        if is_trade_candidate_name(nm):
+            bucket["members"][code] = nm
+            bucket["seed_codes"].add(code)
+        for peer_code, peer_name in peers[:5]:
+            if peer_code == code:
+                continue
+            bucket["members"].setdefault(peer_code, peer_name)
+    if upper_seed_cnt >= 1 or strong_seed_cnt >= 2:
+        event_mode = True
+    if not candidate_themes:
+        print("ℹ️ 시장 주도 섹터 생략 — 유효 테마 0개")
+        return {}
+    leader_min = max(3.8, profile["leader_min"] - (1.0 if event_mode else 0.0))
+    score_min = max(52, profile["score_min"] - (5 if event_mode else 0))
+    follow_min = max(1.0, profile["follow_min"] - (0.3 if event_mode else 0.0))
+    sectors = []
+    quote_cache: dict[tuple[str, str], dict] = {}
+    quote_market_basis = "NXT" if nxt_open and not market_open else "KRX"
+    for theme_name, bucket in list(candidate_themes.items())[:10]:
+        members = list(bucket.get("members", {}).items())[:6]
+        quotes = []
+        for code, name in members:
+            cache_key = (str(code), quote_market_basis)
+            q = quote_cache.get(cache_key)
+            if q is None:
+                q = _get_market_leader_live_quote(code, name, market_open=market_open, nxt_open=nxt_open)
+                quote_cache[cache_key] = dict(q) if isinstance(q, dict) else {}
+            else:
+                q = dict(q) if isinstance(q, dict) else {}
+            if not q or not q.get("price"):
+                continue
+            nm = _resolve_stock_name(code, name, q)
+            if not is_trade_candidate_name(nm):
+                continue
+            quotes.append({
+                "code": code,
+                "name": nm,
+                "change_rate": safe_float(q.get("change_rate", 0)),
+                "volume_ratio": safe_float(q.get("volume_ratio", 0)),
+                "market": q.get("market", ""),
+            })
+            time.sleep(0.05)
+        if len(quotes) < 2:
+            continue
+        quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+        leader = quotes[0]
+        score, riser_cnt, avg_change, flow_avg = _calc_market_leader_sector_score(quotes, leader, follow_min, market_chg)
+        followers = [q for q in quotes if q["code"] != leader["code"] and safe_float(q.get("change_rate", 0)) >= follow_min][:4]
+        if safe_float(leader.get("change_rate", 0)) < leader_min:
+            continue
+        if riser_cnt < 2 or not followers:
+            continue
+        if score < score_min:
+            continue
+        sectors.append({
+            "theme": theme_name,
+            "score": int(round(score)),
+            "leader": leader,
+            "followers": followers,
+            "riser_cnt": riser_cnt,
+            "member_cnt": len(quotes),
+            "avg_change": avg_change,
+            "flow_avg": flow_avg,
+        })
+    if not sectors:
+        return {}
+    sectors.sort(key=lambda s: (s.get("score", 0), safe_float(s.get("leader", {}).get("change_rate", 0))), reverse=True)
+    top = sectors[:profile["max_sections"]]
+    market_heat = min(100, int(len(sectors) * 12 + strong_seed_cnt * 10 + upper_seed_cnt * 15 + max(s.get("score", 0) for s in top) * 0.2))
+    interval_min = 10 if market_heat >= 70 or event_mode else 15 if market_heat >= 45 else 20
+    title_icon = "🔥" if max(s.get("score", 0) for s in top) >= 75 else "📈"
+    mode_line = "🟡 NXT (넥스트레이드) 주도" if nxt_open and not market_open else "🟡 오전 반응형" if profile["is_morning_open"] or profile["is_morning"] else "🔴 장중 주도"
+    lines = [
+        f"{title_icon} <b>[시장 주도 섹터]</b>",
+        f"🕐 {now_dt.strftime('%Y-%m-%d %H:%M:%S')}  |  {mode_line}",
+        "━━━━━━━━━━━━━━━",
+    ]
+    digest_parts = []
+    for sec in top:
+        leader = sec["leader"]
+        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
+        lines.append(f"👑 {leader['name']} {leader['change_rate']:+.1f}%")
+        fol = "  ".join(f"{q['name']} {q['change_rate']:+.1f}%" for q in sec.get("followers", [])[:4])
+        if fol:
+            lines.append(f"📈 {fol}")
+        lines.append("")
+        digest_parts.append(sec['theme'])
+        digest_parts.append(f"{leader['code']}:{leader['change_rate']:.1f}")
+        digest_parts.extend(f"{q['code']}:{q['change_rate']:.1f}" for q in sec.get('followers', [])[:4])
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append(f"💥 시장 활력 {market_heat}점  |  다음 재평가 {interval_min}분")
+    msg = "\n".join(lines).strip()
+    digest = hashlib.sha256("|".join(digest_parts).encode("utf-8")).hexdigest()
+    return {
+        "msg": msg,
+        "digest": digest,
+        "interval_min": interval_min,
+        "market_heat": market_heat,
+        "event_mode": event_mode,
+        "sectors": top,
+        "ts": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def send_market_leading_sector_update(force: bool = False):
+    if is_holiday() or not is_any_market_open():
+        return
+    try:
+        payload = _build_market_leading_sector_payload(force=force)
+        if not payload:
+            print("ℹ️ 시장 주도 섹터 생략 — 조건 충족 섹터 없음")
+            return
+        now_ts = time.time()
+        state = _read_market_leader_state()
+        last_ts = float(state.get("last_ts", 0) or 0)
+        last_digest = str(state.get("last_digest", "") or "")
+        interval_sec = int(max(600, safe_float(payload.get("interval_min", 15)) * 60))
+        if not force and last_ts and now_ts - last_ts < interval_sec:
+            print(f"ℹ️ 시장 주도 섹터 생략 — 최근 발송 {int(now_ts-last_ts)}초 전")
+            return
+        if not force and last_digest == payload.get("digest") and last_ts and now_ts - last_ts < max(interval_sec, 1800):
+            print("ℹ️ 시장 주도 섹터 생략 — 구성 변화 없음")
+            return
+        send(payload.get("msg", ""))
+        _save_market_leader_state({
+            "last_ts": now_ts,
+            "last_digest": payload.get("digest", ""),
+            "interval_min": payload.get("interval_min", 15),
+            "market_heat": payload.get("market_heat", 0),
+            "sent_at": payload.get("ts", ""),
+            "themes": [sec.get("theme", "") for sec in payload.get("sectors", [])],
+        })
+        print(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 섹터, heat={payload.get('market_heat', 0)})")
+    except Exception as e:
+        _log_error("send_market_leading_sector_update", e)
+
+def send_premarket_risk_update_if_changed():
+    if is_holiday():
+        return
+    try:
+        payload = _build_premarket_risk_payload()
+        prev = _read_json_safe(PREMARKET_RISK_LAST_FILE, {})
+        if not isinstance(prev, dict) or prev.get("digest") != payload.get("digest"):
+            msg = "🔄 <b>장전 리스크 업데이트</b>\n━━━━━━━━━━━━━━━\n" + str(payload.get("msg", ""))
+            send(msg)
+            _save_premarket_risk_payload(payload)
+        else:
+            print("ℹ️ 장전 리스크 업데이트 생략 — 07:30 대비 변화 없음")
+    except Exception as e:
+        _log_error("send_premarket_risk_update_if_changed", e)
+
+def send_premarket_risk_assessment():
+    """07:30 장전 리스크 평가 full 발송."""
+    if is_holiday():
+        return
+    try:
+        payload = _build_premarket_risk_payload()
+        sent_id = send(str(payload.get("msg", "")))
+        _save_premarket_risk_payload(payload)
+        if sent_id is not None:
+            _consume_preopen_buffers()
+    except Exception as e:
+        _log_error("send_premarket_risk_assessment", e)
+
+
+def send_premarket_briefing():
+    """매일 08:50 장 시작 전 브리핑 — 주말/공휴일 스킵"""
+    if is_holiday(): return
+    now_dt = _now_kst()
+    today = now_dt.strftime("%Y-%m-%d (%a)")
+    msg   = f"🌅 <b>장 시작 전 브리핑</b>  {today}\n━━━━━━━━━━━━━━━\n"
+
+    # ── ⓪ 미국 시장 요약 + 갭 예측 + 오버나이트 요약 ──
+    try:
+        us = get_us_market_signals()
+        if us.get("summary"):
+            gap_emoji = {"gap_up":"⬆️ 갭상승 기대","flat":"➡️ 갭 없음","gap_down":"⬇️ 갭하락 주의"}
+            msg += (f"\n🌐 <b>미국 시장</b>\n"
+                    f"  {us['summary']}\n"
+                    f"  {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n")
+        # 오버나이트 중 발생한 이벤트 요약 (파일 기반 상태 우선)
+        overnight_lines = _get_effective_overnight_lines(now_dt)
+        if overnight_lines:
+            msg += f"\n🌙 <b>오버나이트 이벤트</b>\n"
+            for line in overnight_lines[-5:]:  # 최근 5개만
+                msg += f"  {line}\n"
+    except Exception:
+        pass
+
+    # ── ⓪-A 지정학 이벤트 요약 ──
+    try:
+        geo_state = _get_effective_geo_state(now_dt) or {}
+        geo_sum = geo_state.get("summary", "")
+        geo_sec = geo_state.get("sectors", [])
+        geo_unc = geo_state.get("uncertainty", "low")
+        if geo_sum:
+            unc_emoji = {"high": "🔵", "mid": "🟡", "low": "🔴"}.get(geo_unc, "🟡")
+            msg += (f"\n🌍 <b>지정학 이벤트</b>  {unc_emoji} 불확실성 {geo_unc.upper()}\n"
+                    f"  {geo_sum}\n"
+                    f"  관련 섹터: {', '.join(geo_sec)}\n")
+    except Exception:
+        pass
+
+    # ── ⓪-B 테마 로테이션 ──
+    try:
+        rotation = detect_theme_rotation()
+        strong = rotation.get("strong", [])
+        weak   = rotation.get("weak", [])
+        if strong or weak:
+            msg += "\n🔄 <b>테마 로테이션</b>\n"
+            for k, v in strong:
+                msg += f"  🔴 {k} 강세 ({v:+.1f}%)\n"
+            for k, v in weak:
+                msg += f"  🔵 {k} 약세 ({v:+.1f}%)\n"
+    except Exception: pass
+
+    # ── ① 이월 감시 종목 ──
+    if _detected_stocks:
+        msg += f"\n📂 <b>감시 중 종목</b>  ({len(_detected_stocks)}개)\n"
+        for code, info in list(_detected_stocks.items())[:6]:
+            try:
+                cur   = get_stock_price(code)
+                price = cur.get("price", 0)
+                entry = info.get("entry_price", 0)
+                if price and entry:
+                    pnl = round((price - entry) / entry * 100, 1)
+                    dot = "🔴" if pnl >= 0 else "🔵"
+                    msg += f"  {dot} {info['name']}  진입 {entry:,} → 현재 {price:,} ({pnl:+.1f}%)\n"
+                    # v37.0: 동일 종목 과거 전적
+                    _tr = get_stock_track_record(code, info.get("name",""))
+                    if _tr:
+                        msg += f"  {_tr}\n"
+                time.sleep(0.15)
+            except Exception: continue
+    else:
+        msg += "\n📂 감시 중 종목 없음\n"
+
+    # ── ② 어제 상한가 종목 ──
+    try:
+        upper_yest = []
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception: pass
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        upper_yest = [v for v in data.values()
+                      if v.get("detect_date") == yesterday
+                      and v.get("signal_type") == "UPPER_LIMIT"]
+        if upper_yest:
+            msg += f"\n🔁 <b>전일 상한가 → 오늘 연속 주목</b>\n"
+            for v in upper_yest[:4]:
+                msg += f"  🚨 {v['name']}  ({v['code']})\n"
+    except Exception: pass
+
+    # ── ③ 오늘 DART 예정 공시 (최근 등록 기준) ──
+    try:
+        if DART_API_KEY:
+            today_str = datetime.now().strftime("%Y%m%d")
+            dart_list = _fetch_dart_list(today_str)
+            hot = [i for i in dart_list[:10]
+                   if any(kw in i.get("report_nm","")
+                          for kw in ["유상증자","무상증자","합병","분할","실적","배당","자사주"])]
+            if hot:
+                msg += f"\n📌 <b>오늘 공시 주목</b>  ({len(hot)}건)\n"
+                for h in hot[:4]:
+                    msg += f"  • {h.get('corp_name','')}  {h.get('report_nm','')[:20]}\n"
+    except Exception: pass
+
+    # v37.0: 현재 시장 국면에서의 과거 신호 승률
+    try:
+        _cur_regime = get_market_regime()
+        _r_hist = get_regime_history(_cur_regime)
+        if _r_hist:
+            regime_kor = {"crash":"급락장","bear":"약세장","normal":"보통장","bull":"강세장",
+                         "crisis":"급락장","risk_off":"약세장","euphoria":"강세장","panic":"급락장"}
+            msg += f"\n📊 <b>시장 국면</b>: {regime_kor.get(_cur_regime, _cur_regime)}\n  {_r_hist}\n"
+    except Exception: pass
+
+    # ── ④ 현재 파라미터 상태 ──
+    tuned = any([
+        _dynamic["early_price_min"]  != EARLY_PRICE_MIN,
+        _dynamic["mid_surge_min_pct"] != MID_SURGE_MIN_PCT,
+        _dynamic["min_score_normal"] != 60,
+    ])
+    if tuned:
+        msg += (f"\n⚙️ <b>자동 조정된 파라미터</b>\n"
+                f"  조기포착 기준: {_dynamic['early_price_min']:.0f}%  "
+                f"눌림목: {_dynamic['mid_surge_min_pct']:.0f}%\n"
+                f"  최소점수: {_dynamic['min_score_normal']}점\n")
+
+    # ── ⑤ NXT 장전 동향 (08:00~09:00 사이에만) ──
+    try:
+        nxt_stocks = get_nxt_surge_stocks()
+        if nxt_stocks:
+            # 변동률 상위 5개
+            hot_nxt = sorted(nxt_stocks, key=lambda x: abs(x.get("change_rate",0)), reverse=True)[:5]
+            msg += f"\n📡 <b>NXT 장전 동향</b>  (KRX 개장 전)\n"
+            for s in hot_nxt:
+                cr  = s.get("change_rate", 0)
+                vr  = s.get("volume_ratio", 0)
+                dot = "📈" if cr > 0 else "📉"
+                vt  = f" 🔊{vr:.0f}x" if vr >= 3 else ""
+                msg += f"  {dot} {s['name']} <b>{cr:+.1f}%</b>{vt}\n"
+
+            # 외인 순매수 상위 종목 (NXT 선취매 신호)
+            nxt_foreign_buys = []
+            for s in nxt_stocks[:8]:
+                try:
+                    inv = get_nxt_investor_trend(s["code"])
+                    fn  = inv.get("foreign_net", 0)
+                    if fn > 1000:
+                        nxt_foreign_buys.append((s["name"], fn, s.get("change_rate",0)))
+                    time.sleep(0.1)
+                except Exception: continue
+            if nxt_foreign_buys:
+                msg += f"\n  💡 외인 선취매 주목:\n"
+                for nm, fn, cr in sorted(nxt_foreign_buys, key=lambda x: -x[1])[:3]:
+                    msg += f"    🟡 {nm} 외인 {fn:+,}주  ({cr:+.1f}%)\n"
+    except Exception: pass
+
+    # ── 시장 국면 브리핑 ──
+    try:
         regime = get_market_regime()
         rmode  = regime.get("mode", "normal")
         rlabels = {"bull":"🔴 상승장","normal":"🟡 보통장","bear":"🔵 하락장","crash":"🔵 급락장"}
