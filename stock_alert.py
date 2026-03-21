@@ -1,13 +1,24 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.93
+버전: v41.94
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v41.94 (2026-03-21): 지정학 AI 신규 섹터 자동 흡수 + 종목 매핑 확장.
+  [#1] `_normalize_geo_sector_name()` / `_split_geo_sector_tokens()` / `_derive_geo_sector_stocks()`를 추가해,
+       지정학 섹터명을 `·`, `/`, `및`, `와/과`, 괄호 기준으로 분해하고 `_GEO_SECTOR_STOCKS`/`THEME_MAP`/`_dynamic_theme_map`/이유문 내 종목명까지 함께 탐색하도록 확장.
+  [#2] `_get_geo_sector_stocks()`를 위 확장 로직 기반으로 재구성해,
+       AI가 새 섹터명(예: 복합 섹터/세부 섹터)을 반환해도 기존 섹터 토큰과 테마 설명에서 관련 종목을 더 안정적으로 찾도록 보강.
+  [#3] `_remember_geo_sector_candidates()`를 추가하고 `analyze_geopolitical_event()`의 AI/fallback 결과에 연결해,
+       새 지정학 섹터명이 나오면 당일 동적 테마로 자동 저장하여 이후 `/geo`/지정학 알림에서도 같은 섹터명을 재사용할 수 있게 정리.
+  이유: 지정학 분석은 AI가 새로운 한국 섹터명을 반환할 수 있지만, 종목 매핑은 주로 고정 섹터명 위주라 신규/복합 섹터의 종목·과거이력 표시가 약했음.
+  개선점: 신규 지정학 섹터 수용력↑, 복합 섹터 종목 매핑 안정성↑, `/geo`/정기 지정학 알림의 관련 종목·과거 유사 이력 가시성↑.
+  주의점: 지정학 알림의 방향 점수식과 기존 fallback 섹터 규칙은 유지하고, 신규/복합 섹터의 종목 연결층만 확장.
 
 - v41.93 (2026-03-21): /stats 눌림목 bucket 진단 출력 추가.
   [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해,
@@ -15311,32 +15322,211 @@ _GEO_SECTOR_STOCKS: dict = {
     "반도체·디스플레이": [("000660","SK하이닉스"), ("005930","삼성전자"), ("034220","LG디스플레이"), ("042700","한미반도체")],
 }
 
+_GEO_SECTOR_SPLIT_RE = _re.compile(r"[·/,|+]+|\s*\([^)]*\)\s*|\s*(?:및|와|과|and|&|→)\s*", _re.I)
+
+
+def _normalize_geo_sector_name(sector_name: str) -> str:
+    try:
+        sec = str(sector_name or "").strip()
+        sec = sec.replace("／", "/").replace("ㆍ", "·")
+        sec = _re.sub(r"\s+", " ", sec)
+        return sec
+    except Exception:
+        return str(sector_name or "").strip()
+
+
+def _split_geo_sector_tokens(sector_name: str) -> list:
+    sec = _normalize_geo_sector_name(sector_name)
+    if not sec:
+        return []
+    parts = [sec]
+    try:
+        parts.extend(tok.strip() for tok in _GEO_SECTOR_SPLIT_RE.split(sec) if tok.strip())
+    except Exception:
+        pass
+    tokens = []
+    for tok in parts:
+        tok = tok.strip(" ()[]{}")
+        if len(tok) < 2:
+            continue
+        if tok not in tokens:
+            tokens.append(tok)
+    return tokens
+
+
+def _derive_geo_sector_stocks(sector_name: str, extra_text: str = "", max_n: int = 8) -> list:
+    """
+    지정학 섹터명에서 관련 종목을 최대한 보수적으로 추론.
+    - 고정 섹터 직접 매핑
+    - 복합/신규 섹터 토큰 매칭
+    - THEME_MAP / 동적 테마의 sectors/desc/reason 매칭
+    - 섹터 이유문에 직접 언급된 종목명 반영
+    """
+    sec = _normalize_geo_sector_name(sector_name)
+    if not sec:
+        return []
+
+    tokens = _split_geo_sector_tokens(sec)
+    extra_text = str(extra_text or "")
+    result = []
+    seen = set()
+
+    def _add_stock(code, name):
+        code = str(code or "").strip()
+        name = str(name or "").strip()
+        if not code or not name or code in seen:
+            return
+        seen.add(code)
+        result.append((code, name))
+
+    def _merge_stocks(stocks):
+        for item in stocks or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                _add_stock(item[0], item[1])
+            elif isinstance(item, dict):
+                _add_stock(item.get("code", ""), item.get("name", ""))
+            if len(result) >= max_n:
+                return
+
+    # 1) 고정 섹터 직접/부분 매칭
+    if sec in _GEO_SECTOR_STOCKS:
+        _merge_stocks(_GEO_SECTOR_STOCKS.get(sec, []))
+    for key, stocks in _GEO_SECTOR_STOCKS.items():
+        if key == sec:
+            continue
+        if key in sec or sec in key or any(tok in key or key in tok for tok in tokens):
+            _merge_stocks(stocks)
+            if len(result) >= max_n:
+                return result[:max_n]
+
+    def _theme_matches(theme_key: str, theme_info: dict) -> bool:
+        theme_desc = _normalize_geo_sector_name(theme_info.get("desc", ""))
+        theme_reason = _normalize_geo_sector_name(theme_info.get("reason", ""))
+        theme_sectors = [_normalize_geo_sector_name(s) for s in theme_info.get("sectors", []) if str(s or "").strip()]
+        haystacks = [theme_key or "", theme_desc, theme_reason] + theme_sectors
+        if sec in theme_sectors:
+            return True
+        for hs in haystacks:
+            hs = str(hs or "").strip()
+            if not hs:
+                continue
+            if sec in hs or hs in sec:
+                return True
+            if any(tok in hs or hs in tok for tok in tokens):
+                return True
+        return False
+
+    # 2) THEME_MAP / 동적 테마에서 확장 매칭
+    for theme_key, theme_info in THEME_MAP.items():
+        if _theme_matches(str(theme_key), theme_info):
+            _merge_stocks(theme_info.get("stocks", []))
+            if len(result) >= max_n:
+                return result[:max_n]
+
+    for theme_key, theme_info in _dynamic_theme_map.items():
+        if _theme_matches(str(theme_key), theme_info):
+            _merge_stocks(theme_info.get("stocks", []))
+            if len(result) >= max_n:
+                return result[:max_n]
+
+    # 3) 이유문에 직접 언급된 종목명 반영
+    if extra_text:
+        known = {}
+        for stocks in _GEO_SECTOR_STOCKS.values():
+            for code, name in stocks:
+                known[code] = name
+        for theme_info in THEME_MAP.values():
+            for code, name in theme_info.get("stocks", []):
+                known[code] = name
+        for theme_info in _dynamic_theme_map.values():
+            for item in theme_info.get("stocks", []):
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    known[str(item[0])] = str(item[1])
+        for code, info in _dynamic_candidates.items():
+            nm = str(info.get("name", "") or "").strip()
+            if nm:
+                known[str(code)] = nm
+        for code, name in known.items():
+            if name and name in extra_text:
+                _add_stock(code, name)
+                if len(result) >= max_n:
+                    break
+
+    return result[:max_n]
+
+
+def _remember_geo_sector_candidates(sec_dirs: list, detected_kws: list | None = None):
+    """
+    AI가 새/복합 지정학 섹터명을 반환했을 때 당일 동적 테마로 흡수.
+    기존 하드코딩 섹터는 그대로 두고, 신규/복합 섹터의 관련 종목 연결층만 보강한다.
+    """
+    global _dynamic_theme_map
+    changed = False
+    today = _now_kst().strftime("%m%d")
+    detected_kws = list(detected_kws or [])[:5]
+
+    for sd in sec_dirs or []:
+        sec = _normalize_geo_sector_name(sd.get("sector", ""))
+        if not sec:
+            continue
+        if sec in _GEO_SECTOR_STOCKS:
+            continue
+
+        stocks = _derive_geo_sector_stocks(sec, sd.get("reason", ""), max_n=8)
+        if not stocks:
+            continue
+
+        alias_tokens = _split_geo_sector_tokens(sec)
+        theme_key = f"geo_{today}_{hashlib.md5(sec.encode('utf-8')).hexdigest()[:8]}"
+        existing = _dynamic_theme_map.get(theme_key, {})
+
+        merged = []
+        seen_codes = set()
+        for item in list(existing.get("stocks", [])) + stocks:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                code, name = str(item[0]), str(item[1])
+            elif isinstance(item, dict):
+                code, name = str(item.get("code", "")), str(item.get("name", ""))
+            else:
+                continue
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            merged.append((code, name))
+
+        reason_parts = ["지정학 AI 섹터 자동흡수"]
+        if sd.get("reason"):
+            reason_parts.append(str(sd.get("reason", "")).strip())
+        _dynamic_theme_map[theme_key] = {
+            "desc": f"{sec} 지정학 연관",
+            "reason": " | ".join(p for p in reason_parts if p),
+            "sectors": alias_tokens,
+            "stocks": merged[:8],
+            "events": detected_kws,
+            "ts": time.time(),
+            "source": "geo_sector_ai",
+        }
+        changed = True
+
+    if changed:
+        try:
+            _write_json_atomic(
+                DYNAMIC_THEME_FILE,
+                {k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()},
+                indent=2,
+            )
+        except Exception:
+            pass
+
+
 def _get_geo_sector_stocks(sector_name: str, max_n: int = 3) -> list:
     """
     섹터명으로 관련 종목 조회.
-    _GEO_SECTOR_STOCKS 직접 매핑 + THEME_MAP 섹터 키워드 매칭.
+    고정 섹터 직접 매핑 + 복합/신규 섹터 토큰 매칭 + THEME_MAP/동적 테마 확장 매칭.
     returns: [(code, name), ...]
     """
-    # 1. 직접 매핑
-    if sector_name in _GEO_SECTOR_STOCKS:
-        return _GEO_SECTOR_STOCKS[sector_name][:max_n]
+    return _derive_geo_sector_stocks(sector_name, "", max_n=max_n)
 
-    # 2. 부분 매핑 (예: "에너지·정유" → "정유" 규칙 활용)
-    for key, stocks in _GEO_SECTOR_STOCKS.items():
-        if key in sector_name or sector_name in key:
-            return stocks[:max_n]
-
-    # 3. THEME_MAP 섹터 키워드 매칭
-    for theme_key, theme_info in THEME_MAP.items():
-        if sector_name in theme_info.get("sectors", []) or            any(s in sector_name for s in theme_info.get("sectors", [])):
-            return theme_info["stocks"][:max_n]
-
-    # 4. 동적 테마 매칭
-    for tk, ti in _dynamic_theme_map.items():
-        if sector_name in ti.get("sectors", []) or            any(s in sector_name for s in ti.get("sectors", [])):
-            return [(s[0], s[1]) for s in ti.get("stocks", [])][:max_n]
-
-    return []
 
 def _get_geo_sector_history(sector_name: str, stock_list: list) -> str:
     """
@@ -15729,6 +15919,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         score_adj = -5 if len(detected_kws) >= 3 else 0
         # 키워드로 기본 섹터 방향 추론
         sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+        _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
                 "sector_directions": sec_dirs_fb,
                 "score_adj": score_adj, "summary": f"⚠️ 지정학 이벤트 감지: {', '.join(detected_kws[:3])}",
@@ -15798,6 +15989,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
+            _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
             _geo_cache[cache_key] = result_fb
             return result_fb
         raw  = extract_ai_text(resp_json)
@@ -15812,6 +16004,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
+            _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
             _geo_cache[cache_key] = result_fb
             return result_fb
         data = json.loads(raw)
@@ -15831,6 +16024,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
             "kws":               detected_kws[:5],
             "ts":                time.time(),
         }
+        _remember_geo_sector_candidates(sec_dirs, detected_kws)
         _geo_cache[cache_key] = result
         # [v37.10-all5] 섹터 방향을 점수 보정용 전역 상태로 반영
         try:
@@ -15857,6 +16051,7 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         # fallback
         sectors = _map_geo_sectors(detected_kws)
         sec_dirs_fb = _build_fallback_sector_directions(detected_kws, sectors)
+        _remember_geo_sector_candidates(sec_dirs_fb, detected_kws)
         return {"detected": True, "uncertainty": "mid", "sectors": sectors,
                 "sector_directions": sec_dirs_fb,
                 "score_adj": -5, "summary": f"⚠️ 지정학 이벤트: {', '.join(detected_kws[:3])}",
