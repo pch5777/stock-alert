@@ -1,23 +1,33 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.91
+버전: v41.93
 날짜: 2026-03-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
 - v41.93 (2026-03-21): /stats 눌림목 bucket 진단 출력 추가.
-  [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해, `signal_log` 완료 건 중
-       `mid_pullback_bucket`별 승률/평균손익/손익비/기대수익/A·B·C 분포를 함께 계산하도록 확장.
+  [#1] `compute_signal_kpi()`에 `by_mid_pullback_bucket` 집계를 추가해,
+       `signal_log` 완료 건 중 `mid_pullback_bucket`별 승률/평균손익/손익비/기대수익/A·B·C 분포를 함께 계산하도록 확장.
   [#2] `/stats`(`_send_stats()`)에 `눌림목 bucket 진단` 섹션을 추가해
        `월·주 추세형 / 일봉 추세형 / 갭 후 첫 눌림형 / 분봉 재개형`별 실제 성과를 한눈에 보이도록 출력.
-  [#3] bucket 데이터가 적을 때는 `데이터 부족`으로 안내하고, 샘플이 쌓이면 고성과/저성과 bucket을 함께 표시.
+  [#3] bucket 데이터가 적을 때는 `표본 부족`으로 안내하고, 샘플이 쌓이면 `고성과 bucket` / `저성과 bucket` 요약도 함께 표시.
   이유: 자동교정은 bucket 기준으로 이미 돌고 있었지만, 사용자가 `/stats`에서 어떤 bucket이 실제로 돈이 되는지 바로 보기 어려웠음.
   개선점: 눌림목 유형별 성과 해석력↑, bucket별 허용/차단 판단 속도↑, auto_tune 결과 검증 가시성↑.
   주의점: 신호 계산식/알림 정책/진입 판단 로직은 변경하지 않고, `signal_log` 기반 진단 출력만 추가.
+
+- v41.92 (2026-03-21): 크래시 로그 실기록 복원 + 점검 노이즈성 중복 정리.
+  [#1] `install_excepthook()`의 crash log 저장을 `traceback.format_exception(exc_type, exc, tb)` 기반으로 정리해,
+       미처리 예외 시 로그 파일에 `NoneType: None` 대신 실제 traceback이 남도록 복원.
+  [#2] `_decorate_ui_score_line()` / `_decorate_capture_reason_line()` 내부 지역 helper명을 분리해
+       점검 시 중복 정의처럼 보이던 지역 `_signed_repl()` 재사용을 제거.
+  [#3] `_map_geo_sectors()` 내부 불필요한 `import re`를 제거해 함수 내부 중복 import 노이즈를 정리.
+  이유: 실제 크래시 상황에서 로그 파일 정보가 약하고, 점검 과정에서 지역 helper명/내부 import가 중복처럼 보여 검증 노이즈가 있었음.
+  개선점: 크래시 추적력↑, 점검 가독성↑, 코드 위생↑.
+  주의점: 알림 정책/진입 로직/신호 계산식은 변경하지 않음.
 
 - v41.91 (2026-03-21): 변경이력 정합성 복원 + v41.89/v41.90 누락 기능 재적용.
   [#1] changelog를 `v41.88 → v41.89 → v41.90 → v41.91` 순으로 복원하고,
@@ -10357,35 +10367,13 @@ def analyze_loss_pattern(completed: list) -> str:
 # ============================================================
 # 📊 v41.63: signal_log 피드백 루프 — KPI 자동 분석 + 전략 건강도 판정
 # ============================================================
-def _extract_mid_pullback_bucket(rec: dict) -> str:
-    if not isinstance(rec, dict):
-        return ""
-    bucket = str(rec.get("mid_pullback_bucket", "") or "").strip()
-    if bucket:
-        return bucket
-    feature_snapshot = rec.get("feature_snapshot") or {}
-    if isinstance(feature_snapshot, dict):
-        bucket = str(feature_snapshot.get("mid_pullback_bucket", "") or "").strip()
-        if bucket:
-            return bucket
-    return ""
-
-
-def _calc_mid_pullback_grade_mix(recs: list) -> dict:
-    mix = {"A": 0, "B": 0, "C": 0}
-    for rec in recs:
-        grade = str(rec.get("execution_grade", rec.get("grade", "")) or "").upper()
-        if grade in mix:
-            mix[grade] += 1
-    return mix
-
-
 KPI_MIN_SAMPLES = int(os.getenv("KPI_MIN_SAMPLES", "10") or "10")
 
 def compute_signal_kpi(completed: list | None = None) -> dict:
     """
     signal_log 기반 승률/손익비/기대수익 KPI 자동 계산.
     v41.63 #1: 신호유형별·레짐별·시간대별 세분화 KPI.
+    v41.93 #1: 눌림목 bucket별 성과 KPI 추가.
     반환: {
       "overall": {win_rate, avg_pnl, profit_factor, payoff_ratio, expectancy, n},
       "by_type": {signal_type: {...}},
@@ -10405,10 +10393,14 @@ def compute_signal_kpi(completed: list | None = None) -> dict:
 
     def _calc_kpi(recs: list) -> dict:
         if not recs:
-            return {"win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
-                    "payoff_ratio": 0, "expectancy": 0, "n": 0}
+            return {
+                "win_rate": 0, "avg_pnl": 0, "profit_factor": 0,
+                "payoff_ratio": 0, "expectancy": 0, "n": 0,
+                "execution_grade_counts": {"A": 0, "B": 0, "C": 0},
+            }
+
         n = len(recs)
-        pnls = [r.get("pnl_pct", 0) for r in recs]
+        pnls = [float(r.get("pnl_pct", 0) or 0) for r in recs]
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p < 0]
         win_rate = len(wins) / n * 100 if n else 0
@@ -10417,9 +10409,15 @@ def compute_signal_kpi(completed: list | None = None) -> dict:
         avg_loss = abs(sum(losses) / len(losses)) if losses else 1
         payoff_ratio = round(avg_win / avg_loss, 2) if avg_loss > 0 else 99.0
         profit_factor = round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 99.0
-        # 기대수익 = 승률 × 평균수익 - 패율 × 평균손실
         loss_rate = 1 - len(wins) / n if n else 0
         expectancy = round((len(wins) / n * avg_win - loss_rate * avg_loss) if n else 0, 2)
+
+        grade_counts = {"A": 0, "B": 0, "C": 0}
+        for r in recs:
+            grade = str(r.get("execution_grade") or r.get("grade") or "").strip().upper()
+            if grade in grade_counts:
+                grade_counts[grade] += 1
+
         return {
             "win_rate": round(win_rate, 1),
             "avg_pnl": round(avg_pnl, 2),
@@ -10427,57 +10425,68 @@ def compute_signal_kpi(completed: list | None = None) -> dict:
             "payoff_ratio": payoff_ratio,
             "expectancy": expectancy,
             "n": n,
+            "execution_grade_counts": grade_counts,
         }
 
     result = {"overall": _calc_kpi(completed)}
 
-    # 신호유형별
     by_type = {}
     for v in completed:
         t = v.get("signal_type", "기타")
         by_type.setdefault(t, []).append(v)
     result["by_type"] = {t: _calc_kpi(recs) for t, recs in by_type.items()}
 
-    # 레짐별
     by_regime = {}
     for v in completed:
         r = v.get("regime", v.get("market_regime_mode", "normal"))
         by_regime.setdefault(r, []).append(v)
     result["by_regime"] = {r: _calc_kpi(recs) for r, recs in by_regime.items()}
 
-    # 시간대별
     by_slot = {}
     for v in completed:
         slot = _get_timeslot(v.get("time", "10:00:00"))
         by_slot.setdefault(slot, []).append(v)
     result["by_slot"] = {s: _calc_kpi(recs) for s, recs in by_slot.items()}
 
-    # 눌림목 bucket별
-    by_mid_pullback_bucket = {}
+    bucket_order = [
+        "weekly_monthly_trend",
+        "daily_trend",
+        "gap_first_pullback",
+        "intraday_reclaim",
+    ]
+    bucket_groups = {}
     for v in completed:
-        bucket = _extract_mid_pullback_bucket(v)
+        bucket = str(v.get("mid_pullback_bucket") or "").strip()
         if not bucket:
             continue
-        by_mid_pullback_bucket.setdefault(bucket, []).append(v)
-    result["by_mid_pullback_bucket"] = {}
-    for bucket, recs in by_mid_pullback_bucket.items():
-        info = _calc_kpi(recs)
-        info["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
-        info["grade_mix"] = _calc_mid_pullback_grade_mix(recs)
-        result["by_mid_pullback_bucket"][bucket] = info
+        bucket_groups.setdefault(bucket, []).append(v)
 
-    # 연속 손절 카운트
+    bucket_stats = {}
+    for bucket in bucket_order:
+        recs = bucket_groups.get(bucket, [])
+        if not recs:
+            continue
+        stats = _calc_kpi(recs)
+        stats["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+        bucket_stats[bucket] = stats
+    for bucket, recs in bucket_groups.items():
+        if bucket in bucket_stats:
+            continue
+        stats = _calc_kpi(recs)
+        stats["label"] = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+        bucket_stats[bucket] = stats
+    result["by_mid_pullback_bucket"] = bucket_stats
+
     sorted_recs = sorted(completed, key=lambda x: x.get("exit_date", "") + x.get("exit_time", ""))
     consec = 0
     for r in reversed(sorted_recs):
-        if r.get("pnl_pct", 0) < 0:
+        if float(r.get("pnl_pct", 0) or 0) < 0:
             consec += 1
         else:
             break
     result["consecutive_loss"] = consec
 
     return result
-
 
 def _check_strategy_health(kpi: dict, notify: bool = True) -> list:
     """
@@ -17914,48 +17923,52 @@ def _send_stats():
         except Exception:
             pass
 
-        # ── 눌림목 bucket 진단 ──
         try:
-            by_bucket = kpi.get("by_mid_pullback_bucket", {}) if 'kpi' in locals() else {}
-            bucket_rows = [(bucket, info) for bucket, info in by_bucket.items() if info.get("n", 0) >= 3]
-            if bucket_rows:
-                bucket_rows.sort(
-                    key=lambda kv: (
-                        -float(kv[1].get("expectancy", 0) or 0),
-                        -float(kv[1].get("avg_pnl", 0) or 0),
-                        -int(kv[1].get("n", 0) or 0),
-                    )
-                )
+            bucket_stats = kpi.get("by_mid_pullback_bucket", {}) if "kpi" in locals() else {}
+            if bucket_stats:
+                bucket_order = [
+                    "weekly_monthly_trend",
+                    "daily_trend",
+                    "gap_first_pullback",
+                    "intraday_reclaim",
+                ]
                 msg += f"\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
-                for bucket, info in bucket_rows[:4]:
-                    grade_mix = info.get("grade_mix", {}) if isinstance(info.get("grade_mix", {}), dict) else {}
-                    grade_mix_str = f"A/B/C {int(grade_mix.get('A', 0) or 0)}/{int(grade_mix.get('B', 0) or 0)}/{int(grade_mix.get('C', 0) or 0)}"
-                    diag_emoji = "🔴" if info.get("expectancy", 0) > 0.5 else "🟡" if info.get("expectancy", 0) >= 0 else "🔵"
+                printed = False
+                qualified = []
+                weak = []
+                for bucket in bucket_order:
+                    bk = bucket_stats.get(bucket)
+                    label = MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket)
+                    if not bk:
+                        msg += f"  {label}: 표본 부족 (0건)\n"
+                        continue
+                    n = int(bk.get("n", 0) or 0)
+                    if n < 3:
+                        msg += f"  {label}: 표본 부족 ({n}건)\n"
+                        continue
+                    printed = True
+                    wr = float(bk.get("win_rate", 0) or 0)
+                    avg = float(bk.get("avg_pnl", 0) or 0)
+                    exp = float(bk.get("expectancy", 0) or 0)
+                    pr = float(bk.get("payoff_ratio", 0) or 0)
+                    grades = bk.get("execution_grade_counts", {}) or {}
+                    grade_str = f"A:{int(grades.get('A',0) or 0)} B:{int(grades.get('B',0) or 0)} C:{int(grades.get('C',0) or 0)}"
+                    exp_emoji = "🔴" if exp > 0.5 else "🟡" if exp >= 0 else "🔵"
                     msg += (
-                        f"  {diag_emoji} {info.get('label', MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))}: "
-                        f"승률 {info.get('win_rate', 0):.0f}%  평균 {info.get('avg_pnl', 0):+.1f}%  "
-                        f"기대 {info.get('expectancy', 0):+.2f}%  손익비 {info.get('payoff_ratio', 0):.2f}  "
-                        f"({int(info.get('n', 0) or 0)}건, {grade_mix_str})\n"
+                        f"  {label}: 승률 {wr:.0f}%  평균 {avg:+.1f}%  "
+                        f"손익비 {pr:.2f}  {exp_emoji} 기대 {exp:+.2f}%  ({n}건)\n"
+                        f"    실행등급 분포 {grade_str}\n"
                     )
-                good_buckets = [
-                    info.get("label", MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))
-                    for bucket, info in bucket_rows
-                    if info.get("n", 0) >= 4 and info.get("win_rate", 0) >= 60 and info.get("expectancy", 0) > 0
-                ]
-                bad_buckets = [
-                    info.get("label", MID_PULLBACK_BUCKET_LABELS.get(bucket, bucket))
-                    for bucket, info in bucket_rows
-                    if info.get("n", 0) >= 4 and (info.get("win_rate", 0) < 40 or info.get("expectancy", 0) < 0)
-                ]
-                if good_buckets:
-                    msg += f"  🌟 고성과 bucket: {', '.join(good_buckets[:2])}\n"
-                if bad_buckets:
-                    msg += f"  ⚠️ 저성과 bucket: {', '.join(bad_buckets[:2])}\n"
-            elif by_bucket:
-                msg += (
-                    f"\n━━━━━━━━━━━━━━━\n🧪 <b>눌림목 bucket 진단</b>\n"
-                    f"  표본 부족: bucket별 완료 건이 아직 3건 미만이에요.\n"
-                )
+                    if n >= 5 and wr >= 60 and pr >= 1.2 and exp > 0:
+                        qualified.append(f"{label}({wr:.0f}%)")
+                    if n >= 5 and (wr < 35 or pr < 0.8 or exp < 0):
+                        weak.append(f"{label}({wr:.0f}%)")
+                if not printed:
+                    msg += "  표본 부족 — 완료 데이터 누적 후 재확인\n"
+                if qualified:
+                    msg += f"  🌟 고성과 bucket: {', '.join(qualified[:3])}\n"
+                if weak:
+                    msg += f"  ⚠️ 저성과 bucket: {', '.join(weak[:3])}\n"
         except Exception:
             pass
 
