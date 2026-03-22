@@ -3,21 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.97
-날짜: 2026-03-21
+버전: v41.98
+날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v41.97 (2026-03-21): `/list` 현재가 옆에 진입가 대비 괴리율 표시로 위치 교체.
-  [#1] `_format_watch_list_current_vs_entry()`를 추가해 `/list`에서 `📍 현재가` 옆에
-       `진입가 대비 ±%`를 붙이도록 정리.
-  [#2] `🎯 진입가` 라인은 가격만 남기고, 기존처럼 괴리율을 진입가 쪽에 붙이는 방식은 제거.
-  이유: 사용자가 보고 싶었던 값은 `현재가가 진입가보다 얼마나 위/아래인지`였고,
-       이를 현재가 옆에서 바로 읽는 쪽이 해석이 더 직관적이었음.
-  개선점: `/list` 대기 거리 해석력↑, 현재 위치 판단 속도↑.
-  주의점: 이번 버전은 `/list` 표시 위치만 조정하며 진입/알림 정책은 변경하지 않음.
 
+- v41.98 (2026-03-23): 주말/공휴일 대기 모드에서 평일 자동 전환 복구.
+  [#1] `_run_holiday_standby_until_trading_day()`를 추가해 주말/공휴일에 시작한 프로세스가
+       자정 이후 평일로 바뀌면 대기 모드를 빠져나와 평일 스케줄을 다시 등록하도록 수정.
+  [#2] 공휴일/주말 분기에서 기존 무한 대기 루프를 helper 호출로 교체하고,
+       평일 전환 시 `schedule.clear()` 후 정상 초기화 흐름으로 이어지도록 정리.
+  이유: 주말에 켜 둔 봇이 월요일이 되어도 대기 모드에 머물러 07:30 장전 메시지를 놓칠 수 있었음.
+  개선점: 주말→평일 자동 복귀 안정성↑, 07:30/08:30/08:50 장전 메시지 연속성↑.
+  주의점: 주말/공휴일에는 기존처럼 대기 모드를 유지하며, 평일 전환 시에만 자동 복귀함.
+
+- v41.97 (2026-03-21): `/list` 진입가 옆에 현재가 대비 괴리율 표시 추가.
+  [#1] `_format_watch_list_entry_vs_current()`를 추가해 현재가가 있을 때 `진입가` 라인 옆에
+       `현재가 대비 +/-%`를 일관된 부호 규칙으로 표시하도록 정리.
+  [#2] `/list`의 `진입가 감시중 종목` / `목표가 추적중 종목`에서 `🎯 진입가` 표시에
+       `(<현재가 대비 ±x.x%>)`를 함께 붙이도록 수정.
+  이유: `/list`에서 현재가와 진입가를 눈으로 다시 계산해야 해 대기 거리와 체결 후 위치를 즉시 판단하기 어려웠음.
+  개선점: 진입 괴리 해석 속도↑, `/list` 실전 판단력↑.
+  주의점: 표시 계층만 보강하며 진입/알림 정책은 변경하지 않음.
 
 - v41.96 (2026-03-21): `/list` 감시 종목 현황에 종목별 현재가 표시 추가.
   [#1] `_get_watch_list_current_price()`를 추가해 `/list`에서 종목별 현재가를 KRX/NXT 상태에 맞게 조회하고,
@@ -11486,16 +11495,15 @@ def _watch_suffix(peer_code: str, peer_price: int) -> str:
     except Exception:
         return ""
 
-
-def _format_watch_list_current_vs_entry(cur_price: int, entry: int) -> str:
-    """`/list` 현재가 옆에 붙일 진입가 대비 괴리율 문구."""
+def _format_watch_list_entry_vs_current(entry_price: int, current_price: int) -> str:
+    """`/list`에서 현재가 기준 진입가 괴리율 표기."""
     try:
-        cur_price = safe_int(cur_price, 0)
-        entry = safe_int(entry, 0)
-        if cur_price <= 0 or entry <= 0:
+        entry = safe_int(entry_price, 0)
+        current = safe_int(current_price, 0)
+        if entry <= 0 or current <= 0:
             return ""
-        diff_pct = ((cur_price / entry) - 1.0) * 100.0
-        return f" (진입가 대비 {diff_pct:+.1f}%)"
+        gap_pct = (entry / current - 1.0) * 100.0
+        return f" (현재가 대비 {gap_pct:+.1f}%)"
     except Exception:
         return ""
 
@@ -17092,10 +17100,10 @@ def poll_telegram_commands():
                                 line += f" — 재포착 {miss_count}회"
                             details = []
                             if cur_price > 0:
-                                cur_suffix = _format_watch_list_current_vs_entry(cur_price, entry)
-                                details.append(f"📍 현재가 {cur_price:,}원{cur_suffix}")
+                                details.append(f"📍 현재가 {cur_price:,}원")
                             if entry > 0:
-                                details.append(f"🎯 진입가 {entry:,}원")
+                                entry_gap = _format_watch_list_entry_vs_current(entry, cur_price)
+                                details.append(f"🎯 진입가 {entry:,}원{entry_gap}")
                             if target > 0:
                                 details.append(f"🏆 목표가 {target:,}원")
                             if stop > 0:
@@ -18479,6 +18487,24 @@ def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> l
         pass
     return sorted(causes, key=lambda x: -x["score"])
 
+
+def _run_holiday_standby_until_trading_day():
+    """주말/공휴일 대기 모드 유지. 평일 전환 시 스케줄을 비우고 정상 모드로 복귀."""
+    print("✅ 대기 모드 스케줄 등록 완료")
+    while True:
+        try:
+            schedule.run_pending()
+            if not is_holiday():
+                print("🌅 공휴일/주말 대기 모드 종료 — 평일 스케줄로 전환")
+                try:
+                    schedule.clear()
+                except Exception as clear_err:
+                    print(f"⚠️ 대기 모드 스케줄 초기화 실패: {clear_err}")
+                break
+            time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ 대기 모드 루프 오류: {e}")
+            time.sleep(5)
 
 def _build_premarket_risk_payload() -> dict:
     us = get_us_market_signals()
@@ -20619,10 +20645,7 @@ if __name__ == "__main__":
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
 
-        print("✅ 대기 모드 스케줄 등록 완료")
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+        _run_holiday_standby_until_trading_day()
 
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
