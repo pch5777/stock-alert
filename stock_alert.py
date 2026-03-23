@@ -3,12 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.103
+버전: v42
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v42 (2026-03-23): DART 실행형 진입가 전환 + 공시 이벤트군 묶음 dedupe + 재시작 후 중복 방지.
+  [#1] `run_dart_intraday()`에 공시 이벤트군 canonical key(`_derive_dart_event_family()` / `_build_dart_event_key()`)를 추가해
+       `공개매수설명서`·`공개매수신고서`처럼 같은 종목·같은 이벤트군 공시를 1회 대표 알림으로 묶고,
+       `_dart_seen_ids` 런타임 set만 쓰던 구조를 `dart_intraday_state.json` persistent dedupe로 확장해 재시작 후 재발송도 줄이도록 수정.
+  [#2] `_build_dart_execution_entry_plan()` / `_build_dart_execution_stock()`를 추가해 DART 긍정 공시도
+       현재가 직결 브리핑이 아니라 ATR·변동성·상대강도·호가유동성·손익비를 반영한 실행형 눌림 진입가를 산출하고,
+       가능한 경우 `save_signal_log()` / `register_entry_watch()`를 타도록 연결.
+  [#3] DART 메시지 출력도 실행형 진입가 중심으로 정리해, 진입가/손절가/목표가를 대표 진입가 계획과 일치시키고
+       실행형 산출이 불가능한 경우에는 `실행형 진입가 산출 보류`로 분리해 현재가 브리핑을 실전형 알림처럼 오해하지 않도록 정리.
+  이유: 사람인 같은 공개매수 공시가 설명서/신고서로 중복 발송되고, 같은 이벤트가 런타임 재시작 후 반복 전송되며,
+       진입가도 매번 현재가 기준으로 바뀌어 실제 진입 가능한 가격으로 보기 어려웠음.
+  개선점: DART 중복 알림↓, 재시작 후 재발송↓, 실행형 진입가 현실성↑, 공시 신호의 진입감시 연동↑.
+  주의점: 실행형 진입가는 호가유동성/손익비/목표여력까지 통과한 경우에만 제시하며, 통과하지 못한 공시는 `실행형 진입가 산출 보류`로 표시한다.
 
 - v41.103 (2026-03-23): 신규 이슈 자동 테마화 보강 — 사전 용어 없이도 강세 이슈를 섹터/점수에 반영.
   [#1] `EMERGENT_*` 규칙과 `_infer_emergent_issue_theme()` / `_register_emergent_issue_theme()`를 추가해
@@ -852,11 +866,13 @@ _PERSIST_FILES = [
     "geo_active.json",
     "overnight_snapshot_last.json",
     "geo_snapshot_last.json",
+    "dart_intraday_state.json",
 ]
 
 LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
 AUTO_TUNE_STATE_FILE = os.path.join(DATA_DIR, "auto_tune_state.json")
 AUTO_BACKUP_STATE_FILE = os.path.join(DATA_DIR, "auto_backup_state.json")
+DART_INTRADAY_STATE_FILE = os.path.join(DATA_DIR, "dart_intraday_state.json")
 LEADER_LOCK_LEASE_SEC = int(os.getenv("LEADER_LOCK_LEASE_SEC", "75") or "75")
 _INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'local'}:{os.getpid()}:{random.randint(1000, 9999)}"
 _RUNTIME_IS_LEADER = False
@@ -1580,6 +1596,24 @@ DART_URGENT_KEYWORDS = [
 ]
 DART_RISK_KEYWORDS = ["거래정지","상장폐지","횡령","배임","파산","워크아웃",
                       "감사의견","영업정지","회생","관리종목","분식","조사"]
+
+DART_EVENT_DEDUPE_HOURS = int(os.getenv("DART_EVENT_DEDUPE_HOURS", "12") or "12")
+DART_EVENT_SEEN_KEEP_DAYS = int(os.getenv("DART_EVENT_SEEN_KEEP_DAYS", "7") or "7")
+DART_EXEC_MIN_RR = float(os.getenv("DART_EXEC_MIN_RR", "1.15") or "1.15")
+DART_EXEC_MAX_ENTRY_AWAY_PCT = float(os.getenv("DART_EXEC_MAX_ENTRY_AWAY_PCT", "3.6") or "3.6")
+DART_EXEC_MAX_SPREAD = int(os.getenv("DART_EXEC_MAX_SPREAD", "400") or "400")
+DART_EVENT_FAMILY_RULES = [
+    ("공개매수", ["공개매수"]),
+    ("자사주소각", ["자사주소각", "주식소각", "자기주식소각"]),
+    ("자사주취득", ["자사주취득", "자기주식취득결정", "자기주식취득"]),
+    ("유상증자", ["유상증자"]),
+    ("무상증자", ["무상증자"]),
+    ("수주계약", ["공급계약", "계약체결", "수출계약", "수주"]),
+    ("M&A", ["회사합병결정", "합병", "인수"]),
+    ("배당", ["배당"]),
+    ("대표이사변경", ["대표이사변경"]),
+    ("최대주주변경", ["최대주주변경"]),
+]
 
 _UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -15090,13 +15124,6 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
     return True
 
 
-def _headline_mentions_stock_name(headline: str, name: str) -> bool:
-    h = _normalize_news_headline(str(headline or ""))
-    n = _normalize_news_headline(str(name or ""))
-    if not h or not n or len(n) < 2:
-        return False
-    return n in h
-
 
 def _extract_alert_sector_theme(alert: dict) -> str:
     try:
@@ -17101,79 +17128,329 @@ def _fetch_dart_list(today: str) -> list:
         except Exception: pass
     return items
 
+def _default_dart_intraday_state() -> dict:
+    return {"seen_receipts": {}, "event_dispatch": {}}
+
+
+def _prune_dart_intraday_state(state: dict, now_ts: float | None = None) -> dict:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    base = _default_dart_intraday_state()
+    if isinstance(state, dict):
+        base.update(state)
+    seen_receipts = base.get("seen_receipts") if isinstance(base.get("seen_receipts"), dict) else {}
+    event_dispatch = base.get("event_dispatch") if isinstance(base.get("event_dispatch"), dict) else {}
+    seen_cutoff = now_ts - max(1, int(DART_EVENT_SEEN_KEEP_DAYS or 1)) * 86400
+    event_cutoff = now_ts - max(6, int(DART_EVENT_DEDUPE_HOURS or 6)) * 3600
+    pruned_seen = {}
+    for key, value in seen_receipts.items():
+        ts = float(value or 0) if not isinstance(value, dict) else float(value.get("ts", 0) or 0)
+        if ts >= seen_cutoff:
+            pruned_seen[str(key)] = ts
+    pruned_events = {}
+    for key, value in event_dispatch.items():
+        if isinstance(value, dict):
+            ts = float(value.get("ts", 0) or 0)
+            title = str(value.get("title", "") or "")[:120]
+        else:
+            ts = float(value or 0)
+            title = ""
+        if ts >= event_cutoff:
+            pruned_events[str(key)] = {"ts": ts, "title": title}
+    return {"seen_receipts": pruned_seen, "event_dispatch": pruned_events}
+
+
+def _load_dart_intraday_state() -> dict:
+    st = _read_state_json(DART_INTRADAY_STATE_FILE, _default_dart_intraday_state())
+    return _prune_dart_intraday_state(st)
+
+
+def _save_dart_intraday_state(state: dict) -> None:
+    _write_state_json(DART_INTRADAY_STATE_FILE, _prune_dart_intraday_state(state))
+
+
+def _derive_dart_event_family(title: str, matched_keywords: list | None = None) -> str:
+    raw = str(title or "")
+    for family, keywords in DART_EVENT_FAMILY_RULES:
+        if any(kw in raw for kw in keywords):
+            return family
+    for kw in list(matched_keywords or []):
+        if kw and kw in raw:
+            return str(kw)
+    norm = _normalize_news_headline(raw)
+    norm = _re.sub(r"[^0-9a-z가-힣]+", "_", norm).strip("_")
+    return norm[:24] or "기타공시"
+
+
+def _build_dart_event_key(code: str, title: str, matched_keywords: list | None = None, now_dt: datetime | None = None) -> str:
+    now_dt = datetime.now() if now_dt is None else now_dt
+    family = _derive_dart_event_family(title, matched_keywords)
+    return f"{now_dt.strftime('%Y%m%d')}:{normalize_stock_code(code)}:{family}"
+
+
+def _build_dart_execution_entry_plan(code: str, current_price: int, change_rate: float, *,
+                                     vol_ratio: float = 0.0, rs: float = 0.0,
+                                     sector_bonus: int = 0, dart_reliability: int = 0,
+                                     quote: dict | None = None, title: str = "",
+                                     signal_type: str = "DART_EVENT") -> dict | None:
+    code = normalize_stock_code(code)
+    current_price = safe_int(current_price, 0)
+    if not code or current_price <= 0:
+        return None
+    if not check_liquidity(code, max_spread=DART_EXEC_MAX_SPREAD, quote=quote):
+        return None
+    try:
+        atr_pct = float(calc_atr_pct(code, current_price, fallback_pct=2.5) or 2.5)
+    except Exception:
+        atr_pct = 2.5
+
+    if change_rate >= 20:
+        base_pullback = 2.0
+    elif change_rate >= 12:
+        base_pullback = 1.5
+    elif change_rate >= 6:
+        base_pullback = 1.1
+    elif change_rate >= 3:
+        base_pullback = 0.9
+    else:
+        base_pullback = 0.7
+
+    if vol_ratio >= 8:
+        base_pullback += 0.2
+    elif vol_ratio >= 4:
+        base_pullback += 0.1
+    if rs >= 3.0:
+        base_pullback += 0.15
+    elif rs >= 2.0:
+        base_pullback += 0.08
+    if sector_bonus >= 20:
+        base_pullback -= 0.1
+    if dart_reliability >= 2:
+        base_pullback -= 0.05
+    if "공개매수" in str(title or ""):
+        base_pullback = max(base_pullback, 0.9)
+
+    atr_pullback = max(0.6, min(atr_pct * 0.45, 2.4))
+    pullback_pct = min(max(max(base_pullback, atr_pullback), 0.7), 2.8)
+    entry_price = _round_price_down(current_price * (1 - pullback_pct / 100.0))
+    if entry_price <= 0 or entry_price >= current_price:
+        entry_price = _round_price_down(current_price * 0.995)
+    if entry_price <= 0 or entry_price >= current_price:
+        return None
+
+    stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(code, entry_price, signal_type=signal_type)
+    if stop_price <= 0 or target_price <= entry_price:
+        return None
+    if current_price >= target_price:
+        return None
+
+    risk = max(entry_price - stop_price, 1)
+    reward = max(target_price - entry_price, 0)
+    rr = round(reward / risk, 2) if risk > 0 else 0.0
+    entry_away_pct = round((current_price - entry_price) / entry_price * 100.0, 2) if entry_price else 0.0
+    if rr < DART_EXEC_MIN_RR:
+        return None
+    if entry_away_pct > DART_EXEC_MAX_ENTRY_AWAY_PCT:
+        return None
+
+    return {
+        "entry_price": int(entry_price),
+        "planned_entry_price": int(entry_price),
+        "stop_price": int(stop_price),
+        "target_price": int(target_price),
+        "stop_pct": float(stop_pct or 0.0),
+        "target_pct": float(target_pct or 0.0),
+        "atr_used": bool(atr_used),
+        "pullback_pct": round(pullback_pct, 2),
+        "rr": float(rr),
+        "entry_away_pct": float(entry_away_pct),
+    }
+
+
+def _score_dart_execution_signal(change_rate: float, vol_ratio: float, rs: float, *,
+                                 matched_urgent: list | None = None, dart_reliability: int = 0,
+                                 sector_bonus: int = 0) -> tuple[int, str]:
+    score = 60
+    if change_rate >= 15:
+        score += 12
+    elif change_rate >= 10:
+        score += 9
+    elif change_rate >= 5:
+        score += 6
+    elif change_rate >= 2:
+        score += 3
+    if vol_ratio >= 6:
+        score += 8
+    elif vol_ratio >= 4:
+        score += 6
+    elif vol_ratio >= 2:
+        score += 3
+    if rs >= 3.0:
+        score += 6
+    elif rs >= 2.0:
+        score += 4
+    elif rs >= 1.5:
+        score += 2
+    if matched_urgent:
+        score += 6
+    score += max(0, min(3, int(dart_reliability or 0))) * 3
+    if sector_bonus >= 20:
+        score += 4
+    elif sector_bonus >= 10:
+        score += 2
+    score = max(55, min(95, int(score)))
+    grade = "A" if score >= 80 else "B"
+    return score, grade
+
+
+def _build_dart_execution_stock(code: str, company: str, title: str, *, price: int,
+                                change_rate: float, today_vol: int, vol_ratio: float,
+                                sector_info: dict | None = None, dart_reliability: int = 0,
+                                matched_urgent: list | None = None, rs: float = 0.0,
+                                plan: dict | None = None, signal_type: str = "DART_EVENT") -> dict | None:
+    if not plan:
+        return None
+    sector_info = sector_info if isinstance(sector_info, dict) else {}
+    score, grade = _score_dart_execution_signal(
+        change_rate, vol_ratio, rs,
+        matched_urgent=list(matched_urgent or []),
+        dart_reliability=dart_reliability,
+        sector_bonus=int(sector_info.get("bonus", 0) or 0),
+    )
+    reasons = [f"DART 실행형: {str(title or '')[:40]}"]
+    if plan.get("pullback_pct", 0) > 0:
+        reasons.append(f"현재가 대비 눌림 {float(plan.get('pullback_pct', 0.0)):.1f}% 대기")
+    if plan.get("rr", 0) > 0:
+        reasons.append(f"손익비 {float(plan.get('rr', 0.0)):.2f}")
+    return {
+        "code": normalize_stock_code(code),
+        "name": company,
+        "price": safe_int(price, 0),
+        "change_rate": float(change_rate or 0.0),
+        "today_vol": safe_int(today_vol, 0),
+        "volume_ratio": float(vol_ratio or 0.0),
+        "signal_type": str(signal_type or "DART_EVENT"),
+        "score": int(score),
+        "grade": str(grade),
+        "entry_price": int(plan.get("entry_price", 0) or 0),
+        "planned_entry_price": int(plan.get("planned_entry_price", plan.get("entry_price", 0)) or 0),
+        "stop_loss": int(plan.get("stop_price", 0) or 0),
+        "target_price": int(plan.get("target_price", 0) or 0),
+        "atr_used": bool(plan.get("atr_used")),
+        "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "detect_time": datetime.now().strftime("%H:%M:%S"),
+        "source": "DART",
+        "dart_reliability_score": int(dart_reliability or 0),
+        "shareholder_confirmation_date": "",
+        "reasons": reasons,
+        "sector_info": dict(sector_info or {}),
+    }
+
+
 def run_dart_intraday():
-    if not DART_API_KEY or not is_market_open(): return
+    if not DART_API_KEY or not is_market_open():
+        return
     today = datetime.now().strftime("%Y%m%d")
+    dart_state = _load_dart_intraday_state()
+    state_dirty = False
     try:
         for item in _fetch_dart_list(today):
-            rcept_no = item.get("rcept_no","")
-            if not rcept_no or rcept_no in _dart_seen_ids: continue
-            title,company,code = item.get("report_nm",""),item.get("corp_name",""),item.get("stock_code","")
-            if not code: continue
-            matched_urgent = [kw for kw in DART_URGENT_KEYWORDS if kw in title]
-            matched_pos    = [kw for level,kws in DART_KEYWORDS.items() for kw in kws if kw in title]
-            if not matched_urgent and not matched_pos: continue
-            _dart_seen_ids.add(rcept_no)
-            is_risk = any(kw in title for kw in DART_RISK_KEYWORDS)
+            now_dt = datetime.now()
+            now_ts = time.time()
+            rcept_no = item.get("rcept_no", "")
+            if not rcept_no:
+                continue
+            seen_receipts = dart_state.get("seen_receipts") if isinstance(dart_state.get("seen_receipts"), dict) else {}
+            if rcept_no in _dart_seen_ids or str(rcept_no) in seen_receipts:
+                continue
 
-            # ── DART 공시 심층 분석 (기업 이벤트인 경우) ──
+            title, company, code = item.get("report_nm", ""), item.get("corp_name", ""), item.get("stock_code", "")
+            if not code:
+                dart_state.setdefault("seen_receipts", {})[str(rcept_no)] = now_ts
+                state_dirty = True
+                continue
+            matched_urgent = [kw for kw in DART_URGENT_KEYWORDS if kw in title]
+            matched_pos = [kw for level, kws in DART_KEYWORDS.items() for kw in kws if kw in title]
+            if not matched_urgent and not matched_pos:
+                dart_state.setdefault("seen_receipts", {})[str(rcept_no)] = now_ts
+                state_dirty = True
+                continue
+
+            is_risk = any(kw in title for kw in DART_RISK_KEYWORDS)
+            event_key = _build_dart_event_key(code, title, matched_urgent + matched_pos, now_dt=now_dt)
+            last_event = ((dart_state.get("event_dispatch") or {}).get(event_key) or {}) if isinstance((dart_state.get("event_dispatch") or {}).get(event_key), dict) else {"ts": (dart_state.get("event_dispatch") or {}).get(event_key)}
+            last_event_ts = float(last_event.get("ts", 0) or 0)
+            if not is_risk and last_event_ts and now_ts - last_event_ts < DART_EVENT_DEDUPE_HOURS * 3600:
+                _dart_seen_ids.add(rcept_no)
+                dart_state.setdefault("seen_receipts", {})[str(rcept_no)] = now_ts
+                state_dirty = True
+                print(f"  ↪ DART 이벤트군 중복 스킵: {company} [{_derive_dart_event_family(title, matched_urgent + matched_pos)}]")
+                continue
+
+            _dart_seen_ids.add(rcept_no)
+            dart_state.setdefault("seen_receipts", {})[str(rcept_no)] = now_ts
+            state_dirty = True
+
             dart_deep = None
             try:
-                event_kws = ["무상증자","유상증자","합병","분할","인수","자사주","배당",
-                             "흑자전환","적자전환","실적","수주","계약"]
+                event_kws = ["무상증자", "유상증자", "합병", "분할", "인수", "자사주", "배당",
+                             "흑자전환", "적자전환", "실적", "수주", "계약"]
                 if any(kw in title for kw in event_kws):
                     fake_article = [{"title": title, "url": "", "time": ""}]
                     dart_deep = analyze_news_deep(fake_article, company, code)
-            except Exception: pass
+            except Exception:
+                pass
 
-            # ── 주가 상세 조회 (실패해도 최대한 표시) ──
-            cur         = {}
-            price       = 0
+            cur = {}
+            price = 0
             change_rate = 0
-            vol_ratio   = 0
-            today_vol   = 0
+            vol_ratio = 0
+            today_vol = 0
             for _attempt in range(2):
                 try:
-                    cur         = get_stock_price(code)
-                    price       = cur.get("price", 0)
+                    cur = get_stock_price(code)
+                    price = cur.get("price", 0)
                     change_rate = cur.get("change_rate", 0)
-                    vol_ratio   = cur.get("volume_ratio", 0)
-                    today_vol   = cur.get("today_vol", 0)
-                    if price: break
-                except Exception: time.sleep(1)
+                    vol_ratio = cur.get("volume_ratio", 0)
+                    today_vol = cur.get("today_vol", 0)
+                    if price:
+                        break
+                except Exception:
+                    time.sleep(1)
 
-            # v41.78 #1: 자사주소각 공시는 change_rate 0.5% 이상이면 통과
             _is_buyback_cancel = any(kw in title for kw in ("자사주소각", "주식소각", "자기주식소각"))
             _min_change = 0.5 if _is_buyback_cancel else 1.0
             if not (change_rate >= _min_change) and not is_risk:
-                print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵"); continue
+                print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵")
+                continue
 
-            # ── 추가 지표 (각각 독립적으로 실패 허용) ──
             z = 0
-            try: z = get_volume_zscore(code, today_vol) if today_vol else 0
-            except Exception: pass
-
+            try:
+                z = get_volume_zscore(code, today_vol) if today_vol else 0
+            except Exception:
+                pass
             rs = 0
-            try: rs = get_relative_strength(change_rate)
-            except Exception: pass
-
+            try:
+                rs = get_relative_strength(change_rate)
+            except Exception:
+                pass
             ma20_dev = 0.0
-            try: ma20_dev = get_ma20_deviation(code)
-            except Exception: pass
-
+            try:
+                ma20_dev = get_ma20_deviation(code)
+            except Exception:
+                pass
             prev_upper = False
-            try: prev_upper = was_upper_limit_yesterday(code)
-            except Exception: pass
+            try:
+                prev_upper = was_upper_limit_yesterday(code)
+            except Exception:
+                pass
 
-            # 외국인·기관·개인 수급
             inv_text = ""
             try:
-                inv   = get_investor_trend(code)
-                f_net = inv.get("foreign_net",     0)
+                inv = get_investor_trend(code)
+                f_net = inv.get("foreign_net", 0)
                 i_net = inv.get("institution_net", 0)
-                r_net = inv.get("retail_net",      0)
-                # 3자 구도 표시
-                if   f_net > 0 and i_net > 0 and r_net < 0:
+                r_net = inv.get("retail_net", 0)
+                if f_net > 0 and i_net > 0 and r_net < 0:
                     inv_text = "\n💎 외국인+기관 매수 / 개인 매도 (최강 수급)"
                 elif f_net > 0 and i_net > 0:
                     inv_text = "\n✅ 외국인+기관 동시 순매수"
@@ -17182,50 +17459,51 @@ def run_dart_intraday():
                 elif i_net > 0:
                     inv_text = "\n🟡 기관 순매수"
                 elif r_net > 0 and f_net < 0 and i_net < 0:
-                    # 맥락 분석
                     _re = eval_retail_signal(code, f_net, i_net, r_net,
-                                            inv.get("cap_size","unknown") if hasattr(inv,"get") else "unknown")
-                    if _re and _re.get("score_adj",0) >= 0:
+                                             inv.get("cap_size", "unknown") if hasattr(inv, "get") else "unknown")
+                    if _re and _re.get("score_adj", 0) >= 0:
                         inv_text = f"\n{_re['label']}"
                     else:
                         inv_text = "\n⚠️ 개인만 매수 / 기관+외국인 이탈 (맥락 주의)"
                 elif f_net < 0 and i_net < 0:
                     inv_text = "\n🔵 외국인+기관 동시 순매도"
-            except Exception: pass
+            except Exception:
+                pass
 
-            # ATR 손절·목표가
-            entry = price or 0
-            stop = target = stop_pct = target_pct = 0
-            atr_used = False
-            if price:
-                try:
-                    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MANUAL")
-                except Exception: pass
-            atr_tag = " (ATR)" if atr_used else " (고정)"
-
-            # 섹터 모멘텀 (실패 시 백그라운드 재시도)
-            sector_info = {"bonus":0,"detail":[],"rising":[],"flat":[],"theme":"","summary":""}
+            sector_info = {"bonus": 0, "detail": [], "rising": [], "flat": [], "theme": "", "summary": ""}
             try:
                 if price:
                     sector_info = calc_sector_momentum(code, company)
-            except Exception: pass
-
-            # 섹터 지속 모니터링 + 진입가 감시 등록 (공시 발생 종목)
+            except Exception:
+                pass
             if price:
                 start_sector_monitor(code, company, "DISCLOSURE", datetime.now().strftime("%H:%M:%S"), False)
 
-            # ── 이모지 및 등급 ──
+            dart_reliability = get_dart_reliability_score(title)
+            signal_type = "DART_BUYBACK_CANCEL" if _is_buyback_cancel else "DART_EVENT"
+            execution_plan = None
+            if price and not is_risk:
+                try:
+                    execution_plan = _build_dart_execution_entry_plan(
+                        code, price, change_rate,
+                        vol_ratio=vol_ratio, rs=rs,
+                        sector_bonus=int(sector_info.get("bonus", 0) or 0),
+                        dart_reliability=dart_reliability,
+                        quote=cur, title=title, signal_type=signal_type,
+                    )
+                except Exception:
+                    execution_plan = None
+
             emoji = "🚨" if is_risk else ("🚀" if change_rate >= 10.0 else "📢")
-            tag   = "⚠️ 위험 공시" if is_risk else "✅ 주요 공시"
+            tag = "⚠️ 위험 공시" if is_risk else "✅ 주요 공시"
             all_kw = list(dict.fromkeys(matched_urgent + matched_pos))
 
-            # ── 주가 블록 (항상 표시, 조회 실패 시 안내) ──
             if price:
-                vol_str    = f"<b>{vol_ratio:.1f}배</b> (5일 평균 대비)" if vol_ratio else "조회 중"
+                vol_str = f"<b>{vol_ratio:.1f}배</b> (5일 평균 대비)" if vol_ratio else "조회 중"
                 zscore_str = f"  📊 Z={z:.1f}σ" if z >= VOL_ZSCORE_MIN else ""
-                rs_str     = f"  💪 RS={rs:.1f}x" if rs >= RS_MIN else ""
-                ma_str     = f"  📐 20일선 {ma20_dev:+.1f}%" if ma20_dev else ""
-                prev_str   = "\n🔁 전일 상한가 종목" if prev_upper else ""
+                rs_str = f"  💪 RS={rs:.1f}x" if rs >= RS_MIN else ""
+                ma_str = f"  📐 20일선 {ma20_dev:+.1f}%" if ma20_dev else ""
+                prev_str = "\n🔁 전일 상한가 종목" if prev_upper else ""
                 price_block = (
                     f"\n━━━━━━━━━━━━━━━\n"
                     f"💰 현재가: <b>{price:,}원</b>  (<b>{change_rate:+.1f}%</b>)\n"
@@ -17236,72 +17514,73 @@ def run_dart_intraday():
             else:
                 price_block = "\n━━━━━━━━━━━━━━━\n💰 현재가: 조회 실패 (장 중 API 지연)"
 
-            # ── 손절·목표가 블록 ──
-            if price and stop and target:
+            if execution_plan and price:
+                atr_tag = " (ATR)" if execution_plan.get("atr_used") else " (고정)"
                 stop_block = (
                     f"\n━━━━━━━━━━━━━━━\n"
-                    f"🎯 진입가: <b>{entry:,}원</b>\n"
-                    f"🛡 손절가: <b>{stop:,}원</b>  (-{stop_pct:.1f}%){atr_tag}\n"
-                    f"🏆 목표가: <b>{target:,}원</b>  (+{target_pct:.1f}%){atr_tag}"
+                    f"🎯 진입가: <b>{int(execution_plan['entry_price']):,}원</b>  (현재가 대비 -{float(execution_plan['entry_away_pct']):.1f}%)\n"
+                    f"🛡 손절가: <b>{int(execution_plan['stop_price']):,}원</b>  (-{float(execution_plan['stop_pct']):.1f}%){atr_tag}\n"
+                    f"🏆 목표가: <b>{int(execution_plan['target_price']):,}원</b>  (+{float(execution_plan['target_pct']):.1f}%){atr_tag}\n"
+                    f"📐 실행 기준: 눌림 {float(execution_plan['pullback_pct']):.1f}% / 손익비 {float(execution_plan['rr']):.2f}"
                 )
+            elif not is_risk:
+                stop_block = "\n━━━━━━━━━━━━━━━\n🎯 실행형 진입가: 산출 보류 (호가유동성/손익비/목표여력 부족)"
             else:
                 stop_block = ""
 
-            # ── 섹터 블록 ──
             sector_block = ""
             rising = sector_info.get("rising", [])
-            flat   = sector_info.get("flat", [])
+            flat = sector_info.get("flat", [])
             detail = sector_info.get("detail", [])
-            theme  = sector_info.get("theme", "")
+            theme = sector_info.get("theme", "")
             if detail:
-                react_cnt    = len(rising)
-                total_cnt    = len(detail)
+                react_cnt = len(rising)
+                total_cnt = len(detail)
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: <b>{react_cnt}/{total_cnt}개</b> 동반 상승\n"
                 sector_block += "".join([
-                    f"  📈 {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
-                    + (f" 🔊{r['volume_ratio']:.0f}x" if r.get("volume_ratio",0)>=2 else "") + "\n"
+                    f"  📈 {_resolve_stock_name(r['code'], r.get('name', ''))} {r['change_rate']:+.1f}%"
+                    + (f" 🔊{r['volume_ratio']:.0f}x" if r.get('volume_ratio', 0) >= 2 else "") + "\n"
                     for r in rising[:4]
                 ])
                 for r in flat[:2]:
-                    sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%\n"
+                    sector_block += f"  ➖ {_resolve_stock_name(r['code'], r.get('name', ''))} {r['change_rate']:+.1f}%\n"
             elif theme:
                 sector_block = f"\n━━━━━━━━━━━━━━━\n🏭 섹터 [{theme}]: 동업종 조회 중\n"
-                # v39.4-#7: 배경 재조회 (DART 알림용)
                 def _dart_sector_retry(_code, _name, _theme):
                     time.sleep(30)
                     try:
                         si2 = calc_sector_momentum(_code, _name)
                         if si2.get("rising"):
                             _l = si2.get("leader")
-                            _msg = f"🏭 <b>섹터 [{_theme}] 조회 완료</b>\n  {si2.get('summary','')}\n"
+                            _msg = f"🏭 <b>섹터 [{_theme}] 조회 완료</b>\n  {si2.get('summary', '')}\n"
                             if _l and isinstance(_l, dict):
-                                _msg += f"  👑 <b>대장: {_l['name']}</b> {_l.get('cr',0):+.1f}%\n"
+                                _msg += f"  👑 <b>대장: {_l['name']}</b> {_l.get('cr', 0):+.1f}%\n"
                             send(_msg)
-                    except Exception: pass
+                    except Exception:
+                        pass
                 threading.Thread(target=_dart_sector_retry, args=(code, company, theme), daemon=True).start()
 
-            # 심층 분석 블록
             deep_block = ""
             if dart_deep:
-                verd = dart_deep.get("verdict","")
-                adj  = dart_deep.get("score_adj", 0)
-                rsn  = dart_deep.get("reason","")
-                rps  = dart_deep.get("risk_points",[])
+                verd = dart_deep.get("verdict", "")
+                adj = dart_deep.get("score_adj", 0)
+                rsn = dart_deep.get("reason", "")
+                rps = dart_deep.get("risk_points", [])
                 if verd == "표면호재실질악재":
                     deep_block = f"\n━━━━━━━━━━━━━━━\n⚠️ <b>표면호재실질악재 경고</b>\n  {rsn}"
                     for rp in rps[:2]:
                         deep_block += f"\n  🔸 {rp}"
                 elif verd == "표면악재실질호재":
                     deep_block = f"\n━━━━━━━━━━━━━━━\n💡 <b>역발상 매수 검토</b>\n  {rsn}"
-                elif verd in ("실질호재","실질악재") and rsn:
+                elif verd in ("실질호재", "실질악재") and rsn:
                     v_emoji = "✅" if "호재" in verd else "❌"
                     deep_block = f"\n━━━━━━━━━━━━━━━\n{v_emoji} <b>{verd}</b>  {adj:+d}점\n  {rsn}"
 
-            # v37.0: 과거 유사 공시 이력 조회
             dart_hist_block = ""
             try:
                 dart_hist_block = get_dart_keyword_history(code, company, all_kw)
-            except Exception: pass
+            except Exception:
+                pass
 
             send_with_chart_buttons(
                 f"{emoji} <b>[공시+주가 연동]</b>  {tag}\n"
@@ -17320,28 +17599,57 @@ def run_dart_intraday():
             )
             print(f"  📋 공시 알림: {company} {change_rate:+.1f}% - {title}")
 
-            # v41.78 #1: 자사주소각 공시 → 진입감시 즉시 등록
-            if _is_buyback_cancel and price:
+            if not is_risk:
+                dart_state.setdefault("event_dispatch", {})[event_key] = {
+                    "ts": now_ts,
+                    "title": str(title or "")[:120],
+                }
+                state_dirty = True
+
+            registered_dart_execution = False
+            if execution_plan and price and not is_risk:
+                try:
+                    dart_entry_stock = _build_dart_execution_stock(
+                        code, company, title, price=price, change_rate=change_rate,
+                        today_vol=today_vol, vol_ratio=vol_ratio, sector_info=sector_info,
+                        dart_reliability=dart_reliability, matched_urgent=matched_urgent,
+                        rs=rs, plan=execution_plan, signal_type=signal_type,
+                    )
+                    if dart_entry_stock:
+                        save_signal_log(dart_entry_stock)
+                        register_entry_watch(dart_entry_stock)
+                        registered_dart_execution = True
+                        print(f"  ✅ DART 실행형 진입감시 등록: {company} {int(execution_plan['entry_price']):,}원")
+                except Exception as _e:
+                    print(f"  ⚠️ DART 실행형 등록 실패: {_e}")
+
+            if _is_buyback_cancel and price and not registered_dart_execution:
                 try:
                     _dart_entry_stock = {
                         "code": code, "name": company, "price": price,
                         "change_rate": change_rate, "signal_type": "DART_BUYBACK_CANCEL",
-                        "score": 70, "entry_price": price,
+                        "score": 70, "grade": "B", "entry_price": price,
+                        "planned_entry_price": price,
                         "stop_loss": round(price * 0.97),
                         "target_price": round(price * 1.05),
                         "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "detect_time": datetime.now().strftime("%H:%M:%S"),
                         "source": "DART",
-                        "dart_reliability_score": get_dart_reliability_score(title),
+                        "dart_reliability_score": dart_reliability,
                         "shareholder_confirmation_date": "",
                         "reasons": [f"자사주소각 공시: {title[:30]}"],
+                        "sector_info": dict(sector_info or {}),
                     }
                     register_entry_watch(_dart_entry_stock)
                     save_signal_log(_dart_entry_stock)
                     print(f"  ✅ 자사주소각 진입감시 즉시 등록: {company} {price:,}원")
                 except Exception as _e:
                     print(f"  ⚠️ 자사주소각 진입감시 등록 실패: {_e}")
-    except Exception as e: print(f"⚠️ DART 오류: {e}")
+    except Exception as e:
+        print(f"⚠️ DART 오류: {e}")
+    finally:
+        if state_dirty:
+            _save_dart_intraday_state(dart_state)
 
 def analyze_dart_disclosures():
     if not DART_API_KEY: return
