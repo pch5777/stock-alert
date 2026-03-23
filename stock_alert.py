@@ -3,12 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.99
+버전: v41.100
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.100 (2026-03-23): 오전 NXT 장전 선포착 호출 복구.
+  [#1] `check_nxt_preopen_detection()`를 분리해 08:00~08:59 NXT 장전 선포착 조건을 별도 helper로 정리.
+  [#2] `run_scan()`에서 `nxt_open and not krx_open` 구간에도 해당 helper를 호출하도록 연결해,
+       정규장 시작 전에도 장전 NXT 선포착 신호가 실제로 평가되게 수정.
+  [#3] 기존 `check_early_detection()`는 KRX 장중 조기포착을 유지하되, 장전 NXT 선포착 helper를 재사용하도록 정리.
+  이유: 오전 NXT-only 구간에서는 후보 수집은 되고 있었지만 장전 선포착 호출 경로가 막혀 실제 신호가 전부 사라지고 있었음.
+  개선점: 오전 NXT 선포착 복구↑, 장전 후보 포착 연속성↑, KRX 개장 전 알림 공백 감소↑.
+  주의점: 이번 버전은 장전 NXT 선포착 호출 경로만 복구하며 기존 점수식/일반 장중 스캔 구조는 유지.
 
 - v41.99 (2026-03-23): 상승이탈 기반 진입가 자동완화 + 손실 누적 시 보수 복원 가드 추가.
   [#1] `_signal_feedback_sort_key()` / `_auto_tune_entry_pullback_ratio_feedback()`를 추가해
@@ -14391,6 +14400,62 @@ def analyze(stock: dict) -> dict:
 # ============================================================
 # 조기 포착
 # ============================================================
+def check_nxt_preopen_detection(existing_codes=None) -> list:
+    signals = []
+    existing = set(existing_codes or [])
+
+    now_t = datetime.now().time()
+    if not (is_nxt_open() and dtime(8, 0) <= now_t < dtime(9, 0)):
+        return signals
+
+    for stock in get_nxt_surge_stocks():
+        code = stock.get("code",""); price = stock.get("price",0)
+        vr   = stock.get("volume_ratio",0); cr = stock.get("change_rate",0)
+        if not code or price < 500 or code in existing:
+            continue
+        if cr < 5.0 or vr < 5.0:
+            continue   # NXT 장 전 기준 더 엄격
+
+        nxt = get_nxt_info(code)
+        pre_score = 70
+        pre_reasons = [
+            f"🌅 장 전 NXT 선포착!",
+            f"📈 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
+            f"💥 NXT 거래량 {vr:.1f}배",
+        ]
+        if nxt.get("inv_bullish"):
+            pre_score += 15
+            pre_reasons.append(f"🔴 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
+        if nxt.get("vs_krx_pct", 0) > 0.5:
+            pre_score += 10
+            pre_reasons.append(f"🔴 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
+        if pre_score < 75:
+            continue
+
+        entry = price
+        stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="EARLY_DETECT")
+        pre_key = f"NXT_PRE_{code}"
+        if time.time() - _alert_history.get(pre_key, 0) < 3600:
+            continue
+        _alert_history[pre_key] = time.time()
+
+        pre_score, pre_reasons, pre_similar_pattern_stats = _apply_similar_pattern_score(
+            pre_score, pre_reasons, code, "EARLY_DETECT", cr, vr, weight_mode="strong"
+        )
+        signals.append({"code":code,"name":stock.get("name",code),"price":price,
+                        "change_rate":cr,"volume_ratio":vr,
+                        "signal_type":"EARLY_DETECT","score":pre_score,
+                        "sector_info":{},"market":"NXT",
+                        "similar_pattern_stats":pre_similar_pattern_stats,
+                        "entry_price":entry,"stop_loss":stop,"target_price":target,
+                        "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
+                        "prev_upper":False,"reasons":pre_reasons,
+                        "detected_at":datetime.now()})
+        existing.add(code)
+
+    return signals
+
+
 def check_early_detection() -> list:
     signals = []
     for stock in get_volume_surge_stocks():
@@ -14485,49 +14550,7 @@ def check_early_detection() -> list:
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":prev_upper,"reasons":reasons,"detected_at":now})
 
-    # ── 장 전 NXT 선포착 (08:00~08:59) ──
-    # KRX 개장 전 NXT에서 이미 급등 중인 종목을 미리 포착
-    now_t = datetime.now().time()
-    if dtime(8, 0) <= now_t < dtime(9, 0):
-        for stock in get_nxt_surge_stocks():
-            code = stock.get("code",""); price = stock.get("price",0)
-            vr   = stock.get("volume_ratio",0); cr = stock.get("change_rate",0)
-            if not code or price < 500 or code in {s["code"] for s in signals}: continue
-            if cr < 5.0 or vr < 5.0: continue   # NXT 장 전 기준 더 엄격
-
-            nxt = get_nxt_info(code)
-            pre_score = 70
-            pre_reasons = [
-                f"🌅 장 전 NXT 선포착!",
-                f"📈 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
-                f"💥 NXT 거래량 {vr:.1f}배",
-            ]
-            if nxt.get("inv_bullish"):
-                pre_score += 15
-                pre_reasons.append(f"🔴 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
-            if nxt.get("vs_krx_pct", 0) > 0.5:
-                pre_score += 10
-                pre_reasons.append(f"🔴 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
-            if pre_score < 75: continue
-
-            entry = price
-            stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="EARLY_DETECT")
-            pre_key = f"NXT_PRE_{code}"
-            if time.time() - _alert_history.get(pre_key, 0) < 3600: continue
-            _alert_history[pre_key] = time.time()
-
-            pre_score, pre_reasons, pre_similar_pattern_stats = _apply_similar_pattern_score(
-                pre_score, pre_reasons, code, "EARLY_DETECT", cr, vr, weight_mode="strong"
-            )
-            signals.append({"code":code,"name":stock.get("name",code),"price":price,
-                            "change_rate":cr,"volume_ratio":vr,
-                            "signal_type":"EARLY_DETECT","score":pre_score,
-                            "sector_info":{},"market":"NXT",
-                            "similar_pattern_stats":pre_similar_pattern_stats,
-                            "entry_price":entry,"stop_loss":stop,"target_price":target,
-                            "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
-                            "prev_upper":False,"reasons":pre_reasons,
-                            "detected_at":datetime.now()})
+    signals.extend(check_nxt_preopen_detection(existing_codes={s["code"] for s in signals}))
 
     return signals
 
@@ -20640,14 +20663,19 @@ def run_scan():
             if r and time.time()-_alert_history.get((f"NXT_{r['code']}" if r.get("market") == "NXT" else r["code"]),0)>get_regime_cooldown():
                 alerts.append(r); seen.add(code)
 
-        # 조기포착·눌림목은 KRX 장중에만 의미 있음
+        # 조기포착은 KRX 장중 + 오전 NXT 장전 선포착을 모두 반영
         if krx_open:
             for s in check_early_detection():
-                if s["code"] not in seen and time.time()-_alert_history.get(s["code"],0)>get_regime_cooldown():
+                hist_key = f"NXT_{s['code']}" if s.get("market") == "NXT" else s["code"]
+                if s["code"] not in seen and time.time()-_alert_history.get(hist_key,0)>get_regime_cooldown():
                     alerts.append(s); seen.add(s["code"])
             for s in check_pullback_signals():
                 # v39.3-#9-2: MID_PULLBACK↔ENTRY_POINT 동일종목 중복 억제
                 if s["code"] not in seen and s["code"] not in _mid_pullback_alert_history:
+                    alerts.append(s); seen.add(s["code"])
+        elif nxt_open:
+            for s in check_nxt_preopen_detection(existing_codes=seen):
+                if s["code"] not in seen and time.time()-_alert_history.get(f"NXT_{s['code']}",0)>get_regime_cooldown():
                     alerts.append(s); seen.add(s["code"])
 
         # ── v39.3-#9-5: 섹터당 최대 신호 수 제한 (집중도 향상) ──
