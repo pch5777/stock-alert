@@ -1,14 +1,25 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.100
+버전: v41.101
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.101 (2026-03-23): 급등/조기포착 계열 고점추격방지 경과 완화 복구.
+  [#1] `RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES`를 추가해 `SURGE` / `EARLY_DETECT` / `NEAR_UPPER`에만
+       경과 완화 로직을 다시 연결하고, `MID_PULLBACK` / `ENTRY_POINT`는 기존 고점추격방지 고정 정책을 유지.
+  [#2] `_select_representative_entry_price()` / `_apply_entry_price_guard()`에 `detect_date` / `miss_count`를 복구해
+       최초 포착 2일 경과, 미도달 3회 이상, 괴리율 15% 이상 중 하나면 상향 진입가 갱신을 허용하도록 수정.
+  [#3] 대표 진입가 재동기화 및 진입감시 재등록 경로에서 `first_detect_date` / `miss_count`를 함께 넘기고,
+       `_entry_watch`에 `first_detect_date`를 보존해 재포착 누적 시간이 끊기지 않도록 정리.
+  이유: `SURGE` 계열은 고점추격방지를 너무 오래 고정하면 현재 시장과 동떨어진 진입가가 유지돼 실질 진입 기회를 놓칠 수 있었음.
+  개선점: 급등 재포착 현실성↑, 오래된 대표 진입가 갱신 가능성↑, SURGE 계열 행동 가능성↑.
+  주의점: 눌림목 계열(`MID_PULLBACK`, `ENTRY_POINT`)은 동일 완화에서 제외해 기존 보수성을 유지.
 
 - v41.100 (2026-03-23): 오전 NXT 장전 선포착 호출 복구.
   [#1] `check_nxt_preopen_detection()`를 분리해 08:00~08:59 NXT 장전 선포착 조건을 별도 helper로 정리.
@@ -1440,6 +1451,7 @@ NEWS_STOCK_PROMOTION_MIN_VOLUME = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_VOLU
 NEWS_STOCK_PROMOTION_LIMIT = int(os.getenv("NEWS_STOCK_PROMOTION_LIMIT", "3") or "3")
 NEWS_STOCK_PROMOTION_COOLDOWN = int(os.getenv("NEWS_STOCK_PROMOTION_COOLDOWN", "900") or "900")
 NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK", "ENTRY_POINT"}
+RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
@@ -3609,6 +3621,7 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("signal_log_key", str(watch.get("signal_log_key", key) or key))
             watch.setdefault("detect_date", str(watch.get("detect_date", "") or ""))
             watch.setdefault("detect_time", str(watch.get("detect_time", "") or ""))
+            watch.setdefault("first_detect_date", str(watch.get("first_detect_date", watch.get("detect_date", "")) or ""))
             watch.setdefault("notify_count", safe_int(watch.get("notify_count", 0), 0))
             watch.setdefault("miss_count", safe_int(watch.get("miss_count", 0), 0))
             watch.setdefault("peak_price", safe_int(watch.get("peak_price", 0), 0))
@@ -8638,7 +8651,8 @@ def _calc_resurge_entry_price(current_price: int, pullback_low: int, reclaim_rat
     return int(base_entry)
 
 
-def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_type: str = "") -> tuple[int, str]:
+def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_type: str = "",
+                                       detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
     prev_entry = safe_int(prev_entry, 0)
     next_entry = safe_int(next_entry, 0)
     sig_type = str(signal_type or "")
@@ -8649,14 +8663,32 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
     if next_entry < prev_entry:
         return next_entry, "하향갱신"
     if next_entry > prev_entry and sig_type in NO_CHASE_ENTRY_SIGNAL_TYPES:
+        if sig_type in RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES:
+            try:
+                if detect_date:
+                    elapsed = (datetime.strptime(datetime.now().strftime("%Y%m%d"), "%Y%m%d") -
+                               datetime.strptime(detect_date, "%Y%m%d")).days
+                else:
+                    elapsed = 0
+            except Exception:
+                elapsed = 0
+            gap_pct = (next_entry - prev_entry) / prev_entry * 100 if prev_entry else 0.0
+            if elapsed >= 2 or safe_int(miss_count, 0) >= 3 or gap_pct >= 15.0:
+                reason = f"경과완화({elapsed}일/{safe_int(miss_count, 0)}회/괴리{gap_pct:.0f}%)"
+                return next_entry, reason
         return prev_entry, "고점추격방지유지"
     return next_entry, "상향갱신" if next_entry > prev_entry else "기존유지"
 
 
-def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0) -> tuple[int, str]:
+def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0, detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
     stock = stock if isinstance(stock, dict) else {}
     current_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
-    chosen_entry, mode = _select_representative_entry_price(prev_entry, current_entry, stock.get("signal_type", ""))
+    _det_date = detect_date or str(stock.get("first_detect_date", stock.get("detect_date", "")) or "")
+    _miss_cnt = miss_count or safe_int(stock.get("miss_count", 0), 0)
+    chosen_entry, mode = _select_representative_entry_price(
+        prev_entry, current_entry, stock.get("signal_type", ""),
+        detect_date=_det_date, miss_count=_miss_cnt
+    )
     if chosen_entry > 0:
         stock["entry_price"] = chosen_entry
         planned_prev = safe_int(stock.get("planned_entry_price", current_entry or chosen_entry), 0)
@@ -8904,7 +8936,11 @@ def save_signal_log(stock: dict):
             stock["signal_log_key"] = representative_key
             if not rec.get("entry_hit"):
                 prev_entry = safe_int(rec.get("entry_price", 0), 0)
-                _chosen_entry, _entry_guard_mode = _apply_entry_price_guard(stock, prev_entry)
+                _chosen_entry, _entry_guard_mode = _apply_entry_price_guard(
+                    stock, prev_entry,
+                    detect_date=str(rec.get("first_detect_date", rec.get("detect_date", "")) or ""),
+                    miss_count=safe_int(rec.get("miss_count", 0), 0)
+                )
                 next_entry = safe_int(stock.get("entry_price", stock.get("price", 0)), 0)
                 if next_entry != prev_entry:
                     _append_tracking_entry_update(rec, prev_entry, next_entry, reason="재포착대표진입갱신" if _entry_guard_mode != "고점추격방지유지" else "재포착고점추격방지")
@@ -11768,7 +11804,12 @@ def register_entry_watch(s: dict):
     latest_old_watch = max((w for _, w in old_items), key=lambda x: x.get("registered_ts", 0), default=None)
     previous_entry = safe_int((latest_old_watch or {}).get("entry_price", 0), 0)
     previous_miss_count = safe_int((latest_old_watch or {}).get("miss_count", 0), 0)
-    entry, entry_guard_mode = _apply_entry_price_guard(s, previous_entry)
+    previous_first_detect_date = str((latest_old_watch or {}).get("first_detect_date", (latest_old_watch or {}).get("detect_date", "")) or "")
+    entry, entry_guard_mode = _apply_entry_price_guard(
+        s, previous_entry,
+        detect_date=previous_first_detect_date,
+        miss_count=previous_miss_count
+    )
 
     try:
         sig_data = {}
@@ -11833,6 +11874,7 @@ def register_entry_watch(s: dict):
         "signal_log_key": signal_log_key,
         "detect_date": detect_date,
         "detect_time": detect_time,
+        "first_detect_date": previous_first_detect_date or detect_date,
         "last_notified_ts": 0,
         "notify_count": 0,
         "miss_count": previous_miss_count + len(old_items),
