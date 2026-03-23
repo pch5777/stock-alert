@@ -1,13 +1,25 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v55
+버전: v56
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v56 (2026-03-24): NXT 포착 외부알림 복구 — 장전/장후 NXT helper에 grade 부여.
+  [#1] `_derive_general_signal_grade()`를 추가해, `SURGE` / `EARLY_DETECT` 계열이 `analyze()`와 동일한 A게이트 완화 규칙으로
+       score→grade를 계산하도록 공용화.
+  [#2] `check_nxt_preopen_detection()` / `check_nxt_postmarket_detection()`가 helper 반환 신호에
+       `grade` / `execution_grade` / `pattern_grade` / `position`을 함께 싣도록 수정.
+  [#3] 이로써 NXT helper 신호가 점수는 80점대인데도 `grade` 누락으로 `C등급 외부알림 억제(A전용)`에 걸려
+       내부기록만 남던 문제를 차단.
+  이유: 실로그에서 `삼성전자`, `DL이앤씨`, `삼성E&A`가 `84점 [C]`, `85점 [C]`로 찍혀 NXT 포착 자체는 있었지만
+       외부알림 단계에서 grade 미기재 신호가 기본값 `C`로 해석되고 있었음.
+  개선점: NXT 장전/장후 선포착의 실제 외부알림 복구, A전용 억제 오탐↓, signal_log/entry_watch 등급 일관성↑.
+  주의점: 이번 수정은 NXT helper의 grade 누락 보정이며, 실제 A조건은 기존 `GENERAL_A_RELAX_SIGNAL_TYPES` / A게이트 규칙을 그대로 따른다.
 
 - v55 (2026-03-24): 고아 추적 만료 전파 보강 + 장전/오버나이트 stale 재노출 차단.
   [#1] `_get_tracking_elapsed_days()` / `_is_tracking_display_expired()` / `_iter_signal_log_records()`를 추가해,
@@ -16239,12 +16251,21 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
             )
             continue
 
+        grade = _derive_general_signal_grade(
+            "EARLY_DETECT", pre_score, change_rate=cr, vol_ratio=vr,
+            sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=int(nxt.get("vs_krx_pct", 0) or 0),
+            market="NXT", reasons=pre_reasons,
+        )
+        position = calc_position_size("EARLY_DETECT", pre_score, grade)
+
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":cr,"volume_ratio":vr,
                         "signal_type":"EARLY_DETECT","score":pre_score,
+                        "grade":grade,"execution_grade":grade,"pattern_grade":grade,
                         "sector_info":sector_info,"sector_theme": sector_info.get("theme", ""),
                         "direct_news_hit": direct_news_hit, "market":"NXT",
                         "similar_pattern_stats":pre_similar_pattern_stats,
+                        "position": position,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":False,"reasons":pre_reasons,
@@ -16384,13 +16405,22 @@ def check_nxt_postmarket_detection(existing_codes=None) -> list:
         entry = int((price - (price - open_est) * _pullback_r) / 10) * 10
         stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="SURGE")
 
+        grade = _derive_general_signal_grade(
+            "SURGE", score, change_rate=cr, vol_ratio=vr,
+            sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=int(float(nxt.get("vs_krx_pct", 0.0) or 0.0)),
+            market="NXT", reasons=reasons,
+        )
+        position = calc_position_size("SURGE", score, grade)
+
         signals.append({
             "code": code, "name": stock.get("name", code), "price": price,
             "change_rate": cr, "volume_ratio": vr,
             "signal_type": "SURGE", "score": score,
+            "grade": grade, "execution_grade": grade, "pattern_grade": grade,
             "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
             "direct_news_hit": direct_news_hit, "market": "NXT",
             "nxt_post_leader_hit": True,
+            "position": position,
             "entry_price": entry, "stop_loss": stop, "target_price": target,
             "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
             "prev_upper": False, "reasons": reasons,
@@ -17340,6 +17370,24 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     market_flag = str(market or "").upper() == "NXT"
     return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
+
+
+def _derive_general_signal_grade(signal_type: str, score: int, change_rate: float = 0.0,
+                                 vol_ratio: float = 0.0, sector_info: dict | None = None,
+                                 direct_news_hit: bool = False, nxt_delta: int = 0,
+                                 market: str = "", reasons: list | None = None) -> str:
+    a_cut = 80
+    if _should_relax_general_a_threshold(
+        signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio,
+        sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta,
+        market=market, reasons=reasons,
+    ):
+        a_cut = min(a_cut, GENERAL_A_RELAXED_SCORE)
+    if score >= a_cut:
+        return "A"
+    if score >= 60:
+        return "B"
+    return "C"
 
 
 def _should_send_external_grade_alert(signal: dict | None) -> bool:
