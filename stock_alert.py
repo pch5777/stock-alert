@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v53
+버전: v54
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v54 (2026-03-23): KIS REST 전역 호출 제한기 추가.
+  [#1] `KIS_REST_LIMIT_PER_SEC` / `KIS_TOKEN_LIMIT_PER_SEC` / `_wait_for_kis_rest_slot()`를 추가해,
+       실전 REST 호출을 전역 1초 윈도우에서 내부 상한(default 14건/초)으로 평탄화하고 토큰 발급도 1건/초로 별도 제한하도록 수정.
+  [#2] `get_token()`과 `_safe_get()`의 실제 KIS REST 호출 직전에 동일 limiter를 연결해,
+       재시도·403 재발급·동시 스캔이 겹쳐도 순간 burst가 공식 한도에 근접하지 않도록 보강.
+  [#3] `SCAN_INTERVAL` 주석과 limiter 진단 카운터를 정리해,
+       스캔 주기 자체가 아니라 전역 REST gate가 호출 한도 보호의 1차 장치임을 코드 해석상 명확히 반영.
+  이유: 실전투자 REST는 최신 공지 기준 1초당 20건으로 관리되며, 기존 v53은 평균 주기만 보수적으로 잡고 순간 burst를 제어하지 못해
+       장중/장마감/NXT 후처리 겹침 구간에서 호출 한도 안전 설계를 보장하기 어려웠음.
+  개선점: 실전 REST burst 리스크↓, 장마감 self-audit/auto_tune 유지한 채 순간 호출 평탄화↑, 호출 한도 관련 운영 안전성↑.
+  주의점: 내부 상한은 단일 프로세스 기준 기본 14건/초이며, 동일 appkey를 다른 프로세스·수동 조회와 병행하면 환경변수로 더 낮춰 운영하는 것이 안전함.
 
 - v53 (2026-03-23): 동시보유 제한 후단 이동 + 신규 리더 선평가/후제한.
   [#1] `_get_carry_position_context()` / `_apply_position_limit_after_priority()`를 추가해,
@@ -825,6 +837,7 @@ _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 
 import os, requests, time, schedule, json, random, threading, math
+from collections import deque
 import xml.etree.ElementTree as ET
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
@@ -840,6 +853,10 @@ def _now_kst() -> datetime:
 _file_lock  = threading.Lock()   # signal_log/carry/dynamic JSON 읽기/쓰기
 _state_lock = threading.Lock()   # _detected_stocks/_alert_history 등 공유 dict
 _cache_lock = threading.Lock()   # 캐시 dict 일괄 관리
+_kis_rate_lock = threading.Lock()  # KIS REST 전역 호출 burst 제어
+_kis_rest_call_times = deque()
+_kis_token_call_times = deque()
+_kis_rate_stats = {"rest_wait_events": 0, "rest_wait_sec": 0.0, "token_wait_events": 0, "token_wait_sec": 0.0}
 
 # ============================================================
 # 📊 에러 집계 (v38.3-D2)
@@ -2416,7 +2433,9 @@ EARLY_PRICE_MIN       = 9.0
 EARLY_VOLUME_MIN      = 9.0
 EARLY_HOGA_RATIO      = 3.0
 EARLY_CONFIRM_COUNT   = 2
-SCAN_INTERVAL         = 20    # 60→20초 (KIS API 분당 20회 한도 내 최대)
+SCAN_INTERVAL         = 20    # 60→20초 (스캔 cadence; 실제 KIS 호출 보호는 전역 REST limiter가 담당)
+KIS_REST_LIMIT_PER_SEC = int(os.getenv("KIS_REST_LIMIT_PER_SEC", "14") or "14")
+KIS_TOKEN_LIMIT_PER_SEC = int(os.getenv("KIS_TOKEN_LIMIT_PER_SEC", "1") or "1")
 ALERT_COOLDOWN        = 1800
 
 # ── v41.61: 시장 레짐별 파라미터 대응표 ──
@@ -2970,12 +2989,38 @@ def _get_time_risk_profile() -> str:
 # ============================================================
 # 🔐 KIS API
 # ============================================================
+def _wait_for_kis_rest_slot(kind: str = "rest") -> None:
+    """실전 KIS REST burst를 1초 윈도우 내부 상한으로 평탄화한다."""
+    limit = KIS_TOKEN_LIMIT_PER_SEC if kind == "token" else KIS_REST_LIMIT_PER_SEC
+    limit = max(1, int(limit or 1))
+    window = 1.0
+    min_sleep = 0.01
+    dq = _kis_token_call_times if kind == "token" else _kis_rest_call_times
+    stat_wait_key = "token_wait_sec" if kind == "token" else "rest_wait_sec"
+    stat_evt_key = "token_wait_events" if kind == "token" else "rest_wait_events"
+
+    while True:
+        sleep_for = 0.0
+        with _kis_rate_lock:
+            now = time.monotonic()
+            while dq and now - dq[0] >= window:
+                dq.popleft()
+            if len(dq) < limit:
+                dq.append(now)
+                return
+            oldest = dq[0] if dq else now
+            sleep_for = max(min_sleep, window - (now - oldest) + 0.005)
+            _kis_rate_stats[stat_evt_key] = int(_kis_rate_stats.get(stat_evt_key, 0)) + 1
+            _kis_rate_stats[stat_wait_key] = float(_kis_rate_stats.get(stat_wait_key, 0.0)) + float(sleep_for)
+        time.sleep(sleep_for)
+
 def get_token(retry: int = 3) -> str:
     global _access_token, _token_expires
     if _access_token and time.time() < _token_expires:
         return _access_token
     for attempt in range(retry):
         try:
+            _wait_for_kis_rest_slot("token")
             resp = _session.post(f"{KIS_BASE_URL}/oauth2/tokenP",
                 json={"grant_type":"client_credentials","appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET},
                 timeout=15)
@@ -3005,6 +3050,7 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
 
     for attempt in range(3):
         try:
+            _wait_for_kis_rest_slot("rest")
             resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
             last_status = getattr(resp, "status_code", None)
             last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
@@ -3013,6 +3059,7 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             if last_status == 403:
                 global _access_token
                 _access_token = None
+                _wait_for_kis_rest_slot("rest")
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
                 last_status = getattr(resp, "status_code", None)
                 last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
