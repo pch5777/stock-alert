@@ -3,12 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.102
+버전: v41.103
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.103 (2026-03-23): 신규 이슈 자동 테마화 보강 — 사전 용어 없이도 강세 이슈를 섹터/점수에 반영.
+  [#1] `EMERGENT_*` 규칙과 `_infer_emergent_issue_theme()` / `_register_emergent_issue_theme()`를 추가해
+       종목별 뉴스 헤드라인에서 반복되는 핵심어를 자동 추출하고, 기존 직접뉴스 키워드에 없더라도
+       `신규이슈·{핵심어}` 형태의 내부 테마로 승격하도록 수정.
+  [#2] `analyze()` / `check_nxt_preopen_detection()`에 신규 이슈 fallback을 연결해,
+       직접뉴스 테마가 비어도 강한 흐름 + 반복 헤드라인이 있으면 `sector_info.theme`과 점수에 즉시 반영되게 정리.
+  [#3] 자동 추출된 이슈 테마는 `_dynamic_theme_map`에 저장해 이후 동적 후보군/섹터 모멘텀/시장 주도 섹터에도
+       연동되도록 연결하고, A 완화 판정에서도 `신규이슈 자동감지` 근거를 의미 있는 테마로 해석하게 보강.
+  이유: 한텍처럼 기존 사전에 없는 표현의 이슈가 뉴스·수급으로 먼저 강해질 때, 수동 키워드 추가 전까지 `기타`에 묻어
+       강한 종목이 누락되는 문제가 있었음.
+  개선점: 새 이슈 자동 테마화↑, `기타` 잔류 감소↑, NXT→정규장 연속 강세주의 A 후보 반영력↑.
+  주의점: 신규 이슈 자동감지는 반복 헤드라인 기반이라 너무 일반적인 단어는 제외하며, `MID_PULLBACK` / `ENTRY_POINT` 보수 정책은 유지.
 
 - v41.102 (2026-03-23): A전용 외부알림 전환 + 한텍형 리더 승격 보강 + 코드 위생 정리.
   [#1] 일반 포착/눌림목 신규 외부알림을 A등급 전용으로 전환하고, B/C는 내부 기록만 남기도록 정리.
@@ -1536,6 +1549,18 @@ DIRECT_NEWS_THEME_RULES = {
         "bonus": 7,
         "reason": "LNG/플랜트/에너지설비 직접 뉴스",
     },
+}
+
+EMERGENT_THEME_SIGNAL_TYPES = {"UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY", "SURGE", "EARLY_DETECT"}
+EMERGENT_THEME_MIN_CHANGE = 5.0
+EMERGENT_THEME_MIN_VOLUME = 2.0
+EMERGENT_THEME_STOPWORDS = {
+    "상승", "급등", "강세", "약세", "반등", "상한가", "하한가", "돌파", "주목", "부각", "관련", "관련주", "수혜", "기대",
+    "호재", "악재", "계약", "공급계약", "체결", "공시", "실적", "흑자", "적자", "매수", "매도", "투자", "전망", "확대",
+    "오늘", "장중", "정규장", "개장", "마감", "시장", "증시", "주가", "종목", "코스피", "코스닥", "넥스트레이드", "nxt",
+    "회사", "기업", "사업", "기술", "제품", "서비스", "부문", "분야", "국내", "해외", "북미", "글로벌", "미국", "중국",
+    "정조준", "본격화", "가속", "강화", "추진", "돌입", "업계", "관심", "기록", "연속", "신고가", "장초반", "오전", "오후",
+    "뉴스", "기사", "속보", "단독", "테마", "섹터", "신규", "자동", "감지", "기반", "핵심", "반복", "헤드라인",
 }
 
 DART_KEYWORDS = {
@@ -14209,6 +14234,7 @@ def analyze(stock: dict) -> dict:
     news_articles = []
     news_analysis = {}
     direct_news_hit = False
+    emergent_theme_hit = False
     try:
         _articles = fetch_news_for_stock(code, stock.get("name", code))
         if _articles:
@@ -14249,6 +14275,23 @@ def analyze(stock: dict) -> dict:
                     f"{direct_theme.get('reason','')}"
                     + (f" ({_matched})" if _matched else "")
                 )
+            elif signal_type in EMERGENT_THEME_SIGNAL_TYPES or change_rate >= EMERGENT_THEME_MIN_CHANGE or vol_ratio >= EMERGENT_THEME_MIN_VOLUME:
+                emergent_theme = _infer_emergent_issue_theme(code, stock.get("name", code), news_articles)
+                if emergent_theme.get("theme"):
+                    if sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
+                        sector_info["theme"] = emergent_theme["theme"]
+                        sector_info["theme_key"] = emergent_theme.get("theme_key", emergent_theme["theme"])
+                    emergent_bonus = int(emergent_theme.get("bonus", 0) or 0)
+                    if emergent_bonus > 0:
+                        score += emergent_bonus
+                    emergent_theme_hit = True
+                    _matched = ", ".join(emergent_theme.get("matched", [])[:3])
+                    reasons.append(
+                        f"🧠 신규이슈 자동감지 [{emergent_theme['theme']}] {emergent_bonus:+d}점 — "
+                        f"{emergent_theme.get('reason','')}"
+                        + (f" ({_matched})" if _matched else "")
+                    )
+                    _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="analyze")
     except Exception as _e: _log_error(f"analyze_news({code})", _e)
 
     try:
@@ -14431,6 +14474,7 @@ def analyze(stock: dict) -> dict:
             "signal_type":signal_type,"score":score,"sector_info":sector_info,
             "sector_theme": sector_info.get("theme", ""),
             "direct_news_hit": direct_news_hit,
+            "emergent_theme_hit": emergent_theme_hit,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
@@ -14508,6 +14552,22 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
                     f"{direct_theme.get('reason','')}"
                     + (f" ({_matched})" if _matched else "")
                 )
+            else:
+                emergent_theme = _infer_emergent_issue_theme(code, stock.get("name", code))
+                if emergent_theme.get("theme"):
+                    if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+                        sector_info["theme"] = emergent_theme["theme"]
+                        sector_info["theme_key"] = emergent_theme.get("theme_key", emergent_theme["theme"])
+                    emergent_bonus = int(emergent_theme.get("bonus", 0) or 0)
+                    if emergent_bonus > 0:
+                        pre_score += emergent_bonus
+                    _matched = ", ".join(emergent_theme.get("matched", [])[:3])
+                    pre_reasons.append(
+                        f"🧠 신규이슈 자동감지 [{emergent_theme['theme']}] {emergent_bonus:+d}점 — "
+                        f"{emergent_theme.get('reason','')}"
+                        + (f" ({_matched})" if _matched else "")
+                    )
+                    _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="nxt_preopen")
         except Exception:
             pass
         if pre_score < 75:
@@ -14758,6 +14818,160 @@ def _infer_direct_news_theme(code: str, name: str, articles: list | None = None)
         return {"theme": "", "bonus": 0, "reason": "", "headline": "", "matched": []}
 
 
+def _normalize_emergent_issue_label(label: str) -> str:
+    try:
+        t = html.unescape(str(label or "").strip())
+        t = t.replace("—", " ").replace("–", " ").replace("|", " ")
+        t = _re.sub(r"\s+", " ", t).strip(" -_/,:;[](){}")
+        return t
+    except Exception:
+        return str(label or "").strip()
+
+
+def _normalize_emergent_issue_key(label: str) -> str:
+    txt = _normalize_news_headline(str(label or ""))
+    txt = _re.sub(r"[^0-9a-z가-힣]+", "", txt)
+    return txt[:24]
+
+
+def _extract_emergent_issue_candidates(headlines: list, stock_name: str = "") -> list:
+    stop_keys = {_normalize_emergent_issue_key(w) for w in EMERGENT_THEME_STOPWORDS}
+    stock_key = _normalize_emergent_issue_key(stock_name)
+    counter = {}
+    for raw in headlines or []:
+        title = _normalize_emergent_issue_label(raw)
+        if not title:
+            continue
+        local = {}
+        for phrase in _re.findall(r"\[([^\]]{2,18})\]", title):
+            label = _normalize_emergent_issue_label(phrase)
+            key = _normalize_emergent_issue_key(label)
+            if not key or key == stock_key or key in stop_keys or key.isdigit() or len(key) < 2:
+                continue
+            local[key] = (label, 3)
+        norm = _normalize_news_headline(title)
+        pieces = [p.strip(".,/%+-") for p in _re.split(r"\s+", norm) if p.strip(".,/%+-")]
+        for tok in pieces:
+            key = _normalize_emergent_issue_key(tok)
+            if not key or key == stock_key or key in stop_keys or key.isdigit() or len(key) < 2:
+                continue
+            if len(key) <= 3 and not _re.search(r"[a-z]", key):
+                continue
+            local.setdefault(key, (_normalize_emergent_issue_label(tok), 1))
+        for a, b in zip(pieces, pieces[1:]):
+            phrase = f"{a} {b}".strip()
+            key = _normalize_emergent_issue_key(phrase)
+            if not key or key == stock_key or key in stop_keys or key.isdigit() or len(key) < 4:
+                continue
+            if any(sw in phrase for sw in ("관련", "기대", "상승", "급등", "강세", "주가", "증시", "종목")):
+                continue
+            local.setdefault(key, (_normalize_emergent_issue_label(phrase), 2))
+        for key, (label, weight) in local.items():
+            info = counter.setdefault(key, {"label": label, "score": 0, "hits": 0})
+            if len(label) > len(info["label"]):
+                info["label"] = label
+            info["score"] += int(weight)
+            info["hits"] += 1
+    ranked = sorted(
+        [(v["label"], int(v["score"]), int(v["hits"])) for v in counter.values()],
+        key=lambda x: (x[1], x[2], len(x[0])),
+        reverse=True,
+    )
+    return ranked[:5]
+
+
+def _infer_emergent_issue_theme(code: str, name: str, articles: list | None = None) -> dict:
+    try:
+        items = list(articles or fetch_news_for_stock(code, name) or [])[:3]
+        titles = [str((item or {}).get("title", "") or "").strip() for item in items if str((item or {}).get("title", "") or "").strip()]
+        if not titles:
+            return {"theme": "", "theme_key": "", "bonus": 0, "reason": "", "headline": "", "matched": [], "raw_term": ""}
+        ranked = _extract_emergent_issue_candidates(titles, name)
+        if not ranked:
+            return {"theme": "", "theme_key": "", "bonus": 0, "reason": "", "headline": titles[0], "matched": [], "raw_term": ""}
+        label, score, hits = ranked[0]
+        if hits < 2 and score < 4:
+            return {"theme": "", "theme_key": "", "bonus": 0, "reason": "", "headline": titles[0], "matched": [], "raw_term": ""}
+        raw_term = _normalize_emergent_issue_label(label)
+        theme_key = _normalize_emergent_issue_key(raw_term)
+        if not theme_key:
+            return {"theme": "", "theme_key": "", "bonus": 0, "reason": "", "headline": titles[0], "matched": [], "raw_term": ""}
+        bonus = 4
+        if hits >= 2:
+            bonus += 1
+        if score >= 6:
+            bonus += 1
+        theme_label = f"신규이슈·{raw_term[:14]}"
+        return {
+            "theme": theme_label,
+            "theme_key": theme_key,
+            "bonus": int(min(bonus, 8)),
+            "reason": "반복 헤드라인 기반 신규 이슈 자동감지",
+            "headline": titles[0],
+            "matched": [term for term, _, _ in ranked[:3]],
+            "raw_term": raw_term,
+        }
+    except Exception:
+        return {"theme": "", "theme_key": "", "bonus": 0, "reason": "", "headline": "", "matched": [], "raw_term": ""}
+
+
+def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, trigger: str = "") -> None:
+    issue = issue if isinstance(issue, dict) else {}
+    theme = str(issue.get("theme", "") or "").strip()
+    theme_key_raw = str(issue.get("theme_key", "") or "").strip()
+    if not theme or not theme_key_raw:
+        return
+    try:
+        today = datetime.now().strftime("%m%d")
+        dyn_key = f"issue_{theme_key_raw}_{today}"
+        existing = _dynamic_theme_map.get(dyn_key)
+        if existing and any(c == code for c, _ in existing.get("stocks", [])):
+            existing["ts"] = time.time()
+            return
+        peers = []
+        seen = {code}
+        if existing:
+            for c, n in existing.get("stocks", []):
+                if c not in seen:
+                    seen.add(c)
+                    peers.append((c, n))
+        for c, n in build_correlation_theme(code, name):
+            if c not in seen:
+                seen.add(c)
+                peers.append((c, n))
+        for c, n, _cnt in get_news_cooccur_peers(code):
+            if c not in seen:
+                seen.add(c)
+                peers.append((c, n))
+        for c, n in get_sector_stocks_from_kis(code):
+            if c not in seen:
+                seen.add(c)
+                peers.append((c, n))
+        stocks = [(code, name)] + peers[:8]
+        payload = {
+            "desc": theme,
+            "reason": f"{issue.get('reason', '')} [{issue.get('raw_term', '')}]" + (f" ({trigger})" if trigger else ""),
+            "stocks": stocks,
+            "ts": time.time(),
+            "source": "emergent_auto",
+            "matched": list(issue.get("matched", [])[:3]),
+            "score_adj": int(issue.get("bonus", 0) or 0),
+        }
+        if existing:
+            existing.update(payload)
+            existing["stocks"] = stocks
+        else:
+            _dynamic_theme_map[dyn_key] = payload
+            print(f"  🧠 신규 이슈 테마 생성: [{dyn_key}] {theme} | {issue.get('raw_term', '')}")
+        try:
+            with open(DYNAMIC_THEME_FILE, "w") as f:
+                json.dump({k: {**v, "stocks": v["stocks"]} for k, v in _dynamic_theme_map.items()}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"⚠️ _register_emergent_issue_theme: {e}")
+
+
 def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
@@ -14914,7 +15128,7 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
     joined_reasons = " ".join(str(r or "") for r in (reasons or []))
-    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주"))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주"))
     market_flag = str(market or "").upper() == "NXT"
     return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
 
