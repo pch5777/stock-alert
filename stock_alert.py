@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.101
+버전: v41.102
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+
+- v41.102 (2026-03-23): A전용 외부알림 전환 + 한텍형 리더 승격 보강 + 코드 위생 정리.
+  [#1] 일반 포착/눌림목 신규 외부알림을 A등급 전용으로 전환하고, B/C는 내부 기록만 남기도록 정리.
+       `_dispatch_general_alert_signal()` / `run_mid_pullback_scan()`에 내부전용 억제 경로를 추가해
+       B/C 반복 외부알림을 줄이되, 추후 A 상향 재평가는 유지.
+  [#2] `GENERAL_A_RELAX_SIGNAL_TYPES` / `_should_relax_general_a_threshold()`를 추가해
+       `SURGE` / `EARLY_DETECT` / `NEAR_UPPER`는 강한 흐름·의미 있는 테마·NXT 연속성 조건에서
+       A 문턱을 선택 완화하도록 수정.
+  [#3] `DIRECT_NEWS_THEME_RULES`에 LNG·플랜트·에너지설비·열교환기 계열 직접뉴스 승격 규칙을 추가하고,
+       `check_nxt_preopen_detection()`에도 직접뉴스/섹터 보강을 연결해 한텍형 종목이 `기타`에 묻히지 않도록 정리.
+  [#4] 미사용 함수 `_gather_news_stock_candidates()` / `_is_news_reason_for_ui()` / `_is_sector_reason_for_ui()`를 제거하고,
+       점수 표기용 `_signed_repl` 로컬 중복을 공용 helper로 통합.
+  이유: 실제 행동 가능한 알림은 A등급 중심인데 B/C 외부알림이 많았고, LNG·수주·에너지설비형 리더가
+       직접 승격 부족으로 `기타`에 묻히는 반면 stale 눌림목은 상대적으로 자주 노출되는 문제가 있었음.
+  개선점: 외부 알림 품질↑, 한텍형 리더 승격력↑, `기타` 병목 완화↑, 코드 혼선↓.
+  주의점: `MID_PULLBACK` / `ENTRY_POINT`는 A 문턱 완화 대상에서 제외하며, B/C는 외부알림 없이 내부 로그/재평가만 유지.
 
 
 - v41.101 (2026-03-23): 급등/조기포착 계열 고점추격방지 경과 완화 복구.
@@ -1452,6 +1469,10 @@ NEWS_STOCK_PROMOTION_LIMIT = int(os.getenv("NEWS_STOCK_PROMOTION_LIMIT", "3") or
 NEWS_STOCK_PROMOTION_COOLDOWN = int(os.getenv("NEWS_STOCK_PROMOTION_COOLDOWN", "900") or "900")
 NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK", "ENTRY_POINT"}
 RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
+GENERAL_A_RELAX_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
+GENERAL_A_RELAXED_SCORE = int(os.getenv("GENERAL_A_RELAXED_SCORE", "77") or "77")
+INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "900") or "900")
+
 
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
@@ -1509,6 +1530,11 @@ DIRECT_NEWS_THEME_RULES = {
         "keywords": ["오픈ai", "openai", "baa", "헬스케어", "엔터프라이즈 ai", "vertical ai", "버티컬 ai", "ai 솔루션", "ai 고도화", "생성형 ai"],
         "bonus": 6,
         "reason": "AI 서비스/제휴 직접 뉴스",
+    },
+    "에너지인프라수주": {
+        "keywords": ["lng", "열교환기", "플랜트", "에너지설비", "에너지 설비", "암모니아", "수소", "가스처리", "process equipment", "shintech"],
+        "bonus": 7,
+        "reason": "LNG/플랜트/에너지설비 직접 뉴스",
     },
 }
 
@@ -1574,6 +1600,7 @@ def _log_error(func_name: str, e: Exception, critical: bool = False):
         except Exception: pass
 
 _alert_history      = {}
+_internal_only_alert_history = {}
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
@@ -6376,6 +6403,14 @@ def run_mid_pullback_scan():
             _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
             print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
+            continue
+        if not _should_send_external_grade_alert(s):
+            _logged = _record_internal_only_alert(s["code"], s, f"눌림목 {str(s.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
+            if _logged:
+                save_signal_log(s)
+            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
+            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 외부알림 억제/내부기록 유지")
             continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
@@ -13306,34 +13341,6 @@ def _calc_rr_text(entry: int, stop: int, target: int) -> str:
     return "계산불가"
 
 
-def _is_sector_reason_for_ui(txt: str) -> bool:
-    t = str(txt or '').strip()
-    if not t:
-        return False
-    if t.startswith('📌 동반 상승:'):
-        return True
-    sector_markers = (
-        '섹터 전체 동반 상승',
-        '섹터 강세',
-        '동업종',
-        '섹터 모멘텀',
-    )
-    return any(m in t for m in sector_markers)
-
-
-def _is_news_reason_for_ui(raw_txt: str) -> bool:
-    raw = str(raw_txt or '')
-    t = raw.strip()
-    if not t:
-        return False
-    if raw.startswith('  ⚠️ '):
-        return True
-    news_prefixes = (
-        '📰 뉴스 ', '🔍 뉴스 ', '💡 표면악재실질호재', '⚠️ 표면호재실질악재'
-    )
-    return t.startswith(news_prefixes)
-
-
 def _find_cached_deep_news_result(code: str, articles: list) -> dict:
     try:
         if not code or not articles:
@@ -13720,17 +13727,20 @@ _UI_SIGNED_POINT_RE = re.compile(r'(?P<value>[+-]\d+)점(?:\s*\([^\)\n]{1,20}\))
 _UI_UNSIGNED_POINT_RE = re.compile(r'(?<![+\-\d])(?P<value>\d+)점(?:\s*\([^\)\n]{1,20}\))?(?!\s*[>%])')
 
 
+def _format_signed_score_delta(value: int, compact: bool = False) -> str:
+    val = int(value or 0)
+    label = _score_delta_impact_label(val)
+    if not label:
+        return f"{val:+d}점"
+    return f"{val:+d}점({label})" if compact else f"{val:+d}점 ({label})"
+
+
 def _decorate_ui_score_line(line: str) -> str:
     raw = str(line or '')
     if '점' not in raw:
         return raw
 
-    def _signed_repl(match: re.Match) -> str:
-        value = int(match.group('value'))
-        label = _score_delta_impact_label(value)
-        return f"{value:+d}점({label})" if label else f"{value:+d}점"
-
-    out = _UI_SIGNED_POINT_RE.sub(_signed_repl, raw)
+    out = _UI_SIGNED_POINT_RE.sub(lambda match: _format_signed_score_delta(int(match.group('value')), compact=True), raw)
 
     def _unsigned_repl(match: re.Match) -> str:
         value = int(match.group('value'))
@@ -13751,12 +13761,7 @@ def _decorate_capture_reason_line(txt: str) -> str:
     if not line:
         return ''
 
-    def _signed_repl(match: re.Match) -> str:
-        raw = match.group('value')
-        label = _score_delta_impact_label(int(raw))
-        return f"{raw}점 ({label})" if label else match.group(0)
-
-    line = _CAPTURE_SIGNED_POINT_RE.sub(_signed_repl, line)
+    line = _CAPTURE_SIGNED_POINT_RE.sub(lambda match: _format_signed_score_delta(int(match.group('value')), compact=False), line)
     line = re.sub(
         r'(체결지속속도\s+)(\d+)점(?!\s*\()',
         lambda m: f"{m.group(1)}{m.group(2)}점 ({_execution_score_label(int(m.group(2)))})",
@@ -14402,7 +14407,15 @@ def analyze(stock: dict) -> dict:
         _log_error(f"detect_force({code})", _e)
 
     # 등급 계산
-    if   score >= 80: grade = "A"
+    a_cut = 80
+    if _should_relax_general_a_threshold(
+        signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio,
+        sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta,
+        market=stock.get("market", ""), reasons=reasons
+    ):
+        a_cut = min(a_cut, GENERAL_A_RELAXED_SCORE)
+        reasons.append(f"🏷 한텍형 리더 A게이트 완화 ({80}→{a_cut})")
+    if   score >= a_cut: grade = "A"
     elif score >= 60: grade = "B"
     else:             grade = "C"
     if countertrend_ctx.get("is_countertrend") and signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "SURGE") and grade == "A":
@@ -14465,21 +14478,43 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
             f"📈 NXT 현재 +{cr:.1f}%  (KRX 개장 전)",
             f"💥 NXT 거래량 {vr:.1f}배",
         ]
+        sector_info = calc_sector_momentum(code, stock.get("name", code)) or {}
+        direct_news_hit = False
         if nxt.get("inv_bullish"):
             pre_score += 15
             pre_reasons.append(f"🔴 NXT 외인+기관 매수 ({nxt['foreign_net']:+,}주)")
         if nxt.get("vs_krx_pct", 0) > 0.5:
             pre_score += 10
             pre_reasons.append(f"🔴 NXT 프리미엄 +{nxt['vs_krx_pct']:.1f}% → KRX 갭상 주목")
+        if sector_info.get("bonus", 0) > 0:
+            pre_score += int(sector_info.get("bonus", 0) or 0)
+            if sector_info.get("summary"):
+                pre_reasons.append(sector_info["summary"])
+            if sector_info.get("rising"):
+                pre_reasons.append("📌 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info.get("rising", [])[:4]]))
+        try:
+            direct_theme = _infer_direct_news_theme(code, stock.get("name", code))
+            if direct_theme.get("theme"):
+                if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+                    sector_info["theme"] = direct_theme["theme"]
+                    sector_info["theme_key"] = direct_theme["theme"]
+                direct_bonus = int(direct_theme.get("bonus", 0) or 0)
+                if direct_bonus > 0:
+                    pre_score += direct_bonus
+                direct_news_hit = True
+                _matched = ", ".join(direct_theme.get("matched", [])[:3])
+                pre_reasons.append(
+                    f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — "
+                    f"{direct_theme.get('reason','')}"
+                    + (f" ({_matched})" if _matched else "")
+                )
+        except Exception:
+            pass
         if pre_score < 75:
             continue
 
         entry = price
         stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="EARLY_DETECT")
-        pre_key = f"NXT_PRE_{code}"
-        if time.time() - _alert_history.get(pre_key, 0) < 3600:
-            continue
-        _alert_history[pre_key] = time.time()
 
         pre_score, pre_reasons, pre_similar_pattern_stats = _apply_similar_pattern_score(
             pre_score, pre_reasons, code, "EARLY_DETECT", cr, vr, weight_mode="strong"
@@ -14487,7 +14522,8 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":cr,"volume_ratio":vr,
                         "signal_type":"EARLY_DETECT","score":pre_score,
-                        "sector_info":{},"market":"NXT",
+                        "sector_info":sector_info,"sector_theme": sector_info.get("theme", ""),
+                        "direct_news_hit": direct_news_hit, "market":"NXT",
                         "similar_pattern_stats":pre_similar_pattern_stats,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
@@ -14793,7 +14829,17 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                 {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
             )
             return False
-    print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점")
+    grade_upper = str(s.get("execution_grade") or s.get("grade") or "C").upper()
+    if not _should_send_external_grade_alert(s):
+        _logged = _record_internal_only_alert(hist_key, s, f"{source_label} {grade_upper}등급 외부알림 억제(A전용)")
+        if _logged:
+            save_signal_log(s)
+            if s.get("signal_type") == "EARLY_DETECT":
+                save_early_detect(s)
+        print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
+        return False
+    _internal_only_alert_history.pop(hist_key, None)
+    print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[hist_key] = time.time()
     save_signal_log(s)
@@ -14838,80 +14884,6 @@ def _headline_mentions_stock_name(headline: str, name: str) -> bool:
     return n in h
 
 
-def _gather_news_stock_candidates(headlines: list[str]) -> list[dict]:
-    if not headlines:
-        return []
-    candidates: dict[str, dict] = {}
-
-    def _add(code: str, name: str, market: str = "", source: str = ""):
-        code = normalize_stock_code(code)
-        name = _resolve_stock_name(code, name)
-        if not code or not name or not is_trade_candidate_name(name):
-            return
-        rec = candidates.setdefault(code, {"code": code, "name": name, "market": market or "", "sources": set()})
-        if market and not rec.get("market"):
-            rec["market"] = market
-        if source:
-            rec["sources"].add(source)
-
-    for theme_key, theme_info in THEME_MAP.items():
-        for code, name in theme_info.get("stocks", []):
-            _add(code, name, source=f"theme:{theme_key}")
-    for code, info in _dynamic_candidates.items():
-        _add(code, info.get("name", ""), source="dynamic")
-    try:
-        if is_market_open():
-            for item in get_volume_surge_stocks()[:50]:
-                _add(item.get("code", ""), item.get("name", ""), market="KRX", source="krx_rank")
-            for item in get_upper_limit_stocks()[:50]:
-                _add(item.get("code", ""), item.get("name", ""), market="KRX", source="krx_chgrate")
-    except Exception:
-        pass
-    try:
-        if is_nxt_open():
-            for item in get_nxt_surge_stocks()[:50]:
-                _add(item.get("code", ""), item.get("name", ""), market="NXT", source="nxt_rank")
-    except Exception:
-        pass
-
-    enriched = []
-    for code, rec in candidates.items():
-        hits = [h for h in headlines if _headline_mentions_stock_name(h, rec.get("name", ""))]
-        if not hits:
-            continue
-        articles = [{"title": h} for h in hits[:3]]
-        direct = _infer_direct_news_theme(code, rec.get("name", code), articles)
-        try:
-            quote = get_nxt_stock_price(code) if rec.get("market") == "NXT" else get_stock_price(code)
-        except Exception:
-            quote = {}
-        if not quote:
-            continue
-        change_rate = float(quote.get("change_rate", 0.0) or 0.0)
-        vol_ratio = float(quote.get("volume_ratio", 0.0) or 0.0)
-        if change_rate < NEWS_STOCK_PROMOTION_MIN_CHANGE and vol_ratio < NEWS_STOCK_PROMOTION_MIN_VOLUME:
-            continue
-        priority = len(hits) * 30 + max(change_rate, 0.0) * 5 + min(max(vol_ratio, 0.0), 10.0) * 3
-        if direct.get("theme"):
-            priority += 12
-        if rec.get("market") == "NXT":
-            priority += 4
-        rec.update({
-            "hits": hits[:3],
-            "hit_count": len(hits),
-            "direct_theme": direct,
-            "price": int(quote.get("price", 0) or 0),
-            "change_rate": change_rate,
-            "volume_ratio": vol_ratio,
-            "today_vol": int(quote.get("today_vol", 0) or 0),
-            "priority": priority,
-            "sources": sorted(rec.get("sources", set())),
-        })
-        enriched.append(rec)
-    enriched.sort(key=lambda x: (x.get("priority", 0), x.get("hit_count", 0), x.get("change_rate", 0.0)), reverse=True)
-    return enriched[:NEWS_STOCK_PROMOTION_LIMIT]
-
-
 def _extract_alert_sector_theme(alert: dict) -> str:
     try:
         sec = str(alert.get("sector_theme", "") or "").strip()
@@ -14922,6 +14894,52 @@ def _extract_alert_sector_theme(alert: dict) -> str:
         return sec
     except Exception:
         return "기타"
+
+
+def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate: float = 0.0,
+                                     vol_ratio: float = 0.0, sector_info: dict | None = None,
+                                     direct_news_hit: bool = False, nxt_delta: int = 0,
+                                     market: str = "", reasons: list | None = None) -> bool:
+    sig_type = str(signal_type or "").upper()
+    if sig_type not in GENERAL_A_RELAX_SIGNAL_TYPES:
+        return False
+    try:
+        strong_price = float(change_rate or 0.0) >= 7.0
+    except Exception:
+        strong_price = False
+    try:
+        strong_flow = float(vol_ratio or 0.0) >= 2.0 or int(nxt_delta or 0) >= 5
+    except Exception:
+        strong_flow = False
+    theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
+    meaningful_theme = theme != "기타"
+    joined_reasons = " ".join(str(r or "") for r in (reasons or []))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주"))
+    market_flag = str(market or "").upper() == "NXT"
+    return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
+
+
+def _should_send_external_grade_alert(signal: dict | None) -> bool:
+    grade = str((signal or {}).get("execution_grade") or (signal or {}).get("grade") or "").upper()
+    return grade == "A"
+
+
+def _record_internal_only_alert(hist_key: str, signal: dict, reason: str) -> bool:
+    if not hist_key or not isinstance(signal, dict):
+        return False
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
+    prev = _internal_only_alert_history.get(hist_key) or {}
+    prev_ts = float(prev.get("ts", 0) or 0)
+    prev_grade = str(prev.get("grade", "C") or "C").upper()
+    should_log = (time.time() - prev_ts) >= INTERNAL_ONLY_ALERT_COOLDOWN or _grade_rank(grade) > _grade_rank(prev_grade)
+    _internal_only_alert_history[hist_key] = {"ts": time.time(), "grade": grade}
+    if should_log:
+        _log_suppressed_alert(
+            signal.get("code", ""), signal.get("name", signal.get("code", "")), reason,
+            signal.get("signal_type", ""),
+            {"score": signal.get("score", 0), "grade": grade, "entry_price": signal.get("entry_price", 0), "market": signal.get("market", "")}
+        )
+    return should_log
 
 
 def _sector_gate_sort_key(alert: dict) -> tuple:
