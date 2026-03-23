@@ -3,26 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v42
+버전: v43
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
 
-- v42 (2026-03-23): DART 실행형 진입가 전환 + 공시 이벤트군 묶음 dedupe + 재시작 후 중복 방지.
-  [#1] `run_dart_intraday()`에 공시 이벤트군 canonical key(`_derive_dart_event_family()` / `_build_dart_event_key()`)를 추가해
-       `공개매수설명서`·`공개매수신고서`처럼 같은 종목·같은 이벤트군 공시를 1회 대표 알림으로 묶고,
-       `_dart_seen_ids` 런타임 set만 쓰던 구조를 `dart_intraday_state.json` persistent dedupe로 확장해 재시작 후 재발송도 줄이도록 수정.
-  [#2] `_build_dart_execution_entry_plan()` / `_build_dart_execution_stock()`를 추가해 DART 긍정 공시도
-       현재가 직결 브리핑이 아니라 ATR·변동성·상대강도·호가유동성·손익비를 반영한 실행형 눌림 진입가를 산출하고,
-       가능한 경우 `save_signal_log()` / `register_entry_watch()`를 타도록 연결.
-  [#3] DART 메시지 출력도 실행형 진입가 중심으로 정리해, 진입가/손절가/목표가를 대표 진입가 계획과 일치시키고
-       실행형 산출이 불가능한 경우에는 `실행형 진입가 산출 보류`로 분리해 현재가 브리핑을 실전형 알림처럼 오해하지 않도록 정리.
-  이유: 사람인 같은 공개매수 공시가 설명서/신고서로 중복 발송되고, 같은 이벤트가 런타임 재시작 후 반복 전송되며,
-       진입가도 매번 현재가 기준으로 바뀌어 실제 진입 가능한 가격으로 보기 어려웠음.
-  개선점: DART 중복 알림↓, 재시작 후 재발송↓, 실행형 진입가 현실성↑, 공시 신호의 진입감시 연동↑.
-  주의점: 실행형 진입가는 호가유동성/손익비/목표여력까지 통과한 경우에만 제시하며, 통과하지 못한 공시는 `실행형 진입가 산출 보류`로 표시한다.
+- v43 (2026-03-23): 비실전형 알림 진입가 제거 + 포착/행동 알림 용어 분리.
+  [#1] 일반 포착 상세/컴팩트 메시지에서 `_build_capture_focus_price_line()`과 compact header를 정리해,
+       실전형이 아닌 포착 알림은 `현재가`만 보여주고 `진입가`·`목표진입`·가격 괴리 문구를 제거하도록 수정.
+  [#2] `[익영업일 갭상승 선진입 후보]`, `[손절 후 재진입 후보]`처럼 아직 실행 확정 전인 후보형 알림은
+       진입가/손절가/목표가 블록을 제거하고 `실제 진입가는 도달/확정 알림에서만 제공` 문구로 역할을 분리.
+  [#3] 비실전형 포착 사유 필터에서도 `진입가` 문구를 제외해, 텔레그램에서 `진입가 확인 → 도달 확인 → 진입` 흐름이
+       오직 실전형 알림에만 대응되도록 정리.
+  이유: 사용자가 텔레그램에서 `종목 포착 → 진입가 확인 → 진입가 도달 알림 → 진입` 순서로 활용하므로,
+       실전형이 아닌 포착/후보 알림에 `진입가`가 노출되면 행동 기준을 오염시켜 해석 혼선을 유발했음.
+  개선점: `진입가` 용어 신뢰도↑, 포착 알림과 행동 알림 역할 분리↑, 비실전형 가격 오해↓.
+  주의점: 초기 포착/후보 알림은 여전히 참고용이며, 실제 진입 가격은 도달/확정 알림에서만 확인한다.
 
 - v41.103 (2026-03-23): 신규 이슈 자동 테마화 보강 — 사전 용어 없이도 강세 이슈를 섹터/점수에 반영.
   [#1] `EMERGENT_*` 규칙과 `_infer_emergent_issue_theme()` / `_register_emergent_issue_theme()`를 추가해
@@ -5332,11 +5330,10 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
     else:
         score += 3; reasons.append(f"⚖️ 손익비 {rr:.1f} +3")
 
-    if entry_away_pct <= 1.2:
-        score += 4; reasons.append("🎯 오늘 선진입가 근접 +4")
-    elif entry_away_pct <= 1.8:
-        score += 2; reasons.append("🎯 오늘 선진입가 유효 +2")
-    else:
+        msg += (
+            f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
+            f"  ℹ️ 실제 진입가는 선진입가 도달 알림에서만 제공합니다.  ·  {item.get('market_note','KRX 기준')}\n"
+        )
         cautions.append(f"⏰ 진입가까지 {entry_away_pct:.1f}% 여유")
 
     score = int(round(score))
@@ -5838,10 +5835,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
             msg += f"  {sim_summary}\n"
         msg += (
             f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
-            f"  🎯 오늘 선진입가 {int(item.get('entry_price',0) or 0):,}원  (현재 대비 {float(item.get('entry_away_pct',0.0) or 0.0):.1f}%)\n"
-            f"  🛡 손절가 {int(item.get('stop_loss',0) or 0):,}원  ({float(item.get('stop_pct',0.0) or 0.0):+.1f}%)\n"
-            f"  🏆 익일 목표 {int(item.get('target_price',0) or 0):,}원  ({float(item.get('target_pct',0.0) or 0.0):+.1f}%)\n"
-            f"  ⚖️ 손익비 1 : {float(item.get('rr',0.0) or 0.0):.1f}  ·  {item.get('market_note','KRX 기준')}\n"
+            f"  ℹ️ 실제 진입가는 선진입가 도달 알림에서만 제공합니다.  ·  {item.get('market_note','KRX 기준')}\n"
         )
         for line in item.get("reasons", [])[:3]:
             msg += f"  {line}\n"
@@ -5851,7 +5845,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
     summary = str(us.get("summary", "") or "").splitlines()[0].strip()
     if summary:
         msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
-    msg += "⚠️ 예상 선진입가 근처에서 하락 중 체결속도 유지가 확인된 종목만 실제 진입으로 확정합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
+    msg += "⚠️ 후보 알림은 참고용입니다. 실제 진입가는 선진입가 도달 알림에서만 제공합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand))
     print(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
@@ -10192,8 +10186,6 @@ def check_reentry_watch():
                               "SURGE":"급등","EARLY_DETECT":"조기포착",
                               "MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목"}
                 sig = sig_labels.get(w["signal_type"], w["signal_type"])
-                stop_new, target_new, sp, tp, atr = calc_stop_target(code, price, signal_type=w.get("signal_type"))
-                rr = round((target_new - price) / (price - stop_new), 1) if price > stop_new else 0
                 send_with_chart_buttons(
                     f"🔄 <b>[손절 후 재진입 후보{mkt_tag}]</b>\n"
                     f"━━━━━━━━━━━━━━━\n"
@@ -10204,12 +10196,7 @@ def check_reentry_watch():
                     f"📈 현재가:  <b>{price:,}원</b>  (+{bounce:.1f}% 반등)\n"
                     f"🔊 거래량:  {vr:.1f}배 (회복)\n"
                     f"━━━━━━━━━━━━━━━\n"
-                    f"┌─────────────────────\n"
-                    f"│ 🎯 재진입가  <b>{price:,}원</b>\n"
-                    f"│ 🛡 손절가   <b>{stop_new:,}원</b>  (-{sp:.1f}%)\n"
-                    f"│ 🏆 목표가   <b>{target_new:,}원</b>  (+{tp:.1f}%)\n"
-                    f"│ 손익비:    {rr:.1f} : 1\n"
-                    f"└─────────────────────\n"
+                    f"ℹ️ 실제 재진입가는 재진입 확정 알림에서만 제공합니다.\n"
                     f"⚠️ 손절 후 재진입 — 물타기 아님, 새 포지션으로 판단",
                     code, w["name"]
                 )
@@ -13584,14 +13571,11 @@ def send_alert(s: dict):
     if _compact_mode:
         name_dot = {"UPPER_LIMIT":"🔵","NEAR_UPPER":"🟡","STRONG_BUY":"🔴",
                     "SURGE":"🟡","EARLY_DETECT":"🟡","ENTRY_POINT":"🟣"}.get(s["signal_type"],"")
-        entry  = s.get("entry_price", 0)
-        stop   = s.get("stop_loss", 0)
-        target = s.get("target_price", 0)
-        rr     = round((target-entry)/(entry-stop),1) if entry and stop and entry>stop else 0
+        price = int(s.get("price", 0) or 0)
         compact_text = (
             f"{lvl_icon}{emoji} {name_dot}<b>{s['name']}</b>  {s['change_rate']:+.1f}%  "
             f"{s['score']}점 ({_signal_total_score_label(s['score'])}){nxt_badge}\n"
-            f"진입 {entry:,} | 손절 {stop:,} | 목표 {target:,}  RR {rr:.1f}"
+            f"현재가 {price:,}원"
         )
         send_by_level(compact_text, level, s["code"], s["name"])
         return
@@ -13715,7 +13699,6 @@ def _is_capture_focus_reason(txt: str) -> bool:
         '💎 외국인+기관 매수 / 개인 매도', '✅ 외국인+기관 동시 순매수',
         '🟡 외국인 순매수', '🟡 기관 순매수',
         '🔴 NXT 외인+기관 동시매수',
-        '✅ 진입가 ',
         '🚦 최근 체결흐름 ', '⚡ 체결지속속도 ',
         '🧭 눌림 유형:', '🎯 실행 A 조건:', '⚠️ 실행 보정:', '🕒 장마감 근접:'
     )):
@@ -13875,21 +13858,9 @@ def _build_capture_focus_sector_block(s: dict) -> str:
 
 def _build_capture_focus_price_line(s: dict) -> str:
     price = int(s.get('price', 0) or 0)
-    entry = int(s.get('entry_price', 0) or 0)
-    if not price and not entry:
+    if not price:
         return ''
-    if price and entry:
-        diff_pct = ((price - entry) / entry * 100) if entry else 0.0
-        if abs(diff_pct) < 0.05:
-            gap_text = '진입가 도달'
-        elif diff_pct > 0:
-            gap_text = f'현재는 진입가보다 <b>+{diff_pct:.1f}% 위</b>'
-        else:
-            gap_text = f'현재는 진입가보다 <b>{diff_pct:.1f}% 아래</b>'
-        return f"💵 현재가 <b>{price:,}원</b> | 🎯 진입가 <b>{entry:,}원</b> | {gap_text}"
-    if price:
-        return f"💵 현재가 <b>{price:,}원</b>"
-    return f"🎯 진입가 <b>{entry:,}원</b>"
+    return f"💵 현재가 <b>{price:,}원</b>"
 
 
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
