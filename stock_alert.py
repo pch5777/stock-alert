@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v49
+버전: v50
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v50 (2026-03-23): 주봉·일봉 동반 하락 추세 종목 포착 차단.
+  [#1] `_get_multi_tf_downtrend_context()` / `_should_block_multi_tf_downtrend_capture()`를 추가해,
+       최근 20일·8주 수익률, 20일선/60일선, 일봉·주봉 lower-high를 함께 보고 주봉·일봉 동반 하락 추세를 보수적으로 판정하도록 수정.
+  [#2] `analyze()` / `check_early_detection()` / `check_nxt_preopen_detection()` / `analyze_mid_pullback()` / `check_pullback_signals()`에
+       동일 차단 로직을 연결해 `SURGE`/`EARLY_DETECT`/`NEAR_UPPER`뿐 아니라 `MID_PULLBACK`/`ENTRY_POINT`도 큰 하락 추세면 포착 단계에서 기본 제외되도록 정리.
+  [#3] `_log_suppressed_alert()`에 20일 수익률/8주 수익률/일봉·주봉 하락 플래그를 남기게 해,
+       인베니아처럼 주봉·일봉이 함께 눌리는 종목이 왜 차단됐는지 내부 학습 로그로 추적 가능하게 보강.
+  이유: stale 재노출 감점과 breadth 보정이 있어도 주봉·일봉 동반 하락 추세 종목이 `MID_PULLBACK`/`ENTRY_POINT` 경로에서 다시 살아날 여지가 남아 있었고,
+       관리종목/거래정지 위험으로 이어지는 종목을 큰 줄기에서 선제 배제할 필요가 있었음.
+  개선점: 하락 추세 종목 포착률↓, 인베니아류 역추세 포착 차단↑, 신규 주도주 슬롯 확보↑.
+  주의점: 직접뉴스/테마주도 강세라도 주봉·일봉 동반 하락 추세 판정이면 기본 차단하며, 해당 차단은 내부 suppressed 로그에만 남고 외부 알림은 발송되지 않음.
 
 - v49 (2026-03-23): 반복 miss 테마 신규 리더 가산 + stale 테마 breadth 정밀 감점.
   [#1] `_collect_theme_feedback_candidates()` / `_calc_miss_theme_leader_bonus()` / `_get_theme_breadth_hint()`를 추가해,
@@ -4445,6 +4457,24 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     # 손절·목표가
     entry = today_close
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
+
+    _mid_tf_block = _should_block_multi_tf_downtrend_capture(code, "MID_PULLBACK")
+    if _mid_tf_block.get("block"):
+        _ctx = _mid_tf_block.get("context", {}) or {}
+        _log_suppressed_alert(
+            code, name,
+            _mid_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"),
+            "MID_PULLBACK",
+            {
+                "daily_ret20": _ctx.get("daily_ret20", 0.0),
+                "weekly_ret8": _ctx.get("weekly_ret8", 0.0),
+                "daily_flags": _ctx.get("daily_flags", 0),
+                "weekly_flags": _ctx.get("weekly_flags", 0),
+                "change_rate": today_chg,
+                "score": score,
+            },
+        )
+        return {}
 
     return {
         "code": code, "name": name,
@@ -12506,6 +12536,100 @@ def _get_countertrend_surge_context(code: str) -> dict:
     except Exception:
         return out
 
+def _get_multi_tf_downtrend_context(code: str) -> dict:
+    """주봉·일봉 동반 하락 추세를 보수적으로 판정."""
+    out = {
+        "is_multi_tf_downtrend": False,
+        "daily_ret20": 0.0,
+        "weekly_ret8": 0.0,
+        "daily_ma_down": False,
+        "weekly_ma_down": False,
+        "daily_lower_high": False,
+        "weekly_lower_high": False,
+        "daily_flags": 0,
+        "weekly_flags": 0,
+    }
+    try:
+        items = get_daily_data(code, 90) or []
+        items = [it for it in items if float((it or {}).get("close", 0) or 0) > 0]
+        if len(items) < 40:
+            return out
+
+        closes = [float((it or {}).get("close", 0) or 0) for it in items]
+        highs = [float((it or {}).get("high", 0) or 0) for it in items]
+        last_close = closes[-1]
+        ref20 = closes[-20] if len(closes) >= 20 else closes[0]
+        daily_ret20 = ((last_close / ref20) - 1.0) * 100.0 if ref20 > 0 else 0.0
+        ma20 = sum(closes[-20:]) / min(20, len(closes))
+        ma60 = sum(closes[-60:]) / min(60, len(closes))
+        daily_ma_down = ma20 < ma60
+        recent_high10 = max(highs[-10:]) if len(highs) >= 10 else max(highs)
+        prev_high10 = max(highs[-20:-10]) if len(highs) >= 20 else recent_high10
+        daily_lower_high = bool(prev_high10 > 0 and recent_high10 <= prev_high10 * 0.985)
+
+        last40 = items[-40:]
+        weekly_chunks = [last40[i:i+5] for i in range(0, len(last40), 5) if len(last40[i:i+5]) >= 5]
+        if len(weekly_chunks) < 8:
+            return out
+        week_closes = [float(chunk[-1].get("close", 0) or 0) for chunk in weekly_chunks]
+        week_highs = [max(float((row or {}).get("high", 0) or 0) for row in chunk) for chunk in weekly_chunks]
+        week_last = week_closes[-1]
+        week_ref = week_closes[0]
+        weekly_ret8 = ((week_last / week_ref) - 1.0) * 100.0 if week_ref > 0 else 0.0
+        ma4w = sum(week_closes[-4:]) / 4.0
+        ma8w = sum(week_closes[-8:]) / 8.0
+        weekly_ma_down = ma4w < ma8w
+        recent_high4 = max(week_highs[-4:])
+        prev_high4 = max(week_highs[-8:-4])
+        weekly_lower_high = bool(prev_high4 > 0 and recent_high4 <= prev_high4 * 0.985)
+
+        daily_flags = 0
+        if daily_ret20 <= -10.0:
+            daily_flags += 1
+        if daily_ma_down:
+            daily_flags += 1
+        if daily_lower_high:
+            daily_flags += 1
+
+        weekly_flags = 0
+        if weekly_ret8 <= -15.0:
+            weekly_flags += 1
+        if weekly_ma_down:
+            weekly_flags += 1
+        if weekly_lower_high:
+            weekly_flags += 1
+
+        out.update({
+            "is_multi_tf_downtrend": daily_flags >= 2 and weekly_flags >= 2,
+            "daily_ret20": round(daily_ret20, 1),
+            "weekly_ret8": round(weekly_ret8, 1),
+            "daily_ma_down": bool(daily_ma_down),
+            "weekly_ma_down": bool(weekly_ma_down),
+            "daily_lower_high": bool(daily_lower_high),
+            "weekly_lower_high": bool(weekly_lower_high),
+            "daily_flags": int(daily_flags),
+            "weekly_flags": int(weekly_flags),
+        })
+    except Exception:
+        return out
+    return out
+
+
+def _should_block_multi_tf_downtrend_capture(code: str, signal_type: str) -> dict:
+    block_types = {"UPPER_LIMIT", "NEAR_UPPER", "SURGE", "EARLY_DETECT", "STRONG_BUY", "MID_PULLBACK", "ENTRY_POINT"}
+    ctx = _get_multi_tf_downtrend_context(code)
+    if signal_type not in block_types:
+        return {"block": False, "context": ctx, "reason": ""}
+    if not ctx.get("is_multi_tf_downtrend"):
+        return {"block": False, "context": ctx, "reason": ""}
+    reason = (
+        f"주봉·일봉 동반 하락 추세 차단 "
+        f"(20일 {ctx.get('daily_ret20', 0):+.1f}% / 8주 {ctx.get('weekly_ret8', 0):+.1f}% / "
+        f"일봉{'↓' if ctx.get('daily_ma_down') else '-'}·주봉{'↓' if ctx.get('weekly_ma_down') else '-'} / "
+        f"일LH {int(bool(ctx.get('daily_lower_high')))} / 주LH {int(bool(ctx.get('weekly_lower_high')))} )"
+    )
+    return {"block": True, "context": ctx, "reason": reason}
+
 
 def _signal_age_minutes_for_retry(s: dict | None) -> int:
     if not isinstance(s, dict):
@@ -15534,6 +15658,24 @@ def analyze(stock: dict) -> dict:
     except Exception as _e:
         _log_error(f"detect_force({code})", _e)
 
+    _multi_tf_block = _should_block_multi_tf_downtrend_capture(code, signal_type)
+    if _multi_tf_block.get("block"):
+        _ctx = _multi_tf_block.get("context", {}) or {}
+        _log_suppressed_alert(
+            code, stock.get("name", code),
+            _multi_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"),
+            signal_type,
+            {
+                "daily_ret20": _ctx.get("daily_ret20", 0.0),
+                "weekly_ret8": _ctx.get("weekly_ret8", 0.0),
+                "daily_flags": _ctx.get("daily_flags", 0),
+                "weekly_flags": _ctx.get("weekly_flags", 0),
+                "change_rate": change_rate,
+                "score": score,
+            },
+        )
+        return {}
+
     # 등급 계산
     a_cut = 80
     if _should_relax_general_a_threshold(
@@ -15669,6 +15811,25 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
         pre_score, pre_reasons, pre_similar_pattern_stats = _apply_similar_pattern_score(
             pre_score, pre_reasons, code, "EARLY_DETECT", cr, vr, weight_mode="strong"
         )
+        _nxt_tf_block = _should_block_multi_tf_downtrend_capture(code, "EARLY_DETECT")
+        if _nxt_tf_block.get("block"):
+            _ctx = _nxt_tf_block.get("context", {}) or {}
+            _log_suppressed_alert(
+                code, stock.get("name", code),
+                _nxt_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"),
+                "EARLY_DETECT",
+                {
+                    "daily_ret20": _ctx.get("daily_ret20", 0.0),
+                    "weekly_ret8": _ctx.get("weekly_ret8", 0.0),
+                    "daily_flags": _ctx.get("daily_flags", 0),
+                    "weekly_flags": _ctx.get("weekly_flags", 0),
+                    "change_rate": cr,
+                    "score": pre_score,
+                    "market": "NXT",
+                },
+            )
+            continue
+
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":cr,"volume_ratio":vr,
                         "signal_type":"EARLY_DETECT","score":pre_score,
@@ -15768,6 +15929,24 @@ def check_early_detection() -> list:
         early_score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
             early_score, reasons, code, "EARLY_DETECT", change_rate, vol_ratio, weight_mode="strong"
         )
+        _early_tf_block = _should_block_multi_tf_downtrend_capture(code, "EARLY_DETECT")
+        if _early_tf_block.get("block"):
+            _ctx = _early_tf_block.get("context", {}) or {}
+            _log_suppressed_alert(
+                code, stock.get("name", code),
+                _early_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"),
+                "EARLY_DETECT",
+                {
+                    "daily_ret20": _ctx.get("daily_ret20", 0.0),
+                    "weekly_ret8": _ctx.get("weekly_ret8", 0.0),
+                    "daily_flags": _ctx.get("daily_flags", 0),
+                    "weekly_flags": _ctx.get("weekly_flags", 0),
+                    "change_rate": change_rate,
+                    "score": early_score,
+                    "market": stock.get("market", ""),
+                },
+            )
+            continue
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
                         "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
@@ -15809,6 +15988,24 @@ def check_pullback_signals() -> list:
                 entry_score, entry_reasons, similar_pattern_stats = _apply_similar_pattern_score(
                     entry_score, entry_reasons, code, "ENTRY_POINT", cur.get("change_rate",0), 0, weight_mode="confirm"
                 )
+                _entry_tf_block = _should_block_multi_tf_downtrend_capture(code, "ENTRY_POINT")
+                if _entry_tf_block.get("block"):
+                    _ctx = _entry_tf_block.get("context", {}) or {}
+                    _log_suppressed_alert(
+                        code, cur.get("name", code),
+                        _entry_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"),
+                        "ENTRY_POINT",
+                        {
+                            "daily_ret20": _ctx.get("daily_ret20", 0.0),
+                            "weekly_ret8": _ctx.get("weekly_ret8", 0.0),
+                            "daily_flags": _ctx.get("daily_flags", 0),
+                            "weekly_flags": _ctx.get("weekly_flags", 0),
+                            "change_rate": cur.get("change_rate", 0),
+                            "score": entry_score,
+                        },
+                    )
+                    continue
+
                 signals.append({"code":code,"name":cur.get("name",code),"price":price,
                                  "change_rate":cur.get("change_rate",0),"volume_ratio":0,
                                  "signal_type":"ENTRY_POINT","score":entry_score,
