@@ -3,11 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v52
+버전: v53
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v53 (2026-03-23): 동시보유 제한 후단 이동 + 신규 리더 선평가/후제한.
+  [#1] `_get_carry_position_context()` / `_apply_position_limit_after_priority()`를 추가해,
+       `filter_portfolio_signals()`가 신규/기존 신호를 먼저 `stale quota`·리더 우선 정렬로 평가한 뒤에만
+       max_positions 기반 동시보유 제한을 적용하도록 순서를 재배치.
+  [#2] 보유 한도 초과 시 잘리는 신규 후보는 `position_limit` shadow 기록에
+       `priority_rank` / `leader_priority_hit` / `stale_pullback_hit` / `stale_replay_penalty_hit`를 함께 남기도록 보강.
+  [#3] 동시보유 제한 로그를 `평가 후 신규 n개 억제` 형태로 바꿔, 신규 리더를 먼저 선별한 뒤 행동 가능 단계에서만 잘랐는지
+       운영 로그에서 바로 확인 가능하게 정리.
+  이유: v52까지는 `filter_portfolio_signals()` 초반의 max_positions 차단이 stale 눌림목 quota·리더 우선 정렬보다 먼저 실행돼,
+       좋은 신규 리더도 보유 중이라는 이유만으로 선평가 없이 잘리는 구조적 모순이 남아 있었음.
+  개선점: 신규 리더 선평가/기록↑, 동시보유 제한의 과잉 억제 체감↓, position_limit self-audit 해석력↑.
+  주의점: 실제 외부 알림은 기존처럼 보유 한도 이후 행동 가능한 후보만 남기며, 이번 변경은 동시보유 제한을 제거하는 것이 아니라 적용 순서를 후단으로 내리는 보정임.
 
 - v52 (2026-03-23): 오후 NXT-only 리더 포착 보강.
   [#1] `_is_nxt_postmarket_only_window()` / `_collect_nxt_postmarket_candidates()` / `check_nxt_postmarket_detection()`를 추가해,
@@ -22988,13 +23001,67 @@ def check_earnings_risk(code: str, name: str) -> dict:
 # ============================================================
 # 🗂️ ⑤ 동시 신호 포트폴리오 관리
 # ============================================================
+def _get_carry_position_context() -> tuple[int, set[str]]:
+    carry = {}
+    try:
+        carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
+        if isinstance(carry, list):
+            carry_count = len(carry)
+            carry_codes = {str(c.get("code", "")) for c in carry if isinstance(c, dict) and str(c.get("code", ""))}
+        elif isinstance(carry, dict):
+            carry_count = len([v for v in carry.values() if isinstance(v, dict)])
+            carry_codes = {str(v.get("code", k)) for k, v in carry.items() if isinstance(v, dict) and str(v.get("code", k))}
+        else:
+            carry_count = 0
+            carry_codes = set()
+    except Exception:
+        carry_count = 0
+        carry_codes = set()
+    return carry_count, carry_codes
+
+
+def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[str], carry_count: int, max_positions: int, stage: str = "") -> list:
+    if not sorted_alerts:
+        return []
+    if carry_count < max_positions:
+        return sorted_alerts
+
+    allowed = []
+    blocked = []
+    for rank, alert in enumerate(sorted_alerts, start=1):
+        if alert.get("code") in carry_codes:
+            allowed.append(alert)
+            continue
+        blocked.append((rank, alert))
+
+    if blocked:
+        for rank, alert in blocked:
+            _record_shadow_capture(
+                alert.get("code", ""), alert.get("name", alert.get("code", "")),
+                "position_limit", alert.get("signal_type", ""), stage=stage or "filter_portfolio_signals",
+                extra={
+                    "score": alert.get("score", 0),
+                    "grade": alert.get("grade", ""),
+                    "change_rate": alert.get("change_rate", 0),
+                    "market": alert.get("market", ""),
+                    "priority_rank": rank,
+                    "leader_priority_hit": bool(alert.get("leader_priority_hit")),
+                    "stale_pullback_hit": bool(alert.get("stale_pullback_hit")),
+                    "stale_replay_penalty_hit": bool(alert.get("stale_replay_penalty_hit")),
+                },
+            )
+        print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 평가 후 신규 {len(blocked)}개 억제")
+
+    return allowed
+
+
 def filter_portfolio_signals(alerts: list) -> list:
     """
     동시 다발 신호에서 실질 섹터 스코어 기반 중복 제거.
     - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
     - 점수 높은 것 1개만 통과 (나머지 제외)
     - 국면별 총 신호 수 제한
-    - v41.80: max_positions 기반 동시 보유 제한 강제
+    - v53: 신규/기존 신호를 먼저 평가한 뒤 동시 보유 제한을 마지막 행동 단계에 적용
     """
     if not alerts:
         return alerts
@@ -23005,41 +23072,7 @@ def filter_portfolio_signals(alerts: list) -> list:
     max_positions = rp.get("max_positions", 1)
     max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
 
-    # v41.80: 이미 보유 중인 종목 수 확인 → max_positions 초과 시 신규 포착 억제
-    try:
-        carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
-        if isinstance(carry, list):
-            carry_count = len(carry)
-        elif isinstance(carry, dict):
-            carry_count = len([v for v in carry.values() if isinstance(v, dict)])
-        else:
-            carry_count = 0
-    except Exception:
-        carry_count = 0
-
-    if carry_count >= max_positions:
-        # 보유 중인 종목과 같은 종목의 재진입 신호만 허용
-        carry_codes = set()
-        try:
-            if isinstance(carry, list):
-                carry_codes = {str(c.get("code", "")) for c in carry if isinstance(c, dict)}
-            elif isinstance(carry, dict):
-                carry_codes = {str(v.get("code", k)) for k, v in carry.items() if isinstance(v, dict)}
-        except Exception:
-            pass
-        before_count = len(alerts)
-        blocked_alerts = [a for a in alerts if a.get("code") not in carry_codes]
-        alerts = [a for a in alerts if a.get("code") in carry_codes]
-        if blocked_alerts:
-            for _a in blocked_alerts:
-                _record_shadow_capture(
-                    _a.get("code", ""), _a.get("name", _a.get("code", "")),
-                    "position_limit", _a.get("signal_type", ""), stage="filter_portfolio_signals",
-                    extra={"score": _a.get("score", 0), "grade": _a.get("grade", ""), "change_rate": _a.get("change_rate", 0), "market": _a.get("market", "")}
-                )
-            print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 신규 {len(blocked_alerts)}개 억제")
-        if not alerts:
-            return alerts
+    carry_count, carry_codes = _get_carry_position_context()
 
     alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
 
@@ -23056,6 +23089,16 @@ def filter_portfolio_signals(alerts: list) -> list:
         ),
         reverse=True,
     )
+
+    sorted_alerts = _apply_position_limit_after_priority(
+        sorted_alerts,
+        carry_codes=carry_codes,
+        carry_count=carry_count,
+        max_positions=max_positions,
+        stage="filter_portfolio_signals",
+    )
+    if not sorted_alerts:
+        return []
 
     passed   = []
     excluded = set()
