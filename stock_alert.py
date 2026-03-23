@@ -3,11 +3,82 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v43
+버전: v49
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v49 (2026-03-23): 반복 miss 테마 신규 리더 가산 + stale 테마 breadth 정밀 감점.
+  [#1] `_collect_theme_feedback_candidates()` / `_calc_miss_theme_leader_bonus()` / `_get_theme_breadth_hint()`를 추가해,
+       self-audit에서 반복 miss된 테마의 신규 리더/동조 강세 종목을 다음날 동적 후보군에 제한적으로 재편입하고, 강한 리더면 추가 점수와 우선권을 부여하도록 수정.
+  [#2] `_calc_stale_replay_penalty()`에 stale 테마 breadth(상승 종목 비율/평균 상승률/리더 강도)를 연결해,
+       breadth가 약한 stale 테마는 감점을 더 강하게 하고 breadth가 살아 있는 테마는 감점을 일부 완화하도록 보강.
+  [#3] `refresh_dynamic_candidates()` / `analyze()` / `_sector_gate_sort_key()` / `_should_soft_allow_no_ask_liquidity_general()`에
+       `miss_theme_leader_hit`과 theme feedback 후보를 연결해, 전일 반복 miss된 테마의 신규 강세 리더가 후보군·점수·정렬·soft allow에서 더 앞서도록 정리.
+  이유: v48까지 stale 재노출 감점은 강화됐지만, self-audit에서 반복 miss된 테마의 신규 리더를 장중에 충분히 밀어주지 못했고,
+       stale 테마 감점도 breadth 강도와 무관하게 작동해 살아 있는 테마까지 과하게 눌릴 여지가 있었음.
+  개선점: 반복 miss 테마 신규 리더 포착률↑, 테마 기반 후보 보강↑, stale 테마 과감점↓/약한 stale 테마 정밀 감점↑.
+  주의점: theme feedback 후보와 가산점은 직접뉴스/테마동조/강한 급등형에만 제한 적용되며, `MID_PULLBACK`/`ENTRY_POINT`를 신규 리더처럼 승격시키지는 않음.
+
+- v48 (2026-03-23): stale quota + self-audit 연동 재노출 감점 보정.
+  [#1] `stale_replay_penalty.json`과 `_build_stale_replay_penalty_profile()` / `load_stale_replay_penalty_profile()`를 추가해,
+       `stale_pullback_quota`/`stale_replay_penalty` shadow 기록과 장마감 self-audit miss 압력을 묶어 반복적인 stale 재노출 종목·테마 감점 프로필을 생성하도록 수정.
+  [#2] `_calc_stale_replay_penalty()`를 추가하고 `_annotate_signal_priority()`에 연결해,
+       `MID_PULLBACK` / `ENTRY_POINT`가 장중 repeatedly stale로 판정된 코드/테마면 점수를 추가 감점하고 강한 경우 `stale_pullback_hit`으로 승격되게 보강.
+  [#3] `_apply_stale_pullback_quota()` / `filter_portfolio_signals()` / `run_mid_pullback_scan()` / `_sector_gate_sort_key()`에
+       `stale_replay_penalty_hit`을 연결해 신규 리더가 존재할 때 stale 재노출이 반복되는 눌림목이 더 뒤로 밀리거나 shadow 기록으로 전환되도록 정리.
+  이유: v47까지 stale quota와 신규 리더 우선권은 들어갔지만, self-audit에서 반복 확인된 stale 재노출 종목/테마가 다음날 장중 점수/정렬에 더 강하게 감점되지 않아 같은 종목이 다시 앞줄에 설 여지가 남아 있었음.
+  개선점: stale 재노출 반복 감점↑, 신규 리더 우선권 체감↑, shadow/self-audit 기반 장중 보정 연속성↑.
+  주의점: 직접뉴스/테마주도/강한 급등처럼 신규 리더 근거가 충분한 경우는 감점을 제한하며, stale 눌림목을 전면 차단하지는 않음.
+
+- v47 (2026-03-23): stale 눌림목 quota 축소 + 신규 리더 우선권 연결.
+  [#1] `_load_tracking_priority_hints()` / `_annotate_signal_priority()`를 추가해 대표 추적 로그의 최초 포착 시각과 최근 상태를 읽고,
+       `MID_PULLBACK` / `ENTRY_POINT`가 오래된 재포착인지(stale)와 당일 신규 리더 우선권 대상인지(leader priority)를 공통 표기하도록 수정.
+  [#2] `_apply_stale_pullback_quota()`를 추가해 같은 스캔 사이클에 신규 리더가 존재하면 stale 눌림목/재포착 신호 수를 제한하고,
+       초과분은 `shadow_capture`로 남기되 외부 알림 우선순위에서는 뒤로 밀리게 정리.
+  [#3] `filter_portfolio_signals()` / `run_mid_pullback_scan()` / `_sector_gate_sort_key()`에 leader priority / stale penalty를 연결해
+       기존 `ENTRY_POINT`/`MID_PULLBACK` 재노출보다 신규 강세주/테마 리더가 먼저 통과되도록 보강.
+  이유: 주간 로그/CSV 분석 결과 상승 리더 miss의 본질 중 하나가 stale 눌림목 재노출이 신규 강세주보다 앞서 알림 슬롯과 우선순위를 차지하는 구조에 있었음.
+  개선점: stale 재노출 과다↓, 신규 리더 우선 통과↑, self-audit/adaptive feedback 효과 체감↑.
+  주의점: 눌림목 신호를 제거하지는 않으며, 대표 재상승·직접뉴스·테마 동조형처럼 신규 리더 근거가 충분한 경우는 stale quota에서 제외.
+
+- v46 (2026-03-23): self-audit 결과 기반 다음날 자동 피드백 연결.
+  [#1] `adaptive_capture_feedback.json`과 `_build_adaptive_capture_feedback()` / `load_adaptive_capture_feedback()`를 추가해,
+       장마감 self-audit의 누락 종목·테마·차단 사유를 다음 거래일 후보군/점수/필터 보정에 재사용하도록 수정.
+  [#2] `refresh_dynamic_candidates()`에 최근 miss 상위 종목 재편입 후보 수집을 연결하고,
+       `analyze()`에는 feedback priority code/theme 가산점을 추가해 전일 장마감 상승주 miss가 다음날 `기타`에 묻지 않도록 보강.
+  [#3] `no_ask_liquidity` soft 허용과 섹터 게이트 정렬에도 feedback bias를 연결해,
+       전일 self-audit에서 반복 차단된 리더형 종목이 다음날 동일 이유로 재차 잘리는 문제를 완화.
+  이유: 주간 CSV 분석 결과 miss의 본질이 개별 조건값보다 장마감 결과와 프로그램 결과의 차이를 다음날 로직에 반영하지 못하는 구조에 있었음.
+       self-audit/shadow-capture를 기록만 하지 말고 실제 후보·점수·차단 완화에 연결해야 개선 효과가 누적됨.
+  개선점: 전일 miss 리더 후보 재편입↑, 테마 동조·개별 리더 보정 누적↑, no_ask_liquidity/후보미포착 재발 방지↑.
+  주의점: feedback 가산은 제한적으로만 적용되며, `MID_PULLBACK` / `ENTRY_POINT` stale 재노출을 우대하지 않도록 점수 상한과 신호군 제한을 둠.
+
+- v45 (2026-03-23): 운영 버전 잠금 + 장마감 self-audit + shadow-capture 추가.
+  [#1] `runtime_version_lock.json` 기반 운영 버전 잠금을 추가해 공유 볼륨에 더 최신 버전이 기록돼 있으면 구버전 런타임이
+       스캔/알림을 자동 중단하도록 수정. 같은 날 구버전/신버전이 섞여 실제 miss 원인 분석이 흔들리던 문제를 줄이기 위한 보강이다.
+  [#2] `run_daily_self_audit()`를 추가해 장마감 상승 상위 종목과 실제 포착/차단/제한 억제 결과를 자동 비교하고
+       `daily_self_audit.json`에 저장한 뒤 텔레그램 요약을 발송하도록 수정.
+  [#3] `position_limit`/`sector_limit`/`no_ask_liquidity`/`A전용 외부억제` 같은 누락 사유를 `shadow_captures.json`에
+       남기도록 연결해, 외부 알림이 막혀도 self-audit과 다음날 로직 보정에 쓸 내부 학습 데이터는 유지되게 정리.
+  이유: 주간 로그 분석 결과 강세주 miss의 본질이 단일 조건값보다 운영 버전 혼선 + 동시보유 제한/유동성 차단 같은 구조적 누락에 가까웠고,
+       장마감 결과와 프로그램 결과를 자동 비교하는 피드백 루프가 필요했다.
+  개선점: 구버전 혼선↓, 누락 사유 가시성↑, 장마감 결과 기반 다음 수정 효율↑.
+  주의점: 이번 버전은 stale 눌림목 quota 대수술보다 운영 잠금·self-audit·shadow 기록을 먼저 넣는 최소 보강이다.
+
+- v44 (2026-03-23): 테마 동조 강세주 후보 확장 + 실시간 테마 주도 보강.
+  [#1] `_collect_theme_peer_follow_candidates()`를 추가해 상한가/급등 seed 종목의 동일 테마 peer를 실시간 시세로 재확인한 뒤,
+       강한 동조 상승 종목을 후보군에 즉시 편입하도록 수정. 삼륭물산처럼 테마 주도주 peer인데 랭킹/NXT 후보에서 밀리던 종목의
+       스캔 누락을 줄이기 위한 보강이다.
+  [#2] `_get_theme_drive_hint()`와 `THEME_DRIVE_*` 규칙을 추가해 직접뉴스가 약해도 테마 leader·breadth·flow가 강하면
+       `sector_info.theme`을 보존/승격하고 점수에 `테마 동조강세` 보너스를 반영하도록 정리.
+  [#3] A게이트 완화 판정에 `테마 동조강세` 근거를 반영해, 강한 테마 주도 구간의 `SURGE` / `EARLY_DETECT` / `NEAR_UPPER`가
+       `기타`로 눌리거나 B에 머무는 문제를 완화.
+  이유: 삼륭물산처럼 개별 공시보다 테마 전체 강세로 상한가에 가는 종목은 직접뉴스/신규이슈만으로는 늦거나 누락될 수 있었음.
+       테마 leader의 동조 확산을 실시간 후보군과 점수에 같이 반영해야 효율적으로 놓침을 줄일 수 있음.
+  개선점: 테마 동조주 포착률↑, 상한가/주도주 peer 누락↓, `기타업종` 잔류 감소↑, A 후보 선별력↑.
+  주의점: `MID_PULLBACK` / `ENTRY_POINT` 보수 정책은 유지하며, theme peer 편입은 강한 seed/동조 흐름이 확인될 때만 제한적으로 동작.
 
 
 - v43 (2026-03-23): 비실전형 알림 진입가 제거 + 포착/행동 알림 용어 분리.
@@ -875,6 +946,41 @@ LEADER_LOCK_LEASE_SEC = int(os.getenv("LEADER_LOCK_LEASE_SEC", "75") or "75")
 _INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'local'}:{os.getpid()}:{random.randint(1000, 9999)}"
 _RUNTIME_IS_LEADER = False
 _STARTUP_BANNER_SENT = False
+RUNTIME_VERSION_LOCK_FILE = os.path.join(DATA_DIR, "runtime_version_lock.json")
+SHADOW_CAPTURE_FILE = os.path.join(DATA_DIR, "shadow_captures.json")
+SELF_AUDIT_FILE = os.path.join(DATA_DIR, "daily_self_audit.json")
+ADAPTIVE_CAPTURE_FEEDBACK_FILE = os.path.join(DATA_DIR, "adaptive_capture_feedback.json")
+STALE_REPLAY_PENALTY_FILE = os.path.join(DATA_DIR, "stale_replay_penalty.json")
+ADAPTIVE_FEEDBACK_LOOKBACK_DAYS = int(os.getenv("ADAPTIVE_FEEDBACK_LOOKBACK_DAYS", "5") or "5")
+ADAPTIVE_FEEDBACK_MAX_CODES = int(os.getenv("ADAPTIVE_FEEDBACK_MAX_CODES", "12") or "12")
+ADAPTIVE_FEEDBACK_CODE_MIN_WEIGHT = float(os.getenv("ADAPTIVE_FEEDBACK_CODE_MIN_WEIGHT", "2.5") or "2.5")
+ADAPTIVE_FEEDBACK_THEME_MIN_WEIGHT = float(os.getenv("ADAPTIVE_FEEDBACK_THEME_MIN_WEIGHT", "2.0") or "2.0")
+STALE_REPLAY_LOOKBACK_DAYS = int(os.getenv("STALE_REPLAY_LOOKBACK_DAYS", "5") or "5")
+STALE_REPLAY_CODE_MIN_WEIGHT = float(os.getenv("STALE_REPLAY_CODE_MIN_WEIGHT", "3.0") or "3.0")
+STALE_REPLAY_THEME_MIN_WEIGHT = float(os.getenv("STALE_REPLAY_THEME_MIN_WEIGHT", "2.4") or "2.4")
+STALE_REPLAY_MAX_CODE_PENALTY = int(os.getenv("STALE_REPLAY_MAX_CODE_PENALTY", "6") or "6")
+STALE_REPLAY_MAX_THEME_PENALTY = int(os.getenv("STALE_REPLAY_MAX_THEME_PENALTY", "4") or "4")
+STALE_REPLAY_FORCE_STALE_PENALTY = int(os.getenv("STALE_REPLAY_FORCE_STALE_PENALTY", "6") or "6")
+STALE_REPLAY_STRONG_DROP_POINTS = int(os.getenv("STALE_REPLAY_STRONG_DROP_POINTS", "6") or "6")
+STALE_PULLBACK_MIN_HOURS = float(os.getenv("STALE_PULLBACK_MIN_HOURS", "18") or "18")
+STALE_PULLBACK_MAX_PER_SCAN = int(os.getenv("STALE_PULLBACK_MAX_PER_SCAN", "1") or "1")
+MISSED_THEME_CANDIDATE_LIMIT = int(os.getenv("MISSED_THEME_CANDIDATE_LIMIT", "6") or "6")
+MISSED_THEME_LEADER_MIN_WEIGHT = float(os.getenv("MISSED_THEME_LEADER_MIN_WEIGHT", "2.4") or "2.4")
+MISSED_THEME_LEADER_MAX_BONUS = int(os.getenv("MISSED_THEME_LEADER_MAX_BONUS", "5") or "5")
+MISSED_THEME_STRONG_LEADER_CHANGE = float(os.getenv("MISSED_THEME_STRONG_LEADER_CHANGE", "6.0") or "6.0")
+MISSED_THEME_STRONG_BREADTH_RATIO = float(os.getenv("MISSED_THEME_STRONG_BREADTH_RATIO", "0.5") or "0.5")
+STALE_THEME_WEAK_BREADTH_RATIO = float(os.getenv("STALE_THEME_WEAK_BREADTH_RATIO", "0.34") or "0.34")
+STALE_THEME_WEAK_AVG_CHANGE = float(os.getenv("STALE_THEME_WEAK_AVG_CHANGE", "2.5") or "2.5")
+STALE_THEME_BREADTH_EXTRA_PENALTY = int(os.getenv("STALE_THEME_BREADTH_EXTRA_PENALTY", "3") or "3")
+LEADER_PRIORITY_SIGNAL_TYPES = {"UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY", "SURGE", "EARLY_DETECT"}
+_tracking_priority_hint_cache: dict = {"ts": 0.0, "rows": {}}
+_runtime_version_blocked = False
+_daily_self_audit_sent: set[str] = set()
+_adaptive_capture_feedback: dict = {"generated_date": "", "priority_codes": {}, "theme_bias": {}, "reason_counts": {}, "source_dates": []}
+_stale_replay_penalty_profile: dict = {"generated_date": "", "code_penalty": {}, "theme_penalty": {}, "source_dates": [], "date_pressure": {}}
+_stale_shadow_intraday_cache: dict = {"ts": 0.0, "date": "", "codes": {}, "themes": {}}
+_theme_breadth_cache: dict = {}
+
 
 def _normalize_for_hash(obj):
     if isinstance(obj, dict):
@@ -1028,10 +1134,64 @@ def _send_startup_banner_once() -> bool:
         print(f"⚠️ 시작 배너 전송 실패: {e}")
         return False
 
+def _version_sort_key(ver: str) -> tuple:
+    ver = str(ver or "").strip().lower()
+    if ver.startswith("v"):
+        ver = ver[1:]
+    parts = []
+    for token in ver.replace("-", ".").split("."):
+        if token.isdigit():
+            parts.append((0, int(token)))
+        else:
+            parts.append((1, token))
+    return tuple(parts)
+
+
+def _enforce_runtime_version_lock(notify: bool = True) -> bool:
+    """공유 볼륨에 더 최신 버전 잠금이 있으면 현재 구버전 런타임을 정지한다."""
+    global _runtime_version_blocked
+    try:
+        current = {
+            "version": BOT_VERSION,
+            "code_hash": _get_code_hash(),
+            "updated_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "instance_id": _INSTANCE_ID,
+        }
+        saved = _read_json_safe(RUNTIME_VERSION_LOCK_FILE, {}) or {}
+        saved_ver = str(saved.get("version", "") or "")
+        if saved_ver and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION):
+            _runtime_version_blocked = True
+            msg = (
+                f"⛔ <b>구버전 런타임 자동 정지</b>\n"
+                f"현재 실행: <b>{BOT_VERSION}</b> / 잠금 버전: <b>{saved_ver}</b>\n"
+                f"인스턴스: <code>{_INSTANCE_ID}</code>\n"
+                f"최신 버전이 이미 운영 중이므로 이 런타임은 스캔/알림을 중단합니다."
+            )
+            print(msg.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
+            if notify:
+                try:
+                    send(msg)
+                except Exception:
+                    pass
+            return False
+        if (not saved_ver) or _version_sort_key(BOT_VERSION) >= _version_sort_key(saved_ver):
+            if saved_ver != BOT_VERSION or str(saved.get("code_hash", "")) != current["code_hash"]:
+                _write_json_atomic(RUNTIME_VERSION_LOCK_FILE, current, indent=2)
+        _runtime_version_blocked = False
+        return True
+    except Exception as e:
+        print(f"⚠️ 운영 버전 잠금 확인 실패: {e}")
+        return True
+
+
 def _leader_job(fn):
     def _wrapped(*args, **kwargs):
+        if _runtime_version_blocked:
+            return None
         was_leader = bool(_RUNTIME_IS_LEADER)
         if not _try_acquire_leader_lock():
+            return None
+        if not _enforce_runtime_version_lock(notify=False):
             return None
         if not was_leader:
             _send_startup_banner_once()
@@ -1195,6 +1355,847 @@ def _log_suppressed_alert(code: str, name: str, reason: str, signal_type: str = 
         print(f"  🚫 차단: {name}({code}) — {reason}")
     except Exception as e:
         print(f"⚠️ 차단 로그 기록 오류: {e}")
+
+
+def _safe_feedback_theme_key(theme: str) -> str:
+    theme = str(theme or "").strip()
+    if theme in ("", "기타", "기타업종", "unknown", "미분류"):
+        return ""
+    return theme[:60]
+
+
+def _feedback_reason_weight(reason: str) -> float:
+    reason = str(reason or "")
+    if reason == "candidate_miss":
+        return 4.0
+    if reason == "no_ask_liquidity":
+        return 3.0
+    if reason == "position_limit":
+        return 2.5
+    if reason == "sector_limit":
+        return 2.0
+    if reason == "blocked_other":
+        return 1.8
+    if reason == "external_suppressed":
+        return 1.2
+    return 1.0
+
+
+def load_adaptive_capture_feedback() -> dict:
+    global _adaptive_capture_feedback
+    try:
+        obj = _read_json_locked(ADAPTIVE_CAPTURE_FEEDBACK_FILE) if os.path.exists(ADAPTIVE_CAPTURE_FEEDBACK_FILE) else {}
+        if not isinstance(obj, dict):
+            obj = {}
+        base = {"generated_date": "", "priority_codes": {}, "theme_bias": {}, "reason_counts": {}, "source_dates": []}
+        base.update(obj)
+        if not isinstance(base.get("priority_codes"), dict):
+            base["priority_codes"] = {}
+        if not isinstance(base.get("theme_bias"), dict):
+            base["theme_bias"] = {}
+        if not isinstance(base.get("reason_counts"), dict):
+            base["reason_counts"] = {}
+        if not isinstance(base.get("source_dates"), list):
+            base["source_dates"] = []
+        _adaptive_capture_feedback = base
+    except Exception as e:
+        print(f"⚠️ adaptive feedback 로드 오류: {e}")
+        _adaptive_capture_feedback = {"generated_date": "", "priority_codes": {}, "theme_bias": {}, "reason_counts": {}, "source_dates": []}
+    return _adaptive_capture_feedback
+
+
+def _build_adaptive_capture_feedback(lookback_days: int | None = None) -> dict:
+    lookback_days = int(lookback_days or ADAPTIVE_FEEDBACK_LOOKBACK_DAYS or 5)
+    try:
+        raw = _read_json_locked(SELF_AUDIT_FILE) if os.path.exists(SELF_AUDIT_FILE) else {}
+        raw = raw if isinstance(raw, dict) else {}
+        rows = []
+        for rec in raw.values():
+            if isinstance(rec, dict):
+                rows.append(rec)
+        rows.sort(key=lambda x: str(x.get("date", "")))
+        if lookback_days > 0:
+            rows = rows[-lookback_days*2:]
+        code_weights: dict[str, dict] = {}
+        theme_weights: dict[str, dict] = {}
+        reason_counts: dict[str, int] = {}
+        source_dates: list[str] = []
+        for rec in rows:
+            date_key = str(rec.get("date", "") or "")
+            if date_key and date_key not in source_dates:
+                source_dates.append(date_key)
+            for d in rec.get("leaders", []) or []:
+                if not isinstance(d, dict):
+                    continue
+                cls = str(d.get("class", "") or "")
+                if cls in ("", "detected"):
+                    continue
+                code = normalize_stock_code(d.get("code"))
+                if not code:
+                    continue
+                chg = float(d.get("change_rate", 0) or 0)
+                if chg < 5.0:
+                    continue
+                weight = _feedback_reason_weight(cls)
+                reason_counts[cls] = reason_counts.get(cls, 0) + 1
+                row = code_weights.setdefault(code, {
+                    "code": code,
+                    "name": str(d.get("name", code) or code),
+                    "weight": 0.0,
+                    "best_change": 0.0,
+                    "reasons": set(),
+                    "theme": _safe_feedback_theme_key(d.get("theme", "")),
+                })
+                row["weight"] += weight + min(max(chg - 5.0, 0.0) * 0.08, 1.6)
+                row["best_change"] = max(row["best_change"], chg)
+                row["reasons"].add(cls)
+                theme_key = _safe_feedback_theme_key(d.get("theme", ""))
+                if theme_key:
+                    trow = theme_weights.setdefault(theme_key, {"theme": theme_key, "weight": 0.0, "codes": set(), "reasons": set()})
+                    trow["weight"] += weight
+                    trow["codes"].add(code)
+                    trow["reasons"].add(cls)
+        priority_codes = {}
+        for code, row in sorted(code_weights.items(), key=lambda kv: (kv[1]["weight"], kv[1]["best_change"]), reverse=True)[:ADAPTIVE_FEEDBACK_MAX_CODES]:
+            if float(row.get("weight", 0.0) or 0.0) < ADAPTIVE_FEEDBACK_CODE_MIN_WEIGHT:
+                continue
+            priority_codes[code] = {
+                "name": row.get("name", code),
+                "weight": round(float(row.get("weight", 0.0) or 0.0), 2),
+                "best_change": round(float(row.get("best_change", 0.0) or 0.0), 2),
+                "reasons": sorted(list(row.get("reasons") or [])),
+                "theme": row.get("theme", ""),
+            }
+        theme_bias = {}
+        for theme_key, row in sorted(theme_weights.items(), key=lambda kv: kv[1]["weight"], reverse=True):
+            if float(row.get("weight", 0.0) or 0.0) < ADAPTIVE_FEEDBACK_THEME_MIN_WEIGHT:
+                continue
+            theme_bias[theme_key] = {
+                "weight": round(float(row.get("weight", 0.0) or 0.0), 2),
+                "codes": sorted(list(row.get("codes") or []))[:8],
+                "reasons": sorted(list(row.get("reasons") or [])),
+            }
+        payload = {
+            "generated_date": _now_kst().strftime("%Y%m%d"),
+            "generated_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "version": BOT_VERSION,
+            "source_dates": source_dates[-lookback_days:],
+            "priority_codes": priority_codes,
+            "theme_bias": theme_bias,
+            "reason_counts": reason_counts,
+        }
+        _write_json_atomic(ADAPTIVE_CAPTURE_FEEDBACK_FILE, payload, indent=2)
+        load_adaptive_capture_feedback()
+        return payload
+    except Exception as e:
+        _log_error("_build_adaptive_capture_feedback", e)
+        return {}
+
+
+def load_stale_replay_penalty_profile() -> dict:
+    global _stale_replay_penalty_profile
+    try:
+        obj = _read_json_locked(STALE_REPLAY_PENALTY_FILE) if os.path.exists(STALE_REPLAY_PENALTY_FILE) else {}
+        if not isinstance(obj, dict):
+            obj = {}
+        base = {"generated_date": "", "code_penalty": {}, "theme_penalty": {}, "source_dates": [], "date_pressure": {}}
+        base.update(obj)
+        if not isinstance(base.get("code_penalty"), dict):
+            base["code_penalty"] = {}
+        if not isinstance(base.get("theme_penalty"), dict):
+            base["theme_penalty"] = {}
+        if not isinstance(base.get("source_dates"), list):
+            base["source_dates"] = []
+        if not isinstance(base.get("date_pressure"), dict):
+            base["date_pressure"] = {}
+        _stale_replay_penalty_profile = base
+    except Exception as e:
+        print(f"⚠️ stale replay penalty 로드 오류: {e}")
+        _stale_replay_penalty_profile = {"generated_date": "", "code_penalty": {}, "theme_penalty": {}, "source_dates": [], "date_pressure": {}}
+    return _stale_replay_penalty_profile
+
+
+def _build_stale_replay_penalty_profile(lookback_days: int | None = None) -> dict:
+    lookback_days = int(lookback_days or STALE_REPLAY_LOOKBACK_DAYS or 5)
+    try:
+        raw_audit = _read_json_locked(SELF_AUDIT_FILE) if os.path.exists(SELF_AUDIT_FILE) else {}
+        raw_shadow = _read_json_locked(SHADOW_CAPTURE_FILE) if os.path.exists(SHADOW_CAPTURE_FILE) else {}
+        raw_audit = raw_audit if isinstance(raw_audit, dict) else {}
+        raw_shadow = raw_shadow if isinstance(raw_shadow, dict) else {}
+
+        audit_rows = [v for v in raw_audit.values() if isinstance(v, dict)]
+        audit_rows.sort(key=lambda x: str(x.get("date", "")))
+        if lookback_days > 0:
+            audit_rows = audit_rows[-lookback_days * 2:]
+
+        date_pressure = {}
+        source_dates = []
+        for rec in audit_rows:
+            date_key = str(rec.get("date", "") or "")
+            if not date_key:
+                continue
+            summary = rec.get("summary") or {}
+            pressure = (
+                float(summary.get("candidate_miss", 0) or 0) * 1.0
+                + float(summary.get("no_ask_liquidity", 0) or 0) * 0.8
+                + float(summary.get("position_limit", 0) or 0) * 0.7
+                + float(summary.get("blocked_other", 0) or 0) * 0.5
+            )
+            if pressure <= 0:
+                continue
+            date_pressure[date_key] = max(float(date_pressure.get(date_key, 0.0) or 0.0), round(pressure, 2))
+            if date_key not in source_dates:
+                source_dates.append(date_key)
+        if lookback_days > 0:
+            source_dates = source_dates[-lookback_days:]
+
+        code_rows: dict[str, dict] = {}
+        theme_rows: dict[str, dict] = {}
+        for rec in raw_shadow.values():
+            if not isinstance(rec, dict):
+                continue
+            date_key = str(rec.get("date", "") or "")
+            if not date_key or date_key not in date_pressure:
+                continue
+            sig = str(rec.get("signal_type", "") or "").upper()
+            reason = str(rec.get("reason", "") or "")
+            if sig not in ("MID_PULLBACK", "ENTRY_POINT"):
+                continue
+            if reason not in ("stale_pullback_quota", "stale_replay_penalty"):
+                continue
+            code = normalize_stock_code(rec.get("code"))
+            if not code:
+                continue
+            pressure = float(date_pressure.get(date_key, 0.0) or 0.0)
+            age_hours = safe_float(rec.get("tracking_replay_age_hours", 0.0), 0.0)
+            miss_count = safe_int(rec.get("tracking_replay_miss_count", 0), 0)
+            theme_key = _safe_feedback_theme_key(rec.get("sector_theme") or rec.get("theme") or rec.get("sector") or "")
+            weight = 1.0 + min(3.0, pressure * 0.14)
+            if age_hours >= STALE_PULLBACK_MIN_HOURS:
+                weight += min(1.8, (age_hours / max(STALE_PULLBACK_MIN_HOURS, 1.0)) * 0.55)
+            if miss_count >= 2:
+                weight += min(1.2, miss_count * 0.25)
+            crow = code_rows.setdefault(code, {
+                "code": code,
+                "name": str(rec.get("name", code) or code),
+                "weight": 0.0,
+                "count": 0,
+                "themes": set(),
+                "reasons": set(),
+                "max_age_hours": 0.0,
+            })
+            crow["weight"] += weight
+            crow["count"] += 1
+            crow["reasons"].add(reason)
+            crow["max_age_hours"] = max(float(crow.get("max_age_hours", 0.0) or 0.0), age_hours)
+            if theme_key:
+                crow["themes"].add(theme_key)
+                trow = theme_rows.setdefault(theme_key, {"theme": theme_key, "weight": 0.0, "count": 0, "codes": set(), "reasons": set()})
+                trow["weight"] += weight
+                trow["count"] += 1
+                trow["codes"].add(code)
+                trow["reasons"].add(reason)
+
+        code_penalty = {}
+        for code, row in sorted(code_rows.items(), key=lambda kv: (kv[1]["weight"], kv[1]["count"]), reverse=True):
+            if float(row.get("weight", 0.0) or 0.0) < STALE_REPLAY_CODE_MIN_WEIGHT:
+                continue
+            code_penalty[code] = {
+                "name": row.get("name", code),
+                "weight": round(float(row.get("weight", 0.0) or 0.0), 2),
+                "count": safe_int(row.get("count", 0), 0),
+                "themes": sorted(list(row.get("themes") or []))[:6],
+                "reasons": sorted(list(row.get("reasons") or [])),
+                "max_age_hours": round(float(row.get("max_age_hours", 0.0) or 0.0), 2),
+            }
+        theme_penalty = {}
+        for theme_key, row in sorted(theme_rows.items(), key=lambda kv: (kv[1]["weight"], kv[1]["count"]), reverse=True):
+            if float(row.get("weight", 0.0) or 0.0) < STALE_REPLAY_THEME_MIN_WEIGHT:
+                continue
+            theme_penalty[theme_key] = {
+                "weight": round(float(row.get("weight", 0.0) or 0.0), 2),
+                "count": safe_int(row.get("count", 0), 0),
+                "codes": sorted(list(row.get("codes") or []))[:8],
+                "reasons": sorted(list(row.get("reasons") or [])),
+            }
+
+        payload = {
+            "generated_date": _now_kst().strftime("%Y%m%d"),
+            "generated_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "version": BOT_VERSION,
+            "source_dates": source_dates,
+            "date_pressure": date_pressure,
+            "code_penalty": code_penalty,
+            "theme_penalty": theme_penalty,
+        }
+        _write_json_atomic(STALE_REPLAY_PENALTY_FILE, payload, indent=2)
+        load_stale_replay_penalty_profile()
+        return payload
+    except Exception as e:
+        _log_error("_build_stale_replay_penalty_profile", e)
+        return {}
+
+
+def _get_stale_replay_code_entry(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code or not isinstance(_stale_replay_penalty_profile, dict):
+        return {}
+    rows = _stale_replay_penalty_profile.get("code_penalty") or {}
+    return dict(rows.get(code) or {}) if isinstance(rows, dict) else {}
+
+
+def _get_stale_replay_theme_entry(theme: str) -> dict:
+    theme = _safe_feedback_theme_key(theme)
+    if not theme or not isinstance(_stale_replay_penalty_profile, dict):
+        return {}
+    rows = _stale_replay_penalty_profile.get("theme_penalty") or {}
+    return dict(rows.get(theme) or {}) if isinstance(rows, dict) else {}
+
+
+def _load_intraday_stale_shadow_counts(force: bool = False) -> dict:
+    global _stale_shadow_intraday_cache
+    now_ts = time.time()
+    today = _now_kst().strftime("%Y%m%d")
+    cache = _stale_shadow_intraday_cache if isinstance(_stale_shadow_intraday_cache, dict) else {"ts": 0.0, "date": "", "codes": {}, "themes": {}}
+    if not force and cache.get("date") == today and (now_ts - float(cache.get("ts", 0.0) or 0.0)) < 60:
+        return cache
+    codes = {}
+    themes = {}
+    try:
+        obj = _read_json_locked(SHADOW_CAPTURE_FILE) if os.path.exists(SHADOW_CAPTURE_FILE) else {}
+        obj = obj if isinstance(obj, dict) else {}
+        for rec in obj.values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("date", "") or "") != today:
+                continue
+            sig = str(rec.get("signal_type", "") or "").upper()
+            reason = str(rec.get("reason", "") or "")
+            if sig not in ("MID_PULLBACK", "ENTRY_POINT"):
+                continue
+            if reason not in ("stale_pullback_quota", "stale_replay_penalty"):
+                continue
+            code = normalize_stock_code(rec.get("code"))
+            if code:
+                codes[code] = codes.get(code, 0) + 1
+            theme_key = _safe_feedback_theme_key(rec.get("sector_theme") or rec.get("theme") or rec.get("sector") or "")
+            if theme_key:
+                themes[theme_key] = themes.get(theme_key, 0) + 1
+    except Exception:
+        codes, themes = {}, {}
+    cache = {"ts": now_ts, "date": today, "codes": codes, "themes": themes}
+    _stale_shadow_intraday_cache = cache
+    return cache
+
+
+def _get_intraday_stale_shadow_count(code: str = "", theme: str = "") -> tuple[int, int]:
+    cache = _load_intraday_stale_shadow_counts()
+    codes = cache.get("codes") or {}
+    themes = cache.get("themes") or {}
+    code = normalize_stock_code(code)
+    theme = _safe_feedback_theme_key(theme)
+    return safe_int(codes.get(code, 0), 0), safe_int(themes.get(theme, 0), 0)
+
+
+def _calc_stale_replay_penalty(code: str, theme: str = "", signal_type: str = "", age_hours: float = 0.0, miss_count: int = 0, leader_hit: bool = False, direct_like: bool = False, change_rate: float = 0.0, name: str = "", market: str = "") -> tuple[int, list[str]]:
+    sig = str(signal_type or "").upper()
+    if sig not in ("MID_PULLBACK", "ENTRY_POINT"):
+        return 0, []
+    if leader_hit or direct_like:
+        return 0, []
+    code_row = _get_stale_replay_code_entry(code)
+    theme_row = _get_stale_replay_theme_entry(theme)
+    intraday_code_hits, intraday_theme_hits = _get_intraday_stale_shadow_count(code, theme)
+    penalty = 0
+    notes = []
+    if code_row:
+        w = float(code_row.get("weight", 0.0) or 0.0)
+        code_penalty = min(int(STALE_REPLAY_MAX_CODE_PENALTY or 6), max(2, int(round(w * 0.5))))
+        penalty += code_penalty
+        notes.append(f"🧯 stale 재노출 반복 감점 [{code_row.get('name', code)}] -{code_penalty}점")
+    breadth = _get_theme_breadth_hint(code, name, theme=theme, market=market) if theme else {}
+    if theme_row and change_rate < 18.0:
+        tw = float(theme_row.get("weight", 0.0) or 0.0)
+        theme_penalty = min(int(STALE_REPLAY_MAX_THEME_PENALTY or 4), max(1, int(round(tw * 0.28))))
+        if breadth and bool(breadth.get("strong_breadth")) and safe_float(breadth.get("leader_change", 0.0), 0.0) >= max(8.0, change_rate):
+            theme_penalty = max(0, theme_penalty - 1)
+            if theme_penalty > 0:
+                notes.append(f"🌱 stale 테마 breadth 방어 [{theme}] 감점완화")
+        if theme_penalty > 0:
+            penalty += theme_penalty
+            notes.append(f"🧪 stale 테마 재노출 감점 [{theme}] -{theme_penalty}점")
+        if breadth and bool(breadth.get("weak_breadth")) and change_rate < 18.0:
+            extra = min(STALE_THEME_BREADTH_EXTRA_PENALTY, max(1, int(round(tw * 0.16)) + (1 if safe_float(breadth.get("breadth_ratio", 0.0), 0.0) < 0.25 else 0)))
+            penalty += extra
+            notes.append(f"📉 stale 테마 breadth 약세 [{theme}] -{extra}점")
+    if intraday_code_hits >= 2:
+        dyn = min(2, intraday_code_hits - 1)
+        penalty += dyn
+        notes.append(f"⏱ 당일 stale 재노출 누적 [{code}] -{dyn}점")
+    if intraday_theme_hits >= 3 and change_rate < 16.0:
+        dyn_theme = min(2, intraday_theme_hits - 2)
+        penalty += dyn_theme
+        notes.append(f"📉 당일 stale 테마 누적 [{theme}] -{dyn_theme}점")
+    if penalty and age_hours >= STALE_PULLBACK_MIN_HOURS * 1.5:
+        penalty += 1
+    if penalty and miss_count >= 3:
+        penalty += 1
+    penalty = min(10, penalty)
+    return penalty, notes
+
+
+def _get_adaptive_feedback_code_entry(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    if not isinstance(_adaptive_capture_feedback, dict):
+        return {}
+    rows = _adaptive_capture_feedback.get("priority_codes") or {}
+    return dict(rows.get(code) or {}) if isinstance(rows, dict) else {}
+
+
+def _get_adaptive_feedback_theme_entry(theme: str) -> dict:
+    theme = _safe_feedback_theme_key(theme)
+    if not theme:
+        return {}
+    if not isinstance(_adaptive_capture_feedback, dict):
+        return {}
+    rows = _adaptive_capture_feedback.get("theme_bias") or {}
+    return dict(rows.get(theme) or {}) if isinstance(rows, dict) else {}
+
+
+def _collect_adaptive_feedback_candidates(existing_codes=None) -> list:
+    existing = {normalize_stock_code(c) for c in (existing_codes or []) if c}
+    rows = []
+    if not isinstance(_adaptive_capture_feedback, dict):
+        return rows
+    prio = _adaptive_capture_feedback.get("priority_codes") or {}
+    if not isinstance(prio, dict) or not prio:
+        return rows
+    nxt_open = is_nxt_open()
+    krx_open = is_market_open()
+    for code, meta in list(sorted(prio.items(), key=lambda kv: float((kv[1] or {}).get("weight", 0.0) or 0.0), reverse=True))[:ADAPTIVE_FEEDBACK_MAX_CODES]:
+        code = normalize_stock_code(code)
+        if not code or code in existing:
+            continue
+        cur = {}
+        try:
+            if nxt_open and is_nxt_listed(code):
+                cur = get_nxt_stock_price(code) or {}
+            if (not cur or not cur.get("price")) and (krx_open or nxt_open):
+                cur = get_stock_price(code) or {}
+        except Exception:
+            cur = {}
+        price = safe_int(cur.get("price", 0), 0)
+        change_rate = float(cur.get("change_rate", 0.0) or 0.0)
+        vol_ratio = float(cur.get("volume_ratio", 0.0) or 0.0)
+        if price <= 0:
+            continue
+        if change_rate < 3.0 and vol_ratio < 1.8:
+            continue
+        rows.append({
+            "code": code,
+            "name": _resolve_stock_name(code, meta.get("name", code)),
+            "price": price,
+            "change_rate": change_rate,
+            "volume_ratio": vol_ratio,
+            "today_vol": safe_int(cur.get("today_vol", 0), 0),
+            "market": "NXT" if (nxt_open and is_nxt_listed(code)) else "KRX",
+            "desc": "adaptive_feedback",
+            "adaptive_feedback": True,
+            "adaptive_feedback_weight": float(meta.get("weight", 0.0) or 0.0),
+            "adaptive_feedback_theme": str(meta.get("theme", "") or ""),
+        })
+    return rows
+
+
+def _calc_adaptive_feedback_bonus(code: str, theme: str = "", signal_type: str = "", change_rate: float = 0.0, vol_ratio: float = 0.0) -> tuple[int, list[str]]:
+    bonus = 0
+    notes = []
+    code_row = _get_adaptive_feedback_code_entry(code)
+    theme_row = _get_adaptive_feedback_theme_entry(theme)
+    sig = str(signal_type or "")
+    eligible_code = sig in ("SURGE", "EARLY_DETECT", "NEAR_UPPER", "STRONG_BUY", "UPPER_LIMIT")
+    eligible_theme = sig in ("SURGE", "EARLY_DETECT", "NEAR_UPPER", "STRONG_BUY")
+    if code_row and eligible_code:
+        w = float(code_row.get("weight", 0.0) or 0.0)
+        code_bonus = min(6, max(2, int(round(w * 0.8))))
+        if change_rate >= 5.0 or vol_ratio >= 2.0:
+            bonus += code_bonus
+            notes.append(f"🔁 전일 miss 리더 재평가 [{code_row.get('name', code)}] +{code_bonus}점")
+    if theme_row and eligible_theme:
+        tw = float(theme_row.get("weight", 0.0) or 0.0)
+        theme_bonus = min(4, max(1, int(round(tw * 0.45))))
+        if change_rate >= 4.0 or vol_ratio >= 1.8:
+            bonus += theme_bonus
+            notes.append(f"🧪 self-audit 테마 보정 [{theme}] +{theme_bonus}점")
+    return bonus, notes
+
+
+def _parse_tracking_hint_datetime(date_str: str = "", time_str: str = "") -> datetime | None:
+    date_str = str(date_str or "").strip()
+    time_str = str(time_str or "").strip() or "00:00:00"
+    if not date_str:
+        return None
+    try:
+        if len(date_str) == 8 and date_str.isdigit():
+            return datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M:%S")
+        return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _load_tracking_priority_hints(force: bool = False) -> dict:
+    now_ts = time.time()
+    cache = _tracking_priority_hint_cache if isinstance(_tracking_priority_hint_cache, dict) else {"ts": 0.0, "rows": {}}
+    if not force and cache.get("rows") and (now_ts - float(cache.get("ts", 0.0) or 0.0)) < 60:
+        return cache.get("rows") or {}
+    rows: dict = {}
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        for _k, rec in data.items():
+            if not isinstance(rec, dict):
+                continue
+            code = normalize_stock_code(rec.get("code", ""))
+            if not code:
+                continue
+            first_dt = _parse_tracking_hint_datetime(rec.get("first_detect_date", rec.get("detect_date", "")), rec.get("first_detect_time", rec.get("detect_time", "")))
+            last_dt = _parse_tracking_hint_datetime(rec.get("last_detect_date", rec.get("detect_date", "")), rec.get("last_detect_time", rec.get("detect_time", ""))) or first_dt
+            cur = rows.get(code) or {}
+            cur_last_dt = cur.get("last_dt")
+            if cur and isinstance(cur_last_dt, datetime) and isinstance(last_dt, datetime) and last_dt <= cur_last_dt:
+                continue
+            rows[code] = {
+                "first_dt": first_dt,
+                "last_dt": last_dt,
+                "signal_type": str(rec.get("signal_type", "") or ""),
+                "status": str(rec.get("status", "") or ""),
+                "miss_count": safe_int(rec.get("miss_count", 0), 0),
+                "episode_candidate_count": safe_int(rec.get("episode_candidate_count", 0), 0),
+            }
+    _tracking_priority_hint_cache["ts"] = now_ts
+    _tracking_priority_hint_cache["rows"] = rows
+    return rows
+
+
+def _get_tracking_priority_hint(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    rows = _load_tracking_priority_hints()
+    row = dict((rows or {}).get(code) or {})
+    first_dt = row.get("first_dt")
+    last_dt = row.get("last_dt")
+    row["age_hours"] = max(0.0, round((datetime.now() - first_dt).total_seconds() / 3600.0, 2)) if isinstance(first_dt, datetime) else 0.0
+    row["last_seen_hours"] = max(0.0, round((datetime.now() - last_dt).total_seconds() / 3600.0, 2)) if isinstance(last_dt, datetime) else 0.0
+    return row
+
+
+def _is_leader_priority_signal(signal: dict | None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    sig = str(signal.get("signal_type", "") or "").upper()
+    if sig in LEADER_PRIORITY_SIGNAL_TYPES:
+        return True
+    if bool(signal.get("direct_news_hit") or signal.get("theme_drive_hit") or signal.get("adaptive_feedback_hit") or signal.get("miss_theme_leader_hit")):
+        return True
+    change_rate = safe_float(signal.get("change_rate", 0.0), 0.0)
+    vol_ratio = safe_float(signal.get("volume_ratio", 0.0), 0.0)
+    score = safe_int(signal.get("score", 0), 0)
+    if change_rate >= 12.0 and (vol_ratio >= 2.5 or score >= 95):
+        return True
+    if _extract_alert_sector_theme(signal) != "기타" and change_rate >= 8.0 and vol_ratio >= 1.8:
+        return True
+    return False
+
+
+def _annotate_signal_priority(signal: dict | None) -> dict:
+    signal = dict(signal or {})
+    code = normalize_stock_code(signal.get("code", ""))
+    hint = _get_tracking_priority_hint(code) if code else {}
+    leader_hit = _is_leader_priority_signal(signal)
+    sig = str(signal.get("signal_type", "") or "").upper()
+    stale_hit = False
+    if sig in ("MID_PULLBACK", "ENTRY_POINT"):
+        age_hours = safe_float(hint.get("age_hours", 0.0), 0.0)
+        miss_count = safe_int(hint.get("miss_count", 0), 0)
+        last_seen_hours = safe_float(hint.get("last_seen_hours", 0.0), 0.0)
+        is_intraday = bool(signal.get("is_intraday"))
+        resurge_mode = bool(signal.get("resurge_mode"))
+        theme_live = _extract_alert_sector_theme(signal) != "기타"
+        direct_like = bool(signal.get("direct_news_hit") or signal.get("theme_drive_hit") or signal.get("adaptive_feedback_hit"))
+        change_rate = safe_float(signal.get("change_rate", 0.0), 0.0)
+        score = safe_int(signal.get("score", 0), 0)
+        stale_hit = (
+            age_hours >= STALE_PULLBACK_MIN_HOURS
+            and last_seen_hours >= 0.25
+            and not leader_hit
+            and not direct_like
+            and not theme_live
+            and not is_intraday
+            and not resurge_mode
+            and change_rate < 12.0
+            and score < 105
+        )
+        signal["tracking_replay_age_hours"] = age_hours
+        signal["tracking_replay_miss_count"] = miss_count
+        if not signal.get("_stale_replay_penalty_applied"):
+            theme_key = _extract_alert_sector_theme(signal)
+            penalty, notes = _calc_stale_replay_penalty(
+                code=code,
+                theme=theme_key,
+                signal_type=sig,
+                age_hours=age_hours,
+                miss_count=miss_count,
+                leader_hit=leader_hit,
+                direct_like=direct_like,
+                change_rate=change_rate,
+                name=signal.get("name", ""),
+                market=signal.get("market", ""),
+            )
+            signal["_priority_base_score"] = safe_int(signal.get("_priority_base_score", signal.get("score", 0)), 0)
+            if penalty > 0:
+                signal["score"] = max(0, safe_int(signal.get("_priority_base_score", signal.get("score", 0)), 0) - penalty)
+                signal["stale_replay_penalty_points"] = penalty
+                signal["stale_replay_penalty_hit"] = True
+                signal.setdefault("reasons", []).extend(notes)
+                if (
+                    penalty >= STALE_REPLAY_FORCE_STALE_PENALTY
+                    and not leader_hit
+                    and not direct_like
+                    and not theme_live
+                    and not is_intraday
+                    and not resurge_mode
+                    and change_rate < 14.0
+                ):
+                    stale_hit = True
+            signal["_stale_replay_penalty_applied"] = True
+    signal["leader_priority_hit"] = bool(leader_hit)
+    signal["stale_pullback_hit"] = bool(stale_hit)
+    signal["stale_replay_penalty_hit"] = bool(signal.get("stale_replay_penalty_hit"))
+    if stale_hit:
+        signal.setdefault("reasons", []).append("🕰 기존 눌림목 재포착 성격 — 신규 리더 우선 구간에서는 후순위")
+    return signal
+
+
+def _apply_stale_pullback_quota(alerts: list, stage: str = "") -> list:
+    if not alerts:
+        return []
+    staged = [_annotate_signal_priority(a) for a in alerts if isinstance(a, dict)]
+    leader_present = any(a.get("leader_priority_hit") for a in staged)
+    if not leader_present:
+        return staged
+    stale_limit = max(0, int(STALE_PULLBACK_MAX_PER_SCAN or 0))
+    stale_kept = 0
+    passed = []
+    for a in staged:
+        if a.get("stale_pullback_hit"):
+            if safe_int(a.get("stale_replay_penalty_points", 0), 0) >= STALE_REPLAY_STRONG_DROP_POINTS:
+                _record_shadow_capture(
+                    a.get("code", ""), a.get("name", a.get("code", "")),
+                    "stale_replay_penalty", a.get("signal_type", ""), stage=stage or "stale_replay_penalty",
+                    extra={
+                        "score": a.get("score", 0),
+                        "grade": a.get("grade", ""),
+                        "change_rate": a.get("change_rate", 0),
+                        "market": a.get("market", ""),
+                        "tracking_replay_age_hours": a.get("tracking_replay_age_hours", 0),
+                        "tracking_replay_miss_count": a.get("tracking_replay_miss_count", 0),
+                        "sector_theme": _extract_alert_sector_theme(a),
+                    },
+                )
+                continue
+            if stale_limit <= 0 or stale_kept >= stale_limit:
+                _record_shadow_capture(
+                    a.get("code", ""), a.get("name", a.get("code", "")),
+                    "stale_pullback_quota", a.get("signal_type", ""), stage=stage or "stale_pullback_quota",
+                    extra={
+                        "score": a.get("score", 0),
+                        "grade": a.get("grade", ""),
+                        "change_rate": a.get("change_rate", 0),
+                        "market": a.get("market", ""),
+                        "tracking_replay_age_hours": a.get("tracking_replay_age_hours", 0),
+                        "tracking_replay_miss_count": a.get("tracking_replay_miss_count", 0),
+                        "sector_theme": _extract_alert_sector_theme(a),
+                    },
+                )
+                continue
+            stale_kept += 1
+        passed.append(a)
+    return passed
+
+
+def _record_shadow_capture(code: str, name: str, reason: str, signal_type: str = "", stage: str = "", extra: dict | None = None):
+    """외부 알림/실행으로 이어지지 못한 강세 후보를 내부 shadow 기록으로 남긴다."""
+    try:
+        data = _read_json_locked(SHADOW_CAPTURE_FILE) if os.path.exists(SHADOW_CAPTURE_FILE) else {}
+        if not isinstance(data, dict):
+            data = {}
+        now = _now_kst()
+        key = f"{normalize_stock_code(code) or code}_{now.strftime('%Y%m%d%H%M%S%f')}"
+        rec = {
+            "date": now.strftime('%Y%m%d'),
+            "time": now.strftime('%Y-%m-%d %H:%M:%S'),
+            "code": normalize_stock_code(code) or str(code or ""),
+            "name": str(name or code or ""),
+            "reason": str(reason or ""),
+            "signal_type": str(signal_type or ""),
+            "stage": str(stage or ""),
+            "version": BOT_VERSION,
+        }
+        if isinstance(extra, dict):
+            rec.update(extra)
+        data[key] = rec
+        if len(data) > 2000:
+            for old_k in sorted(data.keys())[:len(data) - 2000]:
+                data.pop(old_k, None)
+        _write_json_atomic(SHADOW_CAPTURE_FILE, data, indent=2)
+    except Exception as e:
+        print(f"⚠️ shadow capture 기록 오류: {e}")
+
+
+def _iter_today_records(path: str, date_key: str) -> list:
+    try:
+        obj = _read_json_locked(path) if os.path.exists(path) else {}
+        if not isinstance(obj, dict):
+            return []
+        rows = []
+        for v in obj.values():
+            if not isinstance(v, dict):
+                continue
+            d = str(v.get("date") or v.get("detect_date") or "")
+            if d == date_key:
+                rows.append(v)
+        return rows
+    except Exception:
+        return []
+
+
+def run_daily_self_audit(stage: str = "krx") -> dict:
+    """장마감 실제 상승 상위 종목 vs 포착/차단 결과를 자동 비교해 누락 패턴을 남긴다."""
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    today = _now_kst().strftime("%Y%m%d")
+    audit_key = f"{today}_{stage}_{BOT_VERSION}"
+    if audit_key in _daily_self_audit_sent:
+        return {}
+
+    try:
+        leaders = []
+        if stage == "krx":
+            leaders.extend(_rank_from_universe("KRX")[:15])
+        else:
+            leaders.extend(_rank_from_universe("NXT")[:15])
+        uniq = []
+        seen = set()
+        for row in leaders:
+            code = normalize_stock_code(row.get("code"))
+            if code and code not in seen:
+                seen.add(code)
+                uniq.append(row)
+        leaders = uniq[:15]
+        if not leaders:
+            return {}
+
+        signal_log = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+        signal_log = signal_log if isinstance(signal_log, dict) else {}
+        today_detected = {}
+        for rec in signal_log.values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("detect_date") or "") != today:
+                continue
+            code = normalize_stock_code(rec.get("code"))
+            if code:
+                today_detected.setdefault(code, rec)
+
+        suppressed_rows = _iter_today_records(SUPPRESSED_LOG_FILE, today)
+        shadow_rows = _iter_today_records(SHADOW_CAPTURE_FILE, today)
+        by_code_supp = {}
+        by_code_shadow = {}
+        for rec in suppressed_rows:
+            code = normalize_stock_code(rec.get("code"))
+            if code:
+                by_code_supp.setdefault(code, []).append(rec)
+        for rec in shadow_rows:
+            code = normalize_stock_code(rec.get("code"))
+            if code:
+                by_code_shadow.setdefault(code, []).append(rec)
+
+        summary = {"detected": 0, "position_limit": 0, "no_ask_liquidity": 0, "external_suppressed": 0, "blocked_other": 0, "candidate_miss": 0}
+        details = []
+        for row in leaders:
+            code = normalize_stock_code(row.get("code"))
+            name = row.get("name", code or "")
+            chg = float(row.get("change_rate", 0) or 0)
+            if code in today_detected:
+                cls = "detected"
+            else:
+                shadow = by_code_shadow.get(code, [])
+                supp = by_code_supp.get(code, [])
+                all_reasons = [str(r.get("reason", "")) for r in shadow + supp]
+                joined = " | ".join(all_reasons)
+                if any("position_limit" in r for r in all_reasons):
+                    cls = "position_limit"
+                elif any("no_ask_liquidity" in r for r in all_reasons):
+                    cls = "no_ask_liquidity"
+                elif any("external_grade_suppressed" in r or "외부알림 억제" in r for r in all_reasons):
+                    cls = "external_suppressed"
+                elif all_reasons:
+                    cls = "blocked_other"
+                else:
+                    cls = "candidate_miss"
+            summary[cls] += 1
+            details.append({
+                "code": code, "name": name, "change_rate": round(chg, 2), "class": cls,
+                "theme": row.get("theme", "") or row.get("sector", ""),
+            })
+
+        audit_data = _read_json_locked(SELF_AUDIT_FILE) if os.path.exists(SELF_AUDIT_FILE) else {}
+        if not isinstance(audit_data, dict):
+            audit_data = {}
+        audit_data[audit_key] = {
+            "date": today, "stage": stage, "version": BOT_VERSION, "created_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "summary": summary, "leaders": details,
+        }
+        if len(audit_data) > 60:
+            for old_k in sorted(audit_data.keys())[:len(audit_data) - 60]:
+                audit_data.pop(old_k, None)
+        _write_json_atomic(SELF_AUDIT_FILE, audit_data, indent=2)
+
+        lines = [
+            f"🧪 <b>장마감 self-audit</b> ({stage.upper()})  {BOT_VERSION}",
+            f"━━━━━━━━━━━━━━━",
+            f"상승 상위 {len(details)}종목 | 포착 {summary['detected']} | 제한 {summary['position_limit']} | 유동성 {summary['no_ask_liquidity']}",
+            f"외부억제 {summary['external_suppressed']} | 기타차단 {summary['blocked_other']} | 후보미포착 {summary['candidate_miss']}",
+        ]
+        misses = [d for d in details if d["class"] != "detected"][:8]
+        if misses:
+            lines.append("━━━━━━━━━━━━━━━")
+            for d in misses:
+                reason_map = {
+                    "position_limit": "동시보유 제한",
+                    "no_ask_liquidity": "유동성 차단",
+                    "external_suppressed": "외부알림 억제",
+                    "blocked_other": "기타 차단",
+                    "candidate_miss": "후보 미포착",
+                }
+                lines.append(f"• {d['name']} {d['change_rate']:+.1f}% — {reason_map.get(d['class'], d['class'])}")
+        send("\n".join(lines))
+        _daily_self_audit_sent.add(audit_key)
+        try:
+            _build_adaptive_capture_feedback()
+        except Exception:
+            pass
+        try:
+            _build_stale_replay_penalty_profile()
+        except Exception:
+            pass
+        return audit_data[audit_key]
+    except Exception as e:
+        _log_error(f"run_daily_self_audit({stage})", e)
+        return {}
 
 
 # ============================================================
@@ -1568,6 +2569,14 @@ DIRECT_NEWS_THEME_RULES = {
 EMERGENT_THEME_SIGNAL_TYPES = {"UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY", "SURGE", "EARLY_DETECT"}
 EMERGENT_THEME_MIN_CHANGE = 5.0
 EMERGENT_THEME_MIN_VOLUME = 2.0
+THEME_DRIVE_SIGNAL_TYPES = {"UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY", "SURGE", "EARLY_DETECT"}
+THEME_DRIVE_MIN_CHANGE = 6.0
+THEME_DRIVE_MIN_VOLUME = 2.5
+THEME_DRIVE_LEADER_CHANGE = 8.0
+THEME_DRIVE_PEER_CHANGE = 3.0
+THEME_DRIVE_CACHE_TTL = 90
+_theme_drive_cache: dict = {}
+
 EMERGENT_THEME_STOPWORDS = {
     "상승", "급등", "강세", "약세", "반등", "상한가", "하한가", "돌파", "주목", "부각", "관련", "관련주", "수혜", "기대",
     "호재", "악재", "계약", "공급계약", "체결", "공시", "실적", "흑자", "적자", "매수", "매도", "투자", "전망", "확대",
@@ -6107,9 +7116,11 @@ def refresh_dynamic_candidates():
         candidates = {}
         excluded_cnt = 0
         early_rank_cnt = 0
+        adaptive_cnt = 0
+        theme_feedback_cnt = 0
 
         def _put_candidate(item: dict, desc: str):
-            nonlocal excluded_cnt, early_rank_cnt
+            nonlocal excluded_cnt, early_rank_cnt, theme_feedback_cnt
             code = item.get("code")
             if not code:
                 return
@@ -6119,6 +7130,10 @@ def refresh_dynamic_candidates():
                 return
             if "랭킹후보" in str(desc):
                 early_rank_cnt += 1
+            if "adaptive_feedback" in str(desc):
+                adaptive_cnt += 1
+            if "theme_feedback" in str(desc):
+                theme_feedback_cnt += 1
             prev = candidates.get(code)
             if prev:
                 labels = set(str(prev.get("desc", "")).split(" | ")) | {str(desc)}
@@ -6134,6 +7149,10 @@ def refresh_dynamic_candidates():
             _put_candidate(item, item.get("desc", f"KRX랭킹후보[{rank_mode}]"))
         for item in nxt_rank_stocks:
             _put_candidate(item, item.get("desc", f"NXT랭킹후보[{rank_mode}]"))
+        for item in _collect_adaptive_feedback_candidates(existing_codes=candidates.keys()):
+            _put_candidate(item, item.get("desc", "adaptive_feedback"))
+        for item in _collect_theme_feedback_candidates(existing_codes=candidates.keys()):
+            _put_candidate(item, item.get("desc", "theme_feedback"))
 
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
@@ -6147,7 +7166,7 @@ def refresh_dynamic_candidates():
         print(
             f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 "
             f"(제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
-            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}])"
+            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}], 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt})"
         )
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -6410,7 +7429,18 @@ def run_mid_pullback_scan():
         print("  → 눌림목 조건 충족 종목 없음")
         return
 
-    signals.sort(key=lambda x: (_grade_rank(x.get("grade", "C")), int(x.get("score", 0) or 0)), reverse=True)
+    signals = _apply_stale_pullback_quota(signals, stage="run_mid_pullback_scan")
+    signals.sort(
+        key=lambda x: (
+            1 if x.get("leader_priority_hit") else 0,
+            0 if x.get("stale_pullback_hit") else 1,
+            0 if x.get("stale_replay_penalty_hit") else 1,
+            _grade_rank(x.get("grade", "C")),
+            int(x.get("score", 0) or 0),
+            float(x.get("change_rate", 0) or 0),
+        ),
+        reverse=True,
+    )
     for s in signals[:3]:
         if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
             print(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
@@ -14148,6 +15178,26 @@ def analyze(stock: dict) -> dict:
     elif sector_info.get("summary"):
         reasons.append(sector_info["summary"])
 
+    theme_drive_hit = False
+    try:
+        if signal_type in THEME_DRIVE_SIGNAL_TYPES or change_rate >= THEME_DRIVE_MIN_CHANGE or vol_ratio >= THEME_DRIVE_MIN_VOLUME:
+            theme_drive = _get_theme_drive_hint(code, stock.get("name", code), change_rate=change_rate, vol_ratio=vol_ratio, market=str(stock.get("market", "") or ""))
+            if theme_drive.get("theme"):
+                if sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
+                    sector_info["theme"] = theme_drive["theme"]
+                    sector_info["theme_key"] = theme_drive.get("theme_key", theme_drive["theme"])
+                theme_bonus = int(theme_drive.get("bonus", 0) or 0)
+                if theme_bonus > 0:
+                    score += theme_bonus
+                theme_drive_hit = True
+                reasons.append(
+                    f"🏭 테마 동조강세 [{theme_drive['theme']}] {theme_bonus:+d}점 — "
+                    f"리더 {theme_drive.get('leader_name','')} {theme_drive.get('leader_change',0):+.1f}% / "
+                    f"동조 {theme_drive.get('riser_cnt',0)}종목"
+                )
+    except Exception as _e:
+        _log_error(f"theme_drive({code})", _e)
+
     # ── NXT 보정 (장 중에만, 백그라운드 영향 최소화) ──
     nxt_delta, nxt_reason = 0, ""
     try:
@@ -14157,6 +15207,36 @@ def analyze(stock: dict) -> dict:
             score += int(nxt_delta * _w_nxt)
             if nxt_reason: reasons.append(nxt_reason)
     except Exception: pass
+
+    adaptive_feedback_hit = False
+    adaptive_feedback_bonus = 0
+    try:
+        _fb_bonus, _fb_notes = _calc_adaptive_feedback_bonus(code, sector_info.get("theme", ""), signal_type, change_rate=change_rate, vol_ratio=vol_ratio)
+        if _fb_bonus > 0:
+            adaptive_feedback_hit = True
+            adaptive_feedback_bonus = int(_fb_bonus)
+            score += adaptive_feedback_bonus
+            reasons.extend(_fb_notes[:2])
+    except Exception as _e:
+        _log_error(f"adaptive_feedback({code})", _e)
+
+    miss_theme_leader_hit = False
+    miss_theme_leader_bonus = 0
+    try:
+        _mt_bonus, _mt_notes, _mt_breadth = _calc_miss_theme_leader_bonus(
+            code, stock.get("name", code), sector_info.get("theme", ""), signal_type,
+            change_rate=change_rate, vol_ratio=vol_ratio, market=stock.get("market", "")
+        )
+        if _mt_bonus > 0:
+            miss_theme_leader_hit = True
+            miss_theme_leader_bonus = int(_mt_bonus)
+            score += miss_theme_leader_bonus
+            reasons.extend(_mt_notes[:2])
+            if isinstance(_mt_breadth, dict) and _mt_breadth.get("theme") and sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
+                sector_info["theme"] = _mt_breadth.get("theme")
+                sector_info["theme_key"] = _mt_breadth.get("theme")
+    except Exception as _e:
+        _log_error(f"miss_theme_leader_feedback({code})", _e)
 
     # ── ① 시장 국면 보정 ──
     regime = get_market_regime()
@@ -14480,6 +15560,11 @@ def analyze(stock: dict) -> dict:
             "sector_theme": sector_info.get("theme", ""),
             "direct_news_hit": direct_news_hit,
             "emergent_theme_hit": emergent_theme_hit,
+            "theme_drive_hit": theme_drive_hit,
+            "adaptive_feedback_hit": adaptive_feedback_hit,
+            "adaptive_feedback_bonus": adaptive_feedback_bonus,
+            "miss_theme_leader_hit": miss_theme_leader_hit,
+            "miss_theme_leader_bonus": miss_theme_leader_bonus,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
@@ -15001,12 +16086,21 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     sector_bonus = int(((signal.get("sector_info") or {}).get("bonus", 0)) or 0)
     sector_live = _extract_alert_sector_theme(signal) != "기타"
     nxt_order_flow = any("NXT 외인+기관 동시매수" in str(r or "") for r in (signal.get("reasons") or []))
+    adaptive_priority = bool(_get_adaptive_feedback_code_entry(signal.get("code", "")))
+    miss_theme_leader = bool(signal.get("miss_theme_leader_hit"))
+    leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader
     strong_combo = score >= GENERAL_SOFT_ALLOW_MIN_SCORE and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and (
         vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
     )
     if direct_news and change_rate >= max(2.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 2.0):
         return True
     if str(signal.get("market") or "") == "NXT" and score >= GENERAL_SOFT_ALLOW_MIN_SCORE - 5 and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and vol_ratio >= 2.0:
+        return True
+    if adaptive_priority and change_rate >= max(4.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.5) and vol_ratio >= max(1.8, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.7):
+        return True
+    if miss_theme_leader and change_rate >= max(5.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 0.8) and (vol_ratio >= max(1.8, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.6) or sector_live):
+        return True
+    if leader_priority and change_rate >= max(4.5, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.0) and (vol_ratio >= max(1.7, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.8) or sector_live):
         return True
     return strong_combo
 
@@ -15047,6 +16141,11 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                 s.get("signal_type", ""),
                 {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
             )
+            _record_shadow_capture(
+                s.get("code", ""), s.get("name", s.get("code", "")), _blocked_reason, s.get("signal_type", ""),
+                stage=source_label,
+                extra={"score": s.get("score", 0), "grade": s.get("grade", ""), "entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "market": s.get("market", "")}
+            )
             return False
     grade_upper = str(s.get("execution_grade") or s.get("grade") or "C").upper()
     if not _should_send_external_grade_alert(s):
@@ -15055,6 +16154,10 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
             save_signal_log(s)
             if s.get("signal_type") == "EARLY_DETECT":
                 save_early_detect(s)
+        _record_shadow_capture(
+            s.get("code", ""), s.get("name", s.get("code", "")), "external_grade_suppressed", s.get("signal_type", ""),
+            stage=source_label, extra={"score": s.get("score", 0), "grade": grade_upper, "change_rate": s.get("change_rate", 0), "market": s.get("market", "")}
+        )
         print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
         return False
     _internal_only_alert_history.pop(hist_key, None)
@@ -15108,6 +16211,357 @@ def _extract_alert_sector_theme(alert: dict) -> str:
         return "기타"
 
 
+def _is_generic_sector_theme(theme_name: str) -> bool:
+    try:
+        theme = str(theme_name or "").strip()
+        return theme in ("", "기타", "기타업종", "unknown", "미분류")
+    except Exception:
+        return True
+
+
+def _get_theme_drive_hint(code: str, name: str = "", change_rate: float = 0.0,
+                          vol_ratio: float = 0.0, market: str = "", max_members: int = 6) -> dict:
+    code = str(code or "").strip()
+    if not code:
+        return {}
+    theme_name, peers, _ = get_theme_sector_stocks(code)
+    if _is_generic_sector_theme(theme_name):
+        return {}
+    market_basis = "NXT" if str(market or "").upper() == "NXT" else "KRX"
+    cache_key = f"{market_basis}:{theme_name}"
+    now_ts = time.time()
+    cached = _theme_drive_cache.get(cache_key)
+    if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0) or 0) < THEME_DRIVE_CACHE_TTL:
+        return dict(cached)
+
+    members = [(code, name)]
+    seen = {code}
+    for peer_code, peer_name in list(peers or [])[:max(0, max_members - 1)]:
+        peer_code = str(peer_code or "").strip()
+        if not peer_code or peer_code in seen:
+            continue
+        seen.add(peer_code)
+        members.append((peer_code, peer_name))
+
+    quotes = []
+    for member_code, member_name in members[:max_members]:
+        try:
+            q = _get_live_quote_for_signal({
+                "code": member_code,
+                "name": member_name,
+                "market": market_basis if market_basis == "NXT" else "",
+            })
+        except Exception:
+            q = {}
+        if not isinstance(q, dict) or not q.get("price"):
+            continue
+        quotes.append({
+            "code": member_code,
+            "name": _resolve_stock_name(member_code, member_name, q),
+            "change_rate": safe_float(q.get("change_rate", 0)),
+            "volume_ratio": safe_float(q.get("volume_ratio", 0)),
+            "market": q.get("market", market_basis),
+        })
+        time.sleep(0.03)
+
+    if len(quotes) < 2:
+        return {}
+
+    quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+    leader = quotes[0]
+    risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= THEME_DRIVE_PEER_CHANGE]
+    flow_avg = sum(max(0.0, safe_float(q.get("volume_ratio", 0))) for q in quotes) / max(1, len(quotes))
+    avg_change = sum(safe_float(q.get("change_rate", 0)) for q in risers) / max(1, len(risers)) if risers else 0.0
+    if safe_float(leader.get("change_rate", 0)) < THEME_DRIVE_LEADER_CHANGE or len(risers) < 2:
+        return {}
+
+    bonus = 4
+    if len(risers) >= 3:
+        bonus += 1
+    if avg_change >= 6.0:
+        bonus += 1
+    if flow_avg >= 4.0:
+        bonus += 1
+    hint = {
+        "theme": theme_name,
+        "theme_key": theme_name,
+        "leader_name": leader.get("name", ""),
+        "leader_change": round(safe_float(leader.get("change_rate", 0)), 1),
+        "riser_cnt": len(risers),
+        "member_cnt": len(quotes),
+        "avg_change": round(avg_change, 1),
+        "flow_avg": round(flow_avg, 1),
+        "bonus": int(min(bonus, 8)),
+        "reason": "실시간 테마 주도/동조 강세",
+        "ts": now_ts,
+    }
+    _theme_drive_cache[cache_key] = dict(hint)
+    return hint
+
+
+def _get_theme_breadth_hint(code: str, name: str = "", theme: str = "", market: str = "", max_members: int = 6) -> dict:
+    code = str(code or "").strip()
+    theme_name = str(theme or "").strip()
+    market_basis = "NXT" if str(market or "").upper() == "NXT" else "KRX"
+    if not theme_name and code:
+        try:
+            theme_name, _, _ = get_theme_sector_stocks(code)
+        except Exception:
+            theme_name = ""
+    if _is_generic_sector_theme(theme_name):
+        return {}
+    cache_key = f"{market_basis}:{theme_name}:breadth"
+    now_ts = time.time()
+    cached = _theme_breadth_cache.get(cache_key)
+    if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0) or 0) < THEME_DRIVE_CACHE_TTL:
+        return dict(cached)
+
+    members = []
+    seen = set()
+    if code:
+        members.append((code, name))
+        seen.add(code)
+    try:
+        seed = code
+        if not seed and isinstance(_adaptive_capture_feedback, dict):
+            row = (_adaptive_capture_feedback.get("theme_bias") or {}).get(_safe_feedback_theme_key(theme_name)) or {}
+            for c in row.get("codes", []) or []:
+                seed = normalize_stock_code(c)
+                if seed:
+                    break
+        if seed:
+            _theme_name, peers, _ = get_theme_sector_stocks(seed)
+            if not theme_name and _theme_name:
+                theme_name = _theme_name
+            for peer_code, peer_name in list(peers or [])[:max(0, max_members - len(members))]:
+                peer_code = str(peer_code or "").strip()
+                if not peer_code or peer_code in seen:
+                    continue
+                seen.add(peer_code)
+                members.append((peer_code, peer_name))
+    except Exception:
+        pass
+
+    quotes = []
+    for member_code, member_name in members[:max_members]:
+        try:
+            q = _get_live_quote_for_signal({
+                "code": member_code,
+                "name": member_name,
+                "market": market_basis if market_basis == "NXT" else "",
+            })
+        except Exception:
+            q = {}
+        if not isinstance(q, dict) or not q.get("price"):
+            continue
+        quotes.append({
+            "code": member_code,
+            "name": _resolve_stock_name(member_code, member_name, q),
+            "change_rate": safe_float(q.get("change_rate", 0)),
+            "volume_ratio": safe_float(q.get("volume_ratio", 0)),
+            "market": q.get("market", market_basis),
+        })
+        time.sleep(0.02)
+
+    if len(quotes) < 2:
+        return {}
+    quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+    leader = quotes[0]
+    risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= THEME_DRIVE_PEER_CHANGE]
+    breadth_ratio = len(risers) / max(1, len(quotes))
+    avg_change = sum(safe_float(q.get("change_rate", 0)) for q in risers) / max(1, len(risers)) if risers else 0.0
+    hint = {
+        "theme": theme_name,
+        "leader_code": leader.get("code", ""),
+        "leader_name": leader.get("name", ""),
+        "leader_change": round(safe_float(leader.get("change_rate", 0)), 1),
+        "riser_cnt": len(risers),
+        "member_cnt": len(quotes),
+        "breadth_ratio": round(breadth_ratio, 3),
+        "avg_change": round(avg_change, 1),
+        "weak_breadth": bool(breadth_ratio < STALE_THEME_WEAK_BREADTH_RATIO or len(risers) <= 1 or avg_change < STALE_THEME_WEAK_AVG_CHANGE),
+        "strong_breadth": bool(breadth_ratio >= MISSED_THEME_STRONG_BREADTH_RATIO and len(risers) >= 2 and safe_float(leader.get("change_rate", 0)) >= MISSED_THEME_STRONG_LEADER_CHANGE),
+        "ts": now_ts,
+    }
+    _theme_breadth_cache[cache_key] = dict(hint)
+    return hint
+
+
+def _collect_theme_feedback_candidates(existing_codes=None, limit_total: int | None = None) -> list:
+    existing = {normalize_stock_code(c) for c in (existing_codes or []) if c}
+    rows = []
+    if not isinstance(_adaptive_capture_feedback, dict):
+        return rows
+    theme_bias = _adaptive_capture_feedback.get("theme_bias") or {}
+    if not isinstance(theme_bias, dict) or not theme_bias:
+        return rows
+    limit_total = max(0, int(limit_total or MISSED_THEME_CANDIDATE_LIMIT or 0))
+    if limit_total <= 0:
+        return rows
+    nxt_open = is_nxt_open()
+    krx_open = is_market_open()
+    for theme_key, meta in list(sorted(theme_bias.items(), key=lambda kv: float((kv[1] or {}).get("weight", 0.0) or 0.0), reverse=True)):
+        if len(rows) >= limit_total:
+            break
+        weight = float((meta or {}).get("weight", 0.0) or 0.0)
+        if weight < MISSED_THEME_LEADER_MIN_WEIGHT:
+            continue
+        seed_codes = list((meta or {}).get("codes") or [])
+        seed = ""
+        for cand in seed_codes:
+            cand = normalize_stock_code(cand)
+            if cand:
+                seed = cand
+                break
+        if not seed:
+            continue
+        try:
+            theme_name, peers, _ = get_theme_sector_stocks(seed)
+        except Exception:
+            continue
+        if _is_generic_sector_theme(theme_name):
+            continue
+        market = "NXT" if (nxt_open and is_nxt_listed(seed)) else ("KRX" if (krx_open or nxt_open) else "")
+        member_list = [(seed, "")] + list(peers or [])[:6]
+        seen_local = set()
+        for peer_code, peer_name in member_list:
+            peer_code = normalize_stock_code(peer_code)
+            if not peer_code or peer_code in existing or peer_code in seen_local:
+                continue
+            seen_local.add(peer_code)
+            try:
+                q = _get_live_quote_for_signal({
+                    "code": peer_code,
+                    "name": peer_name,
+                    "market": market if market == "NXT" else "",
+                })
+            except Exception:
+                q = {}
+            if not isinstance(q, dict) or not q.get("price"):
+                continue
+            chg = safe_float(q.get("change_rate", 0))
+            vol = safe_float(q.get("volume_ratio", 0))
+            if chg < 4.5 and vol < 2.0:
+                continue
+            rows.append({
+                "code": peer_code,
+                "name": _resolve_stock_name(peer_code, peer_name, q),
+                "price": safe_int(q.get("price", 0), 0),
+                "change_rate": chg,
+                "volume_ratio": vol,
+                "today_vol": safe_int(q.get("today_vol", 0), 0),
+                "market": market or ("NXT" if is_nxt_listed(peer_code) and nxt_open else "KRX"),
+                "desc": f"theme_feedback[{theme_name}]",
+                "theme_feedback": True,
+                "theme_feedback_weight": weight,
+                "adaptive_feedback_theme": theme_name,
+            })
+            existing.add(peer_code)
+            time.sleep(0.02)
+            if len(rows) >= limit_total:
+                break
+    return rows
+
+
+def _calc_miss_theme_leader_bonus(code: str, name: str = "", theme: str = "", signal_type: str = "", change_rate: float = 0.0, vol_ratio: float = 0.0, market: str = "") -> tuple[int, list[str], dict]:
+    theme_row = _get_adaptive_feedback_theme_entry(theme)
+    if not theme_row:
+        return 0, [], {}
+    sig = str(signal_type or "").upper()
+    if sig not in ("SURGE", "EARLY_DETECT", "NEAR_UPPER", "STRONG_BUY", "UPPER_LIMIT"):
+        return 0, [], {}
+    weight = float(theme_row.get("weight", 0.0) or 0.0)
+    if weight < MISSED_THEME_LEADER_MIN_WEIGHT:
+        return 0, [], {}
+    breadth = _get_theme_breadth_hint(code, name, theme=theme, market=market)
+    leader_code = normalize_stock_code(breadth.get("leader_code", "")) if breadth else ""
+    leader_change = safe_float((breadth or {}).get("leader_change", 0.0), 0.0)
+    breadth_ratio = safe_float((breadth or {}).get("breadth_ratio", 0.0), 0.0)
+    riser_cnt = safe_int((breadth or {}).get("riser_cnt", 0), 0)
+    leader_like = bool(code and code == leader_code) or change_rate >= max(MISSED_THEME_STRONG_LEADER_CHANGE, leader_change - 0.4)
+    breadth_ok = bool((breadth or {}).get("strong_breadth")) or breadth_ratio >= MISSED_THEME_STRONG_BREADTH_RATIO or riser_cnt >= 3
+    if not leader_like and not (change_rate >= MISSED_THEME_STRONG_LEADER_CHANGE and vol_ratio >= 2.0):
+        return 0, [], breadth or {}
+    if not breadth_ok and vol_ratio < 2.2:
+        return 0, [], breadth or {}
+    bonus = min(MISSED_THEME_LEADER_MAX_BONUS, max(2, int(round(weight * 0.35)) + (1 if breadth_ok else 0)))
+    notes = [f"🚀 반복 miss 테마 신규 리더 보정 [{theme}] +{bonus}점"]
+    if breadth:
+        notes.append(f"🏭 breadth {safe_int(breadth.get('riser_cnt',0),0)}/{safe_int(breadth.get('member_cnt',0),0)} · 리더 {breadth.get('leader_name','')} {safe_float(breadth.get('leader_change',0.0),0.0):+.1f}%")
+    return bonus, notes, breadth or {}
+
+
+def _collect_theme_peer_follow_candidates(existing_codes: set | None = None, limit_total: int = 8) -> list:
+    existing_codes = set(existing_codes or set())
+    candidates = []
+    seen = set(existing_codes)
+    seeds = []
+    try:
+        if is_market_open():
+            seeds.extend(get_upper_limit_stocks()[:6])
+            seeds.extend(get_volume_surge_stocks()[:12])
+        if is_nxt_open():
+            seeds.extend(get_nxt_surge_stocks()[:8])
+    except Exception:
+        seeds = list(seeds)
+
+    seed_seen = set()
+    merged_seeds = []
+    for item in seeds:
+        if not isinstance(item, dict):
+            continue
+        seed_code = str(item.get("code", "") or "").strip()
+        if not seed_code or seed_code in seed_seen:
+            continue
+        seed_seen.add(seed_code)
+        merged_seeds.append(item)
+
+    for seed in merged_seeds[:16]:
+        try:
+            seed_code = str(seed.get("code", "") or "").strip()
+            seed_name = str(seed.get("name", "") or "").strip()
+            if not seed_code:
+                continue
+            seed_chg = safe_float(seed.get("change_rate", 0))
+            seed_vol = safe_float(seed.get("volume_ratio", 0))
+            if seed_chg < 8.0 and seed_vol < 5.0:
+                continue
+            theme_name, peers, _ = get_theme_sector_stocks(seed_code)
+            if _is_generic_sector_theme(theme_name):
+                continue
+            market = str(seed.get("market", "") or "")
+            for peer_code, peer_name in list(peers or [])[:6]:
+                peer_code = str(peer_code or "").strip()
+                if not peer_code or peer_code in seen or peer_code == seed_code:
+                    continue
+                q = _get_live_quote_for_signal({
+                    "code": peer_code,
+                    "name": peer_name,
+                    "market": market if market == "NXT" else "",
+                })
+                if not isinstance(q, dict) or not q.get("price"):
+                    continue
+                peer_chg = safe_float(q.get("change_rate", 0))
+                peer_vol = safe_float(q.get("volume_ratio", 0))
+                if peer_chg < 4.0 and peer_vol < 2.0:
+                    continue
+                cand = dict(q)
+                cand["code"] = peer_code
+                cand["name"] = _resolve_stock_name(peer_code, peer_name, q)
+                if market == "NXT":
+                    cand["market"] = "NXT"
+                cand["_theme_peer_seed"] = seed_name or seed_code
+                cand["_theme_peer_theme"] = theme_name
+                candidates.append(cand)
+                seen.add(peer_code)
+                time.sleep(0.03)
+                if len(candidates) >= limit_total:
+                    return candidates
+        except Exception:
+            continue
+    return candidates
+
+
 def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate: float = 0.0,
                                      vol_ratio: float = 0.0, sector_info: dict | None = None,
                                      direct_news_hit: bool = False, nxt_delta: int = 0,
@@ -15126,7 +16580,7 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
     joined_reasons = " ".join(str(r or "") for r in (reasons or []))
-    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주"))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     market_flag = str(market or "").upper() == "NXT"
     return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
 
@@ -15155,6 +16609,7 @@ def _record_internal_only_alert(hist_key: str, signal: dict, reason: str) -> boo
 
 
 def _sector_gate_sort_key(alert: dict) -> tuple:
+    alert = _annotate_signal_priority(alert)
     sec = _extract_alert_sector_theme(alert)
     signal_rank = {
         "UPPER_LIMIT": 6,
@@ -15165,7 +16620,13 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
         "ENTRY_POINT": 1,
     }.get(str(alert.get("signal_type", "") or ""), 0)
     return (
+        1 if alert.get("leader_priority_hit") else 0,
         1 if alert.get("direct_news_hit") else 0,
+        1 if alert.get("theme_drive_hit") else 0,
+        1 if alert.get("adaptive_feedback_hit") else 0,
+        1 if alert.get("miss_theme_leader_hit") else 0,
+        0 if alert.get("stale_pullback_hit") else 1,
+        0 if alert.get("stale_replay_penalty_hit") else 1,
         0 if sec == "기타" else 1,
         signal_rank,
         int(alert.get("score", 0) or 0),
@@ -19063,6 +20524,7 @@ def on_market_close():
 
     send(msg)
     analyze_dart_disclosures()
+    run_daily_self_audit(stage="krx")
 
     # 금요일 장 마감 = 주간 리포트 (금요일이 공휴일이라 목요일에 마감하는 경우도 처리)
     now = datetime.now()
@@ -21065,14 +22527,34 @@ def filter_portfolio_signals(alerts: list) -> list:
         except Exception:
             pass
         before_count = len(alerts)
+        blocked_alerts = [a for a in alerts if a.get("code") not in carry_codes]
         alerts = [a for a in alerts if a.get("code") in carry_codes]
-        if len(alerts) < before_count:
-            print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 신규 {before_count - len(alerts)}개 억제")
+        if blocked_alerts:
+            for _a in blocked_alerts:
+                _record_shadow_capture(
+                    _a.get("code", ""), _a.get("name", _a.get("code", "")),
+                    "position_limit", _a.get("signal_type", ""), stage="filter_portfolio_signals",
+                    extra={"score": _a.get("score", 0), "grade": _a.get("grade", ""), "change_rate": _a.get("change_rate", 0), "market": _a.get("market", "")}
+                )
+            print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 신규 {len(blocked_alerts)}개 억제")
         if not alerts:
             return alerts
 
-    # 점수 내림차순 정렬
-    sorted_alerts = sorted(alerts, key=lambda x: x.get("score", 0), reverse=True)
+    alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
+
+    # 신규 리더 우선 + stale 눌림목 후순위 정렬
+    sorted_alerts = sorted(
+        alerts,
+        key=lambda x: (
+            1 if x.get("leader_priority_hit") else 0,
+            0 if x.get("stale_pullback_hit") else 1,
+            0 if x.get("stale_replay_penalty_hit") else 1,
+            int(x.get("score", 0) or 0),
+            float(x.get("change_rate", 0) or 0),
+            float(x.get("volume_ratio", 0) or 0),
+        ),
+        reverse=True,
+    )
 
     passed   = []
     excluded = set()
@@ -21216,6 +22698,15 @@ def run_scan():
             if r and time.time()-_alert_history.get((f"NXT_{r['code']}" if r.get("market") == "NXT" else r["code"]),0)>get_regime_cooldown():
                 alerts.append(r); seen.add(code)
 
+        # ── 테마 동조주 후보 확장: 강한 seed 종목의 동일 테마 peer를 제한적으로 추가 스캔 ──
+        for stock in _collect_theme_peer_follow_candidates(existing_codes=seen):
+            code = stock.get("code")
+            if not code or code in seen:
+                continue
+            r = analyze(stock)
+            if r and time.time()-_alert_history.get((f"NXT_{r['code']}" if r.get("market") == "NXT" else r["code"]),0)>get_regime_cooldown():
+                alerts.append(r); seen.add(code)
+
         # 조기포착은 KRX 장중 + 오전 NXT 장전 선포착을 모두 반영
         if krx_open:
             for s in check_early_detection():
@@ -21246,6 +22737,7 @@ def run_scan():
                     s["sector_theme"] = sec
                 filtered_alerts.append(s)
             else:
+                _record_shadow_capture(s.get("code", ""), s.get("name", s.get("code", "")), "sector_limit", s.get("signal_type", ""), stage="sector_gate", extra={"sector": sec, "score": s.get("score", 0), "change_rate": s.get("change_rate", 0)})
                 print(f"  ⏭ 섹터 제한({sec} {sector_counts[sec]}번째): {s.get('name','')} 생략")
         alerts = filtered_alerts
 
@@ -21347,10 +22839,13 @@ if __name__ == "__main__":
     migrate_signal_log_pnl_fields()
     load_tracker_feedback()
     load_dynamic_themes()
+    load_adaptive_capture_feedback()
+    load_stale_replay_penalty_profile()
     refresh_dynamic_candidates()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
     if _try_acquire_leader_lock():
-        _send_startup_banner_once()
+        if _enforce_runtime_version_lock(notify=True):
+            _send_startup_banner_once()
     else:
         print("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
 
@@ -21398,6 +22893,7 @@ if __name__ == "__main__":
     # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
     schedule.every().day.at("20:05").do(_leader_job(
         lambda: (
+            run_daily_self_audit(stage="nxt"),
             _clear_reentry_watch_all(),
             _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
             print("📡 NXT 마감(20:00) — 재진입 감시 전체 초기화")
@@ -21444,7 +22940,7 @@ if __name__ == "__main__":
 
     _maybe_run_preclose_gap_alert_catchup()
 
-    if _try_acquire_leader_lock():
+    if _try_acquire_leader_lock() and _enforce_runtime_version_lock(notify=False):
         run_scan()
         run_news_scan()
         run_mid_pullback_scan()
