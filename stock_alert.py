@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v51
+버전: v52
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v52 (2026-03-23): 오후 NXT-only 리더 포착 보강.
+  [#1] `_is_nxt_postmarket_only_window()` / `_collect_nxt_postmarket_candidates()` / `check_nxt_postmarket_detection()`를 추가해,
+       15:40 이후 KRX 종료·NXT 단독 시간대에 현대힘스형 장후 리더를 별도 helper로 선포착하고 일반 급등 스캔 이전에 후보화하도록 수정.
+  [#2] `get_nxt_surge_stocks()`의 NXT volume-rank 조회 수를 시간대별로 조정하고, `refresh_dynamic_candidates()` / `run_scan()`에서
+       장후 NXT-only일 때 랭킹 후보를 선택적으로 더 넓게 스캔해 후보군이 20개 상한에 갇히지 않도록 보강.
+  [#3] `_calc_nxt_postmarket_leader_bonus()` / `_should_soft_allow_no_ask_liquidity_general()` / `_sector_gate_sort_key()`에
+       `nxt_post_leader_hit`을 연결해 장후 NXT 리더 후보는 점수·정렬·유동성 soft allow에서 우선권을 더 받게 정리.
+  이유: 현대힘스처럼 정규장에 잠잠하다가 오후 NXT-only에서만 +10% 안팎으로 강해지는 종목은 기존 `v51` 구조에선 후보군 20개·보수 파라미터·오후 전용 helper 부재 때문에 쉽게 누락될 수 있었음.
+  개선점: 오후 NXT-only 리더 포착률↑, 장후 후보군 미포함 miss↓, 리더 후보 `no_ask_liquidity` 과차단↓.
+  주의점: 장후 NXT helper는 15:40 이후 KRX 종료 구간에서만 작동하며, 장후 breadth·테마·직접뉴스가 모두 약한 종목까지 무리하게 끌어올리지는 않음.
 
 - v51 (2026-03-23): 미사용 상수 `ENTRY_TOLERANCE_PCT` 제거.
   [#1] 실제 참조가 없는 `ENTRY_TOLERANCE_PCT = 2.0` 정의를 삭제해, 공통 진입 허용 구간 로직이 살아 있는 것처럼 보이던 혼선을 제거.
@@ -2509,6 +2520,13 @@ MID_SOFT_ALLOW_MIN_SCORE     = 75
 GENERAL_SOFT_ALLOW_MIN_SCORE = int(os.getenv("GENERAL_SOFT_ALLOW_MIN_SCORE", "72") or "72")
 GENERAL_SOFT_ALLOW_MIN_CHANGE = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_CHANGE", "5.0") or "5.0")
 GENERAL_SOFT_ALLOW_MIN_VOLUME = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_VOLUME", "3.0") or "3.0")
+NXT_POSTMARKET_HELPER_START = dtime(15, 40)
+NXT_POSTMARKET_MIN_CHANGE = float(os.getenv("NXT_POSTMARKET_MIN_CHANGE", "4.5") or "4.5")
+NXT_POSTMARKET_MIN_VOLUME = float(os.getenv("NXT_POSTMARKET_MIN_VOLUME", "1.6") or "1.6")
+NXT_POSTMARKET_ALERT_MIN_SCORE = int(os.getenv("NXT_POSTMARKET_ALERT_MIN_SCORE", "74") or "74")
+NXT_POSTMARKET_EXTRA_RANK_LIMIT = int(os.getenv("NXT_POSTMARKET_EXTRA_RANK_LIMIT", "20") or "20")
+NXT_POSTMARKET_VOLUME_RANK_EARLY = int(os.getenv("NXT_POSTMARKET_VOLUME_RANK_EARLY", "30") or "30")
+NXT_POSTMARKET_VOLUME_RANK_LATE = int(os.getenv("NXT_POSTMARKET_VOLUME_RANK_LATE", "40") or "40")
 NEWS_STOCK_PROMOTION_MIN_CHANGE = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_CHANGE", "2.0") or "2.0")
 NEWS_STOCK_PROMOTION_MIN_VOLUME = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_VOLUME", "1.5") or "1.5")
 NEWS_STOCK_PROMOTION_LIMIT = int(os.getenv("NEWS_STOCK_PROMOTION_LIMIT", "3") or "3")
@@ -7153,9 +7171,10 @@ def refresh_dynamic_candidates():
         early_rank_cnt = 0
         adaptive_cnt = 0
         theme_feedback_cnt = 0
+        nxt_post_cnt = 0
 
         def _put_candidate(item: dict, desc: str):
-            nonlocal excluded_cnt, early_rank_cnt, theme_feedback_cnt
+            nonlocal excluded_cnt, early_rank_cnt, theme_feedback_cnt, nxt_post_cnt, adaptive_cnt
             code = item.get("code")
             if not code:
                 return
@@ -7169,6 +7188,8 @@ def refresh_dynamic_candidates():
                 adaptive_cnt += 1
             if "theme_feedback" in str(desc):
                 theme_feedback_cnt += 1
+            if "NXT장후리더" in str(desc):
+                nxt_post_cnt += 1
             prev = candidates.get(code)
             if prev:
                 labels = set(str(prev.get("desc", "")).split(" | ")) | {str(desc)}
@@ -7188,6 +7209,8 @@ def refresh_dynamic_candidates():
             _put_candidate(item, item.get("desc", "adaptive_feedback"))
         for item in _collect_theme_feedback_candidates(existing_codes=candidates.keys()):
             _put_candidate(item, item.get("desc", "theme_feedback"))
+        for item in _collect_nxt_postmarket_candidates(existing_codes=candidates.keys()):
+            _put_candidate(item, item.get("desc", "NXT장후리더"))
 
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
@@ -7201,7 +7224,7 @@ def refresh_dynamic_candidates():
         print(
             f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 "
             f"(제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
-            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}], 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt})"
+            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}], 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt}, 장후NXT={nxt_post_cnt})"
         )
     except Exception as e:
         print(f"⚠️ 동적 후보군 갱신 오류: {e}")
@@ -7959,7 +7982,11 @@ def _collect_market_rank_candidates(market: str = "KRX", *, scan_limit: int | No
 def get_market_rank_focus_stocks(*, scan_limit_per_market: int | None = None, force: bool = False) -> list:
     if not is_any_market_open():
         return []
-    scan_limit_per_market = scan_limit_per_market or _get_rank_scan_limit()
+    base_limit = scan_limit_per_market or _get_rank_scan_limit()
+    if _is_nxt_postmarket_only_window() and not is_market_open():
+        scan_limit_per_market = max(base_limit, NXT_POSTMARKET_EXTRA_RANK_LIMIT)
+    else:
+        scan_limit_per_market = base_limit
     result = []
     seen = set()
     if is_market_open():
@@ -8234,6 +8261,109 @@ def get_nxt_params() -> dict:
         return {}
     return NXT_TIME_PARAMS.get(slot, {})
 
+
+def _is_nxt_postmarket_only_window(now_t: dtime | None = None) -> bool:
+    now_t = now_t or datetime.now().time()
+    return is_nxt_open() and (not is_market_open()) and now_t >= NXT_POSTMARKET_HELPER_START
+
+
+def _get_nxt_volume_rank_count() -> int:
+    slot = get_nxt_time_slot()
+    if slot == "post_late" and _is_nxt_postmarket_only_window():
+        return max(20, NXT_POSTMARKET_VOLUME_RANK_LATE)
+    if slot == "post_early" and _is_nxt_postmarket_only_window():
+        return max(20, NXT_POSTMARKET_VOLUME_RANK_EARLY)
+    return 20
+
+
+def _is_nxt_postmarket_leader_candidate(item: dict | None) -> bool:
+    if not isinstance(item, dict) or not _is_nxt_postmarket_only_window():
+        return False
+    try:
+        change_rate = float(item.get("change_rate", 0.0) or 0.0)
+        vol_ratio = float(item.get("volume_ratio", 0.0) or 0.0)
+    except Exception:
+        return False
+    slot = get_nxt_time_slot()
+    min_change = NXT_POSTMARKET_MIN_CHANGE + (0.0 if slot == "post_early" else 1.0)
+    min_volume = NXT_POSTMARKET_MIN_VOLUME - (0.2 if slot == "post_late" else 0.0)
+    return change_rate >= min_change and (vol_ratio >= min_volume or int(item.get("today_vol", 0) or 0) >= 100000)
+
+
+def _collect_nxt_postmarket_candidates(existing_codes=None) -> list:
+    if not _is_nxt_postmarket_only_window():
+        return []
+    existing = {str(c) for c in (existing_codes or [])}
+    out, seen = [], set(existing)
+
+    def _push(item: dict, desc: str):
+        code = str(item.get("code", "") or "")
+        if not code or code in seen:
+            return
+        name = _resolve_stock_name(code, item.get("name", ""))
+        if not is_trade_candidate_name(name):
+            return
+        rec = dict(item)
+        rec["code"] = code
+        rec["name"] = name
+        rec["market"] = "NXT"
+        rec["desc"] = desc
+        out.append(rec)
+        seen.add(code)
+
+    for item in get_nxt_surge_stocks():
+        if _is_nxt_postmarket_leader_candidate(item):
+            _push(item, "NXT장후리더")
+
+    rank_limit = max(_get_rank_scan_limit(), NXT_POSTMARKET_EXTRA_RANK_LIMIT)
+    for item in _collect_market_rank_candidates("NXT", scan_limit=rank_limit, force=False):
+        if _is_nxt_postmarket_leader_candidate(item):
+            _push(item, item.get("desc", "NXT랭킹후보") + " | NXT장후리더")
+
+    for item in _collect_theme_peer_follow_candidates(existing_codes=seen):
+        if str(item.get("market", "") or "") != "NXT":
+            continue
+        if _is_nxt_postmarket_leader_candidate(item):
+            _push(item, item.get("desc", "테마동조") + " | NXT장후리더")
+
+    out.sort(key=lambda x: (float(x.get("change_rate", 0) or 0), float(x.get("volume_ratio", 0) or 0), int(x.get("today_vol", 0) or 0)), reverse=True)
+    return out
+
+
+def _calc_nxt_postmarket_leader_bonus(code: str, name: str, theme: str, signal_type: str, *, change_rate: float, vol_ratio: float, market: str = "") -> tuple[int, list[str]]:
+    if str(market or "") != "NXT" or not _is_nxt_postmarket_only_window():
+        return 0, []
+    slot = get_nxt_time_slot()
+    min_change = NXT_POSTMARKET_MIN_CHANGE + (0.0 if slot == "post_early" else 1.0)
+    if float(change_rate or 0.0) < min_change:
+        return 0, []
+    bonus = 0
+    notes = []
+    if vol_ratio >= 3.0:
+        bonus += 8
+    elif vol_ratio >= 2.0:
+        bonus += 6
+    elif vol_ratio >= max(1.2, NXT_POSTMARKET_MIN_VOLUME):
+        bonus += 4
+    if str(theme or "") not in ("", "기타업종", "unknown", "미분류"):
+        bonus += 4
+        notes.append(f"🌙 NXT 장후 리더 후보 [{theme}] +4점")
+    if signal_type in ("NEAR_UPPER", "SURGE", "STRONG_BUY"):
+        bonus += 4
+    try:
+        nxt = get_nxt_info(code)
+        if float(nxt.get("vs_krx_pct", 0.0) or 0.0) >= 1.0:
+            bonus += 4
+            notes.append(f"🟡 NXT 종가 프리미엄 +{float(nxt.get('vs_krx_pct', 0.0) or 0.0):.1f}% +4점")
+        if nxt.get("inv_bullish"):
+            bonus += 4
+            notes.append("🔴 NXT 외인+기관 동시매수 +4점")
+    except Exception:
+        pass
+    if bonus > 0 and not notes:
+        notes.append(f"🌙 NXT 장후 리더 가산 +{bonus}점")
+    return bonus, notes[:2]
+
 def is_nxt_open() -> bool:
     """NXT는 주말/공휴일 제외, 08:00~20:00"""
     if is_holiday(): return False
@@ -8248,7 +8378,7 @@ def get_nxt_surge_stocks() -> list:
             "FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0",
             "FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000",
             "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"",
-            "FID_VOL_CNT":"20","FID_INPUT_DATE_1":"",
+            "FID_VOL_CNT":str(_get_nxt_volume_rank_count()),"FID_INPUT_DATE_1":"",
         })
         items = [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
                   "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
@@ -15367,6 +15497,21 @@ def analyze(stock: dict) -> dict:
     except Exception as _e:
         _log_error(f"miss_theme_leader_feedback({code})", _e)
 
+    nxt_post_leader_hit = False
+    nxt_post_leader_bonus = 0
+    try:
+        _pm_bonus, _pm_notes = _calc_nxt_postmarket_leader_bonus(
+            code, stock.get("name", code), sector_info.get("theme", ""), signal_type,
+            change_rate=change_rate, vol_ratio=vol_ratio, market=stock.get("market", "")
+        )
+        if _pm_bonus > 0:
+            nxt_post_leader_hit = True
+            nxt_post_leader_bonus = int(_pm_bonus)
+            score += nxt_post_leader_bonus
+            reasons.extend(_pm_notes[:2])
+    except Exception as _e:
+        _log_error(f"nxt_postmarket_bonus({code})", _e)
+
     # ── ① 시장 국면 보정 ──
     regime = get_market_regime()
     regime_mode = regime.get("mode", _regime_mode)
@@ -15712,6 +15857,8 @@ def analyze(stock: dict) -> dict:
             "adaptive_feedback_bonus": adaptive_feedback_bonus,
             "miss_theme_leader_hit": miss_theme_leader_hit,
             "miss_theme_leader_bonus": miss_theme_leader_bonus,
+            "nxt_post_leader_hit": nxt_post_leader_hit,
+            "nxt_post_leader_bonus": nxt_post_leader_bonus,
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
@@ -15845,6 +15992,154 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
                         "prev_upper":False,"reasons":pre_reasons,
                         "detected_at":datetime.now()})
+        existing.add(code)
+
+    return signals
+
+
+def check_nxt_postmarket_detection(existing_codes=None) -> list:
+    signals = []
+    existing = set(existing_codes or [])
+    if not _is_nxt_postmarket_only_window():
+        return signals
+
+    slot = get_nxt_time_slot()
+    min_score = NXT_POSTMARKET_ALERT_MIN_SCORE + (2 if slot == "post_late" else 0)
+    for stock in _collect_nxt_postmarket_candidates(existing_codes=existing):
+        code = stock.get("code", "")
+        price = int(stock.get("price", 0) or 0)
+        vr = float(stock.get("volume_ratio", 0) or 0)
+        cr = float(stock.get("change_rate", 0) or 0)
+        if not code or price < 500 or code in existing:
+            continue
+        if cr < NXT_POSTMARKET_MIN_CHANGE or vr < max(1.0, NXT_POSTMARKET_MIN_VOLUME - 0.4):
+            continue
+
+        score = 62 if slot == "post_early" else 64
+        reasons = [
+            "🌙 장후 NXT 선포착!",
+            f"📈 NXT 현재 {cr:+.1f}%  (KRX 종가 이후)",
+            f"💥 NXT 거래량 {vr:.1f}배",
+        ]
+        if cr >= 8.0:
+            score += 12
+            reasons.append("🚀 장후 급등 강도 상위")
+        elif cr >= 6.0:
+            score += 8
+            reasons.append("📈 장후 리더 구간 진입")
+        if vr >= 3.0:
+            score += 10
+        elif vr >= 2.0:
+            score += 6
+
+        sector_info = calc_sector_momentum(code, stock.get("name", code)) or {}
+        direct_news_hit = False
+        if sector_info.get("bonus", 0) > 0:
+            score += int(sector_info.get("bonus", 0) or 0)
+            if sector_info.get("summary"):
+                reasons.append(sector_info["summary"])
+            if sector_info.get("rising"):
+                reasons.append("📌 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info.get("rising", [])[:4]]))
+
+        try:
+            nxt = get_nxt_info(code)
+        except Exception:
+            nxt = {}
+        if nxt.get("inv_bullish"):
+            score += 8
+            reasons.append(f"🔴 NXT 외인+기관 매수 ({int(nxt.get('foreign_net',0) or 0):+,}주)")
+        if float(nxt.get("vs_krx_pct", 0.0) or 0.0) >= 1.0:
+            score += 8
+            reasons.append(f"🟡 NXT 종가 프리미엄 +{float(nxt.get('vs_krx_pct',0.0) or 0.0):.1f}%")
+
+        try:
+            direct_theme = _infer_direct_news_theme(code, stock.get("name", code))
+            if direct_theme.get("theme"):
+                if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+                    sector_info["theme"] = direct_theme["theme"]
+                    sector_info["theme_key"] = direct_theme["theme"]
+                direct_bonus = int(direct_theme.get("bonus", 0) or 0)
+                if direct_bonus > 0:
+                    score += direct_bonus
+                direct_news_hit = True
+                reasons.append(f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — {direct_theme.get('reason','')}")
+            else:
+                emergent_theme = _infer_emergent_issue_theme(code, stock.get("name", code))
+                if emergent_theme.get("theme"):
+                    if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+                        sector_info["theme"] = emergent_theme["theme"]
+                        sector_info["theme_key"] = emergent_theme.get("theme_key", emergent_theme["theme"])
+                    emergent_bonus = int(emergent_theme.get("bonus", 0) or 0)
+                    if emergent_bonus > 0:
+                        score += emergent_bonus
+                    reasons.append(f"🧠 신규이슈 자동감지 [{emergent_theme['theme']}] {emergent_bonus:+d}점 — {emergent_theme.get('reason','')}")
+                    _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="nxt_postmarket")
+        except Exception:
+            pass
+
+        try:
+            theme_drive = _get_theme_drive_hint(code, stock.get("name", code), change_rate=cr, vol_ratio=vr, market="NXT")
+            if theme_drive.get("theme"):
+                if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류"):
+                    sector_info["theme"] = theme_drive["theme"]
+                    sector_info["theme_key"] = theme_drive.get("theme_key", theme_drive["theme"])
+                theme_bonus = int(theme_drive.get("bonus", 0) or 0)
+                if theme_bonus > 0:
+                    score += theme_bonus
+                reasons.append(f"🏭 테마 동조강세 [{theme_drive['theme']}] {theme_bonus:+d}점 — 리더 {theme_drive.get('leader_name','')} {float(theme_drive.get('leader_change',0) or 0):+.1f}%")
+        except Exception:
+            pass
+
+        try:
+            _fb_bonus, _fb_notes = _calc_adaptive_feedback_bonus(code, sector_info.get("theme", ""), "SURGE", change_rate=cr, vol_ratio=vr)
+            if _fb_bonus > 0:
+                score += int(_fb_bonus)
+                reasons.extend(_fb_notes[:1])
+        except Exception:
+            pass
+        try:
+            _mt_bonus, _mt_notes, _ = _calc_miss_theme_leader_bonus(code, stock.get("name", code), sector_info.get("theme", ""), "SURGE", change_rate=cr, vol_ratio=vr, market="NXT")
+            if _mt_bonus > 0:
+                score += int(_mt_bonus)
+                reasons.extend(_mt_notes[:1])
+        except Exception:
+            pass
+        try:
+            _pm_bonus, _pm_notes = _calc_nxt_postmarket_leader_bonus(code, stock.get("name", code), sector_info.get("theme", ""), "SURGE", change_rate=cr, vol_ratio=vr, market="NXT")
+            if _pm_bonus > 0:
+                score += int(_pm_bonus)
+                reasons.extend(_pm_notes[:1])
+        except Exception:
+            pass
+
+        score, reasons, similar_pattern_stats = _apply_similar_pattern_score(score, reasons, code, "SURGE", cr, vr, weight_mode="strong")
+        if score < min_score:
+            continue
+
+        _nxt_tf_block = _should_block_multi_tf_downtrend_capture(code, "SURGE")
+        if _nxt_tf_block.get("block"):
+            _ctx = _nxt_tf_block.get("context", {}) or {}
+            _log_suppressed_alert(code, stock.get("name", code), _nxt_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"), "SURGE", {"daily_ret20": _ctx.get("daily_ret20", 0.0), "weekly_ret8": _ctx.get("weekly_ret8", 0.0), "change_rate": cr, "score": score, "market": "NXT"})
+            continue
+
+        open_est = price / (1 + cr / 100) if cr > -99 else price
+        _pullback_r = _dynamic.get("entry_pullback_ratio", get_regime_pullback_ratio())
+        entry = int((price - (price - open_est) * _pullback_r) / 10) * 10
+        stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="SURGE")
+
+        signals.append({
+            "code": code, "name": stock.get("name", code), "price": price,
+            "change_rate": cr, "volume_ratio": vr,
+            "signal_type": "SURGE", "score": score,
+            "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
+            "direct_news_hit": direct_news_hit, "market": "NXT",
+            "nxt_post_leader_hit": True,
+            "entry_price": entry, "stop_loss": stop, "target_price": target,
+            "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
+            "prev_upper": False, "reasons": reasons,
+            "similar_pattern_stats": similar_pattern_stats,
+            "detected_at": datetime.now(),
+        })
         existing.add(code)
 
     return signals
@@ -16290,7 +16585,8 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     nxt_order_flow = any("NXT 외인+기관 동시매수" in str(r or "") for r in (signal.get("reasons") or []))
     adaptive_priority = bool(_get_adaptive_feedback_code_entry(signal.get("code", "")))
     miss_theme_leader = bool(signal.get("miss_theme_leader_hit"))
-    leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader
+    nxt_post_leader = bool(signal.get("nxt_post_leader_hit"))
+    leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader or nxt_post_leader
     strong_combo = score >= GENERAL_SOFT_ALLOW_MIN_SCORE and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and (
         vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
     )
@@ -16301,6 +16597,8 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     if adaptive_priority and change_rate >= max(4.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.5) and vol_ratio >= max(1.8, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.7):
         return True
     if miss_theme_leader and change_rate >= max(5.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 0.8) and (vol_ratio >= max(1.8, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.6) or sector_live):
+        return True
+    if nxt_post_leader and change_rate >= max(4.2, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.2) and (vol_ratio >= max(1.5, GENERAL_SOFT_ALLOW_MIN_VOLUME - 1.2) or sector_live):
         return True
     if leader_priority and change_rate >= max(4.5, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.0) and (vol_ratio >= max(1.7, GENERAL_SOFT_ALLOW_MIN_VOLUME - 0.8) or sector_live):
         return True
@@ -16823,6 +17121,7 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
     }.get(str(alert.get("signal_type", "") or ""), 0)
     return (
         1 if alert.get("leader_priority_hit") else 0,
+        1 if alert.get("nxt_post_leader_hit") else 0,
         1 if alert.get("direct_news_hit") else 0,
         1 if alert.get("theme_drive_hit") else 0,
         1 if alert.get("adaptive_feedback_hit") else 0,
@@ -22892,7 +23191,8 @@ def run_scan():
                     alerts.append(r); seen.add(stock["code"])
 
         # 실시간 랭킹 후보군 직접 스캔 — 장초반은 강하게, 이후 장중은 보수적으로
-        for stock in get_market_rank_focus_stocks():
+        _rank_scan_limit = NXT_POSTMARKET_EXTRA_RANK_LIMIT if _is_nxt_postmarket_only_window() else None
+        for stock in get_market_rank_focus_stocks(scan_limit_per_market=_rank_scan_limit):
             code = stock.get("code")
             if not code or code in seen:
                 continue
@@ -22921,6 +23221,9 @@ def run_scan():
                     alerts.append(s); seen.add(s["code"])
         elif nxt_open:
             for s in check_nxt_preopen_detection(existing_codes=seen):
+                if s["code"] not in seen and time.time()-_alert_history.get(f"NXT_{s['code']}",0)>get_regime_cooldown():
+                    alerts.append(s); seen.add(s["code"])
+            for s in check_nxt_postmarket_detection(existing_codes=seen):
                 if s["code"] not in seen and time.time()-_alert_history.get(f"NXT_{s['code']}",0)>get_regime_cooldown():
                     alerts.append(s); seen.add(s["code"])
 
