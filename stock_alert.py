@@ -3,12 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v41.98
+버전: v41.99
 날짜: 2026-03-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+
+- v41.99 (2026-03-23): 상승이탈 기반 진입가 자동완화 + 손실 누적 시 보수 복원 가드 추가.
+  [#1] `_signal_feedback_sort_key()` / `_auto_tune_entry_pullback_ratio_feedback()`를 추가해
+       최근 `진입미달` 중 `상승이탈` 비중이 높으면 `entry_pullback_ratio`를 자동 완화하도록 연결.
+  [#2] 자동 완화 이후 최근 완료건 승률/평균손익/손절 비중이 악화되면
+       `entry_pullback_ratio`를 기준값 쪽으로 복원하고 `min_score_normal`, `atr_stop_mult`를 함께 보수화.
+  [#3] `check_entry_watch()`의 `기간만료` 기반 진입가 비율 완화 직후 `_save_dynamic_params()`를 호출해
+       재시작 후에도 즉시 반영되도록 정리.
+  이유: `상승이탈`이 많을 때 진입가 완화가 자동으로 따라가야 하고, 그 결과 손실이 누적되면
+       다시 기준을 되돌리는 보완 장치가 함께 돌아야 운영 리스크를 줄일 수 있었음.
+  개선점: 진입미달 적응력↑, 자동완화 이후 손실 방어력↑, 재시작 후 파라미터 일관성↑.
+  주의점: 이번 버전은 `entry_pullback_ratio` 피드백 루프를 추가하며 기존 신호/알림 구조는 유지.
 
 - v41.98 (2026-03-23): 주말/공휴일 대기 모드에서 평일 자동 전환 복구.
   [#1] `_run_holiday_standby_until_trading_day()`를 추가해 주말/공휴일에 시작한 프로세스가
@@ -845,6 +857,8 @@ def _default_auto_tune_state() -> dict:
         "emergency_active": False,
         "last_emergency_reason": "",
         "last_emergency_ts": 0.0,
+        "last_entry_pullback_reason": "",
+        "last_entry_pullback_ts": 0.0,
     }
 
 def _get_auto_tune_state() -> dict:
@@ -1356,6 +1370,13 @@ TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "2") or "2")
 MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
 ENTRY_PULLBACK_RATIO  = 0.4
+ENTRY_PULLBACK_RATIO_MIN = 0.20
+ENTRY_PULLBACK_RATIO_MAX = 0.60
+ENTRY_PULLBACK_ADJUST_STEP = 0.03
+ENTRY_PULLBACK_MISS_LOOKBACK = 30
+ENTRY_PULLBACK_RESULT_LOOKBACK = 16
+ENTRY_PULLBACK_MISS_MIN_SAMPLES = 8
+ENTRY_PULLBACK_RESULT_MIN_SAMPLES = 8
 MAX_CARRY_DAYS        = 3
 CARRY_FILE            = os.path.join(DATA_DIR, "carry_stocks.json")
 EARLY_LOG_FILE        = os.path.join(DATA_DIR, "early_detect_log.json")
@@ -10672,6 +10693,90 @@ def _auto_tune_mid_pullback_bucket_params(mid_recs: list) -> list:
     return changes
 
 
+
+def _signal_feedback_sort_key(rec: dict | None = None) -> tuple:
+    rec = dict(rec or {})
+    exit_ts = f"{rec.get('exit_date','')} {rec.get('exit_time','')}".strip()
+    detect_ts = f"{rec.get('detect_date','')} {rec.get('detect_time','')}".strip()
+    hit_ts = str(rec.get('entry_hit_time') or '').strip()
+    return (exit_ts, hit_ts, detect_ts, str(rec.get('code') or ''), str(rec.get('signal_type') or ''))
+
+
+def _auto_tune_entry_pullback_ratio_feedback(data: dict, completed: list, tune_state: dict) -> list:
+    """상승이탈 누적 시 entry_pullback_ratio 완화, 손실 악화 시 보수 복원."""
+    changes = []
+    try:
+        if not isinstance(data, dict):
+            return changes
+
+        cur_ratio = round(float(_dynamic.get('entry_pullback_ratio', ENTRY_PULLBACK_RATIO) or ENTRY_PULLBACK_RATIO), 2)
+        base_ratio = round(float(get_regime_pullback_ratio() or ENTRY_PULLBACK_RATIO), 2)
+
+        miss_all = []
+        for rec in data.values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get('status') or '') != '진입미달':
+                continue
+            miss_all.append(dict(rec))
+        miss_all.sort(key=_signal_feedback_sort_key)
+        recent_miss = miss_all[-ENTRY_PULLBACK_MISS_LOOKBACK:]
+
+        surge_miss = [r for r in recent_miss if '상승이탈' in str(r.get('exit_reason', '') or '')]
+        expire_miss = [r for r in recent_miss if '기간만료' in str(r.get('exit_reason', '') or '')]
+
+        if len(recent_miss) >= ENTRY_PULLBACK_MISS_MIN_SAMPLES:
+            surge_share = len(surge_miss) / len(recent_miss) if recent_miss else 0.0
+            avg_surge_away = 0.0
+            if surge_miss:
+                avg_surge_away = sum(float(r.get('entry_miss_away', 0) or 0) for r in surge_miss) / len(surge_miss)
+            if (len(surge_miss) >= max(4, len(expire_miss) + 2)
+                    and surge_share >= 0.45
+                    and cur_ratio > ENTRY_PULLBACK_RATIO_MIN):
+                new_ratio = round(max(ENTRY_PULLBACK_RATIO_MIN, cur_ratio - ENTRY_PULLBACK_ADJUST_STEP), 2)
+                if new_ratio != cur_ratio:
+                    _dynamic['entry_pullback_ratio'] = new_ratio
+                    tune_state['last_entry_pullback_reason'] = f'surge_miss_{len(surge_miss)}of{len(recent_miss)}'
+                    tune_state['last_entry_pullback_ts'] = time.time()
+                    changes.append(
+                        f"🎯 진입가 비율 완화: {cur_ratio:.2f}→{new_ratio:.2f} "
+                        f"(최근 진입미달 {len(recent_miss)}건 중 상승이탈 {len(surge_miss)}건, 평균 {avg_surge_away:+.1f}%)"
+                    )
+                    cur_ratio = new_ratio
+
+        recent_completed = sorted([dict(r) for r in completed if isinstance(r, dict)], key=_signal_feedback_sort_key)[-ENTRY_PULLBACK_RESULT_LOOKBACK:]
+        if len(recent_completed) >= ENTRY_PULLBACK_RESULT_MIN_SAMPLES and cur_ratio < base_ratio:
+            losses = [r for r in recent_completed if float(r.get('pnl_pct', 0) or 0) <= 0]
+            loss_rate = len(losses) / len(recent_completed) if recent_completed else 0.0
+            avg_pnl = sum(float(r.get('pnl_pct', 0) or 0) for r in recent_completed) / len(recent_completed) if recent_completed else 0.0
+            stop_hits = sum(1 for r in recent_completed if str(r.get('exit_reason') or '') == '손절가')
+            stop_ratio = stop_hits / len(recent_completed) if recent_completed else 0.0
+            if loss_rate >= 0.60 or avg_pnl <= -1.0 or stop_ratio >= 0.35:
+                restore_to = round(min(base_ratio, cur_ratio + ENTRY_PULLBACK_ADJUST_STEP), 2)
+                if restore_to != cur_ratio:
+                    _dynamic['entry_pullback_ratio'] = restore_to
+                    tune_state['last_entry_pullback_reason'] = f'loss_guard_{len(recent_completed)}'
+                    tune_state['last_entry_pullback_ts'] = time.time()
+                    changes.append(
+                        f"🛡 진입가 비율 보수 복원: {cur_ratio:.2f}→{restore_to:.2f} "
+                        f"(최근 완료 {len(recent_completed)}건 손실비중 {loss_rate*100:.0f}% / 평균 {avg_pnl:+.1f}%)"
+                    )
+                    cur_ratio = restore_to
+                old_min = int(_dynamic.get('min_score_normal', 56) or 56)
+                new_min = min(old_min + 2, 85)
+                if new_min != old_min:
+                    _dynamic['min_score_normal'] = new_min
+                    changes.append(f"🛡 손실 가드 최소점수 강화: {old_min}→{new_min}점")
+                if stop_ratio >= 0.35:
+                    old_atr = round(float(_dynamic.get('atr_stop_mult', ATR_STOP_MULT) or ATR_STOP_MULT), 2)
+                    new_atr = round(min(old_atr + 0.1, 2.5), 1)
+                    if new_atr != old_atr:
+                        _dynamic['atr_stop_mult'] = new_atr
+                        changes.append(f"🛡 손실 가드 ATR 손절배수 확대: {old_atr}→{new_atr}")
+    except Exception as e:
+        _log_error('_auto_tune_entry_pullback_ratio_feedback', e)
+    return changes
+
 def auto_tune(notify: bool = True):
     """
     signal_log.json 기반으로 신호 유형별 성과를 분석해서
@@ -10834,6 +10939,9 @@ def auto_tune(notify: bool = True):
                 changes.append(f"🏆 눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
             changes.extend(_auto_tune_mid_pullback_bucket_params(mid_recs))
+
+        # ── ③-1 진입가 미달/손실 피드백 루프 ──
+        changes.extend(_auto_tune_entry_pullback_ratio_feedback(data, completed, tune_state))
 
         # ── ④ 최소 점수 조정 ──
         if len(completed) >= MIN_SAMPLES:
@@ -12223,6 +12331,7 @@ def check_entry_watch():
                 old_ratio = _dynamic.get("entry_pullback_ratio", ENTRY_PULLBACK_RATIO)
                 if old_ratio > 0.15:
                     _dynamic["entry_pullback_ratio"] = round(old_ratio - 0.05, 2)
+                    _save_dynamic_params()
                     print(f"  🔧 진입가 비율 완화: {old_ratio:.2f}→{_dynamic['entry_pullback_ratio']:.2f} (미도달 {miss_count}회)")
             expired.append((log_key, "기간만료", _entry_watch_final_status(watch))); continue
 
@@ -18486,6 +18595,7 @@ def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> l
     except Exception:
         pass
     return sorted(causes, key=lambda x: -x["score"])
+
 
 
 def _run_holiday_standby_until_trading_day():
