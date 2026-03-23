@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v54
-날짜: 2026-03-23
+버전: v55
+날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v55 (2026-03-24): 고아 추적 만료 전파 보강 + 장전/오버나이트 stale 재노출 차단.
+  [#1] `_get_tracking_elapsed_days()` / `_is_tracking_display_expired()` / `_iter_signal_log_records()`를 추가해,
+       `TRACK_MAX_DAYS`를 이미 넘긴 추적중 레코드와 고아 레코드를 장전/오버나이트 조회 단계에서 즉시 제외하도록 정리.
+  [#2] `save_carry_stocks()` / `load_carry_stocks()` / `build_next_open_watchlist()`를 보강해,
+       entry/stop/target이 비어 있는 carry·signal_log 잔존 종목이 `watchlist_next_open.json`과 재시작 복원 경로로 다시 살아나지 않도록 수정.
+  [#3] `send_preopen_watchlist()`가 저장된 `overnight_risk_last.json` 문자열을 재사용하지 않고
+       `_build_overnight_risk_alert_message()`로 현재 유효 추적 종목 기준 오버나이트 리스크를 다시 계산하도록 변경.
+  [#4] `purge_orphan_tracking()`가 고아 만료 후 `_detected_stocks` / `_entry_watch` / `_execution_setup_watch`와
+       익개장 워치리스트 캐시까지 함께 정리해, 고아 종목이 저장 파일·런타임 상태를 통해 재등장하는 문제를 막음.
+  이유: v54 기준 고아 만료는 `signal_log` 중심으로만 반영돼 `carry_stocks`, `watchlist_next_open`, 장전 재사용 메시지 경로에 남은 종목이
+       익개장 전 워치리스트와 오버나이트 위험 알림에 다시 나타날 수 있었음.
+  개선점: 고아/stale 종목 재등장↓, 장전 워치리스트/오버나이트 요약 정확성↑, 재시작 후 잔존 추적 복원 오류↓.
+  주의점: `TRACK_MAX_DAYS`를 넘긴 추적중 종목은 장전/야간 표시에서 먼저 제외되며, 최종 결과 기록은 기존처럼 `track_signal_results()`가 장중 가격으로 확정한다.
 
 - v54 (2026-03-23): KIS REST 전역 호출 제한기 추가.
   [#1] `KIS_REST_LIMIT_PER_SEC` / `KIS_TOKEN_LIMIT_PER_SEC` / `_wait_for_kis_rest_slot()`를 추가해,
@@ -6103,37 +6117,140 @@ def check_execution_setup_watch() -> None:
     elif state_snapshot_changed:
         _save_execution_setup_watch(force=False)
 
+def _iter_signal_log_records(data) -> list:
+    if isinstance(data, dict):
+        return [v for v in data.values() if isinstance(v, dict)]
+    if isinstance(data, list):
+        return [v for v in data if isinstance(v, dict)]
+    return []
+
+
+def _get_tracking_elapsed_days(rec: dict, today: str | None = None) -> int:
+    today = str(today or datetime.now().strftime("%Y%m%d"))
+    detect_date = str(rec.get("detect_date", "") or "").strip()
+    if not detect_date:
+        return 999
+    try:
+        return (datetime.strptime(today, "%Y%m%d") - datetime.strptime(detect_date, "%Y%m%d")).days
+    except Exception:
+        return 999
+
+
+def _is_tracking_display_expired(rec: dict, today: str | None = None) -> bool:
+    if not isinstance(rec, dict):
+        return True
+    if rec.get("status") != "추적중":
+        return True
+    return _get_tracking_elapsed_days(rec, today) >= TRACK_MAX_DAYS
+
+
+def _is_empty_tracking_price_triplet(entry_price: int | float | None, stop_price: int | float | None, target_price: int | float | None) -> bool:
+    return (not safe_int(entry_price, 0) and
+            not safe_int(stop_price, 0) and
+            not safe_int(target_price, 0))
+
+
+def _is_orphan_carry_snapshot(info: dict | None) -> bool:
+    if not isinstance(info, dict):
+        return False
+    return _is_empty_tracking_price_triplet(
+        info.get("entry_price", info.get("entry", 0)),
+        info.get("stop_loss", info.get("stop_price", info.get("stop", 0))),
+        info.get("target_price", info.get("target", 0)),
+    )
+
+
+def _should_skip_next_open_signal_record(rec: dict, today: str | None = None) -> bool:
+    if not isinstance(rec, dict):
+        return True
+    status = str(rec.get("status", "") or "")
+    exit_reason = str(rec.get("exit_reason", "") or "")
+    if status == TRACK_TIMEOUT_RESULT or exit_reason == "고아추적_자동만료":
+        return True
+    if status == "추적중" and (_is_orphan_tracking(rec) or _is_tracking_display_expired(rec, today)):
+        return True
+    return False
+
+
+def _sanitize_next_open_watchlist_codes(codes: list, carry_data=None, siglog_data=None) -> list:
+    today = datetime.now().strftime("%Y%m%d")
+    latest_by_code = {}
+    latest_key_by_code = {}
+    for rec in _iter_signal_log_records(siglog_data):
+        code = normalize_stock_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
+        if not code:
+            continue
+        key = f"{rec.get('detect_date','')}{rec.get('detect_time','')}"
+        if key >= latest_key_by_code.get(code, ""):
+            latest_by_code[code] = rec
+            latest_key_by_code[code] = key
+
+    orphan_carry_codes = set()
+    if isinstance(carry_data, dict):
+        for raw_code, info in carry_data.items():
+            code = normalize_stock_code(raw_code)
+            if code and _is_orphan_carry_snapshot(info):
+                orphan_carry_codes.add(code)
+    elif isinstance(carry_data, list):
+        for item in carry_data:
+            if not isinstance(item, dict):
+                continue
+            code = normalize_stock_code(item.get("code") or item.get("stock_code") or item.get("종목코드"))
+            if code and _is_orphan_carry_snapshot(item):
+                orphan_carry_codes.add(code)
+
+    cleaned = []
+    seen = set()
+    for raw_code in codes or []:
+        code = normalize_stock_code(raw_code)
+        if not code or code in seen:
+            continue
+        latest = latest_by_code.get(code)
+        if latest and _should_skip_next_open_signal_record(latest, today):
+            continue
+        if code in orphan_carry_codes and not latest:
+            continue
+        seen.add(code)
+        cleaned.append(code)
+    return cleaned
+
+
 def build_next_open_watchlist(max_codes: int = 30) -> dict:
     """장 종료 후: 내일 감시할 워치리스트를 생성해서 파일로 저장."""
     # 우선순위: carry_stocks → 최근 signal_log 종목 → (있으면) universe.json
     carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
-    siglog = _read_json_safe(os.path.join(DATA_DIR, "signal_log.json"), [])
+    siglog = _read_json_safe(os.path.join(DATA_DIR, "signal_log.json"), {})
     universe = _read_json_safe(os.path.join(DATA_DIR, "universe.json"), {})
 
     codes = []
     seen = set()
 
+    def _push(raw_code):
+        c = normalize_stock_code(raw_code)
+        if c and c not in seen:
+            seen.add(c)
+            codes.append(c)
+
     # carry_stocks 구조가 dict/list 어떤 형태든 대응
     if isinstance(carry, dict):
-        for k in list(carry.keys()):
-            c = normalize_stock_code(k)
-            if c and c not in seen:
-                seen.add(c); codes.append(c)
+        for k, info in carry.items():
+            if isinstance(info, dict) and _is_orphan_carry_snapshot(info):
+                continue
+            _push(k)
     elif isinstance(carry, list):
         for item in carry:
-            c = normalize_stock_code(item.get("code") if isinstance(item, dict) else item)
-            if c and c not in seen:
-                seen.add(c); codes.append(c)
+            if isinstance(item, dict) and _is_orphan_carry_snapshot(item):
+                continue
+            _push(item.get("code") if isinstance(item, dict) else item)
 
     # 최근 신호/추적 종목
-    if isinstance(siglog, list):
-        # 최근 것부터
-        for rec in reversed(siglog[-500:]):  # 너무 오래는 보지 않음
-            if not isinstance(rec, dict):
+    recs = _iter_signal_log_records(siglog)
+    if recs:
+        recs.sort(key=lambda r: f"{r.get('detect_date','')}{r.get('detect_time','')}", reverse=True)
+        for rec in recs[:500]:  # 너무 오래는 보지 않음
+            if _should_skip_next_open_signal_record(rec):
                 continue
-            c = normalize_stock_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
-            if c and c not in seen:
-                seen.add(c); codes.append(c)
+            _push(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
             if len(codes) >= max_codes:
                 break
 
@@ -6142,17 +6259,16 @@ def build_next_open_watchlist(max_codes: int = 30) -> dict:
         ulist = universe.get("codes") or universe.get("universe") or universe.get("tickers") or []
         if isinstance(ulist, list):
             for u in ulist:
-                c = normalize_stock_code(u)
-                if c and c not in seen:
-                    seen.add(c); codes.append(c)
+                _push(u)
                 if len(codes) >= max_codes:
                     break
 
+    codes = _sanitize_next_open_watchlist_codes(codes, carry_data=carry, siglog_data=siglog)[:max_codes]
     payload = {
         "ts": time.time(),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "max_codes": max_codes,
-        "codes": codes[:max_codes],
+        "codes": codes,
     }
     try:
         _ensure_dir(DATA_DIR)
@@ -7072,7 +7188,7 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
 def send_preopen_watchlist():
     """익개장 전(07:30) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
     try:
-        data = _read_json_safe(WATCHLIST_NEXT_OPEN_FILE, {})
+        data = build_next_open_watchlist(max_codes=30)
         codes = data.get("codes") if isinstance(data, dict) else None
         if not codes:
             return
@@ -7094,16 +7210,11 @@ def send_preopen_watchlist():
         except Exception:
             pass
 
-        # Include overnight risk recap (saved during night / last run)
+        # Fresh overnight risk recap (do not reuse stale saved string)
         try:
-            _ov = _read_json_safe(OVERNIGHT_RISK_LAST_FILE, {})
-            _ov_msg = _ov.get("msg") if isinstance(_ov, dict) else None
+            _ov_msg = _build_overnight_risk_alert_message(limit_items=2, include_stats=False)
             if _ov_msg:
-                # Keep it short: top 6 lines max
-                _lines = [ln for ln in str(_ov_msg).splitlines() if ln.strip()]
-                if len(_lines) > 6:
-                    _lines = _lines[:6] + ["…(생략)"]
-                msg += "\n\n" + "\n".join(_lines)
+                msg += "\n\n" + _ov_msg
         except Exception:
             pass
 
@@ -9860,15 +9971,76 @@ def _is_orphan_tracking(rec: dict) -> bool:
     """entry/stop/target이 모두 0인 '추적중' 레코드인지 판별."""
     if rec.get("status") != "추적중":
         return False
-    return (not rec.get("entry_price") and
-            not rec.get("stop_price") and
-            not rec.get("target_price"))
+    return _is_empty_tracking_price_triplet(
+        rec.get("entry_price", 0),
+        rec.get("stop_price", 0),
+        rec.get("target_price", 0),
+    )
 
 
 def _get_valid_tracking(data: dict) -> list:
-    """signal_log에서 고아를 제외한 유효 추적중 레코드만 반환."""
-    return [v for v in data.values()
-            if v.get("status") == "추적중" and not _is_orphan_tracking(v)]
+    """signal_log에서 고아/만료 예정 레코드를 제외한 유효 추적중 레코드만 반환."""
+    today = datetime.now().strftime("%Y%m%d")
+    out = []
+    for rec in _iter_signal_log_records(data):
+        if rec.get("status") != "추적중":
+            continue
+        if _is_orphan_tracking(rec):
+            continue
+        if _is_tracking_display_expired(rec, today):
+            continue
+        out.append(rec)
+    return out
+
+
+def _drop_tracking_runtime_artifacts(codes: set[str]) -> None:
+    normalized = set()
+    for code in codes or set():
+        norm = normalize_stock_code(code)
+        if norm:
+            normalized.add(norm)
+    codes = normalized
+    if not codes:
+        return
+
+    detected_changed = False
+    entry_changed = False
+    execution_changed = False
+    try:
+        with _state_lock:
+            for code in list(codes):
+                if _detected_stocks.pop(code, None) is not None:
+                    detected_changed = True
+
+            for key in list(_entry_watch.keys()):
+                watch = _entry_watch.get(key)
+                if not isinstance(watch, dict):
+                    continue
+                if normalize_stock_code(watch.get("code")) in codes:
+                    _entry_watch.pop(key, None)
+                    entry_changed = True
+
+            for key in list(_execution_setup_watch.keys()):
+                watch = _execution_setup_watch.get(key)
+                if not isinstance(watch, dict):
+                    continue
+                if normalize_stock_code(watch.get("code")) in codes:
+                    _execution_setup_watch.pop(key, None)
+                    execution_changed = True
+    except Exception:
+        pass
+
+    if detected_changed:
+        save_carry_stocks()
+    if entry_changed:
+        _save_entry_watch_active()
+    if execution_changed:
+        _save_execution_setup_watch(force=True)
+
+    try:
+        build_next_open_watchlist(max_codes=30)
+    except Exception:
+        pass
 
 
 def purge_orphan_tracking(notify: bool = False) -> int:
@@ -9879,33 +10051,32 @@ def purge_orphan_tracking(notify: bool = False) -> int:
         return 0
     today = datetime.now().strftime("%Y%m%d")
     purged = 0
+    purged_codes: set[str] = set()
     for log_key, rec in data.items():
         if not isinstance(rec, dict):
             continue
         if not _is_orphan_tracking(rec):
             continue
-        detect_date = rec.get("detect_date", "")
-        try:
-            elapsed = (datetime.strptime(today, "%Y%m%d") -
-                       datetime.strptime(detect_date, "%Y%m%d")).days if detect_date else 999
-        except Exception:
-            elapsed = 999
+        elapsed = _get_tracking_elapsed_days(rec, today)
         if elapsed >= TRACK_MAX_DAYS:
             rec["status"] = TRACK_TIMEOUT_RESULT
             rec["exit_date"] = today
             rec["exit_reason"] = "고아추적_자동만료"
             rec["pnl_pct"] = 0.0
             purged += 1
+            code = normalize_stock_code(rec.get("code"))
+            if code:
+                purged_codes.add(code)
             print(f"  🗑 고아 추적 만료: {rec.get('name', rec.get('code', log_key))} ({elapsed}일 경과)")
     if purged:
         try:
             _write_json_atomic(SIGNAL_LOG_FILE, data)
         except Exception:
             pass
+        _drop_tracking_runtime_artifacts(purged_codes)
         if notify:
             print(f"  🗑 고아 추적 총 {purged}건 자동 만료")
     return purged
-
 
 def _extract_signal_detect_datetime(stock: dict | None) -> datetime:
     stock = stock or {}
@@ -10452,40 +10623,47 @@ _tracking_notified = set()   # 이미 결과 알림 보낸 log_key
 # ============================================================
 # ✍️ 수동 매도 결과 입력 보조
 # ============================================================
-def send_overnight_risk_alerts():
-    """장 마감 후 추적 중 종목 오버나이트 위험도 알림"""
+def _build_overnight_risk_alert_message(limit_items: int | None = None, include_stats: bool = True) -> str:
     try:
-        data = {}
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+    except Exception:
+        return ""
+
+    tracking = _get_valid_tracking(data)
+    if not tracking:
+        return ""
+
+    high_risk = []
+    for rec in tracking:
+        code = rec.get("code", "")
+        name = rec.get("name", "")
+        entry = rec.get("entry_price", 0)
+        pnl = rec.get("pnl_pct", 0.0)
+        risk = calc_overnight_risk(code, name, entry, pnl)
+        if risk["level"] in ("high", "mid"):
+            high_risk.append((rec, risk))
+
+    if not high_risk:
+        return ""
+
+    if limit_items is not None:
         try:
-            data = _read_json_locked(SIGNAL_LOG_FILE)
-        except Exception: pass
-        tracking = _get_valid_tracking(data)  # [v41.85] 고아 추적 제외
-        if not tracking: return
+            limit_items = max(1, int(limit_items))
+        except Exception:
+            limit_items = None
+    rows = high_risk if limit_items is None else high_risk[:limit_items]
 
-        high_risk = []
-        for rec in tracking:
-            code  = rec.get("code","")
-            name  = rec.get("name","")
-            entry = rec.get("entry_price", 0)
-            pnl   = rec.get("pnl_pct", 0.0)
-            risk  = calc_overnight_risk(code, name, entry, pnl)
-            if risk["level"] in ("high", "mid"):
-                high_risk.append((rec, risk))
+    msg = "🌙 <b>오버나이트 위험 알림</b>\n━━━━━━━━━━━━━━━\n"
+    for rec, risk in rows:
+        pnl_str = f"{rec.get('pnl_pct', 0):+.1f}%"
+        msg += (f"{'🔵' if risk['level']=='high' else '🟡'} "
+                f"<b>{rec['name']}</b>  현재 {pnl_str}\n"
+                f"  {risk['reason']}\n")
+        for c in risk.get("causes", [])[:2]:
+            c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
+            msg += f"  {c_emoji} {c['label']}: {c['detail']}\n"
 
-        if not high_risk: return
-
-        msg = "🌙 <b>오버나이트 위험 알림</b>\n━━━━━━━━━━━━━━━\n"
-        for rec, risk in high_risk:
-            pnl_str = f"{rec.get('pnl_pct',0):+.1f}%"
-            msg += (f"{'🔵' if risk['level']=='high' else '🟡'} "
-                    f"<b>{rec['name']}</b>  현재 {pnl_str}\n"
-                    f"  {risk['reason']}\n")
-            # v40.0-#5: 리스크 원인별 표시
-            for c in risk.get("causes", [])[:2]:
-                c_emoji = {"liquidity": "💧", "energy_geo": "🌍", "domestic_trend": "📉"}.get(c["type"], "⚠️")
-                msg += f"  {c_emoji} {c['label']}: {c['detail']}\n"
-
-        # v37.0: 오버나이트 보유 과거 통계 + 현재 국면 이력
+    if include_stats:
         try:
             _on_hist = get_overnight_history()
             if _on_hist:
@@ -10494,8 +10672,19 @@ def send_overnight_risk_alerts():
             _r_hist = get_regime_history(_regime)
             if _r_hist:
                 msg += f"📊 {_r_hist}\n"
-        except Exception: pass
-        # Save latest overnight risk message (for pre-open recap)
+        except Exception:
+            pass
+    return msg.rstrip()
+
+
+def send_overnight_risk_alerts():
+    """장 마감 후 추적 중 종목 오버나이트 위험도 알림"""
+    try:
+        msg = _build_overnight_risk_alert_message()
+        if not msg:
+            return
+
+        # Save latest overnight risk message (for diagnostics / same-night recall)
         try:
             _write_json_atomic(OVERNIGHT_RISK_LAST_FILE, {
                 "ts": _now_kst().isoformat(timespec="seconds"),
@@ -11474,17 +11663,29 @@ def save_carry_stocks():
                     "target_price":info["target_price"],
                     "detected_at":info["detected_at"].strftime("%Y%m%d%H%M%S"),
                     "carry_day":info.get("carry_day",0),
-                } for code,info in _detected_stocks.items()}, f, ensure_ascii=False)
+                } for code,info in _detected_stocks.items()
+                  if isinstance(info, dict) and not _is_orphan_carry_snapshot(info)}, f, ensure_ascii=False)
         except Exception as e: print(f"⚠️ 이월 저장 실패: {e}")
 
 def load_carry_stocks():
     """Railway 재시작 시 추적 상태 전체 복원"""
+    # [v55] 고아 추적 종목 일괄 정리 (복원 전에 먼저 1회)
+    try:
+        _orphan_count = purge_orphan_tracking(notify=True)
+        if _orphan_count:
+            print(f"🗑 봇 시작 시 고아 추적 {_orphan_count}건 자동 만료")
+    except Exception as _oe:
+        print(f"⚠️ 고아 추적 정리 오류: {_oe}")
+
     # ① 이월 종목 복원
     try:
         data = _read_json_locked(CARRY_FILE)
         for code, info in data.items():
             carry_day = info.get("carry_day",0)
-            if carry_day >= MAX_CARRY_DAYS: continue
+            if carry_day >= MAX_CARRY_DAYS:
+                continue
+            if isinstance(info, dict) and _is_orphan_carry_snapshot(info):
+                continue
             _detected_stocks[code] = {
                 "name":info["name"],"high_price":info["high_price"],
                 "entry_price":info["entry_price"],"stop_loss":info["stop_loss"],
@@ -11494,17 +11695,18 @@ def load_carry_stocks():
             }
         if _detected_stocks:
             print(f"📂 이월 종목 {len(_detected_stocks)}개 복원")
-    except Exception: pass
+    except Exception:
+        pass
 
-    # ② signal_log에서 추적 중 종목 복원 (이월 파일에 없는 당일 추적 종목)
+    # ② signal_log에서 유효 추적 종목 복원 (이월 파일에 없는 당일 추적 종목)
     try:
         sig_data = _read_json_locked(SIGNAL_LOG_FILE)
         today = datetime.now().strftime("%Y%m%d")
         restored = 0
-        for rec in sig_data.values():
-            code = rec.get("code","")
-            if (rec.get("status") == "추적중"
-                    and rec.get("detect_date") == today
+        for rec in _get_valid_tracking(sig_data):
+            code = normalize_stock_code(rec.get("code",""))
+            if (rec.get("detect_date") == today
+                    and code
                     and code not in _detected_stocks):
                 _detected_stocks[code] = {
                     "name":        rec["name"],
@@ -11518,23 +11720,18 @@ def load_carry_stocks():
                 restored += 1
         if restored:
             print(f"  📋 signal_log에서 추적 중 종목 {restored}개 추가 복원")
-    except Exception: pass
+    except Exception:
+        pass
 
     # 복원 알림
     if _detected_stocks:
-        send(f"🔄 <b>봇 재시작 — 추적 상태 복원</b>\n"
-             f"📂 감시 중 종목 {len(_detected_stocks)}개\n" +
-             "\n".join([f"• {v['name']} ({k})" for k,v in list(_detected_stocks.items())[:6]]) +
-             ("\n  ..." if len(_detected_stocks) > 6 else "") +
-             "\n\n📡 스캔 재개")
-
-    # [v41.85] 고아 추적 종목 일괄 정리 (봇 시작 시 1회)
-    try:
-        _orphan_count = purge_orphan_tracking(notify=True)
-        if _orphan_count:
-            print(f"🗑 봇 시작 시 고아 추적 {_orphan_count}건 자동 만료")
-    except Exception as _oe:
-        print(f"⚠️ 고아 추적 정리 오류: {_oe}")
+        send(
+            f"🔄 <b>봇 재시작 — 추적 상태 복원</b>\n"
+            f"📂 감시 중 종목 {len(_detected_stocks)}개\n"
+            + "\n".join([f"• {v['name']} ({k})" for k, v in list(_detected_stocks.items())[:6]])
+            + ("\n  ..." if len(_detected_stocks) > 6 else "")
+            + "\n\n📡 스캔 재개"
+        )
 
     # ③ 컴팩트 모드 복원
     _load_compact_mode()
