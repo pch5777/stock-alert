@@ -9,19 +9,18 @@
 
 [변경 이력]
 
-- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 진입감시 연동 보강.
+- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 진입감시 연동 보강 + 눌림목 NameError 복구.
   [#1] `_has_recent_actionable_tracking_state()` / `_should_promote_internal_capture_watch()` / `_promote_internal_capture_watch()`를 추가해,
        외부 A전용 억제로 바로 안 나가더라도 테마/직접뉴스/체결속도/장중 miss 확증이 붙은 near-A 후보는 자동으로 `signal_log` / `entry_watch` / `execution_setup_watch`에 내부 승격되도록 수정.
   [#2] `_dispatch_general_alert_signal()` / `run_mid_pullback_scan()`의 외부억제 경로에 위 내부승격을 연결해,
        섹터 seed 단계에서 보인 종목이 A 직전 단계에서 그냥 사라지지 않고 진입가 감시까지 이어지도록 보강.
   [#3] `_build_market_leading_sector_payload()`에 actionable tracking gate를 추가해,
        `entry_watch` / `execution_setup_watch` / 최근 `signal_log`로 연결된 종목이 한 개도 없는 테마는 사용자용 `[시장 주도 섹터]` 메시지에서 제외하고, 노출되는 leader/follower도 행동 경로에 걸린 종목 중심으로 재구성하도록 수정.
-  [#4] 섹터 메시지와 종목 포착 경로가 어긋난 경우 `sector_actionable_missing` shadow 기록을 남겨,
-       “섹터 형성 중인데 종목 감시는 왜 없었는가”를 로그에서 바로 추적할 수 있게 보강.
-  이유: 섹터는 종목 포착 후 강화를 위한 보조 근거여야 하는데, 기존 v60까지는 섹터 seed/요약 레이어가 종목 행동 경로보다 먼저 발화할 수 있어
-       섹터 알림은 오는데 진입가 감시/알림이 비는 순서 역전이 남아 있었음.
-  개선점: 종목 raw 포착→내부감시→A승격→섹터 강화 순서 일관성↑, near-A 후보의 진입가 감시 연결↑, 섹터/종목 로그 추적성↑.
-  주의점: 외부 A전용 정책은 유지하며, 내부 자동승격은 테마/체결/장중 miss 확증이 충분한 후보에만 제한적으로 적용된다.
+  [#4] `analyze_mid_pullback()` 시작부에 `sector_info = {}` / `sentiment = {}` 기본값을 먼저 선언하고,
+       `_should_block_multi_tf_downtrend_capture()`에 넘기는 `signal_meta`와 반환 payload를 정리해 `⚠️ 눌림목 오류 (...): name 'sector_info' is not defined` 반복 오류를 제거.
+  이유: 섹터는 먼저 보이는데 종목 포착/감시/진입가 알림이 비는 순서 역전을 줄이고, v61 초안에서 함께 드러난 눌림목 핫패스 예외까지 같은 계열의 포착 경로 문제로 묶어 복구해야 했음.
+  개선점: 섹터 단독 선발화↓, near-A 내부감시 승격↑, `MID_PULLBACK` 예외 탈락↓, `entry_watch` 및 진입가 알림 연결 안정성↑.
+  주의점: 외부 A전용 정책/v60 장중 miss 자동확장 철학은 유지하며, 이번 버전은 v61 최종본으로서 종목 행동 경로 정합성 복구가 중심이다.
 
 - v60 (2026-03-24): 선행형 A후보 자동확장 + ENTRY_POINT A등급 복구.
   [#1] `intraday_capture_mode.json`과 `_get_intraday_capture_mode()` / `_get_dynamic_general_a_relax_signal_types()` /
@@ -4757,6 +4756,8 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     score   = 0
     reasons = []
     grade   = "C"
+    sector_info: dict = {}
+    sentiment: dict = {}
 
     # 1차 급등 강도
     if surge_pct >= 40:   score += 25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
@@ -4897,6 +4898,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "stop_loss":     stop, "target_price": target,
         "stop_pct":      stop_pct, "target_pct": target_pct,
         "atr_used":      atr_used,
+        "sector_info":   sector_info,
         "reasons":       reasons,
         "detected_at":   datetime.now(),
         "market_regime_label": regime_label(),
