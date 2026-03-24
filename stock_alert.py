@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v62
+버전: v63
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v63 (2026-03-24): saved→watch 전환 회복 + no_ask_liquidity 내부감시 유지 + actionable position_limit 실반영.
+  [#1] `_collect_actionable_position_limit_codes()` / `_get_capture_watch_recovery_state()`를 추가해,
+       `position_limit`가 `_detected_stocks` 전체가 아니라 `entry_watch` / `execution_setup_watch` / 최근 active signal_log 중심으로 계산되도록 수정하고,
+       같은 날 `saved→watch` 전환율이 급락하면 자동 recovery 모드가 켜지도록 보강.
+  [#2] `_persist_blocked_capture_watch()` / `_should_keep_internal_watch_on_no_ask_liquidity()` / `_promote_internal_capture_watch()`를 연결해,
+       `no_ask_liquidity`나 A전용 외부억제로 외부 알림이 막혀도 선행형/near-A 후보는 내부 `signal_log` / `entry_watch` / `execution_setup_watch` 경로를 유지하도록 수정.
+  [#3] `save_signal_log()` / `register_entry_watch()` / `check_entry_watch()`에 capture funnel 기록을 연결해
+       저장→감시→도달 전환율을 자동 집계하고, watch 비율이 무너지면 shadow 로그와 함께 회복 모드가 발동되도록 추가.
+  [#4] v62의 `analyze_mid_pullback()` `sector_info` / `sentiment` 초기화와 `sector_info` payload 반환을 그대로 유지해,
+       saved→watch 복구 수정 과정에서 눌림목 `NameError` 복구가 다시 빠지는 회귀를 차단.
+  이유: 최근 로그상 진입가 알림 0건의 핵심은 raw 포착 0건보다 `saved→watch` 전환 붕괴, `no_ask_liquidity` 조기차단,
+       그리고 `position_limit`가 실제 행동 가능한 감시보다 넓게 계산돼 신규 후보를 먼저 죽이는 구조였음.
+  개선점: saved→watch 전환율↑, no_ask_liquidity 후보 내부감시 유지↑, actionable 동시보유 제한 정확도↑, 눌림목 회귀 오류 방지↑.
+  주의점: A전용 외부알림은 유지하며, 자동 recovery는 최근 저장 건수가 충분히 쌓였을 때만 제한 발동한다.
 
 - v62 (2026-03-24): 동시보유 제한 actionable 기준 재정의 + stale 추적 과잉억제 완화.
   [#1] `_collect_actionable_position_limit_codes()`를 추가해, `position_limit` 계산 시 단순 `_detected_stocks`/carry 전체가 아니라
