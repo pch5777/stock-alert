@@ -1,13 +1,27 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v57
+버전: v58
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v58 (2026-03-24): 상승이탈 후속 추적 + BOM 제거.
+  [#1] `_track_escape_aftermath()` 추가: 당일 상승이탈 종목의 장마감 시점 현재가를 조회해
+       "진입했더라면 얼마나 벌었을까"(escape_aftermath_pct)를 signal_log에 자동 기록.
+       run_daily_self_audit() KRX/NXT 양쪽에서 호출.
+  [#2] `_refine_pullback_ratio_from_escape()` 추가: 후속 추적 데이터 기반 entry_pullback_ratio 정밀 조정.
+       이탈 후 +10% 이상 계속 오른 비율이 60% 이상이면 진입가 완화,
+       이탈 후 되돌림 40% 이상이면 현재 설정 유지.
+  [#3] UTF-8 BOM(EF BB BF) 제거.
+  이유: 상승이탈 23건(일주일 로그)이 이후 얼마나 더 올랐는지 추적하지 않으면
+       entry_pullback_ratio 자동 완화가 "더 완화해야 하는지 / 이미 적절한지" 판단 불가.
+  개선점: 상승이탈 후속 데이터 축적↑, entry_pullback_ratio 정밀 조정↑, BOM 혼선 제거.
+  주의점: 후속 추적은 self-audit 시점(장마감)에 1회 실행. 장중에는 실행 안 됨.
+       정밀 조정은 최근 20건 기준, 5건 미만이면 조정하지 않음 (데이터 부족 방어).
 
 - v57 (2026-03-24): 포착 외부알림 행동단계 지연 + NXT 내부포착/감시 보존.
   [#1] `_should_delay_external_general_capture()` / `_persist_general_capture_without_external()` / `_has_pending_capture_watch()`를 추가해,
@@ -2289,6 +2303,14 @@ def run_daily_self_audit(stage: str = "krx") -> dict:
             _build_stale_replay_penalty_profile()
         except Exception:
             pass
+        # [v58] 상승이탈 후속 추적 — 이탈 종목의 이후 상승률 기록 + 진입가 비율 정밀 조정
+        try:
+            escape_changes = _track_escape_aftermath()
+            if escape_changes:
+                for ec in escape_changes[:5]:
+                    print(f"  {ec}")
+        except Exception as _esc_e:
+            print(f"⚠️ 이탈 후속 추적 호출 오류: {_esc_e}")
         return audit_data[audit_key]
     except Exception as e:
         _log_error(f"run_daily_self_audit({stage})", e)
@@ -13799,6 +13821,130 @@ def _record_entry_miss(watch: dict, reason: str, final_price: int):
         print(f"  📝 진입미달 기록: {watch['name']} {reason} (진입가 대비 {miss_away:+.1f}%)")
     except Exception as e:
         print(f"⚠️ 진입미달 기록 오류: {e}")
+
+
+# [v58] 상승이탈 후속 추적 — 이탈 종목이 이후 얼마나 더 올랐는지 기록
+def _track_escape_aftermath() -> list:
+    """
+    당일 상승이탈된 종목의 현재가를 조회해 '이탈 후 추가 상승률'을 signal_log에 기록.
+    run_daily_self_audit 시점에 호출 → entry_pullback_ratio 정밀 조정 데이터로 활용.
+    반환: 변경 요약 리스트
+    """
+    changes = []
+    try:
+        data = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+        if not isinstance(data, dict):
+            return changes
+        today = _now_kst().strftime("%Y%m%d")
+        updated = False
+
+        for log_key, rec in data.items():
+            if not isinstance(rec, dict):
+                continue
+            # 오늘 상승이탈된 종목만
+            if str(rec.get("status") or "") != "진입미달":
+                continue
+            if "상승이탈" not in str(rec.get("exit_reason") or ""):
+                continue
+            if str(rec.get("detect_date") or "")[:8] != today and str(rec.get("exit_date") or "")[:8] != today:
+                continue
+            # 이미 후속 추적 완료된 건은 건너뛰기
+            if rec.get("escape_aftermath_pct") is not None:
+                continue
+
+            code = normalize_stock_code(rec.get("code"))
+            if not code:
+                continue
+            entry = safe_int(rec.get("entry_price", 0), 0)
+            if not entry:
+                continue
+
+            # 현재가 조회
+            try:
+                cur = get_stock_price(code)
+                price = cur.get("price", 0)
+                if not price:
+                    nxt_cur = get_nxt_stock_price(code)
+                    price = nxt_cur.get("price", 0)
+                if not price:
+                    continue
+            except Exception:
+                continue
+
+            # 진입가 대비 현재가 상승률 = "진입했더라면 얼마나 벌었을까"
+            aftermath_pct = round((price - entry) / entry * 100, 2)
+            # 이탈 시점 가격 대비 추가 상승률
+            escape_price = safe_int(rec.get("entry_peak_away", 0), 0)
+            miss_away = float(rec.get("entry_miss_away", 0) or 0)
+
+            rec["escape_aftermath_pct"] = aftermath_pct
+            rec["escape_aftermath_price"] = price
+            rec["escape_aftermath_ts"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+            updated = True
+
+            name = rec.get("name", code)
+            changes.append(
+                f"📊 상승이탈 후속: {name} 진입가 {entry:,}원 → 현재 {price:,}원 ({aftermath_pct:+.1f}%)"
+            )
+
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+
+        # entry_pullback_ratio 정밀 조정 데이터로 활용
+        if changes:
+            _refine_pullback_ratio_from_escape(data)
+
+    except Exception as e:
+        print(f"⚠️ 상승이탈 후속 추적 오류: {e}")
+    return changes
+
+
+def _refine_pullback_ratio_from_escape(data: dict):
+    """
+    상승이탈 후속 추적 데이터 기반 entry_pullback_ratio 미세 조정.
+    이탈 후에도 계속 오른 종목이 많으면 → 진입가를 좀 더 현재가에 가깝게 (완화)
+    이탈 후 하락한 종목이 많으면 → 현재 진입가 설정이 적절 (유지)
+    """
+    try:
+        # 최근 20건의 상승이탈 후속 데이터
+        escape_recs = [
+            rec for rec in data.values()
+            if isinstance(rec, dict)
+            and rec.get("escape_aftermath_pct") is not None
+            and "상승이탈" in str(rec.get("exit_reason") or "")
+        ]
+        escape_recs.sort(key=lambda r: str(r.get("escape_aftermath_ts") or ""))
+        recent = escape_recs[-20:]
+        if len(recent) < 5:
+            return
+
+        # 이탈 후 +10% 이상 더 오른 종목 비율
+        still_rising = [r for r in recent if float(r.get("escape_aftermath_pct", 0) or 0) >= 10.0]
+        still_rising_pct = len(still_rising) / len(recent)
+
+        # 이탈 후 0% 이하(진입가 아래)로 내려간 종목 비율
+        came_back = [r for r in recent if float(r.get("escape_aftermath_pct", 0) or 0) <= 0]
+        came_back_pct = len(came_back) / len(recent)
+
+        avg_aftermath = sum(float(r.get("escape_aftermath_pct", 0) or 0) for r in recent) / len(recent)
+
+        cur_ratio = round(float(_dynamic.get('entry_pullback_ratio', ENTRY_PULLBACK_RATIO) or ENTRY_PULLBACK_RATIO), 2)
+
+        # 이탈 후 계속 오르는 비율이 60% 이상 + 평균 +15% 이상 → 완화 압력
+        if still_rising_pct >= 0.60 and avg_aftermath >= 15.0 and cur_ratio > ENTRY_PULLBACK_RATIO_MIN:
+            new_ratio = round(max(ENTRY_PULLBACK_RATIO_MIN, cur_ratio - 0.3), 2)
+            if new_ratio != cur_ratio:
+                _dynamic['entry_pullback_ratio'] = new_ratio
+                _save_dynamic_params()
+                print(f"  📊 이탈 후속 기반 진입가 완화: {cur_ratio:.2f}→{new_ratio:.2f} "
+                      f"(이탈 후 +10%↑ {len(still_rising)}/{len(recent)}, 평균 {avg_aftermath:+.1f}%)")
+
+        # 이탈 후 되돌아온 비율이 40% 이상 → 현재 설정 적절, 보수화 필요 없음
+        elif came_back_pct >= 0.40:
+            print(f"  📊 이탈 후속 분석: 이탈 후 되돌림 {len(came_back)}/{len(recent)} — 현재 비율 {cur_ratio:.2f} 유지")
+
+    except Exception as e:
+        print(f"⚠️ 이탈 후속 비율 조정 오류: {e}")
 
 
 def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None, log_key: str | None = None) -> None:
