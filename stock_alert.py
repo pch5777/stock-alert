@@ -3,11 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v58
+버전: v59
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v59 (2026-03-24): stale carry 활성보유 오판 차단 + carry 로드 정리 강화.
+  [#1] `_parse_compact_datetime()` / `_build_latest_tracking_by_code()` / `_is_active_carry_snapshot()` / `_sanitize_carry_snapshot_map()` 추가.
+       carry snapshot을 단순 dict 개수로 세지 않고, 고아·만료·stale 추적 여부까지 반영해 실제 활성 carry만 남기도록 정리.
+  [#2] `save_carry_stocks()` / `load_carry_stocks()`를 강화해, 시작 시 carry 파일을 signal_log 기준으로 먼저 정리하고
+       stale carry는 복원·재저장하지 않도록 수정. 정리된 항목은 carry 파일에 즉시 재기록.
+  [#3] `_get_carry_position_context()`를 `_detected_stocks` 우선 + carry sanitize fallback 구조로 바꿔
+       `36/1종목 보유 중`처럼 잔존 carry를 실제 보유로 오인해 정규장 포착이 전부 막히는 문제를 차단.
+  [#4] 출력 파일은 전부 plain UTF-8로 재생성해 BOM(EF BB BF) 재유입을 방지.
+  이유: 동시보유 제한은 유지해야 하지만 stale carry를 실제 보유로 잘못 세면 신규 리더가 전부 억제돼
+       정규장 포착 품질과 행동 가능 알림이 동시에 무너짐.
+  개선점: 활성 carry count 정확도↑, 정규장 포착 복구↑, stale carry 잔존 억제↑.
+  주의점: 실제 활성 추적중 종목은 여전히 동시보유 제한 대상이며, 이번 수정은 stale carry 오판만 제거한다.
 
 - v58 (2026-03-24): 상승이탈 후속 추적 + BOM 제거.
   [#1] `_track_escape_aftermath()` 추가: 당일 상승이탈 종목의 장마감 시점 현재가를 조회해
@@ -6206,6 +6219,98 @@ def _is_orphan_carry_snapshot(info: dict | None) -> bool:
     )
 
 
+def _parse_compact_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    value = str(value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _build_latest_tracking_by_code(data: dict | None = None) -> dict[str, dict]:
+    latest_by_code = {}
+    latest_key_by_code = {}
+    for rec in _iter_signal_log_records(data):
+        code = normalize_stock_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
+        if not code:
+            continue
+        key = f"{rec.get('detect_date', '')}{rec.get('detect_time', '')}{rec.get('status', '')}"
+        if key >= latest_key_by_code.get(code, ""):
+            latest_by_code[code] = rec
+            latest_key_by_code[code] = key
+    return latest_by_code
+
+
+def _is_active_carry_snapshot(info: dict | None, latest_rec: dict | None = None, today: str | None = None) -> bool:
+    if not isinstance(info, dict):
+        return False
+    if _is_orphan_carry_snapshot(info):
+        return False
+
+    carry_day = safe_int(info.get("carry_day", 0), 0)
+    if carry_day < 0 or carry_day >= MAX_CARRY_DAYS:
+        return False
+
+    detected_at = _parse_compact_datetime(info.get("detected_at"))
+    if detected_at is not None:
+        stale_days = max(MAX_CARRY_DAYS + 1, TRACK_MAX_DAYS)
+        if (datetime.now() - detected_at).days >= stale_days:
+            return False
+
+    if latest_rec is None:
+        return True
+    if not isinstance(latest_rec, dict):
+        return False
+    if latest_rec.get("status") != "추적중":
+        return False
+    if _is_orphan_tracking(latest_rec):
+        return False
+    if _is_tracking_display_expired(latest_rec, today):
+        return False
+    return True
+
+
+def _sanitize_carry_snapshot_map(raw_data, siglog_data: dict | None = None) -> tuple[dict, set[str]]:
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
+    today = datetime.now().strftime("%Y%m%d")
+    dropped_codes = set()
+    sanitized = {}
+
+    if isinstance(raw_data, dict):
+        items = list(raw_data.items())
+    elif isinstance(raw_data, list):
+        items = []
+        for item in raw_data:
+            if not isinstance(item, dict):
+                continue
+            code = normalize_stock_code(item.get("code") or item.get("stock_code") or item.get("종목코드"))
+            items.append((code, item))
+    else:
+        items = []
+
+    for raw_code, info in items:
+        if not isinstance(info, dict):
+            continue
+        code = normalize_stock_code(info.get("code") or raw_code)
+        if not code:
+            continue
+        latest_rec = latest_by_code.get(code)
+        if not _is_active_carry_snapshot(info, latest_rec=latest_rec, today=today):
+            dropped_codes.add(code)
+            continue
+        snap = dict(info)
+        snap["code"] = code
+        sanitized[code] = snap
+
+    return sanitized, dropped_codes
+
+
 def _should_skip_next_open_signal_record(rec: dict, today: str | None = None) -> bool:
     if not isinstance(rec, dict):
         return True
@@ -11702,15 +11807,28 @@ def check_reentry_watch():
 def save_carry_stocks():
     with _file_lock:  # v38.3-P0-5
         try:
-            with open(CARRY_FILE,"w") as f:
-                json.dump({code: {
-                    "name":info["name"],"high_price":info["high_price"],
-                    "entry_price":info["entry_price"],"stop_loss":info["stop_loss"],
-                    "target_price":info["target_price"],
-                    "detected_at":info["detected_at"].strftime("%Y%m%d%H%M%S"),
-                    "carry_day":info.get("carry_day",0),
-                } for code,info in _detected_stocks.items()
-                  if isinstance(info, dict) and not _is_orphan_carry_snapshot(info)}, f, ensure_ascii=False)
+            payload = {}
+            for raw_code, info in _detected_stocks.items():
+                if not isinstance(info, dict):
+                    continue
+                code = normalize_stock_code(raw_code or info.get("code"))
+                if not code:
+                    continue
+                snap = {
+                    "code": code,
+                    "name": info.get("name", code),
+                    "high_price": safe_int(info.get("high_price", 0), 0),
+                    "entry_price": safe_int(info.get("entry_price", 0), 0),
+                    "stop_loss": safe_int(info.get("stop_loss", 0), 0),
+                    "target_price": safe_int(info.get("target_price", 0), 0),
+                    "detected_at": info.get("detected_at").strftime("%Y%m%d%H%M%S") if isinstance(info.get("detected_at"), datetime) else str(info.get("detected_at", "") or ""),
+                    "carry_day": safe_int(info.get("carry_day", 0), 0),
+                }
+                if not _is_active_carry_snapshot(snap):
+                    continue
+                payload[code] = snap
+            with open(CARRY_FILE, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(payload, f, ensure_ascii=False)
         except Exception as e: print(f"⚠️ 이월 저장 실패: {e}")
 
 def load_carry_stocks():
@@ -11723,21 +11841,30 @@ def load_carry_stocks():
     except Exception as _oe:
         print(f"⚠️ 고아 추적 정리 오류: {_oe}")
 
-    # ① 이월 종목 복원
     try:
-        data = _read_json_locked(CARRY_FILE)
+        sig_data = _read_json_locked(SIGNAL_LOG_FILE)
+    except Exception:
+        sig_data = {}
+
+    # ① 이월 종목 복원 전 carry 파일 자체를 정리
+    try:
+        raw_carry = _read_json_locked(CARRY_FILE)
+        data, dropped_codes = _sanitize_carry_snapshot_map(raw_carry, siglog_data=sig_data)
+        if dropped_codes or not isinstance(raw_carry, dict) or len(data) != len(raw_carry):
+            _write_json_atomic(CARRY_FILE, data)
+        if dropped_codes:
+            print(f"  🧹 stale carry 정리: {len(dropped_codes)}개 제거")
+
         for code, info in data.items():
-            carry_day = info.get("carry_day",0)
-            if carry_day >= MAX_CARRY_DAYS:
-                continue
-            if isinstance(info, dict) and _is_orphan_carry_snapshot(info):
-                continue
+            detected_at = _parse_compact_datetime(info.get("detected_at")) or datetime.now()
             _detected_stocks[code] = {
-                "name":info["name"],"high_price":info["high_price"],
-                "entry_price":info["entry_price"],"stop_loss":info["stop_loss"],
-                "target_price":info["target_price"],
-                "detected_at":datetime.strptime(info["detected_at"],"%Y%m%d%H%M%S"),
-                "carry_day":carry_day,
+                "name": info.get("name", code),
+                "high_price": safe_int(info.get("high_price", 0), 0),
+                "entry_price": safe_int(info.get("entry_price", 0), 0),
+                "stop_loss": safe_int(info.get("stop_loss", 0), 0),
+                "target_price": safe_int(info.get("target_price", 0), 0),
+                "detected_at": detected_at,
+                "carry_day": safe_int(info.get("carry_day", 0), 0),
             }
         if _detected_stocks:
             print(f"📂 이월 종목 {len(_detected_stocks)}개 복원")
@@ -11746,11 +11873,10 @@ def load_carry_stocks():
 
     # ② signal_log에서 유효 추적 종목 복원 (이월 파일에 없는 당일 추적 종목)
     try:
-        sig_data = _read_json_locked(SIGNAL_LOG_FILE)
         today = datetime.now().strftime("%Y%m%d")
         restored = 0
         for rec in _get_valid_tracking(sig_data):
-            code = normalize_stock_code(rec.get("code",""))
+            code = normalize_stock_code(rec.get("code", ""))
             if (rec.get("detect_date") == today
                     and code
                     and code not in _detected_stocks):
@@ -11768,6 +11894,8 @@ def load_carry_stocks():
             print(f"  📋 signal_log에서 추적 중 종목 {restored}개 추가 복원")
     except Exception:
         pass
+
+    save_carry_stocks()
 
     # 복원 알림
     if _detected_stocks:
@@ -23515,22 +23643,40 @@ def check_earnings_risk(code: str, name: str) -> dict:
 # 🗂️ ⑤ 동시 신호 포트폴리오 관리
 # ============================================================
 def _get_carry_position_context() -> tuple[int, set[str]]:
-    carry = {}
     try:
-        carry = _read_json_safe(os.path.join(DATA_DIR, "carry_stocks.json"), {})
-        if isinstance(carry, list):
-            carry_count = len(carry)
-            carry_codes = {str(c.get("code", "")) for c in carry if isinstance(c, dict) and str(c.get("code", ""))}
-        elif isinstance(carry, dict):
-            carry_count = len([v for v in carry.values() if isinstance(v, dict)])
-            carry_codes = {str(v.get("code", k)) for k, v in carry.items() if isinstance(v, dict) and str(v.get("code", k))}
-        else:
-            carry_count = 0
-            carry_codes = set()
+        siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
     except Exception:
-        carry_count = 0
-        carry_codes = set()
-    return carry_count, carry_codes
+        siglog_data = {}
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
+    today = datetime.now().strftime("%Y%m%d")
+
+    carry_codes = set()
+    try:
+        with _state_lock:
+            detected_snapshot = dict(_detected_stocks)
+    except Exception:
+        detected_snapshot = dict(_detected_stocks)
+
+    for raw_code, info in detected_snapshot.items():
+        if not isinstance(info, dict):
+            continue
+        code = normalize_stock_code(raw_code or info.get("code"))
+        if not code:
+            continue
+        latest_rec = latest_by_code.get(code)
+        if _is_active_carry_snapshot(info, latest_rec=latest_rec, today=today):
+            carry_codes.add(code)
+
+    if carry_codes:
+        return len(carry_codes), carry_codes
+
+    try:
+        raw_carry = _read_json_safe(CARRY_FILE, {})
+        sanitized_carry, _ = _sanitize_carry_snapshot_map(raw_carry, siglog_data=siglog_data)
+        carry_codes = set(sanitized_carry.keys())
+        return len(carry_codes), carry_codes
+    except Exception:
+        return 0, set()
 
 
 def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[str], carry_count: int, max_positions: int, stage: str = "") -> list:
