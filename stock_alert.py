@@ -3,11 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v59
+버전: v60
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v60 (2026-03-24): 선행형 A후보 자동확장 + ENTRY_POINT A등급 복구.
+  [#1] `intraday_capture_mode.json`과 `_get_intraday_capture_mode()` / `_get_dynamic_general_a_relax_signal_types()` /
+       `_get_dynamic_relaxable_no_chase_signal_types()`를 추가해,
+       장중 상승 상위 리더 대비 포착률이 낮고 miss가 누적되면 `MID_PULLBACK` / `ENTRY_POINT`를 A완화·진입가 경과완화 대상에 자동 편입하도록 수정.
+  [#2] `_should_bypass_mid_pullback_downtrend_block()` / `_count_intraday_leader_follow_confirmations()`를 추가해,
+       선행형 후보가 직접뉴스·재상승·장중돌파·상대강도·거래량 회복 등 확증을 갖춘 경우에는
+       장중 자동확장 모드에서 과도한 주봉·일봉 동반 하락추세 차단을 제한적으로 우회하도록 보강.
+  [#3] `_finalize_mid_pullback_signal()` / `_get_mid_pullback_bucket_thresholds()`를 보강해,
+       자동확장 모드에서는 `MID_PULLBACK`의 패턴 A컷과 실행확증 요구치를 제한적으로 완화하고 이유를 `reasons`에 남기도록 수정.
+  [#4] `check_pullback_signals()`가 `ENTRY_POINT`에 `grade` / `execution_grade` / `pattern_grade`를 직접 부여하도록 고쳐,
+       진입구간 신호가 등급 누락 때문에 `A전용 외부알림`에서 기본 `C`로 눌리던 문제를 차단.
+  이유: 선행형 A후보를 찾는 구조로 바꾸려면 장중 miss 패턴을 프로그램이 스스로 감지해 A승격 경로를 자동으로 넓혀야 하고,
+       진입가 알림은 `ENTRY_POINT` 등급 누락 같은 핫패스 오류 없이 바로 행동 단계로 이어져야 함.
+  개선점: 장중 선행형 A후보 자동확장↑, 진입가 알림 복구↑, 과도한 하락추세 일괄차단 완화↑.
+  주의점: A전용 정책은 유지하며, 자동확장은 KRX 장중 miss가 누적된 경우에만 제한적으로 켜지고 일정 시간 뒤 자동 해제된다.
 
 - v59 (2026-03-24): stale carry 활성보유 오판 차단 + carry 로드 정리 강화.
   [#1] `_parse_compact_datetime()` / `_build_latest_tracking_by_code()` / `_is_active_carry_snapshot()` / `_sanitize_carry_snapshot_map()` 추가.
@@ -1060,6 +1076,7 @@ _PERSIST_FILES = [
     "overnight_snapshot_last.json",
     "geo_snapshot_last.json",
     "dart_intraday_state.json",
+    "intraday_capture_mode.json",
 ]
 
 LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
@@ -1104,6 +1121,17 @@ _adaptive_capture_feedback: dict = {"generated_date": "", "priority_codes": {}, 
 _stale_replay_penalty_profile: dict = {"generated_date": "", "code_penalty": {}, "theme_penalty": {}, "source_dates": [], "date_pressure": {}}
 _stale_shadow_intraday_cache: dict = {"ts": 0.0, "date": "", "codes": {}, "themes": {}}
 _theme_breadth_cache: dict = {}
+INTRADAY_CAPTURE_MODE_FILE = os.path.join(DATA_DIR, "intraday_capture_mode.json")
+INTRADAY_CAPTURE_REFRESH_SEC = int(os.getenv("INTRADAY_CAPTURE_REFRESH_SEC", "180") or "180")
+INTRADAY_CAPTURE_MIN_LEADERS = int(os.getenv("INTRADAY_CAPTURE_MIN_LEADERS", "4") or "4")
+INTRADAY_CAPTURE_MIN_CHANGE = float(os.getenv("INTRADAY_CAPTURE_MIN_CHANGE", "6.0") or "6.0")
+INTRADAY_CAPTURE_STRONG_CHANGE = float(os.getenv("INTRADAY_CAPTURE_STRONG_CHANGE", "12.0") or "12.0")
+INTRADAY_CAPTURE_MIN_VOLUME = float(os.getenv("INTRADAY_CAPTURE_MIN_VOLUME", "1.8") or "1.8")
+INTRADAY_CAPTURE_MISS_RATIO = float(os.getenv("INTRADAY_CAPTURE_MISS_RATIO", "0.6") or "0.6")
+INTRADAY_CAPTURE_ACTIVE_SEC = int(os.getenv("INTRADAY_CAPTURE_ACTIVE_SEC", "900") or "900")
+INTRADAY_CAPTURE_MAX_CHECK = int(os.getenv("INTRADAY_CAPTURE_MAX_CHECK", "12") or "12")
+INTRADAY_CAPTURE_RELAX_SCORE = int(os.getenv("INTRADAY_CAPTURE_RELAX_SCORE", "77") or "77")
+_intraday_capture_mode_cache: dict = {"ts": 0.0, "state": {}}
 
 
 def _normalize_for_hash(obj):
@@ -1167,6 +1195,189 @@ def _save_auto_tune_state(state: dict):
     if isinstance(state, dict):
         merged.update(state)
     _write_state_json(AUTO_TUNE_STATE_FILE, merged)
+
+
+def _default_intraday_capture_mode() -> dict:
+    return {
+        "date": "",
+        "mode": "normal",
+        "reason": "",
+        "leader_count": 0,
+        "strong_leader_count": 0,
+        "detected_count": 0,
+        "miss_count": 0,
+        "blocked_count": 0,
+        "theme_count": 0,
+        "active_until_ts": 0.0,
+        "last_eval_ts": 0.0,
+        "active_signal_types": [],
+    }
+
+
+def _save_intraday_capture_mode(state: dict):
+    merged = _default_intraday_capture_mode()
+    if isinstance(state, dict):
+        merged.update(state)
+    _write_state_json(INTRADAY_CAPTURE_MODE_FILE, merged)
+
+
+def _intraday_capture_mode_active(state: dict | None = None) -> bool:
+    st = state if isinstance(state, dict) else _get_intraday_capture_mode()
+    return bool(st.get("mode") == "leader_followup" and float(st.get("active_until_ts", 0.0) or 0.0) > time.time())
+
+
+def _evaluate_intraday_capture_mode() -> dict:
+    base = _default_intraday_capture_mode()
+    now_dt = _now_kst()
+    now_ts = time.time()
+    today = now_dt.strftime("%Y%m%d")
+    base["date"] = today
+    base["last_eval_ts"] = now_ts
+    if not is_market_open():
+        return base
+    try:
+        leaders = list(_rank_from_universe("KRX")[:max(4, INTRADAY_CAPTURE_MAX_CHECK)])
+    except Exception:
+        leaders = []
+    focus = []
+    seen = set()
+    for row in leaders:
+        if not isinstance(row, dict):
+            continue
+        code = normalize_stock_code(row.get("code"))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        chg = safe_float(row.get("change_rate", 0.0), 0.0)
+        vr = safe_float(row.get("volume_ratio", 0.0), 0.0)
+        if chg >= INTRADAY_CAPTURE_STRONG_CHANGE or (chg >= INTRADAY_CAPTURE_MIN_CHANGE and vr >= INTRADAY_CAPTURE_MIN_VOLUME):
+            focus.append(row)
+    base["leader_count"] = len(focus)
+    if len(focus) < INTRADAY_CAPTURE_MIN_LEADERS:
+        base["reason"] = "장중 강세 리더 부족"
+        return base
+
+    signal_log = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+    signal_log = signal_log if isinstance(signal_log, dict) else {}
+    detected_codes = set()
+    for rec in signal_log.values():
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("detect_date") or "") != today:
+            continue
+        code = normalize_stock_code(rec.get("code"))
+        if code:
+            detected_codes.add(code)
+    try:
+        for code in list((_detected_stocks or {}).keys()):
+            n = normalize_stock_code(code)
+            if n:
+                detected_codes.add(n)
+    except Exception:
+        pass
+    try:
+        for watch in list((_entry_watch or {}).values()):
+            if not isinstance(watch, dict):
+                continue
+            n = normalize_stock_code(watch.get("code"))
+            if n:
+                detected_codes.add(n)
+    except Exception:
+        pass
+
+    suppressed = _iter_today_records(SUPPRESSED_LOG_FILE, today)
+    shadow = _iter_today_records(SHADOW_CAPTURE_FILE, today)
+    blocked_codes = set()
+    reason_rows = {}
+    for rec in list(suppressed) + list(shadow):
+        if not isinstance(rec, dict):
+            continue
+        code = normalize_stock_code(rec.get("code"))
+        if not code:
+            continue
+        blocked_codes.add(code)
+        reason_rows.setdefault(code, []).append(str(rec.get("reason", "") or ""))
+
+    theme_keys = set()
+    strong_count = 0
+    miss_count = 0
+    blocked_count = 0
+    for row in focus:
+        code = normalize_stock_code(row.get("code"))
+        chg = safe_float(row.get("change_rate", 0.0), 0.0)
+        if chg >= INTRADAY_CAPTURE_STRONG_CHANGE:
+            strong_count += 1
+        theme = str(row.get("theme") or row.get("sector") or "").strip()
+        if theme:
+            theme_keys.add(theme)
+        if code not in detected_codes:
+            miss_count += 1
+            if code in blocked_codes:
+                blocked_count += 1
+    base["strong_leader_count"] = strong_count
+    base["detected_count"] = len(focus) - miss_count
+    base["miss_count"] = miss_count
+    base["blocked_count"] = blocked_count
+    base["theme_count"] = len(theme_keys)
+    miss_ratio = miss_count / max(1, len(focus))
+    if miss_ratio >= INTRADAY_CAPTURE_MISS_RATIO and (blocked_count >= 2 or strong_count >= 2 or len(theme_keys) >= 2):
+        base["mode"] = "leader_followup"
+        base["active_until_ts"] = now_ts + INTRADAY_CAPTURE_ACTIVE_SEC
+        base["active_signal_types"] = ["MID_PULLBACK", "ENTRY_POINT"]
+        base["reason"] = (
+            f"장중 리더 miss 자동확장({len(focus)}개 중 {miss_count}개 miss, 차단 {blocked_count}개, "
+            f"강한리더 {strong_count}개, 테마 {len(theme_keys)}개)"
+        )
+    else:
+        base["reason"] = (
+            f"장중 리더 추적 정상({len(focus)}개 중 포착 {len(focus) - miss_count}개 / miss {miss_count}개)"
+        )
+    return base
+
+
+def _get_intraday_capture_mode(force: bool = False) -> dict:
+    global _intraday_capture_mode_cache
+    now_ts = time.time()
+    cache = _intraday_capture_mode_cache if isinstance(_intraday_capture_mode_cache, dict) else {"ts": 0.0, "state": {}}
+    cached_state = cache.get("state") if isinstance(cache.get("state"), dict) else {}
+    if not force and cached_state and (now_ts - float(cache.get("ts", 0.0) or 0.0)) < INTRADAY_CAPTURE_REFRESH_SEC:
+        return cached_state
+
+    state = _read_state_json(INTRADAY_CAPTURE_MODE_FILE, _default_intraday_capture_mode())
+    base = _default_intraday_capture_mode()
+    if isinstance(state, dict):
+        base.update(state)
+    today = _now_kst().strftime("%Y%m%d")
+    if not force and base.get("date") == today and _intraday_capture_mode_active(base):
+        _intraday_capture_mode_cache = {"ts": now_ts, "state": base}
+        return base
+
+    evaluated = _evaluate_intraday_capture_mode()
+    if _intraday_capture_mode_active(base) and base.get("date") == today and not force:
+        evaluated["mode"] = base.get("mode", evaluated.get("mode", "normal"))
+        evaluated["reason"] = base.get("reason") or evaluated.get("reason", "")
+        evaluated["active_until_ts"] = max(float(base.get("active_until_ts", 0.0) or 0.0), float(evaluated.get("active_until_ts", 0.0) or 0.0))
+        evaluated["active_signal_types"] = list(base.get("active_signal_types") or evaluated.get("active_signal_types") or [])
+    _save_intraday_capture_mode(evaluated)
+    _intraday_capture_mode_cache = {"ts": now_ts, "state": evaluated}
+    return evaluated
+
+
+def _get_dynamic_general_a_relax_signal_types() -> set[str]:
+    sigs = set(GENERAL_A_RELAX_SIGNAL_TYPES)
+    st = _get_intraday_capture_mode()
+    if _intraday_capture_mode_active(st):
+        sigs.update({"MID_PULLBACK", "ENTRY_POINT"})
+    return sigs
+
+
+def _get_dynamic_relaxable_no_chase_signal_types() -> set[str]:
+    sigs = set(RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES)
+    st = _get_intraday_capture_mode()
+    if _intraday_capture_mode_active(st):
+        sigs.update({"MID_PULLBACK", "ENTRY_POINT"})
+    return sigs
+
 
 def _clear_emergency_tune_state(reason: str = ""):
     st = _get_auto_tune_state()
@@ -4189,9 +4400,10 @@ MID_PULLBACK_BUCKET_A_GUIDE = {
     "intraday_reclaim": "장중 재개 + 거래량/섹터/수급 포함 4개 이상 확증",
 }
 
-def _mid_pullback_grade_from_score(score: int) -> str:
+def _mid_pullback_grade_from_score(score: int, a_cut: int = 80) -> str:
     s = int(score or 0)
-    if s >= 80:
+    a_cut = max(70, int(a_cut or 80))
+    if s >= a_cut:
         return "A"
     if s >= 60:
         return "B"
@@ -4278,6 +4490,10 @@ def _get_mid_pullback_bucket_thresholds(bucket: str) -> tuple[int, int]:
     b_map = _safe_nested_dict(_dynamic, "mid_pullback_bucket_b_confirm_min", base_b)
     a_min = int(a_map.get(bucket, base_a.get(bucket, 3)) or base_a.get(bucket, 3))
     b_min = int(b_map.get(bucket, base_b.get(bucket, 1)) or base_b.get(bucket, 1))
+    st = _get_intraday_capture_mode()
+    if _intraday_capture_mode_active(st) and bucket in {"daily_trend", "gap_first_pullback", "intraday_reclaim"}:
+        a_min = max(1, a_min - 1)
+        b_min = max(0, b_min - 1)
     return max(1, a_min), max(0, b_min)
 
 
@@ -4396,7 +4612,21 @@ def _finalize_mid_pullback_signal(result: dict) -> dict:
     result.update(ctx)
     pattern_score = int(result.get("pattern_score_base", result.get("score", 0)) or 0)
     result["pattern_score_base"] = pattern_score
-    result["pattern_grade"] = _mid_pullback_grade_from_score(pattern_score)
+    a_cut = 80
+    if _should_relax_general_a_threshold(
+        "MID_PULLBACK",
+        pattern_score,
+        change_rate=float(result.get("change_rate", 0.0) or 0.0),
+        vol_ratio=float(result.get("volume_ratio", 0.0) or 0.0),
+        sector_info=result.get("sector_info") if isinstance(result.get("sector_info"), dict) else {},
+        direct_news_hit=bool(result.get("direct_news_hit")),
+        market=str(result.get("market", "") or ""),
+        reasons=list(result.get("reasons") or []),
+    ):
+        a_cut = min(a_cut, INTRADAY_CAPTURE_RELAX_SCORE)
+        result.setdefault("reasons", []).append(f"🏷 선행형 A게이트 자동확장 (80→{a_cut})")
+    result["mid_pullback_a_cut"] = a_cut
+    result["pattern_grade"] = _mid_pullback_grade_from_score(pattern_score, a_cut=a_cut)
     return _apply_mid_pullback_execution_grade(result)
 
 
@@ -4614,7 +4844,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     entry = today_close
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type="MID_PULLBACK")
 
-    _mid_tf_block = _should_block_multi_tf_downtrend_capture(code, "MID_PULLBACK")
+    _mid_tf_block = _should_block_multi_tf_downtrend_capture(code, "MID_PULLBACK", signal_meta={"score": score, "change_rate": today_chg, "vol_ratio": round(today_vol / avg_surge_vol, 1) if avg_surge_vol else 0, "sector_info": sector_info, "direct_news_hit": False, "resurge_mode": False, "is_intraday": False, "rs": rs, "vol_zscore": z, "vol_recovered": vol_recovered, "is_bullish": is_bullish, "turnaround_confirmed": bool(sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"))})
     if _mid_tf_block.get("block"):
         _ctx = _mid_tf_block.get("context", {}) or {}
         _log_suppressed_alert(
@@ -10328,7 +10558,7 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
     if next_entry < prev_entry:
         return next_entry, "하향갱신"
     if next_entry > prev_entry and sig_type in NO_CHASE_ENTRY_SIGNAL_TYPES:
-        if sig_type in RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES:
+        if sig_type in _get_dynamic_relaxable_no_chase_signal_types():
             try:
                 if detect_date:
                     elapsed = (datetime.strptime(datetime.now().strftime("%Y%m%d"), "%Y%m%d") -
@@ -13181,13 +13411,70 @@ def _get_multi_tf_downtrend_context(code: str) -> dict:
     return out
 
 
-def _should_block_multi_tf_downtrend_capture(code: str, signal_type: str) -> dict:
+def _count_intraday_leader_follow_confirmations(signal_meta: dict | None = None) -> int:
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    hits = 0
+    if bool(meta.get("direct_news_hit")):
+        hits += 1
+    if bool(meta.get("resurge_mode")):
+        hits += 1
+    if bool(meta.get("is_intraday")):
+        hits += 1
+    if safe_float(meta.get("vol_ratio", 0.0), 0.0) >= 2.0:
+        hits += 1
+    if safe_float(meta.get("rs", 0.0), 0.0) >= RS_MIN:
+        hits += 1
+    if safe_float(meta.get("vol_zscore", 0.0), 0.0) >= VOL_ZSCORE_MIN:
+        hits += 1
+    if bool(meta.get("vol_recovered")):
+        hits += 1
+    if bool(meta.get("is_bullish")):
+        hits += 1
+    if bool(meta.get("turnaround_confirmed")):
+        hits += 1
+    sector_info = meta.get("sector_info") if isinstance(meta.get("sector_info"), dict) else {}
+    if int(sector_info.get("bonus", 0) or 0) >= 3:
+        hits += 1
+    return hits
+
+
+def _should_bypass_mid_pullback_downtrend_block(signal_type: str, signal_meta: dict | None = None, ctx: dict | None = None) -> bool:
+    sig = str(signal_type or "").upper()
+    if sig not in {"MID_PULLBACK", "ENTRY_POINT"}:
+        return False
+    st = _get_intraday_capture_mode()
+    if not _intraday_capture_mode_active(st):
+        return False
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    ctx = ctx if isinstance(ctx, dict) else {}
+    score = safe_int(meta.get("score", 0), 0)
+    change_rate = safe_float(meta.get("change_rate", 0.0), 0.0)
+    daily_ret20 = safe_float(ctx.get("daily_ret20", 0.0), 0.0)
+    weekly_ret8 = safe_float(ctx.get("weekly_ret8", 0.0), 0.0)
+    total_flags = safe_int(ctx.get("daily_flags", 0), 0) + safe_int(ctx.get("weekly_flags", 0), 0)
+    confirms = _count_intraday_leader_follow_confirmations(meta)
+    if score < INTRADAY_CAPTURE_RELAX_SCORE:
+        return False
+    if change_rate < 3.0:
+        return False
+    if confirms < 2:
+        return False
+    if daily_ret20 <= -28.0 or weekly_ret8 <= -35.0:
+        return False
+    if total_flags >= 6:
+        return False
+    return True
+
+
+def _should_block_multi_tf_downtrend_capture(code: str, signal_type: str, signal_meta: dict | None = None) -> dict:
     block_types = {"UPPER_LIMIT", "NEAR_UPPER", "SURGE", "EARLY_DETECT", "STRONG_BUY", "MID_PULLBACK", "ENTRY_POINT"}
     ctx = _get_multi_tf_downtrend_context(code)
     if signal_type not in block_types:
         return {"block": False, "context": ctx, "reason": ""}
     if not ctx.get("is_multi_tf_downtrend"):
         return {"block": False, "context": ctx, "reason": ""}
+    if _should_bypass_mid_pullback_downtrend_block(signal_type, signal_meta=signal_meta, ctx=ctx):
+        return {"block": False, "context": ctx, "reason": "", "override": "leader_followup"}
     reason = (
         f"주봉·일봉 동반 하락 추세 차단 "
         f"(20일 {ctx.get('daily_ret20', 0):+.1f}% / 8주 {ctx.get('weekly_ret8', 0):+.1f}% / "
@@ -16363,7 +16650,7 @@ def analyze(stock: dict) -> dict:
     except Exception as _e:
         _log_error(f"detect_force({code})", _e)
 
-    _multi_tf_block = _should_block_multi_tf_downtrend_capture(code, signal_type)
+    _multi_tf_block = _should_block_multi_tf_downtrend_capture(code, signal_type, signal_meta={"score": score, "change_rate": change_rate, "vol_ratio": vol_ratio, "sector_info": sector_info, "direct_news_hit": direct_news_hit, "market": stock.get("market", ""), "reasons": reasons})
     if _multi_tf_block.get("block"):
         _ctx = _multi_tf_block.get("context", {}) or {}
         _log_suppressed_alert(
@@ -16861,7 +17148,7 @@ def check_pullback_signals() -> list:
                 entry_score, entry_reasons, similar_pattern_stats = _apply_similar_pattern_score(
                     entry_score, entry_reasons, code, "ENTRY_POINT", cur.get("change_rate",0), 0, weight_mode="confirm"
                 )
-                _entry_tf_block = _should_block_multi_tf_downtrend_capture(code, "ENTRY_POINT")
+                _entry_tf_block = _should_block_multi_tf_downtrend_capture(code, "ENTRY_POINT", signal_meta={"score": entry_score, "change_rate": cur.get("change_rate", 0), "vol_ratio": cur.get("volume_ratio", 0), "reasons": entry_reasons})
                 if _entry_tf_block.get("block"):
                     _ctx = _entry_tf_block.get("context", {}) or {}
                     _log_suppressed_alert(
@@ -16879,9 +17166,20 @@ def check_pullback_signals() -> list:
                     )
                     continue
 
+                entry_grade = _derive_general_signal_grade(
+                    "ENTRY_POINT",
+                    entry_score,
+                    change_rate=cur.get("change_rate", 0),
+                    vol_ratio=cur.get("volume_ratio", 0),
+                    sector_info=info.get("sector_info") if isinstance(info.get("sector_info"), dict) else {},
+                    direct_news_hit=bool(info.get("direct_news_hit")),
+                    market=cur.get("market", ""),
+                    reasons=entry_reasons,
+                )
                 signals.append({"code":code,"name":cur.get("name",code),"price":price,
-                                 "change_rate":cur.get("change_rate",0),"volume_ratio":0,
+                                 "change_rate":cur.get("change_rate",0),"volume_ratio":cur.get("volume_ratio",0),
                                  "signal_type":"ENTRY_POINT","score":entry_score,
+                                 "grade":entry_grade,"execution_grade":entry_grade,"pattern_grade":entry_grade,
                                  "similar_pattern_stats":similar_pattern_stats,
                                  "entry_price":entry,"stop_loss":stop,"target_price":target,
                                  "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
@@ -17703,7 +18001,8 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
                                      direct_news_hit: bool = False, nxt_delta: int = 0,
                                      market: str = "", reasons: list | None = None) -> bool:
     sig_type = str(signal_type or "").upper()
-    if sig_type not in GENERAL_A_RELAX_SIGNAL_TYPES:
+    dynamic_relax_types = _get_dynamic_general_a_relax_signal_types()
+    if sig_type not in dynamic_relax_types:
         return False
     try:
         strong_price = float(change_rate or 0.0) >= 7.0
@@ -17718,7 +18017,18 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     joined_reasons = " ".join(str(r or "") for r in (reasons or []))
     direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     market_flag = str(market or "").upper() == "NXT"
-    return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
+    if sig_type in GENERAL_A_RELAX_SIGNAL_TYPES:
+        return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
+
+    st = _get_intraday_capture_mode()
+    if not _intraday_capture_mode_active(st):
+        return False
+    proactive_support = any(token in joined_reasons for token in ("코스피 상대강도", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "장중 돌파", "장중돌파", "재상승", "거래량 이상 급증", "거래량3배", "당일양봉"))
+    try:
+        soft_price = float(change_rate or 0.0) >= 2.5
+    except Exception:
+        soft_price = False
+    return int(score or 0) >= INTRADAY_CAPTURE_RELAX_SCORE and soft_price and (direct_like or meaningful_theme or strong_flow or proactive_support)
 
 
 def _derive_general_signal_grade(signal_type: str, score: int, change_rate: float = 0.0,
