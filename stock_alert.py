@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v64
+버전: v65
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v65 (2026-03-24): 동시보유 제한 actionable 기준 재정의 — entry_hit 기반 실보유만 카운트.
+  [#1] `_collect_actionable_position_limit_codes()`를 재작성.
+       기존: _entry_watch의 active/watching/pending 전체 + _detected_stocks 오늘/직전 → 23~24개 카운트.
+       수정: entry_hit(진입가 도달 확정) 또는 confirmed(체결 확정)된 종목만 "보유"로 카운트.
+       만료된 entry_watch(expire_ts 경과)는 즉시 제외.
+       아직 진입가에 도달하지 않은 "대기 중" 감시는 보유가 아니므로 제외.
+  [#2] carry_stocks.json 기반 fallback도 signal_log entry_hit 확인 후에만 카운트.
+  이유: max_positions=1인데 stale entry_watch 23~24개가 "보유"로 오판되어
+       모든 신규 포착이 position_limit에 걸려 진입가 도달 0건 발생.
+       포착 13건(A등급) + 감시등록 12건은 정상인데 filter_portfolio_signals에서 전부 억제.
+  개선점: 실제 보유(entry_hit) 기준 position_limit↑, 신규 리더 진입 기회↑, stale 오판↓.
+  주의점: 진입가 대기 중인 종목은 보유로 카운트하지 않음.
+       실투자 시 실제 체결된 종목만 제한에 반영되어야 하므로 이 방향이 올바름.
 
 - v64 (2026-03-24): watch→reach 회복 + 근접 진입가 도달 자동완화 + v63 실반영 보정.
   [#1] `CAPTURE_FUNNEL_FILE` / `_record_capture_funnel_event()` / `_get_capture_funnel_summary()` / `_get_capture_watch_recovery_state()`를 실제 코드에 추가해,
@@ -6607,7 +6621,9 @@ def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, to
     """
     actionable_codes: set[str] = set()
     today = str(today or datetime.now().strftime("%Y%m%d"))
+    now_ts = time.time()
 
+    # [v65] entry_watch 중 만료 안 된 + entry_hit 또는 도달 가능한 것만 카운트
     try:
         for watch in list((_entry_watch or {}).values()):
             if not isinstance(watch, dict):
@@ -6615,54 +6631,46 @@ def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, to
             state = str(watch.get("entry_watch_state", "active") or "active").lower()
             if state not in ("active", "watching", "pending"):
                 continue
-            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
-            if code:
-                actionable_codes.add(code)
+            # 만료된 감시는 제외
+            expire_ts = float(watch.get("expire_ts", 0) or 0)
+            if expire_ts and now_ts >= expire_ts:
+                continue
+            # entry_hit 된 것(진입가 도달)만 실제 보유로 카운트
+            # 아직 도달 안 된 건 "대기 중"이지 "보유 중"이 아님
+            if watch.get("entry_hit") or watch.get("entry_hit_locked"):
+                code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+                if code:
+                    actionable_codes.add(code)
     except Exception:
         pass
 
+    # execution_setup_watch도 진입 확정된 것만
     try:
         for watch in list((_execution_setup_watch or {}).values()):
             if not isinstance(watch, dict):
                 continue
-            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
-            if code:
-                actionable_codes.add(code)
+            # 체결 확정된 것만 보유로 카운트
+            if watch.get("confirmed") or watch.get("entry_hit"):
+                code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+                if code:
+                    actionable_codes.add(code)
     except Exception:
         pass
 
+    # signal_log에서 실제 "추적중" + entry_hit 완료된 것만 (대기 중인 건 제외)
     latest_by_code = _build_latest_tracking_by_code(siglog_data)
     try:
-        with _state_lock:
-            detected_snapshot = dict(_detected_stocks)
+        carry_raw = _read_json_safe(CARRY_FILE, {})
+        if isinstance(carry_raw, dict):
+            for raw_code in carry_raw:
+                code = normalize_stock_code(raw_code)
+                if code:
+                    rec = latest_by_code.get(code)
+                    if isinstance(rec, dict) and rec.get("status") in TRACK_ACTIVE_STATUSES:
+                        if rec.get("entry_hit") and not _is_orphan_tracking(rec):
+                            actionable_codes.add(code)
     except Exception:
-        detected_snapshot = dict(_detected_stocks)
-
-    for raw_code, info in detected_snapshot.items():
-        if not isinstance(info, dict):
-            continue
-        code = normalize_stock_code(raw_code or info.get("code"))
-        if not code:
-            continue
-        latest_rec = latest_by_code.get(code)
-        if not isinstance(latest_rec, dict):
-            continue
-        if latest_rec.get("status") not in TRACK_ACTIVE_STATUSES:
-            continue
-        if _is_orphan_tracking(latest_rec):
-            continue
-        if _is_tracking_display_expired(latest_rec, today):
-            continue
-        if normalize_stock_code(latest_rec.get("code")) != code:
-            continue
-
-        # entry_watch / execution_setup_watch가 아직 비어 있어도,
-        # 오늘 또는 직전 영업일의 실제 행동 후보만 position_limit에 반영.
-        rec_day = str(latest_rec.get("detect_date", "") or "")
-        elapsed_days = _get_tracking_elapsed_days(latest_rec, today)
-        if rec_day == today or elapsed_days <= 1:
-            if safe_int(latest_rec.get("entry_price", 0), 0) > 0 or bool(latest_rec.get("execution_setup_required")):
-                actionable_codes.add(code)
+        pass
 
     return actionable_codes
 
