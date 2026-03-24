@@ -3,11 +3,66 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v60
+버전: v64
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v64 (2026-03-24): watch→reach 회복 + 근접 진입가 도달 자동완화 + v63 실반영 보정.
+  [#1] `CAPTURE_FUNNEL_FILE` / `_record_capture_funnel_event()` / `_get_capture_funnel_summary()` / `_get_capture_watch_recovery_state()`를 실제 코드에 추가해,
+       `saved -> watch -> reached` 전환율을 일자별로 집계하고 같은 날 `saved`/`watch`는 충분한데 `reached`가 0건이면 recovery 모드가 자동으로 켜지도록 수정.
+  [#2] `_get_dynamic_entry_reach_slack_pct()`와 `check_entry_watch()`를 보강해,
+       recovery 모드의 strong/A 후보는 진입가 상단 최대 1.2% 이내를 `근접 진입가 도달`로 인정하고 메시지에 `회복모드 근접도달 허용` 문구를 남기도록 수정.
+  [#3] `_select_representative_entry_price()`를 보강해, recovery 모드에서는 고점추격방지 신호라도 `경과 1일` / `미도달 1회` / `괴리 6%` 이상이면 대표 진입가 상향 갱신을 조기 허용하도록 완화.
+  [#4] `_should_keep_internal_watch_on_no_ask_liquidity()` / `_persist_blocked_capture_watch()`를 추가하고
+       일반 포착/눌림목의 `no_ask_liquidity` 차단 경로에 연결해, 외부 체결 차단이어도 선행형/near-A 후보는 내부 `signal_log` / `entry_watch`를 유지하도록 실제 반영.
+  이유: 최신 로그상 종목 포착과 `진입가 감시 등록`은 회복됐지만 `진입가 도달`이 0건이었고, v63 변경 이력에 적힌 일부 복구 경로가 실파일에는 실제 함수로 반영되지 않은 구간이 있었음.
+  개선점: `watch→reach` 회복↑, strong/A 후보 근접도달 포착↑, 대표 진입가 갱신 지연↓, `no_ask_liquidity` 후보 내부감시 지속↑.
+  주의점: A전용 외부알림 정책은 유지하며, recovery 모드 완화는 같은 날 `saved/watch`가 충분하고 `reached`가 무너진 경우에만 제한 발동한다.
+
+- v63 (2026-03-24): saved→watch 전환 회복 + no_ask_liquidity 내부감시 유지 + actionable position_limit 실반영.
+  [#1] `_collect_actionable_position_limit_codes()` / `_get_capture_watch_recovery_state()`를 추가해,
+       `position_limit`가 `_detected_stocks` 전체가 아니라 `entry_watch` / `execution_setup_watch` / 최근 active signal_log 중심으로 계산되도록 수정하고,
+       같은 날 `saved→watch` 전환율이 급락하면 자동 recovery 모드가 켜지도록 보강.
+  [#2] `_persist_blocked_capture_watch()` / `_should_keep_internal_watch_on_no_ask_liquidity()` / `_promote_internal_capture_watch()`를 연결해,
+       `no_ask_liquidity`나 A전용 외부억제로 외부 알림이 막혀도 선행형/near-A 후보는 내부 `signal_log` / `entry_watch` / `execution_setup_watch` 경로를 유지하도록 수정.
+  [#3] `save_signal_log()` / `register_entry_watch()` / `check_entry_watch()`에 capture funnel 기록을 연결해
+       저장→감시→도달 전환율을 자동 집계하고, watch 비율이 무너지면 shadow 로그와 함께 회복 모드가 발동되도록 추가.
+  [#4] v62의 `analyze_mid_pullback()` `sector_info` / `sentiment` 초기화와 `sector_info` payload 반환을 그대로 유지해,
+       saved→watch 복구 수정 과정에서 눌림목 `NameError` 복구가 다시 빠지는 회귀를 차단.
+  이유: 최근 로그상 진입가 알림 0건의 핵심은 raw 포착 0건보다 `saved→watch` 전환 붕괴, `no_ask_liquidity` 조기차단,
+       그리고 `position_limit`가 실제 행동 가능한 감시보다 넓게 계산돼 신규 후보를 먼저 죽이는 구조였음.
+  개선점: saved→watch 전환율↑, no_ask_liquidity 후보 내부감시 유지↑, actionable 동시보유 제한 정확도↑, 눌림목 회귀 오류 방지↑.
+  주의점: A전용 외부알림은 유지하며, 자동 recovery는 최근 저장 건수가 충분히 쌓였을 때만 제한 발동한다.
+
+- v62 (2026-03-24): 동시보유 제한 actionable 기준 재정의 + stale 추적 과잉억제 완화.
+  [#1] `_collect_actionable_position_limit_codes()`를 추가해, `position_limit` 계산 시 단순 `_detected_stocks`/carry 전체가 아니라
+       실제 `entry_watch` / `execution_setup_watch` / 최근 active signal_log로 이어진 행동 가능한 코드만 우선 집계하도록 수정.
+  [#2] `_get_carry_position_context()`를 위 actionable 코드 우선 구조로 바꿔, 재시작 후 `signal_log`/carry에 남은 다수의 추적중 종목 때문에
+       `19/1종목 보유 중`처럼 신규 후보가 전부 억제되는 문제를 완화.
+  [#3] entry_watch가 아직 비어 있어도 오늘/직전 영업일의 실제 행동 후보(`entry_price>0` 또는 `execution_setup_required`)만 제한적으로 반영하도록 보강.
+  이유: 최근 로그상 진입가 알림 0건의 직접 병목은 `MID_PULLBACK` 예외보다도, stale/비행동성 추적 잔존이 동시보유 제한을 과하게 점유해
+       선행형 A후보와 신규 리더가 position_limit에서 먼저 잘리는 구조였음.
+  개선점: 동시보유 제한의 stale 억제↓, 신규 리더 포착 경로↑, 진입가 알림 연결 가능성↑.
+  주의점: 동시보유 제한 자체는 유지하며, 실제 행동 가능한 감시(entry_watch/execution_setup/recent active signal)만 점유로 간주한다.
+
+- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 눌림목 NameError 복구.
+  [#1] `_has_recent_actionable_tracking_state()` / `_should_promote_internal_capture_watch()` / `_promote_internal_capture_watch()`를 추가해,
+       외부 A전용 억제로 바로 안 나가더라도 테마/직접뉴스/체결속도/장중 miss 확증이 붙은 near-A 후보는 자동으로 `signal_log` / `entry_watch` /
+       `execution_setup_watch`에 내부 승격되도록 수정.
+  [#2] `_dispatch_general_alert_signal()` / `run_mid_pullback_scan()`의 외부억제 경로에 위 내부승격을 연결해,
+       섹터 seed 단계에서 보인 종목이 A 직전 단계에서 그냥 사라지지 않고 진입가 감시까지 이어지도록 보강.
+  [#3] `_build_market_leading_sector_payload()`에 actionable tracking gate를 추가해,
+       `entry_watch` / `execution_setup_watch` / 최근 `signal_log`로 연결된 종목이 한 개도 없는 테마는 사용자용 `[시장 주도 섹터]` 메시지에서 제외하고,
+       노출되는 leader/follower도 행동 경로에 걸린 종목 중심으로 재구성하도록 수정.
+  [#4] `analyze_mid_pullback()` 시작부에 `sector_info = {}` / `sentiment = {}` 기본값을 먼저 선언하고,
+       `MID_PULLBACK` downtrend gate의 `signal_meta`와 반환 payload에 `sector_info`를 일관되게 싣도록 정리해,
+       반복 발생한 `⚠️ 눌림목 오류 (...): name 'sector_info' is not defined`를 제거.
+  이유: 섹터는 종목 포착 후 강화를 위한 보조 근거여야 하는데 기존 v60까지는 섹터 seed/요약 레이어가 종목 행동 경로보다 먼저 발화할 수 있었고,
+       v61 작업 중에는 `analyze_mid_pullback()` 지역 변수 초기화 순서까지 어긋나 눌림목 스캔 예외 탈락이 추가로 발생했음.
+  개선점: 종목 raw 포착→내부감시→A승격→섹터 강화 순서 일관성↑, near-A 후보의 진입가 감시 연결↑, 눌림목 예외 탈락↓.
+  주의점: 외부 A전용 정책은 유지하며, 내부 자동승격은 테마/체결/장중 miss 확증이 충분한 후보에만 제한적으로 적용된다.
 
 - v60 (2026-03-24): 선행형 A후보 자동확장 + ENTRY_POINT A등급 복구.
   [#1] `intraday_capture_mode.json`과 `_get_intraday_capture_mode()` / `_get_dynamic_general_a_relax_signal_types()` /
@@ -1377,76 +1432,6 @@ def _get_dynamic_relaxable_no_chase_signal_types() -> set[str]:
     if _intraday_capture_mode_active(st):
         sigs.update({"MID_PULLBACK", "ENTRY_POINT"})
     return sigs
-
-
-def _get_capture_watch_recovery_state() -> dict:
-    now = datetime.now()
-    today = now.strftime("%Y%m%d")
-    saved_today = 0
-    reached_today = 0
-    try:
-        data = _read_json_safe(SIGNAL_LOG_FILE, {})
-    except Exception:
-        data = {}
-    for rec in (data or {}).values():
-        if not isinstance(rec, dict):
-            continue
-        detect_date = str(rec.get("last_detect_date", rec.get("detect_date", "")) or "")
-        if detect_date != today:
-            continue
-        if normalize_stock_code(rec.get("code")):
-            saved_today += 1
-        hit_date = str(rec.get("entry_hit_date", "") or "").replace("-", "")
-        if rec.get("entry_hit") and hit_date == today:
-            reached_today += 1
-    active_watch = 0
-    try:
-        active_watch += sum(1 for w in (_entry_watch or {}).values() if isinstance(w, dict) and w.get("entry_watch_state", "active") == "active")
-    except Exception:
-        pass
-    try:
-        active_watch += sum(1 for w in (_execution_setup_watch or {}).values() if isinstance(w, dict))
-    except Exception:
-        pass
-    watch_rate = (active_watch / saved_today) if saved_today > 0 else 0.0
-    active = saved_today >= 6 and active_watch >= max(3, int(saved_today * 0.5)) and reached_today == 0
-    return {
-        "active": bool(active),
-        "saved_today": int(saved_today),
-        "watch_today": int(active_watch),
-        "reached_today": int(reached_today),
-        "watch_rate": round(watch_rate, 2),
-    }
-
-
-def _get_dynamic_entry_reach_slack_pct(watch: dict | None = None) -> float:
-    watch = watch if isinstance(watch, dict) else {}
-    state = _get_capture_watch_recovery_state()
-    if not state.get("active"):
-        return 0.0
-    sig_type = str(watch.get("signal_type") or "")
-    if sig_type not in {"MID_PULLBACK", "ENTRY_POINT", "SURGE", "EARLY_DETECT", "STRONG_BUY", "PRECLOSE_GAP_ENTRY"}:
-        return 0.0
-    score = int(watch.get("score", 0) or 0)
-    grade = str(watch.get("grade", watch.get("grade_at_detect", "")) or "").upper()
-    miss_count = int(watch.get("miss_count", 0) or 0)
-    reclaim_ratio = float(watch.get("pullback_reclaim_ratio", watch.get("pullback_ratio_at_register", 0.0)) or 0.0)
-    slack = 0.0
-    if grade == "A":
-        slack = 0.8
-    elif score >= 90:
-        slack = 0.7
-    elif score >= 80:
-        slack = 0.6
-    elif sig_type in {"MID_PULLBACK", "ENTRY_POINT"}:
-        slack = 0.5
-    if miss_count >= 1:
-        slack += 0.3
-    if reclaim_ratio >= 0.55:
-        slack += 0.2
-    if not is_market_open() and is_nxt_open():
-        slack += 0.2
-    return round(min(slack, 1.2), 2)
 
 
 def _clear_emergency_tune_state(reason: str = ""):
@@ -4813,6 +4798,8 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
     score   = 0
     reasons = []
     grade   = "C"
+    sector_info: dict = {}
+    sentiment: dict = {}
 
     # 1차 급등 강도
     if surge_pct >= 40:   score += 25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
@@ -4953,6 +4940,7 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "stop_loss":     stop, "target_price": target,
         "stop_pct":      stop_pct, "target_pct": target_pct,
         "atr_used":      atr_used,
+        "sector_info":   sector_info,
         "reasons":       reasons,
         "detected_at":   datetime.now(),
         "market_regime_label": regime_label(),
@@ -6611,6 +6599,148 @@ def _sanitize_carry_snapshot_map(raw_data, siglog_data: dict | None = None) -> t
     return sanitized, dropped_codes
 
 
+def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, today: str | None = None) -> set[str]:
+    """동시보유 제한에 실제로 반영할 '행동 가능한' 감시 코드를 수집.
+    v62: 단순 carry/_detected_stocks 전체가 아니라 entry_watch / execution_setup_watch /
+    최근 active signal_log로 연결된 코드 중심으로 계산해 stale 감시 잔존 때문에
+    신규 리더가 전부 position_limit에 막히는 현상을 줄인다.
+    """
+    actionable_codes: set[str] = set()
+    today = str(today or datetime.now().strftime("%Y%m%d"))
+
+    try:
+        for watch in list((_entry_watch or {}).values()):
+            if not isinstance(watch, dict):
+                continue
+            state = str(watch.get("entry_watch_state", "active") or "active").lower()
+            if state not in ("active", "watching", "pending"):
+                continue
+            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+            if code:
+                actionable_codes.add(code)
+    except Exception:
+        pass
+
+    try:
+        for watch in list((_execution_setup_watch or {}).values()):
+            if not isinstance(watch, dict):
+                continue
+            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+            if code:
+                actionable_codes.add(code)
+    except Exception:
+        pass
+
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
+    try:
+        with _state_lock:
+            detected_snapshot = dict(_detected_stocks)
+    except Exception:
+        detected_snapshot = dict(_detected_stocks)
+
+    for raw_code, info in detected_snapshot.items():
+        if not isinstance(info, dict):
+            continue
+        code = normalize_stock_code(raw_code or info.get("code"))
+        if not code:
+            continue
+        latest_rec = latest_by_code.get(code)
+        if not isinstance(latest_rec, dict):
+            continue
+        if latest_rec.get("status") not in TRACK_ACTIVE_STATUSES:
+            continue
+        if _is_orphan_tracking(latest_rec):
+            continue
+        if _is_tracking_display_expired(latest_rec, today):
+            continue
+        if normalize_stock_code(latest_rec.get("code")) != code:
+            continue
+
+        # entry_watch / execution_setup_watch가 아직 비어 있어도,
+        # 오늘 또는 직전 영업일의 실제 행동 후보만 position_limit에 반영.
+        rec_day = str(latest_rec.get("detect_date", "") or "")
+        elapsed_days = _get_tracking_elapsed_days(latest_rec, today)
+        if rec_day == today or elapsed_days <= 1:
+            if safe_int(latest_rec.get("entry_price", 0), 0) > 0 or bool(latest_rec.get("execution_setup_required")):
+                actionable_codes.add(code)
+
+    return actionable_codes
+
+
+def _record_capture_funnel_event(event_type: str, signal: dict | None = None, extra: dict | None = None) -> None:
+    event_type = str(event_type or "").strip().lower()
+    if event_type not in {"saved", "watch", "reached"}:
+        return
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        data = _read_json_safe(CAPTURE_FUNNEL_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        row = data.get(today) if isinstance(data.get(today), dict) else {}
+        row = dict(row)
+        row.setdefault("saved", 0)
+        row.setdefault("watch", 0)
+        row.setdefault("reached", 0)
+        row[event_type] = safe_int(row.get(event_type, 0), 0) + 1
+        if isinstance(signal, dict):
+            row["last_code"] = normalize_stock_code(signal.get("code") or row.get("last_code") or "")
+            row["last_name"] = str(signal.get("name") or row.get("last_name") or "")
+            row["last_signal_type"] = str(signal.get("signal_type") or row.get("last_signal_type") or "")
+        if isinstance(extra, dict) and extra:
+            row["last_extra"] = dict(extra)
+        row["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data[today] = row
+        _write_json_atomic(CAPTURE_FUNNEL_FILE, data, indent=2)
+    except Exception:
+        pass
+
+
+def _get_capture_funnel_summary(day: str | None = None) -> dict:
+    day = str(day or datetime.now().strftime("%Y%m%d"))
+    try:
+        data = _read_json_safe(CAPTURE_FUNNEL_FILE, {})
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    row = data.get(day) if isinstance(data.get(day), dict) else {}
+    row = dict(row)
+    saved = safe_int(row.get("saved", 0), 0)
+    watch = safe_int(row.get("watch", 0), 0)
+    reached = safe_int(row.get("reached", 0), 0)
+    return {
+        "day": day,
+        "saved": saved,
+        "watch": watch,
+        "reached": reached,
+        "watch_ratio": round(watch / saved, 3) if saved > 0 else 0.0,
+        "reach_ratio": round(reached / watch, 3) if watch > 0 else 0.0,
+        "updated_at": str(row.get("updated_at") or ""),
+    }
+
+
+def _get_capture_watch_recovery_state(signal: dict | None = None, day: str | None = None) -> dict:
+    summary = _get_capture_funnel_summary(day=day)
+    saved = safe_int(summary.get("saved", 0), 0)
+    watch = safe_int(summary.get("watch", 0), 0)
+    reached = safe_int(summary.get("reached", 0), 0)
+    active = False
+    reason = ""
+    if saved >= 8 and watch >= max(5, int(saved * 0.6)) and reached == 0:
+        active = True
+        reason = "watch_reach_zero"
+    elif saved >= 10 and watch >= 6 and reached <= 1 and (reached / max(1, watch)) <= 0.08:
+        active = True
+        reason = "watch_reach_collapse"
+    out = dict(summary)
+    out["active"] = bool(active)
+    out["reason"] = reason
+    if isinstance(signal, dict):
+        out["code"] = normalize_stock_code(signal.get("code") or "")
+        out["signal_type"] = str(signal.get("signal_type") or "")
+    return out
+
+
 def _should_skip_next_open_signal_record(rec: dict, today: str | None = None) -> bool:
     if not isinstance(rec, dict):
         return True
@@ -8148,11 +8278,14 @@ def run_mid_pullback_scan():
                     {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
                 )
             else:
+                kept_internal = False
+                if _blocked_reason == "no_ask_liquidity" and _should_keep_internal_watch_on_no_ask_liquidity(_live or {}, s):
+                    kept_internal = _persist_blocked_capture_watch(s, source_label="눌림목", blocked_reason=_blocked_reason)
                 _log_suppressed_alert(
                     s["code"], s["name"],
                     f"눌림목 진입 신호 차단 ({_blocked_reason})",
                     s.get("signal_type", ""),
-                    {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+                    {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0), "internal_watch_kept": bool(kept_internal)}
                 )
                 continue
         if _should_suppress_mid_pullback_c_alert(s):
@@ -8162,18 +8295,21 @@ def run_mid_pullback_scan():
                 s.get("signal_type", ""),
                 {"score": s.get("score", 0), "grade": s.get("grade", ""), "resurge_mode": bool(s.get("resurge_mode")), "direct_news_hit": bool(s.get("direct_news_hit")), "entry_price": s.get("entry_price", 0)}
             )
-            save_signal_log(s)
-            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
-            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
-            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
-            continue
-        if not _should_send_external_grade_alert(s):
-            _logged = _record_internal_only_alert(s["code"], s, f"눌림목 {str(s.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
-            if _logged:
+            promoted = _promote_internal_capture_watch(s, hist_key=s["code"], source_label="눌림목", reason="C등급 실알림 억제 but 선행형 near-A 확증")
+            if not promoted:
                 save_signal_log(s)
             _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
-            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 외부알림 억제/내부기록 유지")
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
+            continue
+        if not _should_send_external_grade_alert(s):
+            _logged = _record_internal_only_alert(s["code"], s, f"눌림목 {str(s.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
+            promoted = _promote_internal_capture_watch(s, hist_key=s["code"], source_label="눌림목", reason=f"{str(s.get('grade','C')).upper()}등급 near-A/체결 확증")
+            if _logged and not promoted:
+                save_signal_log(s)
+            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
+            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
             continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
@@ -10048,6 +10184,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
 SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_log.json")   # 모든 신호 추적 (신규)
+CAPTURE_FUNNEL_FILE = os.path.join(DATA_DIR, "capture_funnel.json")  # saved/watch/reached 전환율 집계
 
 # ============================================================
 # 🎯 최적조건 만들기용 데이터/튜닝 설정
@@ -10628,11 +10765,6 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
     if next_entry < prev_entry:
         return next_entry, "하향갱신"
     if next_entry > prev_entry and sig_type in NO_CHASE_ENTRY_SIGNAL_TYPES:
-        gap_pct = (next_entry - prev_entry) / prev_entry * 100 if prev_entry else 0.0
-        recovery = _get_capture_watch_recovery_state()
-        if recovery.get("active") and sig_type in _get_dynamic_relaxable_no_chase_signal_types():
-            if safe_int(miss_count, 0) >= 1 and gap_pct >= 1.0:
-                return next_entry, f"전환회복완화({safe_int(miss_count, 0)}회/{gap_pct:.1f}%)"
         if sig_type in _get_dynamic_relaxable_no_chase_signal_types():
             try:
                 if detect_date:
@@ -10642,11 +10774,17 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
                     elapsed = 0
             except Exception:
                 elapsed = 0
+            gap_pct = (next_entry - prev_entry) / prev_entry * 100 if prev_entry else 0.0
+            recovery = _get_capture_watch_recovery_state({"signal_type": sig_type, "miss_count": safe_int(miss_count, 0)})
             if elapsed >= 2 or safe_int(miss_count, 0) >= 3 or gap_pct >= 15.0:
                 reason = f"경과완화({elapsed}일/{safe_int(miss_count, 0)}회/괴리{gap_pct:.0f}%)"
                 return next_entry, reason
+            if recovery.get("active") and (elapsed >= 1 or safe_int(miss_count, 0) >= 1 or gap_pct >= 6.0):
+                reason = f"회복완화({elapsed}일/{safe_int(miss_count, 0)}회/괴리{gap_pct:.0f}%)"
+                return next_entry, reason
         return prev_entry, "고점추격방지유지"
     return next_entry, "상향갱신" if next_entry > prev_entry else "기존유지"
+
 
 def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0, detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
     stock = stock if isinstance(stock, dict) else {}
@@ -10676,6 +10814,22 @@ def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0, detect_dat
             pass
     stock["entry_guard_mode"] = mode
     return chosen_entry, mode
+
+
+def _get_dynamic_entry_reach_slack_pct(watch: dict | None = None) -> float:
+    watch = watch if isinstance(watch, dict) else {}
+    recovery = _get_capture_watch_recovery_state(watch)
+    if not recovery.get("active"):
+        return 0.0
+    grade = str(watch.get("execution_grade") or watch.get("grade") or watch.get("execution_grade_at_detect") or watch.get("grade_at_detect") or "").upper()
+    score = safe_int(watch.get("score", 0), 0)
+    strength = str(watch.get("signal_strength") or watch.get("signal_strength_at_detect") or "")
+    sig_type = str(watch.get("signal_type") or "").upper()
+    if grade == "A" or strength == "강한" or score >= 85 or sig_type in {"MID_PULLBACK", "ENTRY_POINT", "STRONG_BUY", "SURGE"}:
+        return 0.012
+    if grade == "B" or score >= 78:
+        return 0.006
+    return 0.0
 
 
 def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
@@ -10956,6 +11110,7 @@ def save_signal_log(stock: dict):
                 rec["entry_reference_price"] = 0
             data = _prune_signal_log(data)
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+            _record_capture_funnel_event("saved", stock, {"mode": "representative_update"})
             print(f"  💾 신호 저장(대표갱신): {stock['name']} [{sig_type}] → {representative_key}")
             return
 
@@ -11032,6 +11187,7 @@ def save_signal_log(stock: dict):
         stock["signal_log_key"] = log_key
         data = _prune_signal_log(data)
         _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        _record_capture_funnel_event("saved", stock, {"mode": "new"})
         print(f"  💾 신호 저장: {stock['name']} [{sig_type}] 진입{stock.get('entry_price',0):,} 손절{stock.get('stop_loss',0):,} 목표{stock.get('target_price',0):,}")
     except Exception as e:
         print(f"⚠️ 신호 저장 오류: {e}")
@@ -14078,6 +14234,7 @@ def register_entry_watch(s: dict):
         "entry_watch_state": "active",
     }
     _save_entry_watch_active()
+    _record_capture_funnel_event("watch", s, {"entry_price": entry, "guard_mode": entry_guard_mode})
     _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
 
@@ -14720,6 +14877,8 @@ def check_entry_watch():
 
             entry    = watch["entry_price"]
             diff_pct = (price - entry) / entry * 100
+            _reach_slack_pct = _get_dynamic_entry_reach_slack_pct(watch)
+            _reach_via_recovery = bool(_reach_slack_pct > 0 and price > entry and price <= int(round(entry * (1.0 + _reach_slack_pct))))
 
             # ── 상승 이탈: ATR×국면 기반 기준 이상 오르면 포기 ──
             _escape_pct = calc_surge_escape_pct(watch["code"], entry)
@@ -14735,10 +14894,8 @@ def check_entry_watch():
                 )
                 expired.append((log_key, "상승이탈", _entry_watch_final_status(watch, "진입미달"))); continue
 
-            # ── 엄격형 진입가 도달 + recovery 근접 허용 ──
-            _entry_reach_slack_pct = _get_dynamic_entry_reach_slack_pct(watch)
-            _recovery_near_hit = price > entry and _entry_reach_slack_pct > 0 and price <= int(entry * (1 + (_entry_reach_slack_pct / 100.0)))
-            if price <= entry or _recovery_near_hit:
+            # ── 진입가 도달: 기본은 현재가<=진입가, recovery strong/A 후보는 근접 허용 ──
+            if price <= entry or _reach_via_recovery:
                 if reference_only:
                     if not watch.get("entry_reference_only"):
                         watch["entry_reference_only"] = True
@@ -14904,12 +15061,6 @@ def check_entry_watch():
                         similar_block = f"{_similar_line}\n\n"
                 except Exception:
                     similar_block = ""
-                recovery_reach_block = ""
-                if locals().get("_recovery_near_hit"):
-                    recovery_reach_block = (
-                        f"⚠️ <b>회복모드 근접도달 허용</b> — 진입가 대비 +{diff_pct:.1f}%\n"
-                        f"  허용 범위: +{_entry_reach_slack_pct:.1f}% 이내\n\n"
-                    )
 
                 # ── v41.66: 1차/2차 분기 ──
                 is_phase1 = (notify_count == 0)
@@ -14935,12 +15086,13 @@ def check_entry_watch():
                     _p1_pct = _split_rule["phase1_pct"]
                     _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
                     _nxt_delta_block = _format_nxt_transition_delta_block(watch)
+                    _reach_note_block = f"│ 🛠 회복모드 근접도달 허용  (+{_reach_slack_pct*100:.1f}%)\n" if _reach_via_recovery else ""
                     send_with_chart_buttons(
                         f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
                         f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
-                        f"{_nxt_delta_block}{similar_block}{recovery_reach_block}"
+                        f"{_nxt_delta_block}{similar_block}"
                         f"{reasons_block}"
                         f"{sector_block}"
                         f"{_entry_exec_block}"
@@ -15053,6 +15205,7 @@ def check_entry_watch():
                     watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
                 try:
                     _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts, log_key=watch.get('signal_log_key'))
+                    _record_capture_funnel_event("reached", watch, {"hit_price": int(price or 0), "recovery_reach": bool(_reach_via_recovery)})
                 except Exception:
                     pass
                 _phase_label = "1차" if is_phase1 else "2차"
@@ -17576,6 +17729,130 @@ def _has_pending_capture_watch(code: str) -> bool:
     return False
 
 
+def _has_recent_actionable_tracking_state(code: str, max_age_minutes: int = 240) -> bool:
+    code = normalize_stock_code(code)
+    if not code:
+        return False
+    try:
+        if _has_pending_capture_watch(code):
+            return True
+    except Exception:
+        pass
+    try:
+        sig_data = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+    except Exception:
+        sig_data = {}
+    if not isinstance(sig_data, dict):
+        return False
+    now_dt = _now_kst()
+    active_statuses = {"추적중", "진입준비", "NXT참고도달"}
+    newest_dt = None
+    for rec in sig_data.values():
+        if not isinstance(rec, dict):
+            continue
+        if normalize_stock_code(rec.get("code")) != code:
+            continue
+        status = str(rec.get("status", "") or "")
+        if status not in active_statuses:
+            continue
+        cand_dt = None
+        for d_key, t_key in (("last_detect_date", "last_detect_time"), ("detect_date", "detect_time"), ("first_detect_date", "first_detect_time")):
+            cand_dt = _parse_compact_datetime(rec.get(d_key), rec.get(t_key))
+            if cand_dt:
+                break
+        if not cand_dt:
+            continue
+        if newest_dt is None or cand_dt > newest_dt:
+            newest_dt = cand_dt
+    if not newest_dt:
+        return False
+    return (now_dt - newest_dt).total_seconds() <= max(900, int(max_age_minutes) * 60)
+
+
+def _should_promote_internal_capture_watch(signal: dict, source_label: str = "") -> bool:
+    if not isinstance(signal, dict):
+        return False
+    code = normalize_stock_code(signal.get("code"))
+    if not code or _has_pending_capture_watch(code):
+        return False
+    entry_price = safe_int(signal.get("entry_price", 0), 0)
+    if entry_price <= 0:
+        return False
+    sig_type = str(signal.get("signal_type", "") or "").upper()
+    if sig_type not in ("SURGE", "EARLY_DETECT", "MID_PULLBACK", "ENTRY_POINT", "NEAR_UPPER", "STRONG_BUY"):
+        return False
+    score = safe_int(signal.get("score", 0), 0)
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
+    exec_m = signal.get("execution_metrics") or {}
+    exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
+    dip_score = safe_int(exec_m.get("dip_resilience_score", 0), 0)
+    theme_live = not _is_generic_sector_theme(_extract_alert_sector_theme(signal))
+    direct_like = bool(
+        signal.get("direct_news_hit")
+        or signal.get("theme_drive_hit")
+        or signal.get("adaptive_feedback_hit")
+        or signal.get("miss_theme_leader_hit")
+        or signal.get("leader_priority_hit")
+        or signal.get("emergent_theme_hit")
+    )
+    change_rate = safe_float(signal.get("change_rate", 0), 0.0)
+    vol_ratio = safe_float(signal.get("volume_ratio", 0), 0.0)
+    intraday_mode = _intraday_capture_mode_active(_get_intraday_capture_mode())
+    if grade == "A":
+        return True
+    if grade == "B" and (theme_live or direct_like or intraday_mode or exec_score >= 58 or dip_score >= 54 or (change_rate >= 4.0 and vol_ratio >= 2.0)):
+        return True
+    if score >= max(74, GENERAL_A_RELAXED_SCORE - 2) and (theme_live or direct_like or intraday_mode or exec_score >= 65 or dip_score >= 60):
+        return True
+    return False
+
+
+def _promote_internal_capture_watch(signal: dict, hist_key: str = "", source_label: str = "", reason: str = "") -> bool:
+    if not _should_promote_internal_capture_watch(signal, source_label=source_label):
+        return False
+    code = normalize_stock_code(signal.get("code"))
+    if not code:
+        return False
+    snap = dict(signal)
+    snap.setdefault("reasons", list(signal.get("reasons") or []))
+    snap["internal_watch_promoted"] = True
+    snap["internal_watch_reason"] = reason or source_label or "internal_watch_promoted"
+    snap["force_register_entry_watch"] = bool(snap.get("force_register_entry_watch"))
+    snap.setdefault("reasons", []).append(f"🧭 {source_label or '일반 포착'} 내부감시 자동승격 — {reason or 'near-A 선행 후보 유지'}")
+    try:
+        save_signal_log(snap)
+        if snap.get("signal_type") == "EARLY_DETECT":
+            save_early_detect(snap)
+        register_entry_watch(snap)
+        register_top_signal(snap)
+        _log_suppressed_alert(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")),
+            f"{source_label or '일반 포착'} 내부감시 자동승격 ({reason or 'near-A'})",
+            snap.get("signal_type", ""),
+            {
+                "score": snap.get("score", 0),
+                "grade": str(snap.get("execution_grade") or snap.get("grade") or "C"),
+                "entry_price": snap.get("entry_price", 0),
+                "market": snap.get("market", ""),
+            }
+        )
+        _record_shadow_capture(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")), "internal_watch_promoted", snap.get("signal_type", ""),
+            stage=source_label or "internal_watch_promoted",
+            extra={
+                "score": snap.get("score", 0),
+                "grade": str(snap.get("execution_grade") or snap.get("grade") or "C"),
+                "change_rate": snap.get("change_rate", 0),
+                "entry_price": snap.get("entry_price", 0),
+                "reason": reason or "near-A",
+            },
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ 내부감시 자동승격 오류 [{code}]: {e}")
+        return False
+
+
 def _should_delay_external_general_capture(signal: dict) -> str:
     if not isinstance(signal, dict):
         return ""
@@ -17617,6 +17894,59 @@ def _persist_general_capture_without_external(s: dict, hist_key: str, source_lab
     print(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
     return True
 
+
+def _should_keep_internal_watch_on_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    entry_price = safe_int(signal.get("entry_price", 0), 0)
+    if entry_price <= 0:
+        return False
+    if _should_promote_internal_capture_watch(signal, source_label="호가차단내부유지"):
+        return True
+    score = safe_int(signal.get("score", 0), 0)
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+    exec_m = signal.get("execution_metrics") or {}
+    exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
+    change_rate = safe_float(signal.get("change_rate", 0), 0.0)
+    vol_ratio = safe_float(signal.get("volume_ratio", 0), 0.0)
+    if grade == "A" or score >= 82:
+        return True
+    if grade == "B" and (exec_score >= 58 or (change_rate >= 4.0 and vol_ratio >= 2.0)):
+        return True
+    return False
+
+
+def _persist_blocked_capture_watch(signal: dict, source_label: str = "", blocked_reason: str = "") -> bool:
+    snap = dict(signal if isinstance(signal, dict) else {})
+    code = normalize_stock_code(snap.get("code"))
+    if not code:
+        return False
+    if _has_pending_capture_watch(code):
+        return True
+    snap["force_register_entry_watch"] = True
+    snap["internal_watch_promoted"] = True
+    snap["internal_watch_reason"] = f"{source_label or '포착'} {blocked_reason or '차단'} 내부감시 유지"
+    snap.setdefault("reasons", []).append(f"🧭 {source_label or '포착'} 호가 차단 상태에서도 내부감시 유지 ({blocked_reason or 'no_ask_liquidity'})")
+    try:
+        save_signal_log(snap)
+        register_entry_watch(snap)
+        register_top_signal(snap)
+        _log_suppressed_alert(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")),
+            f"{source_label or '포착'} 내부감시 유지 ({blocked_reason or 'no_ask_liquidity'})",
+            snap.get("signal_type", ""),
+            {"entry_price": snap.get("entry_price", 0), "score": snap.get("score", 0), "grade": str(snap.get("execution_grade") or snap.get("grade") or "")}
+        )
+        _record_shadow_capture(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")), "internal_watch_kept", snap.get("signal_type", ""),
+            stage=source_label or "internal_watch_kept",
+            extra={"blocked_reason": blocked_reason or "no_ask_liquidity", "entry_price": snap.get("entry_price", 0), "score": snap.get("score", 0), "grade": str(snap.get("execution_grade") or snap.get("grade") or "")}
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ 호가 차단 내부감시 유지 오류 [{code}]: {e}")
+        return False
+
+
 def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_label: str = "일반 포착") -> bool:
     if not isinstance(s, dict) or not s.get("code"):
         return False
@@ -17647,16 +17977,19 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                 {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
             )
         else:
+            kept_internal = False
+            if _blocked_reason == "no_ask_liquidity" and _should_keep_internal_watch_on_no_ask_liquidity(_live or {}, s):
+                kept_internal = _persist_blocked_capture_watch(s, source_label=source_label, blocked_reason=_blocked_reason)
             _log_suppressed_alert(
                 s["code"], s["name"],
                 f"{source_label} 신호 차단 ({_blocked_reason})",
                 s.get("signal_type", ""),
-                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0)}
+                {"entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "ask_qty": (_live or {}).get("ask_qty", 0), "bid_qty": (_live or {}).get("bid_qty", 0), "internal_watch_kept": bool(kept_internal)}
             )
             _record_shadow_capture(
                 s.get("code", ""), s.get("name", s.get("code", "")), _blocked_reason, s.get("signal_type", ""),
                 stage=source_label,
-                extra={"score": s.get("score", 0), "grade": s.get("grade", ""), "entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "market": s.get("market", "")}
+                extra={"score": s.get("score", 0), "grade": s.get("grade", ""), "entry_price": _entry, "blocked_price": _live_price, "change_rate": (_live or {}).get("change_rate", 0), "market": s.get("market", ""), "internal_watch_kept": bool(kept_internal)}
             )
             return False
     grade_upper = str(s.get("execution_grade") or s.get("grade") or "C").upper()
@@ -17665,15 +17998,19 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         return _persist_general_capture_without_external(s, hist_key, source_label, _delay_reason)
     if not _should_send_external_grade_alert(s):
         _logged = _record_internal_only_alert(hist_key, s, f"{source_label} {grade_upper}등급 외부알림 억제(A전용)")
-        if _logged:
+        promoted = _promote_internal_capture_watch(s, hist_key=hist_key, source_label=source_label, reason=f"{grade_upper}등급 near-A/테마/체결 확증")
+        if _logged and not promoted:
             save_signal_log(s)
             if s.get("signal_type") == "EARLY_DETECT":
                 save_early_detect(s)
         _record_shadow_capture(
             s.get("code", ""), s.get("name", s.get("code", "")), "external_grade_suppressed", s.get("signal_type", ""),
-            stage=source_label, extra={"score": s.get("score", 0), "grade": grade_upper, "change_rate": s.get("change_rate", 0), "market": s.get("market", "")}
+            stage=source_label, extra={"score": s.get("score", 0), "grade": grade_upper, "change_rate": s.get("change_rate", 0), "market": s.get("market", ""), "internal_watch_promoted": bool(promoted)}
         )
-        print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
+        if promoted:
+            print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 외부억제/내부감시 자동승격")
+        else:
+            print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
         return False
     _internal_only_alert_history.pop(hist_key, None)
     print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}]")
@@ -22445,6 +22782,24 @@ def _get_market_leader_live_quote(code: str, name: str = "", market_open: bool |
     return q
 
 
+def _collect_actionable_market_leader_quotes(quotes: list) -> tuple[list, dict]:
+    actionable = []
+    shadow_codes = []
+    for q in list(quotes or []):
+        code = normalize_stock_code((q or {}).get("code"))
+        if not code:
+            continue
+        if _has_recent_actionable_tracking_state(code):
+            actionable.append(dict(q))
+        else:
+            shadow_codes.append(code)
+    meta = {
+        "actionable_count": len(actionable),
+        "missing_codes": shadow_codes[:6],
+    }
+    return actionable, meta
+
+
 def _calc_market_leader_sector_score(quotes: list, leader: dict, follow_min: float, market_chg: float) -> tuple[float, int, float, float]:
     risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= follow_min]
     breadth_ratio = len(risers) / max(1, len(quotes))
@@ -22546,15 +22901,33 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
             continue
         if score < score_min:
             continue
+        actionable_quotes, actionable_meta = _collect_actionable_market_leader_quotes([leader] + followers)
+        if not actionable_quotes:
+            _record_shadow_capture(
+                leader.get("code", ""), leader.get("name", leader.get("code", "")),
+                "sector_actionable_missing", "MARKET_LEADER", stage="market_leader_sector",
+                extra={
+                    "theme": theme_name,
+                    "score": int(round(score)),
+                    "leader_change_rate": leader.get("change_rate", 0),
+                    "missing_codes": actionable_meta.get("missing_codes", []),
+                }
+            )
+            continue
+        actionable_quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+        display_leader = actionable_quotes[0]
+        display_followers = [q for q in actionable_quotes[1:] if safe_float(q.get("change_rate", 0)) >= follow_min][:4]
         sectors.append({
             "theme": theme_name,
             "score": int(round(score)),
-            "leader": leader,
-            "followers": followers,
+            "leader": display_leader,
+            "followers": display_followers,
             "riser_cnt": riser_cnt,
             "member_cnt": len(quotes),
             "avg_change": avg_change,
             "flow_avg": flow_avg,
+            "actionable_count": actionable_meta.get("actionable_count", 0),
+            "actionable_missing_codes": actionable_meta.get("missing_codes", []),
         })
     if not sectors:
         return {}
@@ -22572,7 +22945,8 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     digest_parts = []
     for sec in top:
         leader = sec["leader"]
-        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
+        _linked = int(sec.get("actionable_count", 0) or 0)
+        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>" + (f"  🔗종목연동 {_linked}건" if _linked > 0 else ""))
         lines.append(f"👑 {leader['name']} {leader['change_rate']:+.1f}%")
         fol = "  ".join(f"{q['name']} {q['change_rate']:+.1f}%" for q in sec.get("followers", [])[:4])
         if fol:
@@ -24033,59 +24407,18 @@ def check_earnings_risk(code: str, name: str) -> dict:
 # ============================================================
 # 🗂️ ⑤ 동시 신호 포트폴리오 관리
 # ============================================================
-def _collect_actionable_position_limit_codes(siglog_data: dict | None = None) -> set[str]:
-    codes: set[str] = set()
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        for watch in (_entry_watch or {}).values():
-            if not isinstance(watch, dict):
-                continue
-            if str(watch.get("entry_watch_state", "active") or "active") != "active":
-                continue
-            code = normalize_stock_code(watch.get("code"))
-            if code:
-                codes.add(code)
-    except Exception:
-        pass
-    try:
-        for watch in (_execution_setup_watch or {}).values():
-            if not isinstance(watch, dict):
-                continue
-            code = normalize_stock_code(watch.get("code"))
-            if code:
-                codes.add(code)
-    except Exception:
-        pass
-    data = siglog_data if isinstance(siglog_data, dict) else {}
-    for rec in data.values():
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("status") not in TRACK_ACTIVE_STATUSES:
-            continue
-        code = normalize_stock_code(rec.get("code"))
-        if not code or code in codes:
-            continue
-        detect_date = str(rec.get("last_detect_date", rec.get("detect_date", "")) or "")
-        if detect_date and detect_date not in {today, _prev_business_day(today)}:
-            continue
-        if safe_int(rec.get("entry_price", 0), 0) <= 0 and not rec.get("execution_setup_required"):
-            continue
-        codes.add(code)
-    return codes
-
-
 def _get_carry_position_context() -> tuple[int, set[str]]:
     try:
         siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
     except Exception:
         siglog_data = {}
+    today = datetime.now().strftime("%Y%m%d")
 
-    actionable_codes = _collect_actionable_position_limit_codes(siglog_data)
+    actionable_codes = _collect_actionable_position_limit_codes(siglog_data=siglog_data, today=today)
     if actionable_codes:
         return len(actionable_codes), actionable_codes
 
     latest_by_code = _build_latest_tracking_by_code(siglog_data)
-    today = datetime.now().strftime("%Y%m%d")
     carry_codes = set()
     try:
         with _state_lock:
