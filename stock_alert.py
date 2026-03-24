@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v60
+버전: v61
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 진입감시 연동 보강.
+  [#1] `_has_recent_actionable_tracking_state()` / `_should_promote_internal_capture_watch()` / `_promote_internal_capture_watch()`를 추가해,
+       외부 A전용 억제로 바로 안 나가더라도 테마/직접뉴스/체결속도/장중 miss 확증이 붙은 near-A 후보는 자동으로 `signal_log` / `entry_watch` / `execution_setup_watch`에 내부 승격되도록 수정.
+  [#2] `_dispatch_general_alert_signal()` / `run_mid_pullback_scan()`의 외부억제 경로에 위 내부승격을 연결해,
+       섹터 seed 단계에서 보인 종목이 A 직전 단계에서 그냥 사라지지 않고 진입가 감시까지 이어지도록 보강.
+  [#3] `_build_market_leading_sector_payload()`에 actionable tracking gate를 추가해,
+       `entry_watch` / `execution_setup_watch` / 최근 `signal_log`로 연결된 종목이 한 개도 없는 테마는 사용자용 `[시장 주도 섹터]` 메시지에서 제외하고, 노출되는 leader/follower도 행동 경로에 걸린 종목 중심으로 재구성하도록 수정.
+  [#4] 섹터 메시지와 종목 포착 경로가 어긋난 경우 `sector_actionable_missing` shadow 기록을 남겨,
+       “섹터 형성 중인데 종목 감시는 왜 없었는가”를 로그에서 바로 추적할 수 있게 보강.
+  이유: 섹터는 종목 포착 후 강화를 위한 보조 근거여야 하는데, 기존 v60까지는 섹터 seed/요약 레이어가 종목 행동 경로보다 먼저 발화할 수 있어
+       섹터 알림은 오는데 진입가 감시/알림이 비는 순서 역전이 남아 있었음.
+  개선점: 종목 raw 포착→내부감시→A승격→섹터 강화 순서 일관성↑, near-A 후보의 진입가 감시 연결↑, 섹터/종목 로그 추적성↑.
+  주의점: 외부 A전용 정책은 유지하며, 내부 자동승격은 테마/체결/장중 miss 확증이 충분한 후보에만 제한적으로 적용된다.
 
 - v60 (2026-03-24): 선행형 A후보 자동확장 + ENTRY_POINT A등급 복구.
   [#1] `intraday_capture_mode.json`과 `_get_intraday_capture_mode()` / `_get_dynamic_general_a_relax_signal_types()` /
@@ -8092,18 +8106,21 @@ def run_mid_pullback_scan():
                 s.get("signal_type", ""),
                 {"score": s.get("score", 0), "grade": s.get("grade", ""), "resurge_mode": bool(s.get("resurge_mode")), "direct_news_hit": bool(s.get("direct_news_hit")), "entry_price": s.get("entry_price", 0)}
             )
-            save_signal_log(s)
-            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
-            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
-            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 실알림 억제/내부기록 유지")
-            continue
-        if not _should_send_external_grade_alert(s):
-            _logged = _record_internal_only_alert(s["code"], s, f"눌림목 {str(s.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
-            if _logged:
+            promoted = _promote_internal_capture_watch(s, hist_key=s["code"], source_label="눌림목", reason="C등급 실알림 억제 but 선행형 near-A 확증")
+            if not promoted:
                 save_signal_log(s)
             _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
-            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — 외부알림 억제/내부기록 유지")
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
+            continue
+        if not _should_send_external_grade_alert(s):
+            _logged = _record_internal_only_alert(s["code"], s, f"눌림목 {str(s.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
+            promoted = _promote_internal_capture_watch(s, hist_key=s["code"], source_label="눌림목", reason=f"{str(s.get('grade','C')).upper()}등급 near-A/체결 확증")
+            if _logged and not promoted:
+                save_signal_log(s)
+            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
+            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
             continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
@@ -17495,6 +17512,130 @@ def _has_pending_capture_watch(code: str) -> bool:
     return False
 
 
+def _has_recent_actionable_tracking_state(code: str, max_age_minutes: int = 240) -> bool:
+    code = normalize_stock_code(code)
+    if not code:
+        return False
+    try:
+        if _has_pending_capture_watch(code):
+            return True
+    except Exception:
+        pass
+    try:
+        sig_data = _read_json_locked(SIGNAL_LOG_FILE) if os.path.exists(SIGNAL_LOG_FILE) else {}
+    except Exception:
+        sig_data = {}
+    if not isinstance(sig_data, dict):
+        return False
+    now_dt = _now_kst()
+    active_statuses = {"추적중", "진입준비", "NXT참고도달"}
+    newest_dt = None
+    for rec in sig_data.values():
+        if not isinstance(rec, dict):
+            continue
+        if normalize_stock_code(rec.get("code")) != code:
+            continue
+        status = str(rec.get("status", "") or "")
+        if status not in active_statuses:
+            continue
+        cand_dt = None
+        for d_key, t_key in (("last_detect_date", "last_detect_time"), ("detect_date", "detect_time"), ("first_detect_date", "first_detect_time")):
+            cand_dt = _parse_compact_datetime(rec.get(d_key), rec.get(t_key))
+            if cand_dt:
+                break
+        if not cand_dt:
+            continue
+        if newest_dt is None or cand_dt > newest_dt:
+            newest_dt = cand_dt
+    if not newest_dt:
+        return False
+    return (now_dt - newest_dt).total_seconds() <= max(900, int(max_age_minutes) * 60)
+
+
+def _should_promote_internal_capture_watch(signal: dict, source_label: str = "") -> bool:
+    if not isinstance(signal, dict):
+        return False
+    code = normalize_stock_code(signal.get("code"))
+    if not code or _has_pending_capture_watch(code):
+        return False
+    entry_price = safe_int(signal.get("entry_price", 0), 0)
+    if entry_price <= 0:
+        return False
+    sig_type = str(signal.get("signal_type", "") or "").upper()
+    if sig_type not in ("SURGE", "EARLY_DETECT", "MID_PULLBACK", "ENTRY_POINT", "NEAR_UPPER", "STRONG_BUY"):
+        return False
+    score = safe_int(signal.get("score", 0), 0)
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
+    exec_m = signal.get("execution_metrics") or {}
+    exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
+    dip_score = safe_int(exec_m.get("dip_resilience_score", 0), 0)
+    theme_live = not _is_generic_sector_theme(_extract_alert_sector_theme(signal))
+    direct_like = bool(
+        signal.get("direct_news_hit")
+        or signal.get("theme_drive_hit")
+        or signal.get("adaptive_feedback_hit")
+        or signal.get("miss_theme_leader_hit")
+        or signal.get("leader_priority_hit")
+        or signal.get("emergent_theme_hit")
+    )
+    change_rate = safe_float(signal.get("change_rate", 0), 0.0)
+    vol_ratio = safe_float(signal.get("volume_ratio", 0), 0.0)
+    intraday_mode = _intraday_capture_mode_active(_get_intraday_capture_mode())
+    if grade == "A":
+        return True
+    if grade == "B" and (theme_live or direct_like or intraday_mode or exec_score >= 58 or dip_score >= 54 or (change_rate >= 4.0 and vol_ratio >= 2.0)):
+        return True
+    if score >= max(74, GENERAL_A_RELAXED_SCORE - 2) and (theme_live or direct_like or intraday_mode or exec_score >= 65 or dip_score >= 60):
+        return True
+    return False
+
+
+def _promote_internal_capture_watch(signal: dict, hist_key: str = "", source_label: str = "", reason: str = "") -> bool:
+    if not _should_promote_internal_capture_watch(signal, source_label=source_label):
+        return False
+    code = normalize_stock_code(signal.get("code"))
+    if not code:
+        return False
+    snap = dict(signal)
+    snap.setdefault("reasons", list(signal.get("reasons") or []))
+    snap["internal_watch_promoted"] = True
+    snap["internal_watch_reason"] = reason or source_label or "internal_watch_promoted"
+    snap["force_register_entry_watch"] = bool(snap.get("force_register_entry_watch"))
+    snap.setdefault("reasons", []).append(f"🧭 {source_label or '일반 포착'} 내부감시 자동승격 — {reason or 'near-A 선행 후보 유지'}")
+    try:
+        save_signal_log(snap)
+        if snap.get("signal_type") == "EARLY_DETECT":
+            save_early_detect(snap)
+        register_entry_watch(snap)
+        register_top_signal(snap)
+        _log_suppressed_alert(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")),
+            f"{source_label or '일반 포착'} 내부감시 자동승격 ({reason or 'near-A'})",
+            snap.get("signal_type", ""),
+            {
+                "score": snap.get("score", 0),
+                "grade": str(snap.get("execution_grade") or snap.get("grade") or "C"),
+                "entry_price": snap.get("entry_price", 0),
+                "market": snap.get("market", ""),
+            }
+        )
+        _record_shadow_capture(
+            snap.get("code", ""), snap.get("name", snap.get("code", "")), "internal_watch_promoted", snap.get("signal_type", ""),
+            stage=source_label or "internal_watch_promoted",
+            extra={
+                "score": snap.get("score", 0),
+                "grade": str(snap.get("execution_grade") or snap.get("grade") or "C"),
+                "change_rate": snap.get("change_rate", 0),
+                "entry_price": snap.get("entry_price", 0),
+                "reason": reason or "near-A",
+            },
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ 내부감시 자동승격 오류 [{code}]: {e}")
+        return False
+
+
 def _should_delay_external_general_capture(signal: dict) -> str:
     if not isinstance(signal, dict):
         return ""
@@ -17584,15 +17725,19 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         return _persist_general_capture_without_external(s, hist_key, source_label, _delay_reason)
     if not _should_send_external_grade_alert(s):
         _logged = _record_internal_only_alert(hist_key, s, f"{source_label} {grade_upper}등급 외부알림 억제(A전용)")
-        if _logged:
+        promoted = _promote_internal_capture_watch(s, hist_key=hist_key, source_label=source_label, reason=f"{grade_upper}등급 near-A/테마/체결 확증")
+        if _logged and not promoted:
             save_signal_log(s)
             if s.get("signal_type") == "EARLY_DETECT":
                 save_early_detect(s)
         _record_shadow_capture(
             s.get("code", ""), s.get("name", s.get("code", "")), "external_grade_suppressed", s.get("signal_type", ""),
-            stage=source_label, extra={"score": s.get("score", 0), "grade": grade_upper, "change_rate": s.get("change_rate", 0), "market": s.get("market", "")}
+            stage=source_label, extra={"score": s.get("score", 0), "grade": grade_upper, "change_rate": s.get("change_rate", 0), "market": s.get("market", ""), "internal_watch_promoted": bool(promoted)}
         )
-        print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
+        if promoted:
+            print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 외부억제/내부감시 자동승격")
+        else:
+            print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
         return False
     _internal_only_alert_history.pop(hist_key, None)
     print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}]")
@@ -22364,6 +22509,24 @@ def _get_market_leader_live_quote(code: str, name: str = "", market_open: bool |
     return q
 
 
+def _collect_actionable_market_leader_quotes(quotes: list) -> tuple[list, dict]:
+    actionable = []
+    shadow_codes = []
+    for q in list(quotes or []):
+        code = normalize_stock_code((q or {}).get("code"))
+        if not code:
+            continue
+        if _has_recent_actionable_tracking_state(code):
+            actionable.append(dict(q))
+        else:
+            shadow_codes.append(code)
+    meta = {
+        "actionable_count": len(actionable),
+        "missing_codes": shadow_codes[:6],
+    }
+    return actionable, meta
+
+
 def _calc_market_leader_sector_score(quotes: list, leader: dict, follow_min: float, market_chg: float) -> tuple[float, int, float, float]:
     risers = [q for q in quotes if safe_float(q.get("change_rate", 0)) >= follow_min]
     breadth_ratio = len(risers) / max(1, len(quotes))
@@ -22465,15 +22628,33 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
             continue
         if score < score_min:
             continue
+        actionable_quotes, actionable_meta = _collect_actionable_market_leader_quotes([leader] + followers)
+        if not actionable_quotes:
+            _record_shadow_capture(
+                leader.get("code", ""), leader.get("name", leader.get("code", "")),
+                "sector_actionable_missing", "MARKET_LEADER", stage="market_leader_sector",
+                extra={
+                    "theme": theme_name,
+                    "score": int(round(score)),
+                    "leader_change_rate": leader.get("change_rate", 0),
+                    "missing_codes": actionable_meta.get("missing_codes", []),
+                }
+            )
+            continue
+        actionable_quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0)), safe_float(x.get("volume_ratio", 0))), reverse=True)
+        display_leader = actionable_quotes[0]
+        display_followers = [q for q in actionable_quotes[1:] if safe_float(q.get("change_rate", 0)) >= follow_min][:4]
         sectors.append({
             "theme": theme_name,
             "score": int(round(score)),
-            "leader": leader,
-            "followers": followers,
+            "leader": display_leader,
+            "followers": display_followers,
             "riser_cnt": riser_cnt,
             "member_cnt": len(quotes),
             "avg_change": avg_change,
             "flow_avg": flow_avg,
+            "actionable_count": actionable_meta.get("actionable_count", 0),
+            "actionable_missing_codes": actionable_meta.get("missing_codes", []),
         })
     if not sectors:
         return {}
@@ -22491,7 +22672,8 @@ def _build_market_leading_sector_payload(force: bool = False) -> dict:
     digest_parts = []
     for sec in top:
         leader = sec["leader"]
-        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>")
+        _linked = int(sec.get("actionable_count", 0) or 0)
+        lines.append(f"🏭 <b>{sec['theme']}</b>  <b>{sec['score']}점</b>" + (f"  🔗종목연동 {_linked}건" if _linked > 0 else ""))
         lines.append(f"👑 {leader['name']} {leader['change_rate']:+.1f}%")
         fol = "  ".join(f"{q['name']} {q['change_rate']:+.1f}%" for q in sec.get("followers", [])[:4])
         if fol:
