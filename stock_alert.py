@@ -3,24 +3,39 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v61
+버전: v62
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
-- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 진입감시 연동 보강 + 눌림목 NameError 복구.
+- v62 (2026-03-24): 동시보유 제한 actionable 기준 재정의 + stale 추적 과잉억제 완화.
+  [#1] `_collect_actionable_position_limit_codes()`를 추가해, `position_limit` 계산 시 단순 `_detected_stocks`/carry 전체가 아니라
+       실제 `entry_watch` / `execution_setup_watch` / 최근 active signal_log로 이어진 행동 가능한 코드만 우선 집계하도록 수정.
+  [#2] `_get_carry_position_context()`를 위 actionable 코드 우선 구조로 바꿔, 재시작 후 `signal_log`/carry에 남은 다수의 추적중 종목 때문에
+       `19/1종목 보유 중`처럼 신규 후보가 전부 억제되는 문제를 완화.
+  [#3] entry_watch가 아직 비어 있어도 오늘/직전 영업일의 실제 행동 후보(`entry_price>0` 또는 `execution_setup_required`)만 제한적으로 반영하도록 보강.
+  이유: 최근 로그상 진입가 알림 0건의 직접 병목은 `MID_PULLBACK` 예외보다도, stale/비행동성 추적 잔존이 동시보유 제한을 과하게 점유해
+       선행형 A후보와 신규 리더가 position_limit에서 먼저 잘리는 구조였음.
+  개선점: 동시보유 제한의 stale 억제↓, 신규 리더 포착 경로↑, 진입가 알림 연결 가능성↑.
+  주의점: 동시보유 제한 자체는 유지하며, 실제 행동 가능한 감시(entry_watch/execution_setup/recent active signal)만 점유로 간주한다.
+
+- v61 (2026-03-24): 섹터 후행화 + near-A 내부감시 자동승격 + 눌림목 NameError 복구.
   [#1] `_has_recent_actionable_tracking_state()` / `_should_promote_internal_capture_watch()` / `_promote_internal_capture_watch()`를 추가해,
-       외부 A전용 억제로 바로 안 나가더라도 테마/직접뉴스/체결속도/장중 miss 확증이 붙은 near-A 후보는 자동으로 `signal_log` / `entry_watch` / `execution_setup_watch`에 내부 승격되도록 수정.
+       외부 A전용 억제로 바로 안 나가더라도 테마/직접뉴스/체결속도/장중 miss 확증이 붙은 near-A 후보는 자동으로 `signal_log` / `entry_watch` /
+       `execution_setup_watch`에 내부 승격되도록 수정.
   [#2] `_dispatch_general_alert_signal()` / `run_mid_pullback_scan()`의 외부억제 경로에 위 내부승격을 연결해,
        섹터 seed 단계에서 보인 종목이 A 직전 단계에서 그냥 사라지지 않고 진입가 감시까지 이어지도록 보강.
   [#3] `_build_market_leading_sector_payload()`에 actionable tracking gate를 추가해,
-       `entry_watch` / `execution_setup_watch` / 최근 `signal_log`로 연결된 종목이 한 개도 없는 테마는 사용자용 `[시장 주도 섹터]` 메시지에서 제외하고, 노출되는 leader/follower도 행동 경로에 걸린 종목 중심으로 재구성하도록 수정.
+       `entry_watch` / `execution_setup_watch` / 최근 `signal_log`로 연결된 종목이 한 개도 없는 테마는 사용자용 `[시장 주도 섹터]` 메시지에서 제외하고,
+       노출되는 leader/follower도 행동 경로에 걸린 종목 중심으로 재구성하도록 수정.
   [#4] `analyze_mid_pullback()` 시작부에 `sector_info = {}` / `sentiment = {}` 기본값을 먼저 선언하고,
-       `_should_block_multi_tf_downtrend_capture()`에 넘기는 `signal_meta`와 반환 payload를 정리해 `⚠️ 눌림목 오류 (...): name 'sector_info' is not defined` 반복 오류를 제거.
-  이유: 섹터는 먼저 보이는데 종목 포착/감시/진입가 알림이 비는 순서 역전을 줄이고, v61 초안에서 함께 드러난 눌림목 핫패스 예외까지 같은 계열의 포착 경로 문제로 묶어 복구해야 했음.
-  개선점: 섹터 단독 선발화↓, near-A 내부감시 승격↑, `MID_PULLBACK` 예외 탈락↓, `entry_watch` 및 진입가 알림 연결 안정성↑.
-  주의점: 외부 A전용 정책/v60 장중 miss 자동확장 철학은 유지하며, 이번 버전은 v61 최종본으로서 종목 행동 경로 정합성 복구가 중심이다.
+       `MID_PULLBACK` downtrend gate의 `signal_meta`와 반환 payload에 `sector_info`를 일관되게 싣도록 정리해,
+       반복 발생한 `⚠️ 눌림목 오류 (...): name 'sector_info' is not defined`를 제거.
+  이유: 섹터는 종목 포착 후 강화를 위한 보조 근거여야 하는데 기존 v60까지는 섹터 seed/요약 레이어가 종목 행동 경로보다 먼저 발화할 수 있었고,
+       v61 작업 중에는 `analyze_mid_pullback()` 지역 변수 초기화 순서까지 어긋나 눌림목 스캔 예외 탈락이 추가로 발생했음.
+  개선점: 종목 raw 포착→내부감시→A승격→섹터 강화 순서 일관성↑, near-A 후보의 진입가 감시 연결↑, 눌림목 예외 탈락↓.
+  주의점: 외부 A전용 정책은 유지하며, 내부 자동승격은 테마/체결/장중 miss 확증이 충분한 후보에만 제한적으로 적용된다.
 
 - v60 (2026-03-24): 선행형 A후보 자동확장 + ENTRY_POINT A등급 복구.
   [#1] `intraday_capture_mode.json`과 `_get_intraday_capture_mode()` / `_get_dynamic_general_a_relax_signal_types()` /
@@ -6555,6 +6570,74 @@ def _sanitize_carry_snapshot_map(raw_data, siglog_data: dict | None = None) -> t
         sanitized[code] = snap
 
     return sanitized, dropped_codes
+
+
+def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, today: str | None = None) -> set[str]:
+    """동시보유 제한에 실제로 반영할 '행동 가능한' 감시 코드를 수집.
+    v62: 단순 carry/_detected_stocks 전체가 아니라 entry_watch / execution_setup_watch /
+    최근 active signal_log로 연결된 코드 중심으로 계산해 stale 감시 잔존 때문에
+    신규 리더가 전부 position_limit에 막히는 현상을 줄인다.
+    """
+    actionable_codes: set[str] = set()
+    today = str(today or datetime.now().strftime("%Y%m%d"))
+
+    try:
+        for watch in list((_entry_watch or {}).values()):
+            if not isinstance(watch, dict):
+                continue
+            state = str(watch.get("entry_watch_state", "active") or "active").lower()
+            if state not in ("active", "watching", "pending"):
+                continue
+            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+            if code:
+                actionable_codes.add(code)
+    except Exception:
+        pass
+
+    try:
+        for watch in list((_execution_setup_watch or {}).values()):
+            if not isinstance(watch, dict):
+                continue
+            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+            if code:
+                actionable_codes.add(code)
+    except Exception:
+        pass
+
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
+    try:
+        with _state_lock:
+            detected_snapshot = dict(_detected_stocks)
+    except Exception:
+        detected_snapshot = dict(_detected_stocks)
+
+    for raw_code, info in detected_snapshot.items():
+        if not isinstance(info, dict):
+            continue
+        code = normalize_stock_code(raw_code or info.get("code"))
+        if not code:
+            continue
+        latest_rec = latest_by_code.get(code)
+        if not isinstance(latest_rec, dict):
+            continue
+        if latest_rec.get("status") not in TRACK_ACTIVE_STATUSES:
+            continue
+        if _is_orphan_tracking(latest_rec):
+            continue
+        if _is_tracking_display_expired(latest_rec, today):
+            continue
+        if normalize_stock_code(latest_rec.get("code")) != code:
+            continue
+
+        # entry_watch / execution_setup_watch가 아직 비어 있어도,
+        # 오늘 또는 직전 영업일의 실제 행동 후보만 position_limit에 반영.
+        rec_day = str(latest_rec.get("detect_date", "") or "")
+        elapsed_days = _get_tracking_elapsed_days(latest_rec, today)
+        if rec_day == today or elapsed_days <= 1:
+            if safe_int(latest_rec.get("entry_price", 0), 0) > 0 or bool(latest_rec.get("execution_setup_required")):
+                actionable_codes.add(code)
+
+    return actionable_codes
 
 
 def _should_skip_next_open_signal_record(rec: dict, today: str | None = None) -> bool:
@@ -24141,9 +24224,13 @@ def _get_carry_position_context() -> tuple[int, set[str]]:
         siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
     except Exception:
         siglog_data = {}
-    latest_by_code = _build_latest_tracking_by_code(siglog_data)
     today = datetime.now().strftime("%Y%m%d")
 
+    actionable_codes = _collect_actionable_position_limit_codes(siglog_data=siglog_data, today=today)
+    if actionable_codes:
+        return len(actionable_codes), actionable_codes
+
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
     carry_codes = set()
     try:
         with _state_lock:
