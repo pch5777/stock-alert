@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v56
+버전: v57
 날짜: 2026-03-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v57 (2026-03-24): 포착 외부알림 행동단계 지연 + NXT 내부포착/감시 보존.
+  [#1] `_should_delay_external_general_capture()` / `_persist_general_capture_without_external()` / `_has_pending_capture_watch()`를 추가해,
+       일반 포착 신호가 행동 가능 단계 전이면 외부알림만 지연하고 `save_signal_log()` / `register_entry_watch()` 내부 파이프라인은 유지하도록 수정.
+  [#2] `_dispatch_general_alert_signal()`에 위 지연 로직을 연결해,
+       `EARLY_DETECT`는 즉시 텔레그램 포착 알림 대신 내부 추적·진입감시로만 넘기고 이후 `체결확정`/`진입가 도달` 단계에서만 외부 행동 알림이 나가게 정리.
+  [#3] `execution_setup_required` 또는 `entry_price` 미확정 일반 포착도 같은 규칙으로 외부 발송을 늦춰,
+       “진입시키지도 않을 종목 포착 알림”이 사용자 채널에 먼저 노출되는 문제를 줄임.
+  이유: 사용자 원칙상 외부 알림은 정보 전달이 아니라 수익으로 이어지는 행동 신호여야 하는데,
+       v56까지는 NXT/조기포착 복구 과정에서 `EARLY_DETECT`가 즉시 외부로 노출돼 실행 단계 전 정보성 알림처럼 보일 수 있었음.
+  개선점: 외부 알림의 행동 가능성↑, 조기포착/NXT 내부 포착·감시 유지, 정보성 포착 스팸↓.
+  주의점: 이번 변경은 외부 노출 시점만 늦추는 것이며, `EARLY_DETECT` 포착 자체와 signal_log/entry_watch 등록은 유지된다.
 
 - v56 (2026-03-24): NXT 포착 외부알림 복구 — 장전/장후 NXT helper에 grade 부여.
   [#1] `_derive_general_signal_grade()`를 추가해, `SURGE` / `EARLY_DETECT` 계열이 `analyze()`와 동일한 A게이트 완화 규칙으로
@@ -16892,6 +16904,66 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     return strong_combo
 
 
+
+def _has_pending_capture_watch(code: str) -> bool:
+    code = normalize_stock_code(code)
+    if not code:
+        return False
+    try:
+        if _latest_entry_watch_by_code(code):
+            return True
+    except Exception:
+        pass
+    try:
+        for watch in list((_execution_setup_watch or {}).values()):
+            if normalize_stock_code((watch or {}).get("code")) == code:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _should_delay_external_general_capture(signal: dict) -> str:
+    if not isinstance(signal, dict):
+        return ""
+    if signal.get("force_external_capture_alert"):
+        return ""
+    sig_type = str(signal.get("signal_type") or "").upper()
+    entry_price = safe_int(signal.get("entry_price", 0), 0)
+    if sig_type == "EARLY_DETECT":
+        return "조기포착 행동단계 전 외부알림 지연"
+    if bool(signal.get("execution_setup_required")):
+        return "체결확인 전 외부알림 지연"
+    if entry_price <= 0:
+        return "진입가 미확정 외부알림 지연"
+    return ""
+
+
+def _persist_general_capture_without_external(s: dict, hist_key: str, source_label: str, delay_reason: str) -> bool:
+    code = normalize_stock_code(s.get("code"))
+    grade_upper = str(s.get("execution_grade") or s.get("grade") or "C").upper()
+    _logged = _record_internal_only_alert(hist_key, s, f"{source_label} {delay_reason}")
+    save_signal_log(s)
+    if s.get("signal_type") == "EARLY_DETECT":
+        save_early_detect(s)
+    if code and safe_int(s.get("entry_price", 0), 0) > 0 and (_logged or not _has_pending_capture_watch(code)):
+        register_entry_watch(s)
+        register_top_signal(s)
+    _record_shadow_capture(
+        s.get("code", ""), s.get("name", s.get("code", "")), "external_action_delayed", s.get("signal_type", ""),
+        stage=source_label,
+        extra={
+            "score": s.get("score", 0),
+            "grade": grade_upper,
+            "change_rate": s.get("change_rate", 0),
+            "market": s.get("market", ""),
+            "delay_reason": delay_reason,
+            "entry_price": s.get("entry_price", 0),
+        },
+    )
+    print(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
+    return True
+
 def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_label: str = "일반 포착") -> bool:
     if not isinstance(s, dict) or not s.get("code"):
         return False
@@ -16935,6 +17007,9 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
             )
             return False
     grade_upper = str(s.get("execution_grade") or s.get("grade") or "C").upper()
+    _delay_reason = _should_delay_external_general_capture(s)
+    if _delay_reason:
+        return _persist_general_capture_without_external(s, hist_key, source_label, _delay_reason)
     if not _should_send_external_grade_alert(s):
         _logged = _record_internal_only_alert(hist_key, s, f"{source_label} {grade_upper}등급 외부알림 억제(A전용)")
         if _logged:
