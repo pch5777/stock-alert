@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v68
+버전: v69
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v69 (2026-03-25): 눌림목 즉시 1차 진입 연동 + 도달 후 취소/보류 사유 사용자 통지 + entry_hit 모니터링 유지.
+  [#1] `register_entry_watch()`가 watch key를 반환하고 `_maybe_send_immediate_entry_hit_from_signal()` / `_send_entry_phase_alert()`를 추가해,
+       눌림목 포착 시 현재가가 대표 진입가 이하인 경우 포착 직후 같은 루프에서 1차 진입가 도달 알림까지 즉시 연동.
+       기존: 눌림목 포착 메시지에 `현재가=예상진입가`가 찍혀도 `check_entry_watch()` 다음 루프까지는 별도 행동 알림이 없어 사용자 체감이 어긋났음.
+       수정: MID_PULLBACK/ENTRY_POINT는 포착 직후 대표 진입가 도달 여부를 한 번 더 확인해, 차단 사유가 없으면 즉시 1차 행동 메시지를 발송.
+  [#2] `_notify_entry_guard_followup()` / `_record_entry_guard_followup()`를 추가하고 `check_entry_watch()`에 post-hit guard 분기를 연결.
+       기존: 1차 진입가 도달 후 신호강도 약화·거래량 폭락·섹터 약세·진입불가가 생겨도 사용자에겐 빠른 취소/보류 통지가 없었고, 일부 경로는 watch가 바로 만료될 수 있었음.
+       수정: 이미 `entry_hit`된 종목에서 취소/보류 사유가 발생하면 `진입 보류/취소 사유` 메시지를 1회 빠르게 발송하고, 내부 모니터링은 계속 유지.
+  [#3] `notify_count>=2` 이후에도 `entry_hit` watch는 알림횟수만료로 즉시 제거하지 않도록 조정.
+       기존: 1차/2차 알림 뒤 재접근 시 watch가 조기 제거돼 후속 보류/취소나 장마감 리스크 추적이 끊길 수 있었음.
+       수정: entry_hit/locked watch는 만료/상승이탈 전까지 active를 유지해 후속 내부 추적과 가이드가 이어지게 함.
+  이유: 사용자는 `좋은 종목 포착 → 진입가 알림 → 진입` 흐름을 기대했고, 이미 1차 진입했을 가능성이 있으므로 이후 취소/보류 사유도 빠르게 알아야 했음.
+  개선점: 눌림목 포착-행동 연결력↑, entry_hit 이후 취소/보류 가시성↑, 내부 모니터링 연속성↑.
+  주의점: 비A급 외부알림 확대는 하지 않으며, 취소/보류 알림은 entry_hit 이후 동일 사유 중복 발송을 억제함.
 
 - v68 (2026-03-25): 조건부 2종목 허용 + 포착 메시지 예상진입가(엔진 재사용) 표기.
   [#1] `_should_allow_conditional_second_position()` / `_extract_tracking_sector_theme()`를 추가하고
@@ -8469,7 +8484,9 @@ def run_mid_pullback_scan():
             continue
         send_mid_pullback_alert(s)
         save_signal_log(s)
-        register_entry_watch(s)                     # ★ 진입가 감시 등록
+        _watch_key = register_entry_watch(s)                     # ★ 진입가 감시 등록
+        if _maybe_send_immediate_entry_hit_from_signal(s, _watch_key):
+            _save_entry_watch_active()
         if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
             _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
             _sector_retry_snap["_alert_sender"] = "mid_pullback"
@@ -14399,6 +14416,7 @@ def register_entry_watch(s: dict):
     _record_capture_funnel_event("watch", s, {"entry_price": entry, "guard_mode": entry_guard_mode})
     _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
     print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
+    return log_key
 
 def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
     """가격은 도달했지만 실제 진입이 곤란한 상태를 signal_log에 기록."""
@@ -14496,6 +14514,328 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
         print(f"  🗑 근거약화 탈락 기록: {watch.get('name','')} {reason} @ {int(current_price or 0):,}")
     except Exception as e:
         print(f"⚠️ 근거약화 탈락 기록 오류: {e}")
+
+
+def _record_entry_guard_followup(watch: dict, reason: str, current_price: int):
+    """entry_hit 이후 취소/보류 사유를 signal_log에 기록하되 추적상태는 유지."""
+    try:
+        data = {}
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+        except Exception:
+            pass
+        target_log_key = str(watch.get("signal_log_key") or "").strip()
+        now_s = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        updated = False
+        for log_key, rec in data.items():
+            if target_log_key and log_key != target_log_key:
+                continue
+            if str(rec.get("code") or "") != str(watch.get("code") or ""):
+                continue
+            if rec.get("status") not in ("추적중", "진입준비", "진입가도달", "진입불가", "근거탈락"):
+                continue
+            rec["entry_guard_reason_latest"] = str(reason or "")
+            rec["entry_guard_time_latest"] = now_s
+            rec["entry_guard_price_latest"] = int(current_price or 0)
+            rec["entry_guard_monitoring_continues"] = True
+            updated = True
+            break
+        if updated:
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        print(f"  ⚠️ 진입 보류/취소 기록: {watch.get('name','')} {reason} @ {int(current_price or 0):,}")
+    except Exception as e:
+        print(f"⚠️ 진입 보류/취소 기록 오류: {e}")
+
+
+def _entry_guard_reason_label(reason: str) -> str:
+    mapping = {
+        "근거약화_신호강도약함": "신호강도 약화",
+        "근거약화_거래량폭락": "거래량 급감",
+        "섹터약세": "섹터 평균 약세",
+        "limit_up_locked": "상한가 잠김",
+        "upper_limit_reached": "상한가 도달",
+        "no_ask_liquidity": "매도호가 부족",
+    }
+    return mapping.get(str(reason or ""), str(reason or "사유 미상"))
+
+
+def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: int, use_nxt: bool = False, detail: str = "") -> bool:
+    reason = str(reason or "").strip()
+    if not reason:
+        return False
+    now_ts = time.time()
+    last_reason = str(watch.get("entry_guard_alert_reason") or "").strip()
+    last_ts = float(watch.get("entry_guard_alert_ts") or 0.0)
+    if last_reason == reason and (now_ts - last_ts) < max(180, ENTRY_REWATCH_MINS * 60):
+        return False
+    diff_pct = round(((price - entry) / entry) * 100, 1) if entry else 0.0
+    diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
+    sig_labels = {
+        "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+        "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
+        "PRECLOSE_GAP_ENTRY": "종가선진입",
+    }
+    sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
+    nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
+    hit_time = str(watch.get("entry_hit_time") or "") or _format_capture_datetime_label(
+        detect_date=watch.get('detect_date', ''), detect_time=watch.get('detect_time', '')
+    )
+    detail_line = f"\n📌 {detail}" if detail else ""
+    send_with_chart_buttons(
+        f"⚠️ <b>[진입 보류/취소 사유]</b>{nxt_notice}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+        f"원신호: {sig}  |  1차도달: {hit_time}  |  감지: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"사유: <b>{_entry_guard_reason_label(reason)}</b>{detail_line}\n"
+        f"현재가 <b>{int(price or 0):,}원</b>  ({diff_str})\n"
+        f"기준 진입가 <b>{int(entry or 0):,}원</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"• 아직 미진입이면 <b>신규 진입 보류</b>\n"
+        f"• 이미 1차 진입했다면 <b>내부 모니터링은 계속 유지</b>",
+        watch.get("code", ""), watch.get("name", "")
+    )
+    watch["entry_guard_alert_reason"] = reason
+    watch["entry_guard_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    watch["entry_guard_alert_ts"] = now_ts
+    watch["entry_guard_alert_price"] = int(price or 0)
+    _record_entry_guard_followup(watch, reason, price)
+    return True
+
+
+def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_nxt: bool = False, reach_via_recovery: bool = False, hit_ts: str | None = None) -> bool:
+    now_ts = time.time()
+    last_ts = watch.get("last_notified_ts", 0)
+    notify_count = safe_int(watch.get("notify_count", 0), 0)
+    cooldown_sec = ENTRY_REWATCH_MINS * 60
+    if notify_count >= 2:
+        return False
+    if now_ts - last_ts < cooldown_sec:
+        return False
+
+    diff_pct = ((price - entry) / entry * 100) if entry else 0.0
+    diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
+    stop_pct = round((watch["stop_loss"] - entry) / entry * 100, 1) if entry else 0
+    tgt_pct = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
+    nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
+
+    watch["last_notified_ts"] = now_ts
+    watch["notify_count"] = notify_count + 1
+    watch["entry_reference_only"] = False
+    watch["entry_reference_market"] = ""
+    watch["entry_reference_reason"] = ""
+    watch["entry_reference_time"] = ""
+    watch["entry_reference_price"] = 0
+
+    sig_labels = {
+        "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+        "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
+        "PRECLOSE_GAP_ENTRY": "종가선진입",
+    }
+    sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
+
+    _reasons = watch.get("reasons", [])
+    reasons_block = ""
+    if _reasons:
+        reasons_lines = "\n".join([f"  {r}" for r in _reasons[:3]])
+        reasons_block = f"\n📋 <b>포착 이유</b>\n{reasons_lines}\n"
+    sector_block = ""
+    try:
+        sector_info = calc_sector_momentum(watch["code"], watch["name"])
+        _theme = str(sector_info.get("theme", "") or "").strip()
+        _summary = str(sector_info.get("summary", "") or "").strip()
+        _rising = sector_info.get("rising", []) or []
+        _sector_lines = []
+        if _theme:
+            _sector_lines.append(f"🏭 <b>섹터 모멘텀</b> [{_theme}]")
+        elif _summary or _rising:
+            _sector_lines.append("🏭 <b>섹터 모멘텀</b>")
+        if _summary:
+            _sector_lines.append(f"  {_summary}")
+        if _rising:
+            _co_rise = ", ".join([
+                f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
+                for r in _rising[:4]
+            ])
+            _sector_lines.append(f"  📌 동반 상승: {_co_rise}")
+        if _sector_lines:
+            sector_block = "\n" + "\n".join(_sector_lines) + "\n"
+    except Exception:
+        sector_block = ""
+    _entry_hit_ts = str(hit_ts or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    _similar_stats = _get_similar_pattern_stats(
+        watch["code"],
+        watch.get("signal_type", ""),
+        float(watch.get("change_at_detect", cur.get("change_rate", 0)) or 0),
+        float(watch.get("volume_ratio", cur.get("volume_ratio", 0)) or 0),
+    )
+    _entry_exec_metrics = get_execution_speed_metrics(watch["code"], current_price=price)
+    _entry_exec_block = _entry_execution_status_block(
+        watch["code"],
+        price=price,
+        metrics=_entry_exec_metrics,
+        fallback_metrics=dict(watch.get("execution_metrics") or {}),
+    )
+    similar_block = ""
+    try:
+        _similar_line = _build_similar_pattern_summary_block(_similar_stats, top_exposed=True)
+        if _similar_line:
+            similar_block = f"{_similar_line}\n\n"
+    except Exception:
+        similar_block = ""
+
+    _strength = _classify_signal_strength(watch, _entry_exec_metrics)
+    _split_rule = _get_split_entry_rule(_strength)
+    if notify_count == 0 and _strength == "약한":
+        _log_suppressed_alert(
+            watch["code"], watch["name"],
+            "1차 정책제외 (약한 신호 관찰 전용)",
+            watch.get("signal_type", ""),
+            {"entry_price": entry, "filtered_price": int(price or 0), "strength": _strength}
+        )
+        _record_entry_policy_filtered(watch, "약한신호_관찰전용", price)
+        return False
+
+    is_phase1 = (notify_count == 0)
+    if is_phase1:
+        _p1_pct = _split_rule["phase1_pct"]
+        _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
+        _nxt_delta_block = _format_nxt_transition_delta_block(watch)
+        _reach_note_block = f"│ 🛠 회복모드 근접도달 허용  (+{_get_dynamic_entry_reach_slack_pct(watch)*100:.1f}%)\n" if reach_via_recovery else ""
+        send_with_chart_buttons(
+            f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+            f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
+            f"{_nxt_delta_block}{similar_block}"
+            f"{reasons_block}"
+            f"{sector_block}"
+            f"{_entry_exec_block}"
+            f"━━━━━━━━━━━━━━━\n"
+            f"┌─────────────────────\n"
+            f"│ {_strength_emoji} <b>1차 진입 구간</b>  (신호: {_strength})\n"
+            f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+            f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
+            f"{_reach_note_block}"
+            f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
+            f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
+            f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
+            f"└─────────────────────",
+            watch["code"], watch["name"]
+        )
+        watch["phase1_price"] = price
+        watch["phase1_pct"] = _p1_pct
+        watch["signal_strength"] = _strength
+        _bottom_check = confirm_bottom_and_signal(
+            watch,
+            price,
+            {"volume_ratio": cur.get("volume_ratio", 0), "execution_metrics": _entry_exec_metrics, **dict(cur or {})},
+        )
+        if _bottom_check.get("is_bottom_confirmed") and _bottom_check.get("should_send_signal"):
+            _bottom_title = "✅ 바닥 확인 + 재상승 신호" if _bottom_check.get("signal_type") == "entry_signal" else "👀 바닥 형성 확인"
+            send_with_chart_buttons(
+                f"{_bottom_title}{nxt_notice}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                f"{_bottom_check.get('reason','')}",
+                watch["code"], watch["name"]
+            )
+    else:
+        _p1_price = watch.get("phase1_price", entry)
+        _p1_pct = watch.get("phase1_pct", _split_rule["phase1_pct"])
+        if not _split_rule["phase2_allowed"]:
+            _p2_pct = 0
+            _total_pct = _p1_pct
+            _avg_price = _p1_price
+            _decision_emoji = "🔵"
+            _decision_label = "추가진입: 금지"
+            _p2_reasons = ["🔵 약한 신호 — 2차 추가매수 금지 대상"]
+            _p2_detail = "신호 강도 부족 — 1차 진입분만 유지, 추가매수 불가"
+            _stop_adj = "유지"
+        else:
+            _p2_judgement = _judge_phase2_entry(watch, cur, price, _entry_exec_metrics)
+            _p2_decision = _p2_judgement["decision"]
+            _p2_reasons = _p2_judgement["reasons"]
+            _p2_detail = _p2_judgement["detail"]
+            if _p2_decision == "가능":
+                _p2_pct = _split_rule["phase2_pct"]
+                _total_pct = _p1_pct + _p2_pct
+                _avg_price = _calc_avg_entry_price(_p1_price, price, _p1_pct, _p2_pct)
+                _decision_emoji = "✅"
+                _decision_label = "추가진입: 가능"
+            elif _p2_decision == "보류":
+                _p2_pct = 0
+                _total_pct = _p1_pct
+                _avg_price = _p1_price
+                _decision_emoji = "🟡"
+                _decision_label = "추가진입: 보류"
+            else:
+                _p2_pct = 0
+                _total_pct = _p1_pct
+                _avg_price = _p1_price
+                _decision_emoji = "🔵"
+                _decision_label = "추가진입: 금지"
+            _stop_adj = "유지"
+            if _p2_decision == "가능" and _p2_pct > 0:
+                _new_stop = int(_avg_price * (1 - abs(stop_pct) / 100)) if stop_pct else watch["stop_loss"]
+                if _new_stop != watch["stop_loss"]:
+                    _stop_adj = f"조정 ({watch['stop_loss']:,}→{_new_stop:,}원)"
+        _reasons_str = "\n".join([f"  {r}" for r in _p2_reasons])
+        send_with_chart_buttons(
+            f"🔔🔔 <b>[2차 진입 판단]</b>{nxt_notice}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+            f"원신호: {sig}  |  도달: {_entry_hit_ts}\n\n"
+            f"{_entry_exec_block}"
+            f"━━━━━━━━━━━━━━━\n"
+            f"┌─────────────────────\n"
+            f"│ {_decision_emoji} <b>{_decision_label}</b>\n"
+            f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+            f"│ 💰 권장 추가비중: <b>{_p2_pct}%</b>\n"
+            f"│ 📊 총 누적 권장비중: <b>{_total_pct}%</b>\n"
+            f"│ 📐 평균단가 예상: <b>{_avg_price:,}원</b>\n"
+            f"│ 🛡 손절가: <b>{_stop_adj}</b>\n"
+            f"├─────────────────────\n"
+            f"│ <b>판단 근거</b>\n"
+            f"{_reasons_str}\n"
+            f"│ → {_p2_detail}\n"
+            f"└─────────────────────",
+            watch["code"], watch["name"]
+        )
+
+    watch['entry_hit'] = True
+    watch['entry_hit_time'] = _entry_hit_ts
+    watch['entry_hit_price'] = price
+    if ' ' in _entry_hit_ts:
+        watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
+    try:
+        _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type', ''), hit_price=price, hit_time=_entry_hit_ts, log_key=watch.get('signal_log_key'))
+        _record_capture_funnel_event("reached", watch, {"hit_price": int(price or 0), "recovery_reach": bool(reach_via_recovery)})
+    except Exception:
+        pass
+    _phase_label = "1차" if is_phase1 else "2차"
+    print(f"  🎯 {_phase_label} 진입가 도달: {watch['name']} {price:,} / 진입 {entry:,}")
+    return True
+
+
+def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | None = None) -> bool:
+    if not isinstance(signal, dict):
+        return False
+    sig_type = str(signal.get("signal_type") or "").upper()
+    if sig_type not in ("MID_PULLBACK", "ENTRY_POINT"):
+        return False
+    if not watch_key or watch_key not in _entry_watch:
+        return False
+    watch = _entry_watch.get(watch_key) or {}
+    if not isinstance(watch, dict) or watch.get("entry_hit") or watch.get("entry_hit_locked"):
+        return False
+    price = safe_int(signal.get("price", 0), 0)
+    entry = safe_int(watch.get("entry_price", 0), 0)
+    if price <= 0 or entry <= 0 or price > entry:
+        return False
+    blocked_reason = _detect_entry_block_reason(signal, watch, price, entry)
+    if blocked_reason:
+        return False
+    return _send_entry_phase_alert(watch, dict(signal), price, entry, use_nxt=bool(signal.get("use_nxt")), reach_via_recovery=False)
 
 
 def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
@@ -15085,10 +15425,9 @@ def check_entry_watch():
                 notify_count = watch.get("notify_count", 0)
                 cooldown_sec = ENTRY_REWATCH_MINS * 60
                 # v41.66: 1차(0회)+2차(1회) = 최대 2회 알림
-                if notify_count >= 2:
+                if notify_count >= 2 and not (watch.get("entry_hit") or watch.get("entry_hit_locked")):
                     expired.append((log_key, "알림횟수만료", _entry_watch_final_status(watch, "진입미달")))
                     continue
-                if now_ts - last_ts < cooldown_sec: continue
 
                 _entry_exec_metrics = _entry_exec_metrics if isinstance(locals().get("_entry_exec_metrics"), dict) else get_execution_speed_metrics(watch["code"], current_price=price)
                 if not should_skip_expiration_for_dart_watch(watch):
@@ -15096,16 +15435,26 @@ def check_entry_watch():
                     vol_now = float(cur.get("volume_ratio", watch.get("volume_ratio", 0)) or 0)
                     vol_at_detect = float(watch.get("volume_ratio_at_detect", watch.get("volume_ratio", vol_now)) or vol_now)
                     if strength_now == "약한":
+                        if watch.get("entry_hit"):
+                            if _notify_entry_guard_followup(watch, "근거약화_신호강도약함", price, entry, use_nxt=use_nxt, detail="1차 도달 이후 신호 강도가 약화되어 신규 진입은 보류가 적절합니다."):
+                                changed_active = True
+                            continue
                         _record_entry_dropped(watch, "근거약화_신호강도약함", price)
                         expired.append((log_key, "근거약화_신호강도약함", "근거탈락"))
                         continue
                     if vol_at_detect > 0 and vol_now < vol_at_detect * 0.5:
+                        if watch.get("entry_hit"):
+                            _ratio = (vol_now / vol_at_detect) if vol_at_detect else 0.0
+                            if _notify_entry_guard_followup(watch, "근거약화_거래량폭락", price, entry, use_nxt=use_nxt, detail=f"포착 대비 거래량이 {_ratio:.2f}배 수준으로 약화되었습니다."):
+                                changed_active = True
+                            continue
                         _record_entry_dropped(watch, "근거약화_거래량폭락", price)
                         expired.append((log_key, "근거약화_거래량폭락", "근거탈락"))
                         continue
 
                 # v40.0-#2: 섹터 약세 시 진입가 도달 알림 차단 (내부 로그만)
                 _sector_blocked = False
+                _sector_avg = None
                 try:
                     _s_theme = watch.get("sector_theme", "")
                     if _s_theme and _s_theme != "기타업종":
@@ -15123,17 +15472,21 @@ def check_entry_watch():
                                         continue
                                 if _chg_list and (sum(_chg_list) / len(_chg_list)) <= -3.0:
                                     _sector_blocked = True
+                                    _sector_avg = round(sum(_chg_list) / len(_chg_list), 1)
                                     _log_suppressed_alert(
                                         watch["code"], watch["name"],
                                         f"섹터 약세 차단 (섹터 {_s_theme} 평균 {sum(_chg_list)/len(_chg_list):.1f}%)",
                                         watch.get("signal_type", ""),
-                                        {"sector_avg_chg": round(sum(_chg_list)/len(_chg_list), 1)}
+                                        {"sector_avg_chg": _sector_avg}
                                     )
                                 break
                 except Exception:
                     pass
                 if _sector_blocked:
-                    continue  # 사용자 알림 차단, 내부 로그만 기록
+                    if watch.get("entry_hit"):
+                        if _notify_entry_guard_followup(watch, "섹터약세", price, entry, use_nxt=use_nxt, detail=f"섹터 평균 등락률이 {_sector_avg:+.1f}%로 약화되었습니다."):
+                            changed_active = True
+                    continue  # 사용자 알림 차단, 내부 로그/모니터링 유지
 
                 _blocked_reason = _detect_entry_block_reason(cur, watch, price, entry)
                 if _blocked_reason:
@@ -15144,6 +15497,9 @@ def check_entry_watch():
                             watch.get("signal_type", ""),
                             {"entry_price": entry, "blocked_price": int(price or 0), "change_rate": cur.get("change_rate", 0), "ask_qty": cur.get("ask_qty", 0), "bid_qty": cur.get("bid_qty", 0)}
                         )
+                        if watch.get("entry_hit"):
+                            if _notify_entry_guard_followup(watch, _blocked_reason, price, entry, use_nxt=use_nxt, detail="매도호가가 얇아 실제 체결 품질을 다시 확인해야 합니다."):
+                                changed_active = True
                         continue
                     watch["entry_blocked"] = True
                     watch["entry_blocked_reason"] = _blocked_reason
@@ -15157,226 +15513,13 @@ def check_entry_watch():
                         watch.get("signal_type", ""),
                         {"entry_price": entry, "blocked_price": int(price or 0), "change_rate": cur.get("change_rate", 0), "ask_qty": cur.get("ask_qty", 0), "bid_qty": cur.get("bid_qty", 0)}
                     )
+                    if watch.get("entry_hit"):
+                        if _notify_entry_guard_followup(watch, _blocked_reason, price, entry, use_nxt=use_nxt, detail="이미 1차 도달 후라도 현재 체결 여건은 진입 보류가 적절합니다."):
+                            changed_active = True
                     continue
 
-                watch["last_notified_ts"] = now_ts
-                watch["notify_count"]     = notify_count + 1
-                watch["entry_reference_only"] = False
-                watch["entry_reference_market"] = ""
-                watch["entry_reference_reason"] = ""
-                watch["entry_reference_time"] = ""
-                watch["entry_reference_price"] = 0
-                changed_active = True
-                sig_labels = {
-                    "UPPER_LIMIT":"상한가","NEAR_UPPER":"상한가근접","SURGE":"급등",
-                    "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목","ENTRY_POINT":"눌림목",
-                    "PRECLOSE_GAP_ENTRY":"종가선진입",
-                }
-                sig       = sig_labels.get(watch["signal_type"], watch["signal_type"])
-                diff_str  = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
-                stop_pct  = round((watch["stop_loss"]    - entry) / entry * 100, 1) if entry else 0
-                tgt_pct   = round((watch["target_price"] - entry) / entry * 100, 1) if entry else 0
-                nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
-
-                # ── 공통 블록 생성 ──
-                _reasons = watch.get("reasons", [])
-                reasons_block = ""
-                if _reasons:
-                    reasons_lines = "\n".join([f"  {r}" for r in _reasons[:3]])
-                    reasons_block = f"\n📋 <b>포착 이유</b>\n{reasons_lines}\n"
-                sector_block = ""
-                try:
-                    sector_info = calc_sector_momentum(watch["code"], watch["name"])
-                    _theme = str(sector_info.get("theme", "") or "").strip()
-                    _summary = str(sector_info.get("summary", "") or "").strip()
-                    _rising = sector_info.get("rising", []) or []
-                    _sector_lines = []
-                    if _theme:
-                        _sector_lines.append(f"🏭 <b>섹터 모멘텀</b> [{_theme}]")
-                    elif _summary or _rising:
-                        _sector_lines.append("🏭 <b>섹터 모멘텀</b>")
-                    if _summary:
-                        _sector_lines.append(f"  {_summary}")
-                    if _rising:
-                        _co_rise = ", ".join([
-                            f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%"
-                            for r in _rising[:4]
-                        ])
-                        _sector_lines.append(f"  📌 동반 상승: {_co_rise}")
-                    if _sector_lines:
-                        sector_block = "\n" + "\n".join(_sector_lines) + "\n"
-                except Exception:
-                    sector_block = ""
-                _entry_hit_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                _similar_stats = _get_similar_pattern_stats(
-                    watch["code"],
-                    watch.get("signal_type", ""),
-                    float(watch.get("change_at_detect", cur.get("change_rate", 0)) or 0),
-                    float(watch.get("volume_ratio", cur.get("volume_ratio", 0)) or 0),
-                )
-                _entry_exec_metrics = get_execution_speed_metrics(watch["code"], current_price=price)
-                _entry_exec_block = _entry_execution_status_block(
-                    watch["code"],
-                    price=price,
-                    metrics=_entry_exec_metrics,
-                    fallback_metrics=dict(watch.get("execution_metrics") or {}),
-                )
-                similar_block = ""
-                try:
-                    _similar_line = _build_similar_pattern_summary_block(_similar_stats, top_exposed=True)
-                    if _similar_line:
-                        similar_block = f"{_similar_line}\n\n"
-                except Exception:
-                    similar_block = ""
-
-                # ── v41.66: 1차/2차 분기 ──
-                is_phase1 = (notify_count == 0)
-                is_phase2 = (notify_count == 1)
-
-                # 신호 강도 판정
-                _strength = _classify_signal_strength(watch, _entry_exec_metrics)
-                _split_rule = _get_entry_split_rule(_strength)
-
-                if is_phase1 and _strength == "약한":
-                    _log_suppressed_alert(
-                        watch["code"], watch["name"],
-                        "1차 정책제외 (약한 신호 관찰 전용)",
-                        watch.get("signal_type", ""),
-                        {"entry_price": entry, "filtered_price": int(price or 0), "strength": _strength}
-                    )
-                    _record_entry_policy_filtered(watch, "약한신호_관찰전용", price)
-                    expired.append((log_key, "정책제외_약한신호", "정책제외"))
-                    continue
-
-                if is_phase1:
-                    # ━━━ 1차 진입가 도달 ━━━
-                    _p1_pct = _split_rule["phase1_pct"]
-                    _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
-                    _nxt_delta_block = _format_nxt_transition_delta_block(watch)
-                    _reach_note_block = f"│ 🛠 회복모드 근접도달 허용  (+{_reach_slack_pct*100:.1f}%)\n" if _reach_via_recovery else ""
-                    send_with_chart_buttons(
-                        f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                        f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
-                        f"{_nxt_delta_block}{similar_block}"
-                        f"{reasons_block}"
-                        f"{sector_block}"
-                        f"{_entry_exec_block}"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"┌─────────────────────\n"
-                        f"│ {_strength_emoji} <b>1차 진입 구간</b>  (신호: {_strength})\n"
-                        f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
-                        f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
-                        f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
-                        f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
-                        f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
-                        f"└─────────────────────",
-                        watch["code"], watch["name"]
-                    )
-                    watch["phase1_price"] = price
-                    watch["phase1_pct"] = _p1_pct
-                    watch["signal_strength"] = _strength
-                    _bottom_check = confirm_bottom_and_signal(
-                        watch,
-                        price,
-                        {"volume_ratio": cur.get("volume_ratio", 0), "execution_metrics": _entry_exec_metrics, **dict(cur or {})},
-                    )
-                    if _bottom_check.get("is_bottom_confirmed") and _bottom_check.get("should_send_signal"):
-                        _bottom_title = "✅ 바닥 확인 + 재상승 신호" if _bottom_check.get("signal_type") == "entry_signal" else "👀 바닥 형성 확인"
-                        send_with_chart_buttons(
-                            f"{_bottom_title}{nxt_notice}\n"
-                            f"━━━━━━━━━━━━━━━\n"
-                            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                            f"{_bottom_check.get('reason','')}",
-                            watch["code"], watch["name"]
-                        )
-
-                elif is_phase2:
-                    # ━━━ 2차 추가진입 판단 ━━━
-                    _p1_price = watch.get("phase1_price", entry)
-                    _p1_pct = watch.get("phase1_pct", _split_rule["phase1_pct"])
-
-                    # v41.80: 약한 신호(phase2_allowed=False)이면 API 호출 없이 즉시 금지
-                    if not _split_rule["phase2_allowed"]:
-                        _p2_pct = 0
-                        _total_pct = _p1_pct
-                        _avg_price = _p1_price
-                        _decision_emoji = "🔵"
-                        _decision_label = "추가진입: 금지"
-                        _p2_reasons = ["🔵 약한 신호 — 2차 추가매수 금지 대상"]
-                        _p2_detail = "신호 강도 부족 — 1차 진입분만 유지, 추가매수 불가"
-                        _stop_adj = "유지"
-                    else:
-                        _p2_judgement = _judge_phase2_entry(watch, cur, price, _entry_exec_metrics)
-                        _p2_decision = _p2_judgement["decision"]
-                        _p2_reasons = _p2_judgement["reasons"]
-                        _p2_detail = _p2_judgement["detail"]
-
-                        if _p2_decision == "가능":
-                            _p2_pct = _split_rule["phase2_pct"]
-                            _total_pct = _p1_pct + _p2_pct
-                            _avg_price = _calc_avg_entry_price(_p1_price, price, _p1_pct, _p2_pct)
-                            _decision_emoji = "✅"
-                            _decision_label = "추가진입: 가능"
-                        elif _p2_decision == "보류":
-                            _p2_pct = 0
-                            _total_pct = _p1_pct
-                            _avg_price = _p1_price
-                            _decision_emoji = "🟡"
-                            _decision_label = "추가진입: 보류"
-                        else:  # 금지
-                            _p2_pct = 0
-                            _total_pct = _p1_pct
-                            _avg_price = _p1_price
-                            _decision_emoji = "🔵"
-                            _decision_label = "추가진입: 금지"
-
-                        # 손절 조정 여부
-                        _stop_adj = "유지"
-                        if _p2_decision == "가능" and _p2_pct > 0:
-                            _new_stop = int(_avg_price * (1 - abs(stop_pct) / 100)) if stop_pct else watch["stop_loss"]
-                            if _new_stop != watch["stop_loss"]:
-                                _stop_adj = f"조정 ({watch['stop_loss']:,}→{_new_stop:,}원)"
-                            else:
-                                _stop_adj = "유지"
-
-                    _reasons_str = "\n".join([f"  {r}" for r in _p2_reasons])
-                    send_with_chart_buttons(
-                        f"🔔🔔 <b>[2차 진입 판단]</b>{nxt_notice}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-                        f"원신호: {sig}  |  도달: {_entry_hit_ts}\n\n"
-                        f"{_entry_exec_block}"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"┌─────────────────────\n"
-                        f"│ {_decision_emoji} <b>{_decision_label}</b>\n"
-                        f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
-                        f"│ 💰 권장 추가비중: <b>{_p2_pct}%</b>\n"
-                        f"│ 📊 총 누적 권장비중: <b>{_total_pct}%</b>\n"
-                        f"│ 📐 평균단가 예상: <b>{_avg_price:,}원</b>\n"
-                        f"│ 🛡 손절가: <b>{_stop_adj}</b>\n"
-                        f"├─────────────────────\n"
-                        f"│ <b>판단 근거</b>\n"
-                        f"{_reasons_str}\n"
-                        f"│ → {_p2_detail}\n"
-                        f"└─────────────────────",
-                        watch["code"], watch["name"]
-                    )
-
-                watch['entry_hit'] = True
-                watch['entry_hit_time'] = _entry_hit_ts
-                watch['entry_hit_price'] = price
-                changed_active = True
-                if ' ' in _entry_hit_ts:
-                    watch['entry_hit_date'], watch['entry_hit_clock'] = _entry_hit_ts.split(' ', 1)
-                try:
-                    _mark_entry_hit_in_signal_log(watch['code'], watch.get('signal_type',''), hit_price=price, hit_time=_entry_hit_ts, log_key=watch.get('signal_log_key'))
-                    _record_capture_funnel_event("reached", watch, {"hit_price": int(price or 0), "recovery_reach": bool(_reach_via_recovery)})
-                except Exception:
-                    pass
-                _phase_label = "1차" if is_phase1 else "2차"
-                print(f"  🎯 {_phase_label} 진입가 도달: {watch['name']} {price:,} / 진입 {entry:,}")
+                if _send_entry_phase_alert(watch, cur, price, entry, use_nxt=use_nxt, reach_via_recovery=_reach_via_recovery):
+                    changed_active = True
         except Exception:
             continue
     for item in expired:
