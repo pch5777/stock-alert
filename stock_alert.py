@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v72
+버전: v73
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v73 (2026-03-25): 일반 눌림목 진입 신호의 상단 가격 문구를 대표진입가 기준으로 정합화.
+  [#1] `register_entry_watch()`가 대표 진입가 가드 적용 후 값을 원본 signal 스냅샷(`s["entry_price"]`)에도 되돌려 쓰도록 동기화.
+       기존: watch에는 guard 후 대표진입가가 저장돼도, 직후 발송되는 `[눌림목 진입 신호]` 메시지는 포착 시점 snapshot 값을 그대로 써 상단 가격표시가 watch 기준과 어긋날 수 있었음.
+       수정: register 직후 signal snapshot에도 동일 대표진입가를 반영해, 이후 메시지/보조 로직이 같은 가격 기준을 사용하도록 맞춤.
+  [#2] `send_mid_pullback_alert()`가 `MID_PULLBACK`/`ENTRY_POINT` 일반 메시지 상단 보조가격 라벨을 `예상진입가`가 아니라 `대표진입가`로 override.
+       기존: 현재가와 동일 가격이어도 `[눌림목 진입 신호]` 상단에 `예상진입가`가 찍혀, 이미 엔진이 확정한 대표 진입 기준을 사용자 입장에서 오해하기 쉬웠음.
+       수정: 일반 눌림목 메시지는 상단에 `대표진입가`를 직접 표기하고, 통합 메시지의 `도달가` override와도 역할이 구분되게 정리.
+  이유: 눌림목 계열은 포착 단계에서도 실제 감시/행동 기준이 대표진입가이므로, 상단 가격 라벨이 `예상`으로 보이면 메시지 해석이 흔들릴 수 있었음.
+  개선점: 일반 눌림목 메시지 해석력↑, 포착/감시 기준 정합성↑, `현재가=예상진입가` 표시 혼선↓.
+  주의점: 다른 신호 타입의 상단 `예상진입가` 표기는 유지되며, 이번 수정은 눌림목 계열 일반 메시지에만 한정됨.
 
 - v72 (2026-03-25): 눌림목 포착+1차 진입 통합 메시지의 상단 가격 라벨을 예상진입가→도달가로 정합화.
   [#1] `_format_capture_secondary_price_line()`를 추가하고 `_build_capture_focus_price_line()`에 상단 보조가격 override 경로를 연결.
@@ -8594,6 +8605,11 @@ def run_mid_pullback_scan():
 def send_mid_pullback_alert(s: dict):
     stock_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = stock_name
+    entry_price = safe_int(s.get("entry_price", 0), 0)
+    if str(s.get("signal_type") or "").upper() in ("MID_PULLBACK", "ENTRY_POINT") and entry_price > 0:
+        s["_capture_focus_secondary_label"] = "대표진입가"
+        s["_capture_focus_secondary_price"] = entry_price
+        s["_capture_focus_secondary_source_label"] = ""
     grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(s.get("grade"), "📊")
     grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(s.get("grade"), "")
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
@@ -14402,6 +14418,7 @@ def register_entry_watch(s: dict):
         detect_date=previous_first_detect_date,
         miss_count=previous_miss_count
     )
+    s["entry_price"] = int(entry or 0)
 
     try:
         sig_data = {}
