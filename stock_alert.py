@@ -15096,22 +15096,23 @@ def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
     """v76: 종목 거래정지 여부 통합 판별.
     KIS API 플래그(trht_yn 등) 또는 DART 거래정지 공시 중 하나라도 감지되면 True.
     cur: get_stock_price/get_nxt_stock_price 반환값 (없으면 API 플래그 체크 생략)
+    주의: 장마감 후 호가 소멸은 정상이므로 호가 기반 판별은 사용하지 않음.
     """
-    # 1) KIS API 응답 플래그 체크
+    # 1) KIS API 응답 플래그 체크 (명시적 정지 플래그만)
     if isinstance(cur, dict):
         for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
             _v = str(cur.get(_k) or "").upper()
             if _v in ("Y", "1", "T", "TRUE", "H", "2"):
                 return True
-        # 호가 완전 소멸 (거래정지 시 ask/bid 모두 0)
-        if safe_int(cur.get("ask_qty", -1), -1) == 0 and safe_int(cur.get("bid_qty", -1), -1) == 0:
-            if safe_int(cur.get("ask_price", -1), -1) == 0 and safe_int(cur.get("bid_price", -1), -1) == 0:
-                return True
-    # 2) DART 캐시 체크 (거래정지 키워드)
+    # 2) DART 캐시 체크 (거래정지 키워드, 당일 조회분만)
     cached = _dart_risk_cache.get(code)
     if isinstance(cached, dict) and cached.get("is_risk"):
         title = str(cached.get("title") or "")
-        if "거래정지" in title or "매매정지" in title:
+        # 당일 캐시인지 확인 (ts가 오늘 날짜 00:00 이후)
+        import time as _time
+        from datetime import date as _date
+        _today_start = _time.mktime(_date.today().timetuple())
+        if ("거래정지" in title or "매매정지" in title) and cached.get("ts", 0) >= _today_start:
             return True
     return False
 
