@@ -3,11 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v75
+버전: v76
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v76 (2026-03-25): 거래정지 종목 즉시 차단 — entry_watch 만료 + 포착 억제.
+  [#1] `get_nxt_stock_price()`에 `vi_cls_code`/`raw_status_code` 거래정지 플래그 필드 추가 (KRX와 동일 구조).
+  [#2] `_is_trading_halt()` 헬퍼 신설 — KIS API 플래그(trht_yn 등) + 호가 완전 소멸 + DART 캐시 거래정지 키워드 통합 판별.
+  [#3] `_notify_trading_halt_cancel()` 신설 — 거래정지 감지 시 [포착 취소 — 거래정지] 알림 발송 (중복 방지).
+  [#4] `check_entry_watch()` KRX/NXT 분기 직후 `_is_trading_halt()` 호출 → True이면 즉시 만료 + 취소 알림.
+  [#5] `_dispatch_general_alert_signal()` send_alert 직전 `_is_trading_halt()` 체크 → True이면 포착 알림 억제.
+  [#6] `check_dart_risk()` 거래정지/매매정지 키워드 히트 시 캐시 ts=0 → 다음 호출 즉시 재조회.
+  이유: 스피어(347700) 케이스 — 14:45 거래정지 후에도 17:06/17:15/18:37 등 반복 포착/알림 발송.
+        KIS API가 마지막 가격을 그대로 반환하고, DART 캐시 10분 TTL 동안 거래정지 상태를 스캔이 인식 못함.
+  개선점: 거래정지 종목 포착 즉시 차단, entry_watch 즉시 만료, 사용자 취소 알림 1회 발송.
+  주의점: API 플래그가 없고 DART 미확인 상태면 호가 완전 소멸(ask=bid=0)로 2차 판별.
 
 - v75 (2026-03-25): entry_hit 종목 재포착 시 신호 강도 방향 기반 분기 — 강화→phase2 트리거 / 약화→내부 기록.
   [#1] `_dispatch_general_alert_signal()`에 entry_hit=True watch 존재 시 분기 로직 추가.
@@ -9489,6 +9501,8 @@ def get_nxt_stock_price(code: str) -> dict:
         "bid_price": int(o.get("bidp1",0) or 0),
         "open": int(o.get("stck_oprc",0) or 0),
         "market": "NXT",
+        "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
     }
     try:
         _record_execution_snapshot(code, payload, market="NXT")
@@ -14701,6 +14715,40 @@ def _entry_guard_reason_label(reason: str) -> str:
     return mapping.get(str(reason or ""), str(reason or "사유 미상"))
 
 
+def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False) -> None:
+    """v76: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
+    code = watch.get("code", "")
+    name = watch.get("name", code)
+    # 중복 발송 방지
+    if watch.get("halt_cancel_notified"):
+        return
+    watch["halt_cancel_notified"] = True
+    nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
+    entry = safe_int(watch.get("entry_price", 0), 0)
+    sig_labels = {
+        "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+        "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
+        "PRECLOSE_GAP_ENTRY": "종가선진입",
+    }
+    sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
+    msg = (
+        f"🚫 <b>[포착 취소 — 거래정지]</b>{nxt_notice}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🔵 <b>{name}</b>  <code>{code}</code>\n"
+        f"원신호: {sig}  |  감지: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"📋 사유: <b>주권매매거래정지</b>\n"
+        f"💵 기준 진입가 <b>{entry:,}원</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"• 거래정지 해제 전까지 진입 불가\n"
+        f"• 감시 종료 — 재상장 시 재포착 대기"
+    )
+    try:
+        send_with_chart_buttons(msg, code, name)
+        print(f"  🚫 거래정지 취소 알림: {name} ({code})")
+    except Exception as _e:
+        print(f"  ⚠️ 거래정지 취소 알림 오류: {_e}")
+
+
 def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: int, use_nxt: bool = False, detail: str = "") -> bool:
     reason = str(reason or "").strip()
     if not reason:
@@ -15041,6 +15089,30 @@ def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty <= 0 and bid_qty <= 0:
         return True
+    return False
+
+
+def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
+    """v76: 종목 거래정지 여부 통합 판별.
+    KIS API 플래그(trht_yn 등) 또는 DART 거래정지 공시 중 하나라도 감지되면 True.
+    cur: get_stock_price/get_nxt_stock_price 반환값 (없으면 API 플래그 체크 생략)
+    """
+    # 1) KIS API 응답 플래그 체크
+    if isinstance(cur, dict):
+        for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
+            _v = str(cur.get(_k) or "").upper()
+            if _v in ("Y", "1", "T", "TRUE", "H", "2"):
+                return True
+        # 호가 완전 소멸 (거래정지 시 ask/bid 모두 0)
+        if safe_int(cur.get("ask_qty", -1), -1) == 0 and safe_int(cur.get("bid_qty", -1), -1) == 0:
+            if safe_int(cur.get("ask_price", -1), -1) == 0 and safe_int(cur.get("bid_price", -1), -1) == 0:
+                return True
+    # 2) DART 캐시 체크 (거래정지 키워드)
+    cached = _dart_risk_cache.get(code)
+    if isinstance(cached, dict) and cached.get("is_risk"):
+        title = str(cached.get("title") or "")
+        if "거래정지" in title or "매매정지" in title:
+            return True
     return False
 
 
@@ -15496,6 +15568,10 @@ def check_entry_watch():
                 price = cur.get("price", 0)
                 if not price:
                     continue
+                # v76: 거래정지 즉시 만료
+                if _is_trading_halt(code, cur):
+                    _notify_trading_halt_cancel(watch)
+                    expired.append((log_key, "거래정지", _entry_watch_final_status(watch, "거래정지"))); continue
                 if nxt_reference_ok and _is_krx_vi_reference_mode(cur, code):
                     nxt_cur = get_nxt_stock_price(code)
                     nxt_price = nxt_cur.get("price", 0)
@@ -15513,6 +15589,10 @@ def check_entry_watch():
                 price = cur.get("price", 0)
                 if not price:
                     continue
+                # v76: NXT에서도 거래정지 즉시 만료
+                if _is_trading_halt(code, cur):
+                    _notify_trading_halt_cancel(watch, use_nxt=True)
+                    expired.append((log_key, "거래정지", _entry_watch_final_status(watch, "거래정지"))); continue
             else:
                 continue
 
@@ -18603,7 +18683,12 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         return False
     _internal_only_alert_history.pop(hist_key, None)
 
-    # v75: 이미 entry_hit=True인 종목에 신규 신호가 오면 [포착 알림] 대신 신호 방향에 따라 분기
+    # v76: 포착 발송 직전 거래정지 최종 확인
+    _live_for_halt = _live if isinstance(_live, dict) else {}
+    if _is_trading_halt(normalize_stock_code(s.get("code", "")), _live_for_halt or None):
+        print(f"  🚫 거래정지 차단: {s.get('name','')} [{s.get('signal_type','')}] — 포착 알림 억제")
+        save_signal_log(s)
+        return False
     # - 강화(눌림목→급등 등): phase2 트리거로 연결
     # - 약화(급등→눌림목 등): 내부 기록만 유지
     _SIGNAL_STRENGTH_RANK = {
@@ -19234,6 +19319,9 @@ def check_dart_risk(code: str) -> dict:
             if any(kw in title for kw in DART_RISK_KEYWORDS):
                 result["is_risk"] = True
                 result["title"]   = title
+                # v76: 거래정지 키워드는 캐시 TTL 0 → 다음 호출 시 즉시 재조회
+                if "거래정지" in title or "매매정지" in title:
+                    result["ts"] = 0
                 break
     except Exception as e:
         print(f"  ⚠️ DART리스크체크오류 [{code}]: {e}")
