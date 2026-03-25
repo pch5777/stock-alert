@@ -3,23 +3,34 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v76
+버전: v77
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
 
+- v77 (2026-03-25): v76 거래정지 판별 버그 수정 + 공시 사유 구분.
+  [#1] `_is_trading_halt()` ts=0 자기모순 버그 수정.
+       기존: check_dart_risk에서 거래정지 확정 시 ts=0 설정 → _is_trading_halt에서 ts>=today_start 체크 → 0>=오늘00시=False → 판별 무효.
+       수정: ts=0이면 거래정지 확정 마커로 보고 무조건 True 처리. ts>0이면 당일 조회분만 인정.
+  [#2] 보유종목 공시 알림 사유 구분.
+       기존: 거래정지 사유가 계약/수주 등 호재성이어도 [악재 공시] + "즉시 매도 검토 권장" 발송.
+       수정: 호재성 사유(계약/수주/공급 등) → [거래정지 — 호재성 공시 사유] + "재개 후 진입 판단".
+             순수 거래정지 → [거래정지 공시 감지] + "재개일 확인 필요".
+             횡령/파산 등 악재 → [보유 종목 악재 공시 감지] + "즉시 매도 검토 권장".
+  이유: v76 배포 후 ts=0 버그로 거래정지 차단이 여전히 무효였고, 단일판매공급계약 공시가 악재로 표시됨.
+  개선점: 거래정지 즉시 차단 실제 동작, 사용자 행동 지침 정확도↑.
+
 - v76 (2026-03-25): 거래정지 종목 즉시 차단 — entry_watch 만료 + 포착 억제.
-  [#1] `get_nxt_stock_price()`에 `vi_cls_code`/`raw_status_code` 거래정지 플래그 필드 추가 (KRX와 동일 구조).
-  [#2] `_is_trading_halt()` 헬퍼 신설 — KIS API 플래그(trht_yn 등) + 호가 완전 소멸 + DART 캐시 거래정지 키워드 통합 판별.
-  [#3] `_notify_trading_halt_cancel()` 신설 — 거래정지 감지 시 [포착 취소 — 거래정지] 알림 발송 (중복 방지).
-  [#4] `check_entry_watch()` KRX/NXT 분기 직후 `_is_trading_halt()` 호출 → True이면 즉시 만료 + 취소 알림.
-  [#5] `_dispatch_general_alert_signal()` send_alert 직전 `_is_trading_halt()` 체크 → True이면 포착 알림 억제.
-  [#6] `check_dart_risk()` 거래정지/매매정지 키워드 히트 시 캐시 ts=0 → 다음 호출 즉시 재조회.
-  이유: 스피어(347700) 케이스 — 14:45 거래정지 후에도 17:06/17:15/18:37 등 반복 포착/알림 발송.
-        KIS API가 마지막 가격을 그대로 반환하고, DART 캐시 10분 TTL 동안 거래정지 상태를 스캔이 인식 못함.
-  개선점: 거래정지 종목 포착 즉시 차단, entry_watch 즉시 만료, 사용자 취소 알림 1회 발송.
-  주의점: API 플래그가 없고 DART 미확인 상태면 호가 완전 소멸(ask=bid=0)로 2차 판별.
+  [#1] `get_nxt_stock_price()`에 vi_cls_code/raw_status_code 거래정지 플래그 필드 추가.
+  [#2] `_is_trading_halt()` 헬퍼 신설 — KIS API 플래그 + DART 캐시 거래정지 키워드 통합 판별.
+       호가 소멸 기반 판별은 장마감 후 오판 유발로 제거.
+  [#3] `_notify_trading_halt_cancel()` 신설 — [포착 취소 — 거래정지] 알림 1회 발송.
+  [#4] `check_entry_watch()` KRX/NXT 분기 직후 거래정지 판별 → 즉시 만료 + 취소 알림.
+  [#5] `_dispatch_general_alert_signal()` send_alert 직전 거래정지 판별 → 포착 알림 억제.
+  [#6] `check_dart_risk()` 거래정지/매매정지 키워드 히트 시 캐시 ts=0 (확정 마커).
+  이유: 스피어(347700) 14:45 거래정지 후 반복 포착/알림 발송 — KIS API 마지막 가격 그대로 반환, DART 캐시 10분 TTL 문제.
+  개선점: 거래정지 종목 포착 차단, entry_watch 즉시 만료, 취소 알림 1회 발송.
 
 - v75 (2026-03-25): entry_hit 종목 재포착 시 신호 강도 방향 기반 분기 — 강화→phase2 트리거 / 약화→내부 기록.
   [#1] `_dispatch_general_alert_signal()`에 entry_hit=True watch 존재 시 분기 로직 추가.
@@ -12103,16 +12114,30 @@ def track_signal_results():
                         _dk = f"{log_key}_dart_exit"
                         if _dk not in _tracking_notified:
                             _tracking_notified.add(_dk)
+                            _title = _d['title']
+                            # v76: 거래정지 사유 구분 — 사유가 호재성(계약/수주 등)이면 타이틀/경고 문구 분리
+                            _HALT_POSITIVE_KEYWORDS = ["계약", "수주", "공급", "납품", "MOU", "협약", "투자", "인수"]
+                            _is_halt = "거래정지" in _title or "매매정지" in _title
+                            _is_positive_reason = _is_halt and any(kw in _title for kw in _HALT_POSITIVE_KEYWORDS)
+                            if _is_positive_reason:
+                                _alert_title = "⚠️ <b>[거래정지 — 호재성 공시 사유]</b>"
+                                _action_line = "⏸ <b>거래정지 중 — 재개 후 진입 판단</b>\n💡 사유는 호재성이나 재개 전까지 매매 불가"
+                            elif _is_halt:
+                                _alert_title = "🚨 <b>[거래정지 공시 감지]</b>"
+                                _action_line = "⚡ <b>거래정지 — 재개일 확인 필요</b>"
+                            else:
+                                _alert_title = "🚨 <b>[보유 종목 악재 공시 감지]</b>"
+                                _action_line = "⚡ <b>즉시 매도 검토 권장</b>"
                             _msg = (
-                                "🚨 <b>[보유 종목 악재 공시 감지]</b>\n"
+                                f"{_alert_title}\n"
                                 "━━━━━━━━━━━━━━━\n"
                                 f"🔵 <b>{_rec_name}</b>  <code>{code}</code>\n"
                                 "━━━━━━━━━━━━━━━\n"
-                                f"📋 공시: {_d['title']}\n"
+                                f"📋 공시: {_title}\n"
                                 "━━━━━━━━━━━━━━━\n"
                                 f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
                                 "━━━━━━━━━━━━━━━\n"
-                                "⚡ <b>즉시 매도 검토 권장</b>\n"
+                                f"{_action_line}\n"
                                 f"💡 /result {code} 로 결과 기록"
                             )
                             send_with_chart_buttons(_msg, code, _rec_name)
@@ -15104,16 +15129,20 @@ def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
             _v = str(cur.get(_k) or "").upper()
             if _v in ("Y", "1", "T", "TRUE", "H", "2"):
                 return True
-    # 2) DART 캐시 체크 (거래정지 키워드, 당일 조회분만)
+    # 2) DART 캐시 체크 (거래정지 키워드)
+    # ts=0: check_dart_risk에서 거래정지 확정 시 설정 → 당일 여부 무관하게 즉시 True
+    # ts>0: 당일(오늘 00:00 이후) 조회분만 인정 (과거 이력 오판 방지)
     cached = _dart_risk_cache.get(code)
     if isinstance(cached, dict) and cached.get("is_risk"):
         title = str(cached.get("title") or "")
-        # 당일 캐시인지 확인 (ts가 오늘 날짜 00:00 이후)
-        import time as _time
-        from datetime import date as _date
-        _today_start = _time.mktime(_date.today().timetuple())
-        if ("거래정지" in title or "매매정지" in title) and cached.get("ts", 0) >= _today_start:
-            return True
+        if "거래정지" in title or "매매정지" in title:
+            _ts = cached.get("ts", 0)
+            if _ts == 0:
+                return True  # 거래정지 확정 마커 (ts=0)
+            _today_start = time.mktime(datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0).timetuple())
+            if _ts >= _today_start:
+                return True
     return False
 
 
