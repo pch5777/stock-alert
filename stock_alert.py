@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v71
+버전: v72
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v72 (2026-03-25): 눌림목 포착+1차 진입 통합 메시지의 상단 가격 라벨을 예상진입가→도달가로 정합화.
+  [#1] `_format_capture_secondary_price_line()`를 추가하고 `_build_capture_focus_price_line()`에 상단 보조가격 override 경로를 연결.
+       기존: 포착 공통 블록을 재사용하는 구조라, 이미 `1차 진입가 도달`이 확정된 통합 메시지 상단에도 `예상진입가`가 그대로 노출됐음.
+       수정: 메시지별 override가 있으면 동일 포맷으로 `도달가` 등 실제 의미에 맞는 라벨/가격을 표시하고, 없으면 기존 `예상진입가` 경로를 그대로 유지.
+  [#2] `_build_integrated_pullback_phase1_message()`가 통합 메시지 상단에 `도달가`를 주입하도록 보강.
+       기존: `[눌림목 포착 + 1차 진입가 도달]` 메시지에서 상단은 `예상진입가`, 하단은 `대표진입가/도달` 맥락이라 같은 메시지 안에서 표현 기준이 엇갈렸음.
+       수정: 통합 메시지에서는 실제 `entry_hit_price`(없으면 해당 시점 현재가)를 사용해 `도달가`를 표기하고, 순수 포착 메시지의 `예상진입가` 표기는 유지.
+  이유: 사용자는 이미 1차 도달이 확정된 통합 메시지에서 행동 기준이 아니라 실제 도달 가격을 바로 읽어야 하며, `예상진입가` 표기는 오해를 만들 수 있었음.
+  개선점: 통합 메시지 가격 해석력↑, 포착/도달 문구 정합성↑, 동일 메시지 내 중복 혼선↓.
+  주의점: 일반 포착 메시지의 `예상진입가`는 유지되며, 이번 수정은 통합 메시지 상단 라벨에만 한정됨.
 
 - v71 (2026-03-25): 종목포착 핵심 3대 차단 해소 — 눌림목 A기준 확장 + 동시보유 오카운트 장중 정리 + NXT A급 호가차단 완화.
   [#1] `_apply_mid_pullback_execution_grade()`에 B등급 고점수 → A승격 조건 추가.
@@ -16635,14 +16646,19 @@ def _select_capture_expected_entry_price(signal: dict | None = None) -> tuple[in
     return 0, ""
 
 
-def _format_capture_expected_entry_line(price: int, expected_entry: int, source_label: str = "") -> str:
+def _format_capture_secondary_price_line(price: int, secondary_price: int, label: str = "예상진입가", source_label: str = "") -> str:
     price = safe_int(price, 0)
-    expected_entry = safe_int(expected_entry, 0)
-    if price <= 0 or expected_entry <= 0:
+    secondary_price = safe_int(secondary_price, 0)
+    label = str(label or "").strip() or "예상진입가"
+    if price <= 0 or secondary_price <= 0:
         return ""
-    gap_pct = ((expected_entry / price) - 1.0) * 100.0 if price else 0.0
+    gap_pct = ((secondary_price / price) - 1.0) * 100.0 if price else 0.0
     source_tail = f" · {source_label}" if source_label else ""
-    return f"🎯 예상진입가 <b>{expected_entry:,}원</b>  (현재가 대비 {gap_pct:+.1f}%{source_tail})"
+    return f"🎯 {label} <b>{secondary_price:,}원</b>  (현재가 대비 {gap_pct:+.1f}%{source_tail})"
+
+
+def _format_capture_expected_entry_line(price: int, expected_entry: int, source_label: str = "") -> str:
+    return _format_capture_secondary_price_line(price, expected_entry, "예상진입가", source_label)
 
 
 def _build_capture_focus_price_line(s: dict) -> str:
@@ -16650,10 +16666,16 @@ def _build_capture_focus_price_line(s: dict) -> str:
     if not price:
         return ''
     lines = [f"💵 현재가 <b>{price:,}원</b>"]
-    expected_entry, source_label = _select_capture_expected_entry_price(s)
-    expected_line = _format_capture_expected_entry_line(price, expected_entry, source_label)
-    if expected_line:
-        lines.append(expected_line)
+    override_label = str(s.get('_capture_focus_secondary_label', '') or '').strip()
+    override_price = safe_int(s.get('_capture_focus_secondary_price', 0), 0)
+    override_source_label = str(s.get('_capture_focus_secondary_source_label', '') or '').strip()
+    if override_label and override_price > 0:
+        secondary_line = _format_capture_secondary_price_line(price, override_price, override_label, override_source_label)
+    else:
+        expected_entry, source_label = _select_capture_expected_entry_price(s)
+        secondary_line = _format_capture_expected_entry_line(price, expected_entry, source_label)
+    if secondary_line:
+        lines.append(secondary_line)
     return "\n".join(lines)
 
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
@@ -16692,6 +16714,11 @@ def _build_integrated_pullback_phase1_message(signal: dict, watch: dict, price: 
     snap["planned_entry_price"] = safe_int(watch.get("entry_price", entry), entry)
     snap["stop_loss"] = safe_int(watch.get("stop_loss", snap.get("stop_loss", 0)), 0)
     snap["target_price"] = safe_int(watch.get("target_price", snap.get("target_price", 0)), 0)
+    snap["entry_hit_price"] = safe_int(watch.get("entry_hit_price", snap.get("entry_hit_price", price)), 0)
+    if snap.get("entry_hit_price", 0) <= 0:
+        snap["entry_hit_price"] = safe_int(price, 0)
+    snap["_capture_focus_secondary_label"] = "도달가"
+    snap["_capture_focus_secondary_price"] = safe_int(snap.get("entry_hit_price", 0), 0)
     grade = str(snap.get("grade") or watch.get("execution_grade") or watch.get("grade") or "B").upper()
     grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(grade, "📊")
     grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(grade, f"{grade}등급")
