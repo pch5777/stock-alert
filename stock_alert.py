@@ -3,11 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v66
+버전: v67
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v67 (2026-03-25): active entry_hit 정합성 정리 + NXT 장전 EARLY_DETECT 허용 강화 + 종목명 복구 보강.
+  [#1] `_load_entry_watch_active()` / `_collect_actionable_position_limit_codes()`에
+       `_is_actionable_entry_watch()` 검증을 연결.
+       기존: signal_log strict cleanup으로 `entry_hit`가 초기화돼도 `entry_watch_active.json`의 오래된
+       `entry_hit`/`entry_hit_locked`가 그대로 복원되면 동시보유가 23~24개로 다시 부풀 수 있었음.
+       수정: 최신 signal_log active 상태와 불일치하는 hit watch는 로드시 자동 제외/정리하고,
+       position_limit 계산도 동일 검증을 공유해 stale hit가 실보유로 카운트되지 않게 함.
+  [#2] `_should_delay_external_general_capture()`에 `_is_signal_nxt_premarket_hint()`를 추가.
+       기존: EARLY_DETECT 외부알림 허용이 현재 시각 helper에만 의존해, 장전 NXT 재평가/재시작/시간대 흔들림 시
+       08시대 A급 신호도 `외부알림 지연`으로 남을 수 있었음.
+       수정: NXT market + detect_time/detected_at이 08시대인 신호도 장전 힌트로 인정해
+       70점↑ A/B급 EARLY_DETECT는 즉시 외부알림 허용.
+  [#3] `_resolve_stock_name()` / `_build_capture_focus_message()` / `check_entry_watch()` name 복구 강화.
+       기존: `010170`처럼 코드만 name_hint로 들어오면 이를 유효 종목명으로 오인해 `010170  010170` 메시지가 발생.
+       수정: 코드형/숫자형 placeholder name은 무효 처리하고, KRX/NXT 현재가·runtime watch·signal_log 순으로 재복구.
+       진입가 감시 루프와 메시지 빌더에서도 발송 직전 종목명을 다시 정규화.
+  이유: 3/25 실로그 기준 핵심 병목은 (1) position_limit stale hit 재오카운트, (2) NXT 장전 A급 EARLY_DETECT
+       외부알림 누락, (3) 종목명 placeholder 노출이었음.
+  개선점: 동시보유 23/1 재발↓, 오전 NXT A급 포착 외부알림 복구↑, `010170` 코드노출 메시지↓.
+  주의점: 동시보유 제한 자체는 유지(max_positions=1). 비A급 외부알림 확대는 하지 않음.
 
 - v66 (2026-03-25): 동시보유 오카운트 근본 수정 + EARLY_DETECT 외부알림 조건부 허용 + NXT 장전 최적화.
   [#1] `_get_carry_position_context()` fallback 경로 근본 차단.
@@ -5060,6 +5081,8 @@ def _load_preclose_gap_entry_watch() -> None:
             return
         now_ts = time.time()
         restored = {}
+        siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
+        latest_by_code = _build_latest_tracking_by_code(siglog_data)
         for key, watch in raw.items():
             if not isinstance(watch, dict):
                 continue
@@ -5214,6 +5237,8 @@ def _load_entry_watch_active() -> None:
             _entry_watch = {}
             return
         now_ts = time.time()
+        siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
+        latest_by_code = _build_latest_tracking_by_code(siglog_data)
         restored = {}
         for key, watch in raw.items():
             if not isinstance(watch, dict):
@@ -5229,7 +5254,10 @@ def _load_entry_watch_active() -> None:
                 continue
             watch = dict(watch)
             watch["code"] = code
-            watch.setdefault("name", watch.get("name", code))
+            latest_rec = latest_by_code.get(code)
+            if (watch.get("entry_hit") or watch.get("entry_hit_locked")) and not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
+                continue
+            watch["name"] = _resolve_stock_name(code, watch.get("name", code))
             watch.setdefault("signal_type", str(watch.get("signal_type", "") or ""))
             watch.setdefault("registered_ts", now_ts)
             watch.setdefault("signal_log_key", str(watch.get("signal_log_key", key) or key))
@@ -6654,6 +6682,29 @@ def _sanitize_carry_snapshot_map(raw_data, siglog_data: dict | None = None) -> t
     return sanitized, dropped_codes
 
 
+
+def _is_actionable_entry_watch(watch: dict | None, latest_rec: dict | None = None, now_ts: float | None = None) -> bool:
+    watch = watch if isinstance(watch, dict) else {}
+    if not (watch.get("entry_hit") or watch.get("entry_hit_locked")):
+        return False
+    state = str(watch.get("entry_watch_state", "active") or "active").lower()
+    if state not in ("active", "watching", "pending"):
+        return False
+    now_ts = float(now_ts or time.time())
+    expire_ts = float(watch.get("expire_ts", 0) or 0)
+    if expire_ts and now_ts >= expire_ts:
+        return False
+    if latest_rec is not None:
+        if not isinstance(latest_rec, dict):
+            return False
+        status = str(latest_rec.get("status", "") or "")
+        if status not in TRACK_ACTIVE_STATUSES:
+            return False
+        if latest_rec.get("actual_entry") is not True and latest_rec.get("entry_hit") is not True:
+            return False
+    return True
+
+
 def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, today: str | None = None) -> set[str]:
     """동시보유 제한에 실제로 반영할 '행동 가능한' 감시 코드를 수집.
     v62: 단순 carry/_detected_stocks 전체가 아니라 entry_watch / execution_setup_watch /
@@ -6663,6 +6714,7 @@ def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, to
     actionable_codes: set[str] = set()
     today = str(today or datetime.now().strftime("%Y%m%d"))
     now_ts = time.time()
+    latest_by_code = _build_latest_tracking_by_code(siglog_data)
 
     # [v65] entry_watch 중 만료 안 된 + entry_hit 또는 도달 가능한 것만 카운트
     try:
@@ -6678,10 +6730,10 @@ def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, to
                 continue
             # entry_hit 된 것(진입가 도달)만 실제 보유로 카운트
             # 아직 도달 안 된 건 "대기 중"이지 "보유 중"이 아님
-            if watch.get("entry_hit") or watch.get("entry_hit_locked"):
-                code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
-                if code:
-                    actionable_codes.add(code)
+            code = normalize_stock_code(watch.get("code") or watch.get("stock_code") or watch.get("종목코드"))
+            latest_rec = latest_by_code.get(code) if code else None
+            if _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts) and code:
+                actionable_codes.add(code)
     except Exception:
         pass
 
@@ -6699,7 +6751,6 @@ def _collect_actionable_position_limit_codes(siglog_data: dict | None = None, to
         pass
 
     # signal_log에서 실제 "추적중" + entry_hit 완료된 것만 (대기 중인 건 제외)
-    latest_by_code = _build_latest_tracking_by_code(siglog_data)
     try:
         carry_raw = _read_json_safe(CARRY_FILE, {})
         if isinstance(carry_raw, dict):
@@ -7904,40 +7955,78 @@ def send_preopen_watchlist():
     except Exception as e:
         print(f"⚠️ send_preopen_watchlist 오류: {e}")
 
+
+def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
+    nm = str(name_hint or "").strip()
+    code = normalize_stock_code(code) or str(code or "").strip()
+    if not nm:
+        return True
+    compact = nm.replace(" ", "")
+    if code and compact == code:
+        return True
+    if compact.isdigit() and len(compact) >= 5:
+        return True
+    return False
+
+
 def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None) -> str:
-    """종목명이 비어 있을 때 현재가 응답 / signal_log / 코드 순으로 복구."""
+    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태로 복구."""
+    code = normalize_stock_code(code) or str(code or "").strip()
     try:
         nm = str(name_hint or "").strip()
-        if nm:
+        if not _looks_like_placeholder_stock_name(code, nm):
             return nm
 
         if isinstance(cur, dict):
             nm = str(cur.get("name", "") or "").strip()
-            if nm:
+            if not _looks_like_placeholder_stock_name(code, nm):
                 return nm
 
         try:
             info = get_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
-            if nm:
+            if not _looks_like_placeholder_stock_name(code, nm):
                 return nm
         except Exception:
             pass
 
         try:
-            data = _read_json_locked(SIGNAL_LOG_FILE)
-            for _k, rec in sorted(data.items(), reverse=True):
-                if not isinstance(rec, dict):
-                    continue
-                if str(rec.get("code", "")) == str(code):
+            info = get_nxt_stock_price(code)
+            nm = str((info or {}).get("name", "") or "").strip()
+            if not _looks_like_placeholder_stock_name(code, nm):
+                return nm
+        except Exception:
+            pass
+
+        try:
+            for pool in (_entry_watch, _execution_setup_watch):
+                for rec in list((pool or {}).values()):
+                    if not isinstance(rec, dict):
+                        continue
+                    if normalize_stock_code(rec.get("code")) != code:
+                        continue
                     nm = str(rec.get("name", "") or "").strip()
-                    if nm:
+                    if not _looks_like_placeholder_stock_name(code, nm):
+                        return nm
+        except Exception:
+            pass
+
+        try:
+            data = _read_json_locked(SIGNAL_LOG_FILE)
+            if isinstance(data, dict):
+                for _k, rec in sorted(data.items(), reverse=True):
+                    if not isinstance(rec, dict):
+                        continue
+                    if normalize_stock_code(rec.get("code")) != code:
+                        continue
+                    nm = str(rec.get("name", "") or "").strip()
+                    if not _looks_like_placeholder_stock_name(code, nm):
                         return nm
         except Exception:
             pass
     except Exception:
         pass
-    return str(code or "").strip()
+    return code or str(name_hint or "").strip()
 
 
 def _lookup_name_by_code(code: str, name_hint: str = "") -> str:
@@ -14917,6 +15006,11 @@ def check_entry_watch():
             else:
                 continue
 
+            resolved_name = _resolve_stock_name(code, watch.get("name", ""), cur if isinstance(cur, dict) else None)
+            if resolved_name and resolved_name != watch.get("name"):
+                watch["name"] = resolved_name
+                changed_active = True
+
             # 최고가 갱신
             if price > watch.get("peak_price", 0):
                 watch["peak_price"] = price
@@ -16284,11 +16378,13 @@ def _build_capture_focus_price_line(s: dict) -> str:
 
 
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
+    display_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
+    s["name"] = display_name
     parts = [
         header_line,
         f"🕐 {capture_label}",
         '━━━━━━━━━━━━━━━',
-        f"{name_dot} <b>{s['name']}</b>  <code>{s['code']}</code>",
+        f"{name_dot} <b>{display_name}</b>  <code>{s['code']}</code>",
     ]
     price_line = _build_capture_focus_price_line(s)
     focus_reasons = _build_capture_focus_reasons(s)
@@ -17910,6 +18006,25 @@ def _promote_internal_capture_watch(signal: dict, hist_key: str = "", source_lab
         return False
 
 
+
+def _is_signal_nxt_premarket_hint(signal: dict | None = None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    if str(signal.get("market") or "").upper() != "NXT":
+        return False
+    if _is_nxt_premarket_window():
+        return True
+    detect_time = str(signal.get("detect_time", "") or "").strip()
+    if detect_time.startswith("08:"):
+        return True
+    detected_at = signal.get("detected_at")
+    try:
+        if isinstance(detected_at, datetime) and detected_at.hour == 8:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _should_delay_external_general_capture(signal: dict) -> str:
     if not isinstance(signal, dict):
         return ""
@@ -17923,7 +18038,7 @@ def _should_delay_external_general_capture(signal: dict) -> str:
         grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
         score = safe_int(signal.get("score", 0), 0)
         market = str(signal.get("market") or "").upper()
-        is_nxt_premarket = market == "NXT" and _is_nxt_premarket_window()
+        is_nxt_premarket = market == "NXT" and _is_signal_nxt_premarket_hint(signal)
         if is_nxt_premarket and score >= 70 and grade in ("A", "B"):
             return ""  # 즉시 알림 허용
         if score >= 80 and grade == "A" and entry_price > 0:
