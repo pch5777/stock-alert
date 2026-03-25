@@ -3,11 +3,40 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v73
+버전: v75
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v75 (2026-03-25): entry_hit 종목 재포착 시 신호 강도 방향 기반 분기 — 강화→phase2 트리거 / 약화→내부 기록.
+  [#1] `_dispatch_general_alert_signal()`에 entry_hit=True watch 존재 시 분기 로직 추가.
+       강화(눌림목→급등/상한가 등): [포착 알림] 차단 + [2차 진입 판단] 메시지 발송.
+       약화(급등→눌림목 등): [포착 알림] 차단 + 내부 signal_log 기록만 유지.
+       동일 신호 타입 재포착: 약화와 동일하게 처리 (기존 watch 보호).
+  [#2] `register_entry_watch()`의 v74 신호 타입 변경 리셋 로직 제거 — v75 분기로 대체돼 불필요.
+       `_notify_entry_guard_followup()` notify_count < 1 차단(v74 #2)은 유지.
+  이유: 같은 종목에 서로 다른 신호가 겹칠 때 사용자에게 맥락 없는 [포착 알림]이 가거나,
+        entry_hit 상태가 꼬여 [보류/취소 사유]가 오발송되던 근본 원인 해소.
+  신호 강도 순위: MID_PULLBACK/ENTRY_POINT(1) < EARLY_DETECT(2) < SURGE(3) < NEAR_UPPER(4) < UPPER_LIMIT/STRONG_BUY(5).
+  개선점: [포착]→[도달]→[보류/취소] 순서 보장, 강화 모멘텀 phase2 자동 연결, 약화 시 기존 포지션 보호.
+  주의점: max_positions=1 유지. entry_hit 없는 첫 포착은 기존 흐름 그대로.
+
+- v74 (2026-03-25): 미통지 상태 보류 알림 차단.
+  [#1] `_notify_entry_guard_followup()`에 notify_count < 1 차단 가드 추가.
+       진입가 도달 알림(notify_count≥1)을 한 번이라도 보낸 후에만 보류/취소 알림 발송.
+  이유: 재시작으로 entry_hit가 복원된 상태에서 사용자가 도달 알림을 못 받았음에도 보류 알림이 먼저 오는 문제 해소.
+  개선점: 맥락 없는 보류 알림 제거.
+  주의점: v75 도입으로 근본 원인이 해소됐으나 안전망으로 유지.
+  [#1] `register_entry_watch()`에서 기존 entry_hit=True watch의 신호 타입이 새 신호와 다를 때(예: MID_PULLBACK→SURGE) entry_hit를 리셋하고 새 신호 기준으로 watch를 갱신.
+       기존: 신호 타입 무관하게 entry_hit=True면 무조건 갱신 생략 → 사용자는 새 [급등 감지] 알림을 받았지만 진입가 도달 알림 없이 곧바로 보류 알림 수신.
+       수정: 신호 타입 변경 시 entry_hit/notify_count/entry_guard 관련 필드를 초기화해 새 신호 기준으로 도달 감시 재시작.
+  [#2] `_notify_entry_guard_followup()`에 notify_count < 1 차단 가드 추가.
+       기존: entry_hit=True면 notify_count=0이어도 보류 알림 발송 → 사용자 입장에서 맥락 없는 알림.
+       수정: 진입가 도달 알림(notify_count≥1)을 한 번이라도 보낸 후에만 보류/취소 알림 발송.
+  이유: 재시작·재포착으로 entry_hit가 복원·승계된 상태에서 사용자가 도달 알림을 못 받았음에도 보류 알림이 먼저 오는 문제 해소.
+  개선점: [급등 감지]→[진입가 도달]→[보류/취소] 순서 보장, 맥락 없는 보류 알림 제거.
+  주의점: 동일 신호 타입 재포착 시 entry_hit 유지 로직은 그대로임.
 
 - v73 (2026-03-25): 일반 눌림목 진입 신호의 상단 가격 문구를 대표진입가 기준으로 정합화.
   [#1] `register_entry_watch()`가 대표 진입가 가드 적용 후 값을 원본 signal 스냅샷(`s["entry_price"]`)에도 되돌려 쓰도록 동기화.
@@ -14676,6 +14705,10 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     reason = str(reason or "").strip()
     if not reason:
         return False
+    # v74: notify_count=0이면 사용자가 진입가 도달 알림을 아직 못 받은 상태
+    # → 보류/취소 알림을 먼저 보내는 것은 맥락 없는 알림이므로 차단
+    if safe_int(watch.get("notify_count", 0), 0) < 1:
+        return False
     now_ts = time.time()
     last_reason = str(watch.get("entry_guard_alert_reason") or "").strip()
     last_ts = float(watch.get("entry_guard_alert_ts") or 0.0)
@@ -18569,6 +18602,93 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
             print(f"  ⏭ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지")
         return False
     _internal_only_alert_history.pop(hist_key, None)
+
+    # v75: 이미 entry_hit=True인 종목에 신규 신호가 오면 [포착 알림] 대신 신호 방향에 따라 분기
+    # - 강화(눌림목→급등 등): phase2 트리거로 연결
+    # - 약화(급등→눌림목 등): 내부 기록만 유지
+    _SIGNAL_STRENGTH_RANK = {
+        "MID_PULLBACK": 1, "ENTRY_POINT": 1,
+        "EARLY_DETECT": 2,
+        "SURGE": 3,
+        "NEAR_UPPER": 4,
+        "UPPER_LIMIT": 5, "STRONG_BUY": 5,
+    }
+    _new_sig_type = str(s.get("signal_type") or "").upper()
+    _existing_hit_watch = None
+    _existing_hit_key = None
+    for _ek, _ew in list(_entry_watch.items()):
+        if not isinstance(_ew, dict):
+            continue
+        if normalize_stock_code(_ew.get("code")) != normalize_stock_code(s.get("code")):
+            continue
+        if _ew.get("entry_hit") or _ew.get("entry_hit_locked"):
+            _existing_hit_watch = _ew
+            _existing_hit_key = _ek
+            break
+    if _existing_hit_watch is not None:
+        _old_sig_type = str(_existing_hit_watch.get("signal_type") or "").upper()
+        _new_rank = _SIGNAL_STRENGTH_RANK.get(_new_sig_type, 0)
+        _old_rank = _SIGNAL_STRENGTH_RANK.get(_old_sig_type, 0)
+        if _new_rank > _old_rank:
+            # 신호 강화 → [포착 알림] 차단, phase2 트리거
+            print(f"  🔀 신호 강화({_old_sig_type}→{_new_sig_type}): {s.get('name','')} — 포착 알림 차단, phase2 트리거")
+            save_signal_log(s)
+            try:
+                _p2_cur = get_nxt_stock_price(s["code"]) if (str(s.get("market") or "") == "NXT") else get_stock_price(s["code"])
+                _p2_price = safe_int((_p2_cur or {}).get("price", s.get("price", 0)), 0) or safe_int(s.get("price", 0), 0)
+                _p2_entry = safe_int(_existing_hit_watch.get("entry_price", 0), 0)
+                _p2_exec = get_execution_speed_metrics(s["code"], current_price=_p2_price)
+                _p2_judgement = _judge_phase2_entry(_existing_hit_watch, _p2_cur or {}, _p2_price, _p2_exec)
+                _p2_detail = _p2_judgement.get("detail", "")
+                _p2_reasons = _p2_judgement.get("reasons", [])
+                _p2_decision = _p2_judgement.get("decision", "보류")
+                _p2_emoji = {"가능": "✅", "보류": "🟡", "금지": "🔴"}.get(_p2_decision, "🟡")
+                _p2_diff_pct = round((_p2_price - _p2_entry) / _p2_entry * 100, 1) if _p2_entry else 0.0
+                _p2_diff_str = f"+{_p2_diff_pct:.1f}%" if _p2_diff_pct >= 0 else f"{_p2_diff_pct:.1f}%"
+                _split_rule = _get_entry_split_rule(_existing_hit_watch.get("regime_mode", "normal"))
+                _p2_pct = _split_rule.get("phase2_pct", 20)
+                _p1_pct = _split_rule.get("phase1_pct", 30)
+                _total_pct = _p1_pct + _p2_pct
+                _avg_price = _calc_avg_entry_price(_p2_entry, _p2_price, _p1_pct, _p2_pct)
+                _nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if (str(s.get("market") or "") == "NXT") else ""
+                _sig_labels = {"UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+                               "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목"}
+                _old_sig_label = _sig_labels.get(_old_sig_type, _old_sig_type)
+                _new_sig_label = _sig_labels.get(_new_sig_type, _new_sig_type)
+                _entry_hit_ts = str(_existing_hit_watch.get("entry_hit_time") or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                _reasons_str = "\n".join([f"│ {r}" for r in _p2_reasons])
+                send_with_chart_buttons(
+                    f"🔔🔔 <b>[2차 진입 판단]</b>{_nxt_notice}\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🔴 <b>{_existing_hit_watch.get('name', s.get('name', ''))}</b>  "
+                    f"<code>{_existing_hit_watch.get('code', s.get('code', ''))}</code>\n"
+                    f"원신호: {_old_sig_label} → 신규: <b>{_new_sig_label}</b> (모멘텀 강화)\n"
+                    f"1차 도달: {_entry_hit_ts}  |  감지: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"┌─────────────────────\n"
+                    f"│ {_p2_emoji} <b>{_p2_decision}</b>\n"
+                    f"│ 📍 현재가  <b>{_p2_price:,}원</b>  ({_p2_diff_str})\n"
+                    f"│ 💰 권장 추가비중: <b>{_p2_pct}%</b>\n"
+                    f"│ 📊 총 누적 권장비중: <b>{_total_pct}%</b>\n"
+                    f"│ 📐 평균단가 예상: <b>{_avg_price:,}원</b>\n"
+                    f"│ 🛡 손절가: <b>{int(_existing_hit_watch.get('stop_loss', 0)):,}원</b>\n"
+                    f"├─────────────────────\n"
+                    f"│ <b>판단 근거</b>\n"
+                    f"{_reasons_str}\n"
+                    f"│ → {_p2_detail}\n"
+                    f"└─────────────────────",
+                    _existing_hit_watch.get("code", s.get("code", "")),
+                    _existing_hit_watch.get("name", s.get("name", ""))
+                )
+            except Exception as _e:
+                print(f"  ⚠️ phase2 트리거 오류: {_e}")
+            return True
+        else:
+            # 신호 약화 또는 동일 → [포착 알림] 차단, 내부 기록만
+            print(f"  ⏭ 신호 약화/유지({_old_sig_type}→{_new_sig_type}): {s.get('name','')} — 기존 entry_hit 보호, 내부 기록만")
+            save_signal_log(s)
+            return False
+
     print(f"  ✓ {s['name']}{mkt_tag} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[hist_key] = time.time()
