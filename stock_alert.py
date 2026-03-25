@@ -24,11 +24,21 @@
   [#4] `is_strict_time()` NXT 장전 08:00~08:10 엄격 해제.
        NXT 장전은 선포착 기회 시간이므로 min_score_strict(66) 대신 min_score_normal(56) 적용.
   [#5] `_is_nxt_premarket_window()` 헬퍼 함수 신설 (08:00~08:59, NXT open + KRX closed).
+  [#6] `analyze()` → `check_liquidity()` 상한가(UPPER_LIMIT/NEAR_UPPER) 면제.
+       상한가는 매도호가(ask_qty)=0이 정상인데, 기존 코드는 이를 유동성 없음으로 판정.
+       정규장 우리로(상한가) 포착→즉시 차단(no_ask_liquidity)이 이 버그 때문이었음.
+  [#7] `calc_surge_escape_pct()` 상승이탈 기준 상향: 최소5→8%, 최대15→25%.
+       급등장에서 와이어블(+20.4%), SK이터닉스(+17.6%)가 너무 일찍 상승이탈 판정.
+  [#8] `REGIME_PARAMS` pullback_ratio 전 레짐 완화 + `ENTRY_PULLBACK_RATIO` 0.4→0.3.
+       bull 0.35→0.25, normal 0.40→0.30, bear 0.50→0.40, crash 0.55→0.50.
+       진입가가 현재가에 더 가까워져 상승이탈 확률↓, 진입가 도달 확률↑.
   이유: 3/25 오전 NXT 로그 분석 결과 아이티엠반도체(+26.7%), 미래에셋생명(+17.8%) 등 강세주를
        전혀 포착하지 못한 핵심 원인이 (1) 동시보유 24/1 오카운트로 전면 차단, (2) EARLY_DETECT
        무조건 외부알림 지연, (3) NXT 장전 거래량 기준 과다의 3중 병목이었음.
-  개선점: 동시보유 오카운트 0건 정상화↑, NXT 장전 A/B급 즉시 알림↑, 거래량 기준 현실화↑.
+  개선점: 동시보유 오카운트 0건 정상화↑, NXT 장전 A/B급 즉시 알림↑, 거래량 기준 현실화↑,
+       상한가 유동성 오차단↓, 상승이탈 조기 판정↓, 진입가 도달 확률↑.
   주의점: 동시보유 제한 자체는 유지(max_positions=1). 실제 entry_hit 종목만 보유로 카운트.
+       pullback_ratio 완화로 진입가가 현재가에 가까워지므로 손절 시 손실폭도 약간 커질 수 있음.
 
 - v65 (2026-03-24): 동시보유 제한 actionable 기준 재정의 — entry_hit 기반 실보유만 카운트.
   [#1] `_collect_actionable_position_limit_codes()`를 재작성.
@@ -2817,13 +2827,13 @@ ALERT_COOLDOWN        = 1800
 # 각 키: score_mult/min_add(포착), cooldown(알림간격), pullback_ratio(진입눌림),
 #         partial_exit_mult(분할청산기준 배수), max_positions(동시보유), overnight_add(야간위험가중)
 REGIME_PARAMS = {
-    "bull":   {"score_mult": 1.15, "min_add": -5,  "cooldown": 900,  "pullback_ratio": 0.35,
+    "bull":   {"score_mult": 1.15, "min_add": -5,  "cooldown": 900,  "pullback_ratio": 0.25,
                "partial_exit_mult": 0.8, "max_positions": 1, "overnight_add": 0},
-    "normal": {"score_mult": 1.0,  "min_add": 0,   "cooldown": 1800, "pullback_ratio": 0.40,
+    "normal": {"score_mult": 1.0,  "min_add": 0,   "cooldown": 1800, "pullback_ratio": 0.30,
                "partial_exit_mult": 1.0, "max_positions": 1, "overnight_add": 0},
-    "bear":   {"score_mult": 0.75, "min_add": 8,   "cooldown": 2700, "pullback_ratio": 0.50,
+    "bear":   {"score_mult": 0.75, "min_add": 8,   "cooldown": 2700, "pullback_ratio": 0.40,
                "partial_exit_mult": 1.3, "max_positions": 1, "overnight_add": 15},
-    "crash":  {"score_mult": 0.5,  "min_add": 15,  "cooldown": 3600, "pullback_ratio": 0.55,
+    "crash":  {"score_mult": 0.5,  "min_add": 15,  "cooldown": 3600, "pullback_ratio": 0.50,
                "partial_exit_mult": 1.5, "max_positions": 1, "overnight_add": 25},
 }
 
@@ -2869,7 +2879,7 @@ DART_INTERVAL         = 60    # 180→60초 (DART API 여유 있음)
 TELEGRAM_POLL_INTERVAL = int(os.getenv("TELEGRAM_POLL_INTERVAL", "2") or "2")
 MARKET_OPEN           = "09:00"
 MARKET_CLOSE          = "15:30"
-ENTRY_PULLBACK_RATIO  = 0.4
+ENTRY_PULLBACK_RATIO  = 0.3   # v66: 0.4→0.3 완화. 상승이탈 다발 방지
 ENTRY_PULLBACK_RATIO_MIN = 0.20
 ENTRY_PULLBACK_RATIO_MAX = 0.60
 ENTRY_PULLBACK_ADJUST_STEP = 0.03
@@ -4120,12 +4130,14 @@ def calc_reentry_bounce(code: str, price: int) -> float:
 def calc_surge_escape_pct(code: str, price: int) -> float:
     """
     진입가 상승이탈 판단 기준 (%) — 진입가보다 이 % 이상 오르면 포기.
-    ATR × 3배 (최소 5%, 최대 15%)
+    ATR × 3배 (최소 8%, 최대 25%)
+    v66: 최소 5→8%, 최대 15→25%로 상향. 급등장에서 너무 일찍 상승이탈 판정되어
+    기회를 놓치는 현상(와이어블 +20.4%, SK이터닉스 +17.6%) 방지.
     """
     atr_pct = calc_atr_pct(code, price, fallback_pct=3.0)
     mult    = get_atr_regime_mult()
     escape  = round(atr_pct * mult * 3.0, 1)
-    return max(5.0, min(escape, 15.0))
+    return max(8.0, min(escape, 25.0))
 
 def calc_partial_exit_min_pct(code: str, price: int) -> float:
     """
@@ -16385,7 +16397,9 @@ def analyze(stock: dict) -> dict:
     if vol_ratio < required_vol:
         return {}
     if not check_liquidity(code, quote=stock):
-        return {}
+        # v66: 상한가/근접 상한가는 매도호가(ask)가 없는 게 정상 → 유동성 체크 면제
+        if signal_type not in ("UPPER_LIMIT", "NEAR_UPPER"):
+            return {}
 
     if vol_ratio >= required_vol*2:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
