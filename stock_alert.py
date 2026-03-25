@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v69
+버전: v70
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v70 (2026-03-25): 눌림목 대표진입가 선동기화 + 현재가<=대표진입가 통합 메시지 + 포착/행동 가격 기준 일치.
+  [#1] `run_mid_pullback_scan()`의 순서를 `save_signal_log() → register_entry_watch() → 즉시 1차 통합판정 → 포착 발송`으로 재정렬하고,
+       `_maybe_send_immediate_entry_hit_from_signal(..., merge_capture_phase1=True)`를 연결.
+       기존: 눌림목 포착 메시지가 대표 진입가 가드 적용 전 `예상진입가`를 보여줘, 실제 watch 진입가/즉시 1차 판단 기준과 어긋날 수 있었음.
+       수정: 눌림목은 저장/감시 등록으로 대표 진입가 가드를 먼저 공유한 뒤 메시지를 보내, 포착 메시지의 `예상진입가`와 실제 watch 진입가가 동일 기준으로 맞춰짐.
+  [#2] `_build_integrated_pullback_phase1_message()`를 추가하고 `_send_entry_phase_alert()`가 `merge_capture_phase1=True`일 때 통합 메시지를 발송하도록 보강.
+       기존: 포착 시점에 `현재가<=예상진입가`여도 `종목포착`과 `1차 진입가 도달`이 분리되어, 사용자 기준으론 같은 말을 두 번 하거나 오히려 개선이 안 된 것처럼 보였음.
+       수정: 눌림목에서 현재가가 대표 진입가 이하이면 `눌림목 포착 + 1차 진입가 도달`을 하나의 메시지로 보내고, 그 안에 대표진입가/손절가/목표가/권장 진입비중을 함께 표기.
+  [#3] 통합 메시지 미발동 시에도 `send_mid_pullback_alert()`는 guard 적용 후의 `entry_price`/`planned_entry_price`를 기준으로 메시지를 구성하도록 정렬.
+       기존: 같은 종목이라도 포착 메시지의 예상진입가와 추후 1차 판단 기준이 달라 사용자 신뢰가 떨어질 수 있었음.
+       수정: 눌림목 포착/감시/즉시 1차가 같은 대표 진입가 체계를 공유해 메시지 해석과 내부 행동 기준이 일치.
+  이유: 사용자는 `좋은 종목 포착 → 진입가 알림 → 진입` 흐름을 기대하되, 포착 시점에 이미 대표 진입가 이하라면 하나의 행동 가능한 메시지에서 가격정보를 모두 보고 싶어 했음.
+  개선점: 눌림목 메시지 정합성↑, `현재가=예상진입가` 혼선↓, 통합 행동 메시지 해석력↑.
+  주의점: 비A급 외부알림 확대는 하지 않으며, 통합 메시지는 `MID_PULLBACK`/`ENTRY_POINT`의 현재가<=대표진입가 케이스에서만 발동함.
 
 - v69 (2026-03-25): 눌림목 즉시 1차 진입 연동 + 도달 후 취소/보류 사유 사용자 통지 + entry_hit 모니터링 유지.
   [#1] `register_entry_watch()`가 watch key를 반환하고 `_maybe_send_immediate_entry_hit_from_signal()` / `_send_entry_phase_alert()`를 추가해,
@@ -8482,10 +8497,12 @@ def run_mid_pullback_scan():
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
             print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
             continue
-        send_mid_pullback_alert(s)
         save_signal_log(s)
-        _watch_key = register_entry_watch(s)                     # ★ 진입가 감시 등록
-        if _maybe_send_immediate_entry_hit_from_signal(s, _watch_key):
+        _watch_key = register_entry_watch(s)                     # ★ 대표 진입가 가드 적용 후 진입가 감시 등록
+        _merged_phase1 = _maybe_send_immediate_entry_hit_from_signal(s, _watch_key, merge_capture_phase1=True)
+        if not _merged_phase1:
+            send_mid_pullback_alert(s)
+        else:
             _save_entry_watch_active()
         if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
             _sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
@@ -14602,7 +14619,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     return True
 
 
-def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_nxt: bool = False, reach_via_recovery: bool = False, hit_ts: str | None = None) -> bool:
+def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_nxt: bool = False, reach_via_recovery: bool = False, hit_ts: str | None = None, merge_capture_phase1: bool = False) -> bool:
     now_ts = time.time()
     last_ts = watch.get("last_notified_ts", 0)
     notify_count = safe_int(watch.get("notify_count", 0), 0)
@@ -14701,27 +14718,33 @@ def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_
         _strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(_strength, "📊")
         _nxt_delta_block = _format_nxt_transition_delta_block(watch)
         _reach_note_block = f"│ 🛠 회복모드 근접도달 허용  (+{_get_dynamic_entry_reach_slack_pct(watch)*100:.1f}%)\n" if reach_via_recovery else ""
-        send_with_chart_buttons(
-            f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
-            f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
-            f"{_nxt_delta_block}{similar_block}"
-            f"{reasons_block}"
-            f"{sector_block}"
-            f"{_entry_exec_block}"
-            f"━━━━━━━━━━━━━━━\n"
-            f"┌─────────────────────\n"
-            f"│ {_strength_emoji} <b>1차 진입 구간</b>  (신호: {_strength})\n"
-            f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
-            f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
-            f"{_reach_note_block}"
-            f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
-            f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
-            f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
-            f"└─────────────────────",
-            watch["code"], watch["name"]
-        )
+        if merge_capture_phase1 and str(watch.get("signal_type") or "").upper() in ("MID_PULLBACK", "ENTRY_POINT"):
+            _merged_message = _build_integrated_pullback_phase1_message(
+                cur, watch, price, entry, diff_str, _strength, _p1_pct, stop_pct, tgt_pct, _entry_hit_ts, nxt_notice=nxt_notice
+            )
+            send_with_chart_buttons(_merged_message, watch["code"], watch["name"])
+        else:
+            send_with_chart_buttons(
+                f"🔔 <b>[1차 진입가 도달]</b>{nxt_notice}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {_entry_hit_ts}\n\n"
+                f"{_nxt_delta_block}{similar_block}"
+                f"{reasons_block}"
+                f"{sector_block}"
+                f"{_entry_exec_block}"
+                f"━━━━━━━━━━━━━━━\n"
+                f"┌─────────────────────\n"
+                f"│ {_strength_emoji} <b>1차 진입 구간</b>  (신호: {_strength})\n"
+                f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})\n"
+                f"│ 🎯 진입가  <b>{entry:,}원</b>  ◀ 목표!\n"
+                f"{_reach_note_block}"
+                f"│ 💰 <b>권장 진입: {_p1_pct}%</b>\n"
+                f"│ 🛡 손절가  <b>{watch['stop_loss']:,}원</b>  ({stop_pct:+.1f}%)\n"
+                f"│ 🏆 목표가  <b>{watch['target_price']:,}원</b>  ({tgt_pct:+.1f}%)\n"
+                f"└─────────────────────",
+                watch["code"], watch["name"]
+            )
         watch["phase1_price"] = price
         watch["phase1_pct"] = _p1_pct
         watch["signal_strength"] = _strength
@@ -14817,7 +14840,7 @@ def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_
     return True
 
 
-def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | None = None) -> bool:
+def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | None = None, merge_capture_phase1: bool = False) -> bool:
     if not isinstance(signal, dict):
         return False
     sig_type = str(signal.get("signal_type") or "").upper()
@@ -14835,7 +14858,7 @@ def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | N
     blocked_reason = _detect_entry_block_reason(signal, watch, price, entry)
     if blocked_reason:
         return False
-    return _send_entry_phase_alert(watch, dict(signal), price, entry, use_nxt=bool(signal.get("use_nxt")), reach_via_recovery=False)
+    return _send_entry_phase_alert(watch, dict(signal), price, entry, use_nxt=bool(signal.get("use_nxt")), reach_via_recovery=False, merge_capture_phase1=merge_capture_phase1)
 
 
 def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
@@ -16586,6 +16609,52 @@ def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, 
         parts.append('━━━━━━━━━━━━━━━')
         parts.extend(sector_block.rstrip().split('\n'))
     return "\n".join([p for p in parts if p]).rstrip()
+
+
+def _build_integrated_pullback_phase1_message(signal: dict, watch: dict, price: int, entry: int,
+                                              diff_str: str, strength: str, phase1_pct: int,
+                                              stop_pct: float, target_pct: float,
+                                              hit_ts: str, nxt_notice: str = "") -> str:
+    snap = dict(signal or {})
+    stock_name = _resolve_stock_name(snap.get("code", watch.get("code", "")), snap.get("name", watch.get("name", "")))
+    snap["name"] = stock_name
+    snap["code"] = normalize_stock_code(snap.get("code", watch.get("code", ""))) or snap.get("code", watch.get("code", ""))
+    snap["price"] = safe_int(price, 0)
+    snap["entry_price"] = safe_int(entry, 0)
+    snap["planned_entry_price"] = safe_int(watch.get("entry_price", entry), entry)
+    snap["stop_loss"] = safe_int(watch.get("stop_loss", snap.get("stop_loss", 0)), 0)
+    snap["target_price"] = safe_int(watch.get("target_price", snap.get("target_price", 0)), 0)
+    grade = str(snap.get("grade") or watch.get("execution_grade") or watch.get("grade") or "B").upper()
+    grade_emoji = {"A": "🏆", "B": "🥈", "C": "🥉"}.get(grade, "📊")
+    grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(grade, f"{grade}등급")
+    intraday_tag = "  ⚡️ 장중 돌파" if snap.get("is_intraday") else ""
+    capture_label = _format_capture_datetime_label(
+        detected_at=snap.get("detected_at"),
+        detect_date=snap.get("detect_date", watch.get("detect_date", "")),
+        detect_time=snap.get("detect_time", watch.get("detect_time", "")),
+    ) or _format_capture_datetime_label(detected_at=datetime.now())
+    header_line = f"{grade_emoji} <b>[눌림목 포착 + 1차 진입가 도달]</b>  {grade_text}{intraday_tag}"
+    msg = _build_capture_focus_message(snap, header_line, capture_label, name_dot="🟣")
+    strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(strength, "📊")
+    sig_labels = {
+        "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
+        "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
+        "PRECLOSE_GAP_ENTRY": "종가선진입",
+    }
+    sig = sig_labels.get(str(watch.get("signal_type", "") or "").upper(), watch.get("signal_type", ""))
+    details = [
+        "━━━━━━━━━━━━━━━",
+        f"{strength_emoji} <b>1차 진입 구간</b>{nxt_notice}",
+        f"원신호: {sig}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {hit_ts}",
+        "┌─────────────────────",
+        f"│ 📍 현재가  <b>{price:,}원</b>  ({diff_str})",
+        f"│ 🎯 대표진입가  <b>{entry:,}원</b>",
+        f"│ 💰 <b>권장 진입: {int(phase1_pct)}%</b>",
+        f"│ 🛡 손절가  <b>{safe_int(watch.get('stop_loss',0),0):,}원</b>  ({float(stop_pct):+.1f}%)",
+        f"│ 🏆 목표가  <b>{safe_int(watch.get('target_price',0),0):,}원</b>  ({float(target_pct):+.1f}%)",
+        "└─────────────────────",
+    ]
+    return "\n".join([msg.rstrip(), *details]).rstrip()
 
 
 
