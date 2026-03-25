@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v67
+버전: v68
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v68 (2026-03-25): 조건부 2종목 허용 + 포착 메시지 예상진입가(엔진 재사용) 표기.
+  [#1] `_should_allow_conditional_second_position()` / `_extract_tracking_sector_theme()`를 추가하고
+       `_apply_position_limit_after_priority()`에 조건부 extra slot 1개를 연결.
+       기존: `max_positions=1`이라 실제 진입 완료 종목이 1개만 있어도 정규장 신규 A급 후보가 전부 동일하게 막혔음.
+       수정: 정규장 KRX + 기존 실보유 1개 + 신규 후보 A등급/점수 85점↑ + 비동일섹터 + 예상진입가 존재일 때만
+       1개 추가 허용(실질 2종목). NXT/비A/동일섹터/섹터미상은 그대로 차단.
+  [#2] `_select_capture_expected_entry_price()` / `_format_capture_expected_entry_line()`를 추가하고
+       `_build_capture_focus_price_line()`이 포착 메시지에 `예상진입가`를 함께 표기하도록 수정.
+       기존: 포착 메시지는 현재가만 보여서 대기 진입 가격대를 바로 판단하기 어려웠음.
+       수정: 단순 현재가 비율계산이 아니라 기존 엔진이 이미 산출한 `entry_price` / `planned_entry_price` /
+       `execution_hint_entry_price`만 재사용해 `예상진입가`를 표시.
+  이유: 사용자는 비A급 확대가 아니라 A급 행동 알림 품질을 원했고, 동시에 포착 단계에서도 엔진 기준 예상 진입대를 바로 확인하길 원했음.
+  개선점: 정규장 A급 이원화 대응력↑, 동시보유 완전삭제 없이 기회손실↓, 포착 메시지 행동 해석력↑.
+  주의점: 동시보유 제한 기본 철학은 유지되며, 조건부 2종목은 정규장 A급·비동일섹터일 때만 허용. `예상진입가`는 엔진 재사용값만 표기하고 단순 추정치는 만들지 않음.
 
 - v67 (2026-03-25): active entry_hit 정합성 정리 + NXT 장전 EARLY_DETECT 허용 강화 + 종목명 복구 보강.
   [#1] `_load_entry_watch_active()` / `_collect_actionable_position_limit_codes()`에
@@ -2857,6 +2872,9 @@ REGIME_PARAMS = {
     "crash":  {"score_mult": 0.5,  "min_add": 15,  "cooldown": 3600, "pullback_ratio": 0.50,
                "partial_exit_mult": 1.5, "max_positions": 1, "overnight_add": 25},
 }
+
+CONDITIONAL_SECOND_POSITION_MIN_SCORE = 85
+CONDITIONAL_SECOND_POSITION_MAX_EXTRA = 1
 
 def get_regime_cooldown() -> int:
     """현재 시장 레짐에 따른 포착 알림 쿨다운(초) 반환.
@@ -16370,12 +16388,39 @@ def _build_capture_focus_sector_block(s: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _select_capture_expected_entry_price(signal: dict | None = None) -> tuple[int, str]:
+    signal = signal if isinstance(signal, dict) else {}
+    candidates = [
+        (safe_int(signal.get("entry_price", 0), 0), "대표진입 기준"),
+        (safe_int(signal.get("planned_entry_price", 0), 0), "계획진입 기준"),
+        (safe_int(signal.get("execution_hint_entry_price", 0), 0), "체결기반 기준"),
+    ]
+    for price, label in candidates:
+        if price > 0:
+            return price, label
+    return 0, ""
+
+
+def _format_capture_expected_entry_line(price: int, expected_entry: int, source_label: str = "") -> str:
+    price = safe_int(price, 0)
+    expected_entry = safe_int(expected_entry, 0)
+    if price <= 0 or expected_entry <= 0:
+        return ""
+    gap_pct = ((expected_entry / price) - 1.0) * 100.0 if price else 0.0
+    source_tail = f" · {source_label}" if source_label else ""
+    return f"🎯 예상진입가 <b>{expected_entry:,}원</b>  (현재가 대비 {gap_pct:+.1f}%{source_tail})"
+
+
 def _build_capture_focus_price_line(s: dict) -> str:
     price = int(s.get('price', 0) or 0)
     if not price:
         return ''
-    return f"💵 현재가 <b>{price:,}원</b>"
-
+    lines = [f"💵 현재가 <b>{price:,}원</b>"]
+    expected_entry, source_label = _select_capture_expected_entry_price(s)
+    expected_line = _format_capture_expected_entry_line(price, expected_entry, source_label)
+    if expected_line:
+        lines.append(expected_line)
+    return "\n".join(lines)
 
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
     display_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
@@ -24628,17 +24673,79 @@ def _get_carry_position_context() -> tuple[int, set[str]]:
     return 0, set()
 
 
+def _extract_tracking_sector_theme(rec: dict | None = None) -> str:
+    rec = rec if isinstance(rec, dict) else {}
+    theme = _extract_alert_sector_theme(rec)
+    if not _is_generic_sector_theme(theme):
+        return theme
+    feature_snapshot = rec.get("feature_snapshot") if isinstance(rec.get("feature_snapshot"), dict) else {}
+    feature_theme = str(feature_snapshot.get("sector_theme", "") or rec.get("sector_theme", "") or "").strip()
+    return "기타" if _is_generic_sector_theme(feature_theme) else feature_theme
+
+
+def _should_allow_conditional_second_position(alert: dict | None = None, carry_codes: set[str] | None = None,
+                                             latest_by_code: dict | None = None) -> bool:
+    alert = alert if isinstance(alert, dict) else {}
+    carry_codes = set(carry_codes or set())
+    latest_by_code = latest_by_code if isinstance(latest_by_code, dict) else {}
+    if len(carry_codes) != 1:
+        return False
+    if not is_market_open() or _is_nxt_premarket_window() or _is_nxt_postmarket_only_window():
+        return False
+    market = str(alert.get("market") or "KRX").upper()
+    if market == "NXT":
+        return False
+    grade = str(alert.get("execution_grade") or alert.get("grade") or "").upper()
+    score = safe_int(alert.get("score", 0), 0)
+    entry_price = safe_int(alert.get("entry_price", alert.get("planned_entry_price", alert.get("execution_hint_entry_price", 0))), 0)
+    candidate_theme = _extract_alert_sector_theme(alert)
+    if grade != "A" or score < CONDITIONAL_SECOND_POSITION_MIN_SCORE or entry_price <= 0:
+        return False
+    if _is_generic_sector_theme(candidate_theme):
+        return False
+    active_themes = set()
+    for code in carry_codes:
+        rec = latest_by_code.get(code) if isinstance(latest_by_code, dict) else None
+        active_theme = _extract_tracking_sector_theme(rec)
+        if _is_generic_sector_theme(active_theme):
+            return False
+        active_themes.add(active_theme)
+    return candidate_theme not in active_themes
+
+
 def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[str], carry_count: int, max_positions: int, stage: str = "") -> list:
     if not sorted_alerts:
         return []
     if carry_count < max_positions:
         return sorted_alerts
 
+    latest_by_code = {}
+    try:
+        latest_by_code = _build_latest_tracking_by_code(_read_json_safe(SIGNAL_LOG_FILE, {}))
+    except Exception:
+        latest_by_code = {}
+
+    extra_slots = 0
+    if max_positions == 1 and carry_count == 1:
+        extra_slots = CONDITIONAL_SECOND_POSITION_MAX_EXTRA
+
     allowed = []
     blocked = []
+    extra_used = 0
+
     for rank, alert in enumerate(sorted_alerts, start=1):
         if alert.get("code") in carry_codes:
             allowed.append(alert)
+            continue
+        if extra_slots > extra_used and _should_allow_conditional_second_position(alert, carry_codes=carry_codes, latest_by_code=latest_by_code):
+            alert["conditional_second_position_allowed"] = True
+            alert["conditional_second_position_slot"] = carry_count + extra_used + 1
+            allowed.append(alert)
+            extra_used += 1
+            print(
+                f"  🧩 조건부 2종목 허용: {_resolve_stock_name(alert.get('code',''), alert.get('name',''))} "
+                f"[{str(alert.get('execution_grade') or alert.get('grade') or '').upper()}등급 / {_extract_alert_sector_theme(alert)}]"
+            )
             continue
         blocked.append((rank, alert))
 
@@ -24656,6 +24763,7 @@ def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[s
                     "leader_priority_hit": bool(alert.get("leader_priority_hit")),
                     "stale_pullback_hit": bool(alert.get("stale_pullback_hit")),
                     "stale_replay_penalty_hit": bool(alert.get("stale_replay_penalty_hit")),
+                    "conditional_second_position_checked": bool(extra_slots > 0),
                 },
             )
         print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 평가 후 신규 {len(blocked)}개 억제")
