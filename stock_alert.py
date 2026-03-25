@@ -3,11 +3,31 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v70
+버전: v71
 날짜: 2026-03-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v71 (2026-03-25): 종목포착 핵심 3대 차단 해소 — 눌림목 A기준 확장 + 동시보유 오카운트 장중 정리 + NXT A급 호가차단 완화.
+  [#1] `_apply_mid_pullback_execution_grade()`에 B등급 고점수 → A승격 조건 추가.
+       기존: 98~129점 B등급도 `grade == "A"` 조건 불충족으로 외부알림 전량 차단.
+       수정: `pattern_grade == "B"` + `pattern_score >= 95` + `total_count >= req_b` → `execution_grade = "A"` 승격.
+       이유: 스킬 7조 — A등급이 왜 포착→발송 못 가는지로만 진단. 고점수 B는 A기준 확장으로 해소.
+       개선점: 쏠리드 98점·DMS 98점·셀바스AI 129점 눌림목 외부알림 통과.
+       주의점: 95점 미만 B등급은 기존 억제 유지.
+  [#2] `_purge_stale_entry_watch_hits()` 추가 → `clean_expired_cache()`(30분 주기)에 연결.
+       기존: 재시작 시에만 stale hit 정리 → 장중 유령 entry_hit 23~26개가 동시보유로 오카운트돼 신규 포착 전량 차단.
+       수정: 30분마다 `_is_actionable_entry_watch()` 재검증해 stale hit 즉시 제거 + `_save_entry_watch_active()` 동기화.
+       이유: 로그 전 구간 `동시보유 제한: 23/1~26/1`이 지속되며 신규 10~12개씩 억제.
+       개선점: 장중 position_limit 오카운트 해소 → A급 포착 통과율↑.
+       주의점: 실보유(`_is_actionable_entry_watch()` 통과)는 제거 대상 아님. 보유 제한 자체는 유지.
+  [#3] `_should_soft_allow_no_ask_liquidity_general()`에 NXT A급 85점↑ soft allow 직통 추가.
+       기존: NXT no_ask_liquidity 시 복합조건만 허용 → SURGE A급 85점도 호가 없으면 전량 차단.
+       수정: NXT + A급 + score >= 85 + change_rate >= 5.0 → 호가 무관 soft allow 통과.
+       이유: 고점수 A급 NXT 포착은 호가가 얇아도 관찰 우선 알림이 나가야 사용자 대응 가능.
+       개선점: NXT A급 SURGE/STRONG_BUY의 no_ask_liquidity 차단↓.
+       주의점: KRX 기존 조건 유지. NXT도 A급 85점↑ 미달 시 기존 로직.
 
 - v70 (2026-03-25): 눌림목 대표진입가 선동기화 + 현재가<=대표진입가 통합 메시지 + 포착/행동 가격 기준 일치.
   [#1] `run_mid_pullback_scan()`의 순서를 `save_signal_log() → register_entry_watch() → 즉시 1차 통합판정 → 포착 발송`으로 재정렬하고,
@@ -2777,6 +2797,42 @@ CACHE_TTL_SECONDS = 3600
 MAX_CACHE_SIZE = 5000
 _exec_speed_cache = {}  # [v41.85] 모듈 레벨 선언 누락 수정 (NameError 방지)
 
+def _purge_stale_entry_watch_hits() -> int:
+    """v71: 장중 30분마다 _entry_watch에서 stale entry_hit 제거.
+    기존: 재시작 시 _load_entry_watch_active()에서만 정리 → 장 중 쌓인 stale hit이
+    _collect_actionable_position_limit_codes()에 의해 23~26개 유령 보유로 오카운트됨.
+    수정: clean_expired_cache() 호출 시 함께 재검증해 장중에도 실시간 정리.
+    """
+    global _entry_watch
+    if not isinstance(_entry_watch, dict) or not _entry_watch:
+        return 0
+    try:
+        now_ts = time.time()
+        siglog_data = _read_json_safe(SIGNAL_LOG_FILE, {})
+        latest_by_code = _build_latest_tracking_by_code(siglog_data)
+        purged = []
+        for key, watch in list(_entry_watch.items()):
+            if not isinstance(watch, dict):
+                continue
+            if not (watch.get("entry_hit") or watch.get("entry_hit_locked")):
+                continue
+            code = normalize_stock_code(watch.get("code"))
+            latest_rec = latest_by_code.get(code) if code else None
+            if not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
+                purged.append(key)
+        for key in purged:
+            w = _entry_watch.pop(key, None)
+            if w:
+                code = normalize_stock_code(w.get("code", ""))
+                print(f"  🗑 stale entry_hit 정리: {w.get('name', code)} ({code}) key={key}")
+        if purged:
+            _save_entry_watch_active()
+        return len(purged)
+    except Exception as e:
+        print(f"  ⚠️ stale entry_hit 정리 오류: {e}")
+        return 0
+
+
 def clean_expired_cache():
     global _sector_cache, _daily_cache, _exec_speed_cache
     current_ts = time.time()
@@ -2792,6 +2848,8 @@ def clean_expired_cache():
             for k, _ in sorted(sortable, key=lambda x: x[1].get("ts", 0))[:10]:
                 del cache[k]; cleaned += 1
     if cleaned > 0: print(f"[캐시 정리] {cleaned}개")
+    # v71: 장중 stale entry_hit 정리 연결
+    _purge_stale_entry_watch_hits()
 
 def reset_daily_caches():
     global _daily_cache, _exec_speed_cache
@@ -4733,6 +4791,7 @@ def _apply_mid_pullback_execution_grade(result: dict) -> dict:
     core_count = int(profile.get("core_count", 0) or 0)
     total_count = int(profile.get("total_count", 0) or 0)
     execution_grade = pattern_grade
+    pattern_score = int(result.get("pattern_score_base", result.get("score", 0)) or 0)
     if pattern_grade == "A":
         if core_count >= 1 and total_count >= req_a:
             execution_grade = "A"
@@ -4741,7 +4800,13 @@ def _apply_mid_pullback_execution_grade(result: dict) -> dict:
         else:
             execution_grade = "C"
     elif pattern_grade == "B":
-        execution_grade = "B" if total_count >= req_b else "C"
+        # v71: 점수 95점↑ B등급 → 실질 A로 승격 (A기준 확장)
+        # 로그상 98~129점 B등급이 외부알림 전량 차단되던 문제 해소
+        if pattern_score >= 95 and total_count >= req_b:
+            execution_grade = "A"
+            result.setdefault("reasons", []).append(f"🔺 고점수 B→A 승격: {pattern_score}점 (임계 95점↑)")
+        else:
+            execution_grade = "B" if total_count >= req_b else "C"
     else:
         execution_grade = "C"
 
@@ -18102,6 +18167,11 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     miss_theme_leader = bool(signal.get("miss_theme_leader_hit"))
     nxt_post_leader = bool(signal.get("nxt_post_leader_hit"))
     leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader or nxt_post_leader
+    # v71: A급 85점↑ NXT 종목은 호가 얇아도 soft allow 통과
+    # 셀바스AI 06:01 SURGE A급 85점이 no_ask_liquidity로 전량 차단되던 문제 해소
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+    if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
+        return True
     strong_combo = score >= GENERAL_SOFT_ALLOW_MIN_SCORE and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and (
         vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
     )
