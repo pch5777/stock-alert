@@ -3,11 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v78
+버전: v79
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v79 (2026-03-26): 동시보유 오카운트 영구 수정 — 재시작 직후 stale entry_hit 차단.
+  [#1] `load_carry_stocks()` 수정 — 시작 시 `_purge_stale_entry_watch_hits()` 즉시 호출.
+       기존: 30분 스케줄에만 연결 → 재시작 직후 스캔 시 stale entry_hit 5개가
+             "보유 중"으로 오카운트 → 전체 NXT 후보 차단.
+       수정: purge_orphan_tracking() 직후 _purge_stale_entry_watch_hits() 추가 호출.
+  [#2] `_is_actionable_entry_watch()` 수정 — detect_date 날짜 검증 추가.
+       entry_hit=True 이지만 detect_date가 오늘 이전이고 signal_log에 매칭 rec 없으면
+       stale로 판단 → actionable 제외.
+       기존: latest_rec=None 이면 entry_hit만 보고 무조건 actionable 처리.
+       수정: latest_rec=None + detect_date 어제 이전 → False 반환.
+  이유: 로그상 "동시보유 제한: 5/1종목 보유 중" 반복으로 NXT 오전 상승 종목 전량 차단.
+       _purge_stale_entry_watch_hits()가 30분 스케줄에만 있어 재시작 직후 미동작.
+  개선점: 재시작 직후 즉시 stale 정리 → NXT 포착 차단 해소.
+  주의점: 실제 entry_hit 된 당일 종목은 영향 없음. 과거 날짜 stale만 제거.
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음).
 
 - v78 (2026-03-26): 이슈 기능 6종 개선 — 이슈 선감지→주가반응 알람 체인 신설.
   [#1] `_news_issue_prewatch` 전역 딕트 신설.
@@ -6922,6 +6938,15 @@ def _is_actionable_entry_watch(watch: dict | None, latest_rec: dict | None = Non
             return False
         if latest_rec.get("actual_entry") is not True and latest_rec.get("entry_hit") is not True:
             return False
+    else:
+        # v79 #2: latest_rec=None(signal_log 매칭 없음) 이면서
+        # detect_date가 어제 이전인 entry_hit는 stale로 판단 → 제외
+        # 당일 포착 종목은 영향 없음
+        detect_date = str(watch.get("detect_date") or watch.get("first_detect_date") or "")
+        if detect_date:
+            today_str = datetime.now().strftime("%Y%m%d")
+            if detect_date < today_str:
+                return False
     return True
 
 
@@ -12688,6 +12713,15 @@ def load_carry_stocks():
             print(f"🗑 봇 시작 시 고아 추적 {_orphan_count}건 자동 만료")
     except Exception as _oe:
         print(f"⚠️ 고아 추적 정리 오류: {_oe}")
+
+    # v79 #1: 시작 직후 stale entry_hit 즉시 정리
+    # 30분 스케줄에만 있어 재시작 직후 스캔 시 stale 5개가 "보유 중"으로 오카운트되던 버그 수정
+    try:
+        purged_hits = _purge_stale_entry_watch_hits()
+        if purged_hits:
+            print(f"🗑 봇 시작 시 stale entry_hit {purged_hits}건 정리")
+    except Exception as _pe:
+        print(f"⚠️ stale entry_hit 정리 오류: {_pe}")
 
     try:
         sig_data = _read_json_locked(SIGNAL_LOG_FILE)
