@@ -22,7 +22,10 @@
        이유: 로그 전 구간 `동시보유 제한: 23/1~26/1`이 지속되며 신규 10~12개씩 억제.
        개선점: 장중 position_limit 오카운트 해소 → A급 포착 통과율↑.
        주의점: 실보유(`_is_actionable_entry_watch()` 통과)는 제거 대상 아님. 보유 제한 자체는 유지.
-  [#3] `_should_soft_allow_no_ask_liquidity_general()`에 NXT A급 85점↑ soft allow 직통 추가.
+  [#4] `_send_entry_phase_alert()` 내 `_get_split_entry_rule` → `_get_entry_split_rule` 오타 수정 (핫픽스).
+       기존: 함수명 단어 순서 오타로 B→A 승격 후 처음 진입가 도달 경로가 실행되면 NameError 크래시.
+       수정: 올바른 기존 함수명 `_get_entry_split_rule`으로 교정.
+       이유: v70부터 잠재된 버그였으나 v71 #1 수정으로 쏠리드가 A급 통과해 해당 경로 최초 실행됨.
        기존: NXT no_ask_liquidity 시 복합조건만 허용 → SURGE A급 85점도 호가 없으면 전량 차단.
        수정: NXT + A급 + score >= 85 + change_rate >= 5.0 → 호가 무관 soft allow 통과.
        이유: 고점수 A급 NXT 포착은 호가가 얇아도 관찰 우선 알림이 나가야 사용자 대응 가능.
@@ -14766,7 +14769,7 @@ def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_
         similar_block = ""
 
     _strength = _classify_signal_strength(watch, _entry_exec_metrics)
-    _split_rule = _get_split_entry_rule(_strength)
+    _split_rule = _get_entry_split_rule(_strength)
     if notify_count == 0 and _strength == "약한":
         _log_suppressed_alert(
             watch["code"], watch["name"],
