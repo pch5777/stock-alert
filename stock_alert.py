@@ -3,11 +3,37 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v77
-날짜: 2026-03-25
+버전: v78
+날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v78 (2026-03-26): 이슈 기능 6종 개선 — 이슈 선감지→주가반응 알람 체인 신설.
+  [#1] `_news_issue_prewatch` 전역 딕트 신설.
+       이슈 뉴스 감지 후 주가 미반응 종목을 스킵하지 않고 prewatch 등록.
+       TTL: 14400초(4시간), 쿨다운 후 자동 소멸.
+  [#2] `analyze_news_theme()` 수정 — 스킵 → prewatch 등록으로 변경.
+       기존: rising_stocks 없으면 완전 스킵.
+       수정: rising_stocks 없으면 not_yet 종목을 _news_issue_prewatch에 보관.
+  [#3] `check_issue_prewatch()` 신설.
+       prewatch 종목 주가 1.5%↑ AND 거래량 1.5x 이상 시:
+       ① analyze() 호출 → grade==A + entry_price>0 이면 _dispatch_general_alert_signal() 진입 체인 연결 (진입가 알람 발송).
+       ② A급 미달 이면 [이슈 선감지] 정보 알람만 발송 (진입 불가).
+       발송 후 해당 theme prewatch 소멸, _news_prewatch_fired로 중복 차단.
+  [#4] `run_news_scan()` 수정 — check_issue_prewatch() 연결.
+  [#5] `run_geo_news_scan()` 수정 — geo 이슈 감지 시 영향 섹터 종목 prewatch 등록.
+  [#6] `analyze_geopolitical_event()` fallback 캐시 TTL 7200초(2배)로 연장.
+       기존: 빈 응답 시 캐시 저장은 하지만 TTL이 정상과 동일 → 반복 API 호출.
+       수정: fallback 결과 캐시 TTL 키에 "fb_" 프리픽스 + ts 갱신으로 재호출 억제.
+  [#7] `run_dart_intraday()` 자사주소각 판단 고도화.
+       기존: _is_buyback_cancel 시 0.5% 기준만으로 알람.
+       수정: analyze_news_deep 결과 score_adj < -3이면 내부 기록만 (알람 발송 차단).
+       이유: "적당한 자사주소각"이 주가에 실질 영향 없는 경우 과알림 방지.
+  이유: 이슈 뉴스 감지 후 주가 미반응 → 완전 스킵(1,287회) 문제 해소.
+       이슈 선발견 후 주가 변동 시 즉시 알람 체인 완성.
+  개선점: 이슈 조기 포착↑, 지정학 API 반복 fallback 로그↓, 자사주 과알림↓.
+  주의점: prewatch 알람은 신호 등급 없이 [이슈 선감지] 단독 발송. max_positions=1 유지.
 
 - v77 (2026-03-25): v76 거래정지 판별 버그 수정 + 공시 사유 구분.
   [#1] `_is_trading_halt()` ts=0 자기모순 버그 수정.
@@ -3327,6 +3353,10 @@ _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
 _news_stock_alert_history = {}
+# v78 #1: 이슈 뉴스 감지 후 주가 미반응 종목 예비워치 (theme_key → {stocks, headline, theme_desc, ts})
+_news_issue_prewatch: dict = {}
+# v78 #1: prewatch 알람 발송 후 중복 차단 (theme_key → ts)
+_news_prewatch_fired: dict = {}
 _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
@@ -20470,9 +20500,12 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
 
     # 캐시 키: 감지된 키워드 조합
     cache_key = ",".join(sorted(detected_kws[:5]))
-    cached = _geo_cache.get(cache_key)
-    if cached and time.time() - cached.get("ts", 0) < 3600:
-        return cached
+    # v78 #6: fallback 캐시는 7200초 TTL (정상 캐시는 3600초)
+    cached = _geo_cache.get(cache_key) or _geo_cache.get("fb_" + cache_key)
+    if cached:
+        ttl = 7200 if _geo_cache.get("fb_" + cache_key) else 3600
+        if time.time() - cached.get("ts", 0) < ttl:
+            return cached
 
     # Claude API 호출
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -20553,7 +20586,8 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
-            _geo_cache[cache_key] = result_fb
+            # v78 #6: fallback은 별도 캐시키 + 짧은 TTL(7200s) → 반복 API 호출 억제
+            _geo_cache["fb_" + cache_key] = result_fb
             return result_fb
         raw  = extract_ai_text(resp_json)
         # JSON 파싱
@@ -20568,7 +20602,8 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
                     "sector_directions": sec_dirs_fb,
                     "score_adj": -3, "summary": f"⚠️ 지정학 키워드 감지: {', '.join(detected_kws[:3])}",
                     "entities": [], "ts": time.time()}
-            _geo_cache[cache_key] = result_fb
+            # v78 #6: fallback은 별도 캐시키 + 짧은 TTL(7200s) → 반복 API 호출 억제
+            _geo_cache["fb_" + cache_key] = result_fb
             return result_fb
         data = json.loads(raw)
 
@@ -20735,6 +20770,48 @@ def run_geo_news_scan():
                         print(f"  🌙 geo→야간 이벤트 {len(detected_events)}건 → 워치리스트 갱신")
         except Exception as _e:
             print(f"  ⚠️ geo→야간 워치리스트 연결 오류: {_e}")
+
+        # v78 #5: 장중 geo 이슈 감지 시 상승 섹터 종목 prewatch 등록
+        try:
+            if is_any_market_open():
+                sec_dirs = geo.get("sector_directions", [])
+                for sd in sec_dirs:
+                    if sd.get("direction") not in ("상승", "up"):
+                        continue
+                    sec_name = sd.get("sector", "")
+                    if not sec_name:
+                        continue
+                    sec_stocks = _get_geo_sector_stocks(sec_name, max_n=5)
+                    if not sec_stocks:
+                        continue
+                    pw_key = f"geo_{sec_name}"
+                    if pw_key in _news_issue_prewatch or pw_key in _news_prewatch_fired:
+                        continue
+                    stock_status_geo = []
+                    for code_g, name_g in sec_stocks:
+                        try:
+                            cur_g = get_stock_price(code_g)
+                            if not cur_g:
+                                continue
+                            stock_status_geo.append({
+                                "code": code_g, "name": name_g,
+                                "price": cur_g.get("price", 0),
+                                "change_rate": cur_g.get("change_rate", 0),
+                                "volume_ratio": cur_g.get("volume_ratio", 0),
+                            })
+                            time.sleep(0.15)
+                        except Exception:
+                            continue
+                    if stock_status_geo:
+                        _news_issue_prewatch[pw_key] = {
+                            "stocks":     stock_status_geo,
+                            "headline":   geo.get("summary", sec_name)[:60],
+                            "theme_desc": f"지정학 수혜섹터: {sec_name}",
+                            "ts":         time.time(),
+                        }
+                        print(f"  🌍 geo prewatch 등록: [{pw_key}] {len(stock_status_geo)}종목 대기")
+        except Exception as _e2:
+            print(f"  ⚠️ geo prewatch 등록 오류: {_e2}")
 
     except Exception as e:
         _log_error("run_geo_news_scan", e)
@@ -21177,7 +21254,21 @@ def analyze_news_theme(headlines: list = None) -> list:
         if not stock_status: continue
         rising_stocks = [s for s in stock_status if s["rising"]]
         if not rising_stocks:
-            print(f"  ⏭ [{theme_key}] 뉴스 있지만 주가 반응 없음 → 스킵"); continue
+            # v78 #2: 완전 스킵 대신 prewatch 등록 — 주가 미반응 종목 감시 대기
+            now_ts = time.time()
+            # 이미 발송된 prewatch거나 쿨다운 내면 스킵
+            if (time.time() - _news_prewatch_fired.get(theme_key, 0) < 14400
+                    or theme_key in _news_issue_prewatch):
+                print(f"  ⏭ [{theme_key}] 뉴스 있지만 주가 반응 없음 → 스킵")
+            else:
+                _news_issue_prewatch[theme_key] = {
+                    "stocks":     stock_status,
+                    "headline":   matched[0][:60],
+                    "theme_desc": theme_info["desc"],
+                    "ts":         now_ts,
+                }
+                print(f"  👁 [{theme_key}] 뉴스 감지 → prewatch 등록 ({len(stock_status)}종목 대기)")
+            continue
         total = len(stock_status); react_ratio = len(rising_stocks)/total
         sector_bonus = (15 if react_ratio>=1.0 else 10 if react_ratio>=0.5 else 5)
         if sum(1 for s in rising_stocks if s["vol_on"]) >= 2: sector_bonus+=5
@@ -21222,6 +21313,108 @@ def send_news_theme_alert(signal: dict):
          +(f"🔥 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
          +(f"🎯 <b>아직 안 오른 종목 (추격 기회)</b>\n{not_yet_block}\n" if not_yet_block else "")
          +"━━━━━━━━━━━━━━━")
+
+# ============================================================
+# v78 #3: 이슈 선감지 prewatch 체크 — 주가 변동 시 즉시 알람
+# ============================================================
+def check_issue_prewatch() -> None:
+    """
+    _news_issue_prewatch 에 등록된 종목들을 순회.
+    주가 1.5%↑ AND 거래량 1.5x 이상 조건 충족 시:
+      1) analyze() → A등급 이상이면 _dispatch_general_alert_signal() 로 진입 체인 연결
+      2) A등급 미달이면 [이슈 선감지] 정보 알람만 발송
+    - TTL 4시간 초과 시 자동 소멸
+    - 알람 발송 후 해당 theme_key → _news_prewatch_fired 로 이동 (중복 차단)
+    - 장외 시간엔 실행 생략
+    """
+    if not is_any_market_open() or _bot_paused:
+        return
+    now = time.time()
+    expired_keys = []
+    for theme_key, pw in list(_news_issue_prewatch.items()):
+        if now - pw.get("ts", 0) > 14400:
+            expired_keys.append(theme_key)
+            continue
+        if theme_key in _news_prewatch_fired:
+            expired_keys.append(theme_key)
+            continue
+        stocks = pw.get("stocks", [])
+        if not stocks:
+            expired_keys.append(theme_key)
+            continue
+        try:
+            reacted = []
+            for s in stocks:
+                try:
+                    cur = get_stock_price(s["code"])
+                    if not cur:
+                        continue
+                    cr  = cur.get("change_rate", 0)
+                    vr  = cur.get("volume_ratio", 0)
+                    if cr >= 1.5 and vr >= 1.5:
+                        reacted.append({
+                            "code":         s["code"],
+                            "name":         s["name"],
+                            "change_rate":  cr,
+                            "volume_ratio": vr,
+                            "price":        cur.get("price", 0),
+                            "today_vol":    cur.get("today_vol", 0),
+                            "ask_qty":      cur.get("ask_qty", 0),
+                            "bid_qty":      cur.get("bid_qty", 0),
+                            "prev_close":   cur.get("prev_close", 0),
+                            "high":         cur.get("high", 0),
+                            "open":         cur.get("open", 0),
+                            "cap_size":     cur.get("cap_size", "small"),
+                            "mktcap":       cur.get("mktcap", 0),
+                        })
+                    time.sleep(0.15)
+                except Exception:
+                    continue
+            if not reacted:
+                continue
+
+            # 이슈 반응 종목 발견 → theme_key 소멸 처리
+            _news_prewatch_fired[theme_key] = now
+            expired_keys.append(theme_key)
+
+            dispatched_codes = set()
+            info_lines = []
+
+            for r in reacted[:5]:
+                code = r["code"]
+                name = r["name"]
+                # ── A급 진입 체인 연결 ──
+                try:
+                    analyzed = analyze(r)
+                    if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
+                        # 이슈 테마 bonus를 reasons에 추가
+                        analyzed.setdefault("reasons", []).append(
+                            f"👁 이슈 선감지: {pw['theme_desc'][:30]}"
+                        )
+                        dispatched = _dispatch_general_alert_signal(
+                            analyzed,
+                            source_label="이슈 선감지"
+                        )
+                        if dispatched:
+                            dispatched_codes.add(code)
+                            print(f"  👁 이슈→A급 진입 체인: {name} {r['change_rate']:+.1f}% 등급A")
+                            continue
+                except Exception as _ae:
+                    _log_error(f"check_issue_prewatch/analyze({name})", _ae)
+
+                # A급 미달 → 내부 기록만 (사용자 알람 없음, 수칙 #14/#16)
+                print(f"  ⏭ 이슈 선감지 A급 미달: {name} {r['change_rate']:+.1f}% — 내부 기록만")
+
+            if dispatched_codes:
+                print(f"  👁 이슈 선감지 A급 진입 체인: {len(dispatched_codes)}종목")
+
+        except Exception as e:
+            _log_error("check_issue_prewatch", e)
+    for k in expired_keys:
+        _news_issue_prewatch.pop(k, None)
+    for k in [k2 for k2, ts in list(_news_prewatch_fired.items()) if now - ts > 28800]:
+        _news_prewatch_fired.pop(k, None)
+
 
 # ============================================================
 # DART
@@ -21531,6 +21724,21 @@ def run_dart_intraday():
             if not (change_rate >= _min_change) and not is_risk:
                 print(f"  ⏭ DART [{company}] 주가 반응 없음 → 스킵")
                 continue
+
+            # v78 #7: 자사주소각 공시 — Claude API 심층분석으로 실질 영향력 판단
+            # score_adj < -3 이면 주가 영향이 미미한 형식적 소각 → 내부 기록만
+            if _is_buyback_cancel and dart_deep is None:
+                try:
+                    fake_article = [{"title": title, "url": "", "time": ""}]
+                    dart_deep = analyze_news_deep(fake_article, company, code)
+                except Exception:
+                    pass
+            if _is_buyback_cancel and dart_deep is not None:
+                _adj = int(dart_deep.get("score_adj", 0) or 0)
+                _verdict = str(dart_deep.get("verdict", "") or "")
+                if _adj < -3 or _verdict in ("실질악재", "표면호재실질악재"):
+                    print(f"  ⏭ DART [{company}] 자사주소각 실질영향 약함({_verdict},{_adj:+d}) → 내부 기록만")
+                    continue
 
             z = 0
             try:
@@ -24192,6 +24400,11 @@ def run_news_scan():
         for signal in analyze_news_theme(headlines=headlines):
             send_news_theme_alert(signal)
     except Exception as e: print(f"⚠️ 뉴스 오류: {e}")
+    # v78 #4: prewatch 종목 주가 반응 체크 (이슈 선감지 알람 체인)
+    try:
+        check_issue_prewatch()
+    except Exception as e:
+        _log_error("run_news_scan/check_issue_prewatch", e)
 
 
 # ── v41.61 #5: 레짐 전환 알림 ──
