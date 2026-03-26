@@ -2956,8 +2956,8 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
         "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
     url_map_kosdaq = {
-        "rise":   "https://finance.naver.com/sise/sise_rise_kosdaq.naver",
-        "volume": "https://finance.naver.com/sise/sise_quant_kosdaq.naver",
+        "rise":   "https://finance.naver.com/sise/sise_rise.naver?sosok=1",
+        "volume": "https://finance.naver.com/sise/sise_quant.naver?sosok=1",
         "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
 
