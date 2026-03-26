@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v89
+버전: v90
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v90 (2026-03-26): entry_hit 이후 반복 알림 억제 — 눌림목 재알림 차단 + phase2/보류 중복발송 축소.
+  [#1] `ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC`, `PHASE2_UPGRADE_ALERT_COOLDOWN_SEC`,
+       `_find_existing_entry_hit_watch()`, `_should_send_phase2_upgrade_alert()`, `_mark_phase2_upgrade_alert_sent()` 추가.
+       같은 entry_hit watch에서 동일 사유의 `진입 보류/취소` 알림은 30분 쿨다운으로 재발송을 억제하고,
+       동일 강화 신호타입+동일 판단결과의 `[2차 진입 판단]`은 30분 내 중복 발송하지 않도록 제한.
+  [#2] `run_mid_pullback_scan()`의 외부 발송 직전에 기존 `entry_hit/entry_hit_locked` watch 존재 여부를 재확인하도록 보강.
+       이미 1차 진입가 도달 후 모니터링 중인 종목은 반복 `[눌림목 진입 신호]`를 생략하고 내부 기록만 유지.
+  [#3] `_dispatch_general_alert_signal()`의 신호 강화 phase2 트리거에 중복 억제 상태 저장을 연결.
+       `MID_PULLBACK→SURGE/STRONG_BUY` 같은 강화가 연속 감지돼도 같은 판단(가능/보류/금지)이면 짧은 시간 재발송을 막음.
+  이유: 한올바이오파마처럼 같은 종목이 `진입 보류/취소` → `눌림목 진입 신호` → `[2차 진입 판단]` → `진입 보류/취소`로
+       짧은 간격 반복 발송돼 행동 가능한 알림 품질을 해치던 문제 축소.
+  개선점: 동일 종목 반복 알림↓, entry_hit 이후 상태 전이 메시지 정합성↑, 사용자 알림 보수성↑.
+  주의점: 다른 사유로 상태가 실제 변경되면 알림은 계속 가능. 이번 수정은 동일 사유·동일 판단 반복 억제에 한정.
 
 - v89 (2026-03-26): 거래정지 공시 외부알림 범위 축소 — 실진입 종목만 발송.
   [#1] `_should_send_tracking_dart_alert()` 신규 추가.
@@ -3945,6 +3959,8 @@ SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES = int(os.getenv("SECTOR_RESEND_ENTRY_HIT_G
 # ── 진입가 감지 ──
 _entry_watch        = {}
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
+ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC = int(os.getenv("ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC", "1800") or "1800")  # 동일 보류사유 재알림 최소 30분
+PHASE2_UPGRADE_ALERT_COOLDOWN_SEC = int(os.getenv("PHASE2_UPGRADE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 동일 강화판단 재알림 최소 30분
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
 
 # v40.0-#10: 상한가 유지 종목 알림 차단 (당일 1회만 알림, 풀리기 전까지 재알림 없음)
@@ -9211,6 +9227,13 @@ def run_mid_pullback_scan():
             _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
             tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
             print(f"  ⏭ 눌림목 {tag}: {s['name']} [{s['grade']}등급] {s['score']}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
+            continue
+        _existing_hit_key, _existing_hit_watch = _find_existing_entry_hit_watch(s.get("code", ""))
+        if _existing_hit_watch is not None:
+            save_signal_log(s)
+            _mid_pullback_alert_history[s["code"]] = {"ts": time.time(), "pattern_grade": str(s.get("pattern_grade", s.get("grade", "C"))).upper(), "execution_grade": str(s.get("grade", "C")).upper(), "grade": str(s.get("grade", "C")).upper()}
+            tag = "[장중돌파]" if s.get("is_intraday") else "[일봉]"
+            print(f"  ⏭ 눌림목 {tag}: {s['name']} — 기존 entry_hit 유지, 외부알림 생략")
             continue
         save_signal_log(s)
         _watch_key = register_entry_watch(s)                     # ★ 대표 진입가 가드 적용 후 진입가 감시 등록
@@ -15456,7 +15479,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     now_ts = time.time()
     last_reason = str(watch.get("entry_guard_alert_reason") or "").strip()
     last_ts = float(watch.get("entry_guard_alert_ts") or 0.0)
-    if last_reason == reason and (now_ts - last_ts) < max(180, ENTRY_REWATCH_MINS * 60):
+    if last_reason == reason and (now_ts - last_ts) < ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC:
         return False
     diff_pct = round(((price - entry) / entry) * 100, 1) if entry else 0.0
     diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
@@ -15765,6 +15788,41 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     if upper_like and ask_qty <= 0:
         return "no_ask_liquidity"
     return ""
+
+
+def _find_existing_entry_hit_watch(code: str):
+    norm_code = normalize_stock_code(code)
+    if not norm_code:
+        return None, None
+    for _ek, _ew in list(_entry_watch.items()):
+        if not isinstance(_ew, dict):
+            continue
+        if normalize_stock_code((_ew or {}).get("code")) != norm_code:
+            continue
+        if _ew.get("entry_hit") or _ew.get("entry_hit_locked"):
+            return _ek, _ew
+    return None, None
+
+
+def _should_send_phase2_upgrade_alert(watch: dict, new_sig_type: str, decision: str) -> bool:
+    if not isinstance(watch, dict):
+        return True
+    last_sig = str(watch.get("phase2_upgrade_alert_signal_type") or "").upper()
+    last_decision = str(watch.get("phase2_upgrade_alert_decision") or "").strip()
+    last_ts = float(watch.get("phase2_upgrade_alert_ts") or 0.0)
+    if last_sig != str(new_sig_type or "").upper() or last_decision != str(decision or "").strip():
+        return True
+    return (time.time() - last_ts) >= PHASE2_UPGRADE_ALERT_COOLDOWN_SEC
+
+
+def _mark_phase2_upgrade_alert_sent(watch: dict, new_sig_type: str, decision: str, price: int = 0) -> None:
+    if not isinstance(watch, dict):
+        return
+    watch["phase2_upgrade_alert_signal_type"] = str(new_sig_type or "").upper()
+    watch["phase2_upgrade_alert_decision"] = str(decision or "").strip()
+    watch["phase2_upgrade_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    watch["phase2_upgrade_alert_ts"] = time.time()
+    watch["phase2_upgrade_alert_price"] = int(price or 0)
 
 
 def _is_truthy_market_flag(v) -> bool:
@@ -19424,17 +19482,7 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
         "UPPER_LIMIT": 5, "STRONG_BUY": 5,
     }
     _new_sig_type = str(s.get("signal_type") or "").upper()
-    _existing_hit_watch = None
-    _existing_hit_key = None
-    for _ek, _ew in list(_entry_watch.items()):
-        if not isinstance(_ew, dict):
-            continue
-        if normalize_stock_code(_ew.get("code")) != normalize_stock_code(s.get("code")):
-            continue
-        if _ew.get("entry_hit") or _ew.get("entry_hit_locked"):
-            _existing_hit_watch = _ew
-            _existing_hit_key = _ek
-            break
+    _existing_hit_key, _existing_hit_watch = _find_existing_entry_hit_watch(s.get("code", ""))
     if _existing_hit_watch is not None:
         _old_sig_type = str(_existing_hit_watch.get("signal_type") or "").upper()
         _new_rank = _SIGNAL_STRENGTH_RANK.get(_new_sig_type, 0)
@@ -19467,6 +19515,9 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                 _new_sig_label = _sig_labels.get(_new_sig_type, _new_sig_type)
                 _entry_hit_ts = str(_existing_hit_watch.get("entry_hit_time") or datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                 _reasons_str = "\n".join([f"│ {r}" for r in _p2_reasons])
+                if not _should_send_phase2_upgrade_alert(_existing_hit_watch, _new_sig_type, _p2_decision):
+                    print(f"  ⏭ phase2 중복억제({_old_sig_type}→{_new_sig_type}/{_p2_decision}): {s.get('name','')} — 외부알림 생략")
+                    return False
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[2차 진입 판단]</b>{_nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
@@ -19490,6 +19541,8 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                     _existing_hit_watch.get("code", s.get("code", "")),
                     _existing_hit_watch.get("name", s.get("name", ""))
                 )
+                _mark_phase2_upgrade_alert_sent(_existing_hit_watch, _new_sig_type, _p2_decision, _p2_price)
+                _save_entry_watch_active()
             except Exception as _e:
                 print(f"  ⚠️ phase2 트리거 오류: {_e}")
             return True
