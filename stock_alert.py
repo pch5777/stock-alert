@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v87
+버전: v88
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v88 (2026-03-26): 거래정지 영속 차단 추가 — 재시작 후 재포착 방지.
+  [#1] `TRADING_HALT_STATE_FILE`, `_load_trading_halt_state()`, `_save_trading_halt_state()`,
+       `_mark_trading_halt_state()`, `_clear_trading_halt_state()` 신규 추가.
+       거래정지 종목을 JSON 상태로 저장/복원해 프로세스 재시작 후에도 차단 상태를 유지.
+  [#2] `_is_trading_halt()`가 영속 halt 상태를 우선 확인하도록 보강.
+       KIS 플래그 또는 DART 거래정지 캐시 적중 시 영속 상태도 함께 갱신.
+  [#3] `check_dart_risk()` / `run_dart_intraday()`에 거래정지/거래재개 상태 동기화 추가.
+       거래정지 공시를 보면 halt state 저장, 거래재개/매매재개 공시를 보면 즉시 해제.
+  [#4] 봇 시작 시 `_load_trading_halt_state()`를 먼저 복원하도록 시작 순서 보강.
+       이전 런타임에서 이미 `[포착 취소 — 거래정지]` 처리된 종목이 재시작 직후 다시 포착되지 않게 함.
+  이유: 스피어처럼 거래정지 취소 이력이 있는 종목이 v87 재시작 후 DART/KIS 캐시 공백 구간에서 다시 포착·진입감시 등록되는 문제 차단.
+  개선점: 재시작 후 거래정지 재포착↓, 포착→몇 분 뒤 거래정지 취소 재발↓, 행동 가능한 알림 품질↑.
+  주의점: 거래재개 해제는 DART `거래재개/매매재개/거래정지해제/매매정지해제` 공시 확인 시에만 자동 해제.
 
 - v87 (2026-03-26): 거래정지 취소 메시지 정합화 — 포착시각/NXT가격/재개문구/사유표시 수정.
   [#1] `_get_trading_halt_reason_label()` 신규 함수 추가.
@@ -1492,12 +1506,15 @@ _PERSIST_FILES = [
     "geo_snapshot_last.json",
     "dart_intraday_state.json",
     "intraday_capture_mode.json",
+    "trading_halt_state.json",
 ]
 
 LEADER_LOCK_FILE = os.path.join(DATA_DIR, "leader_lock.json")
 AUTO_TUNE_STATE_FILE = os.path.join(DATA_DIR, "auto_tune_state.json")
 AUTO_BACKUP_STATE_FILE = os.path.join(DATA_DIR, "auto_backup_state.json")
 DART_INTRADAY_STATE_FILE = os.path.join(DATA_DIR, "dart_intraday_state.json")
+TRADING_HALT_STATE_FILE = os.path.join(DATA_DIR, "trading_halt_state.json")
+TRADING_HALT_KEEP_DAYS = int(os.getenv("TRADING_HALT_KEEP_DAYS", "14") or "14")
 LEADER_LOCK_LEASE_SEC = int(os.getenv("LEADER_LOCK_LEASE_SEC", "75") or "75")
 _INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'local'}:{os.getpid()}:{random.randint(1000, 9999)}"
 _RUNTIME_IS_LEADER = False
@@ -15341,6 +15358,10 @@ def _get_trading_halt_reason_label(code: str) -> str:
     """거래정지 취소 알림에 노출할 사용자용 사유 라벨을 정리한다."""
     _fallback = "주권매매거래정지"
     try:
+        persisted = _get_persisted_trading_halt(code)
+        persisted_title = str((persisted or {}).get("title") or "").strip()
+        if persisted_title and ("거래정지" in persisted_title or "매매정지" in persisted_title):
+            return persisted_title
         cached = _dart_risk_cache.get(code)
         if not isinstance(cached, dict) or not str(cached.get("title") or "").strip():
             cached = check_dart_risk(code)
@@ -15353,9 +15374,11 @@ def _get_trading_halt_reason_label(code: str) -> str:
 
 
 def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | None = None) -> None:
-    """v76/v87: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
+    """v76/v87/v88: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
     code = watch.get("code", "")
     name = _resolve_stock_name(code, watch.get("name", code), cur if isinstance(cur, dict) else None)
+    halt_reason = _get_trading_halt_reason_label(code)
+    _mark_trading_halt_state(code, title=halt_reason, name=name, source="entry_watch_cancel")
     if watch.get("halt_cancel_notified"):
         return
     watch["halt_cancel_notified"] = True
@@ -15368,7 +15391,6 @@ def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | 
         detect_time=watch.get("detect_time", ""),
     )
     halt_checked_label = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    halt_reason = _get_trading_halt_reason_label(code)
     sig_labels = {
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
@@ -15744,16 +15766,26 @@ def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
 
 
 def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
-    """v76: 종목 거래정지 여부 통합 판별.
-    KIS API 플래그(trht_yn 등) 또는 DART 거래정지 공시 중 하나라도 감지되면 True.
+    """v76/v88: 종목 거래정지 여부 통합 판별.
+    영속 halt 상태, KIS API 플래그, DART 거래정지 공시 중 하나라도 감지되면 True.
     cur: get_stock_price/get_nxt_stock_price 반환값 (없으면 API 플래그 체크 생략)
     주의: 장마감 후 호가 소멸은 정상이므로 호가 기반 판별은 사용하지 않음.
     """
+    code = normalize_stock_code(code)
+    if not code:
+        return False
+
+    # 0) 영속 거래정지 상태 체크 (재시작 후 재포착 방지)
+    persisted = _get_persisted_trading_halt(code)
+    if persisted:
+        return True
+
     # 1) KIS API 응답 플래그 체크 (명시적 정지 플래그만)
     if isinstance(cur, dict):
         for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
             _v = str(cur.get(_k) or "").upper()
             if _v in ("Y", "1", "T", "TRUE", "H", "2"):
+                _mark_trading_halt_state(code, title="주권매매거래정지", name=_resolve_stock_name(code, cur.get("name", code), cur), source="KIS_FLAG")
                 return True
     # 2) DART 캐시 체크 (거래정지 키워드)
     # ts=0: check_dart_risk에서 거래정지 확정 시 설정 → 당일 여부 무관하게 즉시 True
@@ -15764,10 +15796,12 @@ def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
         if "거래정지" in title or "매매정지" in title:
             _ts = cached.get("ts", 0)
             if _ts == 0:
+                _mark_trading_halt_state(code, title=title, source="DART_CACHE")
                 return True  # 거래정지 확정 마커 (ts=0)
             _today_start = time.mktime(datetime.now().replace(
                 hour=0, minute=0, second=0, microsecond=0).timetuple())
             if _ts >= _today_start:
+                _mark_trading_halt_state(code, title=title, source="DART_CACHE")
                 return True
     return False
 
@@ -19353,6 +19387,7 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
     # v76: 포착 발송 직전 거래정지 최종 확인
     _live_for_halt = _live if isinstance(_live, dict) else {}
     if _is_trading_halt(normalize_stock_code(s.get("code", "")), _live_for_halt or None):
+        _mark_trading_halt_state(normalize_stock_code(s.get("code", "")), title=_get_trading_halt_reason_label(s.get("code", "")), name=s.get("name", ""), source="dispatch_block")
         print(f"  🚫 거래정지 차단: {s.get('name','')} [{s.get('signal_type','')}] — 포착 알림 억제")
         save_signal_log(s)
         return False
@@ -19950,6 +19985,106 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
 # ============================================================
 _dart_risk_cache: dict = {}   # code → {is_risk, title, ts}  (10분 캐시)
 _carry_news_watch: dict = {}  # code → last_check_ts          (30분 쿨다운)
+_trading_halt_state: dict = {"active": {}}
+
+
+def _default_trading_halt_state() -> dict:
+    return {"active": {}}
+
+
+def _prune_trading_halt_state(state: dict | None) -> dict:
+    active = {}
+    if isinstance(state, dict):
+        active = state.get("active") if isinstance(state.get("active"), dict) else {}
+    keep_sec = max(1, int(TRADING_HALT_KEEP_DAYS or 1)) * 86400
+    now_ts = time.time()
+    pruned = {}
+    for raw_code, rec in active.items():
+        if not isinstance(rec, dict):
+            continue
+        code = normalize_stock_code(raw_code or rec.get("code"))
+        if not code:
+            continue
+        try:
+            last_seen_ts = float(rec.get("last_seen_ts", rec.get("ts", 0)) or 0)
+        except Exception:
+            last_seen_ts = 0.0
+        if last_seen_ts and now_ts - last_seen_ts > keep_sec:
+            continue
+        title = str(rec.get("title", "") or "").strip()
+        if any(kw in title for kw in ("거래재개", "매매재개", "거래정지해제", "매매정지해제")):
+            continue
+        item = dict(rec)
+        item["code"] = code
+        item["status"] = "halted"
+        item["title"] = title or "주권매매거래정지"
+        item["first_seen_ts"] = float(item.get("first_seen_ts", last_seen_ts or now_ts) or (last_seen_ts or now_ts))
+        item["last_seen_ts"] = float(item.get("last_seen_ts", last_seen_ts or now_ts) or (last_seen_ts or now_ts))
+        pruned[code] = item
+    return {"active": pruned}
+
+
+def _save_trading_halt_state() -> None:
+    try:
+        _write_state_json(TRADING_HALT_STATE_FILE, _prune_trading_halt_state(_trading_halt_state))
+    except Exception:
+        pass
+
+
+def _load_trading_halt_state() -> None:
+    global _trading_halt_state
+    try:
+        raw = _read_state_json(TRADING_HALT_STATE_FILE, _default_trading_halt_state())
+        _trading_halt_state = _prune_trading_halt_state(raw)
+        if raw != _trading_halt_state:
+            _save_trading_halt_state()
+        active_cnt = len((_trading_halt_state.get("active") or {})) if isinstance(_trading_halt_state, dict) else 0
+        if active_cnt:
+            print(f"📂 거래정지 영속 상태 {active_cnt}개 복원")
+    except Exception:
+        _trading_halt_state = _default_trading_halt_state()
+
+
+def _get_persisted_trading_halt(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    active = (_trading_halt_state.get("active") or {}) if isinstance(_trading_halt_state, dict) else {}
+    rec = active.get(code)
+    return rec if isinstance(rec, dict) else {}
+
+
+def _mark_trading_halt_state(code: str, title: str = "", name: str = "", source: str = "") -> None:
+    code = normalize_stock_code(code)
+    if not code:
+        return
+    if not isinstance(_trading_halt_state, dict):
+        return
+    active = _trading_halt_state.setdefault("active", {})
+    prev = active.get(code) if isinstance(active.get(code), dict) else {}
+    now_ts = time.time()
+    item = dict(prev) if isinstance(prev, dict) else {}
+    item["code"] = code
+    item["name"] = str(name or item.get("name", "") or "")
+    item["title"] = str(title or item.get("title", "") or "주권매매거래정지")
+    item["status"] = "halted"
+    item["source"] = str(source or item.get("source", "") or "")
+    item["first_seen_ts"] = float(item.get("first_seen_ts", now_ts) or now_ts)
+    item["last_seen_ts"] = now_ts
+    active[code] = item
+    _save_trading_halt_state()
+
+
+def _clear_trading_halt_state(code: str, resume_title: str = "", source: str = "") -> None:
+    code = normalize_stock_code(code)
+    if not code or not isinstance(_trading_halt_state, dict):
+        return
+    active = _trading_halt_state.setdefault("active", {})
+    if code in active:
+        active.pop(code, None)
+        _save_trading_halt_state()
+        title_part = f" — {resume_title}" if resume_title else ""
+        print(f"  ✅ 거래정지 영속 해제: {code}{title_part}")
 
 
 def check_dart_risk(code: str) -> dict:
@@ -19988,6 +20123,7 @@ def check_dart_risk(code: str) -> dict:
             if any(kw in title for kw in _TRADE_RESUME_KWS):
                 result["is_risk"] = False
                 result["title"]   = ""
+                _clear_trading_halt_state(code, resume_title=title, source="DART")
                 break
             if any(kw in title for kw in DART_RISK_KEYWORDS):
                 result["is_risk"] = True
@@ -20000,6 +20136,7 @@ def check_dart_risk(code: str) -> dict:
                         result["ts"] = 0   # 오늘 거래정지 확정 마커
                     else:
                         result["ts"] = now  # 과거 공시 → 10분 후 재조회
+                    _mark_trading_halt_state(code, title=title, source="DART")
                 break
     except Exception as e:
         print(f"  ⚠️ DART리스크체크오류 [{code}]: {e}")
@@ -22335,6 +22472,11 @@ def run_dart_intraday():
                 dart_state.setdefault("seen_receipts", {})[str(rcept_no)] = now_ts
                 state_dirty = True
                 continue
+            _TRADE_RESUME_KWS = ("거래재개", "매매재개", "거래정지해제", "매매정지해제")
+            if any(kw in title for kw in _TRADE_RESUME_KWS):
+                _clear_trading_halt_state(code, resume_title=title, source="run_dart_intraday")
+            elif "거래정지" in title or "매매정지" in title:
+                _mark_trading_halt_state(code, title=title, name=company, source="run_dart_intraday")
             matched_urgent = [kw for kw in DART_URGENT_KEYWORDS if kw in title]
             matched_pos = [kw for level, kws in DART_KEYWORDS.items() for kw in kws if kw in title]
             if not matched_urgent and not matched_pos:
@@ -26475,6 +26617,7 @@ if __name__ == "__main__":
         # 대기 모드: 텔레그램 명령어 + 오버나이트 모니터만 실행
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
+        _load_trading_halt_state()
         _load_entry_watch_active()
         # v80 #1: _load_entry_watch_active() 이후 즉시 stale 정리 (순서가 핵심)
         try:
@@ -26495,6 +26638,7 @@ if __name__ == "__main__":
 
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
+    _load_trading_halt_state()
     _load_entry_watch_active()
     # v80 #1: _load_entry_watch_active() 이후 즉시 stale 정리 (순서가 핵심)
     try:
