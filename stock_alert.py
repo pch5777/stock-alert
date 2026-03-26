@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v88
+버전: v89
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v89 (2026-03-26): 거래정지 공시 외부알림 범위 축소 — 실진입 종목만 발송.
+  [#1] `_should_send_tracking_dart_alert()` 신규 추가.
+       추적중 종목의 DART 위험공시 외부알림은 `actual_entry=True`인 실제 진입 종목에만 허용.
+       미진입/미확정 종목은 내부 추적·기록만 유지하고 텔레그램 발송은 억제.
+  [#2] `update_signal_results()`의 보유 종목 뉴스/공시 실시간 감시 경로에서 거래정지/악재 공시 발송 조건 축소.
+       기존: `추적중` 레코드면 실진입 여부와 무관하게 `[거래정지 공시 감지]` / `[거래정지 — 호재성 공시 사유]` / `[보유 종목 악재 공시 감지]` 발송 가능.
+       수정: 실제 진입(`actual_entry=True`) 레코드에만 외부 발송, 그 외는 `내부기록만` 로그로 남김.
+  이유: 거래정지 공시는 정보성일 수 있어도 재개 전 매매 불가이며, 미진입 종목에 대한 외부알림은 행동 불가능 알림이 되기 쉬움.
+  개선점: 거래정지 정보성 과알림↓, 실제 행동 가능한 포지션 리스크 알림 집중도↑.
+  주의점: DART 위험공시 탐지/내부기록 자체는 유지. 이번 수정은 외부 발송 범위 축소에 한정.
 
 - v88 (2026-03-26): 거래정지 영속 차단 추가 — 재시작 후 재포착 방지.
   [#1] `TRADING_HALT_STATE_FILE`, `_load_trading_halt_state()`, `_save_trading_halt_state()`,
@@ -1416,6 +1427,14 @@ def _should_send_partial_exit_guide(rec: dict) -> bool:
         if rec.get("actual_entry") is True:
             return True
         return bool(ALLOW_VIRTUAL_EXIT_GUIDE and rec.get("entry_hit") is True)
+    except Exception:
+        return False
+
+def _should_send_tracking_dart_alert(rec: dict) -> bool:
+    """추적중 종목의 DART 위험공시 외부알림은 실제 진입 종목에만 허용.
+    미진입/미확정 종목은 내부 기록만 남기고 텔레그램 발송은 억제한다."""
+    try:
+        return rec.get("actual_entry") is True
     except Exception:
         return False
 
@@ -12678,37 +12697,41 @@ def track_signal_results():
                 try:
                     _d = check_dart_risk(code)
                     if _d["is_risk"]:
-                        _dk = f"{log_key}_dart_exit"
-                        if _dk not in _tracking_notified:
-                            _tracking_notified.add(_dk)
-                            _title = _d['title']
-                            # v76: 거래정지 사유 구분 — 사유가 호재성(계약/수주 등)이면 타이틀/경고 문구 분리
-                            _HALT_POSITIVE_KEYWORDS = ["계약", "수주", "공급", "납품", "MOU", "협약", "투자", "인수"]
-                            _is_halt = "거래정지" in _title or "매매정지" in _title
-                            _is_positive_reason = _is_halt and any(kw in _title for kw in _HALT_POSITIVE_KEYWORDS)
-                            if _is_positive_reason:
-                                _alert_title = "⚠️ <b>[거래정지 — 호재성 공시 사유]</b>"
-                                _action_line = "⏸ <b>거래정지 중 — 재개 후 진입 판단</b>\n💡 사유는 호재성이나 재개 전까지 매매 불가"
-                            elif _is_halt:
-                                _alert_title = "🚨 <b>[거래정지 공시 감지]</b>"
-                                _action_line = "⚡ <b>거래정지 — 재개일 확인 필요</b>"
-                            else:
-                                _alert_title = "🚨 <b>[보유 종목 악재 공시 감지]</b>"
-                                _action_line = "⚡ <b>즉시 매도 검토 권장</b>"
-                            _msg = (
-                                f"{_alert_title}\n"
-                                "━━━━━━━━━━━━━━━\n"
-                                f"🔵 <b>{_rec_name}</b>  <code>{code}</code>\n"
-                                "━━━━━━━━━━━━━━━\n"
-                                f"📋 공시: {_title}\n"
-                                "━━━━━━━━━━━━━━━\n"
-                                f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
-                                "━━━━━━━━━━━━━━━\n"
-                                f"{_action_line}\n"
-                                f"💡 /result {code} 로 결과 기록"
-                            )
-                            send_with_chart_buttons(_msg, code, _rec_name)
-                            print(f"  🚨 보유종목 공시악재: {_rec_name} — {_d['title']}")
+                        _title = _d['title']
+                        _allow_external = _should_send_tracking_dart_alert(rec)
+                        if not _allow_external:
+                            print(f"  ℹ️ 추적종목 DART위험 내부기록만: {_rec_name} — {_title} (actual_entry 미확정)")
+                        else:
+                            _dk = f"{log_key}_dart_exit"
+                            if _dk not in _tracking_notified:
+                                _tracking_notified.add(_dk)
+                                # v76: 거래정지 사유 구분 — 사유가 호재성(계약/수주 등)이면 타이틀/경고 문구 분리
+                                _HALT_POSITIVE_KEYWORDS = ["계약", "수주", "공급", "납품", "MOU", "협약", "투자", "인수"]
+                                _is_halt = "거래정지" in _title or "매매정지" in _title
+                                _is_positive_reason = _is_halt and any(kw in _title for kw in _HALT_POSITIVE_KEYWORDS)
+                                if _is_positive_reason:
+                                    _alert_title = "⚠️ <b>[거래정지 — 호재성 공시 사유]</b>"
+                                    _action_line = "⏸ <b>거래정지 중 — 재개 후 진입 판단</b>\n💡 사유는 호재성이나 재개 전까지 매매 불가"
+                                elif _is_halt:
+                                    _alert_title = "🚨 <b>[거래정지 공시 감지]</b>"
+                                    _action_line = "⚡ <b>거래정지 — 재개일 확인 필요</b>"
+                                else:
+                                    _alert_title = "🚨 <b>[보유 종목 악재 공시 감지]</b>"
+                                    _action_line = "⚡ <b>즉시 매도 검토 권장</b>"
+                                _msg = (
+                                    f"{_alert_title}\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"🔵 <b>{_rec_name}</b>  <code>{code}</code>\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"📋 공시: {_title}\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"💰 현재가: <b>{price:,}원</b>  ({pnl_now:+.1f}%)\n"
+                                    "━━━━━━━━━━━━━━━\n"
+                                    f"{_action_line}\n"
+                                    f"💡 /result {code} 로 결과 기록"
+                                )
+                                send_with_chart_buttons(_msg, code, _rec_name)
+                                print(f"  🚨 보유종목 공시악재: {_rec_name} — {_title}")
                 except Exception as _e:
                     print(f"  ⚠️ 보유종목 DART체크오류: {_e}")
 
