@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v90
+버전: v91
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v91 (2026-03-26): entry_hit 후속알림 통합 억제 — phase2/보류/취소를 종목 단위 공통 쿨다운으로 묶음.
+  [#1] `ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC`, `_is_entry_followup_actionable_transition()`,
+       `_should_send_entry_followup_alert()`, `_mark_entry_followup_alert_sent()` 추가.
+       같은 `entry_hit` watch에서 `[2차 진입 판단]`과 `[진입 보류/취소 사유]`를 각각 따로 보지 않고,
+       종목 단위 후속행동 알림으로 묶어 최근 60분 내 재발송을 보수적으로 차단.
+  [#2] `_notify_entry_guard_followup()`에 위 통합 쿨다운을 연결.
+       같은 이유뿐 아니라 다른 보류 사유라도 최근 후속알림이 있었다면 외부 발송을 생략하고 내부 모니터링만 유지.
+  [#3] `_dispatch_general_alert_signal()`의 phase2 강화판단에도 위 통합 쿨다운을 연결.
+       단, 최근 보류/금지 알림 뒤에 `가능`으로 바뀌는 경우는 행동 전환이므로 예외적으로 즉시 발송 허용.
+  이유: 한올바이오파마처럼 `진입 보류/취소`와 `[2차 진입 판단]`이 서로 교차하며 짧은 시간 반복돼,
+       v90의 동일사유/동일판단 억제만으로는 사용자 체감 개선이 거의 없던 문제 보완.
+  개선점: 동일 종목 후속알림 묶음↓, phase2↔보류 교차 반복↓, 행동 가능한 상태 전환(`가능`)만 선별 노출↑.
+  주의점: 거래정지 같은 별도 고위험 경보는 이번 통합 억제 대상이 아니며, 이번 수정은 entry_hit 이후 후속알림 정리에 한정.
 
 - v90 (2026-03-26): entry_hit 이후 반복 알림 억제 — 눌림목 재알림 차단 + phase2/보류 중복발송 축소.
   [#1] `ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC`, `PHASE2_UPGRADE_ALERT_COOLDOWN_SEC`,
@@ -3961,6 +3975,7 @@ _entry_watch        = {}
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
 ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC = int(os.getenv("ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC", "1800") or "1800")  # 동일 보류사유 재알림 최소 30분
 PHASE2_UPGRADE_ALERT_COOLDOWN_SEC = int(os.getenv("PHASE2_UPGRADE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 동일 강화판단 재알림 최소 30분
+ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC", "3600") or "3600")  # entry_hit 이후 후속행동 알림 최소 60분
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
 
 # v40.0-#10: 상한가 유지 종목 알림 차단 (당일 1회만 알림, 풀리기 전까지 재알림 없음)
@@ -15481,6 +15496,9 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     last_ts = float(watch.get("entry_guard_alert_ts") or 0.0)
     if last_reason == reason and (now_ts - last_ts) < ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC:
         return False
+    if not _should_send_entry_followup_alert(watch, "guard", reason):
+        print(f"  ⏭ 후속알림 통합억제(guard/{reason}): {watch.get('name','')} — 외부알림 생략")
+        return False
     diff_pct = round(((price - entry) / entry) * 100, 1) if entry else 0.0
     diff_str = f"+{diff_pct:.1f}%" if diff_pct >= 0 else f"{diff_pct:.1f}%"
     sig_labels = {
@@ -15511,6 +15529,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     watch["entry_guard_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     watch["entry_guard_alert_ts"] = now_ts
     watch["entry_guard_alert_price"] = int(price or 0)
+    _mark_entry_followup_alert_sent(watch, "guard", reason, price)
     _record_entry_guard_followup(watch, reason, price)
     return True
 
@@ -15823,6 +15842,41 @@ def _mark_phase2_upgrade_alert_sent(watch: dict, new_sig_type: str, decision: st
     watch["phase2_upgrade_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     watch["phase2_upgrade_alert_ts"] = time.time()
     watch["phase2_upgrade_alert_price"] = int(price or 0)
+
+def _is_entry_followup_actionable_transition(last_kind: str, last_value: str, new_kind: str, new_value: str) -> bool:
+    last_kind = str(last_kind or "").strip().lower()
+    last_value = str(last_value or "").strip()
+    new_kind = str(new_kind or "").strip().lower()
+    new_value = str(new_value or "").strip()
+    if new_kind == "phase2" and new_value == "가능":
+        return not (last_kind == "phase2" and last_value == "가능")
+    return False
+
+
+def _should_send_entry_followup_alert(watch: dict, kind: str, value: str) -> bool:
+    if not isinstance(watch, dict):
+        return True
+    last_ts = float(watch.get("entry_followup_alert_ts") or 0.0)
+    if last_ts <= 0:
+        return True
+    now_ts = time.time()
+    if (now_ts - last_ts) >= ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC:
+        return True
+    last_kind = str(watch.get("entry_followup_alert_kind") or "").strip().lower()
+    last_value = str(watch.get("entry_followup_alert_value") or "").strip()
+    if _is_entry_followup_actionable_transition(last_kind, last_value, kind, value):
+        return True
+    return False
+
+
+def _mark_entry_followup_alert_sent(watch: dict, kind: str, value: str, price: int = 0) -> None:
+    if not isinstance(watch, dict):
+        return
+    watch["entry_followup_alert_kind"] = str(kind or "").strip().lower()
+    watch["entry_followup_alert_value"] = str(value or "").strip()
+    watch["entry_followup_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    watch["entry_followup_alert_ts"] = time.time()
+    watch["entry_followup_alert_price"] = int(price or 0)
 
 
 def _is_truthy_market_flag(v) -> bool:
@@ -19518,6 +19572,9 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                 if not _should_send_phase2_upgrade_alert(_existing_hit_watch, _new_sig_type, _p2_decision):
                     print(f"  ⏭ phase2 중복억제({_old_sig_type}→{_new_sig_type}/{_p2_decision}): {s.get('name','')} — 외부알림 생략")
                     return False
+                if not _should_send_entry_followup_alert(_existing_hit_watch, "phase2", _p2_decision):
+                    print(f"  ⏭ 후속알림 통합억제(phase2/{_p2_decision}): {s.get('name','')} — 외부알림 생략")
+                    return False
                 send_with_chart_buttons(
                     f"🔔🔔 <b>[2차 진입 판단]</b>{_nxt_notice}\n"
                     f"━━━━━━━━━━━━━━━\n"
@@ -19542,6 +19599,7 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
                     _existing_hit_watch.get("name", s.get("name", ""))
                 )
                 _mark_phase2_upgrade_alert_sent(_existing_hit_watch, _new_sig_type, _p2_decision, _p2_price)
+                _mark_entry_followup_alert_sent(_existing_hit_watch, "phase2", _p2_decision, _p2_price)
                 _save_entry_watch_active()
             except Exception as _e:
                 print(f"  ⚠️ phase2 트리거 오류: {_e}")
