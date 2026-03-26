@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v84
+버전: v85
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v85 (2026-03-26): 코스닥 상승률 외부소스 추가 — KIS API 404 시 코스닥 누락 방지.
+  [#1] `_fetch_naver_rank()`에 코스닥 URL 추가.
+       기존: `sise_rise.naver` (코스피만) → 수정: 코스피 + `sise_rise_kosdaq.naver` (코스닥) 순차 시도 후 합산.
+  [#2] `_fetch_daum_rank()`에 코스닥 API 추가.
+       기존: KOSPI만 → 수정: KOSPI + KOSDAQ 순차 호출 후 합산.
+  이유: KIS chgrate-pcls-100 API가 404로 막힐 때 fallback이 코스피만 스캔해
+       오늘 에코프로(+23%), 레인보우로보틱스(+27%) 등 코스닥 급등주를 전량 누락.
+  개선점: KIS API 불통 시 코스닥 급등주 포착률↑.
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음).
+  주의점: 네이버/다음 스크래핑 실패 시 기존 universe fallback으로 자동 복귀.
 
 - v84 (2026-03-26): 레짐별 진입가 감시 만료 기간 차등 적용 + 상방이탈 즉시만료.
   [#1] `_get_expire_days_by_regime()` 신규 함수 추가.
@@ -2936,85 +2947,127 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
     네이버 증권 순위 스크래핑.
     category: rise(상승률) | volume(거래량) | amount(거래대금)
     KIS API 불통 시 보조 소스로 사용.
+    v85: 코스피 + 코스닥 합산으로 확대.
     """
-    url_map = {
+    # 코스피/코스닥 각각 URL
+    url_map_kospi = {
         "rise":   "https://finance.naver.com/sise/sise_rise.naver",
         "volume": "https://finance.naver.com/sise/sise_quant.naver",
-        "amount": "https://finance.naver.com/sise/sise_etf.naver",  # 거래대금 대용
+        "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
-    url = url_map.get(category, url_map["rise"])
-    try:
-        resp = requests.get(url, timeout=10, headers=_random_ua())
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table.type_2 tr, table.type_5 tr")
-        result = []
-        for row in rows:
-            tds = row.find_all("td")
-            if len(tds) < 4:
-                continue
-            a_tag = row.find("a", href=lambda h: h and "code=" in str(h))
-            if not a_tag:
-                continue
-            import re
-            m = re.search(r"code=(\d{6})", a_tag.get("href", ""))
-            if not m:
-                continue
-            code = m.group(1)
-            name = a_tag.get_text(strip=True)
-            # 등락률 파싱
-            rate_td = None
-            for td in tds:
-                txt = td.get_text(strip=True).replace(",", "").replace("+", "").replace("%", "")
-                try:
-                    val = float(txt)
-                    if -30 < val < 30 and val != 0:
-                        rate_td = val
-                        break
-                except ValueError:
+    url_map_kosdaq = {
+        "rise":   "https://finance.naver.com/sise/sise_rise_kosdaq.naver",
+        "volume": "https://finance.naver.com/sise/sise_quant_kosdaq.naver",
+        "amount": "https://finance.naver.com/sise/sise_etf.naver",
+    }
+
+    def _parse_naver_rank_url(url: str, market_label: str) -> list:
+        try:
+            resp = requests.get(url, timeout=10, headers=_random_ua())
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = soup.select("table.type_2 tr, table.type_5 tr")
+            result = []
+            for row in rows:
+                tds = row.find_all("td")
+                if len(tds) < 4:
                     continue
-            if rate_td is None:
-                continue
-            result.append({
-                "code": code, "name": name,
-                "change_rate": rate_td,
-                "source": f"naver_{category}",
-                "market": "KRX",
-            })
-            if len(result) >= top_n:
-                break
-        return result
-    except Exception as e:
-        print(f"  ⚠️ 네이버 {category} 순위 스크래핑 실패: {e}")
-        return []
+                a_tag = row.find("a", href=lambda h: h and "code=" in str(h))
+                if not a_tag:
+                    continue
+                import re
+                m = re.search(r"code=(\d{6})", a_tag.get("href", ""))
+                if not m:
+                    continue
+                code = m.group(1)
+                name = a_tag.get_text(strip=True)
+                rate_td = None
+                for td in tds:
+                    txt = td.get_text(strip=True).replace(",", "").replace("+", "").replace("%", "")
+                    try:
+                        val = float(txt)
+                        if -30 < val < 30 and val != 0:
+                            rate_td = val
+                            break
+                    except ValueError:
+                        continue
+                if rate_td is None:
+                    continue
+                result.append({
+                    "code": code, "name": name,
+                    "change_rate": rate_td,
+                    "source": f"naver_{category}",
+                    "market": market_label,
+                })
+                if len(result) >= top_n:
+                    break
+            return result
+        except Exception as e:
+            print(f"  ⚠️ 네이버 {market_label} {category} 순위 스크래핑 실패: {e}")
+            return []
+
+    kospi_items = _parse_naver_rank_url(
+        url_map_kospi.get(category, url_map_kospi["rise"]), "KRX"
+    )
+    kosdaq_items = _parse_naver_rank_url(
+        url_map_kosdaq.get(category, url_map_kosdaq["rise"]), "KRX"
+    )
+
+    # 합산 (중복 제거)
+    seen = set()
+    result = []
+    for item in kospi_items + kosdaq_items:
+        code = item.get("code", "")
+        if code and code not in seen:
+            seen.add(code)
+            result.append(item)
+    # 등락률 내림차순 정렬 후 top_n 반환
+    result.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
+    return result[:top_n]
 
 
 def _fetch_daum_rank(top_n: int = 30) -> list:
-    """다음 증권 상승률 순위 스크래핑 (네이버 실패 시 2차 소스)"""
-    try:
-        url = "https://finance.daum.net/api/quotes/ranks?market=KOSPI&perPage=30&rankType=RISE"
-        headers = {**_random_ua(), "Referer": "https://finance.daum.net/"}
-        resp = requests.get(url, timeout=10, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("data", [])
-        result = []
-        for item in items[:top_n]:
-            code = str(item.get("code") or item.get("symbolCode") or "").replace("A", "")[:6]
-            if not code:
-                continue
-            result.append({
-                "code": code,
-                "name": item.get("name", ""),
-                "change_rate": float(item.get("changeRate", 0) or 0) * 100,
-                "price": int(item.get("tradePrice", 0) or 0),
-                "source": "daum_rise",
-                "market": "KRX",
-            })
-        return result
-    except Exception as e:
-        print(f"  ⚠️ 다음 상승률 순위 스크래핑 실패: {e}")
-        return []
+    """다음 증권 상승률 순위 스크래핑 (네이버 실패 시 2차 소스)
+    v85: KOSPI + KOSDAQ 합산.
+    """
+    def _fetch_daum_market(market: str) -> list:
+        try:
+            url = f"https://finance.daum.net/api/quotes/ranks?market={market}&perPage=30&rankType=RISE"
+            headers = {**_random_ua(), "Referer": "https://finance.daum.net/"}
+            resp = requests.get(url, timeout=10, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("data", [])
+            result = []
+            for item in items[:top_n]:
+                code = str(item.get("code") or item.get("symbolCode") or "").replace("A", "")[:6]
+                if not code:
+                    continue
+                result.append({
+                    "code": code,
+                    "name": item.get("name", ""),
+                    "change_rate": float(item.get("changeRate", 0) or 0) * 100,
+                    "price": int(item.get("tradePrice", 0) or 0),
+                    "source": "daum_rise",
+                    "market": "KRX",
+                })
+            return result
+        except Exception as e:
+            print(f"  ⚠️ 다음 {market} 상승률 순위 스크래핑 실패: {e}")
+            return []
+
+    kospi_items = _fetch_daum_market("KOSPI")
+    kosdaq_items = _fetch_daum_market("KOSDAQ")
+
+    seen = set()
+    result = []
+    for item in kospi_items + kosdaq_items:
+        code = item.get("code", "")
+        if code and code not in seen:
+            seen.add(code)
+            result.append(item)
+    result.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
+    return result[:top_n]
 
 
 def _fetch_external_rank_top(min_change: float = 3.0, top_n: int = 30) -> list:
