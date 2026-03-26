@@ -3,11 +3,29 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v80
+버전: v81
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v81 (2026-03-26): 진입 체인 미연결 2개 수정 — 뉴스 테마 + 지정학 prewatch.
+  [#1] `send_news_theme_alert()` 수정 — rising 종목 A급 진입 체인 연결.
+       기존: send(msg) 발송 후 종료 → 알테오젠 +10.9% 감지해도 진입 체인 없음.
+       수정: rising 종목 각각 analyze() → grade==A + entry_price>0 이면
+             _dispatch_general_alert_signal() 호출 → 진입가 알람 발송.
+             A급 미달은 내부 기록만 (수칙 #14/#16).
+       진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인.
+  [#2] `run_geo_news_scan()` 수정 — prewatch 등록 후 check_issue_prewatch() 연결.
+       기존: _news_issue_prewatch 등록만 하고 check_issue_prewatch() 미호출
+             → prewatch 종목이 주가 반응해도 감지 불가.
+       수정: geo prewatch 등록 직후 check_issue_prewatch() 즉시 1회 호출
+             → 이미 반응 중인 섹터 종목 즉시 A급 판정 가능.
+       진입 체인: check_issue_prewatch() → analyze() → _dispatch_general_alert_signal() 연결 확인.
+  이유: 뉴스+주가 연동 "매우강함" 알람 발송돼도 진입 알람 없는 구조 발견.
+       geo prewatch 등록만 하고 체크 루프 미연결 구조 발견.
+  개선점: 뉴스 테마 상승 종목 A급이면 즉시 진입 알람 연결.
+  주의점: rising 종목이 A급 미달이면 기존과 동일하게 정보 알람만. max_positions=1 유지.
 
 - v80 (2026-03-26): 동시보유 오카운트 완전 수정 + 최대낙폭 표시 버그 수정 + 거래정지 오판 수정.
   [#1] 시작 시 stale entry_hit 정리 순서 수정.
@@ -20872,6 +20890,14 @@ def run_geo_news_scan():
         except Exception as _e2:
             print(f"  ⚠️ geo prewatch 등록 오류: {_e2}")
 
+        # v81 #2: geo prewatch 등록 직후 즉시 1회 체크
+        # 이미 반응 중인 섹터 종목을 즉시 A급 진입 체인으로 연결
+        try:
+            if is_any_market_open():
+                check_issue_prewatch()
+        except Exception as _e3:
+            _log_error("run_geo_news_scan/check_issue_prewatch", _e3)
+
     except Exception as e:
         _log_error("run_geo_news_scan", e)
 
@@ -21372,6 +21398,45 @@ def send_news_theme_alert(signal: dict):
          +(f"🔥 <b>실제 상승 중</b>\n{rising_block}\n" if rising_block else "")
          +(f"🎯 <b>아직 안 오른 종목 (추격 기회)</b>\n{not_yet_block}\n" if not_yet_block else "")
          +"━━━━━━━━━━━━━━━")
+
+    # v81 #1: rising 종목 A급 진입 체인 연결
+    # 정보 알람 발송 후 각 상승 종목에 대해 analyze() → A급이면 _dispatch_general_alert_signal()
+    for r in signal.get("rising", []):
+        try:
+            cur = get_stock_price(r["code"])
+            if not cur:
+                continue
+            stock_input = {
+                "code":         r["code"],
+                "name":         r["name"],
+                "price":        cur.get("price", r.get("price", 0)),
+                "change_rate":  cur.get("change_rate", r.get("change_rate", 0)),
+                "volume_ratio": cur.get("volume_ratio", r.get("volume_ratio", 0)),
+                "today_vol":    cur.get("today_vol", 0),
+                "ask_qty":      cur.get("ask_qty", 0),
+                "bid_qty":      cur.get("bid_qty", 0),
+                "prev_close":   cur.get("prev_close", 0),
+                "high":         cur.get("high", 0),
+                "open":         cur.get("open", 0),
+                "cap_size":     cur.get("cap_size", "small"),
+                "mktcap":       cur.get("mktcap", 0),
+            }
+            analyzed = analyze(stock_input)
+            if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
+                analyzed.setdefault("reasons", []).append(
+                    f"📰 뉴스+주가 연동: {signal['theme_desc'][:25]}"
+                )
+                dispatched = _dispatch_general_alert_signal(
+                    analyzed,
+                    source_label="뉴스테마 상승"
+                )
+                if dispatched:
+                    print(f"  📰 뉴스테마→A급 진입 체인: {r['name']} {r['change_rate']:+.1f}%")
+            else:
+                print(f"  ⏭ 뉴스테마 A급 미달: {r['name']} {r.get('change_rate',0):+.1f}% — 내부 기록만")
+            time.sleep(0.2)
+        except Exception as _e:
+            _log_error(f"send_news_theme_alert/analyze({r.get('name','')})", _e)
 
 # ============================================================
 # v78 #3: 이슈 선감지 prewatch 체크 — 주가 변동 시 즉시 알람
