@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v81
+버전: v82
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v82 (2026-03-26): 동시보유 제한 완전 제거.
+  [#1] `_apply_position_limit_after_priority()` → 항상 전체 통과 (3줄로 대체).
+       기존: v62~v80까지 9회 수정에도 stale entry_hit 오카운트 반복 → A급 포착 전량 차단.
+       수정: 함수 내부 차단 로직 전체 제거, sorted_alerts 즉시 반환.
+  이유: 실진입은 사용자 수동 결정이므로 봇 단계 차단 불필요. 로직 복잡도 대비 효과 0.
+  개선점: 동시보유 오카운트로 인한 포착 차단 완전 해소. 섹터 중복 제거·max_total 제한은 유지.
+  주의점: filter_portfolio_signals()의 섹터 dedup·max_total 제한은 그대로 동작.
 
 - v81 (2026-03-26): 진입 체인 미연결 2개 수정 — 뉴스 테마 + 지정학 prewatch.
   [#1] `send_news_theme_alert()` 수정 — rising 종목 A급 진입 체인 연결.
@@ -25618,61 +25626,8 @@ def _should_allow_conditional_second_position(alert: dict | None = None, carry_c
 
 
 def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[str], carry_count: int, max_positions: int, stage: str = "") -> list:
-    if not sorted_alerts:
-        return []
-    if carry_count < max_positions:
-        return sorted_alerts
-
-    latest_by_code = {}
-    try:
-        latest_by_code = _build_latest_tracking_by_code(_read_json_safe(SIGNAL_LOG_FILE, {}))
-    except Exception:
-        latest_by_code = {}
-
-    extra_slots = 0
-    if max_positions == 1 and carry_count == 1:
-        extra_slots = CONDITIONAL_SECOND_POSITION_MAX_EXTRA
-
-    allowed = []
-    blocked = []
-    extra_used = 0
-
-    for rank, alert in enumerate(sorted_alerts, start=1):
-        if alert.get("code") in carry_codes:
-            allowed.append(alert)
-            continue
-        if extra_slots > extra_used and _should_allow_conditional_second_position(alert, carry_codes=carry_codes, latest_by_code=latest_by_code):
-            alert["conditional_second_position_allowed"] = True
-            alert["conditional_second_position_slot"] = carry_count + extra_used + 1
-            allowed.append(alert)
-            extra_used += 1
-            print(
-                f"  🧩 조건부 2종목 허용: {_resolve_stock_name(alert.get('code',''), alert.get('name',''))} "
-                f"[{str(alert.get('execution_grade') or alert.get('grade') or '').upper()}등급 / {_extract_alert_sector_theme(alert)}]"
-            )
-            continue
-        blocked.append((rank, alert))
-
-    if blocked:
-        for rank, alert in blocked:
-            _record_shadow_capture(
-                alert.get("code", ""), alert.get("name", alert.get("code", "")),
-                "position_limit", alert.get("signal_type", ""), stage=stage or "filter_portfolio_signals",
-                extra={
-                    "score": alert.get("score", 0),
-                    "grade": alert.get("grade", ""),
-                    "change_rate": alert.get("change_rate", 0),
-                    "market": alert.get("market", ""),
-                    "priority_rank": rank,
-                    "leader_priority_hit": bool(alert.get("leader_priority_hit")),
-                    "stale_pullback_hit": bool(alert.get("stale_pullback_hit")),
-                    "stale_replay_penalty_hit": bool(alert.get("stale_replay_penalty_hit")),
-                    "conditional_second_position_checked": bool(extra_slots > 0),
-                },
-            )
-        print(f"  🛡 동시보유 제한: {carry_count}/{max_positions}종목 보유 중 → 평가 후 신규 {len(blocked)}개 억제")
-
-    return allowed
+    # v82: 동시보유 제한 완전 제거 — v62~v80 9회 수정에도 오카운트 반복, 실진입은 사용자 수동 결정이므로 봇 단계에서 차단 불필요.
+    return sorted_alerts if sorted_alerts else []
 
 
 def filter_portfolio_signals(alerts: list) -> list:
