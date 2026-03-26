@@ -3,11 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v79
+버전: v80
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v80 (2026-03-26): 동시보유 오카운트 완전 수정 + 최대낙폭 표시 버그 수정 + 거래정지 오판 수정.
+  [#1] 시작 시 stale entry_hit 정리 순서 수정.
+       기존 v79: load_carry_stocks() 안에서 _purge_stale_entry_watch_hits() 호출
+                → 이후 _load_entry_watch_active()가 파일에서 entry_watch 재적재
+                → stale이 다시 메모리에 올라와 purge 효과 없음.
+       수정: _load_entry_watch_active() 호출 직후에 _purge_stale_entry_watch_hits() 이동.
+       load_carry_stocks()의 호출도 제거 (중복 방지).
+  [#2] 최대낙폭 표시 버그 수정.
+       기존: mdd = (min_p - entry) / entry * 100 → min_p > entry이면 양수 출력 → "최대낙폭: +7.5%" 혼란.
+       수정: mdd > 0이면 "낙폭 없음 🟢 (진입 후 우상향)"으로 표시. 음수일 때만 숫자 표시.
+  [#3] 거래정지 오판 수정 — 과거 공시 날짜 기반 거래정지 영구 판정 해소.
+       기존: check_dart_risk() 5일 내 거래정지 공시 존재 → ts=0 → 영구 거래정지 판정.
+       수정 A: 공시 접수일(rcept_dt)이 오늘이면 ts=0 유지, 과거 날짜면 ts=now (10분 재조회).
+       수정 B: "거래재개"/"매매재개" 키워드 감지 시 is_risk=False override.
+  이유: v79 배포 후에도 동시보유 5/1 오카운트 지속 (순서 버그).
+       최대낙폭 +7.5% 혼란 표시. 광전자/신라젠 거래정지 오판 알람.
+  개선점: 재시작 직후 stale 완전 제거 → NXT/KRX 포착 즉시 정상화.
+  주의점: #1은 시작 순서만 변경. 실제 정리 로직(_purge_stale_entry_watch_hits) 자체는 그대로.
 
 - v79 (2026-03-26): 동시보유 오카운트 영구 수정 — 재시작 직후 stale entry_hit 차단.
   [#1] `load_carry_stocks()` 수정 — 시작 시 `_purge_stale_entry_watch_hits()` 즉시 호출.
@@ -12521,7 +12540,9 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
     }
     sig_label = sig_labels.get(sig_type, sig_type)
     theme_tag = f"\n🏭 테마: {theme} (+{bonus}점)" if bonus > 0 else "\n🔍 단독 상승"
-    mdd = round((min_p - entry) / entry * 100, 1) if entry else 0
+    _mdd_raw = round((min_p - entry) / entry * 100, 1) if entry else 0
+    # v80 #2: mdd > 0이면 진입 후 한 번도 진입가 아래 안 간 것 → "낙폭 없음"으로 표시
+    mdd = _mdd_raw
 
     # ── 손절 원인 분석 ──
     cause_block = ""
@@ -12583,7 +12604,7 @@ def _send_tracking_result(rec: dict, log_key: str | None = None):
         f"청산가:  <b>{exit_p:,}원</b>  ({reason})\n"
         f"현재가:  <b>{rec.get('current_price', exit_p):,}원</b>\n"
         f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
-        f"최대낙폭: {mdd:+.1f}%\n"
+        f"최대낙폭: {'낙폭 없음 🟢' if mdd > 0 else f'{mdd:+.1f}%'}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{pnl_emoji} <b>수익률: {pnl:+.1f}%</b>"
         f"{cause_block}"
@@ -12714,14 +12735,7 @@ def load_carry_stocks():
     except Exception as _oe:
         print(f"⚠️ 고아 추적 정리 오류: {_oe}")
 
-    # v79 #1: 시작 직후 stale entry_hit 즉시 정리
-    # 30분 스케줄에만 있어 재시작 직후 스캔 시 stale 5개가 "보유 중"으로 오카운트되던 버그 수정
-    try:
-        purged_hits = _purge_stale_entry_watch_hits()
-        if purged_hits:
-            print(f"🗑 봇 시작 시 stale entry_hit {purged_hits}건 정리")
-    except Exception as _pe:
-        print(f"⚠️ stale entry_hit 정리 오류: {_pe}")
+    # v80 #1: purge는 _load_entry_watch_active() 이후로 이동 (아래 시작 순서 참조)
 
     try:
         sig_data = _read_json_locked(SIGNAL_LOG_FILE)
@@ -19408,14 +19422,25 @@ def check_dart_risk(code: str) -> dict:
             },
             timeout=8
         )
+        _TRADE_RESUME_KWS = ("거래재개", "매매재개", "거래정지해제", "매매정지해제")
         for item in resp.json().get("list", []):
             title = item.get("report_nm", "")
+            # v80 #3B: 거래재개 공시가 있으면 is_risk=False override (순서 중요: 최신 공시가 먼저 옴)
+            if any(kw in title for kw in _TRADE_RESUME_KWS):
+                result["is_risk"] = False
+                result["title"]   = ""
+                break
             if any(kw in title for kw in DART_RISK_KEYWORDS):
                 result["is_risk"] = True
                 result["title"]   = title
-                # v76: 거래정지 키워드는 캐시 TTL 0 → 다음 호출 시 즉시 재조회
+                # v80 #3A: 거래정지 ts=0은 오늘 접수분만 — 과거 날짜는 ts=now (10분 후 재조회)
                 if "거래정지" in title or "매매정지" in title:
-                    result["ts"] = 0
+                    rcept_dt = str(item.get("rcept_dt", "") or "")
+                    today_str = datetime.now().strftime("%Y%m%d")
+                    if rcept_dt == today_str:
+                        result["ts"] = 0   # 오늘 거래정지 확정 마커
+                    else:
+                        result["ts"] = now  # 과거 공시 → 10분 후 재조회
                 break
     except Exception as e:
         print(f"  ⚠️ DART리스크체크오류 [{code}]: {e}")
@@ -25898,6 +25923,13 @@ if __name__ == "__main__":
         _strict_cleanup_legacy_entry_hits()
         load_carry_stocks()
         _load_entry_watch_active()
+        # v80 #1: _load_entry_watch_active() 이후 즉시 stale 정리 (순서가 핵심)
+        try:
+            _phits = _purge_stale_entry_watch_hits()
+            if _phits:
+                print(f"🗑 봇 시작 시 stale entry_hit {_phits}건 정리")
+        except Exception as _pe:
+            print(f"⚠️ stale entry_hit 정리 오류: {_pe}")
         _load_preclose_gap_entry_watch()
         _load_reentry_watch()
         _load_execution_setup_watch()
@@ -25911,6 +25943,13 @@ if __name__ == "__main__":
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
     _load_entry_watch_active()
+    # v80 #1: _load_entry_watch_active() 이후 즉시 stale 정리 (순서가 핵심)
+    try:
+        _phits = _purge_stale_entry_watch_hits()
+        if _phits:
+            print(f"🗑 봇 시작 시 stale entry_hit {_phits}건 정리")
+    except Exception as _pe:
+        print(f"⚠️ stale entry_hit 정리 오류: {_pe}")
     _load_preclose_gap_entry_watch()
     _load_reentry_watch()
     _load_execution_setup_watch()
