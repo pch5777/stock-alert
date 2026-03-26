@@ -1,6 +1,6 @@
-@ -1,4 +0,0 @@
 requests==2.31.0
 schedule==1.2.1
 beautifulsoup4==4.12.2
 psycopg2-binary
-schedule
+pytz==2024.1
+APScheduler==3.10.4
