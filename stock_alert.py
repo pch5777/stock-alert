@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v85
+버전: v86
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v86 (2026-03-26): UPPER_LIMIT 신호 no_ask_liquidity soft allow 추가.
+  [#1] `_should_soft_allow_no_ask_liquidity_general()`의 신호타입 허용 목록에 `UPPER_LIMIT` 추가.
+       기존: SURGE/STRONG_BUY/EARLY_DETECT/NEAR_UPPER만 soft allow 검토 → UPPER_LIMIT 전량 차단.
+       수정: UPPER_LIMIT + vol_ratio≥5.0 + change_rate≥15% 조건 충족 시 soft allow 통과.
+  이유: 대영포장처럼 이슈+거래량 폭발로 상한가 간 종목이 신호타입만으로 알림 없이 차단됨.
+  개선점: 거래량 폭발 UPPER_LIMIT 알림↑, 단순 상한가 고착 차단 유지.
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음).
+  주의점: UPPER_LIMIT soft allow는 vol_ratio≥5.0 + change_rate≥15% 조건 충족 시만 통과.
 
 - v85 (2026-03-26): 코스닥 상승률 외부소스 추가 — KIS API 404 시 코스닥 누락 방지.
   [#1] `_fetch_naver_rank()`에 코스닥 URL 추가.
@@ -2956,8 +2965,8 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
         "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
     url_map_kosdaq = {
-        "rise":   "https://finance.naver.com/sise/sise_rise.naver?sosok=1",
-        "volume": "https://finance.naver.com/sise/sise_quant.naver?sosok=1",
+        "rise":   "https://finance.naver.com/sise/sise_rise_kosdaq.naver",
+        "volume": "https://finance.naver.com/sise/sise_quant_kosdaq.naver",
         "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
 
@@ -18907,8 +18916,17 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
 def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
-    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT", "NEAR_UPPER"):
+    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT", "NEAR_UPPER", "UPPER_LIMIT"):
         return False
+
+    # v86: UPPER_LIMIT은 거래량 폭발 + 급등 조건 충족 시만 soft allow (단순 상한가 고착 차단 유지)
+    if sig_type == "UPPER_LIMIT":
+        try:
+            vol_ratio = max(float(cur.get("volume_ratio", 0.0) or 0.0), float(signal.get("volume_ratio", 0.0) or 0.0))
+            change_rate = max(float(cur.get("change_rate", 0.0) or 0.0), float(signal.get("change_rate", 0.0) or 0.0))
+        except Exception:
+            return False
+        return vol_ratio >= 5.0 and change_rate >= 15.0
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
