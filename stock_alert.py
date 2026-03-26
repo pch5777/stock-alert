@@ -3,11 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v82
+버전: v83
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v83 (2026-03-26): 외부 소스 다변화 + 장중 워치독 자가진단.
+  [#1] `_fetch_naver_rank()` / `_fetch_daum_rank()` / `_fetch_external_rank_top()` 신설.
+       KIS API 불통 시 네이버→다음→유니버스 순으로 자동 전환.
+       `_rank_api_fallback()`에 외부 소스 합산 연결.
+  [#2] `run_intraday_watchdog()` 신설 — 15분마다 실행.
+       ① 외부 소스 상승 종목 5개↑ + ② 30분 침묵 → 차단 사유 자동 집계.
+       주 차단 사유별 파라미터 완화 + 30분 후 자동 복원.
+       코드 구조 문제(candidate_miss, grade_suppressed) 감지 시 수정 권고 텔레그램 발송.
+  [#3] `send_alert()`에 `_last_external_alert_ts` 갱신 추가 (워치독 침묵 판정용).
+  이유: KIS API fallback만 의존하는 단일 소스 구조 + 장중 침묵을 감지·대응하는 로직 부재.
+  개선점: 데이터 소스 다변화↑, 장중 차단 자가진단↑, 코드 구조 문제 조기 발견↑.
+  주의점: 워치독 완화는 임시방편. grade_suppressed/candidate_miss는 코드 수정이 근본 해결.
 
 - v82 (2026-03-26): 동시보유 제한 완전 제거.
   [#1] `_apply_position_limit_after_priority()` → 항상 전체 통과 (3줄로 대체).
@@ -1303,6 +1316,9 @@ def _is_quiet_night(now: datetime | None = None) -> bool:
 from bs4 import BeautifulSoup
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
+_last_external_alert_ts: float = 0.0   # v83: 마지막 외부 알림 발송 시각 (워치독용)
+_watchdog_relaxed_until: float = 0.0   # v83: 임시 완화 적용 만료 시각
+_watchdog_last_run_ts: float = 0.0     # v83: 워치독 직전 실행 시각
 
 def _throttle_ok(store: dict, key: str, cooldown_sec: int) -> bool:
     now = int(time.time())
@@ -2889,6 +2905,336 @@ def run_daily_self_audit(stage: str = "krx") -> dict:
     except Exception as e:
         _log_error(f"run_daily_self_audit({stage})", e)
         return {}
+
+
+        return audit_data[audit_key]
+    except Exception as e:
+        _log_error(f"run_daily_self_audit({stage})", e)
+        return {}
+
+
+# ============================================================
+# v83: 외부 순위 소스 스크래핑 (KIS fallback 다변화)
+# ============================================================
+
+def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
+    """
+    네이버 증권 순위 스크래핑.
+    category: rise(상승률) | volume(거래량) | amount(거래대금)
+    KIS API 불통 시 보조 소스로 사용.
+    """
+    url_map = {
+        "rise":   "https://finance.naver.com/sise/sise_rise.naver",
+        "volume": "https://finance.naver.com/sise/sise_quant.naver",
+        "amount": "https://finance.naver.com/sise/sise_etf.naver",  # 거래대금 대용
+    }
+    url = url_map.get(category, url_map["rise"])
+    try:
+        resp = requests.get(url, timeout=10, headers=_random_ua())
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("table.type_2 tr, table.type_5 tr")
+        result = []
+        for row in rows:
+            tds = row.find_all("td")
+            if len(tds) < 4:
+                continue
+            a_tag = row.find("a", href=lambda h: h and "code=" in str(h))
+            if not a_tag:
+                continue
+            import re
+            m = re.search(r"code=(\d{6})", a_tag.get("href", ""))
+            if not m:
+                continue
+            code = m.group(1)
+            name = a_tag.get_text(strip=True)
+            # 등락률 파싱
+            rate_td = None
+            for td in tds:
+                txt = td.get_text(strip=True).replace(",", "").replace("+", "").replace("%", "")
+                try:
+                    val = float(txt)
+                    if -30 < val < 30 and val != 0:
+                        rate_td = val
+                        break
+                except ValueError:
+                    continue
+            if rate_td is None:
+                continue
+            result.append({
+                "code": code, "name": name,
+                "change_rate": rate_td,
+                "source": f"naver_{category}",
+                "market": "KRX",
+            })
+            if len(result) >= top_n:
+                break
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 네이버 {category} 순위 스크래핑 실패: {e}")
+        return []
+
+
+def _fetch_daum_rank(top_n: int = 30) -> list:
+    """다음 증권 상승률 순위 스크래핑 (네이버 실패 시 2차 소스)"""
+    try:
+        url = "https://finance.daum.net/api/quotes/ranks?market=KOSPI&perPage=30&rankType=RISE"
+        headers = {**_random_ua(), "Referer": "https://finance.daum.net/"}
+        resp = requests.get(url, timeout=10, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data", [])
+        result = []
+        for item in items[:top_n]:
+            code = str(item.get("code") or item.get("symbolCode") or "").replace("A", "")[:6]
+            if not code:
+                continue
+            result.append({
+                "code": code,
+                "name": item.get("name", ""),
+                "change_rate": float(item.get("changeRate", 0) or 0) * 100,
+                "price": int(item.get("tradePrice", 0) or 0),
+                "source": "daum_rise",
+                "market": "KRX",
+            })
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 다음 상승률 순위 스크래핑 실패: {e}")
+        return []
+
+
+def _fetch_external_rank_top(min_change: float = 3.0, top_n: int = 30) -> list:
+    """
+    외부 소스(네이버→다음→유니버스) 순으로 시도해 상승 종목 목록 반환.
+    KIS API 정상 여부와 무관하게 독립 동작.
+    워치독, fallback 체인에서 공통 사용.
+    """
+    # 1순위: 네이버 상승률
+    items = _fetch_naver_rank("rise", top_n=top_n)
+    if not items:
+        # 2순위: 다음
+        items = _fetch_daum_rank(top_n=top_n)
+    if not items:
+        # 3순위: 자체 유니버스 (항상 동작)
+        raw = _rank_from_universe("KRX")
+        items = [{**r, "source": "universe"} for r in raw]
+
+    # min_change 이상만 필터
+    filtered = [r for r in items if float(r.get("change_rate", 0) or 0) >= min_change]
+    filtered.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
+    return filtered[:top_n]
+
+
+# ============================================================
+# v83: 장중 워치독 — 침묵 감지 → 차단 사유 자동 진단 → 파라미터 완화
+# ============================================================
+
+_WATCHDOG_SILENCE_MIN   = int(os.getenv("WATCHDOG_SILENCE_MIN", "30"))    # 침묵 판정 기준(분)
+_WATCHDOG_MIN_RISING    = int(os.getenv("WATCHDOG_MIN_RISING", "5"))      # 외부 상승 종목 최소 수
+_WATCHDOG_RELAX_MIN     = int(os.getenv("WATCHDOG_RELAX_MIN", "30"))      # 완화 유지 시간(분)
+_WATCHDOG_NOTIFY_CD_MIN = int(os.getenv("WATCHDOG_NOTIFY_CD_MIN", "20"))  # 텔레그램 알림 쿨다운(분)
+_watchdog_last_notify_ts: float = 0.0
+
+
+def _watchdog_collect_block_reasons(since_ts: float) -> dict:
+    """shadow_capture에서 since_ts 이후 차단 사유 집계"""
+    counts: dict = {}
+    try:
+        data = _read_json_safe(SHADOW_CAPTURE_FILE, {})
+        if not isinstance(data, dict):
+            return counts
+        for rec in data.values():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                rec_ts = datetime.strptime(
+                    str(rec.get("time") or ""), "%Y-%m-%d %H:%M:%S"
+                ).timestamp()
+            except Exception:
+                continue
+            if rec_ts < since_ts:
+                continue
+            reason = str(rec.get("reason") or rec.get("stage") or "기타")
+            # 사유 정규화
+            if "position_limit" in reason:
+                key = "position_limit"
+            elif "외부알림 억제" in reason or "grade_suppressed" in reason or "B등급" in reason or "C등급" in reason:
+                key = "grade_suppressed"
+            elif "no_ask_liquidity" in reason:
+                key = "no_ask_liquidity"
+            elif "candidate_miss" in reason or "후보 미포착" in reason:
+                key = "candidate_miss"
+            else:
+                key = "기타"
+            counts[key] = counts.get(key, 0) + 1
+    except Exception as e:
+        print(f"  ⚠️ watchdog 사유 집계 오류: {e}")
+    return counts
+
+
+def _watchdog_apply_relax(main_reason: str) -> list:
+    """
+    주 차단 사유에 따라 _dynamic 파라미터 완화.
+    코드 구조 문제(candidate_miss 등)는 파라미터로 못 고치므로 진단만 하고 알림.
+    반환: 변경 내용 문자열 리스트
+    """
+    global _dynamic, _watchdog_relaxed_until
+    changes = []
+    relax_sec = _WATCHDOG_RELAX_MIN * 60
+
+    if main_reason == "grade_suppressed":
+        # 🔧 코드 구조 이슈 + 파라미터 완화 병행
+        # B등급 외부억제는 _should_send_external_grade_alert() 코드 문제이지만
+        # min_score 낮춰서 더 많은 종목이 A등급 진입할 수 있게 완화
+        old_n = int(_dynamic.get("min_score_normal", 56))
+        old_s = int(_dynamic.get("min_score_strict", 66))
+        new_n = max(45, old_n - 8)
+        new_s = max(52, old_s - 8)
+        if new_n < old_n or new_s < old_s:
+            _dynamic["min_score_normal"] = new_n
+            _dynamic["min_score_strict"] = new_s
+            _watchdog_relaxed_until = time.time() + relax_sec
+            changes.append(f"min_score {old_n}/{old_s} → {new_n}/{new_s} (등급억제 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
+            changes.append("⚠️ 코드 구조 문제 감지: _should_send_external_grade_alert()가 B등급 전량 차단 중 — 근본 해결은 코드 수정 필요")
+
+    elif main_reason == "no_ask_liquidity":
+        # 파라미터 완화로 대응 가능
+        old_n = int(_dynamic.get("min_score_normal", 56))
+        new_n = max(48, old_n - 5)
+        if new_n < old_n:
+            _dynamic["min_score_normal"] = new_n
+            _watchdog_relaxed_until = time.time() + relax_sec
+            changes.append(f"min_score_normal {old_n} → {new_n} (호가차단 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
+
+    elif main_reason == "candidate_miss":
+        # 🔧 코드 구조 문제: 후보군 자체가 비어있음 → 파라미터로 해결 불가
+        # KIS fallback 체인 or 유니버스 로딩 문제 → 운영자에게 알림만
+        changes.append("🔴 코드 구조 문제: 외부소스 상승 종목이 후보군에 미포함 — fallback 체인 점검 필요 (코드 수정 요망)")
+
+    elif main_reason == "기타":
+        # 원인 불명 — min_score만 소폭 완화
+        old_n = int(_dynamic.get("min_score_normal", 56))
+        new_n = max(48, old_n - 5)
+        if new_n < old_n:
+            _dynamic["min_score_normal"] = new_n
+            _watchdog_relaxed_until = time.time() + relax_sec
+            changes.append(f"min_score_normal {old_n} → {new_n} (원인불명 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
+
+    return changes
+
+
+def _watchdog_restore_relax() -> bool:
+    """완화 만료 시 원래 값으로 복원"""
+    global _dynamic, _watchdog_relaxed_until
+    if _watchdog_relaxed_until and time.time() >= _watchdog_relaxed_until:
+        _watchdog_relaxed_until = 0.0
+        # auto_tune 최신값으로 재로드 (동적 파라미터 파일 있으면 우선)
+        try:
+            saved = _read_json_safe(DYNAMIC_PARAMS_FILE, {})
+            if isinstance(saved, dict) and saved:
+                for k in ("min_score_normal", "min_score_strict"):
+                    if k in saved:
+                        _dynamic[k] = saved[k]
+                print(f"  🔄 워치독 완화 만료 → 파라미터 복원")
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def run_intraday_watchdog() -> None:
+    """
+    v83: 장중 침묵 감지 워치독.
+    매 15분 실행. 다음 조건 모두 충족 시 자가진단 + 완화:
+      ① 장 운영 중 (KRX or NXT)
+      ② 외부 소스 기준 상승 종목 _WATCHDOG_MIN_RISING개 이상 존재
+      ③ 지난 _WATCHDOG_SILENCE_MIN분간 외부 알림 0건
+
+    완화 후 _WATCHDOG_RELAX_MIN분 뒤 자동 복원.
+    코드 구조 문제 감지 시 파라미터 완화와 함께 텔레그램으로 수정 권고 발송.
+    """
+    global _watchdog_last_run_ts, _watchdog_last_notify_ts
+
+    if not is_any_market_open():
+        return
+    if is_holiday():
+        return
+
+    # 완화 만료 체크 (복원 우선)
+    _watchdog_restore_relax()
+
+    now_ts = time.time()
+    _watchdog_last_run_ts = now_ts
+
+    # ① 외부 소스 상승 종목 확인
+    rising = _fetch_external_rank_top(min_change=3.0, top_n=30)
+    n_rising = len(rising)
+    if n_rising < _WATCHDOG_MIN_RISING:
+        print(f"  🐕 워치독: 외부 상승 종목 {n_rising}개 — 침묵 판정 기준 미달, 스킵")
+        return
+
+    # ② 침묵 판정
+    silence_sec = _WATCHDOG_SILENCE_MIN * 60
+    elapsed_since_alert = now_ts - _last_external_alert_ts
+    if elapsed_since_alert < silence_sec:
+        remaining = int((silence_sec - elapsed_since_alert) / 60)
+        print(f"  🐕 워치독: 마지막 알림 {int(elapsed_since_alert/60)}분 전 — 정상 (침묵 아님, {remaining}분 더 관찰)")
+        return
+
+    # ③ 차단 사유 집계
+    since_ts = now_ts - silence_sec
+    reasons = _watchdog_collect_block_reasons(since_ts)
+    total_blocked = sum(reasons.values())
+    main_reason = max(reasons, key=reasons.get) if reasons else "candidate_miss"
+
+    # 완화 적용
+    relax_changes = _watchdog_apply_relax(main_reason)
+
+    # 텔레그램 알림 (쿨다운 적용)
+    notify_cd_sec = _WATCHDOG_NOTIFY_CD_MIN * 60
+    if now_ts - _watchdog_last_notify_ts < notify_cd_sec:
+        print(f"  🐕 워치독 알림 쿨다운 중 ({int((now_ts - _watchdog_last_notify_ts)/60)}분 경과)")
+        return
+
+    _watchdog_last_notify_ts = now_ts
+
+    reason_labels = {
+        "grade_suppressed": "등급 억제(A전용 차단)",
+        "position_limit":   "동시보유 제한(v82 제거됨)",
+        "no_ask_liquidity": "호가 유동성 차단",
+        "candidate_miss":   "후보군 미포착",
+        "기타":              "기타/원인불명",
+    }
+
+    top3_rising = ", ".join([
+        f"{r.get('name','?')} {float(r.get('change_rate',0)):+.1f}%"
+        for r in rising[:3]
+    ])
+    source_label = (rising[0].get("source", "?") if rising else "?").replace("naver_rise", "네이버").replace("daum_rise", "다음").replace("universe", "내부유니버스")
+
+    lines = [
+        f"🐕 <b>[장중 워치독 자가진단]</b>",
+        f"━━━━━━━━━━━━━━━",
+        f"⏱ 알림 침묵: <b>{int(elapsed_since_alert/60)}분</b> (기준 {_WATCHDOG_SILENCE_MIN}분)",
+        f"📈 외부 상승 종목: <b>{n_rising}개</b> [{source_label}]",
+        f"   {top3_rising} 등",
+        f"",
+        f"🔍 차단 사유 분석 ({total_blocked}건):",
+    ]
+    for k, v in sorted(reasons.items(), key=lambda x: -x[1]):
+        label = reason_labels.get(k, k)
+        lines.append(f"  • {label}: {v}건")
+
+    if relax_changes:
+        lines.append(f"")
+        lines.append(f"⚙️ 자동 조치:")
+        for c in relax_changes:
+            lines.append(f"  {c}")
+    else:
+        lines.append(f"⚙️ 자동 조치: 없음 (이미 최소값)")
+
+    send("\n".join(lines))
+    print(f"  🐕 워치독 자가진단 완료: 침묵 {int(elapsed_since_alert/60)}분, 상승 {n_rising}개, 주 차단사유={main_reason}")
 
 
 # ============================================================
@@ -9335,9 +9681,22 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
     elif not reason:
         reason = _get_rank_api_disable_reason() or "disabled_today"
 
+    # v83: KIS 불통 시 외부 소스(네이버→다음)도 시도 후 유니버스와 합산
     items = _rank_from_universe(market)
+    try:
+        ext = _fetch_external_rank_top(min_change=1.0, top_n=30)
+        ext_codes = {normalize_stock_code(r.get("code")) for r in items}
+        for r in ext:
+            code = normalize_stock_code(r.get("code"))
+            if code and code not in ext_codes:
+                items.append(r)
+                ext_codes.add(code)
+        if ext:
+            print(f"  🌐 외부 소스({ext[0].get('source','?')}) {len(ext)}건 보완")
+    except Exception:
+        pass
     if not _rank_api_disable_notified:
-        msg = f"⚠️ [KIS] chgrate-pcls-100 비활성/대체 → {market} 유니버스 후보군 사용 ({reason})"
+        msg = f"⚠️ [KIS] chgrate-pcls-100 비활성/대체 → {market} 유니버스+외부소스 사용 ({reason})"
         if status not in (None, ""):
             msg += f" status={status}"
         if ct not in (None, ""):
@@ -16581,7 +16940,9 @@ def _sector_block(s: dict) -> str:
     return block + "━━━━━━━━━━━━━━━\n\n"
 
 def send_alert(s: dict):
+    global _last_external_alert_ts
     s["name"] = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
+    _last_external_alert_ts = time.time()  # v83: 외부 알림 발송 시각 갱신
     # throttle repetitive alerts (reduce spam)
     try:
         st = s.get('signal_type','')
@@ -26009,6 +26370,7 @@ if __name__ == "__main__":
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt")
     ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
+    schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
     for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
