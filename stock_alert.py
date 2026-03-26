@@ -3,11 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v86
+버전: v87
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v87 (2026-03-26): 거래정지 취소 메시지 정합화 — 포착시각/NXT가격/재개문구/사유표시 수정.
+  [#1] `_get_trading_halt_reason_label()` 신규 함수 추가.
+       DART 거래정지 캐시/재조회 결과의 실제 공시 제목을 우선 사용하고, 없으면 `주권매매거래정지`로 fallback.
+  [#2] `_notify_trading_halt_cancel()` 메시지 정리.
+       기존: `감지`에 발송시각(now) 표기, NXT 라벨만 있고 실제 NXT 가격 미표시,
+            `재상장 시 재포착 대기`, 사유 고정 문자열 출력.
+       수정: `원신호 | 포착`에는 watch의 원포착 시각 표시, `거래정지 확인` 시각 분리,
+            NXT 기준이면 실제 NXT 현재가 표시, `거래재개 시 재포착 대기`로 문구 수정,
+            사유는 DART 실제 제목 우선 노출.
+  [#3] `check_entry_watch()`의 거래정지 취소 알림 호출부가 현재 가격 dict(`cur`)를 함께 전달하도록 보강.
+  이유: `[포착 취소 — 거래정지]` 메시지에서 시각 의미가 틀리고, NXT 기준 가격 숫자가 빠지며,
+       `재상장` 문구와 고정 사유가 실제 사용자 해석을 흐리던 문제 수정.
+  개선점: 거래정지 취소 메시지 해석력↑, NXT 기준 가격 행동 판단력↑, 공시 사유 가독성↑.
+  주의점: 거래정지 판정 로직 자체는 변경 없음. 이번 수정은 사용자 메시지 정합화에 한정.
 
 - v86 (2026-03-26): UPPER_LIMIT 신호 no_ask_liquidity soft allow 추가.
   [#1] `_should_soft_allow_no_ask_liquidity_general()`의 신호타입 허용 목록에 `UPPER_LIMIT` 추가.
@@ -15322,32 +15337,61 @@ def _entry_guard_reason_label(reason: str) -> str:
     return mapping.get(str(reason or ""), str(reason or "사유 미상"))
 
 
-def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False) -> None:
-    """v76: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
+def _get_trading_halt_reason_label(code: str) -> str:
+    """거래정지 취소 알림에 노출할 사용자용 사유 라벨을 정리한다."""
+    _fallback = "주권매매거래정지"
+    try:
+        cached = _dart_risk_cache.get(code)
+        if not isinstance(cached, dict) or not str(cached.get("title") or "").strip():
+            cached = check_dart_risk(code)
+        title = str((cached or {}).get("title") or "").strip()
+        if title and ("거래정지" in title or "매매정지" in title):
+            return title
+    except Exception:
+        pass
+    return _fallback
+
+
+def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | None = None) -> None:
+    """v76/v87: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
     code = watch.get("code", "")
-    name = watch.get("name", code)
-    # 중복 발송 방지
+    name = _resolve_stock_name(code, watch.get("name", code), cur if isinstance(cur, dict) else None)
     if watch.get("halt_cancel_notified"):
         return
     watch["halt_cancel_notified"] = True
-    nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
+
     entry = safe_int(watch.get("entry_price", 0), 0)
+    ref_price = safe_int((cur or {}).get("price", 0), 0) if isinstance(cur, dict) else 0
+    capture_label = _format_capture_datetime_label(
+        detected_at=watch.get("detected_at"),
+        detect_date=watch.get("detect_date", ""),
+        detect_time=watch.get("detect_time", ""),
+    )
+    halt_checked_label = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    halt_reason = _get_trading_halt_reason_label(code)
     sig_labels = {
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
         "PRECLOSE_GAP_ENTRY": "종가선진입",
     }
     sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
+
+    basis_suffix = f"  <b>{ref_price:,}원</b>" if use_nxt and ref_price > 0 else ""
+    nxt_notice = f"\n📡 <b>NXT 기준 가격</b>{basis_suffix}" if use_nxt else ""
+    price_line = f"\n💰 {'NXT 현재가' if use_nxt else '현재가'} <b>{ref_price:,}원</b>" if ref_price > 0 else ""
+
     msg = (
         f"🚫 <b>[포착 취소 — 거래정지]</b>{nxt_notice}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔵 <b>{name}</b>  <code>{code}</code>\n"
-        f"원신호: {sig}  |  감지: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"📋 사유: <b>주권매매거래정지</b>\n"
+        f"원신호: {sig}  |  포착: {capture_label}\n"
+        f"거래정지 확인: {halt_checked_label}\n\n"
+        f"📋 사유: <b>{halt_reason}</b>"
+        f"{price_line}\n"
         f"💵 기준 진입가 <b>{entry:,}원</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"• 거래정지 해제 전까지 진입 불가\n"
-        f"• 감시 종료 — 재상장 시 재포착 대기"
+        f"• 거래정지 해제/매매재개 확인 전까지 진입 불가\n"
+        f"• 감시 종료 — 거래재개 시 재포착 대기"
     )
     try:
         send_with_chart_buttons(msg, code, name)
@@ -16182,7 +16226,7 @@ def check_entry_watch():
                     continue
                 # v76: 거래정지 즉시 만료
                 if _is_trading_halt(code, cur):
-                    _notify_trading_halt_cancel(watch)
+                    _notify_trading_halt_cancel(watch, cur=cur)
                     expired.append((log_key, "거래정지", _entry_watch_final_status(watch, "거래정지"))); continue
                 if nxt_reference_ok and _is_krx_vi_reference_mode(cur, code):
                     nxt_cur = get_nxt_stock_price(code)
@@ -16203,7 +16247,7 @@ def check_entry_watch():
                     continue
                 # v76: NXT에서도 거래정지 즉시 만료
                 if _is_trading_halt(code, cur):
-                    _notify_trading_halt_cancel(watch, use_nxt=True)
+                    _notify_trading_halt_cancel(watch, use_nxt=True, cur=cur)
                     expired.append((log_key, "거래정지", _entry_watch_final_status(watch, "거래정지"))); continue
             else:
                 continue
