@@ -3,11 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v83
+버전: v84
 날짜: 2026-03-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v84 (2026-03-26): 레짐별 진입가 감시 만료 기간 차등 적용 + 상방이탈 즉시만료.
+  [#1] `_get_expire_days_by_regime()` 신규 함수 추가.
+       레짐(bull/normal/bear/crash) + 신호유형(SURGE/기타)별로 만료 일수를 다르게 설정.
+       bull: SURGE 1일 / PULLBACK 2일, normal: SURGE 2일 / PULLBACK 3일,
+       bear: SURGE 3일 / PULLBACK 4일, crash: SURGE 1일 / PULLBACK 2일.
+  [#2] `register_entry_watch()`에서 `expire_ts` 계산 시 `_get_expire_days_by_regime()` 호출.
+       기존 `MAX_CARRY_DAYS` 고정값 대신 레짐+신호유형 기반 동적 만료 일수 적용.
+  [#3] `register_entry_watch()`에서 진입가 대비 현재가 상방이탈(bull +6% / normal +8% / bear +10% / crash +5%) 시 즉시만료.
+       이미 기회가 지난 신호를 감시 목록에서 빠르게 제거해 유효 신호 집중도↑.
+  이유: 레짐과 무관하게 3일 고정 만료로 인해 죽은 신호가 감시 목록에 누적되던 문제.
+  개선점: 감시 목록 유효 신호 집중도↑, bull장 오래된 신호 빠른 정리↑, 진입가 도달률↑.
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음).
+  주의점: MAX_CARRY_DAYS 상수는 유지 (다른 carry 로직에서 참조 중). entry_hit 종목은 만료 대상 아님.
 
 - v83 (2026-03-26): 외부 소스 다변화 + 장중 워치독 자가진단.
   [#1] `_fetch_naver_rank()` / `_fetch_daum_rank()` / `_fetch_external_rank_top()` 신설.
@@ -14895,6 +14909,37 @@ def reset_top_signals_daily():
     _today_top_signals.clear()
 
 
+def _get_expire_days_by_regime(signal_type: str = "") -> tuple:
+    """
+    v84: 레짐 + 신호유형별 만료 일수 반환.
+    반환: (expire_days, upward_escape_pct)
+      - expire_days: 감시 만료 일수
+      - upward_escape_pct: 현재가가 진입가 대비 이 % 이상 올라가면 즉시만료
+    레짐별 기준:
+      bull  — 안 빠지고 올라가는 장 → 빠른 정리
+      normal— 현재 기본값
+      bear  — 잘 빠지는 장 → 기다릴 가치 있음
+      crash — 반등 빠름 → 짧게 대응
+    """
+    try:
+        regime = get_market_regime()
+        mode = regime.get("mode", "normal")
+    except Exception:
+        mode = "normal"
+
+    is_surge = str(signal_type or "").upper() in ("SURGE", "NEAR_UPPER", "UPPER_LIMIT", "STRONG_BUY")
+
+    # (expire_days, upward_escape_pct)
+    if mode == "bull":
+        return (1, 6.0) if is_surge else (2, 6.0)
+    elif mode == "bear":
+        return (3, 10.0) if is_surge else (4, 10.0)
+    elif mode == "crash":
+        return (1, 5.0) if is_surge else (2, 5.0)
+    else:  # normal
+        return (2, 8.0) if is_surge else (3, 8.0)
+
+
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry:
@@ -14950,6 +14995,18 @@ def register_entry_watch(s: dict):
         miss_count=previous_miss_count
     )
     s["entry_price"] = int(entry or 0)
+
+    # v84: 레짐별 만료 일수 + 상방이탈 즉시만료 기준 계산
+    _v84_expire_days, _v84_escape_pct = _get_expire_days_by_regime(s.get("signal_type", ""))
+    # 상방이탈 즉시만료: 등록 시점 현재가가 진입가 대비 escape_pct 이상 올라가 있으면 등록 자체를 건너뜀
+    _v84_current_price = safe_int(s.get("price", 0), 0)
+    if _v84_current_price and entry and _v84_current_price > entry:
+        _v84_gap_pct = (_v84_current_price - entry) / entry * 100
+        if _v84_gap_pct >= _v84_escape_pct:
+            print(f"  ⏭ 상방이탈 즉시만료: {s.get('name', s.get('code', ''))} "
+                  f"현재가 {_v84_current_price:,}원 / 진입가 {entry:,}원 "
+                  f"(+{_v84_gap_pct:.1f}% ≥ {_v84_escape_pct:.0f}%, {_dynamic.get('regime_mode','normal')}장)")
+            return None
 
     try:
         sig_data = {}
@@ -15019,7 +15076,7 @@ def register_entry_watch(s: dict):
         "notify_count": 0,
         "miss_count": previous_miss_count + len(old_items),
         "registered_ts": time.time(),
-        "expire_ts": time.time() + 86400 * MAX_CARRY_DAYS,
+        "expire_ts": time.time() + 86400 * _v84_expire_days,
         "peak_price": s.get("price", 0),
         "low_price": safe_int(s.get("price", entry), entry),
         "low_price_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -15059,7 +15116,7 @@ def register_entry_watch(s: dict):
     _save_entry_watch_active()
     _record_capture_funnel_event("watch", s, {"entry_price": entry, "guard_mode": entry_guard_mode})
     _exec_speed_prewarm[code] = time.time()   # ★ 포착 즉시 체결속도 스냅샷 워밍 시작
-    print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {MAX_CARRY_DAYS}일 후)")
+    print(f"  🎯 진입가 감시 등록: {stock_name} {entry:,}원 (만료: {_v84_expire_days}일 후, {_dynamic.get('regime_mode','normal')}장)")
     return log_key
 
 def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
