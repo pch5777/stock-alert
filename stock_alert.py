@@ -3,11 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v96
+버전: v97
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v97 (2026-03-27): 상한가 잠김/행동 불가 상한가류 일반 포착 차단 + UPPER_LIMIT soft allow 제거.
+  [#1] `_detect_entry_block_reason()`의 상한가류 차단 기준을 강화.
+       기존: `UPPER_LIMIT`/`NEAR_UPPER`는 `limit_up_locked`가 아니면 `no_ask_liquidity` soft allow 예외로 다시 살아날 수 있어, 상한가 잠김·행동 불가 종목이 일반 포착으로 나갈 수 있었음.
+       수정: 상한가류(`UPPER_LIMIT`/`NEAR_UPPER`)는 `ask_qty<=0`면 `upper_limit_reached` 또는 `limit_up_locked`로 하드 차단되게 조정.
+  [#2] `_should_soft_allow_no_ask_liquidity_general()`에서 `UPPER_LIMIT`/`NEAR_UPPER` soft allow 제거.
+       기존: 거래량 폭발·급등 조건만 크면 `UPPER_LIMIT no_ask_liquidity soft allow`가 유지돼, 오르는 동안엔 조용하다가 상한가 잠김 시점에만 알림이 나갈 수 있었음.
+       수정: `SURGE`/`STRONG_BUY`/`EARLY_DETECT` 등 관찰 우선형 신호만 soft allow를 유지하고, 상한가류는 행동 불가 상태면 일반 포착을 외부 발송하지 않음.
+  [#3] 문서 세트(v97) 정합성 복구.
+       기존: `v96` 코드 실물과 일부 문서에 `v95` 문구가 남아 기준 세트 정합성이 어긋나 있었음.
+       수정: 코드 기준을 소스로 삼아 포인터/핸드오프/시작절차/운영규칙을 모두 `v97` 세트로 다시 동기화.
 
 - v96 (2026-03-27): cross-day 연속 패턴 보강 + 초기 강세 내부포착→재상승 실행형 연결 + 일반 상승주 조기 SURGE 보강 + guard 반복알림 1회성 유지.
   [#1] `_get_crossday_episode_context()` / `_maybe_promote_signal_from_crossday_episode()` / `_should_require_execution_setup_from_crossday()` 추가.
@@ -16137,9 +16148,11 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     upper_like = change_rate >= 29.0 or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
+    if upper_like and ask_qty <= 0:
+        return "upper_limit_reached"
     if upper_like and sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
         return "upper_limit_reached"
-    if upper_like and ask_qty <= 0:
+    if ask_qty <= 0:
         return "no_ask_liquidity"
     return ""
 
@@ -19626,17 +19639,9 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
 def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
-    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT", "NEAR_UPPER", "UPPER_LIMIT"):
+    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT"):
         return False
 
-    # v86: UPPER_LIMIT은 거래량 폭발 + 급등 조건 충족 시만 soft allow (단순 상한가 고착 차단 유지)
-    if sig_type == "UPPER_LIMIT":
-        try:
-            vol_ratio = max(float(cur.get("volume_ratio", 0.0) or 0.0), float(signal.get("volume_ratio", 0.0) or 0.0))
-            change_rate = max(float(cur.get("change_rate", 0.0) or 0.0), float(signal.get("change_rate", 0.0) or 0.0))
-        except Exception:
-            return False
-        return vol_ratio >= 5.0 and change_rate >= 15.0
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
