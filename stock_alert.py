@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v99
+버전: v100
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v100 (2026-03-27): 패턴 검증 반영 — 거래대금+고가 유지 / ORB·전고 돌파 / 상한가 근접 선행 / 섹터 확산을 기존 신호 승격·가점·차단에 통합.
+  [#1] `_get_recent_avg_trade_amount()` / `_get_recent_high_breakout_context()` / `_build_global_pattern_context()` 추가.
+       기존: 공개 검증에서 남긴 핵심 패턴 4개를 코드가 직접 계산하지 않아, 거래대금 급증·고가 유지·전고 돌파·상한가 근접 선행을 기존 change_rate/volume_ratio 축으로만 우회 해석했음.
+       수정: 최근 평균 거래대금 대비 value ratio, intraday 고가 유지율, 최근 N일 고점 돌파, opening range 돌파, 상한가 거리, 테마 breadth를 공통 패턴 컨텍스트로 계산하는 helper를 추가.
+  [#2] `analyze()`에 패턴 기반 조기 승격/가점 연결.
+       기존: `EARLY_DETECT/SURGE/NEAR_UPPER` 조기 승격은 cross-day와 전 시간대 profile 중심이라, 거래대금+고가 유지형/장초반 ORB/전고 돌파/상한가 근접 선행을 직접 반영한 승격은 부족했음.
+       수정: 상한가 근접 선행형은 `NEAR_UPPER` 조기 승격, ORB·전고 돌파·거래대금+고가 유지형은 `EARLY_DETECT/SURGE` 조기 승격 및 가점으로 연결하고, 약한 섹터 breadth는 follow 가점을 보수화.
+  [#3] `check_nxt_preopen_detection()` / `check_nxt_postmarket_detection()`에도 동일 패턴 보너스 연결.
+       기존: NXT 장전·장후 전용 포착은 직접뉴스/섹터 모멘텀 위주라, 전 시간대 반영 원칙과 달리 거래대금+고가 유지·전고 돌파·상한가 근접 선행의 공통 패턴 점수가 제한적으로만 반영됐음.
+       수정: NXT 장전·장후 신호에도 동일 패턴 helper를 연결해, 전 시간대(08:00~20:00)에서 공개 검증 패턴이 같은 기준으로 점수화되게 정리.
+  [#4] 반환 payload와 A완화 support token에 패턴 메타 추가.
+       기존: 로그/후속 판단에서 어떤 공개 검증 패턴이 발동했는지 바로 추적하기 어려웠음.
+       수정: value ratio, high hold, recent high breakout, ORB, near-limit lead, theme expansion 메타를 payload에 남기고, A완화 support token에도 `고가 유지`, `ORB`, `전고 돌파`, `섹터 확산`을 반영.
+  이유: 사용자가 요구한 것은 프로그램 구조와 별개로 공개 검증에서 남긴 패턴 4개를 실제 코드에 NXT 포함 전 시간대로 반영하는 것이었고, 기존 v99는 cross-day/시간대/profile 보정까지는 있었지만 패턴 4개가 직접 코드 엔진으로 고정돼 있지 않았음.
+  개선점: 좋은 강세 종목 조기 승격↑, 상한가 근접 선행 포착↑, 장초반 ORB·전고 돌파 포착↑, 섹터 대장→후발 확산 확증↑, 약한 breadth follow 과가점↓.
+  주의점: `눌림목/A전용 외부억제`, 진입가/손절가/목표가 산식, 거래정지 차단 체계는 유지. 이번 수정은 패턴 4개를 기존 신호 타입에 통합하는 범위에 한정.
 
 - v99 (2026-03-27): 자동조정 불가 구조 문제의 텔레그램 코드수정 요청 알림 추가.
   [#1] `CODE_CHANGE_REQUEST_STATE_FILE`, `_send_code_change_request_alert()`, `_build_watchdog_code_change_request()` 추가.
@@ -3053,6 +3070,165 @@ def _promote_signal_from_full_session_flow(signal_type: str, stock: dict | None,
     return sig, "", 0
 
 
+def _get_recent_avg_trade_amount(code: str, days: int | None = None) -> int:
+    code = normalize_stock_code(code)
+    if not code:
+        return 0
+    cache_key = f"{code}:{int(days or GLOBAL_PATTERN_TRADE_LOOKBACK_DAYS)}"
+    cached = _global_pattern_trade_amount_cache.get(cache_key)
+    if isinstance(cached, dict) and time.time() - float(cached.get("ts", 0) or 0) < 1800:
+        return safe_int(cached.get("value", 0), 0)
+    items = get_daily_data(code, days=max(int(days or 20) + 10, 40))
+    if not items:
+        return 0
+    today = datetime.now().strftime("%Y%m%d")
+    hist = [row for row in items if str(row.get("date", "") or "") < today]
+    if not hist:
+        hist = items[:-1] if len(items) > 1 else items
+    values = [
+        safe_int(row.get("close", 0), 0) * safe_int(row.get("vol", 0), 0)
+        for row in hist[-max(5, int(days or 20)):]
+        if safe_int(row.get("close", 0), 0) > 0 and safe_int(row.get("vol", 0), 0) > 0
+    ]
+    avg_value = int(sum(values) / len(values)) if values else 0
+    _global_pattern_trade_amount_cache[cache_key] = {"ts": time.time(), "value": avg_value}
+    return avg_value
+
+
+def _calc_intraday_high_hold_metrics(stock: dict | None) -> dict:
+    stock = stock if isinstance(stock, dict) else {}
+    price = safe_int(stock.get("price", 0), 0)
+    high = safe_int(stock.get("high", stock.get("day_high", 0)), 0)
+    open_price = safe_int(stock.get("open", stock.get("open_price", 0)), 0)
+    near_high_ratio = round((price / high), 4) if price > 0 and high > 0 else 0.0
+    opening_drive_pct = round(((price - open_price) / open_price * 100.0), 2) if price > 0 and open_price > 0 else 0.0
+    if price > 0 and high > open_price > 0:
+        high_hold_ratio = max(0.0, min(1.2, (price - open_price) / max(high - open_price, 1)))
+        opening_range_pct = round((high - open_price) / open_price * 100.0, 2)
+    elif price > 0 and high > 0:
+        high_hold_ratio = max(0.0, min(1.0, near_high_ratio))
+        opening_range_pct = 0.0
+    else:
+        high_hold_ratio = 0.0
+        opening_range_pct = 0.0
+    return {
+        "near_high_ratio": round(near_high_ratio, 4),
+        "high_hold_ratio": round(high_hold_ratio, 4),
+        "opening_drive_pct": round(opening_drive_pct, 2),
+        "opening_range_pct": round(opening_range_pct, 2),
+        "has_high": bool(high > 0),
+    }
+
+
+def _get_recent_high_breakout_context(code: str, current_price: int, lookback_days: int | None = None) -> dict:
+    code = normalize_stock_code(code)
+    price = safe_int(current_price, 0)
+    if not code or price <= 0:
+        return {}
+    items = get_daily_data(code, days=max(int(lookback_days or 20) + 10, 50))
+    if not items:
+        return {}
+    today = datetime.now().strftime("%Y%m%d")
+    hist = [row for row in items if str(row.get("date", "") or "") < today]
+    window = hist[-max(5, int(lookback_days or 20)):]
+    highs = [safe_int(row.get("high", 0), 0) for row in window if safe_int(row.get("high", 0), 0) > 0]
+    if not highs:
+        return {}
+    recent_high = max(highs)
+    buffer_mult = max(0.95, 1.0 - GLOBAL_PATTERN_BREAKOUT_BUFFER_PCT / 100.0)
+    breakout = bool(price >= int(recent_high * buffer_mult))
+    distance_pct = round((price - recent_high) / recent_high * 100.0, 2) if recent_high > 0 else 0.0
+    return {
+        "recent_high": recent_high,
+        "breakout": breakout,
+        "distance_pct": distance_pct,
+        "lookback_days": int(lookback_days or 20),
+    }
+
+
+def _build_global_pattern_context(stock: dict | None, current_time: str = "", change_rate: float = 0.0,
+                                  vol_ratio: float = 0.0) -> dict:
+    stock = stock if isinstance(stock, dict) else {}
+    code = normalize_stock_code(stock.get("code", ""))
+    price = safe_int(stock.get("price", 0), 0)
+    today_vol = safe_int(stock.get("today_vol", 0), 0)
+    trade_amount = safe_int(stock.get("trade_amount", 0), 0)
+    if trade_amount <= 0 and price > 0 and today_vol > 0:
+        trade_amount = int(price * today_vol)
+    avg_trade_amount = _get_recent_avg_trade_amount(code)
+    value_ratio = round((trade_amount / avg_trade_amount), 2) if trade_amount > 0 and avg_trade_amount > 0 else 0.0
+    hold = _calc_intraday_high_hold_metrics(stock)
+    breakout = _get_recent_high_breakout_context(code, price, lookback_days=GLOBAL_PATTERN_BREAKOUT_LOOKBACK_DAYS)
+    market = str(stock.get("market", "") or "").upper()
+    stage = _get_full_session_capture_stage(current_time=current_time, market=market)
+    in_opening_stage = stage in ("opening", "nxt_pre", "nxt_post_early")
+    recent_high_breakout = bool(
+        breakout.get("breakout")
+        and safe_float(change_rate, 0.0) >= GLOBAL_PATTERN_BREAKOUT_MIN_CHANGE
+        and safe_float(vol_ratio, 0.0) >= GLOBAL_PATTERN_BREAKOUT_MIN_VOLUME
+        and hold.get("near_high_ratio", 0.0) >= 0.985
+    )
+    value_hold_ready = bool(
+        safe_float(change_rate, 0.0) >= GLOBAL_PATTERN_VALUE_MIN_CHANGE
+        and safe_float(vol_ratio, 0.0) >= GLOBAL_PATTERN_VALUE_MIN_VOLUME
+        and value_ratio >= GLOBAL_PATTERN_VALUE_RATIO_MIN
+        and hold.get("high_hold_ratio", 0.0) >= GLOBAL_PATTERN_HIGH_HOLD_MIN
+    )
+    orb_breakout = bool(
+        in_opening_stage
+        and safe_float(change_rate, 0.0) >= GLOBAL_PATTERN_ORB_MIN_CHANGE
+        and safe_float(vol_ratio, 0.0) >= GLOBAL_PATTERN_ORB_MIN_VOLUME
+        and hold.get("high_hold_ratio", 0.0) >= GLOBAL_PATTERN_ORB_HIGH_HOLD_MIN
+        and (
+            hold.get("opening_range_pct", 0.0) >= GLOBAL_PATTERN_ORB_OPENING_RANGE_MIN_PCT
+            or recent_high_breakout
+            or hold.get("opening_drive_pct", 0.0) >= GLOBAL_PATTERN_ORB_OPENING_RANGE_MIN_PCT
+        )
+    )
+    breakout_to_surge = bool(
+        (orb_breakout or recent_high_breakout)
+        and (
+            value_ratio >= GLOBAL_PATTERN_VALUE_RATIO_STRONG
+            or breakout.get("distance_pct", 0.0) >= 0.4
+            or safe_float(change_rate, 0.0) >= 4.0
+        )
+    )
+    breakout_to_early = bool(
+        not breakout_to_surge and (orb_breakout or recent_high_breakout or value_hold_ready)
+    )
+    limit_distance_pct = max(0.0, round(UPPER_LIMIT_THRESHOLD - safe_float(change_rate, 0.0), 2))
+    near_limit_lead = bool(
+        safe_float(change_rate, 0.0) >= GLOBAL_PATTERN_NEAR_LIMIT_MIN_CHANGE
+        and limit_distance_pct <= GLOBAL_PATTERN_NEAR_LIMIT_DISTANCE_PCT
+        and value_ratio >= GLOBAL_PATTERN_NEAR_LIMIT_MIN_VALUE_RATIO
+        and (
+            hold.get("high_hold_ratio", 0.0) >= GLOBAL_PATTERN_NEAR_LIMIT_MIN_HOLD
+            or recent_high_breakout
+            or orb_breakout
+        )
+    )
+    return {
+        "trade_amount": trade_amount,
+        "avg_trade_amount": avg_trade_amount,
+        "value_ratio": value_ratio,
+        "high_hold_ratio": float(hold.get("high_hold_ratio", 0.0) or 0.0),
+        "near_high_ratio": float(hold.get("near_high_ratio", 0.0) or 0.0),
+        "opening_drive_pct": float(hold.get("opening_drive_pct", 0.0) or 0.0),
+        "opening_range_pct": float(hold.get("opening_range_pct", 0.0) or 0.0),
+        "value_hold_ready": value_hold_ready,
+        "value_hold_hit": bool(value_hold_ready and hold.get("near_high_ratio", 0.0) >= 0.986),
+        "recent_high_breakout": recent_high_breakout,
+        "recent_high": safe_int(breakout.get("recent_high", 0), 0),
+        "recent_high_distance_pct": float(breakout.get("distance_pct", 0.0) or 0.0),
+        "orb_breakout": orb_breakout,
+        "breakout_to_surge": breakout_to_surge,
+        "breakout_to_early": breakout_to_early,
+        "near_limit_lead": near_limit_lead,
+        "limit_distance_pct": limit_distance_pct,
+        "stage": stage,
+    }
+
+
 def _is_leader_priority_signal(signal: dict | None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig = str(signal.get("signal_type", "") or "").upper()
@@ -4183,6 +4359,27 @@ CROSSDAY_RESURGE_MIN_VOL_RATIO = float(os.getenv("CROSSDAY_RESURGE_MIN_VOL_RATIO
 CROSSDAY_RESURGE_MIN_RECLAIM_RATIO = float(os.getenv("CROSSDAY_RESURGE_MIN_RECLAIM_RATIO", "0.45") or "0.45")
 CROSSDAY_PREP_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_PREP_REQUIRED_VOL_CAP", "3.0") or "3.0")
 CROSSDAY_CONFIRM_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_CONFIRM_REQUIRED_VOL_CAP", "4.5") or "4.5")
+GLOBAL_PATTERN_TRADE_LOOKBACK_DAYS = int(os.getenv("GLOBAL_PATTERN_TRADE_LOOKBACK_DAYS", "20") or "20")
+GLOBAL_PATTERN_VALUE_MIN_CHANGE = float(os.getenv("GLOBAL_PATTERN_VALUE_MIN_CHANGE", "2.6") or "2.6")
+GLOBAL_PATTERN_VALUE_MIN_VOLUME = float(os.getenv("GLOBAL_PATTERN_VALUE_MIN_VOLUME", "1.8") or "1.8")
+GLOBAL_PATTERN_VALUE_RATIO_MIN = float(os.getenv("GLOBAL_PATTERN_VALUE_RATIO_MIN", "1.7") or "1.7")
+GLOBAL_PATTERN_VALUE_RATIO_STRONG = float(os.getenv("GLOBAL_PATTERN_VALUE_RATIO_STRONG", "2.6") or "2.6")
+GLOBAL_PATTERN_HIGH_HOLD_MIN = float(os.getenv("GLOBAL_PATTERN_HIGH_HOLD_MIN", "0.72") or "0.72")
+GLOBAL_PATTERN_ORB_MIN_CHANGE = float(os.getenv("GLOBAL_PATTERN_ORB_MIN_CHANGE", "2.8") or "2.8")
+GLOBAL_PATTERN_ORB_MIN_VOLUME = float(os.getenv("GLOBAL_PATTERN_ORB_MIN_VOLUME", "1.9") or "1.9")
+GLOBAL_PATTERN_ORB_HIGH_HOLD_MIN = float(os.getenv("GLOBAL_PATTERN_ORB_HIGH_HOLD_MIN", "0.78") or "0.78")
+GLOBAL_PATTERN_ORB_OPENING_RANGE_MIN_PCT = float(os.getenv("GLOBAL_PATTERN_ORB_OPENING_RANGE_MIN_PCT", "0.8") or "0.8")
+GLOBAL_PATTERN_BREAKOUT_LOOKBACK_DAYS = int(os.getenv("GLOBAL_PATTERN_BREAKOUT_LOOKBACK_DAYS", "20") or "20")
+GLOBAL_PATTERN_BREAKOUT_BUFFER_PCT = float(os.getenv("GLOBAL_PATTERN_BREAKOUT_BUFFER_PCT", "0.3") or "0.3")
+GLOBAL_PATTERN_BREAKOUT_MIN_CHANGE = float(os.getenv("GLOBAL_PATTERN_BREAKOUT_MIN_CHANGE", "2.3") or "2.3")
+GLOBAL_PATTERN_BREAKOUT_MIN_VOLUME = float(os.getenv("GLOBAL_PATTERN_BREAKOUT_MIN_VOLUME", "1.6") or "1.6")
+GLOBAL_PATTERN_NEAR_LIMIT_MIN_CHANGE = float(os.getenv("GLOBAL_PATTERN_NEAR_LIMIT_MIN_CHANGE", "13.0") or "13.0")
+GLOBAL_PATTERN_NEAR_LIMIT_DISTANCE_PCT = float(os.getenv("GLOBAL_PATTERN_NEAR_LIMIT_DISTANCE_PCT", "4.0") or "4.0")
+GLOBAL_PATTERN_NEAR_LIMIT_MIN_VALUE_RATIO = float(os.getenv("GLOBAL_PATTERN_NEAR_LIMIT_MIN_VALUE_RATIO", "2.1") or "2.1")
+GLOBAL_PATTERN_NEAR_LIMIT_MIN_HOLD = float(os.getenv("GLOBAL_PATTERN_NEAR_LIMIT_MIN_HOLD", "0.8") or "0.8")
+GLOBAL_PATTERN_THEME_EXPANSION_MIN_CHANGE = float(os.getenv("GLOBAL_PATTERN_THEME_EXPANSION_MIN_CHANGE", "3.0") or "3.0")
+GLOBAL_PATTERN_THEME_EXPANSION_MIN_BREADTH = float(os.getenv("GLOBAL_PATTERN_THEME_EXPANSION_MIN_BREADTH", "0.45") or "0.45")
+GLOBAL_PATTERN_THEME_EXPANSION_MIN_RISERS = int(os.getenv("GLOBAL_PATTERN_THEME_EXPANSION_MIN_RISERS", "2") or "2")
 CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE = float(os.getenv("CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE", "7.5") or "7.5")
 
 FULL_SESSION_CAPTURE_PROFILES = {
@@ -5413,6 +5610,7 @@ def calc_stop_target(code: str, entry: int, signal_type: str | None = None) -> t
 # ⑨ 전일 상한가 체크
 # ============================================================
 _prev_upper_cache = {}
+_global_pattern_trade_amount_cache = {}
 
 def was_upper_limit_yesterday(code: str) -> bool:
     cached = _prev_upper_cache.get(code)
@@ -18450,6 +18648,7 @@ def analyze(stock: dict) -> dict:
         reasons.append(f"🟡 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
 
     current_time = datetime.now().strftime("%H:%M:%S")
+    pattern_ctx = _build_global_pattern_context(stock, current_time=current_time, change_rate=change_rate, vol_ratio=vol_ratio)
     crossday_ctx = {}
     if change_rate >= max(0.1, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.4):
         crossday_ctx = _get_crossday_episode_context(code, current_price=price, change_rate=change_rate, vol_ratio=vol_ratio)
@@ -18467,6 +18666,27 @@ def analyze(stock: dict) -> dict:
     elif crossday_ctx.get("prep") and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE:
         score+=12; reasons.append(f"🧭 초기 강세 내부포착 +{change_rate:.1f}%"); signal_type="EARLY_DETECT"
         reasons.append("♻️ 전일 포함 연속 패턴 — 재상승 확인 전 내부포착 유지")
+
+    if signal_type not in ("UPPER_LIMIT", "NEAR_UPPER") and pattern_ctx.get("near_limit_lead"):
+        signal_type = "NEAR_UPPER"
+        score += 23 if score < 23 else 6
+        reasons.append(
+            f"🎯 상한가 근접 선행 패턴 — 고가 유지·거래대금 강도·상한가 거리 {pattern_ctx.get('limit_distance_pct', 0.0):.1f}%"
+        )
+    elif signal_type in ("", None, "UNKNOWN"):
+        if pattern_ctx.get("breakout_to_surge"):
+            signal_type = "SURGE"
+            score += 14
+            reasons.append("🚀 장초반 ORB/전고 돌파 확증 — SURGE 조기 승격")
+        elif pattern_ctx.get("breakout_to_early"):
+            signal_type = "EARLY_DETECT"
+            score += 10
+            if pattern_ctx.get("orb_breakout"):
+                reasons.append("🧭 장초반 ORB 패턴 포착 — EARLY_DETECT")
+            elif pattern_ctx.get("recent_high_breakout"):
+                reasons.append("🧭 전고 돌파 패턴 포착 — EARLY_DETECT")
+            else:
+                reasons.append("🧭 거래대금 급증 + 고가 유지 패턴 — EARLY_DETECT")
 
     _flow_signal_type, _flow_reason, _flow_bonus = _promote_signal_from_full_session_flow(signal_type, stock, change_rate=change_rate, vol_ratio=vol_ratio, current_time=current_time, crossday_ctx=crossday_ctx)
     if _flow_signal_type and _flow_signal_type != signal_type:
@@ -18511,6 +18731,22 @@ def analyze(stock: dict) -> dict:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
     elif vol_ratio >= required_vol:
         score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (동적기준 {required_vol:.1f}배 대비)")
+
+    if pattern_ctx.get("value_hold_hit"):
+        score += 8 if pattern_ctx.get("value_ratio", 0.0) >= GLOBAL_PATTERN_VALUE_RATIO_STRONG else 6
+        reasons.append(
+            f"💰 거래대금 급증 + 고가 유지 (value {pattern_ctx.get('value_ratio',0.0):.1f}배 / hold {pattern_ctx.get('high_hold_ratio',0.0):.2f})"
+        )
+    if pattern_ctx.get("orb_breakout"):
+        score += 6
+        reasons.append(
+            f"🧭 장초반 ORB 유지 (range {pattern_ctx.get('opening_range_pct',0.0):.1f}% / hold {pattern_ctx.get('high_hold_ratio',0.0):.2f})"
+        )
+    elif pattern_ctx.get("recent_high_breakout"):
+        score += 6
+        reasons.append(
+            f"🪜 전고 돌파 유지 ({GLOBAL_PATTERN_BREAKOUT_LOOKBACK_DAYS}일 고점 대비 {pattern_ctx.get('recent_high_distance_pct',0.0):+.2f}%)"
+        )
 
     if crossday_ctx.get("episode_active"):
         score += int(crossday_ctx.get("score_bonus", 0) or 0)
@@ -18699,6 +18935,41 @@ def analyze(stock: dict) -> dict:
                 )
     except Exception as _e:
         _log_error(f"theme_drive({code})", _e)
+
+    theme_expansion_hit = False
+    theme_expansion_bonus = 0
+    theme_breadth_ratio = 0.0
+    try:
+        if sector_info.get("theme", "") not in ("", "기타업종", "unknown", "미분류") and change_rate >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_CHANGE:
+            _breadth = _get_theme_breadth_hint(
+                code,
+                stock.get("name", code),
+                theme=sector_info.get("theme", ""),
+                market=str(stock.get("market", "") or ""),
+            )
+            if isinstance(_breadth, dict) and _breadth.get("theme"):
+                theme_breadth_ratio = float(_breadth.get("breadth_ratio", 0.0) or 0.0)
+                strong_expansion = bool(
+                    _breadth.get("strong_breadth")
+                    and theme_breadth_ratio >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_BREADTH
+                    and safe_int(_breadth.get("riser_cnt", 0), 0) >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_RISERS
+                )
+                if strong_expansion:
+                    theme_expansion_hit = True
+                    theme_expansion_bonus = 7 if normalize_stock_code(_breadth.get("leader_code")) != code else 5
+                    score += theme_expansion_bonus
+                    reasons.append(
+                        f"🏭 섹터 확산 [{_breadth.get('theme','')}] +{theme_expansion_bonus}점 — "
+                        f"대장 {_breadth.get('leader_name','')} {safe_float(_breadth.get('leader_change',0),0):+.1f}% / "
+                        f"동조 {safe_int(_breadth.get('riser_cnt',0),0)}종목 / breadth {theme_breadth_ratio:.2f}"
+                    )
+                elif _breadth.get("weak_breadth") and signal_type in ("EARLY_DETECT", "SURGE") and change_rate < 8.0:
+                    score -= 4
+                    reasons.append(
+                        f"🌫 섹터 확산 미약 [{_breadth.get('theme','')}] -4점 — breadth {theme_breadth_ratio:.2f}"
+                    )
+    except Exception as _e:
+        _log_error(f"theme_expansion({code})", _e)
 
     # ── NXT 보정 (장 중에만, 백그라운드 영향 최소화) ──
     nxt_delta, nxt_reason = 0, ""
@@ -19107,6 +19378,14 @@ def analyze(stock: dict) -> dict:
             "miss_theme_leader_bonus": miss_theme_leader_bonus,
             "nxt_post_leader_hit": nxt_post_leader_hit,
             "nxt_post_leader_bonus": nxt_post_leader_bonus,
+            "theme_expansion_hit": theme_expansion_hit,
+            "theme_expansion_bonus": theme_expansion_bonus,
+            "theme_breadth_ratio": theme_breadth_ratio,
+            "global_pattern_value_ratio": float(pattern_ctx.get("value_ratio", 0.0) or 0.0),
+            "global_pattern_high_hold_ratio": float(pattern_ctx.get("high_hold_ratio", 0.0) or 0.0),
+            "global_pattern_orb_breakout": bool(pattern_ctx.get("orb_breakout")),
+            "global_pattern_recent_high_breakout": bool(pattern_ctx.get("recent_high_breakout")),
+            "global_pattern_near_limit_lead": bool(pattern_ctx.get("near_limit_lead")),
             "entry_price":entry,"stop_loss":stop,"target_price":target,
             "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
             "prev_upper":prev_upper,"reasons":reasons,"detected_at":datetime.now(),
@@ -19175,6 +19454,22 @@ def check_nxt_preopen_detection(existing_codes=None) -> list:
                 pre_reasons.append(sector_info["summary"])
             if sector_info.get("rising"):
                 pre_reasons.append("📌 동반 상승: " + ", ".join([f"{_resolve_stock_name(r['code'], r.get('name',''))} {r['change_rate']:+.1f}%" for r in sector_info.get("rising", [])[:4]]))
+        try:
+            _pattern_ctx = _build_global_pattern_context(stock, current_time=datetime.now().strftime("%H:%M:%S"), change_rate=cr, vol_ratio=vr)
+            if _pattern_ctx.get("near_limit_lead"):
+                pre_score += 10
+                pre_reasons.append(f"🎯 상한가 근접 선행 패턴 (거리 {_pattern_ctx.get('limit_distance_pct',0.0):.1f}%)")
+            elif _pattern_ctx.get("orb_breakout") or _pattern_ctx.get("recent_high_breakout"):
+                pre_score += 8
+                if _pattern_ctx.get("orb_breakout"):
+                    pre_reasons.append("🧭 장초반 ORB/전고 돌파 패턴")
+                else:
+                    pre_reasons.append("🪜 전고 돌파 유지 패턴")
+            elif _pattern_ctx.get("value_hold_hit"):
+                pre_score += 6
+                pre_reasons.append(f"💰 거래대금 급증 + 고가 유지 (value {_pattern_ctx.get('value_ratio',0.0):.1f}배)")
+        except Exception:
+            pass
         try:
             direct_theme = _infer_direct_news_theme(code, stock.get("name", code))
             if direct_theme.get("theme"):
@@ -19315,6 +19610,22 @@ def check_nxt_postmarket_detection(existing_codes=None) -> list:
         if float(nxt.get("vs_krx_pct", 0.0) or 0.0) >= 1.0:
             score += 8
             reasons.append(f"🟡 NXT 종가 프리미엄 +{float(nxt.get('vs_krx_pct',0.0) or 0.0):.1f}%")
+        try:
+            _pattern_ctx = _build_global_pattern_context(stock, current_time=datetime.now().strftime("%H:%M:%S"), change_rate=cr, vol_ratio=vr)
+            if _pattern_ctx.get("near_limit_lead"):
+                score += 10
+                reasons.append(f"🎯 상한가 근접 선행 패턴 (거리 {_pattern_ctx.get('limit_distance_pct',0.0):.1f}%)")
+            elif _pattern_ctx.get("orb_breakout") or _pattern_ctx.get("recent_high_breakout"):
+                score += 8
+                if _pattern_ctx.get("orb_breakout"):
+                    reasons.append("🧭 장후 ORB/전고 돌파 패턴")
+                else:
+                    reasons.append("🪜 전고 돌파 유지 패턴")
+            elif _pattern_ctx.get("value_hold_hit"):
+                score += 6
+                reasons.append(f"💰 거래대금 급증 + 고가 유지 (value {_pattern_ctx.get('value_ratio',0.0):.1f}배)")
+        except Exception:
+            pass
 
         try:
             direct_theme = _infer_direct_news_theme(code, stock.get("name", code))
@@ -20781,8 +21092,8 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     premium_flow = _vr >= 3.0 or int(nxt_delta or 0) >= 8
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
-    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
-    intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "코스피 상대강도", "코스닥 상대강도", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴"))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
+    intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "거래대금 급증", "고가 유지", "코스피 상대강도", "코스닥 상대강도", "장초반 ORB", "전고 돌파", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴", "섹터 확산"))
     market_flag = str(market or "").upper() == "NXT"
     _session_profile = _get_full_session_capture_profile(datetime.now().strftime("%H:%M:%S"), market)
     _session_bonus = int(_session_profile.get("a_relax_bonus", 0) or 0)
