@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v92
+버전: v93
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v93 (2026-03-27): 정규장 초반 일반 포착 보정 — 09:00~10:00 일반 포착 거래량 기준을 강한 상승 종목에 한해 현실화.
+  [#1] `_relax_opening_general_required_volume()` 추가.
+       기존: 정규장 초반(09:00~10:00) `get_effective_volume_ratio()`가 `SURGE` 9.1배, `NEAR_UPPER` 6.5배처럼 과하게 높아 실제 상승 종목도 일반 포착 단계에서 탈락할 수 있었음.
+       수정: 정규장 초반 `SURGE`/`NEAR_UPPER`/`UPPER_LIMIT` 일반 포착은 상승률 강도에 따라 요구 거래량 배수를 보수적으로 완화해, 실제 강세 종목이 일반 포착 단계까지는 올라올 수 있게 조정.
+  [#2] `analyze()`에 opening-volume relax 연결 및 로그 사유 추가.
+       기존: 일반 포착 부족이 `눌림목/A전용 외부억제` 이전 단계의 거래량 게이트에서 이미 발생해도 원인 확인이 어려웠음.
+       수정: 완화가 적용되면 사유를 남겨 오늘 같은 실제 상승 종목 미포착 원인을 재점검하기 쉽게 정리.
 
 - v92 (2026-03-27): 거래정지 오판 축소 — DART halt 영속 저장을 엄격화하고 실시간 정상 거래 시 자동 해제.
   [#1] `_is_trade_resume_title()`, `_is_trade_halt_title()`, `_should_persist_trade_halt_title()` 추가.
@@ -6604,6 +6612,50 @@ def get_effective_volume_ratio(signal_type: str, current_time: str) -> float:
         time_adj = 0.9
     required = max(2.0, min(base * time_adj, 10.0))
     return round(required, 1)
+
+
+def _relax_opening_general_required_volume(required_vol: float, signal_type: str, change_rate: float,
+                                           current_time: str, market: str = "") -> tuple[float, str]:
+    """정규장 초반 일반 포착 거래량 게이트를 현실화.
+    의도: 눌림목/A전용 외부억제는 유지한 채, 실제 강세 종목이 일반 포착 단계까지는 도달하도록 보정.
+    """
+    sig_type = str(signal_type or "").upper()
+    if sig_type not in ("SURGE", "NEAR_UPPER", "UPPER_LIMIT"):
+        return float(required_vol or 0.0), ""
+    time_str = str(current_time or "")
+    if " " in time_str:
+        time_str = time_str.split(" ")[-1]
+    try:
+        hour = int((time_str or "00:00:00").split(":")[0])
+    except Exception:
+        hour = datetime.now().hour
+    if not (9 <= hour < 10):
+        return float(required_vol or 0.0), ""
+    if str(market or "").upper() == "NXT" and not is_market_open():
+        return float(required_vol or 0.0), ""
+    try:
+        chg = float(change_rate or 0.0)
+    except Exception:
+        chg = 0.0
+    relaxed = float(required_vol or 0.0)
+    if sig_type == "SURGE":
+        if chg >= 12.0:
+            relaxed = min(relaxed, 5.5)
+        elif chg >= 8.0:
+            relaxed = min(relaxed, 6.0)
+        else:
+            relaxed = min(relaxed, 6.5)
+    elif sig_type == "NEAR_UPPER":
+        if chg >= 27.0:
+            relaxed = min(relaxed, 4.0)
+        else:
+            relaxed = min(relaxed, 4.5)
+    elif sig_type == "UPPER_LIMIT":
+        relaxed = min(relaxed, 3.0)
+    relaxed = round(max(2.0, min(relaxed, 10.0)), 1)
+    if relaxed < float(required_vol or 0.0):
+        return relaxed, f"📊 정규장 초반 거래량 기준 완화 ({float(required_vol or 0.0):.1f}배→{relaxed:.1f}배)"
+    return float(required_vol or 0.0), ""
 
 
 def get_dart_reliability_score(disclosure_type: str) -> int:
@@ -17916,8 +17968,13 @@ def analyze(stock: dict) -> dict:
 
     current_time = datetime.now().strftime("%H:%M:%S")
     required_vol = get_effective_volume_ratio(signal_type, current_time)
+    required_vol, opening_relax_reason = _relax_opening_general_required_volume(
+        required_vol, signal_type, change_rate, current_time, market=str(stock.get("market", "") or "")
+    )
     if vol_ratio < required_vol:
         return {}
+    if opening_relax_reason:
+        reasons.append(opening_relax_reason)
     if not check_liquidity(code, quote=stock):
         # v66: 상한가/근접 상한가는 매도호가(ask)가 없는 게 정상 → 유동성 체크 면제
         if signal_type not in ("UPPER_LIMIT", "NEAR_UPPER"):
