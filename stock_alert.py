@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v101
+버전: v102
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v102 (2026-03-27): 일반 눌림목 폐기 — 그냥 눌린 후보 제거 + 실전형 재상승/재테스트만 존치 + A 이외 외부알림 유지.
+  [#1] `MID_PULLBACK_MIN/MAX`, `MID_PULLBACK_DAYS_MIN/MAX` 기본값을 재축소하고 `_is_disabled_general_mid_pullback()`를 추가.
+       기존: 눌림목 후보군이 8~45% / 2~15일 범위로 너무 넓어, 그냥 눌린 일봉 추세형(`daily_trend`)도 반복 후보에 남을 수 있었음.
+       수정: 기본 눌림 범위를 12~28% / 3~9일로 좁히고, `daily_trend` 일반 눌림목은 스캔 단계에서 바로 제외해 실전형 재상승/재테스트만 남김.
+  [#2] `analyze_mid_pullback()`의 재상승 최소 게이트를 강화.
+       기존: 당일 양봉 또는 거래량 회복 중 하나만 있어도 일봉 눌림목 후보가 살아남아, 약한 반등도 점수 누적으로 외부 A 직전까지 갈 여지가 있었음.
+       수정: 일봉 눌림목은 당일 양봉 + 거래량 회복 + 20일선 회복/수급전환/상대강도 중 1개 이상을 기본 요구로 바꿔, 그냥 눌린 종목을 초기에 잘라냄.
+  [#3] 눌림목 자동조정 범위를 실전형 기준으로 재고정.
+       기존: 자동조정이 승률 회복 시 `mid_pullback_min`을 다시 8%까지 완화할 수 있어, 폐기한 일반 눌림목 구간이 재유입될 수 있었음.
+       수정: 자동조정 하한/상한을 12~28% 안쪽으로 고정해, 구조적으로 제거한 일반 눌림목이 다시 살아나지 않게 제한.
+  [#4] `run_mid_pullback_scan()`에 일반 눌림목 제외 분기 추가.
+       기존: A전용 외부알림 정책은 있었지만, 일반 눌림목도 내부 기록/추적 대상으로 반복 순위에 오를 수 있었음.
+       수정: `daily_trend` 일반 눌림목은 외부알림 이전 단계에서 스캔 제외하고, 실전형 `weekly_monthly_trend / gap_first_pullback / intraday_reclaim`만 알림 후보로 유지.
+  이유: 외부 비교와 누적 성과 모두 일반 눌림목은 승률/손익이 약했고, 사용자는 정보성 눌림목보다 실전형 A 알림만 원했음.
+  개선점: 그냥 눌린 종목 후보↓, 장초반 약한 눌림 재노출↓, 실전형 재상승/재테스트 밀도↑, A 이외 외부알림 집중도 유지.
+  주의점: 이번 버전은 일반 눌림목을 꺼내는 구조 수정이다. `눌림목/A전용 외부억제`, 진입가/손절가/목표가 산식, 거래정지 체계는 그대로 유지.
 
 - v101 (2026-03-27): 눌림목 재정렬 — 장초반 과신호 억제 + 실행 A게이트 재강화 + 공개 검증 패턴 확증 연동.
   [#1] `_get_mid_pullback_session_context()` / `_build_mid_pullback_global_context()` 추가.
@@ -4333,10 +4350,12 @@ STRICT_CLOSE_MINUTES = 10
 MID_PULLBACK_SCAN_INTERVAL = 90     # 300→90초 (일봉 기반이라 이 이상 빠르면 의미 없음)
 MID_SURGE_MIN_PCT          = 13.0
 MID_SURGE_LOOKBACK_DAYS    = 20
-MID_PULLBACK_MIN           = 8.0
-MID_PULLBACK_MAX           = 45.0
-MID_PULLBACK_DAYS_MIN      = 2
-MID_PULLBACK_DAYS_MAX      = 15
+MID_PULLBACK_MIN           = 12.0
+MID_PULLBACK_MAX           = 28.0
+MID_PULLBACK_DAYS_MIN      = 3
+MID_PULLBACK_DAYS_MAX      = 9
+MID_PULLBACK_DISABLED_BUCKETS = {"daily_trend"}
+MID_PULLBACK_ALLOWED_BUCKETS = {"weekly_monthly_trend", "gap_first_pullback", "intraday_reclaim"}
 MID_VOL_RECOVERY_MIN       = 1.3
 MID_ALERT_COOLDOWN         = 86400
 MID_RESURGE_MIN_PULLBACK_PCT = 15.0
@@ -6008,6 +6027,14 @@ def _classify_mid_pullback_setup(*, is_intraday: bool = False, resurge_mode: boo
     }
 
 
+def _is_disabled_general_mid_pullback(result: dict | None) -> bool:
+    result = result if isinstance(result, dict) else {}
+    bucket = str(result.get("mid_pullback_bucket") or "")
+    if bucket in MID_PULLBACK_ALLOWED_BUCKETS:
+        return False
+    return bucket in MID_PULLBACK_DISABLED_BUCKETS
+
+
 def _get_mid_pullback_close_window_info(now_dt: datetime | None = None) -> dict:
     now_dt = now_dt or datetime.now()
     stage = ""
@@ -6529,10 +6556,6 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
             if nxt_reason: reasons.append(nxt_reason)
     except Exception: pass
 
-    # 최소 조건: 양봉 + 거래량 회복 둘 다 없으면 재상승 미확인
-    if not is_bullish and not vol_recovered:
-        return {}
-
     try:
         sentiment = detect_foreign_institution_turnaround(code)
         if sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"):
@@ -6540,6 +6563,15 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
             reasons.append(f"🔄 외국인 음→양 전환 + 기관 순매수 (+{int(sentiment.get('score_bonus', 0) or 0)}점)")
     except Exception:
         pass
+
+    # 최소 조건: 일봉 눌림목은 실전형 재상승만 남긴다
+    rebound_confirmed = bool(
+        is_bullish
+        and vol_recovered
+        and (ma20_recovering or bool(sentiment.get("foreign_turnaround") and sentiment.get("institution_buying")) or rs >= RS_MIN)
+    )
+    if not rebound_confirmed:
+        return {}
 
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
         score, reasons, code, "MID_PULLBACK", today_chg, round(today_vol / avg_surge_vol, 1) if avg_surge_vol else 0, weight_mode="weak"
@@ -6615,6 +6647,10 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "market_regime_label": regime_label(),
         "market_regime_mode": _regime.get("mode", "normal"),
     }
+    result = _finalize_mid_pullback_signal(result)
+    if _is_disabled_general_mid_pullback(result):
+        return {}
+    return result
 
 # ============================================================
 # 눌림목 스캐너 후보군 자동 확장
@@ -10022,6 +10058,8 @@ def run_mid_pullback_scan():
                 _w_sec = _dynamic.get("feat_w_sector", 1.0)
                 result["score"] += int(sector_info.get("bonus", 0) * _w_sec)
                 result = _finalize_mid_pullback_signal(result)
+                if _is_disabled_general_mid_pullback(result):
+                    continue
                 signals.append(result)
             time.sleep(0.3)
         except Exception as e:
@@ -15008,17 +15046,19 @@ def auto_tune(notify: bool = True):
             old_max   = _dynamic["mid_pullback_max"]
             if rate < 0.40:
                 _dynamic["mid_surge_min_pct"] = min(old_surge + 3.0, 25.0)
-                _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 15.0)
-                _dynamic["mid_pullback_max"]  = max(old_max - 5.0, 30.0)
+                _dynamic["mid_pullback_min"]  = min(old_min + 2.0, 16.0)
+                _dynamic["mid_pullback_max"]  = max(old_max - 4.0, 24.0)
                 changes.append(f"🏆 눌림목 조건 강화 (승률 {rate*100:.0f}%)\n"
                                 f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%\n"
                                 f"   눌림범위 {old_min}~{old_max}→"
                                 f"{_dynamic['mid_pullback_min']}~{_dynamic['mid_pullback_max']}%")
             elif rate > 0.70:
-                _dynamic["mid_surge_min_pct"] = max(old_surge - 2.0, 10.0)
-                _dynamic["mid_pullback_min"]  = max(old_min - 2.0, 8.0)
-                changes.append(f"🏆 눌림목 조건 완화 (승률 {rate*100:.0f}%)\n"
-                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%")
+                _dynamic["mid_surge_min_pct"] = max(old_surge - 2.0, 12.0)
+                _dynamic["mid_pullback_min"]  = max(old_min - 1.0, 12.0)
+                _dynamic["mid_pullback_max"]  = min(max(old_max, 24.0), 28.0)
+                changes.append(f"🏆 눌림목 조건 완화 제한 (승률 {rate*100:.0f}%)\n"
+                                f"   1차급등 {old_surge}→{_dynamic['mid_surge_min_pct']}%\n"
+                                f"   눌림범위 하한 유지 {old_min}→{_dynamic['mid_pullback_min']}% / 상한 {old_max}→{_dynamic['mid_pullback_max']}%")
             changes.extend(_auto_tune_mid_pullback_bucket_params(mid_recs))
 
         # ── ③-1 진입가 미달/손실 피드백 루프 ──
