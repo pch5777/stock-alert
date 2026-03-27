@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v100
+버전: v101
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v101 (2026-03-27): 눌림목 재정렬 — 장초반 과신호 억제 + 실행 A게이트 재강화 + 공개 검증 패턴 확증 연동.
+  [#1] `_get_mid_pullback_session_context()` / `_build_mid_pullback_global_context()` 추가.
+       기존: 눌림목은 장초반 KRX와 장후/NXT를 같은 execution confirm 축으로 다뤄, 장초반 약한 반등도 A등급 후보로 과상향될 수 있었음.
+       수정: KRX 장초반/정규장 일반/장후 NXT를 구분하는 세션 컨텍스트와, 눌림목 전용 공개 검증 패턴 컨텍스트(거래대금+고가 유지 / ORB / 전고 돌파 / 상한가 근접)를 별도로 계산.
+  [#2] `_get_mid_pullback_execution_profile()` / `_apply_mid_pullback_execution_grade()` 재조정.
+       기존: `MID_PULLBACK`은 B등급 고점수(95점↑)면 실행 A로 쉽게 승격되고, 장초반 intraday reclaim도 core 확증 1개 수준으로 외부 A에 도달할 수 있었음.
+       수정: 장초반 KRX에서는 ORB/전고 돌파/고가 유지 같은 강한 패턴 확증이 없으면 A를 금지하고, intraday reclaim은 core 2개 이상을 요구하며, B→A 승격은 110점↑ + 강한 패턴 + core 2개 이상일 때만 허용.
+  [#3] `analyze_mid_pullback()` / `check_intraday_pullback_breakout()` 반환 메타 보강.
+       기존: 눌림목 결과에 당일 시가/고가/거래량과 turnaround 여부, 공개 패턴 컨텍스트가 충분히 남지 않아, 실행 보정이 가격 구조보다 점수 총합에 치우쳤음.
+       수정: 당일 시가/고가/거래량/turnaround_confirmed/global_pattern_context를 함께 남겨 실행 A 여부가 실제 강세 구조를 기준으로 결정되게 정리.
+  [#4] `v100`의 공개 검증 패턴 4종을 눌림목에도 선택적으로 재사용.
+       기존: 공개 검증 패턴 4종은 일반 상승주 승격에는 반영됐지만, 눌림목은 별도 엔진이라 장초반 약한 반등과 강한 재상승을 충분히 구분하지 못했음.
+       수정: 눌림목은 강한 ORB/전고 돌파/고가 유지/상한가 근접 선행이 동반될 때만 공격적으로 승격하고, 그렇지 않으면 내부추적/B등급으로 남기도록 보수화.
+  이유: 실제 누적 성과 점검에서 눌림목 A가 B보다 약했고, 특히 KRX 장초반 눌림목이 계속 문제였으므로, 외부 A 알림을 강한 재상승형 위주로 다시 좁혀야 했음.
+  개선점: 눌림목 장초반 과신호↓, 가짜 반등 A승격↓, 강한 재상승/고가 유지형 A품질↑, NXT 후반 재상승형 보존.
+  주의점: `눌림목/A전용 외부억제`는 유지. 이번 수정은 눌림목 실행 A게이트와 점수 해석을 보수화하는 범위에 한정.
 
 - v100 (2026-03-27): 패턴 검증 반영 — 거래대금+고가 유지 / ORB·전고 돌파 / 상한가 근접 선행 / 섹터 확산을 기존 신호 승격·가점·차단에 통합.
   [#1] `_get_recent_avg_trade_amount()` / `_get_recent_high_breakout_context()` / `_build_global_pattern_context()` 추가.
@@ -6048,11 +6065,72 @@ def _get_mid_pullback_bucket_thresholds(bucket: str) -> tuple[int, int]:
     return max(1, a_min), max(0, b_min)
 
 
+def _get_mid_pullback_session_context(result: dict | None = None, now_dt: datetime | None = None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    now_dt = now_dt or datetime.now()
+    market = str(result.get("market", result.get("market_basis", "")) or "").upper()
+    if not market:
+        if is_market_open():
+            market = "KRX"
+        elif is_nxt_open():
+            market = "NXT"
+    hhmm = now_dt.hour * 100 + now_dt.minute
+    krx_opening = market == "KRX" and 900 <= hhmm <= 1030
+    krx_morning = market == "KRX" and 900 <= hhmm <= 1130
+    nxt_late = market == "NXT" and hhmm >= 1700
+    return {
+        "market": market,
+        "hhmm": hhmm,
+        "krx_opening": krx_opening,
+        "krx_morning": krx_morning,
+        "nxt_late": nxt_late,
+    }
+
+
+def _build_mid_pullback_global_context(result: dict | None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    existing = result.get("global_pattern_context")
+    if isinstance(existing, dict) and existing:
+        return existing
+    code = normalize_stock_code(result.get("code", ""))
+    price = safe_int(result.get("price", 0), 0)
+    high_price = safe_int(result.get("today_high", result.get("high", price)), price)
+    open_price = safe_int(result.get("today_open", result.get("open", price)), price)
+    today_vol = safe_int(result.get("today_vol", 0), 0)
+    if not code or price <= 0:
+        return {}
+    market = str(result.get("market", result.get("market_basis", "")) or "").upper()
+    if not market:
+        if is_market_open():
+            market = "KRX"
+        elif is_nxt_open():
+            market = "NXT"
+    stock_stub = {
+        "code": code,
+        "price": price,
+        "high": high_price,
+        "open": open_price,
+        "today_vol": today_vol,
+        "trade_amount": int(price * today_vol) if price > 0 and today_vol > 0 else 0,
+        "market": market,
+    }
+    ctx = _build_global_pattern_context(
+        stock_stub,
+        current_time=datetime.now().strftime("%H:%M:%S"),
+        change_rate=float(result.get("change_rate", 0.0) or 0.0),
+        vol_ratio=float(result.get("volume_ratio", 0.0) or 0.0),
+    )
+    result["global_pattern_context"] = ctx
+    return ctx
+
+
 def _get_mid_pullback_execution_profile(result: dict) -> dict:
     sector_info = result.get("sector_info") or {}
     sector_bonus = int(sector_info.get("bonus", 0) or 0)
     core_hits = []
     support_hits = []
+    pattern_ctx = _build_mid_pullback_global_context(result)
+    session_ctx = _get_mid_pullback_session_context(result)
     if sector_bonus >= 3:
         core_hits.append("섹터강함")
     elif sector_bonus > 0:
@@ -6077,12 +6155,32 @@ def _get_mid_pullback_execution_profile(result: dict) -> dict:
         support_hits.append("거래량3배")
     if float(result.get("ma20_dev", -99) or -99) >= 0:
         support_hits.append("20일선회복")
+    if bool(pattern_ctx.get("value_hold_hit")):
+        core_hits.append("고가유지")
+    elif bool(pattern_ctx.get("value_hold_ready")):
+        support_hits.append("거래대금고가")
+    if bool(pattern_ctx.get("recent_high_breakout")):
+        core_hits.append("전고돌파")
+    if bool(pattern_ctx.get("orb_breakout")):
+        core_hits.append("ORB")
+    if bool(pattern_ctx.get("near_limit_lead")):
+        support_hits.append("상한가근접")
     close_info = _get_mid_pullback_close_window_info()
     if close_info.get("is_close_window"):
         support_hits.append(f"{close_info.get('stage','')}마감근접")
+    if session_ctx.get("krx_opening"):
+        support_hits.append("KRX장초반")
+    if session_ctx.get("nxt_late"):
+        support_hits.append("NXT후반")
     core_hits = list(dict.fromkeys(core_hits))
     support_hits = list(dict.fromkeys(support_hits))
     total_hits = list(dict.fromkeys(core_hits + support_hits))
+    strong_pattern_hit = bool(
+        pattern_ctx.get("value_hold_hit")
+        or pattern_ctx.get("recent_high_breakout")
+        or pattern_ctx.get("orb_breakout")
+        or pattern_ctx.get("near_limit_lead")
+    )
     return {
         "core_hits": core_hits,
         "support_hits": support_hits,
@@ -6092,6 +6190,9 @@ def _get_mid_pullback_execution_profile(result: dict) -> dict:
         "sector_bonus": sector_bonus,
         "close_info": close_info,
         "close_penalty": int(close_info.get("penalty", 0) or 0),
+        "pattern_ctx": pattern_ctx,
+        "session_ctx": session_ctx,
+        "strong_pattern_hit": strong_pattern_hit,
     }
 
 
@@ -6114,23 +6215,53 @@ def _apply_mid_pullback_execution_grade(result: dict) -> dict:
     total_count = int(profile.get("total_count", 0) or 0)
     execution_grade = pattern_grade
     pattern_score = int(result.get("pattern_score_base", result.get("score", 0)) or 0)
+    session_ctx = profile.get("session_ctx") or {}
+    strong_pattern_hit = bool(profile.get("strong_pattern_hit"))
+    strong_support = bool(
+        strong_pattern_hit
+        or bool(result.get("direct_news_hit"))
+        or bool(result.get("turnaround_confirmed"))
+        or int(profile.get("sector_bonus", 0) or 0) >= 5
+    )
+    opening_krx = bool(session_ctx.get("krx_opening"))
+    late_nxt = bool(session_ctx.get("nxt_late"))
+    required_core_a = 1
+    if bucket == "intraday_reclaim":
+        required_core_a = 2
+    if opening_krx:
+        req_a += 1
+        required_core_a = max(required_core_a, 2)
+    if bucket in {"gap_first_pullback", "intraday_reclaim"} and not strong_support:
+        req_a += 1
     if pattern_grade == "A":
-        if core_count >= 1 and total_count >= req_a:
+        if core_count >= required_core_a and total_count >= req_a and (strong_support or (not opening_krx and bucket != "intraday_reclaim") or late_nxt):
             execution_grade = "A"
         elif total_count >= max(req_b, req_a - 1):
             execution_grade = "B"
         else:
             execution_grade = "C"
     elif pattern_grade == "B":
-        # v71: 점수 95점↑ B등급 → 실질 A로 승격 (A기준 확장)
-        # 로그상 98~129점 B등급이 외부알림 전량 차단되던 문제 해소
-        if pattern_score >= 95 and total_count >= req_b:
+        if (
+            pattern_score >= 110
+            and core_count >= max(2, required_core_a)
+            and total_count >= max(req_a, req_b + 1)
+            and strong_pattern_hit
+            and not opening_krx
+        ):
             execution_grade = "A"
-            result.setdefault("reasons", []).append(f"🔺 고점수 B→A 승격: {pattern_score}점 (임계 95점↑)")
+            result.setdefault("reasons", []).append(f"🔺 고점수 B→A 제한승격: {pattern_score}점 / 강패턴+core {core_count}개")
         else:
             execution_grade = "B" if total_count >= req_b else "C"
     else:
         execution_grade = "C"
+
+    if opening_krx and not strong_support:
+        if execution_grade == "A":
+            execution_grade = "B"
+            result.setdefault("reasons", []).append("⏰ KRX 장초반 눌림목 과신호 억제 — 강패턴 확증 전 A 보류")
+        elif bucket == "intraday_reclaim" and execution_grade == "B" and total_count < max(req_b + 1, 3):
+            execution_grade = "C"
+            result.setdefault("reasons", []).append("⏰ KRX 장초반 장중돌파형 — ORB/전고돌파/고가유지 부족")
 
     reasons = [r for r in list(result.get("reasons") or []) if not _is_mid_pullback_meta_reason(r)]
     bucket_label = str(result.get("mid_pullback_bucket_label") or MID_PULLBACK_BUCKET_LABELS.get(bucket, "일봉 추세형"))
@@ -6139,6 +6270,23 @@ def _apply_mid_pullback_execution_grade(result: dict) -> dict:
     close_info = profile.get("close_info") or {}
     if close_info.get("is_close_window"):
         reasons.append(f"🕒 장마감 근접: {close_info.get('stage','')} {int(close_info.get('remain_min', 0) or 0)}분 전")
+    if opening_krx:
+        reasons.append("⏰ KRX 장초반: 약한 반등 A승격 보수 적용")
+    if late_nxt:
+        reasons.append("🌙 NXT 후반: 재상승형 유지 허용")
+    if strong_pattern_hit:
+        pattern_labels = []
+        pattern_ctx = profile.get("pattern_ctx") or {}
+        if pattern_ctx.get("orb_breakout"):
+            pattern_labels.append("ORB")
+        if pattern_ctx.get("recent_high_breakout"):
+            pattern_labels.append("전고돌파")
+        if pattern_ctx.get("value_hold_hit"):
+            pattern_labels.append("고가유지")
+        if pattern_ctx.get("near_limit_lead"):
+            pattern_labels.append("상한가근접")
+        if pattern_labels:
+            reasons.append(f"🧩 공개패턴 확증: {', '.join(pattern_labels[:3])}")
     if execution_grade != pattern_grade:
         reason_labels = profile.get("core_hits") or profile.get("support_hits") or []
         note_reason = ", ".join(reason_labels[:2]) if reason_labels else "실행확증 부족"
@@ -6153,6 +6301,9 @@ def _apply_mid_pullback_execution_grade(result: dict) -> dict:
     result["mid_close_remain_min"] = int(close_info.get("remain_min", 999) or 999)
     result["mid_execution_confirm_count"] = total_count
     result["mid_execution_core_count"] = core_count
+    result["mid_opening_krx"] = opening_krx
+    result["mid_late_nxt"] = late_nxt
+    result["mid_strong_pattern_hit"] = strong_pattern_hit
     return result
 
 
@@ -6170,6 +6321,14 @@ def _finalize_mid_pullback_signal(result: dict) -> dict:
     result.update(ctx)
     pattern_score = int(result.get("pattern_score_base", result.get("score", 0)) or 0)
     result["pattern_score_base"] = pattern_score
+    pattern_ctx = _build_mid_pullback_global_context(result)
+    session_ctx = _get_mid_pullback_session_context(result)
+    strong_pattern_hit = bool(
+        pattern_ctx.get("value_hold_hit")
+        or pattern_ctx.get("recent_high_breakout")
+        or pattern_ctx.get("orb_breakout")
+        or pattern_ctx.get("near_limit_lead")
+    )
     a_cut = 80
     if _should_relax_general_a_threshold(
         "MID_PULLBACK",
@@ -6178,12 +6337,14 @@ def _finalize_mid_pullback_signal(result: dict) -> dict:
         vol_ratio=float(result.get("volume_ratio", 0.0) or 0.0),
         sector_info=result.get("sector_info") if isinstance(result.get("sector_info"), dict) else {},
         direct_news_hit=bool(result.get("direct_news_hit")),
-        market=str(result.get("market", "") or ""),
+        market=str(result.get("market", result.get("market_basis", "")) or ""),
         reasons=list(result.get("reasons") or []),
-    ):
-        a_cut = min(a_cut, INTRADAY_CAPTURE_RELAX_SCORE)
-        result.setdefault("reasons", []).append(f"🏷 선행형 A게이트 자동확장 (80→{a_cut})")
+    ) and strong_pattern_hit and not session_ctx.get("krx_opening"):
+        a_cut = min(a_cut, 78)
+        result.setdefault("reasons", []).append(f"🏷 강패턴형 눌림목 A게이트 제한완화 (80→{a_cut})")
     result["mid_pullback_a_cut"] = a_cut
+    result["global_pattern_context"] = pattern_ctx
+    result["mid_strong_pattern_hit"] = strong_pattern_hit
     result["pattern_grade"] = _mid_pullback_grade_from_score(pattern_score, a_cut=a_cut)
     return _apply_mid_pullback_execution_grade(result)
 
@@ -6443,6 +6604,11 @@ def analyze_mid_pullback(code: str, name: str) -> dict:
         "stop_loss":     stop, "target_price": target,
         "stop_pct":      stop_pct, "target_pct": target_pct,
         "atr_used":      atr_used,
+        "today_open":     today_open,
+        "today_high":     today_high,
+        "today_vol":      today_vol,
+        "turnaround_confirmed": bool(sentiment.get("foreign_turnaround") and sentiment.get("institution_buying")),
+        "market":         "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""),
         "sector_info":   sector_info,
         "reasons":       reasons,
         "detected_at":   datetime.now(),
@@ -9783,6 +9949,11 @@ def check_intraday_pullback_breakout(code: str, name: str) -> dict:
         "entry_price": entry, "stop_loss": stop, "target_price": target,
         "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
         "gap_pct": round(((today_price - prev_close) / prev_close) * 100, 1) if prev_close else 0.0,
+        "today_open": safe_int(cur.get("open", today_price), today_price),
+        "today_high": intraday_high,
+        "today_vol": today_vol,
+        "turnaround_confirmed": False,
+        "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""),
         "reasons": reasons, "detected_at": datetime.now(),
     }
     return _finalize_mid_pullback_signal(result)
