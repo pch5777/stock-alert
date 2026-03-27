@@ -3,11 +3,33 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v94
+버전: v96
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v96 (2026-03-27): cross-day 연속 패턴 보강 + 초기 강세 내부포착→재상승 실행형 연결 + 일반 상승주 조기 SURGE 보강 + guard 반복알림 1회성 유지.
+  [#1] `_get_crossday_episode_context()` / `_maybe_promote_signal_from_crossday_episode()` / `_should_require_execution_setup_from_crossday()` 추가.
+       기존: 날짜 경계를 넘는 1차 상승→눌림→재상승 맥락이 일반 포착/조기포착 경로에서 분절적으로만 반영돼, 전날 급등 후 다음날 재가속 같은 케이스가 늦게 보이거나 실행 구조로 안정적으로 이어지지 못했음.
+       수정: 최근 signal_log 힌트 + 최근 일봉 구조를 함께 읽어 cross-day 에피소드 맥락을 계산하고, 초기 강세는 내부포착으로 유지한 뒤 재상승 확인 시 `SURGE/NEAR_UPPER` 후보 자격과 실행 준비 상태를 함께 부여.
+  [#2] `analyze()` / `check_early_detection()`에 cross-day 연속 패턴 로직 연결.
+       기존: `SURGE/NEAR_UPPER`는 당일 상승률 절대기준 위주라, 전날 1차 상승 후 다음날 재상승 종목이 초기 단계에서 `SURGE`로 늦게 보이거나 아예 `EARLY_DETECT` 내부추적으로만 남을 수 있었음.
+       수정: 연속 패턴이 확인되면 3%대 재가속도 `SURGE` 후보로, 23%대 강한 재가속은 `NEAR_UPPER` 후보로 조기 승격 가능하게 하고, 일반 포착 거래량 게이트도 cross-day 맥락에 한해 현실화.
+  [#3] `save_signal_log()` / `register_entry_watch()` / `_notify_entry_guard_followup()`의 연속 패턴 메타·1회성 guard 상태 정리 보강.
+       기존: 초기 강세 내부포착/재상승 실행 맥락과 guard 1회성 여부가 signal_log/active watch에 충분히 남지 않아, 다음 턴 기준 재진술과 실로그 확인 시 반영 여부 추적이 어려웠음.
+       수정: `crossday_episode_*` / `execution_setup_required` / `entry_guard_alert_sent_once` 상태를 대표 레코드와 active watch에 함께 남겨, 연속 패턴과 guard 1회성 동작을 로그 기준으로 바로 추적 가능하게 정리.
+
+- v95 (2026-03-27): 상승 종목 포착 회복용 다중 추세 필터 정상화 + 같은 watch의 guard 반복 외부알림 1회성화.
+  [#1] `_get_multi_tf_downtrend_context()` / `_should_block_multi_tf_downtrend_capture()` 정상화.
+       기존: 일봉/주봉이 둘 다 상승 추세가 아닐 때 거의 전부 `하향/비상승 추세`로 차단해, 강한 장중 상승 후보도 앞단에서 대량 탈락할 수 있었음.
+       수정: 명확한 일봉·주봉 동반 하락 추세 또는 강한 단독 하락일 때만 차단하도록 되돌려, `v94`의 과차단을 완화.
+  [#2] `_should_relax_general_a_threshold()` 보강.
+       기존: `SURGE`/`NEAR_UPPER`가 강한 가격·거래량·상대강도 근거를 보여도 A 완화 게이트 진입이 제한적이어서, 실전형 상승 종목이 B에서 멈출 수 있었음.
+       수정: 장중 강세 근거(거래량 이상 급증/상대강도/재상승/장중돌파 등)가 확인되면 일반 포착의 A 완화 자격을 더 현실적으로 부여.
+  [#3] `_notify_entry_guard_followup()` 1회성 외부알림 가드 추가.
+       기존: 같은 watch가 며칠 살아 있는 동안 `거래량 급감` 같은 guard 사유가 30분~60분 간격으로 반복 외부발송될 수 있었음.
+       수정: 같은 watch의 guard 외부알림은 최초 1회만 보내고, 이후는 내부 기록만 유지하도록 변경.
 
 - v94 (2026-03-27): DART 실행형 과관대 축소 + 다중 추세 필터 보수화.
   [#1] `_should_register_dart_execution_watch()` 추가.
@@ -2744,6 +2766,162 @@ def _get_tracking_priority_hint(code: str) -> dict:
     row["last_seen_hours"] = max(0.0, round((datetime.now() - last_dt).total_seconds() / 3600.0, 2)) if isinstance(last_dt, datetime) else 0.0
     return row
 
+def _get_crossday_episode_context(code: str, current_price: int = 0, change_rate: float = 0.0, vol_ratio: float = 0.0) -> dict:
+    ctx = {
+        "episode_active": False,
+        "prep": False,
+        "confirmed": False,
+        "near_upper_ready": False,
+        "score_bonus": 0,
+        "required_vol_cap": 0.0,
+        "reclaim_ratio": 0.0,
+        "pullback_pct": 0.0,
+        "days_since_surge": 99,
+        "hint_recent": False,
+        "signal_hint_type": "",
+        "reason": "",
+    }
+    code = normalize_stock_code(code)
+    current_price = safe_int(current_price, 0)
+    change_rate = safe_float(change_rate, 0.0)
+    vol_ratio = safe_float(vol_ratio, 0.0)
+    if not code or current_price <= 0:
+        return ctx
+    hint = _get_tracking_priority_hint(code)
+    last_seen_hours = safe_float(hint.get("last_seen_hours", 999.0), 999.0)
+    hint_recent = 0.0 <= last_seen_hours <= CROSSDAY_EPISODE_MAX_HOURS
+    signal_hint_type = str(hint.get("signal_type", "") or "").upper()
+    ctx["hint_recent"] = bool(hint_recent)
+    ctx["signal_hint_type"] = signal_hint_type
+    try:
+        items = get_daily_data(code, 8)
+    except Exception:
+        items = []
+    if len(items) < 4:
+        return ctx
+    hist = items[:-1] if len(items) >= 2 else items
+    if len(hist) < 3:
+        return ctx
+    start_idx = max(1, len(hist) - 4)
+    best_idx = -1
+    best_score = -10**9
+    best_gain = 0.0
+    best_peak = 0
+    for i in range(start_idx, len(hist)):
+        row = hist[i] if isinstance(hist[i], dict) else {}
+        prev_close = safe_int(hist[i-1].get("close", 0), 0) if i > 0 and isinstance(hist[i-1], dict) else 0
+        close_p = safe_int(row.get("close", 0), 0)
+        open_p = safe_int(row.get("open", close_p), close_p)
+        high_p = safe_int(row.get("high", close_p), close_p)
+        low_p = safe_int(row.get("low", min(open_p, close_p) if close_p else 0), min(open_p, close_p) if close_p else 0)
+        if close_p <= 0 or high_p <= 0 or low_p <= 0:
+            continue
+        if prev_close <= 0:
+            prev_close = open_p or close_p
+        day_gain = ((close_p - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        day_range = ((high_p - low_p) / low_p * 100.0) if low_p > 0 else 0.0
+        strong_day = day_gain >= CROSSDAY_PRIOR_SURGE_MIN_PCT or day_range >= CROSSDAY_PRIOR_RANGE_MIN_PCT
+        if not strong_day:
+            continue
+        score = day_gain * 3.0 + day_range
+        if score > best_score:
+            best_score = score
+            best_idx = i
+            best_gain = day_gain
+            best_peak = high_p
+    if best_idx < 0 and not hint_recent:
+        return ctx
+    if best_idx < 0:
+        best_idx = len(hist) - 1
+        row = hist[best_idx] if isinstance(hist[best_idx], dict) else {}
+        best_peak = safe_int(row.get("high", row.get("close", 0)), 0)
+        best_gain = 0.0
+    after_peak = [r for r in hist[best_idx+1:] if isinstance(r, dict)]
+    if not after_peak:
+        after_peak = [hist[-1]] if isinstance(hist[-1], dict) else []
+    pullback_low = 0
+    for row in after_peak:
+        low_p = safe_int(row.get("low", 0), 0)
+        if low_p <= 0:
+            continue
+        pullback_low = low_p if pullback_low <= 0 else min(pullback_low, low_p)
+    if pullback_low <= 0:
+        pullback_low = safe_int(hist[-1].get("low", hist[-1].get("close", 0)), 0) if isinstance(hist[-1], dict) else current_price
+    if pullback_low <= 0 or best_peak <= 0 or best_peak <= pullback_low:
+        return ctx
+    pullback_pct = (best_peak - pullback_low) / best_peak * 100.0
+    days_since_surge = max(0, len(hist) - 1 - best_idx)
+    recent_cap = 4 if hint_recent else 3
+    if days_since_surge > recent_cap:
+        return ctx
+    current_ref_price = max(current_price, safe_int(hist[-1].get("high", current_price), current_price) if isinstance(hist[-1], dict) else current_price)
+    reclaim_ratio = _calc_pullback_reclaim_ratio(best_peak, pullback_low, current_ref_price)
+    prep = (
+        hint_recent
+        and pullback_pct >= CROSSDAY_PULLBACK_MIN_PCT
+        and pullback_pct <= CROSSDAY_PULLBACK_MAX_PCT
+        and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE
+        and current_price >= int(pullback_low * 1.02)
+    )
+    confirmed = (
+        prep
+        and change_rate >= CROSSDAY_RESURGE_SURGE_MIN_CHANGE
+        and vol_ratio >= CROSSDAY_RESURGE_MIN_VOL_RATIO
+        and reclaim_ratio >= CROSSDAY_RESURGE_MIN_RECLAIM_RATIO
+    )
+    near_upper_ready = bool(confirmed and change_rate >= CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE and reclaim_ratio >= 0.72 and vol_ratio >= max(2.0, CROSSDAY_RESURGE_MIN_VOL_RATIO + 0.8))
+    if not (prep or confirmed or near_upper_ready):
+        return ctx
+    reason = (
+        f"♻️ 전일 포함 연속 패턴: 1차상승 후 눌림 {pullback_pct:.1f}% / 회복률 {reclaim_ratio*100:.0f}% / "
+        f"시차 {days_since_surge}일"
+    )
+    ctx.update({
+        "episode_active": True,
+        "prep": bool(prep),
+        "confirmed": bool(confirmed),
+        "near_upper_ready": bool(near_upper_ready),
+        "score_bonus": 12 if near_upper_ready else (10 if confirmed else 6),
+        "required_vol_cap": CROSSDAY_CONFIRM_REQUIRED_VOL_CAP if confirmed else CROSSDAY_PREP_REQUIRED_VOL_CAP,
+        "reclaim_ratio": round(reclaim_ratio, 3),
+        "pullback_pct": round(pullback_pct, 1),
+        "days_since_surge": int(days_since_surge),
+        "prior_day_gain": round(best_gain, 1),
+        "reason": reason,
+    })
+    return ctx
+
+
+def _maybe_promote_signal_from_crossday_episode(signal_type: str, ctx: dict | None, change_rate: float = 0.0) -> str:
+    ctx = ctx if isinstance(ctx, dict) else {}
+    sig = str(signal_type or "").upper()
+    change_rate = safe_float(change_rate, 0.0)
+    if not ctx.get("episode_active"):
+        return sig
+    if ctx.get("near_upper_ready") and change_rate >= CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE:
+        return "NEAR_UPPER"
+    if ctx.get("confirmed") and change_rate >= CROSSDAY_RESURGE_SURGE_MIN_CHANGE:
+        if sig in ("EARLY_DETECT", "SURGE"):
+            return "SURGE"
+    if ctx.get("prep") and sig in ("", "UNKNOWN") and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE:
+        return "EARLY_DETECT"
+    return sig
+
+
+def _should_require_execution_setup_from_crossday(signal_type: str, ctx: dict | None, change_rate: float = 0.0, vol_ratio: float = 0.0) -> bool:
+    ctx = ctx if isinstance(ctx, dict) else {}
+    sig = str(signal_type or "").upper()
+    change_rate = safe_float(change_rate, 0.0)
+    vol_ratio = safe_float(vol_ratio, 0.0)
+    if not ctx.get("episode_active"):
+        return False
+    if sig == "EARLY_DETECT":
+        return True
+    if sig == "SURGE" and (ctx.get("prep") or ctx.get("confirmed")):
+        if change_rate < CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE or vol_ratio < max(2.0, CROSSDAY_RESURGE_MIN_VOL_RATIO + 0.6):
+            return True
+    return False
+
 
 def _is_leader_priority_signal(signal: dict | None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
@@ -3780,6 +3958,19 @@ NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLB
 RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 GENERAL_A_RELAX_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 GENERAL_A_RELAXED_SCORE = int(os.getenv("GENERAL_A_RELAXED_SCORE", "77") or "77")
+CROSSDAY_EPISODE_MAX_HOURS = float(os.getenv("CROSSDAY_EPISODE_MAX_HOURS", "42") or "42")
+CROSSDAY_PRIOR_SURGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_SURGE_MIN_PCT", "7.0") or "7.0")
+CROSSDAY_PRIOR_RANGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_RANGE_MIN_PCT", "9.0") or "9.0")
+CROSSDAY_PULLBACK_MIN_PCT = float(os.getenv("CROSSDAY_PULLBACK_MIN_PCT", "4.0") or "4.0")
+CROSSDAY_PULLBACK_MAX_PCT = float(os.getenv("CROSSDAY_PULLBACK_MAX_PCT", "28.0") or "28.0")
+CROSSDAY_RESURGE_PREP_MIN_CHANGE = float(os.getenv("CROSSDAY_RESURGE_PREP_MIN_CHANGE", "2.3") or "2.3")
+CROSSDAY_RESURGE_SURGE_MIN_CHANGE = float(os.getenv("CROSSDAY_RESURGE_SURGE_MIN_CHANGE", "3.4") or "3.4")
+CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE = float(os.getenv("CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE", "23.0") or "23.0")
+CROSSDAY_RESURGE_MIN_VOL_RATIO = float(os.getenv("CROSSDAY_RESURGE_MIN_VOL_RATIO", "1.4") or "1.4")
+CROSSDAY_RESURGE_MIN_RECLAIM_RATIO = float(os.getenv("CROSSDAY_RESURGE_MIN_RECLAIM_RATIO", "0.45") or "0.45")
+CROSSDAY_PREP_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_PREP_REQUIRED_VOL_CAP", "3.0") or "3.0")
+CROSSDAY_CONFIRM_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_CONFIRM_REQUIRED_VOL_CAP", "4.5") or "4.5")
+CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE = float(os.getenv("CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE", "7.5") or "7.5")
 INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "900") or "900")
 
 
@@ -12082,6 +12273,12 @@ def save_signal_log(stock: dict):
             "entry_price_at_detect": int(stock.get("entry_price_at_detect", stock.get("entry_price", 0)) or 0),
             "pattern_grade_at_detect": str(stock.get("pattern_grade_at_detect", stock.get("pattern_grade", stock.get("grade", ""))) or ""),
             "execution_grade_at_detect": str(stock.get("execution_grade_at_detect", stock.get("grade", "")) or ""),
+            "crossday_episode_active": bool(stock.get("crossday_episode_active")),
+            "crossday_episode_prep": bool(stock.get("crossday_episode_prep")),
+            "crossday_episode_confirmed": bool(stock.get("crossday_episode_confirmed")),
+            "crossday_episode_reason": str(stock.get("crossday_episode_reason", "") or ""),
+            "crossday_episode_reclaim_ratio": float(stock.get("crossday_episode_reclaim_ratio", 0.0) or 0.0),
+            "entry_execution_focus": bool(stock.get("entry_execution_focus")),
         }
 
         track_status = "진입준비" if stock.get("execution_setup_required") else "추적중"
@@ -12139,6 +12336,12 @@ def save_signal_log(stock: dict):
                 rec["feature_snapshot"] = feature_snapshot
                 rec["korea_etf_snapshot"] = korea_etf_snapshot
                 rec["execution_setup_required"] = bool(stock.get("execution_setup_required"))
+                rec["entry_execution_focus"] = bool(stock.get("entry_execution_focus"))
+                rec["crossday_episode_active"] = bool(stock.get("crossday_episode_active"))
+                rec["crossday_episode_prep"] = bool(stock.get("crossday_episode_prep"))
+                rec["crossday_episode_confirmed"] = bool(stock.get("crossday_episode_confirmed"))
+                rec["crossday_episode_reason"] = str(stock.get("crossday_episode_reason", "") or "")
+                rec["crossday_episode_reclaim_ratio"] = float(stock.get("crossday_episode_reclaim_ratio", 0.0) or 0.0)
                 rec["planned_entry_price"] = safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0)
                 rec["pattern_grade"] = str(stock.get("pattern_grade", stock.get("grade", rec.get("pattern_grade", "B"))))
                 rec["execution_grade"] = str(stock.get("grade", rec.get("execution_grade", rec.get("grade", "B"))))
@@ -12221,6 +12424,12 @@ def save_signal_log(stock: dict):
             "actual_exit_date": "",
             "skip_reason": "",
             "execution_setup_required": bool(stock.get("execution_setup_required")),
+            "entry_execution_focus": bool(stock.get("entry_execution_focus")),
+            "crossday_episode_active": bool(stock.get("crossday_episode_active")),
+            "crossday_episode_prep": bool(stock.get("crossday_episode_prep")),
+            "crossday_episode_confirmed": bool(stock.get("crossday_episode_confirmed")),
+            "crossday_episode_reason": str(stock.get("crossday_episode_reason", "") or ""),
+            "crossday_episode_reclaim_ratio": float(stock.get("crossday_episode_reclaim_ratio", 0.0) or 0.0),
             "planned_entry_price": safe_int(stock.get("planned_entry_price", stock.get("entry_price", stock.get("price", 0))), 0),
             "entry_blocked": False,
             "entry_blocked_reason": "",
@@ -14634,7 +14843,7 @@ def _get_countertrend_surge_context(code: str) -> dict:
         return out
 
 def _get_multi_tf_downtrend_context(code: str) -> dict:
-    """주봉·일봉이 모두 상승 추세가 아닐 때 보수적으로 하향/비상승 추세로 판정."""
+    """명확한 주봉·일봉 동반 하락 추세만 차단하도록 다중 추세를 판정."""
     out = {
         "is_multi_tf_downtrend": False,
         "daily_ret20": 0.0,
@@ -14655,7 +14864,6 @@ def _get_multi_tf_downtrend_context(code: str) -> dict:
         items = [it for it in items if float((it or {}).get("close", 0) or 0) > 0]
         if len(items) < 20:
             out.update({
-                "is_multi_tf_downtrend": True,
                 "insufficient_daily_data": True,
                 "insufficient_weekly_data": True,
             })
@@ -14691,13 +14899,11 @@ def _get_multi_tf_downtrend_context(code: str) -> dict:
 
         if len(items) < 40:
             insufficient_weekly_data = True
-            weekly_flags = 3
         else:
             last40 = items[-40:]
             weekly_chunks = [last40[i:i+5] for i in range(0, len(last40), 5) if len(last40[i:i+5]) >= 5]
             if len(weekly_chunks) < 8:
                 insufficient_weekly_data = True
-                weekly_flags = 3
             else:
                 week_closes = [float(chunk[-1].get("close", 0) or 0) for chunk in weekly_chunks]
                 week_highs = [max(float((row or {}).get("high", 0) or 0) for row in chunk) for chunk in weekly_chunks]
@@ -14719,8 +14925,19 @@ def _get_multi_tf_downtrend_context(code: str) -> dict:
                     weekly_flags += 1
                 weekly_uptrend = bool(weekly_ret8 > 0 and not weekly_ma_down and not weekly_lower_high)
 
+        severe_daily_down = bool(daily_ret20 <= -18.0 and daily_ma_down and daily_lower_high)
+        severe_weekly_down = bool(weekly_ret8 <= -22.0 and weekly_ma_down and weekly_lower_high)
+        if insufficient_weekly_data:
+            is_multi_tf_downtrend = bool(severe_daily_down or (daily_flags >= 3 and daily_ret20 <= -8.0))
+        else:
+            clear_daily_down = bool(daily_flags >= 2 and daily_ret20 <= 0.0)
+            clear_weekly_down = bool(weekly_flags >= 2 and weekly_ret8 <= 0.0)
+            aligned_ma_down = bool(daily_ma_down and weekly_ma_down and (daily_ret20 <= -5.0 or weekly_ret8 <= -8.0))
+            aligned_lower_high = bool(daily_lower_high and weekly_lower_high and (daily_ret20 <= 0.0 or weekly_ret8 <= 0.0))
+            is_multi_tf_downtrend = bool((clear_daily_down and clear_weekly_down) or severe_daily_down or severe_weekly_down or aligned_ma_down or aligned_lower_high)
+
         out.update({
-            "is_multi_tf_downtrend": not (daily_uptrend and weekly_uptrend),
+            "is_multi_tf_downtrend": bool(is_multi_tf_downtrend),
             "daily_ret20": round(daily_ret20, 1),
             "weekly_ret8": round(weekly_ret8, 1),
             "daily_ma_down": bool(daily_ma_down),
@@ -14737,7 +14954,6 @@ def _get_multi_tf_downtrend_context(code: str) -> dict:
     except Exception:
         return out
     return out
-
 
 def _count_intraday_leader_follow_confirmations(signal_meta: dict | None = None) -> int:
     meta = signal_meta if isinstance(signal_meta, dict) else {}
@@ -14804,7 +15020,7 @@ def _should_block_multi_tf_downtrend_capture(code: str, signal_type: str, signal
     if _should_bypass_mid_pullback_downtrend_block(signal_type, signal_meta=signal_meta, ctx=ctx):
         return {"block": False, "context": ctx, "reason": "", "override": "leader_followup"}
     reason = (
-        f"주봉·일봉 동시 상승 추세 미충족 차단 "
+        f"주봉·일봉 동반 하락 추세 차단 "
         f"(20일 {ctx.get('daily_ret20', 0):+.1f}% / 8주 {ctx.get('weekly_ret8', 0):+.1f}% / "
         f"일봉UP {int(bool(ctx.get('daily_uptrend')))} / 주봉UP {int(bool(ctx.get('weekly_uptrend')))} / "
         f"일봉{'↓' if ctx.get('daily_ma_down') else '-'}·주봉{'↓' if ctx.get('weekly_ma_down') else '-'} / "
@@ -15375,6 +15591,12 @@ def register_entry_watch(s: dict):
         "entry_reference_reason": "",
         "entry_reference_time": "",
         "entry_reference_price": 0,
+        "crossday_episode_active": bool(s.get("crossday_episode_active")),
+        "crossday_episode_prep": bool(s.get("crossday_episode_prep")),
+        "crossday_episode_confirmed": bool(s.get("crossday_episode_confirmed")),
+        "crossday_episode_reason": str(s.get("crossday_episode_reason", "") or ""),
+        "crossday_episode_reclaim_ratio": float(s.get("crossday_episode_reclaim_ratio", 0.0) or 0.0),
+        "entry_execution_focus": bool(s.get("entry_execution_focus")),
         "entry_watch_state": "active",
     }
     _save_entry_watch_active()
@@ -15605,6 +15827,9 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     last_ts = float(watch.get("entry_guard_alert_ts") or 0.0)
     if last_reason == reason and (now_ts - last_ts) < ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC:
         return False
+    if bool(watch.get("entry_guard_alert_sent_once")):
+        print(f"  ⏭ guard 1회성 유지: {watch.get('name','')} — 내부기록만")
+        return False
     if not _should_send_entry_followup_alert(watch, "guard", reason):
         print(f"  ⏭ 후속알림 통합억제(guard/{reason}): {watch.get('name','')} — 외부알림 생략")
         return False
@@ -15638,6 +15863,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     watch["entry_guard_alert_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     watch["entry_guard_alert_ts"] = now_ts
     watch["entry_guard_alert_price"] = int(price or 0)
+    watch["entry_guard_alert_sent_once"] = True
     _mark_entry_followup_alert_sent(watch, "guard", reason, price)
     _record_entry_guard_followup(watch, reason, price)
     return True
@@ -18001,12 +18227,23 @@ def analyze(stock: dict) -> dict:
     if _nxt_params and stock.get("market") == "NXT" and _nxt_params.get("min_add", 0) > 0:
         reasons.append(f"🟡 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
 
+    crossday_ctx = {}
+    if change_rate >= max(0.1, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.2):
+        crossday_ctx = _get_crossday_episode_context(code, current_price=price, change_rate=change_rate, vol_ratio=vol_ratio)
+
     if change_rate >= 29.0:
         score+=40; reasons.append("🚨 상한가 도달!"); signal_type="UPPER_LIMIT"
-    elif change_rate >= UPPER_LIMIT_THRESHOLD:
+    elif change_rate >= UPPER_LIMIT_THRESHOLD or (crossday_ctx.get("near_upper_ready") and change_rate >= CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE):
         score+=25; reasons.append(f"🔥 상한가 근접 (+{change_rate:.1f}%)"); signal_type="NEAR_UPPER"
-    elif change_rate >= PRICE_SURGE_MIN:
+        if crossday_ctx.get("near_upper_ready") and change_rate < UPPER_LIMIT_THRESHOLD:
+            reasons.append("♻️ cross-day 재상승 강도 — NEAR_UPPER 조기 승격")
+    elif change_rate >= PRICE_SURGE_MIN or (crossday_ctx.get("confirmed") and change_rate >= CROSSDAY_RESURGE_SURGE_MIN_CHANGE):
         score+=15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type="SURGE"
+        if crossday_ctx.get("confirmed") and change_rate < PRICE_SURGE_MIN:
+            reasons.append("♻️ cross-day 재상승 확인 — SURGE 조기 승격")
+    elif crossday_ctx.get("prep") and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE:
+        score+=12; reasons.append(f"🧭 초기 강세 내부포착 +{change_rate:.1f}%"); signal_type="EARLY_DETECT"
+        reasons.append("♻️ 전일 포함 연속 패턴 — 재상승 확인 전 내부포착 유지")
     else: return {}
 
     current_time = datetime.now().strftime("%H:%M:%S")
@@ -18014,6 +18251,11 @@ def analyze(stock: dict) -> dict:
     required_vol, opening_relax_reason = _relax_opening_general_required_volume(
         required_vol, signal_type, change_rate, current_time, market=str(stock.get("market", "") or "")
     )
+    if crossday_ctx.get("episode_active") and crossday_ctx.get("required_vol_cap", 0):
+        _prev_required = required_vol
+        required_vol = min(required_vol, float(crossday_ctx.get("required_vol_cap", 0) or required_vol))
+        if required_vol < _prev_required:
+            reasons.append(f"♻️ 연속 패턴 거래량 기준 완화 ({_prev_required:.1f}→{required_vol:.1f}배)")
     if vol_ratio < required_vol:
         return {}
     if opening_relax_reason:
@@ -18027,6 +18269,10 @@ def analyze(stock: dict) -> dict:
         score+=30; reasons.append(f"💥 거래량 {vol_ratio:.1f}배 폭발 (동적기준 {required_vol:.1f}배 대비)")
     elif vol_ratio >= required_vol:
         score+=20; reasons.append(f"📊 거래량 {vol_ratio:.1f}배 급증 (동적기준 {required_vol:.1f}배 대비)")
+
+    if crossday_ctx.get("episode_active"):
+        score += int(crossday_ctx.get("score_bonus", 0) or 0)
+        reasons.append(crossday_ctx.get("reason", "♻️ 전일 포함 연속 패턴"))
 
     _chg_bucket = _feature_change_bucket(change_rate)
     _vol_bucket = _feature_volume_bucket(vol_ratio)
@@ -18582,6 +18828,11 @@ def analyze(stock: dict) -> dict:
         return {}
 
     # 등급 계산
+    signal_type = _maybe_promote_signal_from_crossday_episode(signal_type, crossday_ctx, change_rate=change_rate)
+    execution_setup_required = _should_require_execution_setup_from_crossday(signal_type, crossday_ctx, change_rate=change_rate, vol_ratio=vol_ratio)
+    entry_execution_focus = bool(execution_setup_required)
+    if execution_setup_required:
+        reasons.append("🧭 초기 강세 내부포착 유지 — 재상승 체결 확인 후 실행형 알림")
     a_cut = 80
     if _should_relax_general_a_threshold(
         signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio,
@@ -18633,7 +18884,14 @@ def analyze(stock: dict) -> dict:
             "similar_pattern_stats": similar_pattern_stats,
             "dart_risk": _dart_r["is_risk"],
             "countertrend_warning": bool(countertrend_ctx.get("is_countertrend")),
-            "countertrend_ctx": countertrend_ctx}
+            "countertrend_ctx": countertrend_ctx,
+            "execution_setup_required": bool(execution_setup_required),
+            "entry_execution_focus": bool(entry_execution_focus),
+            "crossday_episode_active": bool(crossday_ctx.get("episode_active")),
+            "crossday_episode_prep": bool(crossday_ctx.get("prep")),
+            "crossday_episode_confirmed": bool(crossday_ctx.get("confirmed")),
+            "crossday_episode_reason": str(crossday_ctx.get("reason", "") or ""),
+            "crossday_episode_reclaim_ratio": float(crossday_ctx.get("reclaim_ratio", 0.0) or 0.0)}
 
 # ============================================================
 # 조기 포착
@@ -19020,15 +19278,37 @@ def check_early_detection() -> list:
                 },
             )
             continue
+        _early_crossday = _get_crossday_episode_context(code, current_price=price, change_rate=change_rate, vol_ratio=vol_ratio)
+        _early_sig_type = _maybe_promote_signal_from_crossday_episode("EARLY_DETECT", _early_crossday, change_rate=change_rate)
+        if _early_crossday.get("episode_active"):
+            early_score += int(_early_crossday.get("score_bonus", 0) or 0)
+            reasons.append(_early_crossday.get("reason", "♻️ 전일 포함 연속 패턴"))
+        _early_exec_setup = _should_require_execution_setup_from_crossday(_early_sig_type, _early_crossday, change_rate=change_rate, vol_ratio=vol_ratio)
+        if _early_exec_setup:
+            reasons.append("🧭 초기 강세 내부포착 유지 — 재상승 체결 확인 후 실행형 알림")
+        _early_grade = _derive_general_signal_grade(
+            _early_sig_type, early_score, change_rate=change_rate, vol_ratio=vol_ratio,
+            sector_info=sector_info, direct_news_hit=direct_news_hit, market=stock.get("market", ""), reasons=reasons
+        )
+        if _early_sig_type != "EARLY_DETECT":
+            stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type=_early_sig_type)
         signals.append({"code":code,"name":stock.get("name",code),"price":price,
                         "change_rate":change_rate,"volume_ratio":vol_ratio,
-                        "signal_type":"EARLY_DETECT","score":early_score,"sector_info":sector_info,
+                        "signal_type":_early_sig_type,"score":early_score,"sector_info":sector_info,
                         "sector_theme": sector_info.get("theme", ""),
                         "direct_news_hit": direct_news_hit,
+                        "grade":_early_grade,"execution_grade":_early_grade,"pattern_grade":_early_grade,
                         "similar_pattern_stats":similar_pattern_stats,
                         "entry_price":entry,"stop_loss":stop,"target_price":target,
                         "stop_pct":stop_pct,"target_pct":target_pct,"atr_used":atr_used,
-                        "prev_upper":prev_upper,"reasons":reasons,"detected_at":now})
+                        "prev_upper":prev_upper,"reasons":reasons,"detected_at":now,
+                        "execution_setup_required": bool(_early_exec_setup),
+                        "entry_execution_focus": bool(_early_exec_setup),
+                        "crossday_episode_active": bool(_early_crossday.get("episode_active")),
+                        "crossday_episode_prep": bool(_early_crossday.get("prep")),
+                        "crossday_episode_confirmed": bool(_early_crossday.get("confirmed")),
+                        "crossday_episode_reason": str(_early_crossday.get("reason", "") or ""),
+                        "crossday_episode_reclaim_ratio": float(_early_crossday.get("reclaim_ratio", 0.0) or 0.0)})
 
     signals.extend(check_nxt_preopen_detection(existing_codes={s["code"] for s in signals}))
 
@@ -20236,21 +20516,32 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     dynamic_relax_types = _get_dynamic_general_a_relax_signal_types()
     if sig_type not in dynamic_relax_types:
         return False
+    joined_reasons = " ".join(str(r or "") for r in (reasons or []))
     try:
-        strong_price = float(change_rate or 0.0) >= 7.0
+        _cr = float(change_rate or 0.0)
     except Exception:
-        strong_price = False
+        _cr = 0.0
     try:
-        strong_flow = float(vol_ratio or 0.0) >= 2.0 or int(nxt_delta or 0) >= 5
+        _vr = float(vol_ratio or 0.0)
     except Exception:
-        strong_flow = False
+        _vr = 0.0
+    if sig_type == "NEAR_UPPER":
+        strong_price = _cr >= 18.0
+    elif sig_type == "UPPER_LIMIT":
+        strong_price = _cr >= 25.0
+    else:
+        strong_price = _cr >= 5.5
+    strong_flow = _vr >= 2.0 or int(nxt_delta or 0) >= 5
+    premium_flow = _vr >= 3.0 or int(nxt_delta or 0) >= 8
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
-    joined_reasons = " ".join(str(r or "") for r in (reasons or []))
     direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
+    intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "코스피 상대강도", "코스닥 상대강도", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴"))
     market_flag = str(market or "").upper() == "NXT"
     if sig_type in GENERAL_A_RELAX_SIGNAL_TYPES:
-        return strong_price and (direct_like or meaningful_theme or (market_flag and strong_flow))
+        near_a_score = int(score or 0) >= max(74, GENERAL_A_RELAXED_SCORE - 2)
+        support_ok = direct_like or meaningful_theme or strong_flow or premium_flow or intraday_support
+        return near_a_score and support_ok and (strong_price or intraday_support or (market_flag and strong_flow))
 
     st = _get_intraday_capture_mode()
     if not _intraday_capture_mode_active(st):
