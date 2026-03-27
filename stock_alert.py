@@ -3,11 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v97
+버전: v98
 날짜: 2026-03-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
+
+- v98 (2026-03-27): 전 시간대(08:00~20:00) 초기 강세 내부포착→재상승 실행형 승격 강화 + SURGE/NEAR_UPPER 조기 승격의 시간대 확장.
+  [#1] `_get_full_session_capture_stage()` / `_get_full_session_capture_profile()` / `_promote_signal_from_full_session_flow()` 추가.
+       기존: 장초반(09:00~10:00) 거래량 완화와 cross-day 일부 승격만 있어, 좋은 상승 종목의 조기 포착 보정이 전체 장운영시간으로 이어지지 않았음.
+       수정: NXT 장전·정규장 장초반·오전·오후·장후 NXT까지 08:00~20:00 전 시간대별로 서로 다른 승격 기준/거래량 완화/내부포착 강도를 적용.
+  [#2] `analyze()`의 일반 포착 시작부를 시간대 확장 승격 체인으로 보강.
+       기존: 절대 상승률(5%/25%/29%)과 장초반 거래량 완화 의존이 커, 오전 이후/장후 강세 재가속은 포착이 늦거나 후보 단계에서 멈출 수 있었음.
+       수정: 전 시간대 profile을 읽어 `EARLY_DETECT`/`SURGE`/`NEAR_UPPER` 조기 승격을 허용하고, 그에 맞는 점수 보정과 시간대별 거래량 기준 완화를 연결.
+  [#3] `check_early_detection()`를 전 시간대 profile 기준으로 보강.
+       기존: `price_min`/`volume_min`/재확인 횟수가 사실상 장초반 중심으로만 움직여, 오후·장후 재가속/연속 패턴 포착이 둔감했음.
+       수정: 시간대별 price/volume/confirm 기준을 읽어 초기 강세 내부포착을 전 시간대로 확장하고, 재상승 시 `SURGE`/`NEAR_UPPER` 승격이 가능하게 함.
+  [#4] `_should_relax_general_a_threshold()`에 전 시간대 A완화 bonus 연동.
+       기존: A완화 자격이 신호 속성 중심이라, 좋은 상승 종목이 시간대별 강세 profile을 반영해 A로 올라갈 여지가 충분치 않았음.
+       수정: 전 시간대 profile의 `a_relax_bonus`를 반영해, 같은 질의 재가속 종목이면 시간대에 따라 A 자격을 조금 더 현실화.
+  이유: 사용자가 요구한 “좋은 상승 종목을 더 빨리 잡는 구조를 장초반만이 아니라 전체 장운영시간에 적용”이 v97까지는 부분 반영 상태였음.
+  개선점: 장전 NXT~정규장~장후 NXT까지 초기 강세 내부포착↑, 재상승 실행형 승격↑, 좋은 상승 종목의 SURGE/NEAR_UPPER 조기 인식↑.
+  주의점: `눌림목/A전용 외부억제`는 이번에도 유지. 이번 수정은 일반 상승 종목의 전 시간대 포착 구조에만 한정.
 
 - v97 (2026-03-27): 상한가 잠김/행동 불가 상한가류 일반 포착 차단 + UPPER_LIMIT soft allow 제거.
   [#1] `_detect_entry_block_reason()`의 상한가류 차단 기준을 강화.
@@ -2934,6 +2951,94 @@ def _should_require_execution_setup_from_crossday(signal_type: str, ctx: dict | 
     return False
 
 
+def _get_full_session_capture_stage(current_time: str = "", market: str = "") -> str:
+    try:
+        t = str(current_time or datetime.now().strftime("%H:%M:%S"))
+        if " " in t:
+            t = t.split(" ")[-1]
+        hh, mm = int(t[:2]), int(t[3:5])
+        mins = hh * 60 + mm
+    except Exception:
+        now_dt = datetime.now()
+        mins = now_dt.hour * 60 + now_dt.minute
+    market_name = str(market or "").upper()
+    if 8 * 60 <= mins < 9 * 60 and market_name == "NXT":
+        return "nxt_pre"
+    if 9 * 60 <= mins < 10 * 60:
+        return "opening"
+    if 10 * 60 <= mins < 12 * 60:
+        return "morning"
+    if 12 * 60 <= mins < 14 * 60:
+        return "afternoon"
+    if 14 * 60 <= mins < 15 * 60 + 30:
+        return "late"
+    if 15 * 60 + 30 <= mins < 17 * 60 and market_name == "NXT":
+        return "nxt_post_early"
+    if 17 * 60 <= mins <= 20 * 60 and market_name == "NXT":
+        return "nxt_post_late"
+    return "other"
+
+
+def _get_full_session_capture_profile(current_time: str = "", market: str = "") -> dict:
+    stage = _get_full_session_capture_stage(current_time=current_time, market=market)
+    profile = dict(FULL_SESSION_CAPTURE_PROFILES.get(stage, FULL_SESSION_CAPTURE_PROFILES.get("other", {})))
+    profile["stage"] = stage
+    return profile
+
+
+def _promote_signal_from_full_session_flow(signal_type: str, stock: dict | None, change_rate: float = 0.0,
+                                           vol_ratio: float = 0.0, current_time: str = "",
+                                           crossday_ctx: dict | None = None) -> tuple[str, str, int]:
+    stock = stock if isinstance(stock, dict) else {}
+    ctx = crossday_ctx if isinstance(crossday_ctx, dict) else {}
+    sig = str(signal_type or "").upper()
+    market_name = str(stock.get("market", "") or "").upper()
+    profile = _get_full_session_capture_profile(current_time=current_time, market=market_name)
+    stage = str(profile.get("stage", "other") or "other")
+    if stage == "other":
+        return sig, "", 0
+    cr = safe_float(change_rate, 0.0)
+    vr = safe_float(vol_ratio, 0.0)
+    desc = " ".join([str(stock.get("desc", "") or ""), str(stock.get("adaptive_feedback_theme", "") or "")])
+    support_points = 0
+    if ctx.get("episode_active"):
+        support_points += 2
+    if stock.get("theme_feedback") or stock.get("adaptive_feedback_hit") or stock.get("miss_theme_leader_hit") or stock.get("nxt_post_leader_hit"):
+        support_points += 1
+    if any(token in desc for token in ("랭킹후보", "자동편입", "feedback", "NXT장후리더", "theme_feedback", "theme_feedback[", "miss")):
+        support_points += 1
+    if cr >= 6.0:
+        support_points += 1
+    if vr >= 3.0:
+        support_points += 1
+    if market_name == "NXT" and not is_market_open():
+        support_points += 1
+    label = str(profile.get("label", "전시간대") or "전시간대")
+    promo_bonus = profile.get("promo_bonus", {}) or {}
+    near_ready = (
+        cr >= float(profile.get("near_upper_min_change", UPPER_LIMIT_THRESHOLD - 3.0) or (UPPER_LIMIT_THRESHOLD - 3.0))
+        and vr >= float(profile.get("near_upper_min_vol", 2.8) or 2.8)
+        and (support_points >= 3 or ctx.get("near_upper_ready") or vr >= float(profile.get("near_upper_min_vol", 2.8) or 2.8) + 1.0)
+    )
+    surge_ready = (
+        cr >= float(profile.get("surge_min_change", PRICE_SURGE_MIN) or PRICE_SURGE_MIN)
+        and vr >= float(profile.get("surge_min_vol", 2.0) or 2.0)
+        and (support_points >= 2 or ctx.get("confirmed") or vr >= float(profile.get("surge_min_vol", 2.0) or 2.0) + 1.0)
+    )
+    early_ready = (
+        cr >= float(profile.get("early_min_change", max(1.6, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.4)) or max(1.6, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.4))
+        and vr >= float(profile.get("early_min_vol", 1.4) or 1.4)
+        and (support_points >= 1 or market_name == "NXT" or ctx.get("prep"))
+    )
+    if sig not in ("UPPER_LIMIT", "NEAR_UPPER") and near_ready and sig != "NEAR_UPPER":
+        return "NEAR_UPPER", f"🕐 {label} 재가속 포착 — NEAR_UPPER 조기 승격", int(promo_bonus.get("NEAR_UPPER", 0) or 0)
+    if sig in ("", "UNKNOWN", "EARLY_DETECT", "SURGE") and surge_ready and sig != "SURGE":
+        return "SURGE", f"🕐 {label} 강세 지속 확인 — SURGE 조기 승격", int(promo_bonus.get("SURGE", 0) or 0)
+    if sig in ("", "UNKNOWN") and early_ready:
+        return "EARLY_DETECT", f"🕐 {label} 초기 강세 포착 — 내부추적 우선", int(promo_bonus.get("EARLY_DETECT", 0) or 0)
+    return sig, "", 0
+
+
 def _is_leader_priority_signal(signal: dict | None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig = str(signal.get("signal_type", "") or "").upper()
@@ -3982,6 +4087,17 @@ CROSSDAY_RESURGE_MIN_RECLAIM_RATIO = float(os.getenv("CROSSDAY_RESURGE_MIN_RECLA
 CROSSDAY_PREP_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_PREP_REQUIRED_VOL_CAP", "3.0") or "3.0")
 CROSSDAY_CONFIRM_REQUIRED_VOL_CAP = float(os.getenv("CROSSDAY_CONFIRM_REQUIRED_VOL_CAP", "4.5") or "4.5")
 CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE = float(os.getenv("CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE", "7.5") or "7.5")
+
+FULL_SESSION_CAPTURE_PROFILES = {
+    "nxt_pre": {"label": "NXT 장전", "early_min_change": 1.5, "early_min_vol": 1.3, "surge_min_change": 4.0, "surge_min_vol": 1.8, "near_upper_min_change": 19.5, "near_upper_min_vol": 2.4, "required_vol_mult": {"EARLY_DETECT": 0.82, "SURGE": 0.76, "NEAR_UPPER": 0.78, "UPPER_LIMIT": 0.88}, "surge_cap": 4.8, "surge_strong_cap": 4.2, "near_upper_cap": 3.8, "upper_limit_cap": 2.6, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 8}},
+    "opening": {"label": "정규장 초반", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.2, "surge_min_vol": 2.0, "near_upper_min_change": 20.5, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 5.0, "surge_strong_cap": 4.4, "near_upper_cap": 4.0, "upper_limit_cap": 2.8, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
+    "morning": {"label": "정규장 오전", "early_min_change": 1.9, "early_min_vol": 1.5, "surge_min_change": 4.4, "surge_min_vol": 2.1, "near_upper_min_change": 21.0, "near_upper_min_vol": 2.8, "required_vol_mult": {"EARLY_DETECT": 0.90, "SURGE": 0.84, "NEAR_UPPER": 0.85, "UPPER_LIMIT": 0.90}, "surge_cap": 5.4, "surge_strong_cap": 4.8, "near_upper_cap": 4.2, "upper_limit_cap": 3.0, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "afternoon": {"label": "정규장 오후", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.3, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.88, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.2, "surge_strong_cap": 4.6, "near_upper_cap": 4.1, "upper_limit_cap": 3.0, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "late": {"label": "정규장 후반", "early_min_change": 2.0, "early_min_vol": 1.5, "surge_min_change": 4.7, "surge_min_vol": 2.2, "near_upper_min_change": 21.8, "near_upper_min_vol": 3.0, "required_vol_mult": {"EARLY_DETECT": 0.92, "SURGE": 0.88, "NEAR_UPPER": 0.88, "UPPER_LIMIT": 0.92}, "surge_cap": 5.8, "surge_strong_cap": 5.0, "near_upper_cap": 4.4, "upper_limit_cap": 3.1, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 3, "NEAR_UPPER": 5}},
+    "nxt_post_early": {"label": "NXT 장후 초반", "early_min_change": 1.6, "early_min_vol": 1.3, "surge_min_change": 4.1, "surge_min_vol": 1.8, "near_upper_min_change": 20.0, "near_upper_min_vol": 2.5, "required_vol_mult": {"EARLY_DETECT": 0.84, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 4.9, "surge_strong_cap": 4.3, "near_upper_cap": 3.9, "upper_limit_cap": 2.7, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
+    "nxt_post_late": {"label": "NXT 장후 후반", "early_min_change": 1.7, "early_min_vol": 1.4, "surge_min_change": 4.4, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.6, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.1, "surge_strong_cap": 4.5, "near_upper_cap": 4.0, "upper_limit_cap": 2.9, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "other": {"label": "전시간대", "early_min_change": 2.0, "early_min_vol": 1.6, "surge_min_change": 4.8, "surge_min_vol": 2.3, "near_upper_min_change": 22.0, "near_upper_min_vol": 3.0, "required_vol_mult": {"EARLY_DETECT": 1.0, "SURGE": 1.0, "NEAR_UPPER": 1.0, "UPPER_LIMIT": 1.0}, "surge_cap": 6.0, "surge_strong_cap": 5.2, "near_upper_cap": 4.5, "upper_limit_cap": 3.2, "a_relax_bonus": 0, "confirm_count": 3, "promo_bonus": {"EARLY_DETECT": 0, "SURGE": 0, "NEAR_UPPER": 0}},
+}
 INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "900") or "900")
 
 
@@ -6833,46 +6949,42 @@ def get_effective_volume_ratio(signal_type: str, current_time: str) -> float:
 
 def _relax_opening_general_required_volume(required_vol: float, signal_type: str, change_rate: float,
                                            current_time: str, market: str = "") -> tuple[float, str]:
-    """정규장 초반 일반 포착 거래량 게이트를 현실화.
-    의도: 눌림목/A전용 외부억제는 유지한 채, 실제 강세 종목이 일반 포착 단계까지는 도달하도록 보정.
-    """
+    """전 시간대 일반 포착 거래량 게이트를 시간대별로 현실화."""
     sig_type = str(signal_type or "").upper()
-    if sig_type not in ("SURGE", "NEAR_UPPER", "UPPER_LIMIT"):
-        return float(required_vol or 0.0), ""
-    time_str = str(current_time or "")
-    if " " in time_str:
-        time_str = time_str.split(" ")[-1]
+    orig_required = float(required_vol or 0.0)
+    if sig_type not in ("EARLY_DETECT", "SURGE", "NEAR_UPPER", "UPPER_LIMIT"):
+        return orig_required, ""
+    profile = _get_full_session_capture_profile(current_time=current_time, market=market)
+    stage = str(profile.get("stage", "other") or "other")
+    if stage == "other":
+        return orig_required, ""
+    label = str(profile.get("label", "전시간대") or "전시간대")
+    relaxed = orig_required
+    mult_map = profile.get("required_vol_mult", {}) or {}
     try:
-        hour = int((time_str or "00:00:00").split(":")[0])
+        base_mult = float(mult_map.get(sig_type, 1.0) or 1.0)
     except Exception:
-        hour = datetime.now().hour
-    if not (9 <= hour < 10):
-        return float(required_vol or 0.0), ""
-    if str(market or "").upper() == "NXT" and not is_market_open():
-        return float(required_vol or 0.0), ""
-    try:
-        chg = float(change_rate or 0.0)
-    except Exception:
-        chg = 0.0
-    relaxed = float(required_vol or 0.0)
+        base_mult = 1.0
+    if base_mult < 1.0:
+        relaxed = min(relaxed, round(orig_required * base_mult, 1))
+    chg = safe_float(change_rate, 0.0)
     if sig_type == "SURGE":
-        if chg >= 12.0:
-            relaxed = min(relaxed, 5.5)
-        elif chg >= 8.0:
-            relaxed = min(relaxed, 6.0)
+        strong_cap = float(profile.get("surge_strong_cap", relaxed) or relaxed)
+        base_cap = float(profile.get("surge_cap", relaxed) or relaxed)
+        if chg >= max(8.0, float(profile.get("surge_min_change", 4.5) or 4.5) + 3.0):
+            relaxed = min(relaxed, strong_cap)
         else:
-            relaxed = min(relaxed, 6.5)
+            relaxed = min(relaxed, base_cap)
     elif sig_type == "NEAR_UPPER":
-        if chg >= 27.0:
-            relaxed = min(relaxed, 4.0)
-        else:
-            relaxed = min(relaxed, 4.5)
+        relaxed = min(relaxed, float(profile.get("near_upper_cap", relaxed) or relaxed))
     elif sig_type == "UPPER_LIMIT":
-        relaxed = min(relaxed, 3.0)
-    relaxed = round(max(2.0, min(relaxed, 10.0)), 1)
-    if relaxed < float(required_vol or 0.0):
-        return relaxed, f"📊 정규장 초반 거래량 기준 완화 ({float(required_vol or 0.0):.1f}배→{relaxed:.1f}배)"
-    return float(required_vol or 0.0), ""
+        relaxed = min(relaxed, float(profile.get("upper_limit_cap", relaxed) or relaxed))
+    elif sig_type == "EARLY_DETECT":
+        relaxed = min(relaxed, max(1.2, round(orig_required * float(mult_map.get("EARLY_DETECT", 1.0) or 1.0), 1)))
+    relaxed = round(max(1.2, min(relaxed, 10.0)), 1)
+    if relaxed < orig_required:
+        return relaxed, f"📊 {label} 거래량 기준 완화 ({orig_required:.1f}배→{relaxed:.1f}배)"
+    return orig_required, ""
 
 
 def get_dart_reliability_score(disclosure_type: str) -> int:
@@ -18240,8 +18352,9 @@ def analyze(stock: dict) -> dict:
     if _nxt_params and stock.get("market") == "NXT" and _nxt_params.get("min_add", 0) > 0:
         reasons.append(f"🟡 {_nxt_params.get('label','')} 필터: 최소점수 +{_nxt_params['min_add']}점 / 점수배율 x{_nxt_score_mult:.2f}")
 
+    current_time = datetime.now().strftime("%H:%M:%S")
     crossday_ctx = {}
-    if change_rate >= max(0.1, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.2):
+    if change_rate >= max(0.1, CROSSDAY_RESURGE_PREP_MIN_CHANGE - 0.4):
         crossday_ctx = _get_crossday_episode_context(code, current_price=price, change_rate=change_rate, vol_ratio=vol_ratio)
 
     if change_rate >= 29.0:
@@ -18257,9 +18370,28 @@ def analyze(stock: dict) -> dict:
     elif crossday_ctx.get("prep") and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE:
         score+=12; reasons.append(f"🧭 초기 강세 내부포착 +{change_rate:.1f}%"); signal_type="EARLY_DETECT"
         reasons.append("♻️ 전일 포함 연속 패턴 — 재상승 확인 전 내부포착 유지")
-    else: return {}
 
-    current_time = datetime.now().strftime("%H:%M:%S")
+    _flow_signal_type, _flow_reason, _flow_bonus = _promote_signal_from_full_session_flow(signal_type, stock, change_rate=change_rate, vol_ratio=vol_ratio, current_time=current_time, crossday_ctx=crossday_ctx)
+    if _flow_signal_type and _flow_signal_type != signal_type:
+        if not signal_type:
+            if _flow_signal_type == "NEAR_UPPER":
+                score += 23
+                reasons.append(f"🔥 상한가 근접 (+{change_rate:.1f}%)")
+            elif _flow_signal_type == "SURGE":
+                score += 14
+                reasons.append(f"📈 급등 +{change_rate:.1f}%")
+            elif _flow_signal_type == "EARLY_DETECT":
+                score += 10
+                reasons.append(f"🧭 초기 강세 내부포착 +{change_rate:.1f}%")
+        signal_type = _flow_signal_type
+        if _flow_reason:
+            reasons.append(_flow_reason)
+        if _flow_bonus:
+            score += int(_flow_bonus)
+
+    if not signal_type:
+        return {}
+
     required_vol = get_effective_volume_ratio(signal_type, current_time)
     required_vol, opening_relax_reason = _relax_opening_general_required_volume(
         required_vol, signal_type, change_rate, current_time, market=str(stock.get("market", "") or "")
@@ -19196,8 +19328,13 @@ def check_early_detection() -> list:
         vol_ratio = stock.get("volume_ratio",0); price = stock.get("price",0)
         if not code or price < 500: continue
         if change_rate >= UPPER_LIMIT_THRESHOLD: continue
+        _early_now = datetime.now()
+        _early_profile = _get_full_session_capture_profile(_early_now.strftime("%H:%M:%S"), stock.get("market", ""))
         price_min  = _early_price_min_dynamic  * (1.3 if is_strict_time() else 1.0)
         volume_min = _early_volume_min_dynamic * (1.3 if is_strict_time() else 1.0)
+        price_min = min(price_min, float(_early_profile.get("early_min_change", price_min) or price_min))
+        volume_min = min(volume_min, float(_early_profile.get("early_min_vol", volume_min) or volume_min))
+        _early_confirm_need = max(1, min(EARLY_CONFIRM_COUNT, int(_early_profile.get("confirm_count", EARLY_CONFIRM_COUNT) or EARLY_CONFIRM_COUNT)))
         if change_rate < price_min or vol_ratio < volume_min: continue
         try:
             detail = get_stock_price(code)
@@ -19205,7 +19342,7 @@ def check_early_detection() -> list:
             if ask_qty > 0 and bid_qty/ask_qty < EARLY_HOGA_RATIO: continue
         except Exception: continue
 
-        now = datetime.now()
+        now = _early_now
         cache = _early_cache.get(code)
         if cache is None:
             _early_cache[code] = {"count":1,"last_price":price,"last_time":now}; continue
@@ -19215,7 +19352,7 @@ def check_early_detection() -> list:
                 cache["count"]+=1; cache["last_price"]=price; cache["last_time"]=now
             else: _early_cache[code]={"count":1,"last_price":price,"last_time":now}; continue
         else: _early_cache[code]={"count":1,"last_price":price,"last_time":now}; continue
-        if cache["count"] < EARLY_CONFIRM_COUNT: continue
+        if cache["count"] < _early_confirm_need: continue
         del _early_cache[code]
 
         open_est     = price/(1+change_rate/100)
@@ -19296,6 +19433,13 @@ def check_early_detection() -> list:
         if _early_crossday.get("episode_active"):
             early_score += int(_early_crossday.get("score_bonus", 0) or 0)
             reasons.append(_early_crossday.get("reason", "♻️ 전일 포함 연속 패턴"))
+        _early_sig_type2, _early_flow_reason, _early_flow_bonus = _promote_signal_from_full_session_flow(_early_sig_type, stock, change_rate=change_rate, vol_ratio=vol_ratio, current_time=now.strftime("%H:%M:%S"), crossday_ctx=_early_crossday)
+        if _early_sig_type2 and _early_sig_type2 != _early_sig_type:
+            _early_sig_type = _early_sig_type2
+            if _early_flow_reason:
+                reasons.append(_early_flow_reason)
+            if _early_flow_bonus:
+                early_score += int(_early_flow_bonus)
         _early_exec_setup = _should_require_execution_setup_from_crossday(_early_sig_type, _early_crossday, change_rate=change_rate, vol_ratio=vol_ratio)
         if _early_exec_setup:
             reasons.append("🧭 초기 강세 내부포착 유지 — 재상승 체결 확인 후 실행형 알림")
@@ -20543,8 +20687,10 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "코스피 상대강도", "코스닥 상대강도", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴"))
     market_flag = str(market or "").upper() == "NXT"
+    _session_profile = _get_full_session_capture_profile(datetime.now().strftime("%H:%M:%S"), market)
+    _session_bonus = int(_session_profile.get("a_relax_bonus", 0) or 0)
     if sig_type in GENERAL_A_RELAX_SIGNAL_TYPES:
-        near_a_score = int(score or 0) >= max(74, GENERAL_A_RELAXED_SCORE - 2)
+        near_a_score = int(score or 0) >= max(72, GENERAL_A_RELAXED_SCORE - 2 - _session_bonus)
         support_ok = direct_like or meaningful_theme or strong_flow or premium_flow or intraday_support
         return near_a_score and support_ok and (strong_price or intraday_support or (market_flag and strong_flow))
 
