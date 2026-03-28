@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v126
+버전: v127
 날짜: 2026-03-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v127 (2026-03-29): XML RSS 파싱 hotfix — Element.find() 결과를 or 체인 truthiness로 평가하던 description/summary/content 선택 로직을 None 기준 순차 탐색으로 교체해 DeprecationWarning과 향후 동작 왜곡을 차단.
 - v126 (2026-03-28): 시작 크래시 hotfix — load_carry_stocks()의 stale entry watch 정리 호출과 _purge_stale_entry_watch_hits() 시그니처를 동기화해 Railway 재시작 루프를 차단.
 - v125 (2026-03-28): 최종 마감 배치 — raw print 대량 logger 치환 + state path helper 통합 + COMMON_THRESHOLD_3P0 상수화 + 스모크/회귀 검증 보강.
 - v124 (2026-03-28): 남은 상위 함수/운영 로그 final cleanup — early-detect/preclose-gap/signal-log/analyze-result/RSS/Korea-ETF/carry/trailing 구조 정리 + sector/holiday/news theme raw print logger 치환.
@@ -23316,7 +23317,11 @@ def _parse_rss_xml_titles(xml_text: str, max_items: int) -> list:
     titles = []
     for it in items[:max_items]:
         t = it.find(".//{*}title")
-        d = it.find(".//{*}description") or it.find(".//{*}summary") or it.find(".//{*}content")
+        d = it.find(".//{*}description")
+        if d is None:
+            d = it.find(".//{*}summary")
+        if d is None:
+            d = it.find(".//{*}content")
         title = _strip_html((t.text or "").strip()) if t is not None else ""
         desc = _strip_html((d.text or "").strip()) if d is not None else ""
         if not title:
