@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v125
+버전: v126
 날짜: 2026-03-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v126 (2026-03-28): 시작 크래시 hotfix — load_carry_stocks()의 stale entry watch 정리 호출과 _purge_stale_entry_watch_hits() 시그니처를 동기화해 Railway 재시작 루프를 차단.
 - v125 (2026-03-28): 최종 마감 배치 — raw print 대량 logger 치환 + state path helper 통합 + COMMON_THRESHOLD_3P0 상수화 + 스모크/회귀 검증 보강.
 - v124 (2026-03-28): 남은 상위 함수/운영 로그 final cleanup — early-detect/preclose-gap/signal-log/analyze-result/RSS/Korea-ETF/carry/trailing 구조 정리 + sector/holiday/news theme raw print logger 치환.
 - v123 (2026-03-28): 최종 cleanup batch — sector monitor / premarket risk / issue prewatch / universe update / weekly report / market regime / intraday watchdog 구조 정리 및 일부 raw print logger 치환.
@@ -4472,7 +4473,7 @@ CACHE_TTL_SECONDS = 3600
 MAX_CACHE_SIZE = 5000
 _exec_speed_cache = {}  # [v41.85] 모듈 레벨 선언 누락 수정 (NameError 방지)
 
-def _purge_stale_entry_watch_hits() -> int:
+def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
     """v71: 장중 30분마다 _entry_watch에서 stale entry_hit 제거.
     기존: 재시작 시 _load_entry_watch_active()에서만 정리 → 장 중 쌓인 stale hit이
     _collect_actionable_position_limit_codes()에 의해 23~26개 유령 보유로 오카운트됨.
@@ -4502,6 +4503,8 @@ def _purge_stale_entry_watch_hits() -> int:
                 _log_info_msg(f"  🗑 stale entry_hit 정리: {w.get('name', code)} ({code}) key={key}")
         if purged:
             _save_entry_watch_active()
+            if notify:
+                _log_info_msg(f"  🧹 stale entry_hit 시작 정리 완료: {len(purged)}건")
         return len(purged)
     except Exception as e:
         _log_warn_msg(f"  ⚠️ stale entry_hit 정리 오류: {e}")
