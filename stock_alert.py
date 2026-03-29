@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v127
+버전: v128
 날짜: 2026-03-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v128 (2026-03-30): fallback 안정화 hotfix — 미국시장/공매도/지정학/텔레그램 timeout 경로의 비JSON·빈응답·타임아웃을 throttled warning + 기본값 fallback으로 정리해 로그 노이즈와 과도한 예외 카운트를 축소.
 - v127 (2026-03-29): XML RSS 파싱 hotfix — Element.find() 결과를 or 체인 truthiness로 평가하던 description/summary/content 선택 로직을 None 기준 순차 탐색으로 교체해 DeprecationWarning과 향후 동작 왜곡을 차단.
 - v126 (2026-03-28): 시작 크래시 hotfix — load_carry_stocks()의 stale entry watch 정리 호출과 _purge_stale_entry_watch_hits() 시그니처를 동기화해 Railway 재시작 루프를 차단.
 - v125 (2026-03-28): 최종 마감 배치 — raw print 대량 logger 치환 + state path helper 통합 + COMMON_THRESHOLD_3P0 상수화 + 스모크/회귀 검증 보강.
@@ -1819,6 +1820,18 @@ def _warn_json_default_once(path: str, exc: Exception) -> None:
             _RUNTIME_LOGGER.warning(f"⚠️ JSON 로드 실패 → 기본값 사용: {os.path.basename(path)} ({type(exc).__name__}: {exc})")
     except Exception as e:
         _swallow_exception(e)
+
+_THROTTLED_WARN_TS: dict[str, float] = {}
+
+def _warn_throttled_once(key: str, msg: str, cooldown_sec: float = 900.0) -> None:
+    try:
+        now_ts = time.time()
+        last_ts = float(_THROTTLED_WARN_TS.get(key, 0.0) or 0.0)
+        if (now_ts - last_ts) >= cooldown_sec:
+            _THROTTLED_WARN_TS[key] = now_ts
+            _log_warn_msg(msg)
+    except Exception as e:
+        _swallow_exception(e)
 _setup_runtime_logger()
 print = _runtime_print
 
@@ -1828,10 +1841,14 @@ _REQUESTS_POST_RAW = requests.post
 
 def _requests_get_with_defaults(*args, **kwargs):
     kwargs.setdefault("timeout", (5, 15))
+    url = str(args[0]) if args else str(kwargs.get("url", "") or "")
     try:
         return _REQUESTS_GET_RAW(*args, **kwargs)
     except Exception as e:
-        _swallow_exception(e, note="requests.get", level=logging.ERROR)
+        if "api.telegram.org" in url and isinstance(e, requests.exceptions.Timeout):
+            _warn_throttled_once("telegram_api_timeout", f"⚠️ 텔레그램 API timeout → 다음 루프로 이월 ({type(e).__name__})", cooldown_sec=600.0)
+        else:
+            _swallow_exception(e, note="requests.get", level=logging.ERROR)
         raise
 
 def _requests_post_with_defaults(*args, **kwargs):
@@ -23683,16 +23700,16 @@ def analyze_geopolitical_event(headlines_by_source: dict) -> dict:
         prompt = _build_geo_analysis_prompt(_build_geo_analysis_source_text(headlines_by_source), detected_kws)
         resp_json, raw = _request_geo_ai_analysis(api_key, prompt)
         if not resp_json:
-            _log_warn_msg("🌍 지정학 API: HTTP 빈 응답 → 키워드 fallback")
+            _warn_throttled_once("geo_api_empty_response", "🌍 지정학 API: HTTP 빈 응답 → 키워드 fallback", cooldown_sec=3600.0)
             return _build_geo_fallback_result(detected_kws, score_adj=-3, summary_prefix="⚠️ 지정학 키워드 감지", cache_key=cache_key)
         if not raw:
-            _log_warn_msg("🌍 지정학 API: 텍스트 비어있음 → 키워드 fallback")
+            _warn_throttled_once("geo_api_blank_text", "🌍 지정학 API: 텍스트 비어있음 → 키워드 fallback", cooldown_sec=3600.0)
             return _build_geo_fallback_result(detected_kws, score_adj=-3, summary_prefix="⚠️ 지정학 키워드 감지", cache_key=cache_key)
         result = _normalize_geo_ai_result(json.loads(raw), detected_kws, cache_key)
         _log_info_msg(f"🌍 지정학 분석: {result['uncertainty']} 불확실성 / 섹터: {result['sectors']}")
         return result
     except Exception as e:
-        _log_error("analyze_geopolitical_event", e)
+        _warn_throttled_once("geo_api_analysis_error", f"🌍 지정학 분석 실패 → 키워드 fallback ({type(e).__name__})", cooldown_sec=1800.0)
         return _build_geo_fallback_result(detected_kws, score_adj=-5, summary_prefix="⚠️ 지정학 이벤트")
 
 def _load_detected_geo_event(headlines_by_source: dict) -> dict:
@@ -27919,12 +27936,14 @@ def get_short_sell_ratio(code: str) -> float:
         }
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         resp  = requests.get(url, headers=headers, params=params, timeout=5)
-        data  = resp.json()
-        ratio = float(data.get("output", {}).get("ssts_rsqn_rate", 0) or 0)
+        data  = safe_json_response(resp)
+        output = data.get("output", {}) if isinstance(data, dict) else {}
+        raw_ratio = output.get("ssts_rsqn_rate", 0) if isinstance(output, dict) else 0
+        ratio = float(raw_ratio or 0)
         _short_cache[code] = {"ratio": ratio, "ts": time.time()}
         return ratio
     except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
+        _warn_throttled_once(f"short_sell_ratio:{code}", f"⚠️ 공매도 잔고 응답 비정상 → 0.0 기본값 ({code}, {type(e).__name__})", cooldown_sec=1800.0)
         return 0.0
 
 def _get_daily_investor_data(code: str) -> list:
@@ -28282,10 +28301,20 @@ def _fetch_us_market_signal_values(symbols: dict) -> dict:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=2d"
             resp = requests.get(url, timeout=8, headers=_random_ua())
-            data = resp.json()
-            meta = data["chart"]["result"][0]["meta"]
-            prev = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-            prev_close = [c for c in prev if c is not None]
+            data = safe_json_response(resp)
+            chart = data.get("chart", {}) if isinstance(data, dict) else {}
+            results = chart.get("result") or []
+            if not results:
+                _warn_throttled_once("us_market_invalid_json", "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지", cooldown_sec=1800.0)
+                time.sleep(0.2)
+                continue
+            result0 = results[0] if isinstance(results[0], dict) else {}
+            meta = result0.get("meta", {}) if isinstance(result0, dict) else {}
+            indicators = result0.get("indicators", {}) if isinstance(result0, dict) else {}
+            quotes = indicators.get("quote") if isinstance(indicators, dict) else []
+            quote0 = quotes[0] if isinstance(quotes, list) and quotes else {}
+            prev = quote0.get("close") if isinstance(quote0, dict) else []
+            prev_close = [c for c in (prev or []) if c is not None]
             cur_price = meta.get("regularMarketPrice", 0)
             if key == "vix":
                 values["vix"] = round(float(cur_price), 1)
@@ -28301,7 +28330,7 @@ def _fetch_us_market_signal_values(symbols: dict) -> dict:
                 values[f"{key}_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
             time.sleep(0.2)
         except Exception as e:
-            _swallow_exception(e)
+            _warn_throttled_once(f"us_market_symbol:{sym}", f"🌐 미국시장 {sym} 응답 처리 실패 → flat fallback 유지 ({type(e).__name__})", cooldown_sec=1800.0)
     return values
 
 
