@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v141
+버전: v142
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v142 (2026-03-31): 하향 추세 조기포착 차단 강화 + 추세전환 예외 제한 허용 — 다중 타임프레임 하락 추세 판정을 더 보수적으로 강화하고, 일반적인 하향/비상승 구조의 EARLY_DETECT·SURGE류 포착을 더 일찍 차단하도록 조정했다. 대신 직접뉴스·강한 테마 동조·ORB/전고 돌파·quiet absorption·연속 재상승 같은 추세전환 토큰이 충분할 때만 제한적으로 예외 허용해 반전 초입 후보만 남긴다.
 - v141 (2026-03-31): 장중 포착 확대 + 약화 기반 청산/가짜 돌파 가드 — session/focus scan limit를 18/30으로 높이고 strict 최소점수를 62로 낮췄으며, KRX EARLY_DETECT 외부허용을 74점 A + 진입가 확정 + 체결/호가 확인으로 완화했다. 동시에 tracking weakness 점수로 분할익절/트레일링 정리를 앞당기고, 거래량 기준 미달 + 윗꼬리 부담 돌파는 진입 단계에서 fake breakout으로 차단한다.
 - v139 (2026-03-30): KIS 유량 절약형 quiet scan + 거래량 rank 30 우회 — quiet scan 후보 풀과 deep-fetch 대상을 분리하고 KIS 호가/체결/투자자 snapshot에 짧은 TTL 캐시·사이클 budget·rotate selection을 추가해 REST 호출량을 줄였으며, KRX 거래량 rank는 KIS 30건 응답 이후 rank/universe snapshot으로 보강해 실질 80 후보 폭을 유지하도록 조정.
 - v138 (2026-03-30): quiet absorption 초기 매집 감지 추가 — KIS 호가/체결/투자자 + 기존 execution speed를 함께 써 뉴스 없는 조용한 선매집 seed를 market flow state로 등록하고, 같은 사이클의 analyze/익영업일 선진입 scoring에서 `quiet_absorption` 보너스를 리더 본주와 후속주 모두 활용하도록 확장.
@@ -16121,17 +16122,34 @@ def _calc_multi_tf_weekly_context(items: list[dict]) -> dict:
     })
     return out
 def _judge_multi_tf_downtrend(daily: dict, weekly: dict) -> bool:
-    severe_daily_down = bool(daily["daily_ret20"] <= -18.0 and daily["daily_ma_down"] and daily["daily_lower_high"])
-    severe_weekly_down = bool(weekly["weekly_ret8"] <= -22.0 and weekly["weekly_ma_down"] and weekly["weekly_lower_high"])
+    severe_daily_down = bool(daily["daily_ret20"] <= -15.0 and daily["daily_ma_down"] and daily["daily_lower_high"])
+    severe_weekly_down = bool(weekly["weekly_ret8"] <= -18.0 and weekly["weekly_ma_down"] and weekly["weekly_lower_high"])
     if weekly.get("insufficient_weekly_data"):
-        return bool(severe_daily_down or (daily["daily_flags"] >= 3 and daily["daily_ret20"] <= -8.0))
-    clear_daily_down = bool(daily["daily_flags"] >= 2 and daily["daily_ret20"] <= 0.0)
-    clear_weekly_down = bool(weekly["weekly_flags"] >= 2 and weekly["weekly_ret8"] <= 0.0)
-    aligned_ma_down = bool(daily["daily_ma_down"] and weekly["weekly_ma_down"] and (daily["daily_ret20"] <= -5.0 or weekly["weekly_ret8"] <= -8.0))
-    aligned_lower_high = bool(daily["daily_lower_high"] and weekly["weekly_lower_high"] and (daily["daily_ret20"] <= 0.0 or weekly["weekly_ret8"] <= 0.0))
-    return bool((clear_daily_down and clear_weekly_down) or severe_daily_down or severe_weekly_down or aligned_ma_down or aligned_lower_high)
+        return bool(
+            severe_daily_down
+            or (daily["daily_flags"] >= 2 and daily["daily_ret20"] <= -4.0)
+            or (daily["daily_ma_down"] and daily["daily_lower_high"] and daily["daily_ret20"] <= -2.0)
+        )
+    clear_daily_down = bool(daily["daily_flags"] >= 2 and daily["daily_ret20"] <= -COMMON_THRESHOLD_3P0)
+    clear_weekly_down = bool(weekly["weekly_flags"] >= 2 and weekly["weekly_ret8"] <= -COMMON_THRESHOLD_3P0)
+    aligned_ma_down = bool(daily["daily_ma_down"] and weekly["weekly_ma_down"] and (daily["daily_ret20"] <= -COMMON_THRESHOLD_3P0 or weekly["weekly_ret8"] <= -6.0))
+    aligned_lower_high = bool(daily["daily_lower_high"] and weekly["weekly_lower_high"] and (daily["daily_ret20"] <= -COMMON_THRESHOLD_3P0 or weekly["weekly_ret8"] <= -6.0))
+    non_uptrend_cascade = bool(
+        not daily.get("daily_uptrend")
+        and not weekly.get("weekly_uptrend")
+        and (daily["daily_flags"] + weekly["weekly_flags"] >= 4)
+        and (daily["daily_ret20"] <= -4.0 or weekly["weekly_ret8"] <= -6.0)
+    )
+    return bool(
+        (clear_daily_down and clear_weekly_down)
+        or severe_daily_down
+        or severe_weekly_down
+        or aligned_ma_down
+        or aligned_lower_high
+        or non_uptrend_cascade
+    )
 def _get_multi_tf_downtrend_context(code: str) -> dict:
-    """명확한 주봉·일봉 동반 하락 추세만 차단하도록 다중 추세를 판정."""
+    """일·주봉 하향/비상승 구조는 기본 차단하고, 추세전환 토큰이 강할 때만 예외를 허용하도록 다중 추세를 판정."""
     out = _empty_multi_tf_downtrend_context()
     try:
         items = get_daily_data(code, 90) or []
@@ -16176,6 +16194,60 @@ def _count_intraday_leader_follow_confirmations(signal_meta: dict | None = None)
     if int(sector_info.get("bonus", 0) or 0) >= 3:
         hits += 1
     return hits
+def _count_multi_tf_reversal_tokens(signal_meta: dict | None = None) -> int:
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    reasons = " ".join(str(x) for x in list(meta.get("reasons") or []))
+    sector_info = meta.get("sector_info") if isinstance(meta.get("sector_info"), dict) else {}
+    theme = str(sector_info.get("theme", "") or "")
+    sector_bonus = int(sector_info.get("bonus", 0) or 0)
+    hits = 0
+    if bool(meta.get("direct_news_hit")):
+        hits += 2
+    if bool(meta.get("quiet_absorption")) or "조용한 선매집" in reasons:
+        hits += 1
+    if bool(meta.get("resurge_mode")) or bool(meta.get("crossday_episode_active")) or bool(meta.get("crossday_episode_confirmed")):
+        hits += 1
+    if bool(meta.get("turnaround_confirmed")):
+        hits += 1
+    if bool(meta.get("recent_high_breakout")) or bool(meta.get("orb_breakout")) or bool(meta.get("breakout_to_surge")):
+        hits += 1
+    if sector_bonus >= 8 and theme not in ("", "기타업종"):
+        hits += 1
+    if safe_float(meta.get("vol_ratio", 0.0), 0.0) >= 2.2 and safe_float(meta.get("change_rate", 0.0), 0.0) >= 4.0:
+        hits += 1
+    return hits
+
+def _should_override_multi_tf_downtrend_block(signal_type: str, signal_meta: dict | None = None, ctx: dict | None = None) -> tuple[bool, str]:
+    sig = str(signal_type or "").upper()
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    ctx = ctx if isinstance(ctx, dict) else {}
+    if sig in {"MID_PULLBACK", "ENTRY_POINT"}:
+        if _should_bypass_mid_pullback_downtrend_block(sig, signal_meta=meta, ctx=ctx):
+            return True, "leader_followup"
+        return False, ""
+    if sig not in {"EARLY_DETECT", "SURGE", "NEAR_UPPER", "STRONG_BUY", "DART_EVENT", "DART_BUYBACK_CANCEL"}:
+        return False, ""
+    total_flags = safe_int(ctx.get("daily_flags", 0), 0) + safe_int(ctx.get("weekly_flags", 0), 0)
+    daily_ret20 = safe_float(ctx.get("daily_ret20", 0.0), 0.0)
+    weekly_ret8 = safe_float(ctx.get("weekly_ret8", 0.0), 0.0)
+    if daily_ret20 <= -20.0 or weekly_ret8 <= -26.0 or total_flags >= 6:
+        return False, ""
+    reversal_hits = _count_multi_tf_reversal_tokens(meta)
+    direct_like = bool(meta.get("direct_news_hit"))
+    quiet_like = bool(meta.get("quiet_absorption")) or "조용한 선매집" in " ".join(str(x) for x in list(meta.get("reasons") or []))
+    breakout_like = bool(meta.get("recent_high_breakout")) or bool(meta.get("orb_breakout")) or bool(meta.get("breakout_to_surge"))
+    if reversal_hits < 3:
+        return False, ""
+    if not (direct_like or quiet_like or breakout_like or bool(meta.get("resurge_mode")) or bool(meta.get("crossday_episode_confirmed"))):
+        return False, ""
+    if safe_int(meta.get("score", 0), 0) < max(74, INTRADAY_CAPTURE_RELAX_SCORE):
+        return False, ""
+    if safe_float(meta.get("change_rate", 0.0), 0.0) < 3.5 and not (direct_like or quiet_like):
+        return False, ""
+    if safe_float(meta.get("vol_ratio", 0.0), 0.0) < 1.8 and not (direct_like or quiet_like):
+        return False, ""
+    return True, "trend_reclaim"
+
 def _should_bypass_mid_pullback_downtrend_block(signal_type: str, signal_meta: dict | None = None, ctx: dict | None = None) -> bool:
     sig = str(signal_type or "").upper()
     if sig not in {"MID_PULLBACK", "ENTRY_POINT"}:
@@ -16209,10 +16281,11 @@ def _should_block_multi_tf_downtrend_capture(code: str, signal_type: str, signal
         return {"block": False, "context": ctx, "reason": ""}
     if not ctx.get("is_multi_tf_downtrend"):
         return {"block": False, "context": ctx, "reason": ""}
-    if _should_bypass_mid_pullback_downtrend_block(signal_type, signal_meta=signal_meta, ctx=ctx):
-        return {"block": False, "context": ctx, "reason": "", "override": "leader_followup"}
+    override_ok, override_label = _should_override_multi_tf_downtrend_block(signal_type, signal_meta=signal_meta, ctx=ctx)
+    if override_ok:
+        return {"block": False, "context": ctx, "reason": "", "override": override_label}
     reason = (
-        f"주봉·일봉 동반 하락 추세 차단 "
+        f"주봉·일봉 하향 추세 차단 "
         f"(20일 {ctx.get('daily_ret20', 0):+.1f}% / 8주 {ctx.get('weekly_ret8', 0):+.1f}% / "
         f"일봉UP {int(bool(ctx.get('daily_uptrend')))} / 주봉UP {int(bool(ctx.get('weekly_uptrend')))} / "
         f"일봉{'↓' if ctx.get('daily_ma_down') else '-'}·주봉{'↓' if ctx.get('weekly_ma_down') else '-'} / "
@@ -20684,7 +20757,26 @@ def _apply_early_detection_market_context(ctx: dict) -> dict | None:
     reasons = list(ctx["reasons"])
     early_score, reasons, rs = _apply_early_detection_strength_context(code, ctx["detail"], ctx["change_rate"], int(ctx["early_score"]), reasons)
     early_score, reasons, sector_info, direct_news_hit, similar_pattern_stats = _apply_early_detection_sector_theme_context(code, stock, ctx["change_rate"], ctx["vol_ratio"], early_score, reasons)
-    tf_block = _should_block_multi_tf_downtrend_capture(code, "EARLY_DETECT")
+    pattern_stock = dict(stock or {})
+    pattern_stock.setdefault("today_vol", safe_int((ctx.get("detail") or {}).get("today_vol", 0), 0))
+    pattern_ctx = _build_global_pattern_context(pattern_stock, current_time=ctx["now"].strftime("%H:%M:%S"), change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"])
+    tf_block = _should_block_multi_tf_downtrend_capture(
+        code,
+        "EARLY_DETECT",
+        signal_meta={
+            "score": early_score,
+            "change_rate": ctx["change_rate"],
+            "vol_ratio": ctx["vol_ratio"],
+            "sector_info": sector_info,
+            "direct_news_hit": direct_news_hit,
+            "market": stock.get("market", ""),
+            "reasons": reasons,
+            "recent_high_breakout": bool(pattern_ctx.get("recent_high_breakout")),
+            "orb_breakout": bool(pattern_ctx.get("orb_breakout")),
+            "breakout_to_surge": bool(pattern_ctx.get("breakout_to_surge")),
+            "breakout_to_early": bool(pattern_ctx.get("breakout_to_early")),
+        },
+    )
     if tf_block.get("block"):
         block_ctx = tf_block.get("context", {}) or {}
         _log_suppressed_alert(code, stock.get("name", code), tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"), "EARLY_DETECT", {"daily_ret20": block_ctx.get("daily_ret20", 0.0), "weekly_ret8": block_ctx.get("weekly_ret8", 0.0), "daily_flags": block_ctx.get("daily_flags", 0), "weekly_flags": block_ctx.get("weekly_flags", 0), "change_rate": ctx["change_rate"], "score": early_score, "market": stock.get("market", "")})
