@@ -3,8 +3,8 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v129
-날짜: 2026-03-28
+버전: v130
+날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [변경 이력]
@@ -12,6 +12,7 @@
 
 
 
+- v130 (2026-03-30): analyze hotfix — 누락된 `_apply_analyze_theme_context()`를 복구해 run_scan NameError를 차단하고, analyze 경로의 섹터 모멘텀·테마 동조·adaptive feedback·miss-theme breadth/NXT 장후 리더 보정을 다시 연결.
 - v129 (2026-03-30): v128 정상본 기준 통합 hotfix — 일반 포착/재안내 제목의 1차 진입가 도달 상태 반영, 오전 NXT-only 구간 조기포착 본류 및 stage shadow 기록 추가, 전략 긴급 경고 stage 기반 dedupe, html import/overnight now NameError 수정.
 - v128 (2026-03-30): fallback 안정화 hotfix — 미국시장/공매도/지정학/텔레그램 timeout 경로의 비JSON·빈응답·타임아웃을 throttled warning + 기본값 fallback으로 정리해 로그 노이즈와 과도한 예외 카운트를 축소.
 - v127 (2026-03-29): XML RSS 파싱 hotfix — Element.find() 결과를 or 체인 truthiness로 평가하던 description/summary/content 선택 로직을 None 기준 순차 탐색으로 교체해 DeprecationWarning과 향후 동작 왜곡을 차단.
@@ -20380,6 +20381,169 @@ def _apply_analyze_entry_and_filters(ctx: dict) -> bool:
         "atr_used": atr_used, "dart_risk_meta": _dart_r,
     })
     return True
+
+
+def _append_sector_rising_summary(reasons: list, sector_info: dict) -> None:
+    rising = list((sector_info or {}).get("rising") or [])[:4]
+    if rising:
+        summary = ", ".join(
+            f"{_resolve_stock_name(r.get('code', ''), r.get('name', ''))} {safe_float(r.get('change_rate', 0), 0.0):+.1f}%"
+            for r in rising
+        )
+        if summary:
+            reasons.append(f"📌 동반 상승: {summary}")
+
+
+def _apply_analyze_theme_drive_context(ctx: dict, sector_info: dict, score: int, reasons: list) -> tuple[int, dict, bool, int]:
+    stock = ctx["stock"]
+    code = ctx["code"]
+    theme_drive_hit = False
+    theme_drive_bonus = 0
+    signal_type = str(ctx.get("signal_type", "") or "")
+    change_rate = float(ctx.get("change_rate", 0.0) or 0.0)
+    vol_ratio = float(ctx.get("vol_ratio", 0.0) or 0.0)
+    market = str(stock.get("market", "") or "")
+    eligible = signal_type in THEME_DRIVE_SIGNAL_TYPES or change_rate >= THEME_DRIVE_MIN_CHANGE or vol_ratio >= THEME_DRIVE_MIN_VOLUME
+    if not eligible:
+        return score, sector_info, theme_drive_hit, theme_drive_bonus
+    try:
+        hint = _get_theme_drive_hint(code, stock.get("name", code), change_rate=change_rate, vol_ratio=vol_ratio, market=market)
+        if hint.get("theme"):
+            if _is_generic_sector_theme(sector_info.get("theme", "")):
+                sector_info["theme"] = hint["theme"]
+                sector_info["theme_key"] = hint.get("theme_key", hint["theme"])
+            theme_drive_bonus = int(hint.get("bonus", 0) or 0)
+            if theme_drive_bonus > 0:
+                score += theme_drive_bonus
+            theme_drive_hit = theme_drive_bonus > 0
+            reasons.append(
+                f"🏭 테마 동조강세 [{hint['theme']}] {theme_drive_bonus:+d}점 — "
+                f"리더 {hint.get('leader_name', '')} {safe_float(hint.get('leader_change', 0), 0.0):+.1f}% "
+                f"/ breadth {safe_int(hint.get('riser_cnt', 0), 0)}/{safe_int(hint.get('member_cnt', 0), 0)}"
+            )
+    except Exception as e:
+        _swallow_exception(e)
+    return score, sector_info, theme_drive_hit, theme_drive_bonus
+
+
+def _apply_analyze_feedback_context(ctx: dict, sector_info: dict, score: int, reasons: list) -> tuple[int, list, bool, int]:
+    stock = ctx["stock"]
+    code = ctx["code"]
+    adaptive_feedback_hit = False
+    adaptive_feedback_bonus = 0
+    theme_name = str(sector_info.get("theme", "") or stock.get("adaptive_feedback_theme", "") or "")
+    try:
+        adaptive_feedback_bonus, notes = _calc_adaptive_feedback_bonus(
+            code, theme_name, str(ctx.get("signal_type", "") or ""),
+            change_rate=float(ctx.get("change_rate", 0.0) or 0.0),
+            vol_ratio=float(ctx.get("vol_ratio", 0.0) or 0.0),
+        )
+        adaptive_feedback_bonus = int(adaptive_feedback_bonus or 0)
+        if adaptive_feedback_bonus > 0:
+            score += adaptive_feedback_bonus
+            reasons.extend(list(notes)[:2])
+            adaptive_feedback_hit = True
+    except Exception as e:
+        _swallow_exception(e)
+    return score, reasons, adaptive_feedback_hit, adaptive_feedback_bonus
+
+
+def _apply_analyze_theme_breadth_context(ctx: dict, sector_info: dict, score: int, reasons: list, theme_drive_hit: bool) -> tuple[int, list, bool, int, bool, int, float]:
+    stock = ctx["stock"]
+    code = ctx["code"]
+    market = str(stock.get("market", "") or "")
+    theme_name = str(sector_info.get("theme", "") or stock.get("adaptive_feedback_theme", "") or "")
+    miss_theme_leader_hit = False
+    miss_theme_leader_bonus = 0
+    theme_expansion_hit = False
+    theme_expansion_bonus = 0
+    breadth_ratio = 0.0
+    try:
+        miss_theme_leader_bonus, notes, breadth = _calc_miss_theme_leader_bonus(
+            code, stock.get("name", code), theme_name, str(ctx.get("signal_type", "") or ""),
+            change_rate=float(ctx.get("change_rate", 0.0) or 0.0),
+            vol_ratio=float(ctx.get("vol_ratio", 0.0) or 0.0),
+            market=market,
+        )
+        miss_theme_leader_bonus = int(miss_theme_leader_bonus or 0)
+        breadth = breadth or {}
+        breadth_ratio = float(breadth.get("breadth_ratio", 0.0) or 0.0)
+        if miss_theme_leader_bonus > 0:
+            score += miss_theme_leader_bonus
+            reasons.extend(list(notes)[:2])
+            miss_theme_leader_hit = True
+        riser_cnt = safe_int(breadth.get("riser_cnt", 0), 0)
+        member_cnt = safe_int(breadth.get("member_cnt", 0), 0)
+        strong_expansion = (
+            float(ctx.get("change_rate", 0.0) or 0.0) >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_CHANGE
+            and (breadth_ratio >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_BREADTH or riser_cnt >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_RISERS)
+        )
+        if theme_name and strong_expansion and not theme_drive_hit:
+            theme_expansion_bonus = 2 + (1 if breadth_ratio >= 0.6 or riser_cnt >= 3 else 0)
+            score += theme_expansion_bonus
+            reasons.append(f"🧩 섹터 확산 [{theme_name}] +{theme_expansion_bonus}점 — breadth {riser_cnt}/{member_cnt}")
+            theme_expansion_hit = True
+    except Exception as e:
+        _swallow_exception(e)
+    return score, reasons, miss_theme_leader_hit, miss_theme_leader_bonus, theme_expansion_hit, theme_expansion_bonus, breadth_ratio
+
+
+def _apply_analyze_nxt_post_leader_context(ctx: dict, sector_info: dict, score: int, reasons: list) -> tuple[int, list, bool, int]:
+    stock = ctx["stock"]
+    code = ctx["code"]
+    nxt_post_leader_hit = False
+    nxt_post_leader_bonus = 0
+    try:
+        nxt_post_leader_bonus, notes = _calc_nxt_postmarket_leader_bonus(
+            code, stock.get("name", code), str(sector_info.get("theme", "") or ""), str(ctx.get("signal_type", "") or ""),
+            change_rate=float(ctx.get("change_rate", 0.0) or 0.0),
+            vol_ratio=float(ctx.get("vol_ratio", 0.0) or 0.0),
+            market=str(stock.get("market", "") or ""),
+        )
+        nxt_post_leader_bonus = int(nxt_post_leader_bonus or 0)
+        if nxt_post_leader_bonus > 0:
+            score += nxt_post_leader_bonus
+            reasons.extend(list(notes)[:2])
+            nxt_post_leader_hit = True
+    except Exception as e:
+        _swallow_exception(e)
+    return score, reasons, nxt_post_leader_hit, nxt_post_leader_bonus
+
+
+def _apply_analyze_theme_context(ctx: dict) -> None:
+    stock = ctx["stock"]
+    code = ctx["code"]
+    score = ctx["score"]
+    reasons = ctx["reasons"]
+    sector_info = calc_sector_momentum(code, stock.get("name", code)) or {}
+    if int(sector_info.get("bonus", 0) or 0) > 0:
+        score += int(sector_info.get("bonus", 0) or 0)
+        if sector_info.get("summary"):
+            reasons.append(sector_info["summary"])
+        _append_sector_rising_summary(reasons, sector_info)
+    elif sector_info.get("summary"):
+        reasons.append(str(sector_info.get("summary", "") or ""))
+    score, sector_info, theme_drive_hit, theme_drive_bonus = _apply_analyze_theme_drive_context(ctx, sector_info, score, reasons)
+    score, reasons, adaptive_feedback_hit, adaptive_feedback_bonus = _apply_analyze_feedback_context(ctx, sector_info, score, reasons)
+    score, reasons, miss_theme_leader_hit, miss_theme_leader_bonus, theme_expansion_hit, theme_expansion_bonus, breadth_ratio = _apply_analyze_theme_breadth_context(ctx, sector_info, score, reasons, theme_drive_hit)
+    score, reasons, nxt_post_leader_hit, nxt_post_leader_bonus = _apply_analyze_nxt_post_leader_context(ctx, sector_info, score, reasons)
+    stock["sector_info"] = sector_info
+    ctx.update({
+        "score": score,
+        "reasons": reasons,
+        "sector_info": sector_info,
+        "theme_drive_hit": bool(theme_drive_hit),
+        "theme_drive_bonus": int(theme_drive_bonus or 0),
+        "adaptive_feedback_hit": bool(adaptive_feedback_hit),
+        "adaptive_feedback_bonus": int(adaptive_feedback_bonus or 0),
+        "miss_theme_leader_hit": bool(miss_theme_leader_hit),
+        "miss_theme_leader_bonus": int(miss_theme_leader_bonus or 0),
+        "nxt_post_leader_hit": bool(nxt_post_leader_hit),
+        "nxt_post_leader_bonus": int(nxt_post_leader_bonus or 0),
+        "theme_expansion_hit": bool(theme_expansion_hit),
+        "theme_expansion_bonus": int(theme_expansion_bonus or 0),
+        "theme_breadth_ratio": float(breadth_ratio or 0.0),
+    })
 
 
 def _resolve_analyze_result_grade(signal_type: str, score: int, stock: dict, reasons: list, change_rate: float, vol_ratio: float, sector_info: dict, direct_news_hit: bool, nxt_delta: float, countertrend_ctx: dict) -> tuple[str, bool]:
