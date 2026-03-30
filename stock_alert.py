@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v130
+버전: v132
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,8 @@
 
 
 
+- v132 (2026-03-30): A게이트 재설계 — B외부알림 신설 없이 near-A 상위 후보만 A권으로 제한 흡수하도록 일반 신호 A완화 기준을 확장하고, STRONG_BUY/장중 capture 계열의 직접재료·테마동조·수급 결합 신호를 실행형 A에 재편입.
+- v131 (2026-03-30): intraday watchdog hotfix — 최초 외부알림 전 epoch 기준 침묵 분 표시를 부팅 기준으로 바로잡고, A전용 외부알림 정책을 코드오류처럼 오진하던 워치독/코드수정 요청 문구를 정책 기준에 맞게 정렬.
 - v130 (2026-03-30): analyze hotfix — 누락된 `_apply_analyze_theme_context()`를 복구해 run_scan NameError를 차단하고, analyze 경로의 섹터 모멘텀·테마 동조·adaptive feedback·miss-theme breadth/NXT 장후 리더 보정을 다시 연결.
 - v129 (2026-03-30): v128 정상본 기준 통합 hotfix — 일반 포착/재안내 제목의 1차 진입가 도달 상태 반영, 오전 NXT-only 구간 조기포착 본류 및 stage shadow 기록 추가, 전략 긴급 경고 stage 기반 dedupe, html import/overnight now NameError 수정.
 - v128 (2026-03-30): fallback 안정화 hotfix — 미국시장/공매도/지정학/텔레그램 timeout 경로의 비JSON·빈응답·타임아웃을 throttled warning + 기본값 fallback으로 정리해 로그 노이즈와 과도한 예외 카운트를 축소.
@@ -1867,6 +1869,7 @@ requests.post = _requests_post_with_defaults
 # ── Simple throttles to reduce Telegram spam ────────────────────────────────
 _LAST_ALERT_TS: dict[str, int] = {}
 _last_external_alert_ts: float = 0.0   # v83: 마지막 외부 알림 발송 시각 (워치독용)
+_watchdog_process_start_ts: float = time.time()  # v131: 최초 외부알림 전 워치독 침묵 기준점
 _watchdog_relaxed_until: float = 0.0   # v83: 임시 완화 적용 만료 시각
 _watchdog_last_run_ts: float = 0.0     # v83: 워치독 직전 실행 시각
 
@@ -4191,7 +4194,7 @@ def _send_code_change_request_alert(issue_key: str, lines: list[str], cooldown_m
     _log_info_msg(f"  🛠 코드수정 요청 알림 발송: {issue_key}")
     return True
 
-def _build_watchdog_code_change_request(main_reason: str, reasons: dict, rising: list, elapsed_since_alert: float, relax_changes: list[str]) -> dict | None:
+def _build_watchdog_code_change_request(main_reason: str, reasons: dict, rising: list, elapsed_since_alert: float, relax_changes: list[str], alert_baseline_label: str = "") -> dict | None:
     """워치독 결과 중 자동조정 불가 구조 문제를 코드수정 요청 알림 payload로 변환."""
     specs = {
         "candidate_miss": {
@@ -4201,23 +4204,19 @@ def _build_watchdog_code_change_request(main_reason: str, reasons: dict, rising:
             "route": "외부 상승 랭킹 → fallback 체인 → 유니버스 편입 → analyze 후보화",
             "request": "fallback 체인/유니버스 편입/후보화 조건 코드 점검 필요",
         },
-        "grade_suppressed": {
-            "title": "등급 억제 과다",
-            "symptom": "후보는 잡히지만 A전용 외부알림 구조 때문에 장중 강세 종목이 밖으로 못 나옵니다.",
-            "inspect": ["_should_send_external_grade_alert", "_derive_general_signal_grade", "_should_relax_general_a_threshold"],
-            "route": "후보 포착 → 점수/등급 산출 → 외부알림 등급 억제",
-            "request": "A/B 등급 경계와 외부알림 억제 코드 점검 필요",
-        },
     }
     spec = specs.get(main_reason)
     if not spec:
         return None
+    silence_label = f"{int(elapsed_since_alert/60)}분"
+    if alert_baseline_label:
+        silence_label = f"{silence_label} ({alert_baseline_label})"
     top3 = ", ".join([f"{r.get('name','?')} {float(r.get('change_rate',0)):+.1f}%" for r in rising[:3]]) or "없음"
     lines = [
         "🛠 <b>[코드수정 요청]</b>",
         "━━━━━━━━━━━━━━━",
         f"📌 구조 문제: <b>{spec['title']}</b>",
-        f"⏱ 알림 침묵: <b>{int(elapsed_since_alert/60)}분</b>",
+        f"⏱ 알림 침묵: <b>{silence_label}</b>",
         f"📈 외부 상승 종목 예시: {top3}",
         "",
         "❌ 자동조정으로 해결 불가",
@@ -4285,9 +4284,7 @@ def _watchdog_apply_relax(main_reason: str) -> list:
     relax_sec = _WATCHDOG_RELAX_MIN * 60
 
     if main_reason == "grade_suppressed":
-        # 🔧 코드 구조 이슈 + 파라미터 완화 병행
-        # B등급 외부억제는 _should_send_external_grade_alert() 코드 문제이지만
-        # min_score 낮춰서 더 많은 종목이 A등급 진입할 수 있게 완화
+        # A전용 외부알림 정책은 유지하고, 더 많은 종목이 A컷에 진입할 수 있게만 완화
         old_n = int(_dynamic.get("min_score_normal", 56))
         old_s = int(_dynamic.get("min_score_strict", 66))
         new_n = max(45, old_n - 8)
@@ -4296,8 +4293,7 @@ def _watchdog_apply_relax(main_reason: str) -> list:
             _dynamic["min_score_normal"] = new_n
             _dynamic["min_score_strict"] = new_s
             _watchdog_relaxed_until = time.time() + relax_sec
-            changes.append(f"min_score {old_n}/{old_s} → {new_n}/{new_s} (등급억제 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
-            changes.append("⚠️ 코드 구조 문제 감지: _should_send_external_grade_alert()가 B등급 전량 차단 중 — 근본 해결은 코드 수정 필요")
+            changes.append(f"min_score {old_n}/{old_s} → {new_n}/{new_s} (A전용 정책 유지 상태에서 A컷 진입 보조, {_WATCHDOG_RELAX_MIN}분 후 복원)")
 
     elif main_reason == "no_ask_liquidity":
         # 파라미터 완화로 대응 가능
@@ -4353,10 +4349,16 @@ def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
         _log_info_msg(f"  🐕 워치독: 외부 상승 종목 {n_rising}개 — 침묵 판정 기준 미달, 스킵")
         return None
     silence_sec = _WATCHDOG_SILENCE_MIN * 60
-    elapsed_since_alert = now_ts - _last_external_alert_ts
+    if _last_external_alert_ts > 0:
+        baseline_ts = _last_external_alert_ts
+        alert_baseline_label = "마지막 외부알림 기준"
+    else:
+        baseline_ts = _watchdog_process_start_ts
+        alert_baseline_label = "부팅 후 외부알림 없음"
+    elapsed_since_alert = max(0.0, now_ts - baseline_ts)
     if elapsed_since_alert < silence_sec:
         remaining = int((silence_sec - elapsed_since_alert) / 60)
-        _log_info_msg(f"  🐕 워치독: 마지막 알림 {int(elapsed_since_alert/60)}분 전 — 정상 (침묵 아님, {remaining}분 더 관찰)")
+        _log_info_msg(f"  🐕 워치독: {alert_baseline_label} {int(elapsed_since_alert/60)}분 경과 — 정상 (침묵 아님, {remaining}분 더 관찰)")
         return None
     since_ts = now_ts - silence_sec
     reasons = _watchdog_collect_block_reasons(since_ts)
@@ -4365,6 +4367,7 @@ def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
         "rising": rising,
         "n_rising": n_rising,
         "elapsed_since_alert": elapsed_since_alert,
+        "alert_baseline_label": alert_baseline_label,
         "reasons": reasons,
         "total_blocked": sum(reasons.values()),
         "main_reason": main_reason,
@@ -4377,10 +4380,11 @@ def _build_intraday_watchdog_lines(state: dict, relax_changes: list[str]) -> lis
     reasons = state["reasons"]
     total_blocked = state["total_blocked"]
     elapsed_since_alert = state["elapsed_since_alert"]
+    alert_baseline_label = str(state.get("alert_baseline_label") or "")
     source_label = (rising[0].get("source", "?") if rising else "?").replace("naver_rise", "네이버").replace("daum_rise", "다음").replace("universe", "내부유니버스")
     top3_rising = ", ".join([f"{r.get('name','?')} {float(r.get('change_rate',0)):+.1f}%" for r in rising[:3]])
     reason_labels = {
-        "grade_suppressed": "등급 억제(A전용 차단)",
+        "grade_suppressed": "A전용 정책 억제",
         "position_limit": "동시보유 제한(v82 제거됨)",
         "no_ask_liquidity": "호가 유동성 차단",
         "candidate_miss": "후보군 미포착",
@@ -4389,7 +4393,7 @@ def _build_intraday_watchdog_lines(state: dict, relax_changes: list[str]) -> lis
     lines = [
         f"🐕 <b>[장중 워치독 자가진단]</b>",
         f"━━━━━━━━━━━━━━━",
-        f"⏱ 알림 침묵: <b>{int(elapsed_since_alert/60)}분</b> (기준 {_WATCHDOG_SILENCE_MIN}분)",
+        f"⏱ 알림 침묵: <b>{int(elapsed_since_alert/60)}분</b> (기준 {_WATCHDOG_SILENCE_MIN}분, {alert_baseline_label})",
         f"📈 외부 상승 종목: <b>{n_rising}개</b> [{source_label}]",
         f"   {top3_rising} 등",
         f"",
@@ -4436,7 +4440,7 @@ def run_intraday_watchdog() -> None:
         return
     relax_changes = _watchdog_apply_relax(state["main_reason"])
     if _maybe_send_intraday_watchdog_alert(now_ts, state, relax_changes):
-        code_req = _build_watchdog_code_change_request(state["main_reason"], state["reasons"], state["rising"], state["elapsed_since_alert"], relax_changes)
+        code_req = _build_watchdog_code_change_request(state["main_reason"], state["reasons"], state["rising"], state["elapsed_since_alert"], relax_changes, state.get("alert_baseline_label", ""))
         if code_req:
             _send_code_change_request_alert(str(code_req.get("issue_key") or state["main_reason"]), list(code_req.get("lines") or []))
     _log_warn_msg(f"  🐕 워치독 자가진단 완료: 침묵 {int(state['elapsed_since_alert']/60)}분, 상승 {state['n_rising']}개, 주 차단사유={state['main_reason']}")
@@ -4806,7 +4810,10 @@ NEWS_STOCK_PROMOTION_COOLDOWN = int(os.getenv("NEWS_STOCK_PROMOTION_COOLDOWN", "
 NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK", "ENTRY_POINT"}
 RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 GENERAL_A_RELAX_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
+GENERAL_A_EXTENDED_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "STRONG_BUY"}
 GENERAL_A_RELAXED_SCORE = int(os.getenv("GENERAL_A_RELAXED_SCORE", "77") or "77")
+GENERAL_A_EXTENDED_SCORE = int(os.getenv("GENERAL_A_EXTENDED_SCORE", "75") or "75")
+GENERAL_A_EXTENDED_SUPPORT_MIN = int(os.getenv("GENERAL_A_EXTENDED_SUPPORT_MIN", "2") or "2")
 GENERAL_GRADE_A_CUT = int(os.getenv("GENERAL_GRADE_A_CUT", "80") or "80")
 GENERAL_GRADE_B_CUT = int(os.getenv("GENERAL_GRADE_B_CUT", "60") or "60")
 MIN_TRADABLE_SIGNAL_PRICE = int(os.getenv("MIN_TRADABLE_SIGNAL_PRICE", "500") or "500")
@@ -20548,9 +20555,8 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
 
 def _resolve_analyze_result_grade(signal_type: str, score: int, stock: dict, reasons: list, change_rate: float, vol_ratio: float, sector_info: dict, direct_news_hit: bool, nxt_delta: float, countertrend_ctx: dict) -> tuple[str, bool]:
     execution_setup_required = _should_require_execution_setup_from_crossday(signal_type, stock.get("crossday_ctx", {}), change_rate=change_rate, vol_ratio=vol_ratio)
-    a_cut = GENERAL_GRADE_A_CUT
-    if _should_relax_general_a_threshold(signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio, sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta, market=stock.get("market", ""), reasons=reasons):
-        a_cut = min(a_cut, GENERAL_A_RELAXED_SCORE)
+    a_cut = _resolve_general_a_cut(signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio, sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta, market=stock.get("market", ""), reasons=reasons)
+    if a_cut < GENERAL_GRADE_A_CUT:
         reasons.append(f"🏷 한텍형 리더 A게이트 완화 ({GENERAL_GRADE_A_CUT}→{a_cut})")
     grade = "A" if score >= a_cut else "B" if score >= GENERAL_GRADE_B_CUT else "C"
     if countertrend_ctx.get("is_countertrend") and signal_type in ("UPPER_LIMIT", "NEAR_UPPER", "SURGE") and grade == "A":
@@ -22480,25 +22486,22 @@ def _collect_theme_peer_follow_candidates(existing_codes: set | None = None, lim
             continue
     return candidates
 
-def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate: float = 0.0,
-                                     vol_ratio: float = 0.0, sector_info: dict | None = None,
-                                     direct_news_hit: bool = False, nxt_delta: int = 0,
-                                     market: str = "", reasons: list | None = None) -> bool:
-    sig_type = str(signal_type or "").upper()
-    dynamic_relax_types = _get_dynamic_general_a_relax_signal_types()
-    if sig_type not in dynamic_relax_types:
-        return False
+def _build_general_a_support_profile(change_rate: float = 0.0, vol_ratio: float = 0.0,
+                                    sector_info: dict | None = None, direct_news_hit: bool = False,
+                                    nxt_delta: int = 0, market: str = "", reasons: list | None = None,
+                                    signal_type: str = "") -> dict:
     joined_reasons = " ".join(str(r or "") for r in (reasons or []))
     try:
         _cr = float(change_rate or 0.0)
     except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
+        _swallow_exception(e)
         _cr = 0.0
     try:
         _vr = float(vol_ratio or 0.0)
     except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
+        _swallow_exception(e)
         _vr = 0.0
+    sig_type = str(signal_type or "").upper()
     if sig_type == "NEAR_UPPER":
         strong_price = _cr >= 18.0
     elif sig_type == "UPPER_LIMIT":
@@ -22511,36 +22514,83 @@ def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate:
     meaningful_theme = theme != "기타"
     direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "거래대금 급증", "고가 유지", "코스피 상대강도", "코스닥 상대강도", "장초반 ORB", "전고 돌파", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴", "섹터 확산"))
+    flow_support = strong_flow or premium_flow
+    support_count = sum(1 for flag in (direct_like, meaningful_theme, flow_support, intraday_support) if flag)
     market_flag = str(market or "").upper() == "NXT"
+    return {
+        "strong_price": bool(strong_price),
+        "strong_flow": bool(strong_flow),
+        "premium_flow": bool(premium_flow),
+        "flow_support": bool(flow_support),
+        "meaningful_theme": bool(meaningful_theme),
+        "direct_like": bool(direct_like),
+        "intraday_support": bool(intraday_support),
+        "support_count": int(support_count),
+        "market_flag": bool(market_flag),
+    }
+
+
+def _resolve_general_a_cut(signal_type: str, score: int, change_rate: float = 0.0,
+                           vol_ratio: float = 0.0, sector_info: dict | None = None,
+                           direct_news_hit: bool = False, nxt_delta: int = 0,
+                           market: str = "", reasons: list | None = None) -> int:
+    sig_type = str(signal_type or "").upper()
+    dynamic_relax_types = _get_dynamic_general_a_relax_signal_types()
+    extendable_types = set(dynamic_relax_types) | set(GENERAL_A_EXTENDED_SIGNAL_TYPES)
+    if sig_type not in extendable_types:
+        return GENERAL_GRADE_A_CUT
+    support = _build_general_a_support_profile(
+        change_rate=change_rate, vol_ratio=vol_ratio, sector_info=sector_info,
+        direct_news_hit=direct_news_hit, nxt_delta=nxt_delta, market=market,
+        reasons=reasons, signal_type=sig_type,
+    )
     _session_profile = _get_full_session_capture_profile(datetime.now().strftime("%H:%M:%S"), market)
     _session_bonus = int(_session_profile.get("a_relax_bonus", 0) or 0)
+    a_cut = GENERAL_GRADE_A_CUT
     if sig_type in GENERAL_A_RELAX_SIGNAL_TYPES:
         near_a_score = int(score or 0) >= max(72, GENERAL_A_RELAXED_SCORE - 2 - _session_bonus)
-        support_ok = direct_like or meaningful_theme or strong_flow or premium_flow or intraday_support
-        return near_a_score and support_ok and (strong_price or intraday_support or (market_flag and strong_flow))
+        support_ok = support["support_count"] >= 1
+        if near_a_score and support_ok and (support["strong_price"] or support["intraday_support"] or (support["market_flag"] and support["flow_support"])):
+            a_cut = min(a_cut, GENERAL_A_RELAXED_SCORE)
+    extended_score_ok = int(score or 0) >= max(74, GENERAL_A_EXTENDED_SCORE - _session_bonus)
+    extended_core = (support["direct_like"] or support["meaningful_theme"]) and support["flow_support"]
+    extended_price = support["strong_price"] or support["intraday_support"] or (support["market_flag"] and support["flow_support"])
+    if extended_score_ok and support["support_count"] >= GENERAL_A_EXTENDED_SUPPORT_MIN and extended_core and extended_price:
+        a_cut = min(a_cut, GENERAL_A_EXTENDED_SCORE)
 
     st = _get_intraday_capture_mode()
-    if not _intraday_capture_mode_active(st):
-        return False
-    proactive_support = any(token in joined_reasons for token in ("코스피 상대강도", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "장중 돌파", "장중돌파", "재상승", "거래량 이상 급증", "거래량3배", "당일양봉"))
-    try:
-        soft_price = float(change_rate or 0.0) >= 2.5
-    except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
-        soft_price = False
-    return int(score or 0) >= INTRADAY_CAPTURE_RELAX_SCORE and soft_price and (direct_like or meaningful_theme or strong_flow or proactive_support)
+    if _intraday_capture_mode_active(st):
+        proactive_support = any(token in " ".join(str(r or "") for r in (reasons or [])) for token in ("코스피 상대강도", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "장중 돌파", "장중돌파", "재상승", "거래량 이상 급증", "거래량3배", "당일양봉"))
+        try:
+            soft_price = float(change_rate or 0.0) >= 2.5
+        except Exception as e:
+            _swallow_exception(e)
+            soft_price = False
+        if int(score or 0) >= INTRADAY_CAPTURE_RELAX_SCORE and soft_price and (support["direct_like"] or support["meaningful_theme"] or support["flow_support"] or proactive_support):
+            a_cut = min(a_cut, INTRADAY_CAPTURE_RELAX_SCORE)
+    return a_cut
+
+
+def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate: float = 0.0,
+                                     vol_ratio: float = 0.0, sector_info: dict | None = None,
+                                     direct_news_hit: bool = False, nxt_delta: int = 0,
+                                     market: str = "", reasons: list | None = None) -> bool:
+    return _resolve_general_a_cut(
+        signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio,
+        sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta,
+        market=market, reasons=reasons,
+    ) < GENERAL_GRADE_A_CUT
+
 
 def _derive_general_signal_grade(signal_type: str, score: int, change_rate: float = 0.0,
                                  vol_ratio: float = 0.0, sector_info: dict | None = None,
                                  direct_news_hit: bool = False, nxt_delta: int = 0,
                                  market: str = "", reasons: list | None = None) -> str:
-    a_cut = GENERAL_GRADE_A_CUT
-    if _should_relax_general_a_threshold(
+    a_cut = _resolve_general_a_cut(
         signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio,
         sector_info=sector_info, direct_news_hit=direct_news_hit, nxt_delta=nxt_delta,
         market=market, reasons=reasons,
-    ):
-        a_cut = min(a_cut, GENERAL_A_RELAXED_SCORE)
+    )
     if score >= a_cut:
         return "A"
     if score >= 60:
