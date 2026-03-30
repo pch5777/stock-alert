@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v136
+버전: v137
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v137 (2026-03-30): 시장 자금 이동 시나리오 전역 엔진 + 종가선진입 실전형 전환 — 뉴스/리더 seed를 테마별 market flow state로 번역해 analyze/뉴스/야간워치/익영업일 선진입 scoring이 공통으로 참조하도록 연결하고, `PRECLOSE_GAP_ENTRY` 진입가를 눌림 대기형이 아닌 알림 시점 즉시 체결 가능한 현재가/매도1호가 기준으로 재설계.
 - v136 (2026-03-30): 리더 조기포착 폭 확대 — KRX 거래량 rank 조회 폭을 30→80으로 넓히고 `get_volume_surge_stocks()`를 `_get_krx_volume_rank_count()` helper로 전환, 전역 `PRICE_SURGE_MIN`과 full-session `surge_min_change` 컷을 4%대 초반으로 정렬해 1번타자 seed가 sector leader follow에 더 빨리 등록되도록 조정.
 - v135 (2026-03-30): 섹터 대장 후속 강제감시 추가 — 상한가/강한 급등 대장을 감지하면 동일 테마·동업종 peer를 3일간 영속 watch로 등록해 장중 스캔에 강제 편입하고, 후속 후보가 near-A일 때 A권에 더 잘 올라오도록 점수/정렬 보정을 연결.
 - v134 (2026-03-30): KIS 토큰 캐시/403 진단 hotfix — tokenP 24시간 토큰을 프로세스 재시작 후에도 재사용하도록 영속 캐시를 추가하고, 403 발생 시 캐시 무효화·응답 본문 스니펫·실전/모의 및 재발급 힌트를 함께 남겨 동일일 재발급/권한 문제 추적을 쉽게 정리.
@@ -1596,7 +1597,7 @@ SIG_TITLES = {
     "SURGE": "급등 감지", "EARLY_DETECT": "★ 조기 포착 - 선진입 기회 ★",
     "MID_PULLBACK": "눌림목 진입 신호", "ENTRY_POINT": "★ 눌림목 진입 시점 ★",
     "STRONG_BUY": "강력 매수 신호",
-    "PRECLOSE_GAP_ENTRY": "★ 익영업일 갭상승 선진입 후보 ★",
+    "PRECLOSE_GAP_ENTRY": "★ 익영업일 갭상승 실전 선진입 ★",
 }
 def get_signal_label(signal_type: str, default: str = "") -> str:
     return SIG_LABELS.get(str(signal_type or ""), default or str(signal_type or ""))
@@ -5115,6 +5116,14 @@ SECTOR_LEADER_FOLLOW_BONUS = int(os.getenv("SECTOR_LEADER_FOLLOW_BONUS", "5") or
 _sector_leader_follow_watch: dict = {"active": {}}
 _sector_leader_follow_seed_touched: dict = {}
 
+MARKET_FLOW_STATE_FILE = _state_path("market_flow_state.json")
+MARKET_FLOW_KEEP_HOURS = int(os.getenv("MARKET_FLOW_KEEP_HOURS", "72") or "72")
+MARKET_FLOW_MAX_MEMBERS = int(os.getenv("MARKET_FLOW_MAX_MEMBERS", "6") or "6")
+MARKET_FLOW_MIN_SCORE = int(os.getenv("MARKET_FLOW_MIN_SCORE", "28") or "28")
+MARKET_FLOW_EVENT_BONUS = int(os.getenv("MARKET_FLOW_EVENT_BONUS", "6") or "6")
+MARKET_FLOW_FOLLOW_BONUS = int(os.getenv("MARKET_FLOW_FOLLOW_BONUS", "5") or "5")
+_market_flow_state: dict = {"themes": {}, "updated_ts": 0.0}
+
 # v41.77 #1: 동적 테마 자동 발굴 — 야간 이벤트 키워드 → 국내 종목 매핑 테이블
 OVERNIGHT_EVENT_KEYWORDS = {
     "GTC": ["엔비디아","nvidia","gtc","젠슨황","gpu","hbm","ai반도체","blackwell","베라루빈"],
@@ -7306,6 +7315,7 @@ NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "
 PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
 PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
 PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.00") or "1.00")
+PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT", "0.8") or "0.8")
 PRECLOSE_GAP_OPEN_EVAL_TIME = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME", "09:05") or "09:05"
 _preclose_gap_entry_watch: dict = {}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
@@ -9424,53 +9434,77 @@ def _round_price_down(price: float) -> int:
         _swallow_exception(e)  # v105 structured silent-exception log
         return int(price or 0)
 
+
+def _round_price_up(price: float) -> int:
+    try:
+        price = float(price or 0)
+        if price <= 0:
+            return 0
+        return int(math.ceil(price / 10.0) * 10)
+    except Exception as e:
+        _swallow_exception(e)
+        return int(price or 0)
+
+def _resolve_preclose_gap_live_quote(code: str, stage: str) -> dict:
+    use_nxt = bool(str(stage or "").lower() == "nxt" and is_nxt_open() and is_nxt_listed(code))
+    try:
+        cur = get_nxt_stock_price(code) if use_nxt else get_stock_price(code)
+        if use_nxt and (not isinstance(cur, dict) or not cur.get("price")):
+            cur = get_stock_price(code)
+        return cur if isinstance(cur, dict) else {}
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+
+
+def _resolve_preclose_gap_actionable_entry_price(code: str, current_price: int, stage: str, live_quote: dict | None = None) -> dict:
+    quote = live_quote if isinstance(live_quote, dict) else _resolve_preclose_gap_live_quote(code, stage)
+    if not isinstance(quote, dict):
+        quote = {}
+    current_price = safe_int(current_price or quote.get("price", 0), 0)
+    ask_price = safe_int(quote.get("ask_price", 0), 0)
+    ask_qty = safe_int(quote.get("ask_qty", 0), 0)
+    bid_qty = safe_int(quote.get("bid_qty", 0), 0)
+    if ask_price > 0 and ask_qty > 0:
+        entry_price = _round_price_up(max(current_price, ask_price))
+        entry_basis = "ask1"
+    elif current_price > 0 and (bid_qty > 0 or safe_int(quote.get("today_vol", 0), 0) > 0):
+        entry_price = _round_price_up(current_price)
+        entry_basis = "last_price"
+    else:
+        return {}
+    if entry_price <= 0 or entry_price < current_price:
+        return {}
+    entry_slippage_pct = round(max(0.0, ((entry_price - current_price) / max(current_price, 1)) * 100.0), 2)
+    if entry_slippage_pct > PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT:
+        return {}
+    return {
+        "entry_price": int(entry_price),
+        "entry_basis": entry_basis,
+        "entry_slippage_pct": entry_slippage_pct,
+    }
+
+
 def _build_preclose_gap_entry_plan(code: str, current_price: int, change_rate: float, stage: str) -> dict | None:
     code = normalize_stock_code(code)
     current_price = int(current_price or 0)
     if not code or current_price <= 0:
         return None
-    try:
-        atr_pct = float(calc_atr_pct(code, current_price, fallback_pct=2.5) or 2.5)
-    except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
-        atr_pct = 2.5
-
-    if change_rate >= 20:
-        base_pullback = 1.6
-    elif change_rate >= 12:
-        base_pullback = 1.2
-    elif change_rate >= 6:
-        base_pullback = 0.9
-    elif change_rate >= 3:
-        base_pullback = 0.7
-    else:
-        base_pullback = 0.6
-    if stage == "nxt":
-        base_pullback += 0.2
-
-    atr_pullback = max(0.5, min(atr_pct * 0.4, 1.6))
-    pullback_pct = min(max(max(base_pullback, atr_pullback), 0.6), 2.2)
-    entry_price = _round_price_down(current_price * (1 - pullback_pct / 100.0))
-    if entry_price <= 0 or entry_price >= current_price:
-        entry_price = _round_price_down(current_price * 0.995)
-    if entry_price <= 0 or entry_price >= current_price:
+    live_quote = _resolve_preclose_gap_live_quote(code, stage)
+    entry_ctx = _resolve_preclose_gap_actionable_entry_price(code, current_price, stage, live_quote)
+    if not entry_ctx:
         return None
-
+    entry_price = int(entry_ctx.get("entry_price", 0) or 0)
+    if entry_price <= 0:
+        return None
     stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(code, entry_price, signal_type="PRECLOSE_GAP_ENTRY")
     if stop_price <= 0 or target_price <= entry_price:
         return None
-    if current_price >= target_price:
-        return None
-
     risk = max(entry_price - stop_price, 1)
     reward = max(target_price - entry_price, 0)
     rr = round(reward / risk, 2) if risk > 0 else 0.0
-    entry_away_pct = round((current_price - entry_price) / entry_price * 100, 2) if entry_price else 0.0
     if rr < PRECLOSE_GAP_MIN_RR:
         return None
-    if entry_away_pct > PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT:
-        return None
-
     return {
         "entry_price": int(entry_price),
         "stop_loss": int(stop_price),
@@ -9478,8 +9512,10 @@ def _build_preclose_gap_entry_plan(code: str, current_price: int, change_rate: f
         "stop_pct": float(stop_pct),
         "target_pct": float(target_pct),
         "rr": rr,
-        "entry_away_pct": entry_away_pct,
-        "pullback_pct": round(pullback_pct, 2),
+        "entry_away_pct": 0.0,
+        "entry_slippage_pct": float(entry_ctx.get("entry_slippage_pct", 0.0) or 0.0),
+        "entry_basis": str(entry_ctx.get("entry_basis", "last_price") or "last_price"),
+        "pullback_pct": 0.0,
         "atr_used": bool(atr_used),
     }
 
@@ -9605,6 +9641,17 @@ def _apply_next_open_gap_market_context(score: int, reasons: list[str], cautions
     return score, reasons, cautions
 
 
+def _apply_next_open_gap_flow_context(score: int, reasons: list[str], ctx: dict, stage: str) -> tuple[int, list[str]]:
+    market_basis = "NXT" if str(stage or "").lower() == "nxt" else "KRX"
+    hint = _get_market_flow_hint(ctx["code"], ctx.get("name", ctx["code"]), market=market_basis, change_rate=ctx.get("change_rate", 0.0), volume_ratio=ctx.get("volume_ratio", 0.0))
+    bonus = int(hint.get("bonus", 0) or 0)
+    if bonus <= 0:
+        return score, reasons
+    score += bonus
+    reasons.append(f"🧭 {hint.get('reason','시장 자금 이동')} {bonus:+d}점 — 리더 {hint.get('leader_name','')}")
+    return score, reasons
+
+
 def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | None, us: dict,
                                       sector_info: dict, score: int, reasons: list[str], cautions: list[str],
                                       similar_pattern_stats: dict, similar_pattern_summary: str) -> dict | None:
@@ -9613,14 +9660,16 @@ def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | 
         return None
     rr = float(plan.get("rr", 0.0) or 0.0)
     entry_away_pct = float(plan.get("entry_away_pct", 0.0) or 0.0)
+    entry_slippage_pct = float(plan.get("entry_slippage_pct", 0.0) or 0.0)
     if rr >= 2.0:
         score += 10; reasons.append(f"⚖️ 손익비 {rr:.1f} +10")
     elif rr >= 1.6:
         score += 6; reasons.append(f"⚖️ 손익비 {rr:.1f} +6")
     else:
         score += 3; reasons.append(f"⚖️ 손익비 {rr:.1f} +3")
-    if entry_away_pct > 0:
-        cautions.append(f"⏰ 진입가까지 {entry_away_pct:.1f}% 여유")
+    reasons.append("✅ 알림 시점 즉시 진입 가능가 반영")
+    if entry_slippage_pct > 0:
+        cautions.append(f"📐 현재가 대비 진입 슬리피지 {entry_slippage_pct:.1f}%")
     score = int(round(score))
     min_score = NEXT_OPEN_GAP_MIN_SCORE - (2 if stage == "nxt" else 0)
     if score < min_score:
@@ -9650,6 +9699,9 @@ def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | 
         "target_pct": float(plan["target_pct"]),
         "rr": rr,
         "entry_away_pct": entry_away_pct,
+        "entry_slippage_pct": entry_slippage_pct,
+        "entry_basis": str(plan.get("entry_basis", "last_price") or "last_price"),
+        "actionable_now": True,
         "pullback_pct": float(plan["pullback_pct"]),
         "atr_used": bool(plan["atr_used"]),
         "gap_signal": str(us.get("gap_signal", "flat") or "flat"),
@@ -9668,6 +9720,7 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         score, reasons, ctx["code"], "PRECLOSE_GAP_ENTRY", ctx["change_rate"], ctx["volume_ratio"], weight_mode="strong"
     )
     similar_pattern_summary = _build_similar_pattern_summary_block(similar_pattern_stats)
+    score, reasons = _apply_next_open_gap_flow_context(score, reasons, ctx, stage)
     score, reasons, cautions = _apply_next_open_gap_market_context(score, reasons, cautions, ctx, us, strong_dart_codes)
     return _finalize_next_open_gap_candidate(ctx, stage, latest_rec, us, sector_info, score, reasons, cautions, similar_pattern_stats, similar_pattern_summary)
 
@@ -9744,14 +9797,16 @@ def _build_preclose_gap_signal_stock(candidate: dict, stage: str, now_dt: dateti
         "code": candidate.get("code"), "name": candidate.get("name", ""), "signal_type": PRECLOSE_GAP_SIGNAL_TYPE,
         "detected_at": now_dt, "price": int(candidate.get("current_price", 0) or 0), "change_rate": float(candidate.get("change_rate", 0.0) or 0.0),
         "volume_ratio": float(candidate.get("volume_ratio", 0.0) or 0.0), "score": int(candidate.get("score", 0) or 0),
-        "grade": "A" if int(candidate.get("score", 0) or 0) >= 80 else "B", "entry_price": int(candidate.get("entry_price", 0) or 0),
+        "grade": "A" if int(candidate.get("score", 0) or 0) >= 78 else "B", "entry_price": int(candidate.get("entry_price", 0) or 0),
         "stop_loss": int(candidate.get("stop_loss", 0) or 0), "target_price": int(candidate.get("target_price", 0) or 0), "atr_used": bool(candidate.get("atr_used", False)),
         "sector_info": candidate.get("sector_info") or {}, "reasons": list(candidate.get("reasons") or []), "position": {"pct": 6.0},
-        "execution_setup_required": True, "execution_metrics": dict(candidate.get("execution_metrics") or {}),
+        "execution_setup_required": False, "execution_metrics": dict(candidate.get("execution_metrics") or {}),
         "gap_entry_meta": {
             "stage": stage, "stage_label": candidate.get("stage_label", "1차 선별" if stage == "krx" else "최종 보정"),
             "market_basis": candidate.get("market_basis", "KRX"), "entry_away_pct": float(candidate.get("entry_away_pct", 0.0) or 0.0),
             "rr": float(candidate.get("rr", 0.0) or 0.0), "pullback_pct": float(candidate.get("pullback_pct", 0.0) or 0.0),
+            "entry_slippage_pct": float(candidate.get("entry_slippage_pct", 0.0) or 0.0), "entry_basis": candidate.get("entry_basis", "last_price"),
+            "actionable_now": bool(candidate.get("actionable_now", True)),
             "gap_signal": candidate.get("gap_signal", "flat"), "origin_signal_type": candidate.get("origin_signal_type", ""),
         },
     }
@@ -10090,12 +10145,10 @@ def send_next_open_gap_alert(stage: str = "krx"):
         item["stage"] = stage
         item["stage_label"] = payload.get("stage_label", "1차 선별" if stage == "krx" else "최종 보정")
         item["market_basis"] = payload.get("market_basis", "KRX")
-        siglog_key = _upsert_preclose_gap_signal(item, stage=stage)
-        if siglog_key:
-            register_preclose_gap_watch(item, siglog_key)
+        _upsert_preclose_gap_signal(item, stage=stage)
 
     msg = (
-        f"🚀 <b>[익영업일 갭상승 선진입 후보]</b>  {payload.get('time','')}\n"
+        f"🚀 <b>[익영업일 갭상승 실전 선진입]</b>  {payload.get('time','')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🕒 {payload.get('stage_label','')}  ·  {payload.get('market_basis','KRX')} 기준\n"
     )
@@ -10106,7 +10159,8 @@ def send_next_open_gap_alert(stage: str = "krx"):
             msg += f"  {sim_summary}\n"
         msg += (
             f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
-            f"  ℹ️ 실제 진입가는 선진입가 도달 알림에서만 제공합니다.  ·  {item.get('market_note','KRX 기준')}\n"
+            f"  🎯 지금 진입가 {int(item.get('entry_price',0) or 0):,}원  ·  손절 {int(item.get('stop_loss',0) or 0):,}원  ·  목표 {int(item.get('target_price',0) or 0):,}원\n"
+            f"  ⚖️ 손익비 1:{float(item.get('rr',0.0) or 0.0):.1f}  ·  {item.get('market_note','KRX 기준')}\n"
         )
         for line in item.get("reasons", [])[:3]:
             msg += f"  {line}\n"
@@ -10116,7 +10170,7 @@ def send_next_open_gap_alert(stage: str = "krx"):
     summary = str(us.get("summary", "") or "").splitlines()[0].strip()
     if summary:
         msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
-    msg += "⚠️ 후보 알림은 참고용입니다. 실제 진입가는 선진입가 도달 알림에서만 제공합니다. 미확인/미도달 시 자동으로 진입미달 처리됩니다."
+    msg += "⚠️ 이 알림은 장마감 전 즉시 체결 가능한 가격 기준 실전 선진입 플랜입니다. 현재가보다 낮은 눌림 대기 진입가는 사용하지 않습니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand))
     _log_info_msg(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
@@ -12341,6 +12395,7 @@ def _build_overnight_watchlist(detected_events: dict):
                                 }
 
         if watchlist:
+            _refresh_market_flow_state_from_headlines([f"{event_name} {' '.join(kws)}" for event_name, kws in detected_events.items()], source="overnight_event")
             _overnight_watchlist = watchlist
             try:
                 _write_json_atomic(OVERNIGHT_WATCHLIST_FILE, watchlist, indent=2)
@@ -12370,6 +12425,265 @@ def _format_overnight_watchlist_block() -> str:
         _swallow_exception(e)  # v105 structured silent-exception log
         return ""
 
+
+
+def _default_market_flow_state() -> dict:
+    return {"themes": {}, "updated_ts": 0.0}
+
+
+def _prune_market_flow_state(state: dict | None) -> dict:
+    raw = state if isinstance(state, dict) else {}
+    cutoff_ts = time.time() - max(1, int(MARKET_FLOW_KEEP_HOURS or 72)) * 3600
+    active = {}
+    for theme_key, rec in (raw.get("themes") or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        theme_name = str(rec.get("theme") or rec.get("theme_key") or theme_key or "").strip()
+        updated_ts = float(rec.get("updated_ts", 0) or 0)
+        if _is_generic_sector_theme(theme_name) or updated_ts < cutoff_ts:
+            continue
+        active[theme_name] = {
+            "theme": theme_name,
+            "theme_key": str(rec.get("theme_key") or theme_name),
+            "source": str(rec.get("source") or ""),
+            "stage": str(rec.get("stage") or "event_watch"),
+            "flow_score": int(rec.get("flow_score", 0) or 0),
+            "leader_code": normalize_stock_code(rec.get("leader_code") or ""),
+            "leader_name": str(rec.get("leader_name") or ""),
+            "leader_change": round(safe_float(rec.get("leader_change", 0.0), 0.0), 2),
+            "breadth_ratio": round(safe_float(rec.get("breadth_ratio", 0.0), 0.0), 4),
+            "mention_count": int(rec.get("mention_count", 0) or 0),
+            "headline": str(rec.get("headline") or ""),
+            "quiet_codes": list(rec.get("quiet_codes") or [])[:6],
+            "updated_ts": updated_ts,
+            "first_seen_ts": float(rec.get("first_seen_ts", updated_ts) or updated_ts),
+            "market": str(rec.get("market") or "KRX"),
+        }
+    latest_ts = max([float(v.get("updated_ts", 0) or 0) for v in active.values()] + [0.0])
+    return {"themes": active, "updated_ts": latest_ts}
+
+
+def _save_market_flow_state() -> None:
+    global _market_flow_state
+    _market_flow_state = _prune_market_flow_state(_market_flow_state)
+    _write_state_json(MARKET_FLOW_STATE_FILE, _market_flow_state)
+
+
+def _load_market_flow_state() -> None:
+    global _market_flow_state
+    raw = _read_state_json(MARKET_FLOW_STATE_FILE, _default_market_flow_state())
+    _market_flow_state = _prune_market_flow_state(raw)
+    if raw != _market_flow_state:
+        _save_market_flow_state()
+
+
+def _collect_market_flow_theme_members(theme_name: str, seed_code: str = "", seed_name: str = "", max_members: int | None = None) -> tuple[str, list[tuple[str, str]]]:
+    theme_name = str(theme_name or "").strip()
+    max_members = max(1, int(max_members or MARKET_FLOW_MAX_MEMBERS or 1))
+    members: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if seed_code:
+        members.append((seed_code, seed_name or _resolve_stock_name(seed_code, seed_name)))
+        seen.add(seed_code)
+        try:
+            resolved_theme, peers, _ = get_theme_sector_stocks(seed_code)
+            if _is_generic_sector_theme(theme_name) and not _is_generic_sector_theme(resolved_theme):
+                theme_name = resolved_theme
+            for peer_code, peer_name in list(peers or [])[:max_members]:
+                peer_code = normalize_stock_code(peer_code)
+                if not peer_code or peer_code in seen:
+                    continue
+                seen.add(peer_code)
+                members.append((peer_code, peer_name))
+                if len(members) >= max_members:
+                    break
+        except Exception as e:
+            _swallow_exception(e)
+    theme_info = None
+    if theme_name in THEME_MAP:
+        theme_info = THEME_MAP.get(theme_name)
+    else:
+        for tk, ti in THEME_MAP.items():
+            if theme_name == tk or theme_name in list(ti.get("sectors", []) or []):
+                theme_info = ti
+                break
+    if isinstance(theme_info, dict):
+        for c, n in list(theme_info.get("stocks", []) or [])[:max_members]:
+            c = normalize_stock_code(c)
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            members.append((c, n))
+            if len(members) >= max_members:
+                break
+    return theme_name, members[:max_members]
+
+
+def _build_market_flow_theme_record(theme_name: str, seed_code: str = "", seed_name: str = "", headlines: list[str] | None = None, source: str = "", market: str = "") -> dict:
+    theme_name, members = _collect_market_flow_theme_members(theme_name, seed_code=seed_code, seed_name=seed_name)
+    if _is_generic_sector_theme(theme_name) or not members:
+        return {}
+    market_basis = "NXT" if str(market or "").upper() == "NXT" else "KRX"
+    quotes = []
+    for member_code, member_name in members[:max(1, int(MARKET_FLOW_MAX_MEMBERS or 1))]:
+        try:
+            q = _get_live_quote_for_signal({"code": member_code, "name": member_name, "market": market_basis if market_basis == "NXT" else ""})
+        except Exception as e:
+            _swallow_exception(e)
+            q = {}
+        if not isinstance(q, dict) or not q.get("price"):
+            continue
+        quotes.append({
+            "code": member_code,
+            "name": _resolve_stock_name(member_code, member_name, q),
+            "change_rate": round(safe_float(q.get("change_rate", 0.0), 0.0), 2),
+            "volume_ratio": round(safe_float(q.get("volume_ratio", 0.0), 0.0), 2),
+        })
+        time.sleep(0.02)
+    if not quotes:
+        return {}
+    quotes.sort(key=lambda x: (safe_float(x.get("change_rate", 0.0), 0.0), safe_float(x.get("volume_ratio", 0.0), 0.0)), reverse=True)
+    leader = quotes[0]
+    risers = [q for q in quotes if safe_float(q.get("change_rate", 0.0), 0.0) >= 2.0]
+    quiet = [q for q in quotes if 0.4 <= safe_float(q.get("change_rate", 0.0), 0.0) < 4.2 and 0.6 <= safe_float(q.get("volume_ratio", 0.0), 0.0) <= 6.0]
+    breadth_ratio = len(risers) / max(1, len(quotes))
+    mention_count = len(list(headlines or []))
+    leader_change = safe_float(leader.get("change_rate", 0.0), 0.0)
+    stage = "event_watch"
+    if leader_change >= 18.0 and breadth_ratio >= 0.34:
+        stage = "leader_ignition"
+    elif leader_change >= 8.0 and quiet:
+        stage = "quiet_rotation"
+    elif quiet and mention_count >= 1:
+        stage = "quiet_absorption"
+    flow_score = int(min(100, mention_count * 8 + max(0, round(leader_change * 1.5)) + len(risers) * 4 + len(quiet) * 3 + (6 if seed_code else 0)))
+    now_ts = time.time()
+    return {
+        "theme": theme_name,
+        "theme_key": theme_name,
+        "source": str(source or ""),
+        "stage": stage,
+        "flow_score": flow_score,
+        "leader_code": normalize_stock_code(leader.get("code", "")),
+        "leader_name": str(leader.get("name", "")),
+        "leader_change": round(leader_change, 2),
+        "breadth_ratio": round(breadth_ratio, 4),
+        "mention_count": mention_count,
+        "headline": str((list(headlines or [""]) or [""])[0])[:90],
+        "quiet_codes": [normalize_stock_code(q.get("code", "")) for q in quiet[:6] if normalize_stock_code(q.get("code", ""))],
+        "updated_ts": now_ts,
+        "first_seen_ts": now_ts,
+        "market": market_basis,
+    }
+
+
+def _upsert_market_flow_record(record: dict) -> bool:
+    global _market_flow_state
+    if not isinstance(record, dict):
+        return False
+    theme_name = str(record.get("theme") or record.get("theme_key") or "").strip()
+    if _is_generic_sector_theme(theme_name) or int(record.get("flow_score", 0) or 0) < int(MARKET_FLOW_MIN_SCORE or 0):
+        return False
+    state = _market_flow_state if isinstance(_market_flow_state, dict) else _default_market_flow_state()
+    themes = state.setdefault("themes", {})
+    prev = themes.get(theme_name) if isinstance(themes.get(theme_name), dict) else {}
+    merged = dict(prev)
+    merged.update(record)
+    merged["first_seen_ts"] = float(prev.get("first_seen_ts", record.get("first_seen_ts", time.time())) or record.get("first_seen_ts", time.time()))
+    themes[theme_name] = merged
+    state["updated_ts"] = float(record.get("updated_ts", time.time()) or time.time())
+    _market_flow_state = _prune_market_flow_state(state)
+    return True
+
+
+def _refresh_market_flow_state_from_headlines(headlines: list[str] | None = None, source: str = "news") -> int:
+    if not headlines:
+        return 0
+    updated = 0
+    for theme_key, theme_info in THEME_MAP.items():
+        matched = [
+            h for h in list(headlines or [])
+            if theme_key in h
+            or any(sec in h for sec in list(theme_info.get("sectors", []) or [])[:4])
+            or any(name in h for _c, name in list(theme_info.get("stocks", []) or [])[:4])
+        ]
+        if not matched:
+            continue
+        stocks = list(theme_info.get("stocks", []) or [])
+        seed_code, seed_name = stocks[0] if stocks else ("", "")
+        rec = _build_market_flow_theme_record(theme_key, seed_code=normalize_stock_code(seed_code), seed_name=str(seed_name or ""), headlines=matched, source=source)
+        if _upsert_market_flow_record(rec):
+            updated += 1
+    if updated:
+        _save_market_flow_state()
+    return updated
+
+
+def _register_market_flow_seed(seed: dict, source: str = "price_seed") -> bool:
+    if not isinstance(seed, dict):
+        return False
+    seed_code = normalize_stock_code(seed.get("code", ""))
+    seed_name = _resolve_stock_name(seed_code, seed.get("name", ""))
+    if not seed_code or not is_trade_candidate_name(seed_name):
+        return False
+    theme_name, _, _ = get_theme_sector_stocks(seed_code)
+    rec = _build_market_flow_theme_record(theme_name, seed_code=seed_code, seed_name=seed_name, source=source, market=seed.get("market", ""))
+    if not _upsert_market_flow_record(rec):
+        return False
+    _save_market_flow_state()
+    return True
+
+
+def _get_market_flow_hint(code: str, name: str = "", market: str = "", change_rate: float = 0.0, volume_ratio: float = 0.0) -> dict:
+    code = normalize_stock_code(code)
+    if not code or not isinstance(_market_flow_state, dict):
+        return {}
+    theme_name, _, _ = get_theme_sector_stocks(code)
+    if _is_generic_sector_theme(theme_name):
+        return {}
+    rec = ((_market_flow_state.get("themes") or {}) if isinstance(_market_flow_state, dict) else {}).get(theme_name)
+    if not isinstance(rec, dict):
+        return {}
+    leader_code = normalize_stock_code(rec.get("leader_code") or "")
+    leader_name = str(rec.get("leader_name") or "")
+    stage = str(rec.get("stage") or "event_watch")
+    cr = safe_float(change_rate, 0.0)
+    vr = safe_float(volume_ratio, 0.0)
+    breadth_ratio = safe_float(rec.get("breadth_ratio", 0.0), 0.0)
+    mention_count = int(rec.get("mention_count", 0) or 0)
+    bonus = 0
+    if stage == "quiet_absorption" and code != leader_code and 0.0 <= cr < 4.5 and 0.5 <= vr <= 4.5:
+        bonus = MARKET_FLOW_FOLLOW_BONUS + 1
+    elif stage == "quiet_rotation" and code != leader_code and (cr >= 1.2 or vr >= 1.4):
+        bonus = MARKET_FLOW_FOLLOW_BONUS
+    elif stage == "leader_ignition" and code != leader_code and (cr >= 2.0 or vr >= 1.8):
+        bonus = max(3, MARKET_FLOW_FOLLOW_BONUS - 1)
+    elif stage == "leader_ignition" and code == leader_code:
+        bonus = 2
+    if mention_count >= 2:
+        bonus += 1
+    if breadth_ratio >= 0.34:
+        bonus += 1
+    bonus = int(min(bonus, MARKET_FLOW_EVENT_BONUS + MARKET_FLOW_FOLLOW_BONUS))
+    if bonus <= 0:
+        return {}
+    stage_label = {
+        "leader_ignition": "리더 점화",
+        "quiet_rotation": "후속 순환",
+        "quiet_absorption": "조용한 선매집",
+        "event_watch": "이슈 감시",
+    }.get(stage, stage)
+    return {
+        "theme": theme_name,
+        "leader_name": leader_name or _resolve_stock_name(leader_code, leader_name),
+        "leader_code": leader_code,
+        "stage": stage,
+        "stage_label": stage_label,
+        "bonus": bonus,
+        "headline": str(rec.get("headline") or ""),
+        "flow_score": int(rec.get("flow_score", 0) or 0),
+        "reason": f"시장 자금 이동 [{theme_name}] {stage_label}",
+    }
 
 
 def _default_sector_leader_follow_state() -> dict:
@@ -12499,6 +12813,7 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
     _sector_leader_follow_watch = _prune_sector_leader_follow_state({"active": active})
     if added:
         _save_sector_leader_follow_state()
+        _register_market_flow_seed(seed, source="sector_leader_follow")
         _sector_leader_follow_seed_touched[touch_key] = now_ts
         _log_info_msg(f"🧭 섹터 대장 후속 강제감시 등록: {seed_name} [{theme_name}] → {added}개")
     return added
@@ -20836,6 +21151,21 @@ def _apply_analyze_sector_leader_follow_context(ctx: dict, sector_info: dict, sc
     return score, reasons, True, bonus
 
 
+def _apply_analyze_market_flow_context(ctx: dict, sector_info: dict, score: int, reasons: list) -> tuple[int, list[str], bool, int]:
+    stock = ctx["stock"]
+    hint = _get_market_flow_hint(ctx["code"], stock.get("name", ctx["code"]), market=stock.get("market", ""), change_rate=stock.get("change_rate", 0.0), volume_ratio=stock.get("volume_ratio", 0.0))
+    bonus = int(hint.get("bonus", 0) or 0)
+    if bonus <= 0:
+        return score, reasons, False, 0
+    score += bonus
+    headline = str(hint.get("headline", "") or "").strip()
+    reasons.append(f"🧭 {hint.get('reason','시장 자금 이동')} {bonus:+d}점 — 리더 {hint.get('leader_name','')}" + (f" / {headline[:28]}" if headline else ""))
+    if _is_generic_sector_theme(sector_info.get("theme", "")) and hint.get("theme"):
+        sector_info["theme"] = hint["theme"]
+        sector_info["theme_key"] = hint.get("theme", "")
+    return score, reasons, True, bonus
+
+
 def _apply_analyze_theme_context(ctx: dict) -> None:
     stock = ctx["stock"]
     code = ctx["code"]
@@ -20853,6 +21183,7 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
     score, reasons, adaptive_feedback_hit, adaptive_feedback_bonus = _apply_analyze_feedback_context(ctx, sector_info, score, reasons)
     score, reasons, miss_theme_leader_hit, miss_theme_leader_bonus, theme_expansion_hit, theme_expansion_bonus, breadth_ratio = _apply_analyze_theme_breadth_context(ctx, sector_info, score, reasons, theme_drive_hit)
     score, reasons, nxt_post_leader_hit, nxt_post_leader_bonus = _apply_analyze_nxt_post_leader_context(ctx, sector_info, score, reasons)
+    score, reasons, market_flow_hit, market_flow_bonus = _apply_analyze_market_flow_context(ctx, sector_info, score, reasons)
     score, reasons, sector_leader_follow_hit, sector_leader_follow_bonus = _apply_analyze_sector_leader_follow_context(ctx, sector_info, score, reasons)
     stock["sector_info"] = sector_info
     ctx.update({
@@ -20867,6 +21198,8 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
         "miss_theme_leader_bonus": int(miss_theme_leader_bonus or 0),
         "nxt_post_leader_hit": bool(nxt_post_leader_hit),
         "nxt_post_leader_bonus": int(nxt_post_leader_bonus or 0),
+        "market_flow_hit": bool(market_flow_hit),
+        "market_flow_bonus": int(market_flow_bonus or 0),
         "sector_leader_follow_hit": bool(sector_leader_follow_hit),
         "sector_leader_follow_bonus": int(sector_leader_follow_bonus or 0),
         "theme_expansion_hit": bool(theme_expansion_hit),
@@ -20916,6 +21249,7 @@ def _build_analyze_result(ctx: dict) -> dict:
         "score": score, "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
         "direct_news_hit": direct_news_hit, "emergent_theme_hit": bool(ctx.get("emergent_theme_hit")),
         "theme_drive_hit": bool(ctx.get("theme_drive_hit")), "adaptive_feedback_hit": bool(ctx.get("adaptive_feedback_hit")),
+        "market_flow_hit": bool(ctx.get("market_flow_hit")), "market_flow_bonus": int(ctx.get("market_flow_bonus", 0) or 0),
         "sector_leader_follow_hit": bool(ctx.get("sector_leader_follow_hit")), "sector_leader_follow_bonus": ctx.get("sector_leader_follow_bonus", 0),
         "adaptive_feedback_bonus": ctx.get("adaptive_feedback_bonus", 0), "miss_theme_leader_hit": bool(ctx.get("miss_theme_leader_hit")),
         "miss_theme_leader_bonus": ctx.get("miss_theme_leader_bonus", 0), "nxt_post_leader_hit": bool(ctx.get("nxt_post_leader_hit")),
@@ -24925,6 +25259,7 @@ def analyze_news_theme(headlines: list = None) -> list:
     if not headlines:
         return []
     _log_info_msg(f"  📰 뉴스 {len(headlines)}건 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스)")
+    _refresh_market_flow_state_from_headlines(headlines, source="news_theme")
     for theme_key, theme_info in THEME_MAP.items():
         if time.time() - _news_alert_history.get(theme_key, 0) < 14400:
             continue
@@ -29762,6 +30097,7 @@ if __name__ == "__main__":
         _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
         _load_sector_leader_follow_state()
+        _load_market_flow_state()
         _load_dynamic_params()
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
@@ -29786,6 +30122,7 @@ if __name__ == "__main__":
     load_tracker_feedback()
     load_dynamic_themes()
     _load_sector_leader_follow_state()
+    _load_market_flow_state()
     load_adaptive_capture_feedback()
     load_stale_replay_penalty_profile()
     refresh_dynamic_candidates()
