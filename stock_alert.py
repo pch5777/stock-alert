@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v137
+버전: v139
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,8 @@
 
 
 
+- v139 (2026-03-30): KIS 유량 절약형 quiet scan + 거래량 rank 30 우회 — quiet scan 후보 풀과 deep-fetch 대상을 분리하고 KIS 호가/체결/투자자 snapshot에 짧은 TTL 캐시·사이클 budget·rotate selection을 추가해 REST 호출량을 줄였으며, KRX 거래량 rank는 KIS 30건 응답 이후 rank/universe snapshot으로 보강해 실질 80 후보 폭을 유지하도록 조정.
+- v138 (2026-03-30): quiet absorption 초기 매집 감지 추가 — KIS 호가/체결/투자자 + 기존 execution speed를 함께 써 뉴스 없는 조용한 선매집 seed를 market flow state로 등록하고, 같은 사이클의 analyze/익영업일 선진입 scoring에서 `quiet_absorption` 보너스를 리더 본주와 후속주 모두 활용하도록 확장.
 - v137 (2026-03-30): 시장 자금 이동 시나리오 전역 엔진 + 종가선진입 실전형 전환 — 뉴스/리더 seed를 테마별 market flow state로 번역해 analyze/뉴스/야간워치/익영업일 선진입 scoring이 공통으로 참조하도록 연결하고, `PRECLOSE_GAP_ENTRY` 진입가를 눌림 대기형이 아닌 알림 시점 즉시 체결 가능한 현재가/매도1호가 기준으로 재설계.
 - v136 (2026-03-30): 리더 조기포착 폭 확대 — KRX 거래량 rank 조회 폭을 30→80으로 넓히고 `get_volume_surge_stocks()`를 `_get_krx_volume_rank_count()` helper로 전환, 전역 `PRICE_SURGE_MIN`과 full-session `surge_min_change` 컷을 4%대 초반으로 정렬해 1번타자 seed가 sector leader follow에 더 빨리 등록되도록 조정.
 - v135 (2026-03-30): 섹터 대장 후속 강제감시 추가 — 상한가/강한 급등 대장을 감지하면 동일 테마·동업종 peer를 3일간 영속 watch로 등록해 장중 스캔에 강제 편입하고, 후속 후보가 near-A일 때 A권에 더 잘 올라오도록 점수/정렬 보정을 연결.
@@ -5122,7 +5124,19 @@ MARKET_FLOW_MAX_MEMBERS = int(os.getenv("MARKET_FLOW_MAX_MEMBERS", "6") or "6")
 MARKET_FLOW_MIN_SCORE = int(os.getenv("MARKET_FLOW_MIN_SCORE", "28") or "28")
 MARKET_FLOW_EVENT_BONUS = int(os.getenv("MARKET_FLOW_EVENT_BONUS", "6") or "6")
 MARKET_FLOW_FOLLOW_BONUS = int(os.getenv("MARKET_FLOW_FOLLOW_BONUS", "5") or "5")
+MARKET_FLOW_QUIET_MIN_CHANGE = float(os.getenv("MARKET_FLOW_QUIET_MIN_CHANGE", "0.2") or "0.2")
+MARKET_FLOW_QUIET_MAX_CHANGE = float(os.getenv("MARKET_FLOW_QUIET_MAX_CHANGE", "4.8") or "4.8")
+MARKET_FLOW_QUIET_MIN_VOLUME_RATIO = float(os.getenv("MARKET_FLOW_QUIET_MIN_VOLUME_RATIO", "0.5") or "0.5")
+MARKET_FLOW_QUIET_MAX_VOLUME_RATIO = float(os.getenv("MARKET_FLOW_QUIET_MAX_VOLUME_RATIO", "6.5") or "6.5")
+MARKET_FLOW_QUIET_MIN_SCORE = int(os.getenv("MARKET_FLOW_QUIET_MIN_SCORE", "9") or "9")
+MARKET_FLOW_QUIET_SCAN_LIMIT_PER_MARKET = int(os.getenv("MARKET_FLOW_QUIET_SCAN_LIMIT_PER_MARKET", "8") or "8")
+MARKET_FLOW_QUIET_DEEP_FETCH_LIMIT = int(os.getenv("MARKET_FLOW_QUIET_DEEP_FETCH_LIMIT", "4") or "4")
+QUIET_SNAPSHOT_CACHE_TTL_SEC = int(os.getenv("QUIET_SNAPSHOT_CACHE_TTL_SEC", "12") or "12")
+KIS_VOLUME_RANK_HARD_LIMIT = int(os.getenv("KIS_VOLUME_RANK_HARD_LIMIT", "30") or "30")
 _market_flow_state: dict = {"themes": {}, "updated_ts": 0.0}
+_quiet_snapshot_cache: dict = {}
+_quiet_scan_cycle_state: dict = {"started_ts": 0.0, "calls": 0, "budget": 0, "skipped_budget": 0}
+_quiet_scan_cursor: dict = {"all": 0}
 
 # v41.77 #1: 동적 테마 자동 발굴 — 야간 이벤트 키워드 → 국내 종목 매핑 테이블
 OVERNIGHT_EVENT_KEYWORDS = {
@@ -11504,18 +11518,74 @@ def get_upper_limit_stocks() -> list:
     _log_info_msg(f"  ✅ [KIS] chgrate-pcls-100 응답 {len(items)}건 (status={status}, ct={ct or '-'})")
     return items
 
+def _normalize_rank_candidate_item(item: dict, market: str = "KRX", desc: str = "") -> dict:
+    item = item if isinstance(item, dict) else {}
+    code = normalize_stock_code(item.get("code") or item.get("mksc_shrn_iscd") or item.get("stck_shrn_iscd") or "")
+    if not code:
+        return {}
+    rec = {
+        "code": code,
+        "name": _resolve_stock_name(code, item.get("name") or item.get("hts_kor_isnm") or ""),
+        "price": safe_int(item.get("price", item.get("stck_prpr", 0)), 0),
+        "change_rate": safe_float(item.get("change_rate", item.get("prdy_ctrt", 0.0)), 0.0),
+        "volume_ratio": safe_float(item.get("volume_ratio", item.get("vol_inrt", 0.0)), 0.0),
+        "today_vol": safe_int(item.get("today_vol", item.get("acml_vol", 0)), 0),
+        "trade_amount": safe_float(item.get("trade_amount", item.get("acml_tr_pbmn", 0.0)), 0.0),
+        "market": "NXT" if str(market or "").upper() == "NXT" else "KRX",
+    }
+    if desc:
+        rec["desc"] = desc
+    return rec
+
+
+def _extend_krx_volume_rank_items(items: list[dict], target_count: int) -> list[dict]:
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for item in items or []:
+        rec = _normalize_rank_candidate_item(item, "KRX", item.get("desc", "KIS거래량"))
+        code = rec.get("code", "")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        normalized.append(rec)
+    if len(normalized) >= target_count:
+        return normalized[:target_count]
+    sources = (("랭킹보강", _collect_market_rank_candidates("KRX", scan_limit=max(target_count, _get_rank_scan_limit()), force=False)),
+               ("유니버스보강", _rank_from_universe("KRX")))
+    for source_name, source_items in sources:
+        for item in source_items:
+            rec = _normalize_rank_candidate_item(item, "KRX", source_name)
+            code = rec.get("code", "")
+            if not code or code in seen:
+                continue
+            if rec.get("change_rate", 0.0) <= 0.0 and rec.get("volume_ratio", 0.0) < 1.0:
+                continue
+            seen.add(code)
+            normalized.append(rec)
+            if len(normalized) >= target_count:
+                break
+        if len(normalized) >= target_count:
+            break
+    normalized.sort(key=lambda x: (safe_float(x.get("volume_ratio", 0.0), 0.0), safe_float(x.get("change_rate", 0.0), 0.0), safe_float(x.get("trade_amount", 0.0), 0.0), safe_int(x.get("today_vol", 0), 0)), reverse=True)
+    return normalized[:target_count]
+
+
 def get_volume_surge_stocks() -> list:
+    target_count = max(30, int(_get_krx_volume_rank_count() or 30))
+    request_count = min(target_count, max(1, int(KIS_VOLUME_RANK_HARD_LIMIT or 30)))
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
                      "FHPST01710000", {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171","FID_INPUT_ISCD":"0000",
         "FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111",
         "FID_TRGT_EXLS_CLS_CODE":"000000","FID_INPUT_PRICE_1":"1000",
-        "FID_INPUT_PRICE_2":"","FID_VOL_CNT":str(_get_krx_volume_rank_count()),"FID_INPUT_DATE_1":"",
+        "FID_INPUT_PRICE_2":"","FID_VOL_CNT":str(request_count),"FID_INPUT_DATE_1":"",
     })
-    return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
-             "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-             "volume_ratio":float(i.get("vol_inrt",0) or 0), "market":"KRX"}
-            for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+    items = [_normalize_rank_candidate_item(i, "KRX", "KIS거래량")
+             for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+    items = [item for item in items if item.get("code")]
+    if target_count > request_count:
+        items = _extend_krx_volume_rank_items(items, target_count)
+    return items
 
 # ── NXT (넥스트레이드) 조회 ──
 # NXT는 KRX와 동일 종목이 복수 시장에서 거래됨
@@ -11751,6 +11821,168 @@ def get_nxt_investor_trend(code: str) -> dict:
     return {
         "foreign_net":     safe_int(output[0].get('frgn_ntby_qty', 0)),
         "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
+    }
+
+def _kis_market_div_code(market: str = "") -> str:
+    return "NX" if str(market or "").upper() == "NXT" else "J"
+
+
+def _first_dict_output(data: dict, *keys: str) -> dict:
+    raw = data if isinstance(data, dict) else {}
+    for key in keys:
+        obj = raw.get(key)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    return item
+    return {}
+
+
+def _pick_first_numeric(raw: dict, keys: list[str], default: float = 0.0) -> float:
+    obj = raw if isinstance(raw, dict) else {}
+    for key in keys:
+        val = obj.get(key)
+        if val in (None, ""):
+            continue
+        try:
+            return float(str(val).replace(',', ''))
+        except Exception as e:
+            _swallow_exception(e)
+    return float(default or 0.0)
+
+
+def _quiet_snapshot_cache_key(kind: str, code: str, market: str) -> tuple[str, str, str]:
+    return str(kind or ""), normalize_stock_code(code), "NXT" if str(market or "").upper() == "NXT" else "KRX"
+
+
+def _reset_quiet_scan_cycle_state() -> None:
+    budget = max(3, int(MARKET_FLOW_QUIET_DEEP_FETCH_LIMIT or 1) * 3)
+    _quiet_scan_cycle_state.update({
+        "started_ts": time.time(),
+        "calls": 0,
+        "budget": budget,
+        "skipped_budget": 0,
+    })
+
+
+def _get_quiet_cached_snapshot(kind: str, code: str, market: str, loader) -> dict:
+    key = _quiet_snapshot_cache_key(kind, code, market)
+    now_ts = time.time()
+    ttl = max(3, int(QUIET_SNAPSHOT_CACHE_TTL_SEC or 3))
+    cached = _quiet_snapshot_cache.get(key)
+    if cached and now_ts - float(cached.get("ts", 0.0) or 0.0) < ttl:
+        return dict(cached.get("data") or {})
+    if int(_quiet_scan_cycle_state.get("calls", 0) or 0) >= int(_quiet_scan_cycle_state.get("budget", 0) or 0):
+        _quiet_scan_cycle_state["skipped_budget"] = int(_quiet_scan_cycle_state.get("skipped_budget", 0) or 0) + 1
+        if cached and now_ts - float(cached.get("ts", 0.0) or 0.0) < ttl * 3:
+            return dict(cached.get("data") or {})
+        return {}
+    data = loader() or {}
+    _quiet_scan_cycle_state["calls"] = int(_quiet_scan_cycle_state.get("calls", 0) or 0) + 1
+    if data:
+        _quiet_snapshot_cache[key] = {"ts": now_ts, "data": dict(data)}
+        return dict(data)
+    if cached and now_ts - float(cached.get("ts", 0.0) or 0.0) < ttl * 3:
+        return dict(cached.get("data") or {})
+    return {}
+
+
+def _get_quiet_investor_trend(code: str, market: str = "KRX") -> dict:
+    market = "NXT" if str(market or "").upper() == "NXT" else "KRX"
+    return _get_quiet_cached_snapshot(
+        "investor", code, market,
+        lambda: get_nxt_investor_trend(code) if market == "NXT" else get_investor_trend(code),
+    )
+
+
+def _get_quiet_orderbook_snapshot(code: str, market: str = "KRX") -> dict:
+    return _get_quiet_cached_snapshot("orderbook", code, market, lambda: get_orderbook_depth_snapshot(code, market=market))
+
+
+def _get_quiet_trade_snapshot(code: str, market: str = "KRX") -> dict:
+    return _get_quiet_cached_snapshot("trade", code, market, lambda: get_trade_intensity_snapshot(code, market=market))
+
+
+def get_orderbook_depth_snapshot(code: str, market: str = "KRX") -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            "FHKST01010200",
+            {"FID_COND_MRKT_DIV_CODE": _kis_market_div_code(market), "FID_INPUT_ISCD": code},
+        )
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+    out = _first_dict_output(data, "output1", "output")
+    if not out:
+        return {}
+    ask_total = 0
+    bid_total = 0
+    active_levels = 0
+    support_levels = 0
+    for idx in range(1, 11):
+        ask_qty = safe_int(out.get(f"askp_rsqn{idx}", 0), 0)
+        bid_qty = safe_int(out.get(f"bidp_rsqn{idx}", 0), 0)
+        ask_total += ask_qty
+        bid_total += bid_qty
+        if ask_qty > 0 or bid_qty > 0:
+            active_levels += 1
+        if bid_qty > 0 and (ask_qty <= 0 or bid_qty >= ask_qty):
+            support_levels += 1
+    if ask_total <= 0 and bid_total <= 0:
+        return {}
+    bid_ask_ratio = round(min(bid_total / max(ask_total, 1), COMMON_THRESHOLD_3P0), 3)
+    return {
+        "ask_total": ask_total,
+        "bid_total": bid_total,
+        "bid_ask_ratio": bid_ask_ratio,
+        "active_levels": active_levels,
+        "support_levels": support_levels,
+    }
+
+
+def get_trade_intensity_snapshot(code: str, market: str = "KRX") -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-ccnl",
+            "FHKST01010300",
+            {"FID_COND_MRKT_DIV_CODE": _kis_market_div_code(market), "FID_INPUT_ISCD": code},
+        )
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+    out = _first_dict_output(data, "output", "output1")
+    if not out:
+        return {}
+    strength = _pick_first_numeric(out, [
+        "tday_rltv", "acml_cttr", "cttr", "trad_ints", "cntg_power", "cnqn",
+    ])
+    buy_qty = _pick_first_numeric(out, [
+        "buy_cntg_qty", "totl_buy_cntg_qty", "total_buy_cntg_qty", "mspr_buy_qty",
+    ])
+    sell_qty = _pick_first_numeric(out, [
+        "sell_cntg_qty", "totl_sell_cntg_qty", "total_sell_cntg_qty", "mspr_sell_qty",
+    ])
+    buy_ratio = round((buy_qty / max(buy_qty + sell_qty, 1.0)) * 100.0, 1) if (buy_qty > 0 or sell_qty > 0) else 0.0
+    ccnl_vol = _pick_first_numeric(out, [
+        "tday_ccld_qty", "acml_vol", "cntg_vol", "acml_tr_pbmn",
+    ])
+    if strength <= 0 and buy_ratio <= 0 and ccnl_vol <= 0:
+        return {}
+    return {
+        "strength": round(strength, 2),
+        "buy_qty": int(buy_qty or 0),
+        "sell_qty": int(sell_qty or 0),
+        "buy_ratio": buy_ratio,
+        "ccnl_vol": int(ccnl_vol or 0),
     }
 
 # NXT 데이터 캐시 (종목별 5분 유효)
@@ -12455,6 +12687,12 @@ def _prune_market_flow_state(state: dict | None) -> dict:
             "mention_count": int(rec.get("mention_count", 0) or 0),
             "headline": str(rec.get("headline") or ""),
             "quiet_codes": list(rec.get("quiet_codes") or [])[:6],
+            "quiet_score": int(rec.get("quiet_score", 0) or 0),
+            "quiet_summary": str(rec.get("quiet_summary") or ""),
+            "bid_ask_ratio": round(safe_float(rec.get("bid_ask_ratio", 0.0), 0.0), 3),
+            "trade_strength": round(safe_float(rec.get("trade_strength", 0.0), 0.0), 2),
+            "foreign_net": safe_int(rec.get("foreign_net", 0), 0),
+            "institution_net": safe_int(rec.get("institution_net", 0), 0),
             "updated_ts": updated_ts,
             "first_seen_ts": float(rec.get("first_seen_ts", updated_ts) or updated_ts),
             "market": str(rec.get("market") or "KRX"),
@@ -12577,6 +12815,15 @@ def _build_market_flow_theme_record(theme_name: str, seed_code: str = "", seed_n
     }
 
 
+def _market_flow_stage_rank(stage: str) -> int:
+    return {
+        "event_watch": 0,
+        "quiet_absorption": 1,
+        "quiet_rotation": 2,
+        "leader_ignition": 3,
+    }.get(str(stage or "event_watch"), 0)
+
+
 def _upsert_market_flow_record(record: dict) -> bool:
     global _market_flow_state
     if not isinstance(record, dict):
@@ -12589,6 +12836,11 @@ def _upsert_market_flow_record(record: dict) -> bool:
     prev = themes.get(theme_name) if isinstance(themes.get(theme_name), dict) else {}
     merged = dict(prev)
     merged.update(record)
+    prev_stage = str(prev.get("stage") or "event_watch")
+    new_stage = str(record.get("stage") or prev_stage or "event_watch")
+    if _market_flow_stage_rank(prev_stage) > _market_flow_stage_rank(new_stage):
+        merged["stage"] = prev_stage
+    merged["flow_score"] = max(int(prev.get("flow_score", 0) or 0), int(record.get("flow_score", 0) or 0))
     merged["first_seen_ts"] = float(prev.get("first_seen_ts", record.get("first_seen_ts", time.time())) or record.get("first_seen_ts", time.time()))
     themes[theme_name] = merged
     state["updated_ts"] = float(record.get("updated_ts", time.time()) or time.time())
@@ -12634,6 +12886,138 @@ def _register_market_flow_seed(seed: dict, source: str = "price_seed") -> bool:
     return True
 
 
+def _score_quiet_absorption_context(seed: dict) -> dict:
+    seed = seed if isinstance(seed, dict) else {}
+    code = normalize_stock_code(seed.get("code", ""))
+    market = "NXT" if str(seed.get("market", "")).upper() == "NXT" else "KRX"
+    price = safe_int(seed.get("price", 0), 0)
+    change_rate = safe_float(seed.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(seed.get("volume_ratio", 0.0), 0.0)
+    if not code or price <= 0:
+        return {}
+    if change_rate < MARKET_FLOW_QUIET_MIN_CHANGE or change_rate > MARKET_FLOW_QUIET_MAX_CHANGE:
+        return {}
+    if volume_ratio < MARKET_FLOW_QUIET_MIN_VOLUME_RATIO or volume_ratio > MARKET_FLOW_QUIET_MAX_VOLUME_RATIO:
+        return {}
+    inv = _get_quiet_investor_trend(code, market=market)
+    orderbook = _get_quiet_orderbook_snapshot(code, market=market)
+    trade = _get_quiet_trade_snapshot(code, market=market)
+    exec_m = get_execution_speed_metrics(code, current_price=price) or {}
+    foreign_net = safe_int(inv.get("foreign_net", 0), 0)
+    institution_net = safe_int(inv.get("institution_net", 0), 0)
+    investor_total = foreign_net + institution_net
+    bid_ask_ratio = safe_float(orderbook.get("bid_ask_ratio", 0.0), 0.0)
+    support_levels = safe_int(orderbook.get("support_levels", 0), 0)
+    trade_strength = safe_float(trade.get("strength", 0.0), 0.0)
+    buy_ratio = safe_float(trade.get("buy_ratio", 0.0), 0.0)
+    exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
+    dip_score = safe_int(exec_m.get("dip_resilience_score", 0), 0)
+    score = 0
+    reasons: list[str] = []
+    if change_rate >= 0.8:
+        score += 2
+        reasons.append(f"시세 {change_rate:+.1f}%")
+    if change_rate >= 1.8:
+        score += 1
+    if 0.8 <= volume_ratio <= 4.8:
+        score += 2
+        reasons.append(f"거래량 {volume_ratio:.1f}배")
+    elif volume_ratio > 4.8:
+        score += 1
+    if investor_total > 0:
+        score += 2
+        reasons.append("외인·기관 순유입")
+    if foreign_net > 0 and institution_net > 0:
+        score += 1
+    if bid_ask_ratio >= 1.2:
+        score += 2
+        reasons.append(f"호가 {bid_ask_ratio:.1f}배")
+    if bid_ask_ratio >= 1.6:
+        score += 1
+    if support_levels >= 6:
+        score += 1
+    if trade_strength >= 105:
+        score += 2
+        reasons.append(f"체결강도 {trade_strength:.0f}")
+    if trade_strength >= 115:
+        score += 1
+    if buy_ratio >= 54.0:
+        score += 1
+    if exec_score >= 48:
+        score += 2
+        reasons.append(f"체결속도 {exec_score}점")
+    if exec_score >= 60:
+        score += 1
+    if dip_score >= 55:
+        score += 1
+    summary = " / ".join(reasons[:5])
+    return {
+        "score": int(score),
+        "summary": summary,
+        "foreign_net": foreign_net,
+        "institution_net": institution_net,
+        "investor_total": investor_total,
+        "bid_ask_ratio": round(bid_ask_ratio, 3),
+        "support_levels": support_levels,
+        "trade_strength": round(trade_strength, 2),
+        "buy_ratio": round(buy_ratio, 1),
+        "execution_speed_score": exec_score,
+        "dip_resilience_score": dip_score,
+    }
+
+
+def _build_quiet_absorption_record(seed: dict, source: str = "quiet_absorption") -> dict:
+    seed = seed if isinstance(seed, dict) else {}
+    code = normalize_stock_code(seed.get("code", ""))
+    name = _resolve_stock_name(code, seed.get("name", ""), seed)
+    market = "NXT" if str(seed.get("market", "")).upper() == "NXT" else "KRX"
+    if not code or not is_trade_candidate_name(name):
+        return {}
+    theme_name, peers, _ = get_theme_sector_stocks(code)
+    if _is_generic_sector_theme(theme_name):
+        return {}
+    quiet_ctx = _score_quiet_absorption_context(seed)
+    quiet_score = int(quiet_ctx.get("score", 0) or 0)
+    if quiet_score < int(MARKET_FLOW_QUIET_MIN_SCORE or 0):
+        return {}
+    now_ts = time.time()
+    member_count = max(2, min(len(list(peers or [])) + 1, int(MARKET_FLOW_MAX_MEMBERS or 6)))
+    summary = str(quiet_ctx.get("summary", "") or "조용한 선매집 징후")
+    return {
+        "theme": theme_name,
+        "theme_key": theme_name,
+        "source": str(source or "quiet_absorption"),
+        "stage": "quiet_absorption",
+        "flow_score": max(int(MARKET_FLOW_MIN_SCORE or 0) + 2, int(MARKET_FLOW_MIN_SCORE or 0) + quiet_score - 1),
+        "leader_code": code,
+        "leader_name": name,
+        "leader_change": round(safe_float(seed.get("change_rate", 0.0), 0.0), 2),
+        "breadth_ratio": round(1.0 / max(member_count, 2), 4),
+        "mention_count": 0,
+        "headline": summary[:90],
+        "quiet_codes": [code],
+        "quiet_score": quiet_score,
+        "quiet_summary": summary[:120],
+        "bid_ask_ratio": round(safe_float(quiet_ctx.get("bid_ask_ratio", 0.0), 0.0), 3),
+        "trade_strength": round(safe_float(quiet_ctx.get("trade_strength", 0.0), 0.0), 2),
+        "foreign_net": safe_int(quiet_ctx.get("foreign_net", 0), 0),
+        "institution_net": safe_int(quiet_ctx.get("institution_net", 0), 0),
+        "updated_ts": now_ts,
+        "first_seen_ts": now_ts,
+        "market": market,
+    }
+
+
+def _register_quiet_absorption_seed(seed: dict, source: str = "quiet_absorption") -> bool:
+    rec = _build_quiet_absorption_record(seed, source=source)
+    if not rec:
+        return False
+    if not _upsert_market_flow_record(rec):
+        return False
+    _save_market_flow_state()
+    return True
+
+
 def _get_market_flow_hint(code: str, name: str = "", market: str = "", change_rate: float = 0.0, volume_ratio: float = 0.0) -> dict:
     code = normalize_stock_code(code)
     if not code or not isinstance(_market_flow_state, dict):
@@ -12651,8 +13035,12 @@ def _get_market_flow_hint(code: str, name: str = "", market: str = "", change_ra
     vr = safe_float(volume_ratio, 0.0)
     breadth_ratio = safe_float(rec.get("breadth_ratio", 0.0), 0.0)
     mention_count = int(rec.get("mention_count", 0) or 0)
+    quiet_score = int(rec.get("quiet_score", 0) or 0)
+    quiet_summary = str(rec.get("quiet_summary", rec.get("headline", "")) or "").strip()
     bonus = 0
-    if stage == "quiet_absorption" and code != leader_code and 0.0 <= cr < 4.5 and 0.5 <= vr <= 4.5:
+    if stage == "quiet_absorption" and code == leader_code and 0.0 <= cr <= MARKET_FLOW_QUIET_MAX_CHANGE and 0.0 <= vr <= max(MARKET_FLOW_QUIET_MAX_VOLUME_RATIO, 7.0):
+        bonus = max(3, MARKET_FLOW_FOLLOW_BONUS - 1)
+    elif stage == "quiet_absorption" and code != leader_code and 0.0 <= cr < 4.5 and 0.5 <= vr <= 4.5:
         bonus = MARKET_FLOW_FOLLOW_BONUS + 1
     elif stage == "quiet_rotation" and code != leader_code and (cr >= 1.2 or vr >= 1.4):
         bonus = MARKET_FLOW_FOLLOW_BONUS
@@ -12663,6 +13051,8 @@ def _get_market_flow_hint(code: str, name: str = "", market: str = "", change_ra
     if mention_count >= 2:
         bonus += 1
     if breadth_ratio >= 0.34:
+        bonus += 1
+    if quiet_score >= max(0, int(MARKET_FLOW_QUIET_MIN_SCORE or 0) + 2) and stage == "quiet_absorption":
         bonus += 1
     bonus = int(min(bonus, MARKET_FLOW_EVENT_BONUS + MARKET_FLOW_FOLLOW_BONUS))
     if bonus <= 0:
@@ -12682,6 +13072,8 @@ def _get_market_flow_hint(code: str, name: str = "", market: str = "", change_ra
         "bonus": bonus,
         "headline": str(rec.get("headline") or ""),
         "flow_score": int(rec.get("flow_score", 0) or 0),
+        "quiet_score": quiet_score,
+        "summary": quiet_summary,
         "reason": f"시장 자금 이동 [{theme_name}] {stage_label}",
     }
 
@@ -21158,7 +21550,7 @@ def _apply_analyze_market_flow_context(ctx: dict, sector_info: dict, score: int,
     if bonus <= 0:
         return score, reasons, False, 0
     score += bonus
-    headline = str(hint.get("headline", "") or "").strip()
+    headline = str(hint.get("summary", hint.get("headline", "")) or "").strip()
     reasons.append(f"🧭 {hint.get('reason','시장 자금 이동')} {bonus:+d}점 — 리더 {hint.get('leader_name','')}" + (f" / {headline[:28]}" if headline else ""))
     if _is_generic_sector_theme(sector_info.get("theme", "")) and hint.get("theme"):
         sector_info["theme"] = hint["theme"]
@@ -29916,6 +30308,58 @@ def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
         _append_scan_alert(alerts, seen, r, hist_key=(f"NXT_{r['code']}" if r else None), seen_code=stock["code"])
 
 
+def _collect_quiet_absorption_scan_pool(existing_codes: set | None = None) -> list[dict]:
+    scan_limit = max(2, int(MARKET_FLOW_QUIET_SCAN_LIMIT_PER_MARKET or 2))
+    pool: list[dict] = []
+    seen = set(existing_codes or set())
+    for stock in get_market_rank_focus_stocks(scan_limit_per_market=scan_limit):
+        code = normalize_stock_code(stock.get("code", ""))
+        if not code or code in seen:
+            continue
+        change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+        volume_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
+        if change_rate < MARKET_FLOW_QUIET_MIN_CHANGE or change_rate > MARKET_FLOW_QUIET_MAX_CHANGE:
+            continue
+        if volume_ratio <= 0 or volume_ratio > MARKET_FLOW_QUIET_MAX_VOLUME_RATIO:
+            continue
+        seen.add(code)
+        pool.append(stock)
+    return pool
+
+
+def _slice_quiet_absorption_scan_pool(pool: list[dict]) -> list[dict]:
+    if not pool:
+        return []
+    deep_limit = max(1, int(MARKET_FLOW_QUIET_DEEP_FETCH_LIMIT or 1))
+    if len(pool) <= deep_limit:
+        return pool
+    cursor = int(_quiet_scan_cursor.get("all", 0) or 0) % len(pool)
+    selected = [pool[(cursor + idx) % len(pool)] for idx in range(deep_limit)]
+    _quiet_scan_cursor["all"] = (cursor + deep_limit) % len(pool)
+    return selected
+
+
+def _scan_quiet_absorption_candidates(alerts: list, seen: set) -> None:
+    pool = _slice_quiet_absorption_scan_pool(_collect_quiet_absorption_scan_pool(existing_codes=seen))
+    if not pool:
+        return
+    _reset_quiet_scan_cycle_state()
+    for stock in pool:
+        code = normalize_stock_code(stock.get("code", ""))
+        if not code:
+            continue
+        registered = _register_quiet_absorption_seed(stock, source="quiet_absorption_scan")
+        if not registered or code in seen:
+            continue
+        analyzed = analyze(stock)
+        if isinstance(analyzed, dict):
+            analyzed.setdefault("reasons", []).append("🪙 뉴스 전 조용한 선매집 초기감지")
+        _append_scan_alert(alerts, seen, analyzed, seen_code=code)
+    skipped = int(_quiet_scan_cycle_state.get("skipped_budget", 0) or 0)
+    if skipped > 0:
+        _log_info_msg(f"  ⏭ quiet scan budget 절약: snapshot 생략 {skipped}건")
+
+
 def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
     _rank_scan_limit = NXT_POSTMARKET_EXTRA_RANK_LIMIT if _is_nxt_postmarket_only_window() else None
     for stock in get_market_rank_focus_stocks(scan_limit_per_market=_rank_scan_limit):
@@ -30018,6 +30462,7 @@ def run_scan():
             _scan_krx_market_candidates(alerts, seen)
         if ctx["nxt_open"]:
             _scan_nxt_market_candidates(alerts, seen)
+        _scan_quiet_absorption_candidates(alerts, seen)
         _scan_rank_and_theme_candidates(alerts, seen)
         _scan_sector_leader_follow_candidates(alerts, seen)
         _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
