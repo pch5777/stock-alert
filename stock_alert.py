@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v132
+버전: v133
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v133 (2026-03-30): 일반 포착 1차도달 헤더/워치독 후보미스 hotfix — 일반 포착 제목의 `+ 1차 진입가 도달`을 명시적 도달 상태에서만 붙도록 바로잡고, NXT-only 구간 워치독이 KRX 상승랭킹을 근거로 `candidate_miss` 코드수정 요청을 오진하던 경로를 시장 기준 정렬로 차단.
 - v132 (2026-03-30): A게이트 재설계 — B외부알림 신설 없이 near-A 상위 후보만 A권으로 제한 흡수하도록 일반 신호 A완화 기준을 확장하고, STRONG_BUY/장중 capture 계열의 직접재료·테마동조·수급 결합 신호를 실행형 A에 재편입.
 - v131 (2026-03-30): intraday watchdog hotfix — 최초 외부알림 전 epoch 기준 침묵 분 표시를 부팅 기준으로 바로잡고, A전용 외부알림 정책을 코드오류처럼 오진하던 워치독/코드수정 요청 문구를 정책 기준에 맞게 정렬.
 - v130 (2026-03-30): analyze hotfix — 누락된 `_apply_analyze_theme_context()`를 복구해 run_scan NameError를 차단하고, analyze 경로의 섹터 모멘텀·테마 동조·adaptive feedback·miss-theme breadth/NXT 장후 리더 보정을 다시 연결.
@@ -4132,23 +4133,33 @@ def _fetch_daum_rank(top_n: int = 30) -> list:
     result.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
     return result[:top_n]
 
-def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: int = 30) -> list:
+def _resolve_watchdog_market_basis() -> str:
+    if is_nxt_open() and not is_market_open():
+        return "NXT"
+    return "KRX"
+
+
+def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: int = 30, market: str = "AUTO") -> list:
     """
     외부 소스(네이버→다음→유니버스) 순으로 시도해 상승 종목 목록 반환.
-    KIS API 정상 여부와 무관하게 독립 동작.
-    워치독, fallback 체인에서 공통 사용.
+    워치독에서는 활성 시장 기준으로 KRX/NXT를 정렬한다.
     """
-    # 1순위: 네이버 상승률
-    items = _fetch_naver_rank("rise", top_n=top_n)
-    if not items:
-        # 2순위: 다음
-        items = _fetch_daum_rank(top_n=top_n)
-    if not items:
-        # 3순위: 자체 유니버스 (항상 동작)
-        raw = _rank_from_universe("KRX")
-        items = [{**r, "source": "universe"} for r in raw]
+    market_basis = str(market or "AUTO").upper()
+    if market_basis not in {"KRX", "NXT"}:
+        market_basis = _resolve_watchdog_market_basis()
 
-    # min_change 이상만 필터
+    items = []
+    if market_basis == "NXT":
+        raw = _rank_from_universe("NXT")
+        items = [{**r, "source": "universe_nxt", "market": "NXT"} for r in raw]
+    else:
+        items = _fetch_naver_rank("rise", top_n=top_n)
+        if not items:
+            items = _fetch_daum_rank(top_n=top_n)
+        if not items:
+            raw = _rank_from_universe("KRX")
+            items = [{**r, "source": "universe", "market": "KRX"} for r in raw]
+
     filtered = [r for r in items if float(r.get("change_rate", 0) or 0) >= min_change]
     filtered.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
     return filtered[:top_n]
@@ -4339,7 +4350,8 @@ def _watchdog_restore_relax() -> bool:
     return False
 
 def _load_intraday_watchdog_rising() -> list:
-    return _fetch_external_rank_top(min_change=WATCHDOG_RANK_MIN_CHANGE, top_n=WATCHDOG_RANK_TOP_N)
+    market_basis = _resolve_watchdog_market_basis()
+    return _fetch_external_rank_top(min_change=WATCHDOG_RANK_MIN_CHANGE, top_n=WATCHDOG_RANK_TOP_N, market=market_basis)
 
 
 def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
@@ -4381,7 +4393,8 @@ def _build_intraday_watchdog_lines(state: dict, relax_changes: list[str]) -> lis
     total_blocked = state["total_blocked"]
     elapsed_since_alert = state["elapsed_since_alert"]
     alert_baseline_label = str(state.get("alert_baseline_label") or "")
-    source_label = (rising[0].get("source", "?") if rising else "?").replace("naver_rise", "네이버").replace("daum_rise", "다음").replace("universe", "내부유니버스")
+    source_label = (rising[0].get("source", "?") if rising else "?")
+    source_label = source_label.replace("naver_rise", "네이버").replace("daum_rise", "다음").replace("universe_nxt", "내부유니버스(NXT)").replace("universe", "내부유니버스")
     top3_rising = ", ".join([f"{r.get('name','?')} {float(r.get('change_rate',0)):+.1f}%" for r in rising[:3]])
     reason_labels = {
         "grade_suppressed": "A전용 정책 억제",
@@ -4395,6 +4408,7 @@ def _build_intraday_watchdog_lines(state: dict, relax_changes: list[str]) -> lis
         f"━━━━━━━━━━━━━━━",
         f"⏱ 알림 침묵: <b>{int(elapsed_since_alert/60)}분</b> (기준 {_WATCHDOG_SILENCE_MIN}분, {alert_baseline_label})",
         f"📈 외부 상승 종목: <b>{n_rising}개</b> [{source_label}]",
+        f"🏷 감시 시장 기준: <b>{_resolve_watchdog_market_basis()}</b>",
         f"   {top3_rising} 등",
         f"",
         f"🔍 차단 사유 분석 ({total_blocked}건):",
@@ -17684,20 +17698,17 @@ def _is_general_capture_first_entry_reached(signal: dict | None = None, live_pri
     sig_type = str(signal.get("signal_type") or "").upper()
     if sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
         return False
-    code = normalize_stock_code(signal.get("code", ""))
-    entry, _ = _select_capture_expected_entry_price(signal)
-    entry = safe_int(entry, 0)
-    current_price = safe_int(live_price or signal.get("price", 0), 0)
-    if entry > 0 and current_price >= entry:
+    if signal.get("first_entry_reached") is True:
         return True
-    if code:
+    code = normalize_stock_code(signal.get("code", ""))
+    if code and signal.get("_allow_existing_entry_hit_header"):
         try:
             _, watch = _find_existing_entry_hit_watch(code)
             if isinstance(watch, dict) and (watch.get("entry_hit") or watch.get("entry_hit_locked")):
                 return True
         except Exception as e:
             _swallow_exception(e)
-    return bool(signal.get("first_entry_reached"))
+    return False
 
 
 def _apply_first_entry_reached_header_line(header_line: str, signal: dict | None = None, live_price: int = 0) -> str:
