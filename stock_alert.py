@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v133
+버전: v134
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,7 @@
 
 
 
+- v134 (2026-03-30): KIS 토큰 캐시/403 진단 hotfix — tokenP 24시간 토큰을 프로세스 재시작 후에도 재사용하도록 영속 캐시를 추가하고, 403 발생 시 캐시 무효화·응답 본문 스니펫·실전/모의 및 재발급 힌트를 함께 남겨 동일일 재발급/권한 문제 추적을 쉽게 정리.
 - v133 (2026-03-30): 일반 포착 1차도달 헤더/워치독 후보미스 hotfix — 일반 포착 제목의 `+ 1차 진입가 도달`을 명시적 도달 상태에서만 붙도록 바로잡고, NXT-only 구간 워치독이 KRX 상승랭킹을 근거로 `candidate_miss` 코드수정 요청을 오진하던 경로를 시장 기준 정렬로 차단.
 - v132 (2026-03-30): A게이트 재설계 — B외부알림 신설 없이 near-A 상위 후보만 A권으로 제한 흡수하도록 일반 신호 A완화 기준을 확장하고, STRONG_BUY/장중 capture 계열의 직접재료·테마동조·수급 결합 신호를 실행형 A에 재편입.
 - v131 (2026-03-30): intraday watchdog hotfix — 최초 외부알림 전 epoch 기준 침묵 분 표시를 부팅 기준으로 바로잡고, A전용 외부알림 정책을 코드오류처럼 오진하던 워치독/코드수정 요청 문구를 정책 기준에 맞게 정렬.
@@ -4642,7 +4643,7 @@ _load_dotenv()
 KIS_APP_KEY        = os.environ.get("KIS_APP_KEY", "")
 KIS_APP_SECRET     = os.environ.get("KIS_APP_SECRET", "")
 KIS_ACCOUNT_NO     = os.environ.get("KIS_ACCOUNT_NO", "")
-KIS_BASE_URL       = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443").strip()
+KIS_BASE_URL       = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443").strip().rstrip("/")
 DART_API_KEY       = os.environ.get("DART_API_KEY", "")      # DART 공시 API
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -5045,6 +5046,7 @@ _access_token       = None
 _token_expires      = 0
 _session            = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
+KIS_TOKEN_STATE_FILE = _state_path("kis_token_state.json")
 
 # 디버그: 어떤 KIS 서버로 붙는지 1회 출력(환경 혼동 방지)
 try:
@@ -5360,25 +5362,96 @@ def _wait_for_kis_rest_slot(kind: str = "rest") -> None:
             _kis_rate_stats[stat_wait_key] = float(_kis_rate_stats.get(stat_wait_key, 0.0)) + float(sleep_for)
         time.sleep(sleep_for)
 
+def _load_kis_token_state() -> dict:
+    state = _read_json_locked(KIS_TOKEN_STATE_FILE, default={})
+    return state if isinstance(state, dict) else {}
+
+
+def _save_kis_token_state(token: str, expires_at: float) -> None:
+    payload = {
+        "access_token": str(token or "").strip(),
+        "expires_at": int(float(expires_at or 0)),
+        "base_url": KIS_BASE_URL,
+        "saved_at": int(time.time()),
+    }
+    _write_json_atomic(KIS_TOKEN_STATE_FILE, payload, indent=2)
+
+
+def _clear_kis_token_state() -> None:
+    _write_json_atomic(KIS_TOKEN_STATE_FILE, {}, indent=2)
+
+
+def _restore_kis_token_from_state() -> str:
+    global _access_token, _token_expires
+    state = _load_kis_token_state()
+    token = str(state.get("access_token") or "").strip()
+    expires_at = int(float(state.get("expires_at") or 0))
+    base_url = str(state.get("base_url") or "").strip().rstrip("/")
+    if not token or expires_at <= int(time.time()) + 300:
+        return ""
+    if base_url and base_url != KIS_BASE_URL:
+        return ""
+    _access_token = token
+    _token_expires = expires_at
+    _log_info_msg(f"♻️ KIS 토큰 캐시 복원 ({datetime.now().strftime('%H:%M:%S')})")
+    return token
+
+
+def _validate_kis_oauth_config() -> None:
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        raise RuntimeError("KIS_APP_KEY 또는 KIS_APP_SECRET 누락")
+    if not KIS_BASE_URL.startswith("https://"):
+        raise RuntimeError(f"KIS_BASE_URL 형식 오류: {KIS_BASE_URL}")
+
+
+def _kis_http_error_body_snippet(resp) -> str:
+    try:
+        raw = (getattr(resp, "text", "") or "").strip()
+        return " ".join(raw.split())[:240]
+    except Exception as e:
+        _swallow_exception(e)
+        return ""
+
+
 def get_token(retry: int = 3) -> str:
     global _access_token, _token_expires
+    _validate_kis_oauth_config()
     if _access_token and time.time() < _token_expires:
         return _access_token
+    cached = _restore_kis_token_from_state()
+    if cached:
+        return cached
+    last_error: Exception | None = None
     for attempt in range(retry):
+        resp = None
         try:
             _wait_for_kis_rest_slot("token")
-            resp = _session.post(f"{KIS_BASE_URL}/oauth2/tokenP",
+            resp = _session.post(
+                f"{KIS_BASE_URL}/oauth2/tokenP",
                 json={"grant_type":"client_credentials","appkey":KIS_APP_KEY,"appsecret":KIS_APP_SECRET},
-                timeout=15)
+                timeout=15,
+            )
             resp.raise_for_status()
             d = resp.json()
-            _access_token  = d["access_token"]
+            _access_token = d["access_token"]
             _token_expires = time.time() + int(d.get("expires_in", 86400)) - 300
+            _save_kis_token_state(_access_token, _token_expires)
             _log_info_msg(f"✅ KIS 토큰 발급 ({datetime.now().strftime('%H:%M:%S')})")
             return _access_token
+        except requests.HTTPError as e:
+            status = getattr(resp, "status_code", None)
+            body_snip = _kis_http_error_body_snippet(resp)
+            if status == 403:
+                _clear_kis_token_state()
+                hint = "실전/모의 URL-키 조합, API신청/권한 상태, 동일일 재발급 여부 점검 필요"
+                last_error = RuntimeError(f"KIS tokenP 403 Forbidden | {hint} | body={body_snip or '없음'}")
+            else:
+                last_error = RuntimeError(f"KIS tokenP HTTP {status} | body={body_snip or '없음'}")
         except Exception as e:
-            _log_error(f"get_token(attempt={attempt+1})", e, critical=attempt==2); time.sleep(5*(attempt+1))
-    raise Exception("❌ KIS 토큰 최종 실패")
+            last_error = e
+        _log_error(f"get_token(attempt={attempt+1})", last_error, critical=attempt==retry-1)
+        time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"❌ KIS 토큰 최종 실패: {last_error}")
 
 def _headers(tr_id: str) -> dict:
     return {"Content-Type":"application/json; charset=utf-8",
@@ -5402,8 +5475,10 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             last_url = getattr(resp, "url", url) or url
 
             if last_status == 403:
-                global _access_token
+                global _access_token, _token_expires
                 _access_token = None
+                _token_expires = 0
+                _clear_kis_token_state()
                 _wait_for_kis_rest_slot("rest")
                 resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
                 last_status = getattr(resp, "status_code", None)
