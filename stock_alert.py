@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v134
+버전: v136
 날짜: 2026-03-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,6 +12,8 @@
 
 
 
+- v136 (2026-03-30): 리더 조기포착 폭 확대 — KRX 거래량 rank 조회 폭을 30→80으로 넓히고 `get_volume_surge_stocks()`를 `_get_krx_volume_rank_count()` helper로 전환, 전역 `PRICE_SURGE_MIN`과 full-session `surge_min_change` 컷을 4%대 초반으로 정렬해 1번타자 seed가 sector leader follow에 더 빨리 등록되도록 조정.
+- v135 (2026-03-30): 섹터 대장 후속 강제감시 추가 — 상한가/강한 급등 대장을 감지하면 동일 테마·동업종 peer를 3일간 영속 watch로 등록해 장중 스캔에 강제 편입하고, 후속 후보가 near-A일 때 A권에 더 잘 올라오도록 점수/정렬 보정을 연결.
 - v134 (2026-03-30): KIS 토큰 캐시/403 진단 hotfix — tokenP 24시간 토큰을 프로세스 재시작 후에도 재사용하도록 영속 캐시를 추가하고, 403 발생 시 캐시 무효화·응답 본문 스니펫·실전/모의 및 재발급 힌트를 함께 남겨 동일일 재발급/권한 문제 추적을 쉽게 정리.
 - v133 (2026-03-30): 일반 포착 1차도달 헤더/워치독 후보미스 hotfix — 일반 포착 제목의 `+ 1차 진입가 도달`을 명시적 도달 상태에서만 붙도록 바로잡고, NXT-only 구간 워치독이 KRX 상승랭킹을 근거로 `candidate_miss` 코드수정 요청을 오진하던 경로를 시장 기준 정렬로 차단.
 - v132 (2026-03-30): A게이트 재설계 — B외부알림 신설 없이 near-A 상위 후보만 A권으로 제한 흡수하도록 일반 신호 A완화 기준을 확장하고, STRONG_BUY/장중 capture 계열의 직접재료·테마동조·수급 결합 신호를 실행형 A에 재편입.
@@ -4667,7 +4669,7 @@ MAX_TELEGRAM_BACKUPS = 5  # [v41.85] 텔레그램 백업 최대 보관 수
 # ============================================================
 # 기본 스캔
 VOLUME_SURGE_RATIO    = 5.0
-PRICE_SURGE_MIN       = 5.0
+PRICE_SURGE_MIN       = float(os.getenv("PRICE_SURGE_MIN", "4.0") or "4.0")
 UPPER_LIMIT_THRESHOLD = 25.0
 EARLY_PRICE_MIN       = 9.0
 EARLY_VOLUME_MIN      = 9.0
@@ -4809,13 +4811,14 @@ MID_RESURGE_MIN_BOUNCE_PCT   = 5.0
 MID_RESURGE_ENTRY_DISCOUNT_PCT = 1.1
 MID_SOFT_ALLOW_MIN_SCORE     = 75
 GENERAL_SOFT_ALLOW_MIN_SCORE = int(os.getenv("GENERAL_SOFT_ALLOW_MIN_SCORE", "72") or "72")
-GENERAL_SOFT_ALLOW_MIN_CHANGE = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_CHANGE", "5.0") or "5.0")
+GENERAL_SOFT_ALLOW_MIN_CHANGE = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_CHANGE", "4.2") or "4.2")
 GENERAL_SOFT_ALLOW_MIN_VOLUME = float(os.getenv("GENERAL_SOFT_ALLOW_MIN_VOLUME", "3.0") or "3.0")
 NXT_POSTMARKET_HELPER_START = dtime(15, 40)
-NXT_POSTMARKET_MIN_CHANGE = float(os.getenv("NXT_POSTMARKET_MIN_CHANGE", "4.5") or "4.5")
+NXT_POSTMARKET_MIN_CHANGE = float(os.getenv("NXT_POSTMARKET_MIN_CHANGE", "4.2") or "4.2")
 NXT_POSTMARKET_MIN_VOLUME = float(os.getenv("NXT_POSTMARKET_MIN_VOLUME", "1.6") or "1.6")
 NXT_POSTMARKET_ALERT_MIN_SCORE = int(os.getenv("NXT_POSTMARKET_ALERT_MIN_SCORE", "74") or "74")
 NXT_POSTMARKET_EXTRA_RANK_LIMIT = int(os.getenv("NXT_POSTMARKET_EXTRA_RANK_LIMIT", "20") or "20")
+KRX_VOLUME_RANK_COUNT = int(os.getenv("KRX_VOLUME_RANK_COUNT", "80") or "80")
 NXT_POSTMARKET_VOLUME_RANK_EARLY = int(os.getenv("NXT_POSTMARKET_VOLUME_RANK_EARLY", "30") or "30")
 NXT_POSTMARKET_VOLUME_RANK_LATE = int(os.getenv("NXT_POSTMARKET_VOLUME_RANK_LATE", "40") or "40")
 NEWS_STOCK_PROMOTION_MIN_CHANGE = float(os.getenv("NEWS_STOCK_PROMOTION_MIN_CHANGE", "2.0") or "2.0")
@@ -4896,14 +4899,14 @@ GLOBAL_PATTERN_THEME_EXPANSION_MIN_RISERS = int(os.getenv("GLOBAL_PATTERN_THEME_
 CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE = float(os.getenv("CROSSDAY_EXECUTION_DIRECT_MIN_CHANGE", "7.5") or "7.5")
 
 FULL_SESSION_CAPTURE_PROFILES = {
-    "nxt_pre": {"label": "NXT 장전", "early_min_change": 1.5, "early_min_vol": 1.3, "surge_min_change": 4.0, "surge_min_vol": 1.8, "near_upper_min_change": 19.5, "near_upper_min_vol": 2.4, "required_vol_mult": {"EARLY_DETECT": 0.82, "SURGE": 0.76, "NEAR_UPPER": 0.78, "UPPER_LIMIT": 0.88}, "surge_cap": 4.8, "surge_strong_cap": 4.2, "near_upper_cap": 3.8, "upper_limit_cap": 2.6, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 8}},
-    "opening": {"label": "정규장 초반", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.2, "surge_min_vol": 2.0, "near_upper_min_change": 20.5, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 5.0, "surge_strong_cap": 4.4, "near_upper_cap": 4.0, "upper_limit_cap": 2.8, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
-    "morning": {"label": "정규장 오전", "early_min_change": 1.9, "early_min_vol": 1.5, "surge_min_change": 4.4, "surge_min_vol": 2.1, "near_upper_min_change": 21.0, "near_upper_min_vol": 2.8, "required_vol_mult": {"EARLY_DETECT": 0.90, "SURGE": 0.84, "NEAR_UPPER": 0.85, "UPPER_LIMIT": 0.90}, "surge_cap": 5.4, "surge_strong_cap": 4.8, "near_upper_cap": 4.2, "upper_limit_cap": COMMON_THRESHOLD_3P0, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
-    "afternoon": {"label": "정규장 오후", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.3, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.88, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.2, "surge_strong_cap": 4.6, "near_upper_cap": 4.1, "upper_limit_cap": COMMON_THRESHOLD_3P0, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
-    "late": {"label": "정규장 후반", "early_min_change": 2.0, "early_min_vol": 1.5, "surge_min_change": 4.7, "surge_min_vol": 2.2, "near_upper_min_change": 21.8, "near_upper_min_vol": COMMON_THRESHOLD_3P0, "required_vol_mult": {"EARLY_DETECT": 0.92, "SURGE": 0.88, "NEAR_UPPER": 0.88, "UPPER_LIMIT": 0.92}, "surge_cap": 5.8, "surge_strong_cap": 5.0, "near_upper_cap": 4.4, "upper_limit_cap": 3.1, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 3, "NEAR_UPPER": 5}},
-    "nxt_post_early": {"label": "NXT 장후 초반", "early_min_change": 1.6, "early_min_vol": 1.3, "surge_min_change": 4.1, "surge_min_vol": 1.8, "near_upper_min_change": 20.0, "near_upper_min_vol": 2.5, "required_vol_mult": {"EARLY_DETECT": 0.84, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 4.9, "surge_strong_cap": 4.3, "near_upper_cap": 3.9, "upper_limit_cap": 2.7, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
-    "nxt_post_late": {"label": "NXT 장후 후반", "early_min_change": 1.7, "early_min_vol": 1.4, "surge_min_change": 4.4, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.6, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.1, "surge_strong_cap": 4.5, "near_upper_cap": 4.0, "upper_limit_cap": 2.9, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
-    "other": {"label": "전시간대", "early_min_change": 2.0, "early_min_vol": 1.6, "surge_min_change": 4.8, "surge_min_vol": 2.3, "near_upper_min_change": 22.0, "near_upper_min_vol": COMMON_THRESHOLD_3P0, "required_vol_mult": {"EARLY_DETECT": 1.0, "SURGE": 1.0, "NEAR_UPPER": 1.0, "UPPER_LIMIT": 1.0}, "surge_cap": 6.0, "surge_strong_cap": 5.2, "near_upper_cap": 4.5, "upper_limit_cap": 3.2, "a_relax_bonus": 0, "confirm_count": 3, "promo_bonus": {"EARLY_DETECT": 0, "SURGE": 0, "NEAR_UPPER": 0}},
+    "nxt_pre": {"label": "NXT 장전", "early_min_change": 1.5, "early_min_vol": 1.3, "surge_min_change": 3.8, "surge_min_vol": 1.8, "near_upper_min_change": 19.5, "near_upper_min_vol": 2.4, "required_vol_mult": {"EARLY_DETECT": 0.82, "SURGE": 0.76, "NEAR_UPPER": 0.78, "UPPER_LIMIT": 0.88}, "surge_cap": 4.8, "surge_strong_cap": 4.2, "near_upper_cap": 3.8, "upper_limit_cap": 2.6, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 8}},
+    "opening": {"label": "정규장 초반", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.0, "surge_min_vol": 2.0, "near_upper_min_change": 20.5, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 5.0, "surge_strong_cap": 4.4, "near_upper_cap": 4.0, "upper_limit_cap": 2.8, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
+    "morning": {"label": "정규장 오전", "early_min_change": 1.9, "early_min_vol": 1.5, "surge_min_change": 4.1, "surge_min_vol": 2.1, "near_upper_min_change": 21.0, "near_upper_min_vol": 2.8, "required_vol_mult": {"EARLY_DETECT": 0.90, "SURGE": 0.84, "NEAR_UPPER": 0.85, "UPPER_LIMIT": 0.90}, "surge_cap": 5.4, "surge_strong_cap": 4.8, "near_upper_cap": 4.2, "upper_limit_cap": COMMON_THRESHOLD_3P0, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "afternoon": {"label": "정규장 오후", "early_min_change": 1.8, "early_min_vol": 1.4, "surge_min_change": 4.1, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.7, "required_vol_mult": {"EARLY_DETECT": 0.88, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.2, "surge_strong_cap": 4.6, "near_upper_cap": 4.1, "upper_limit_cap": COMMON_THRESHOLD_3P0, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "late": {"label": "정규장 후반", "early_min_change": 2.0, "early_min_vol": 1.5, "surge_min_change": 4.5, "surge_min_vol": 2.2, "near_upper_min_change": 21.8, "near_upper_min_vol": COMMON_THRESHOLD_3P0, "required_vol_mult": {"EARLY_DETECT": 0.92, "SURGE": 0.88, "NEAR_UPPER": 0.88, "UPPER_LIMIT": 0.92}, "surge_cap": 5.8, "surge_strong_cap": 5.0, "near_upper_cap": 4.4, "upper_limit_cap": 3.1, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 3, "NEAR_UPPER": 5}},
+    "nxt_post_early": {"label": "NXT 장후 초반", "early_min_change": 1.6, "early_min_vol": 1.3, "surge_min_change": 3.9, "surge_min_vol": 1.8, "near_upper_min_change": 20.0, "near_upper_min_vol": 2.5, "required_vol_mult": {"EARLY_DETECT": 0.84, "SURGE": 0.78, "NEAR_UPPER": 0.80, "UPPER_LIMIT": 0.88}, "surge_cap": 4.9, "surge_strong_cap": 4.3, "near_upper_cap": 3.9, "upper_limit_cap": 2.7, "a_relax_bonus": 2, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 2, "SURGE": 5, "NEAR_UPPER": 7}},
+    "nxt_post_late": {"label": "NXT 장후 후반", "early_min_change": 1.7, "early_min_vol": 1.4, "surge_min_change": 4.2, "surge_min_vol": 2.0, "near_upper_min_change": 20.8, "near_upper_min_vol": 2.6, "required_vol_mult": {"EARLY_DETECT": 0.86, "SURGE": 0.82, "NEAR_UPPER": 0.84, "UPPER_LIMIT": 0.90}, "surge_cap": 5.1, "surge_strong_cap": 4.5, "near_upper_cap": 4.0, "upper_limit_cap": 2.9, "a_relax_bonus": 1, "confirm_count": 2, "promo_bonus": {"EARLY_DETECT": 1, "SURGE": 4, "NEAR_UPPER": 6}},
+    "other": {"label": "전시간대", "early_min_change": 2.0, "early_min_vol": 1.6, "surge_min_change": 4.5, "surge_min_vol": 2.3, "near_upper_min_change": 22.0, "near_upper_min_vol": COMMON_THRESHOLD_3P0, "required_vol_mult": {"EARLY_DETECT": 1.0, "SURGE": 1.0, "NEAR_UPPER": 1.0, "UPPER_LIMIT": 1.0}, "surge_cap": 6.0, "surge_strong_cap": 5.2, "near_upper_cap": 4.5, "upper_limit_cap": 3.2, "a_relax_bonus": 0, "confirm_count": 3, "promo_bonus": {"EARLY_DETECT": 0, "SURGE": 0, "NEAR_UPPER": 0}},
 }
 INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "900") or "900")
 
@@ -5099,6 +5102,18 @@ NEWS_COOCCUR_FILE   = _state_path("news_cooccur.json")
 # v41.77 #4: 야간 이벤트 워치리스트
 OVERNIGHT_WATCHLIST_FILE = _state_path("overnight_watchlist.json")
 _overnight_watchlist: dict = {}  # {code: {name, reason, keywords, ts}}
+
+SECTOR_LEADER_FOLLOW_FILE = _state_path("sector_leader_follow_watch.json")
+SECTOR_LEADER_FOLLOW_KEEP_DAYS = int(os.getenv("SECTOR_LEADER_FOLLOW_KEEP_DAYS", "3") or "3")
+SECTOR_LEADER_FOLLOW_MAX_PEERS = int(os.getenv("SECTOR_LEADER_FOLLOW_MAX_PEERS", "10") or "10")
+SECTOR_LEADER_FOLLOW_SCAN_LIMIT = int(os.getenv("SECTOR_LEADER_FOLLOW_SCAN_LIMIT", "8") or "8")
+SECTOR_LEADER_SEED_MIN_CHANGE = float(os.getenv("SECTOR_LEADER_SEED_MIN_CHANGE", "12.0") or "12.0")
+SECTOR_LEADER_SEED_MIN_VOLUME = float(os.getenv("SECTOR_LEADER_SEED_MIN_VOLUME", "4.0") or "4.0")
+SECTOR_LEADER_FOLLOW_MIN_CHANGE = float(os.getenv("SECTOR_LEADER_FOLLOW_MIN_CHANGE", "2.8") or "2.8")
+SECTOR_LEADER_FOLLOW_MIN_VOLUME = float(os.getenv("SECTOR_LEADER_FOLLOW_MIN_VOLUME", "1.6") or "1.6")
+SECTOR_LEADER_FOLLOW_BONUS = int(os.getenv("SECTOR_LEADER_FOLLOW_BONUS", "5") or "5")
+_sector_leader_follow_watch: dict = {"active": {}}
+_sector_leader_follow_seed_touched: dict = {}
 
 # v41.77 #1: 동적 테마 자동 발굴 — 야간 이벤트 키워드 → 국내 종목 매핑 테이블
 OVERNIGHT_EVENT_KEYWORDS = {
@@ -11441,7 +11456,7 @@ def get_volume_surge_stocks() -> list:
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171","FID_INPUT_ISCD":"0000",
         "FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111",
         "FID_TRGT_EXLS_CLS_CODE":"000000","FID_INPUT_PRICE_1":"1000",
-        "FID_INPUT_PRICE_2":"","FID_VOL_CNT":"30","FID_INPUT_DATE_1":"",
+        "FID_INPUT_PRICE_2":"","FID_VOL_CNT":str(_get_krx_volume_rank_count()),"FID_INPUT_DATE_1":"",
     })
     return [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
              "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
@@ -11521,6 +11536,14 @@ def _get_nxt_volume_rank_count() -> int:
     if slot == "post_early" and _is_nxt_postmarket_only_window():
         return max(20, NXT_POSTMARKET_VOLUME_RANK_EARLY)
     return 20
+
+def _get_krx_volume_rank_count() -> int:
+    base = max(30, int(KRX_VOLUME_RANK_COUNT or 30))
+    if _intraday_capture_mode_active(_get_intraday_capture_mode()):
+        return max(base, 80)
+    if is_strict_time():
+        return max(base, 60)
+    return base
 
 def _is_nxt_postmarket_leader_candidate(item: dict | None) -> bool:
     if not isinstance(item, dict) or not _is_nxt_postmarket_only_window():
@@ -12346,6 +12369,186 @@ def _format_overnight_watchlist_block() -> str:
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return ""
+
+
+
+def _default_sector_leader_follow_state() -> dict:
+    return {"active": {}}
+
+
+def _prune_sector_leader_follow_state(state: dict | None) -> dict:
+    active = {}
+    if isinstance(state, dict):
+        active = state.get("active") if isinstance(state.get("active"), dict) else {}
+    now_ts = time.time()
+    keep_sec = max(1, int(SECTOR_LEADER_FOLLOW_KEEP_DAYS or 1)) * 86400
+    pruned = {}
+    for raw_code, rec in active.items():
+        if not isinstance(rec, dict):
+            continue
+        code = normalize_stock_code(raw_code or rec.get("code"))
+        if not code:
+            continue
+        try:
+            expires_ts = float(rec.get("expires_ts", 0) or 0)
+            last_seen_ts = float(rec.get("last_seen_ts", rec.get("registered_ts", 0)) or 0)
+        except Exception as e:
+            _swallow_exception(e)
+            expires_ts = 0.0
+            last_seen_ts = 0.0
+        if expires_ts and expires_ts < now_ts:
+            continue
+        if last_seen_ts and now_ts - last_seen_ts > keep_sec:
+            continue
+        item = dict(rec)
+        item["code"] = code
+        item["name"] = _resolve_stock_name(code, rec.get("name", ""))
+        item["theme"] = str(rec.get("theme", "") or "")
+        item["leader_code"] = normalize_stock_code(rec.get("leader_code", ""))
+        item["leader_name"] = str(rec.get("leader_name", "") or "")
+        item["leader_change"] = round(float(rec.get("leader_change", 0.0) or 0.0), 2)
+        item["leader_volume_ratio"] = round(float(rec.get("leader_volume_ratio", 0.0) or 0.0), 2)
+        item["registered_ts"] = float(rec.get("registered_ts", last_seen_ts or now_ts) or (last_seen_ts or now_ts))
+        item["last_seen_ts"] = float(last_seen_ts or item["registered_ts"])
+        item["expires_ts"] = float(expires_ts or (item["registered_ts"] + keep_sec))
+        item["seed_signal"] = str(rec.get("seed_signal", "SURGE") or "SURGE")
+        item["peer_count"] = max(1, int(rec.get("peer_count", 1) or 1))
+        market = str(rec.get("market", "") or "").upper()
+        item["market"] = "NXT" if market == "NXT" else "KRX"
+        pruned[code] = item
+    return {"active": pruned}
+
+
+def _save_sector_leader_follow_state() -> None:
+    global _sector_leader_follow_watch
+    _sector_leader_follow_watch = _prune_sector_leader_follow_state(_sector_leader_follow_watch)
+    _write_state_json(SECTOR_LEADER_FOLLOW_FILE, _sector_leader_follow_watch)
+
+
+def _load_sector_leader_follow_state() -> None:
+    global _sector_leader_follow_watch
+    raw = _read_state_json(SECTOR_LEADER_FOLLOW_FILE, _default_sector_leader_follow_state())
+    _sector_leader_follow_watch = _prune_sector_leader_follow_state(raw)
+    if raw != _sector_leader_follow_watch:
+        _save_sector_leader_follow_state()
+    active_cnt = len((_sector_leader_follow_watch.get("active") or {})) if isinstance(_sector_leader_follow_watch, dict) else 0
+    if active_cnt:
+        _log_info_msg(f"📂 섹터 대장 후속 강제감시 {active_cnt}개 복원")
+
+
+def _get_sector_leader_follow_entry(code: str, market: str = "") -> dict:
+    active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+    rec = active.get(normalize_stock_code(code or ""))
+    if not isinstance(rec, dict):
+        return {}
+    rec_market = str(rec.get("market", "") or "").upper()
+    req_market = str(market or "").upper()
+    if req_market == "NXT" and rec_market not in ("", "NXT"):
+        return {}
+    return rec
+
+
+def _register_sector_leader_follow_seed(seed: dict) -> int:
+    global _sector_leader_follow_watch
+    if not isinstance(seed, dict):
+        return 0
+    seed_code = normalize_stock_code(seed.get("code", ""))
+    seed_name = _resolve_stock_name(seed_code, seed.get("name", ""))
+    if not seed_code or not is_trade_candidate_name(seed_name):
+        return 0
+    seed_change = safe_float(seed.get("change_rate", 0.0), 0.0)
+    seed_vol = safe_float(seed.get("volume_ratio", 0.0), 0.0)
+    upper_like = seed_change >= 29.0
+    if not (upper_like or (seed_change >= SECTOR_LEADER_SEED_MIN_CHANGE and seed_vol >= SECTOR_LEADER_SEED_MIN_VOLUME)):
+        return 0
+    market = "NXT" if str(seed.get("market", "") or "").upper() == "NXT" else "KRX"
+    touch_key = f"{datetime.now().strftime('%Y%m%d')}_{market}_{seed_code}"
+    last_touch = float(_sector_leader_follow_seed_touched.get(touch_key, 0) or 0)
+    if time.time() - last_touch < 600:
+        return 0
+    theme_name, peers, _ = get_theme_sector_stocks(seed_code)
+    if _is_generic_sector_theme(theme_name) or not peers:
+        return 0
+    now_ts = time.time()
+    expires_ts = now_ts + max(2, int(SECTOR_LEADER_FOLLOW_KEEP_DAYS or 3)) * 86400
+    active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+    added = 0
+    for peer_code, peer_name in list(peers or [])[:max(1, int(SECTOR_LEADER_FOLLOW_MAX_PEERS or 1))]:
+        peer_code = normalize_stock_code(peer_code)
+        if not peer_code or peer_code == seed_code:
+            continue
+        prev = active.get(peer_code) if isinstance(active.get(peer_code), dict) else {}
+        if prev and prev.get("leader_code") == seed_code and now_ts - float(prev.get("last_seen_ts", 0) or 0) < 600:
+            continue
+        active[peer_code] = {
+            "code": peer_code,
+            "name": _resolve_stock_name(peer_code, peer_name),
+            "theme": theme_name,
+            "leader_code": seed_code,
+            "leader_name": seed_name,
+            "leader_change": round(seed_change, 2),
+            "leader_volume_ratio": round(seed_vol, 2),
+            "registered_ts": float(prev.get("registered_ts", now_ts) or now_ts),
+            "last_seen_ts": now_ts,
+            "expires_ts": max(float(prev.get("expires_ts", 0) or 0), expires_ts),
+            "market": market,
+            "seed_signal": "UPPER_LIMIT" if upper_like else "SURGE",
+            "peer_count": max(1, len(peers or [])),
+        }
+        added += 1
+    _sector_leader_follow_watch = _prune_sector_leader_follow_state({"active": active})
+    if added:
+        _save_sector_leader_follow_state()
+        _sector_leader_follow_seed_touched[touch_key] = now_ts
+        _log_info_msg(f"🧭 섹터 대장 후속 강제감시 등록: {seed_name} [{theme_name}] → {added}개")
+    return added
+
+
+def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, limit_total: int | None = None) -> list:
+    active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+    if not active:
+        return []
+    existing = {normalize_stock_code(c) for c in (existing_codes or set()) if c}
+    limit_total = max(1, int(limit_total or SECTOR_LEADER_FOLLOW_SCAN_LIMIT or 1))
+    rows = []
+    touched = False
+    ordered = sorted(active.values(), key=lambda rec: (float((rec or {}).get("leader_change", 0.0) or 0.0), float((rec or {}).get("registered_ts", 0.0) or 0.0)), reverse=True)
+    for rec in ordered:
+        if len(rows) >= limit_total:
+            break
+        code = normalize_stock_code((rec or {}).get("code", ""))
+        if not code or code in existing:
+            continue
+        market = str((rec or {}).get("market", "") or "").upper()
+        try:
+            q = _get_live_quote_for_signal({"code": code, "name": rec.get("name", ""), "market": market if market == "NXT" else ""})
+        except Exception as e:
+            _swallow_exception(e)
+            q = {}
+        if not isinstance(q, dict) or not q.get("price"):
+            continue
+        chg = safe_float(q.get("change_rate", 0.0), 0.0)
+        vol = safe_float(q.get("volume_ratio", 0.0), 0.0)
+        if chg < SECTOR_LEADER_FOLLOW_MIN_CHANGE and vol < SECTOR_LEADER_FOLLOW_MIN_VOLUME:
+            continue
+        cand = dict(q)
+        cand["code"] = code
+        cand["name"] = _resolve_stock_name(code, rec.get("name", ""), q)
+        cand["desc"] = f"sector_leader_follow[{rec.get('theme', '기타')}]"
+        cand["_sector_leader_follow"] = dict(rec)
+        if market == "NXT":
+            cand["market"] = "NXT"
+        rows.append(cand)
+        existing.add(code)
+        try:
+            active[code]["last_seen_ts"] = time.time()
+            touched = True
+        except Exception as e:
+            _swallow_exception(e)
+        time.sleep(0.03)
+    if touched:
+        _save_sector_leader_follow_state()
+    return rows
 
 # ============================================================
 # 🏗️ 실질 섹터 분류 (4레이어 가중 스코어)
@@ -19824,15 +20027,19 @@ def _apply_bootstrap_signal_activation(ctx: dict) -> None:
     crossday_ctx = ctx.get("crossday_ctx") or {}
     current_time = ctx["current_time"]
 
+    market_name = str(stock.get("market", "") or "").upper()
+    capture_profile = _get_full_session_capture_profile(current_time=current_time, market=market_name)
+    surge_min_change = float(capture_profile.get("surge_min_change", PRICE_SURGE_MIN) or PRICE_SURGE_MIN)
+
     if change_rate >= 29.0:
         score += 40; reasons.append("🚨 상한가 도달!"); signal_type = "UPPER_LIMIT"
     elif change_rate >= UPPER_LIMIT_THRESHOLD or (crossday_ctx.get("near_upper_ready") and change_rate >= CROSSDAY_RESURGE_NEAR_UPPER_MIN_CHANGE):
         score += 25; reasons.append(f"🔥 상한가 근접 (+{change_rate:.1f}%)"); signal_type = "NEAR_UPPER"
         if crossday_ctx.get("near_upper_ready") and change_rate < UPPER_LIMIT_THRESHOLD:
             reasons.append("♻️ cross-day 재상승 강도 — NEAR_UPPER 조기 승격")
-    elif change_rate >= PRICE_SURGE_MIN or (crossday_ctx.get("confirmed") and change_rate >= CROSSDAY_RESURGE_SURGE_MIN_CHANGE):
+    elif change_rate >= surge_min_change or (crossday_ctx.get("confirmed") and change_rate >= CROSSDAY_RESURGE_SURGE_MIN_CHANGE):
         score += 15; reasons.append(f"📈 급등 +{change_rate:.1f}%"); signal_type = "SURGE"
-        if crossday_ctx.get("confirmed") and change_rate < PRICE_SURGE_MIN:
+        if crossday_ctx.get("confirmed") and change_rate < surge_min_change:
             reasons.append("♻️ cross-day 재상승 확인 — SURGE 조기 승격")
     elif crossday_ctx.get("prep") and change_rate >= CROSSDAY_RESURGE_PREP_MIN_CHANGE:
         score += 12; reasons.append(f"🧭 초기 강세 내부포착 +{change_rate:.1f}%"); signal_type = "EARLY_DETECT"
@@ -20603,6 +20810,32 @@ def _apply_analyze_nxt_post_leader_context(ctx: dict, sector_info: dict, score: 
     return score, reasons, nxt_post_leader_hit, nxt_post_leader_bonus
 
 
+def _apply_analyze_sector_leader_follow_context(ctx: dict, sector_info: dict, score: int, reasons: list) -> tuple[int, list[str], bool, int]:
+    stock = ctx["stock"]
+    follow = stock.get("_sector_leader_follow") if isinstance(stock.get("_sector_leader_follow"), dict) else {}
+    if not follow:
+        follow = _get_sector_leader_follow_entry(ctx["code"], stock.get("market", ""))
+    if not follow:
+        return score, reasons, False, 0
+    bonus = int(SECTOR_LEADER_FOLLOW_BONUS or 0)
+    leader_change = safe_float(follow.get("leader_change", 0.0), 0.0)
+    if leader_change >= 29.0:
+        bonus += 1
+    if bonus <= 0:
+        return score, reasons, False, 0
+    theme_name = str(follow.get("theme", sector_info.get("theme", "")) or sector_info.get("theme", "") or "기타업종")
+    leader_name = str(follow.get("leader_name", follow.get("leader_code", "")) or follow.get("leader_code", ""))
+    days = max(2, int(SECTOR_LEADER_FOLLOW_KEEP_DAYS or 3))
+    score += bonus
+    reasons.append(f"🧭 섹터 대장 후속 강제감시 [{theme_name}] +{bonus}점")
+    reasons.append(f"📌 {leader_name} 선행 급등 후 {days}일 follow-up 감시")
+    if str(sector_info.get("theme", "") or "") in ("", "기타업종", "unknown", "미분류") and theme_name not in ("", "기타업종"):
+        sector_info["theme"] = theme_name
+        sector_info["theme_key"] = theme_name
+    stock["_sector_leader_follow"] = dict(follow)
+    return score, reasons, True, bonus
+
+
 def _apply_analyze_theme_context(ctx: dict) -> None:
     stock = ctx["stock"]
     code = ctx["code"]
@@ -20620,6 +20853,7 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
     score, reasons, adaptive_feedback_hit, adaptive_feedback_bonus = _apply_analyze_feedback_context(ctx, sector_info, score, reasons)
     score, reasons, miss_theme_leader_hit, miss_theme_leader_bonus, theme_expansion_hit, theme_expansion_bonus, breadth_ratio = _apply_analyze_theme_breadth_context(ctx, sector_info, score, reasons, theme_drive_hit)
     score, reasons, nxt_post_leader_hit, nxt_post_leader_bonus = _apply_analyze_nxt_post_leader_context(ctx, sector_info, score, reasons)
+    score, reasons, sector_leader_follow_hit, sector_leader_follow_bonus = _apply_analyze_sector_leader_follow_context(ctx, sector_info, score, reasons)
     stock["sector_info"] = sector_info
     ctx.update({
         "score": score,
@@ -20633,6 +20867,8 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
         "miss_theme_leader_bonus": int(miss_theme_leader_bonus or 0),
         "nxt_post_leader_hit": bool(nxt_post_leader_hit),
         "nxt_post_leader_bonus": int(nxt_post_leader_bonus or 0),
+        "sector_leader_follow_hit": bool(sector_leader_follow_hit),
+        "sector_leader_follow_bonus": int(sector_leader_follow_bonus or 0),
         "theme_expansion_hit": bool(theme_expansion_hit),
         "theme_expansion_bonus": int(theme_expansion_bonus or 0),
         "theme_breadth_ratio": float(breadth_ratio or 0.0),
@@ -20680,6 +20916,7 @@ def _build_analyze_result(ctx: dict) -> dict:
         "score": score, "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
         "direct_news_hit": direct_news_hit, "emergent_theme_hit": bool(ctx.get("emergent_theme_hit")),
         "theme_drive_hit": bool(ctx.get("theme_drive_hit")), "adaptive_feedback_hit": bool(ctx.get("adaptive_feedback_hit")),
+        "sector_leader_follow_hit": bool(ctx.get("sector_leader_follow_hit")), "sector_leader_follow_bonus": ctx.get("sector_leader_follow_bonus", 0),
         "adaptive_feedback_bonus": ctx.get("adaptive_feedback_bonus", 0), "miss_theme_leader_hit": bool(ctx.get("miss_theme_leader_hit")),
         "miss_theme_leader_bonus": ctx.get("miss_theme_leader_bonus", 0), "nxt_post_leader_hit": bool(ctx.get("nxt_post_leader_hit")),
         "nxt_post_leader_bonus": ctx.get("nxt_post_leader_bonus", 0), "theme_expansion_hit": bool(ctx.get("theme_expansion_hit")),
@@ -22598,8 +22835,8 @@ def _build_general_a_support_profile(change_rate: float = 0.0, vol_ratio: float 
     premium_flow = _vr >= COMMON_THRESHOLD_3P0 or int(nxt_delta or 0) >= 8
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
-    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
-    intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "거래대금 급증", "고가 유지", "코스피 상대강도", "코스닥 상대강도", "장초반 ORB", "전고 돌파", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴", "섹터 확산"))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "섹터 대장 후속 강제감시", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
+    intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "거래대금 급증", "고가 유지", "코스피 상대강도", "코스닥 상대강도", "장초반 ORB", "전고 돌파", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴", "섹터 확산", "follow-up 감시"))
     flow_support = strong_flow or premium_flow
     support_count = sum(1 for flag in (direct_like, meaningful_theme, flow_support, intraday_support) if flag)
     market_flag = str(market or "").upper() == "NXT"
@@ -22718,6 +22955,7 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
     return (
         1 if alert.get("leader_priority_hit") else 0,
         1 if alert.get("nxt_post_leader_hit") else 0,
+        1 if alert.get("sector_leader_follow_hit") else 0,
         1 if alert.get("direct_news_hit") else 0,
         1 if alert.get("theme_drive_hit") else 0,
         1 if alert.get("adaptive_feedback_hit") else 0,
@@ -29312,6 +29550,7 @@ def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool
 def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
     today_date = datetime.now().strftime("%Y%m%d")
     for stock in get_upper_limit_stocks():
+        _register_sector_leader_follow_seed(stock)
         if stock["code"] in seen:
             continue
         _ul_rec = _upper_limit_day_alerted.get(stock["code"])
@@ -29325,6 +29564,7 @@ def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
             _upper_limit_day_alerted[r["code"]] = {"date": today_date, "alerted": True}
         _append_scan_alert(alerts, seen, r)
     for stock in get_volume_surge_stocks():
+        _register_sector_leader_follow_seed(stock)
         if stock["code"] in seen:
             continue
         _append_scan_alert(alerts, seen, analyze(stock))
@@ -29332,6 +29572,7 @@ def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
 
 def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
     for stock in get_nxt_surge_stocks():
+        _register_sector_leader_follow_seed(stock)
         if stock["code"] in seen:
             continue
         r = analyze(stock)
@@ -29348,6 +29589,14 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
     for stock in _collect_theme_peer_follow_candidates(existing_codes=seen):
+        code = stock.get("code")
+        if not code or code in seen:
+            continue
+        _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+
+
+def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
+    for stock in _collect_sector_leader_follow_candidates(existing_codes=seen):
         code = stock.get("code")
         if not code or code in seen:
             continue
@@ -29435,6 +29684,7 @@ def run_scan():
         if ctx["nxt_open"]:
             _scan_nxt_market_candidates(alerts, seen)
         _scan_rank_and_theme_candidates(alerts, seen)
+        _scan_sector_leader_follow_candidates(alerts, seen)
         _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
         alerts = _apply_scan_sector_gate(alerts)
         alerts = filter_portfolio_signals(alerts)
@@ -29511,6 +29761,7 @@ if __name__ == "__main__":
         _load_reentry_watch()
         _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
+        _load_sector_leader_follow_state()
         _load_dynamic_params()
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
@@ -29534,6 +29785,7 @@ if __name__ == "__main__":
     migrate_signal_log_pnl_fields()
     load_tracker_feedback()
     load_dynamic_themes()
+    _load_sector_leader_follow_state()
     load_adaptive_capture_feedback()
     load_stale_replay_penalty_profile()
     refresh_dynamic_candidates()
