@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v130
+버전: v129
 날짜: 2026-03-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12,11 +12,7 @@
 
 
 
-- v130 (2026-03-30): 1차 진입가 도달 제목 상태화 + 오전 NXT 조기포착 본류화 + 전략 긴급 경고 단계형 중복 억제.
-  [#1] 일반 포착/재안내 제목에도 기존 눌림목과 같은 `+ 1차 진입가 도달` 상태를 연결. 미도달은 별도 표기하지 않고, 현재가>=대표/예상 진입가이거나 기존 entry_hit watch가 있으면 제목에만 도달 상태를 반영하도록 정리.
-  [#2] 오전 NXT-only 구간에서 `check_nxt_intraday_early_detection()`를 추가해 조기포착 본류(confirm/호가/점수화)를 NXT 데이터로도 돌리도록 보강하고, 후보 탈락 사유를 shadow 로그로 남기며 `html` 미import 버그를 함께 수정.
-  [#3] 전략 긴급 경고를 연속 손절 수치만으로 매번 보내지 않고 stage 상승 + 실제 최소점수 강화가 발생했을 때만 1회 발송하도록 바꾸고, 동일 단계 재평가에서는 중복 발송되지 않게 조정.
-
+- v129 (2026-03-30): v128 정상본 기준 통합 hotfix — 일반 포착/재안내 제목의 1차 진입가 도달 상태 반영, 오전 NXT-only 구간 조기포착 본류 및 stage shadow 기록 추가, 전략 긴급 경고 stage 기반 dedupe, html import/overnight now NameError 수정.
 - v128 (2026-03-30): fallback 안정화 hotfix — 미국시장/공매도/지정학/텔레그램 timeout 경로의 비JSON·빈응답·타임아웃을 throttled warning + 기본값 fallback으로 정리해 로그 노이즈와 과도한 예외 카운트를 축소.
 - v127 (2026-03-29): XML RSS 파싱 hotfix — Element.find() 결과를 or 체인 truthiness로 평가하던 description/summary/content 선택 로직을 None 기준 순차 탐색으로 교체해 DeprecationWarning과 향후 동작 왜곡을 차단.
 - v126 (2026-03-28): 시작 크래시 hotfix — load_carry_stocks()의 stale entry watch 정리 호출과 _purge_stale_entry_watch_hits() 시그니처를 동기화해 Railway 재시작 루프를 차단.
@@ -1629,7 +1625,6 @@ def is_trade_candidate_name(name: str) -> bool:
 import sys
 import builtins
 import hashlib
-import html
 import logging
 import traceback
 import re as _re  # docstring 파싱 등 초기화 단계 사용
@@ -1707,6 +1702,7 @@ BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
 import os, requests, time, schedule, json, random, threading, math
 from collections import deque, defaultdict
 import xml.etree.ElementTree as ET
+import html
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -2382,6 +2378,8 @@ def _build_emergency_tuning_alert(consec: int, overall: dict, stage: int, old_n:
         f"최소점수: {old_n}→{new_n} / 엄격: {old_s}→{new_s}\n"
         f"/stats 로 상세 확인"
     )
+
+
 def _current_dynamic_signature() -> dict:
     return _normalize_for_hash({k: v for k, v in _dynamic.items()})
 
@@ -14584,7 +14582,7 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
         _consecutive_win_count = 0
         if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
             _log_warn_msg(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 평가")
-            auto_tune(notify=True)
+            auto_tune(notify=False)
     else:
         if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
             _clear_emergency_tune_state("win_recovered")
@@ -15706,7 +15704,7 @@ def _auto_tune_apply_params_snapshot_tuning(completed, changes):
         _log_error("auto_tune.params_snapshot", te)
 
 
-def _auto_tune_apply_emergency_tuning(completed, tune_state, changes, notify=notify):
+def _auto_tune_apply_emergency_tuning(completed, overall, tune_state, changes, notify: bool = False):
     recent = sorted(completed, key=lambda x: x.get("exit_date","") + x.get("exit_time",""))[-5:]
     recent_loss_streak = 0
     for r in reversed(recent):
@@ -15739,6 +15737,16 @@ def _auto_tune_apply_emergency_tuning(completed, tune_state, changes, notify=not
         tune_state["emergency_stage"] = cur_stage
         tune_state["last_emergency_reason"] = f"loss_streak_{recent_loss_streak}"
         tune_state["last_emergency_ts"] = time.time()
+        alert_hash = _payload_hash({
+            "stage": cur_stage,
+            "consecutive_loss": recent_loss_streak,
+            "min_score_normal": _dynamic["min_score_normal"],
+            "min_score_strict": _dynamic["min_score_strict"],
+        })
+        if notify and (int(tune_state.get("last_emergency_alert_stage", 0) or 0) != cur_stage or str(tune_state.get("last_emergency_alert_hash") or "") != alert_hash):
+            send(_build_emergency_tuning_alert(recent_loss_streak, overall or {}, cur_stage, old_n, _dynamic["min_score_normal"], old_s, _dynamic["min_score_strict"]))
+            tune_state["last_emergency_alert_stage"] = cur_stage
+            tune_state["last_emergency_alert_hash"] = alert_hash
         return
 
     tune_state["emergency_stage"] = max(prev_stage, cur_stage)
@@ -16134,7 +16142,8 @@ def auto_tune(notify: bool = True):
         changes.extend(_auto_tune_korea_etf_weights(completed))
         _auto_tune_apply_params_snapshot_tuning(completed, changes)
         by_type = _auto_tune_group_by_signal_type(completed)
-        _auto_tune_apply_emergency_tuning(completed, tune_state, changes)
+        overall_kpi = compute_signal_kpi(completed).get("overall", {})
+        _auto_tune_apply_emergency_tuning(completed, overall_kpi, tune_state, changes, notify=notify)
         _auto_tune_apply_signal_type_tuning(by_type, data, completed, tune_state, changes)
         _auto_tune_apply_context_tuning(completed, changes)
         _auto_tune_apply_kpi_feedback(completed, changes, notify)
@@ -17660,6 +17669,38 @@ def _find_existing_entry_hit_watch(code: str):
         if _ew.get("entry_hit") or _ew.get("entry_hit_locked"):
             return _ek, _ew
     return None, None
+
+
+def _is_general_capture_first_entry_reached(signal: dict | None = None, live_price: int = 0) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    sig_type = str(signal.get("signal_type") or "").upper()
+    if sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
+        return False
+    code = normalize_stock_code(signal.get("code", ""))
+    entry, _ = _select_capture_expected_entry_price(signal)
+    entry = safe_int(entry, 0)
+    current_price = safe_int(live_price or signal.get("price", 0), 0)
+    if entry > 0 and current_price >= entry:
+        return True
+    if code:
+        try:
+            _, watch = _find_existing_entry_hit_watch(code)
+            if isinstance(watch, dict) and (watch.get("entry_hit") or watch.get("entry_hit_locked")):
+                return True
+        except Exception as e:
+            _swallow_exception(e)
+    return bool(signal.get("first_entry_reached"))
+
+
+def _apply_first_entry_reached_header_line(header_line: str, signal: dict | None = None, live_price: int = 0) -> str:
+    line = str(header_line or "").strip()
+    if not line or "1차 진입가 도달" in line:
+        return line
+    if not _is_general_capture_first_entry_reached(signal, live_price=live_price):
+        return line
+    if ']</b>' in line:
+        return line.replace(']</b>', ' + 1차 진입가 도달]</b>', 1)
+    return line + ' + 1차 진입가 도달'
 
 def _should_send_phase2_upgrade_alert(watch: dict, new_sig_type: str, decision: str) -> bool:
     if not isinstance(watch, dict):
@@ -19300,7 +19341,7 @@ def send_alert(signal: dict):
         return
     header_override = str(signal.get("_header_override", "") or "").strip()
     header_line = header_override if header_override else f"{visuals['emoji']} <b>[{visuals['title']}]</b>"
-    header_line = _apply_first_entry_reached_header_line(header_line, signal, safe_int(signal.get("_title_live_price", 0), 0))
+    header_line = _apply_first_entry_reached_header_line(header_line, signal, live_price=safe_int(signal.get("price", 0), 0))
     capture_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg = _build_capture_focus_message(signal, header_line, capture_label, name_dot=visuals["name_dot"])
     send_by_level(msg.rstrip(), visuals["level"], signal["code"], signal["name"])
@@ -19485,36 +19526,6 @@ def _format_capture_secondary_price_line(price: int, secondary_price: int, label
 
 def _format_capture_expected_entry_line(price: int, expected_entry: int, source_label: str = "") -> str:
     return _format_capture_secondary_price_line(price, expected_entry, "예상진입가", source_label)
-
-def _is_general_capture_first_entry_reached(signal: dict | None = None, live_price: int = 0) -> bool:
-    signal = signal if isinstance(signal, dict) else {}
-    sig_type = str(signal.get("signal_type") or "").upper()
-    if sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
-        return False
-    code = normalize_stock_code(signal.get("code", ""))
-    entry, _ = _select_capture_expected_entry_price(signal)
-    entry = safe_int(entry, 0)
-    current_price = safe_int(live_price or signal.get("price", 0), 0)
-    if entry > 0 and current_price >= entry:
-        return True
-    if code:
-        try:
-            _, watch = _find_existing_entry_hit_watch(code)
-            if isinstance(watch, dict) and (watch.get("entry_hit") or watch.get("entry_hit_locked")):
-                return True
-        except Exception as e:
-            _swallow_exception(e)
-    return bool(signal.get("first_entry_reached"))
-
-def _apply_first_entry_reached_header_line(header_line: str, signal: dict | None = None, live_price: int = 0) -> str:
-    line = str(header_line or "").strip()
-    if not line or "1차 진입가 도달" in line:
-        return line
-    if not _is_general_capture_first_entry_reached(signal, live_price=live_price):
-        return line
-    if ']</b>' in line:
-        return line.replace(']</b>', ' + 1차 진입가 도달]</b>', 1)
-    return line + ' + 1차 진입가 도달'
 
 def _build_capture_focus_price_line(s: dict) -> str:
     price = int(s.get('price', 0) or 0)
@@ -20783,10 +20794,9 @@ def _build_early_detection_candidate_context(stock: dict) -> dict | None:
     return {"stock": stock, "code": code, "change_rate": change_rate, "vol_ratio": vol_ratio, "price": price, "now": now, "confirm_need": confirm_need}
 
 
-def _passes_early_detection_hoga_gate(code: str, market: str = "") -> tuple[dict, int, int] | None:
+def _passes_early_detection_hoga_gate(code: str, market: str = "KRX") -> tuple[dict, int, int] | None:
     try:
-        mkt = str(market or "").upper()
-        detail = get_nxt_stock_price(code) if mkt == "NXT" else get_stock_price(code)
+        detail = get_nxt_stock_price(code) if str(market).upper() == "NXT" else get_stock_price(code)
         bid_qty = int(detail.get("bid_qty", 0) or 0)
         ask_qty = int(detail.get("ask_qty", 0) or 0)
         if ask_qty > 0 and bid_qty / ask_qty < EARLY_HOGA_RATIO:
@@ -20797,29 +20807,8 @@ def _passes_early_detection_hoga_gate(code: str, market: str = "") -> tuple[dict
         return None
 
 
-def _update_early_detection_cache(code: str, price: int, now: datetime, confirm_need: int) -> bool:
-    cache = _early_cache.get(code)
-    if cache is None:
-        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-        return False
-    elapsed = (now - cache["last_time"]).seconds
-    if 15 <= elapsed <= 80:
-        if price >= cache["last_price"]:
-            cache["count"] += 1
-            cache["last_price"] = price
-            cache["last_time"] = now
-        else:
-            _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-            return False
-    else:
-        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-        return False
-    if cache["count"] < confirm_need:
-        return False
-    del _early_cache[code]
-    return True
+_NXT_INTRADAY_EARLY_STAGE_STATE: dict = {}
 
-_NXT_INTRADAY_EARLY_STAGE_STATE = {}
 
 def _record_nxt_intraday_candidate_stage(stock: dict, stage: str, reason: str, extra: dict | None = None) -> None:
     code = normalize_stock_code((stock or {}).get("code"))
@@ -20846,6 +20835,29 @@ def _record_nxt_intraday_candidate_stage(stock: dict, stage: str, reason: str, e
         )
     except Exception as e:
         _swallow_exception(e)
+
+
+def _update_early_detection_cache(code: str, price: int, now: datetime, confirm_need: int) -> bool:
+    cache = _early_cache.get(code)
+    if cache is None:
+        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
+        return False
+    elapsed = (now - cache["last_time"]).seconds
+    if 15 <= elapsed <= 80:
+        if price >= cache["last_price"]:
+            cache["count"] += 1
+            cache["last_price"] = price
+            cache["last_time"] = now
+        else:
+            _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
+            return False
+    else:
+        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
+        return False
+    if cache["count"] < confirm_need:
+        return False
+    del _early_cache[code]
+    return True
 
 
 def _build_early_detection_entry_context(ctx: dict, detail: dict, bid_qty: int, ask_qty: int) -> dict:
@@ -20982,7 +20994,7 @@ def check_early_detection() -> list:
         ctx = _build_early_detection_candidate_context(stock)
         if not ctx:
             continue
-        hoga = _passes_early_detection_hoga_gate(ctx["code"], market=str((ctx.get("stock") or {}).get("market", "")))
+        hoga = _passes_early_detection_hoga_gate(ctx["code"])
         if not hoga:
             continue
         detail, bid_qty, ask_qty = hoga
@@ -21884,10 +21896,6 @@ def _handle_general_alert_existing_entry_hit(ctx: dict) -> bool | None:
 
 def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     s = ctx["signal"]
-    if ctx.get("live_price"):
-        s["_title_live_price"] = safe_int(ctx.get("live_price", 0), 0)
-    if _is_general_capture_first_entry_reached(s, safe_int(ctx.get("live_price", 0), 0)):
-        s["first_entry_reached"] = True
     _log_info_msg(f"  ✓ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{ctx['grade_upper']}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
@@ -26210,6 +26218,7 @@ def calc_overnight_risk(code: str, name: str, entry: int, current_pnl: float) ->
     반환: {level: "high"/"mid"/"low", score: int, reason: str, causes: list}
     """
     try:
+        now        = _now_kst()
         us         = get_us_market_signals()
         short_r    = get_short_sell_ratio(code)
         vix        = us.get("vix", 20)
