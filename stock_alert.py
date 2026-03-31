@@ -5082,6 +5082,20 @@ def _kis_http_error_body_snippet(resp) -> str:
     except Exception as e:
         _swallow_exception(e)
         return ""
+
+def _kis_response_has_expired_token(resp) -> bool:
+    try:
+        if resp is None:
+            return False
+        data = safe_json_response(resp)
+        if not isinstance(data, dict):
+            return False
+        msg_cd = str(data.get("msg_cd") or data.get("error_code") or data.get("code") or "").strip().upper()
+        msg1 = str(data.get("msg1") or data.get("message") or data.get("error_description") or data.get("error") or "").strip()
+        return msg_cd == "EGW00123" or "기간이 만료된 token" in msg1 or "expired token" in msg1.lower()
+    except Exception as e:
+        _swallow_exception(e)
+        return False
 def get_token(retry: int = 3) -> str:
     global _access_token, _token_expires
     _validate_kis_oauth_config()
@@ -5131,6 +5145,7 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
     return_meta=True → (data, status, ct, body_snippet) 4-tuple.
     return_meta=False(기본) → dict만 반환.
     """
+    global _access_token, _token_expires
     last_exc = None; last_status = None; last_ct = ""; last_body_snip = ""; last_url = url
     for attempt in range(3):
         try:
@@ -5139,8 +5154,7 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             last_status = getattr(resp, "status_code", None)
             last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
             last_url = getattr(resp, "url", url) or url
-            if last_status == 403:
-                global _access_token, _token_expires
+            if last_status == 403 or _kis_response_has_expired_token(resp):
                 _access_token = None
                 _token_expires = 0
                 _clear_kis_token_state()
@@ -5152,6 +5166,12 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             if last_status == 200:
                 data = safe_json_response(resp)
                 return (data, last_status, last_ct, "") if return_meta else data
+            if _kis_response_has_expired_token(resp):
+                _access_token = None
+                _token_expires = 0
+                _clear_kis_token_state()
+                last_exc = "expired_token_auto_refresh_failed"
+                continue
             try:
                 raw = (getattr(resp, "text", "") or "").strip()
                 last_body_snip = " ".join(raw.split())[:200]
@@ -13663,6 +13683,7 @@ def save_signal_log(stock: dict):
     - 이후 track_signal_results()가 목표가·손절가 도달 여부를 자동 체크
     """
     try:
+        stock = _coerce_run_scan_signal_defaults(stock, fallback_code=(stock or {}).get("code", ""))
         data = _load_signal_log_data()
         ctx = _build_signal_log_context(stock)
         if _update_representative_signal_log_record(data, stock, ctx):
@@ -28521,6 +28542,10 @@ def filter_portfolio_signals(alerts: list) -> list:
     max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
     carry_count, carry_codes = _get_carry_position_context()
     alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
+    alerts = [
+        _coerce_run_scan_signal_defaults(a, fallback_code=(a or {}).get("code", ""))
+        for a in list(alerts or []) if isinstance(a, dict)
+    ]
     # 신규 리더 우선 + stale 눌림목 후순위 정렬
     sorted_alerts = sorted(
         alerts,
@@ -28548,27 +28573,33 @@ def filter_portfolio_signals(alerts: list) -> list:
     for i, s in enumerate(sorted_alerts):
         if len(passed) >= max_total:
             break
-        if s["code"] in excluded:
+        s_code = normalize_stock_code(s.get("code", ""))
+        if not s_code:
             continue
+        if s_code in excluded:
+            continue
+        s["code"] = s_code
         passed.append(s)
         # 아직 통과 안 된 뒤 신호들과 실질 섹터 비교
         for j in range(i + 1, len(sorted_alerts)):
             peer = sorted_alerts[j]
-            if peer["code"] in excluded:
+            peer_code = normalize_stock_code(peer.get("code", ""))
+            if not peer_code or peer_code in excluded:
                 continue
+            peer["code"] = peer_code
             try:
-                rs = calc_real_sector_score(s["code"], peer["code"],
-                                            s["name"], peer["name"])
+                rs = calc_real_sector_score(s["code"], peer_code,
+                                            s.get("name", ""), peer.get("name", ""))
                 if rs["score"] >= 50:
                     # 같은 섹터 내 max_same_sector 개수까지는 허용
                     same_sector_passed = sum(
                         1 for p in passed
-                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
+                        if calc_real_sector_score(s["code"], p.get("code", ""), s.get("name", ""), p.get("name", "")).get("score", 0) >= 50
                     )
                     _max_same = _dynamic.get("max_same_sector", 2)
                     if same_sector_passed >= _max_same:
-                        excluded.add(peer["code"])
-                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
+                        excluded.add(peer_code)
+                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer_code, peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
             except Exception as e:
                 _swallow_exception(e)
     if len(passed) < len(sorted_alerts):
