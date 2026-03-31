@@ -7,7 +7,7 @@
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v149 (2026-03-31): run_scan 결측 필드 + KIS 만료 토큰/빈 JSON + INFO 참고 알림 비활성 hotfix — run_scan 후보·신호 중 `change_rate`·`entry_price` 등 핵심 필드가 빠져도 일반 포착 발송 단계에서 KeyError가 나지 않도록 기본값 정규화를 보강했다. 또한 KIS 응답 `EGW00123`/`기간이 만료된 token`을 만료 토큰으로 감지해 자동 재발급 재시도를 수행하고, `safe_json_response()`·심층뉴스·한국ETF 파싱 경로는 빈/비JSON 응답을 조용히 `{}` 또는 fallback으로 처리해 JSONDecodeError 노이즈를 줄인다. 또한 중요하지 않은 INFO 참고 알림 묶음은 사용자 텔레그램으로 보내지 않고, 큐 적재/flush 스케줄도 비활성화한다.
+- v149 (2026-03-31): run_scan `change_rate` 결측 hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -1546,39 +1546,19 @@ GEO_SECTOR_BIAS: dict = {}
 # MARKET_REGIME: 176줄에서 1회만 선언 (v38.3: 중복 제거)
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
-    """Return parsed JSON safely; invalid/empty/non-JSON payloads return {} without noisy exceptions."""
+    """Return resp.json() safely; if invalid/empty/HTML, return {}."""
     try:
         txt = (getattr(resp, "text", "") or "")
-        if not txt or not txt.strip():
+        if not txt.strip():
             return {}
-        txt = txt.strip()
-        ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "").lower()
-        if txt.startswith("<"):
+        ct = (getattr(resp, "headers", {}) or {}).get("Content-Type", "")
+        ct = (ct or "").lower()
+        if "json" not in ct and txt.lstrip().startswith("<"):
             return {}
-        if "json" not in ct and txt[:1] not in "[{":
-            return {}
-        try:
-            return json.loads(txt)
-        except Exception as e:
-            _ = e
-            return {}
+        return resp.json()
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return {}
-
-def _kis_response_has_expired_token(resp=None, payload=None) -> bool:
-    """Detect KIS expired token responses (403 or EGW00123 body) so callers can refresh and retry."""
-    try:
-        data = payload if isinstance(payload, dict) else safe_json_response(resp)
-        if not isinstance(data, dict):
-            data = {}
-        msg_cd = str(data.get("msg_cd") or data.get("error_code") or data.get("code") or "").strip()
-        msg = str(data.get("msg1") or data.get("message") or data.get("error_description") or data.get("error") or "").strip()
-        status = getattr(resp, "status_code", None)
-        return status == 403 or msg_cd == "EGW00123" or "기간이 만료된 token" in msg
-    except Exception as e:
-        _swallow_exception(e)
-        return False
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
@@ -5158,20 +5138,19 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             last_status = getattr(resp, "status_code", None)
             last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
             last_url = getattr(resp, "url", url) or url
-            payload = safe_json_response(resp)
-            if _kis_response_has_expired_token(resp, payload):
+            if last_status == 403:
                 global _access_token, _token_expires
                 _access_token = None
                 _token_expires = 0
                 _clear_kis_token_state()
-                if attempt < 2:
-                    try:
-                        time.sleep(0.2)
-                    except Exception as e:
-                        _swallow_exception(e)
-                    continue
+                _wait_for_kis_rest_slot("rest")
+                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+                last_status = getattr(resp, "status_code", None)
+                last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
+                last_url = getattr(resp, "url", url) or url
             if last_status == 200:
-                return (payload, last_status, last_ct, "") if return_meta else payload
+                data = safe_json_response(resp)
+                return (data, last_status, last_ct, "") if return_meta else data
             try:
                 raw = (getattr(resp, "text", "") or "").strip()
                 last_body_snip = " ".join(raw.split())[:200]
@@ -5180,10 +5159,11 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
                 last_body_snip = ""
             if return_meta:
                 break
-            if isinstance(payload, dict) and payload:
-                msg_cd = payload.get("msg_cd") or payload.get("error_code") or payload.get("code")
-                msg1 = payload.get("msg1") or payload.get("message") or payload.get("error_description") or payload.get("error")
-                last_exc = f"rt_cd={payload.get('rt_cd')} msg_cd={msg_cd} msg={msg1}"
+            j = safe_json_response(resp)
+            if isinstance(j, dict) and j:
+                msg_cd = j.get("msg_cd") or j.get("error_code") or j.get("code")
+                msg1 = j.get("msg1") or j.get("message") or j.get("error_description") or j.get("error")
+                last_exc = f"rt_cd={j.get('rt_cd')} msg_cd={msg_cd} msg={msg1}"
             else:
                 last_exc = None
         except Exception as e:
@@ -18979,32 +18959,35 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
     """
     중요도별 알림 발송
     CRITICAL / NORMAL → 즉시 발송
-    INFO              → 사용자 텔레그램 발송 완전 차단
+    INFO              → _pending_info_alerts 대기열에 추가 (10분마다 묶음 발송)
     """
-    if level == ALERT_LEVEL_INFO:
-        try:
-            _pending_info_alerts.clear()
-        except Exception as exc:
-            _swallow_exception(exc, "send_by_level.info_clear")
-        return
-
     if level in (ALERT_LEVEL_CRITICAL, ALERT_LEVEL_NORMAL):
         if code and name:
             send_with_chart_buttons(text, code, name)
         else:
             send(text)
-        return
-
-    return
-
+    else:  # INFO
+        _pending_info_alerts.append({"text": text, "ts": time.time()})
 def flush_info_alerts():
-    """INFO 큐 폐기만 수행 (사용자 묶음 발송 완전 비활성)"""
-    try:
-        _pending_info_alerts.clear()
-    except Exception as exc:
-        _swallow_exception(exc, "flush_info_alerts.clear")
-    return
-
+    """INFO 알림 묶음 발송 (5분마다 스케줄) + 오래된 항목 자동 제거"""
+    if not _pending_info_alerts: return
+    now = time.time()
+    # v37.0: 슬라이스 할당으로 안전한 리스트 수정 (동시접근 경쟁 조건 제거)
+    # 1시간 이상 된 항목 제거 + 최대 20개 유지
+    fresh = [a for a in _pending_info_alerts if now - a["ts"] <= 3600][-20:]
+    # 5분 이상 된 것만 발송 대상
+    to_send = [a for a in fresh if now - a["ts"] >= 300]
+    remaining = [a for a in fresh if now - a["ts"] < 300]
+    _pending_info_alerts[:] = remaining  # 원자적 교체
+    if not to_send: return
+    if len(to_send) == 1:
+        send(to_send[0]["text"])
+    else:
+        combined = f"🟡 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
+        for a in to_send:
+            first_line = a["text"].split("\n")[0][:60]
+            combined  += f"• {first_line}\n"
+        send(combined)
 def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     """
     신호 유형 + 점수 → 중요도 레벨 결정
@@ -21909,9 +21892,8 @@ def _handle_general_alert_existing_entry_hit(ctx: dict) -> bool | None:
     save_signal_log(s)
     return False
 def _finalize_general_alert_dispatch(ctx: dict) -> bool:
-    s = _coerce_run_scan_signal_defaults(ctx.get("signal", {}), fallback_code=(ctx.get("signal") or {}).get("code", ""))
-    ctx["signal"] = s
-    _log_info_msg(f"  ✓ {s.get('name','')}{ctx['mkt_tag']} {safe_float(s.get('change_rate', 0.0), 0.0):+.1f}% [{s.get('signal_type','')}] {safe_int(s.get('score', 0), 0)}점 [{ctx['grade_upper']}]")
+    s = ctx["signal"]
+    _log_info_msg(f"  ✓ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{ctx['grade_upper']}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
     save_signal_log(s)
@@ -24107,7 +24089,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
         try:
             data = json.loads(raw)
         except Exception as e:
-            _ = e
+            _swallow_exception(e)
             return _default_deep_news_result(reason="(요약 실패)")
         result = _normalize_deep_news_result(data)
         _deep_news_cache[cache_key] = result
@@ -28032,11 +28014,9 @@ def get_korea_etf_signals() -> dict:
             try:
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
                 resp = requests.get(url, timeout=8, headers=_random_ua())
-                data = safe_json_response(resp)
-                chart = data.get("chart", {}) if isinstance(data, dict) else {}
-                result0 = (((chart.get("result") or [None])[0]) or {}) if chart else {}
-                meta = result0.get("meta", {}) if isinstance(result0, dict) else {}
-                prev = ((((result0.get("indicators") or {}).get("quote") or [{}])[0]) or {}).get("close", [])
+                data = resp.json()
+                meta = data["chart"]["result"][0]["meta"]
+                prev = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
                 prev_close = [c for c in prev if c is not None]
                 cur_price = float(meta.get("regularMarketPrice", 0) or 0)
                 if cur_price and prev_close:
@@ -28636,22 +28616,11 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
     item["score"] = safe_int(item.get("score", 0), 0)
     item["price"] = safe_int(item.get("price", 0), 0)
     item["today_vol"] = safe_int(item.get("today_vol", 0), 0)
-    item["entry_price"] = safe_int(item.get("entry_price", 0), 0)
-    item["planned_entry_price"] = safe_int(item.get("planned_entry_price", item.get("entry_price", 0)), 0)
-    item["execution_hint_entry_price"] = safe_int(item.get("execution_hint_entry_price", item.get("entry_price", 0)), 0)
-    item["stop_loss"] = safe_int(item.get("stop_loss", 0), 0)
-    item["target_price"] = safe_int(item.get("target_price", 0), 0)
-    item["detected_at"] = str(item.get("detected_at", "") or "")
     item["market"] = str(item.get("market", "") or "")
-    item["grade"] = str(item.get("grade", "") or "")
     if "signal_type" not in item or item.get("signal_type") is None:
         item["signal_type"] = ""
     if "name" not in item or item.get("name") is None:
         item["name"] = ""
-    reasons = item.get("reasons", [])
-    if not isinstance(reasons, list):
-        reasons = [str(reasons)] if reasons else []
-    item["reasons"] = reasons
     return item
 
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
@@ -29088,7 +29057,7 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
-    # INFO 참고 알림 묶음 스케줄 비활성
+    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
     schedule.every().day.at("05:00").do(reset_daily_caches)  # [v41.84]
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))
