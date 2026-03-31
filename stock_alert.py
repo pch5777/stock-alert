@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v150
+버전: v151
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v151 (2026-04-01): 24시간 시나리오 수집 + 장후/장전 액션보드 연결 — 미국장·미국 이슈·환율·금리·유가·지정학·뉴스/옵션형 유튜브를 공통 시나리오 객체로 묶는 `collect_market_scenarios_24h()`와 `run_market_scenario_collection_cycle()`를 추가했다. 각 재료는 이벤트명·방향·원인·한국 상방/하방 섹터·한국 종목 후보까지 내려와 `premarket_action_board`와 `overnight_watchlist`를 동시에 갱신하고, 재료-first headline 입력에도 같은 시나리오 행을 주입한다. 또한 15:45/20:10 장후 알림은 하방 차단 요약에 더해 상·하방 핵심 시나리오와 한국 후보를 함께 보내고, 07:30/08:50 장전 알림은 기존 단순 워치리스트 대신 액션형 시나리오 보드 중심으로 재구성했으며, 본스캔에도 상방 시나리오 후보를 직접 우선 편입한다.
 - v150 (2026-03-31): 상방/하방 재료 시나리오 강화 + 하방 재료 전구간 차단/알림 — 재료 엔진이 직접뉴스·테마동조·섹터확산·market flow·material-first 선감지가 겹칠수록 추가 가점을 더 크게 주도록 `재료 시나리오 결속` 보너스를 도입했다. 동시에 감사보고서 제출기한 연장신고/지연·감사의견·관리/상장폐지/거래정지·횡령/배임·회생류 하방 재료를 DART/뉴스/옵션형 유튜브 최근성 감시에서 시나리오로 묶어 후보 부트스트랩과 최종 진입 필터 양쪽에서 즉시 차단하고, 이미 걸린 entry/reentry/execution/preclose 감시도 `하방재료차단`으로 정리하며 즉시 알림과 장마감 묶음 요약을 함께 남기도록 확장했다.
 - v149 (2026-03-31): run_scan `change_rate` 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
@@ -4821,6 +4822,10 @@ def _get_material_signal_headline_rows(force: bool = False) -> list[dict]:
         rows.extend(_fetch_youtube_material_headline_rows())
     except Exception as e:
         _swallow_exception(e)
+    try:
+        rows.extend(_build_material_signal_rows_from_scenarios())
+    except Exception as e:
+        _swallow_exception(e)
     deduped = []
     seen = set()
     for row in rows:
@@ -4926,6 +4931,45 @@ def _queue_material_block_digest_row(code: str, name: str, meta: dict, stage: st
         "matched": list(meta.get("matched_keywords", []) or [])[:4],
         "ts": time.time(),
     })
+
+
+def _send_market_scenario_digest(force: bool = False) -> None:
+    runtime = _material_block_runtime if isinstance(_material_block_runtime, dict) else {}
+    rows = list(runtime.get("digest_rows", []) or [])
+    today = datetime.now().strftime("%Y-%m-%d")
+    phase = "night" if force else "close"
+    digest_key = f"{today}:{phase}"
+    if runtime.get("last_market_scenario_digest") == digest_key:
+        return
+    if not force and is_any_market_open():
+        return
+    scenario_text = _build_market_scenario_digest_text(force=force)
+    parts = []
+    if scenario_text:
+        parts.append(scenario_text)
+    if rows:
+        lines = [
+            "🧾 <b>하방 재료 차단 요약</b>",
+            "━━━━━━━━━━━━━━━",
+            f"누적 {len(rows)}건",
+        ]
+        for row in rows[:MATERIAL_BLOCK_DIGEST_LIMIT]:
+            matched = ", ".join(list(row.get("matched", []) or [])[:3])
+            title = str(row.get("title", "") or "")[:44]
+            lines.append(
+                f"• {row.get('name','')} {row.get('code','')} | {row.get('label','')}"
+                + (f" | {title}" if title else "")
+                + (f" | {matched}" if matched else "")
+            )
+        if len(rows) > MATERIAL_BLOCK_DIGEST_LIMIT:
+            lines.append(f"• 외 {len(rows) - MATERIAL_BLOCK_DIGEST_LIMIT}건")
+        parts.append("\n".join(lines))
+    if not parts:
+        return
+    send("\n\n".join(parts))
+    runtime["digest_rows"] = []
+    runtime["last_digest_sent_date"] = today
+    runtime["last_market_scenario_digest"] = digest_key
 
 
 def _send_material_downside_digest(force: bool = False) -> None:
@@ -5171,6 +5215,16 @@ CORR_LOOKBACK       = 20
 NEWS_COOCCUR_FILE   = _state_path("news_cooccur.json")
 # v41.77 #4: 야간 이벤트 워치리스트
 OVERNIGHT_WATCHLIST_FILE = _state_path("overnight_watchlist.json")
+MARKET_SCENARIO_STATE_FILE = _state_path("market_scenario_state.json")
+PREMARKET_ACTION_BOARD_FILE = _state_path("premarket_action_board.json")
+MARKET_SCENARIO_CACHE_TTL_SEC = int(os.getenv("MARKET_SCENARIO_CACHE_TTL_SEC", "900") or "900")
+MARKET_SCENARIO_KEEP_HOURS = int(os.getenv("MARKET_SCENARIO_KEEP_HOURS", "48") or "48")
+MARKET_SCENARIO_MAX_ITEMS = int(os.getenv("MARKET_SCENARIO_MAX_ITEMS", "12") or "12")
+PREMARKET_ACTION_BOARD_MAX_ITEMS = int(os.getenv("PREMARKET_ACTION_BOARD_MAX_ITEMS", "8") or "8")
+SCENARIO_WATCHLIST_MAX_CODES = int(os.getenv("SCENARIO_WATCHLIST_MAX_CODES", "18") or "18")
+SCENARIO_SCAN_LIMIT = int(os.getenv("SCENARIO_SCAN_LIMIT", "10") or "10")
+_market_scenario_state: dict = {"items": [], "updated_ts": 0.0}
+_premarket_action_board: dict = {"items": [], "updated_ts": 0.0}
 _overnight_watchlist: dict = {}  # {code: {name, reason, keywords, ts}}
 SECTOR_LEADER_FOLLOW_FILE = _state_path("sector_leader_follow_watch.json")
 SECTOR_LEADER_FOLLOW_KEEP_DAYS = int(os.getenv("SECTOR_LEADER_FOLLOW_KEEP_DAYS", "3") or "3")
@@ -9986,43 +10040,51 @@ def _build_preopen_issue_section(max_lines: int = 12) -> str:
         lines = lines[:max_lines] + ["…(생략)"]
     return "\n".join(lines)
 def send_preopen_watchlist():
-    """익개장 전(07:30) 워치리스트 요약 전송 + 비장중 이슈(지정학/DART) 반영"""
+    """익개장 전(07:30) 액션형 시나리오 보드 전송 + 비장중 이슈/갭 후보 반영"""
     try:
+        scenario_state = collect_market_scenarios_24h(force=False)
+        board_block = _format_premarket_action_board_block(max_events=6, max_stocks=4)
         data = build_next_open_watchlist(max_codes=30)
         codes = data.get("codes") if isinstance(data, dict) else None
-        if not codes:
+        if not board_block and not codes:
             return
-        # 너무 길면 상위 15개만 표시
-        show = codes[:15]
-        msg = "⏰ 익개장 전 워치리스트\n" + " / ".join(show)
-        # latest next-open gap candidates (saved on prior close / NXT late session)
+        msg_parts = [f"🌅 <b>장전 액션보드</b>  {_now_kst().strftime('%Y-%m-%d %H:%M')}\n━━━━━━━━━━━━━━━"]
+        if board_block:
+            msg_parts.append(board_block)
+        if codes:
+            show = list(codes or [])[:10]
+            msg_parts.append("\n🎯 <b>기본 워치리스트</b>\n  " + " / ".join(show))
         try:
             gap_data = _read_json_safe(NEXT_OPEN_GAP_FILE, {})
             gap_cands = gap_data.get("candidates") if isinstance(gap_data, dict) else None
             if gap_cands:
-                msg += f"\n\n🚀 전일 종가 선진입 후보 [{str(gap_data.get('stage_label','최신'))}]\n"
+                lines = [f"\n🚀 <b>전일 종가 선진입 후보</b>  [{str(gap_data.get('stage_label','최신'))}]"]
                 for idx, item in enumerate(gap_cands[:5], 1):
-                    msg += (
+                    lines.append(
                         f"  {idx}) {item.get('name','')}({item.get('code','')}) {int(item.get('score',0) or 0)}점"
-                        f"  |  진입 {int(item.get('entry_price',0) or 0):,}  손절 {int(item.get('stop_loss',0) or 0):,}  목표 {int(item.get('target_price',0) or 0):,}\n"
+                        f" | 진입 {int(item.get('entry_price',0) or 0):,} 손절 {int(item.get('stop_loss',0) or 0):,} 목표 {int(item.get('target_price',0) or 0):,}"
                     )
+                msg_parts.append("\n".join(lines))
         except Exception as e:
             _swallow_exception(e)
-        # Fresh overnight risk recap (do not reuse stale saved string)
-        try:
-            _ov_msg = _build_overnight_risk_alert_message(limit_items=2, include_stats=False)
-            if _ov_msg:
-                msg += "\n\n" + _ov_msg
-        except Exception as e:
-            _swallow_exception(e)
-        # NEW: off-hours issues (geo sectors + DART strong materials)
         try:
             issue_sec = _build_preopen_issue_section()
             if issue_sec:
-                msg += "\n\n" + issue_sec
+                msg_parts.append("\n" + issue_sec)
         except Exception as e:
             _swallow_exception(e)
-        # entry_hit 종목만 별도 리스크 섹션으로 정리 (07:30 방어 파트)
+        try:
+            wl_block = _format_overnight_watchlist_block()
+            if wl_block:
+                msg_parts.append("\n" + wl_block)
+        except Exception as e:
+            _swallow_exception(e)
+        try:
+            _ov_msg = _build_overnight_risk_alert_message(limit_items=2, include_stats=False)
+            if _ov_msg:
+                msg_parts.append("\n" + _ov_msg)
+        except Exception as e:
+            _swallow_exception(e)
         try:
             risk_lines = []
             with _state_lock:
@@ -10062,10 +10124,14 @@ def send_preopen_watchlist():
                     risk_lines.append((risk_score, f"• {_name}({_code}) [{get_signal_label(status, status)}] — {', '.join(points[:3])}"))
             if risk_lines:
                 risk_lines.sort(key=lambda x: x[0], reverse=True)
-                msg += "\n\n⚠️ 진입가 도달 종목 리스크 점검\n" + "\n".join(line for _, line in risk_lines[:5])
+                msg_parts.append("\n⚠️ <b>진입가 도달 종목 리스크 점검</b>\n" + "\n".join(line for _, line in risk_lines[:5]))
         except Exception as e:
             _swallow_exception(e)
-        send_by_level(msg, level=ALERT_LEVEL_NORMAL)
+        if isinstance(scenario_state, dict):
+            item_cnt = len(list(scenario_state.get("items", []) or []))
+            if item_cnt:
+                msg_parts.append(f"\n━━━━━━━━━━━━━━━\nℹ️ 시나리오 {item_cnt}건 기준으로 장전 후보를 재정렬했습니다.")
+        send_by_level("\n\n".join([part for part in msg_parts if str(part).strip()]), level=ALERT_LEVEL_NORMAL)
     except Exception as e:
         _log_warn_msg(f"⚠️ send_preopen_watchlist 오류: {e}")
 def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
@@ -12080,82 +12146,635 @@ def _register_nxt_surge_to_krx_watch(watch: dict, nxt_price: int):
 # ============================================================
 # v41.77 #4: 야간 이벤트 → 장전 워치리스트 자동 생성
 # ============================================================
+def _dedupe_text_items(values: list | tuple | set, max_items: int = 10) -> list[str]:
+    seen = set()
+    out = []
+    for raw in list(values or []):
+        item = str(raw or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _scenario_direction_label(direction: str) -> str:
+    return {"up": "상방", "down": "하방", "neutral": "중립"}.get(str(direction or "neutral"), "중립")
+
+
+def _infer_scenario_direction_from_text(text: str) -> str:
+    body = str(text or "").lower()
+    pos_tokens = ["상승", "급등", "반등", "랠리", "완화", "호재", "risk on", "risk-on", "합의", "쇼트", "squeeze", "surge", "beat"]
+    neg_tokens = ["하락", "급락", "약세", "리스크", "우려", "긴장", "충격", "실패", "risk off", "risk-off", "selloff", "miss", "경고", "악재"]
+    pos = sum(1 for token in pos_tokens if token in body)
+    neg = sum(1 for token in neg_tokens if token in body)
+    if neg > pos:
+        return "down"
+    if pos > neg:
+        return "up"
+    return "up" if any(token in body for token in ["엔비디아", "nvidia", "ai", "반도체", "원전", "방산"]) else "neutral"
+
+
+SCENARIO_KEYWORD_SECTOR_EFFECTS = {
+    "환율": {"bull": ["반도체", "자동차", "조선"], "bear": ["항공", "여행", "내수소비"]},
+    "원달러": {"bull": ["반도체", "자동차", "조선"], "bear": ["항공", "여행", "내수소비"]},
+    "금리": {"bull": ["은행", "보험", "증권"], "bear": ["바이오", "2차전지", "인터넷"]},
+    "유가": {"bull": ["정유", "에너지", "LNG", "조선"], "bear": ["항공", "운송", "화학"]},
+    "반도체": {"bull": ["반도체", "AI반도체", "HBM"], "bear": ["반도체", "AI반도체", "HBM"]},
+    "엔비디아": {"bull": ["반도체", "AI반도체", "HBM"], "bear": ["반도체", "AI반도체", "HBM"]},
+    "nvidia": {"bull": ["반도체", "AI반도체", "HBM"], "bear": ["반도체", "AI반도체", "HBM"]},
+    "ai": {"bull": ["AI반도체", "AI인프라", "로봇"], "bear": ["AI반도체", "AI인프라"]},
+    "tesla": {"bull": ["2차전지", "자율주행"], "bear": ["2차전지", "자율주행"]},
+    "테슬라": {"bull": ["2차전지", "자율주행"], "bear": ["2차전지", "자율주행"]},
+    "원전": {"bull": ["원전", "건설", "전력인프라"], "bear": []},
+    "방산": {"bull": ["방산", "조선", "항공"], "bear": []},
+    "조선": {"bull": ["조선", "기자재", "LNG"], "bear": []},
+    "바이오": {"bull": ["바이오", "제약", "헬스케어"], "bear": ["바이오", "제약", "헬스케어"]},
+    "fda": {"bull": ["바이오", "제약", "헬스케어"], "bear": ["바이오", "제약", "헬스케어"]},
+    "방위비": {"bull": ["방산", "조선", "항공"], "bear": []},
+}
+SCENARIO_US_LEADER_KEYWORDS = [
+    "엔비디아", "nvidia", "테슬라", "tesla", "마이크론", "micron", "amd", "애플", "apple",
+    "아마존", "amazon", "메타", "meta", "마이크로소프트", "microsoft", "브로드컴", "broadcom",
+]
+
+
+def _iter_theme_stock_candidates_by_sector(sector: str, max_items: int = 6) -> list[dict]:
+    sector = str(sector or "").strip()
+    if not sector:
+        return []
+    found = []
+    seen = set()
+    for theme_key, theme_info in list(THEME_MAP.items()) + list((_dynamic_theme_map or {}).items()):
+        if not isinstance(theme_info, dict):
+            continue
+        sectors = [str(s or "").strip() for s in list(theme_info.get("sectors", []) or [])]
+        desc = str(theme_info.get("desc", "") or "")
+        if not any(sector == sec or sector.lower() in sec.lower() or sec.lower() in sector.lower() for sec in sectors) and sector.lower() not in desc.lower() and sector.lower() not in str(theme_key).lower():
+            continue
+        for code, name in list(theme_info.get("stocks", []) or [])[:max_items]:
+            code = normalize_stock_code(code)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            found.append({
+                "code": code,
+                "name": _resolve_stock_name(code, name),
+                "sector": sector,
+                "theme_key": str(theme_key),
+            })
+            if len(found) >= max_items:
+                return found
+    return found
+
+
+def _build_scenario_candidates_from_sectors(sectors: list[str], max_items: int = 6) -> list[dict]:
+    merged = []
+    seen = set()
+    for sector in _dedupe_text_items(sectors, max_items=8):
+        for row in _iter_theme_stock_candidates_by_sector(sector, max_items=max_items):
+            code = normalize_stock_code(row.get("code"))
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            merged.append(dict(row))
+            if len(merged) >= max_items:
+                return merged
+    return merged
+
+
+def _extract_us_leader_keywords(text: str) -> list[str]:
+    body = str(text or "")
+    hits = []
+    for keyword in SCENARIO_US_LEADER_KEYWORDS:
+        if keyword.lower() in body.lower() and keyword not in hits:
+            hits.append(keyword)
+    return hits[:5]
+
+
+def _collect_keyword_sector_effects(text: str) -> tuple[list[str], list[str]]:
+    body = str(text or "")
+    bull = []
+    bear = []
+    for keyword, effect in SCENARIO_KEYWORD_SECTOR_EFFECTS.items():
+        if keyword.lower() not in body.lower():
+            continue
+        bull.extend(list(effect.get("bull", []) or []))
+        bear.extend(list(effect.get("bear", []) or []))
+    return _dedupe_text_items(bull, max_items=8), _dedupe_text_items(bear, max_items=8)
+
+
+def _build_market_scenario_item(
+    *,
+    event_name: str,
+    direction: str,
+    cause: str,
+    source: str = "HEADLINE",
+    matched_keywords: list[str] | None = None,
+    us_leaders: list[str] | None = None,
+    kr_sector_bull: list[str] | None = None,
+    kr_sector_bear: list[str] | None = None,
+    confidence: str = "mid",
+    priority_base: int = 0,
+) -> dict:
+    direction = str(direction or "neutral")
+    bull_sectors = _dedupe_text_items(list(kr_sector_bull or []), max_items=8)
+    bear_sectors = _dedupe_text_items(list(kr_sector_bear or []), max_items=8)
+    long_candidates = _build_scenario_candidates_from_sectors(bull_sectors, max_items=6)
+    short_candidates = _build_scenario_candidates_from_sectors(bear_sectors, max_items=6)
+    primary_candidates = long_candidates if direction == "up" else short_candidates if direction == "down" else long_candidates
+    priority_score = int(priority_base or 0)
+    priority_score += min(3, len(_dedupe_text_items(matched_keywords or [], max_items=6)))
+    priority_score += min(2, len(_dedupe_text_items(us_leaders or [], max_items=4)))
+    priority_score += min(3, len(primary_candidates))
+    if direction == "up":
+        priority_score += 2
+    elif direction == "down":
+        priority_score += 1
+    return {
+        "event_name": str(event_name or "기타재료").strip() or "기타재료",
+        "direction": direction,
+        "direction_label": _scenario_direction_label(direction),
+        "cause": str(cause or "")[:160],
+        "source": str(source or "HEADLINE"),
+        "matched_keywords": _dedupe_text_items(matched_keywords or [], max_items=6),
+        "us_leaders": _dedupe_text_items(us_leaders or [], max_items=5),
+        "kr_sector_bull": bull_sectors,
+        "kr_sector_bear": bear_sectors,
+        "kr_stock_candidates_long": long_candidates,
+        "kr_stock_candidates_short": short_candidates,
+        "primary_candidates": primary_candidates,
+        "confirm_signal": "장초 동조 + 거래량/호가/섹터 breadth 확인" if direction == "up" else "장초 약세 지속 + 관련 지표 재확인" if direction == "down" else "장초 반응 여부 재확인",
+        "invalidation": "관련 섹터 breadth 붕괴 / 리더 약세 전환" if direction == "up" else "거시 변수 되돌림 / 약세 섹터 반등" if direction == "down" else "후속 재료 부재",
+        "action_stage": "장중재확인" if is_any_market_open() else "장전감시",
+        "confidence": str(confidence or "mid"),
+        "priority_score": int(priority_score),
+        "ts": time.time(),
+    }
+
+
+def _merge_market_scenario_map(scenario_map: dict, item: dict) -> None:
+    if not isinstance(item, dict):
+        return
+    key = f"{str(item.get('event_name', ''))}|{str(item.get('direction', 'neutral'))}"
+    if not key.strip("|"):
+        return
+    existing = scenario_map.get(key)
+    if not isinstance(existing, dict):
+        scenario_map[key] = item
+        return
+    merged = dict(existing)
+    merged["cause"] = str(item.get("cause") or merged.get("cause") or "")[:160]
+    merged["source"] = str(item.get("source") or merged.get("source") or "")
+    merged["matched_keywords"] = _dedupe_text_items(list(merged.get("matched_keywords", []) or []) + list(item.get("matched_keywords", []) or []), max_items=8)
+    merged["us_leaders"] = _dedupe_text_items(list(merged.get("us_leaders", []) or []) + list(item.get("us_leaders", []) or []), max_items=6)
+    merged["kr_sector_bull"] = _dedupe_text_items(list(merged.get("kr_sector_bull", []) or []) + list(item.get("kr_sector_bull", []) or []), max_items=8)
+    merged["kr_sector_bear"] = _dedupe_text_items(list(merged.get("kr_sector_bear", []) or []) + list(item.get("kr_sector_bear", []) or []), max_items=8)
+    merged["kr_stock_candidates_long"] = _build_scenario_candidates_from_sectors(merged.get("kr_sector_bull", []), max_items=6)
+    merged["kr_stock_candidates_short"] = _build_scenario_candidates_from_sectors(merged.get("kr_sector_bear", []), max_items=6)
+    merged["primary_candidates"] = merged["kr_stock_candidates_long"] if merged.get("direction") == "up" else merged["kr_stock_candidates_short"] if merged.get("direction") == "down" else merged["kr_stock_candidates_long"]
+    merged["priority_score"] = max(int(merged.get("priority_score", 0) or 0), int(item.get("priority_score", 0) or 0))
+    merged["ts"] = max(float(merged.get("ts", 0) or 0), float(item.get("ts", 0) or 0))
+    scenario_map[key] = merged
+
+
+def _build_macro_signal_scenarios(us: dict) -> list[dict]:
+    us = dict(us or {})
+    scenarios = []
+    if safe_float(us.get("nasdaq_chg", 0.0), 0.0) >= 1.2 or (safe_float(us.get("sp500_chg", 0.0), 0.0) >= 1.0 and safe_float(us.get("vix", 20.0), 20.0) <= 20.0):
+        scenarios.append(_build_market_scenario_item(
+            event_name="미국 기술주 위험선호",
+            direction="up",
+            cause=f"나스닥선물 {safe_float(us.get('nasdaq_chg', 0.0), 0.0):+.1f}% / S&P {safe_float(us.get('sp500_chg', 0.0), 0.0):+.1f}% / VIX {safe_float(us.get('vix', 0.0), 0.0):.1f}",
+            source="US_MACRO",
+            matched_keywords=["나스닥", "risk_on", "반도체", "AI"],
+            us_leaders=["엔비디아", "반도체", "AI"],
+            kr_sector_bull=["반도체", "AI반도체", "HBM", "AI인프라"],
+            priority_base=7,
+            confidence="mid",
+        ))
+    if safe_float(us.get("nasdaq_chg", 0.0), 0.0) <= -1.5 or safe_float(us.get("vix", 20.0), 20.0) >= 25.0:
+        scenarios.append(_build_market_scenario_item(
+            event_name="미국 기술주 위험회피",
+            direction="down",
+            cause=f"나스닥선물 {safe_float(us.get('nasdaq_chg', 0.0), 0.0):+.1f}% / VIX {safe_float(us.get('vix', 0.0), 0.0):.1f}",
+            source="US_MACRO",
+            matched_keywords=["risk_off", "나스닥", "변동성"],
+            us_leaders=["반도체", "AI"],
+            kr_sector_bear=["반도체", "AI반도체", "2차전지", "바이오"],
+            priority_base=7,
+            confidence="mid",
+        ))
+    if safe_float(us.get("krw_usd_chg", 0.0), 0.0) >= 0.8 or safe_float(us.get("krw_usd", 0.0), 0.0) >= 1400.0:
+        scenarios.append(_build_market_scenario_item(
+            event_name="환율 상승 압박",
+            direction="down",
+            cause=f"원/달러 {safe_float(us.get('krw_usd', 0.0), 0.0):.0f}원 ({safe_float(us.get('krw_usd_chg', 0.0), 0.0):+.1f}%)",
+            source="FX",
+            matched_keywords=["환율", "원달러"],
+            kr_sector_bull=["반도체", "자동차", "조선"],
+            kr_sector_bear=["항공", "여행", "내수소비"],
+            priority_base=8,
+            confidence="high",
+        ))
+    elif safe_float(us.get("krw_usd_chg", 0.0), 0.0) <= -0.8:
+        scenarios.append(_build_market_scenario_item(
+            event_name="환율 안정/외인 우호",
+            direction="up",
+            cause=f"원/달러 {safe_float(us.get('krw_usd', 0.0), 0.0):.0f}원 ({safe_float(us.get('krw_usd_chg', 0.0), 0.0):+.1f}%)",
+            source="FX",
+            matched_keywords=["환율", "외국인"],
+            kr_sector_bull=["반도체", "증권", "바이오"],
+            kr_sector_bear=["수출"],
+            priority_base=6,
+            confidence="mid",
+        ))
+    if safe_float(us.get("tnx", 0.0), 0.0) >= 4.5:
+        scenarios.append(_build_market_scenario_item(
+            event_name="미국 금리 상승",
+            direction="down",
+            cause=f"미 10년물 {safe_float(us.get('tnx', 0.0), 0.0):.2f}%",
+            source="RATE",
+            matched_keywords=["금리", "10년물"],
+            kr_sector_bull=["은행", "보험", "증권"],
+            kr_sector_bear=["바이오", "2차전지", "인터넷"],
+            priority_base=7,
+            confidence="mid",
+        ))
+    if safe_float(us.get("oil_chg", 0.0), 0.0) >= 4.0:
+        scenarios.append(_build_market_scenario_item(
+            event_name="유가 급등",
+            direction="down",
+            cause=f"WTI {safe_float(us.get('oil_chg', 0.0), 0.0):+.1f}%",
+            source="OIL",
+            matched_keywords=["유가", "에너지"],
+            kr_sector_bull=["정유", "에너지", "LNG", "조선"],
+            kr_sector_bear=["항공", "운송", "화학"],
+            priority_base=7,
+            confidence="mid",
+        ))
+    elif safe_float(us.get("oil_chg", 0.0), 0.0) <= -4.0:
+        scenarios.append(_build_market_scenario_item(
+            event_name="유가 안정",
+            direction="up",
+            cause=f"WTI {safe_float(us.get('oil_chg', 0.0), 0.0):+.1f}%",
+            source="OIL",
+            matched_keywords=["유가", "에너지"],
+            kr_sector_bull=["항공", "운송", "화학"],
+            kr_sector_bear=["정유", "에너지"],
+            priority_base=6,
+            confidence="mid",
+        ))
+    return scenarios
+
+
+def _save_market_scenario_state(state: dict | None = None) -> None:
+    global _market_scenario_state
+    payload = dict(state or _market_scenario_state or {"items": [], "updated_ts": 0.0})
+    _market_scenario_state = payload
+    try:
+        _write_json_atomic(MARKET_SCENARIO_STATE_FILE, payload, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _load_market_scenario_state() -> dict:
+    global _market_scenario_state
+    if isinstance(_market_scenario_state, dict) and _market_scenario_state.get("items"):
+        return _market_scenario_state
+    raw = _read_json_safe(MARKET_SCENARIO_STATE_FILE, {"items": [], "updated_ts": 0.0})
+    if isinstance(raw, dict):
+        _market_scenario_state = raw
+    return _market_scenario_state if isinstance(_market_scenario_state, dict) else {"items": [], "updated_ts": 0.0}
+
+
+def _save_premarket_action_board(board: dict | None = None) -> None:
+    global _premarket_action_board
+    payload = dict(board or _premarket_action_board or {"items": [], "updated_ts": 0.0})
+    _premarket_action_board = payload
+    try:
+        _write_json_atomic(PREMARKET_ACTION_BOARD_FILE, payload, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _load_premarket_action_board() -> dict:
+    global _premarket_action_board
+    if isinstance(_premarket_action_board, dict) and _premarket_action_board.get("items"):
+        return _premarket_action_board
+    raw = _read_json_safe(PREMARKET_ACTION_BOARD_FILE, {"items": [], "updated_ts": 0.0})
+    if isinstance(raw, dict):
+        _premarket_action_board = raw
+    return _premarket_action_board if isinstance(_premarket_action_board, dict) else {"items": [], "updated_ts": 0.0}
+
+
+def _rebuild_premarket_action_board(scenarios: list[dict]) -> dict:
+    items = []
+    for row in list(scenarios or []):
+        if not isinstance(row, dict):
+            continue
+        items.append({
+            "event_name": str(row.get("event_name", "") or ""),
+            "direction": str(row.get("direction", "neutral") or "neutral"),
+            "cause": str(row.get("cause", "") or "")[:160],
+            "source": str(row.get("source", "") or ""),
+            "kr_sector_bull": list(row.get("kr_sector_bull", []) or []),
+            "kr_sector_bear": list(row.get("kr_sector_bear", []) or []),
+            "kr_stock_candidates_long": list(row.get("kr_stock_candidates_long", []) or []),
+            "kr_stock_candidates_short": list(row.get("kr_stock_candidates_short", []) or []),
+            "confirm_signal": str(row.get("confirm_signal", "") or ""),
+            "invalidation": str(row.get("invalidation", "") or ""),
+            "priority_score": int(row.get("priority_score", 0) or 0),
+        })
+    items = sorted(items, key=lambda item: (int(item.get("priority_score", 0) or 0), len(item.get("kr_stock_candidates_long", []) or []) + len(item.get("kr_stock_candidates_short", []) or [])), reverse=True)[:PREMARKET_ACTION_BOARD_MAX_ITEMS]
+    board = {"items": items, "updated_ts": time.time()}
+    _save_premarket_action_board(board)
+    return board
+
+
+def _build_material_signal_rows_from_scenarios() -> list[dict]:
+    state = _load_market_scenario_state()
+    rows = []
+    for item in list((state or {}).get("items", []) or [])[:MARKET_SCENARIO_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        direction_label = _scenario_direction_label(item.get("direction", "neutral"))
+        focus_sectors = item.get("kr_sector_bull", []) if item.get("direction") == "up" else item.get("kr_sector_bear", [])
+        focus_candidates = item.get("kr_stock_candidates_long", []) if item.get("direction") == "up" else item.get("kr_stock_candidates_short", [])
+        rows.append({
+            "title": (
+                f"{item.get('event_name', '')} {direction_label} "
+                f"원인 {str(item.get('cause', '') or '')[:60]} "
+                f"한국섹터 {'/'.join(list(focus_sectors or [])[:3])} "
+                f"한국후보 {'/'.join([str(v.get('name', '') or '') for v in list(focus_candidates or [])[:3]])}"
+            ).strip(),
+            "source": "SCENARIO",
+            "published_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return rows
+
+
 def _extract_overnight_event_keywords(headlines: list) -> dict:
     """
-    야간 뉴스 헤드라인에서 이벤트 키워드 자동 추출.
-    반환: {event_name: [matched_keywords]}
+    야간/비장중 헤드라인에서 시나리오 객체를 추출.
+    반환: {"event|direction": scenario_dict}
     """
-    result = {}
-    all_text = " ".join(headlines).lower()
-    for event_name, keywords in OVERNIGHT_EVENT_KEYWORDS.items():
-        matched = [kw for kw in keywords if kw.lower() in all_text]
-        if matched:
-            result[event_name] = matched
-    return result
+    scenario_map = {}
+    for raw in list(headlines or []):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        direction = _infer_scenario_direction_from_text(text)
+        matched_any = False
+        keyword_bull, keyword_bear = _collect_keyword_sector_effects(text)
+        for event_name, keywords in OVERNIGHT_EVENT_KEYWORDS.items():
+            matched = [kw for kw in keywords if kw and kw.lower() in text.lower()]
+            if not matched:
+                continue
+            matched_any = True
+            base_sectors = list(OVERNIGHT_EVENT_SECTOR_MAP.get(event_name, []) or [])
+            bull = base_sectors + keyword_bull
+            bear = keyword_bear
+            item = _build_market_scenario_item(
+                event_name=event_name,
+                direction=direction,
+                cause=text,
+                source="HEADLINE",
+                matched_keywords=matched,
+                us_leaders=_extract_us_leader_keywords(text),
+                kr_sector_bull=bull,
+                kr_sector_bear=bear,
+                priority_base=6,
+                confidence="mid",
+            )
+            _merge_market_scenario_map(scenario_map, item)
+        if matched_any:
+            continue
+        if keyword_bull or keyword_bear:
+            generic_event = "거시/재료"
+            if "환율" in text or "원달러" in text:
+                generic_event = "환율"
+            elif "금리" in text or "10년물" in text:
+                generic_event = "금리"
+            elif "유가" in text or "wti" in text.lower() or "oil" in text.lower():
+                generic_event = "유가"
+            elif "반도체" in text or "nvidia" in text.lower() or "엔비디아" in text:
+                generic_event = "반도체/AI"
+            item = _build_market_scenario_item(
+                event_name=generic_event,
+                direction=direction,
+                cause=text,
+                source="HEADLINE",
+                matched_keywords=keyword_bull + keyword_bear,
+                us_leaders=_extract_us_leader_keywords(text),
+                kr_sector_bull=keyword_bull,
+                kr_sector_bear=keyword_bear,
+                priority_base=5,
+                confidence="low",
+            )
+            _merge_market_scenario_map(scenario_map, item)
+    return scenario_map
+
+
 def _build_overnight_watchlist(detected_events: dict):
     """
-    감지된 야간 이벤트 → 수혜 국내 종목 워치리스트 생성 → overnight_watchlist.json 저장.
-    detected_events: {event_name: [matched_keywords]}
+    감지된 시나리오 → 상방 한국 종목 워치리스트 생성.
+    detected_events: {scenario_key: scenario_dict}
     """
     global _overnight_watchlist
     try:
         watchlist = {}
-        for event_name, kws in detected_events.items():
-            sectors = OVERNIGHT_EVENT_SECTOR_MAP.get(event_name, [])
-            for sec in sectors:
-                # THEME_MAP에서 해당 섹터 종목 추출
-                for tk, ti in THEME_MAP.items():
-                    if sec in ti.get("sectors", []) or sec.lower() in ti.get("desc", "").lower():
-                        for c, n in ti.get("stocks", []):
-                            if c not in watchlist:
-                                watchlist[c] = {
-                                    "name":     n,
-                                    "event":    event_name,
-                                    "keywords": kws,
-                                    "sectors":  sectors,
-                                    "ts":       time.time(),
-                                }
-                # 동적 테마에서도 추가
-                for tk, ti in _dynamic_theme_map.items():
-                    if sec.lower() in ti.get("desc", "").lower():
-                        for c, n in ti.get("stocks", []):
-                            if c not in watchlist:
-                                watchlist[c] = {
-                                    "name":     n,
-                                    "event":    event_name,
-                                    "keywords": kws,
-                                    "sectors":  sectors,
-                                    "ts":       time.time(),
-                                    "source":   "dynamic_theme",
-                                }
-        if watchlist:
-            _refresh_market_flow_state_from_headlines([f"{event_name} {' '.join(kws)}" for event_name, kws in detected_events.items()], source="overnight_event")
-            _overnight_watchlist = watchlist
-            try:
-                _write_json_atomic(OVERNIGHT_WATCHLIST_FILE, watchlist, indent=2)
-                _log_info_msg(f"  🌙 야간 워치리스트 저장: {len(watchlist)}종목 ({list(detected_events.keys())})")
-            except Exception as e:
-                _swallow_exception(e)
+        for scenario in list((detected_events or {}).values()):
+            if not isinstance(scenario, dict):
+                continue
+            if str(scenario.get("direction", "neutral")) == "down":
+                continue
+            for cand in list(scenario.get("kr_stock_candidates_long", []) or [])[:6]:
+                code = normalize_stock_code(cand.get("code"))
+                if not code or code in watchlist:
+                    continue
+                watchlist[code] = {
+                    "name": _resolve_stock_name(code, cand.get("name", "")),
+                    "event": scenario.get("event_name", "기타"),
+                    "keywords": list(scenario.get("matched_keywords", []) or []),
+                    "sectors": list(scenario.get("kr_sector_bull", []) or []),
+                    "cause": str(scenario.get("cause", "") or "")[:120],
+                    "direction": str(scenario.get("direction", "up") or "up"),
+                    "priority_score": int(scenario.get("priority_score", 0) or 0),
+                    "confirm_signal": str(scenario.get("confirm_signal", "") or ""),
+                    "ts": time.time(),
+                    "source": str(scenario.get("source", "scenario") or "scenario"),
+                }
+                if len(watchlist) >= SCENARIO_WATCHLIST_MAX_CODES:
+                    break
+            if len(watchlist) >= SCENARIO_WATCHLIST_MAX_CODES:
+                break
+        _overnight_watchlist = watchlist
+        try:
+            _write_json_atomic(OVERNIGHT_WATCHLIST_FILE, watchlist, indent=2)
+            if watchlist:
+                _log_info_msg(f"  🌙 야간 시나리오 워치리스트 저장: {len(watchlist)}종목")
+        except Exception as e:
+            _swallow_exception(e)
     except Exception as e:
         _log_warn_msg(f"⚠️ _build_overnight_watchlist: {e}")
+
+
+def collect_market_scenarios_24h(force: bool = False, external_headlines: dict | list | None = None, us: dict | None = None) -> dict:
+    global _market_scenario_state
+    now_ts = time.time()
+    cached = _load_market_scenario_state()
+    if not force and cached.get("items") and now_ts - float(cached.get("updated_ts", 0) or 0) < MARKET_SCENARIO_CACHE_TTL_SEC:
+        return cached
+    rows = []
+    try:
+        rows.extend(_get_material_signal_headline_rows(force=force))
+    except Exception as e:
+        _swallow_exception(e)
+    if isinstance(external_headlines, dict):
+        for source, titles in external_headlines.items():
+            for title in list(titles or []):
+                txt = str(title or "").strip()
+                if txt:
+                    rows.append({"title": txt, "source": str(source or "HEADLINE").upper(), "published_at": ""})
+    elif isinstance(external_headlines, list):
+        for title in external_headlines:
+            txt = str(title or "").strip()
+            if txt:
+                rows.append({"title": txt, "source": "HEADLINE", "published_at": ""})
+    scenario_map = {}
+    headline_titles = [str((row or {}).get("title", "") or "").strip() for row in rows if str((row or {}).get("title", "") or "").strip()]
+    for item in _extract_overnight_event_keywords(headline_titles).values():
+        _merge_market_scenario_map(scenario_map, item)
+    us_state = dict(us or get_us_market_signals() or {})
+    for item in _build_macro_signal_scenarios(us_state):
+        _merge_market_scenario_map(scenario_map, item)
+    try:
+        geo_state = _get_effective_geo_state() or {}
+        if geo_state.get("active") and time.time() - float(geo_state.get("ts", 0) or 0) <= 3600 * 18:
+            bull = []
+            bear = []
+            for row in list(geo_state.get("sector_directions", []) or []):
+                direction = str((row or {}).get("direction", "") or "").lower()
+                sector = str((row or {}).get("sector", "") or "").strip()
+                if not sector:
+                    continue
+                if direction in ("상승", "up", "positive", "bull"):
+                    bull.append(sector)
+                elif direction in ("하락", "down", "negative", "bear"):
+                    bear.append(sector)
+            if not bull and geo_state.get("sectors"):
+                bull = list(geo_state.get("sectors", []) or [])[:4]
+            geo_item = _build_market_scenario_item(
+                event_name="지정학/해외이슈",
+                direction="down" if int(geo_state.get("score_adj", 0) or 0) <= -5 else "up",
+                cause=str(geo_state.get("summary", "") or "")[:160],
+                source="GEO",
+                matched_keywords=list(geo_state.get("kws", []) or []),
+                kr_sector_bull=bull,
+                kr_sector_bear=bear,
+                priority_base=7,
+                confidence=str(geo_state.get("uncertainty", "mid") or "mid"),
+            )
+            _merge_market_scenario_map(scenario_map, geo_item)
+    except Exception as e:
+        _swallow_exception(e)
+    items = sorted(scenario_map.values(), key=lambda item: (int(item.get("priority_score", 0) or 0), len(item.get("primary_candidates", []) or [])), reverse=True)
+    items = items[:MARKET_SCENARIO_MAX_ITEMS]
+    state = {"items": items, "updated_ts": now_ts}
+    _save_market_scenario_state(state)
+    _rebuild_premarket_action_board(items)
+    _build_overnight_watchlist({f"{row.get('event_name','')}|{row.get('direction','neutral')}": row for row in items})
+    return state
+
+
+def run_market_scenario_collection_cycle(force: bool = False) -> None:
+    try:
+        if _bot_paused:
+            return
+        collect_market_scenarios_24h(force=force)
+    except Exception as e:
+        _log_error("run_market_scenario_collection_cycle", e)
+
+
+def _format_premarket_action_board_block(max_events: int = 6, max_stocks: int = 4) -> str:
+    board = _load_premarket_action_board()
+    items = list((board or {}).get("items", []) or [])
+    if not items:
+        return ""
+    bulls = [item for item in items if str(item.get("direction", "")) == "up"][:max_events]
+    bears = [item for item in items if str(item.get("direction", "")) == "down"][:max_events]
+    lines = ["🧭 <b>핵심 시나리오 액션보드</b>"]
+    if bulls:
+        lines.append("  🔴 <b>상방 시나리오</b>")
+        for item in bulls[: max(1, max_events // 2 + 1)]:
+            cand_names = "/".join([str(v.get("name", "") or "") for v in list(item.get("kr_stock_candidates_long", []) or [])[:max_stocks]])
+            sec = ", ".join(list(item.get("kr_sector_bull", []) or [])[:3])
+            lines.append(f"   • {item.get('event_name','')} — {str(item.get('cause','') or '')[:36]}")
+            if sec:
+                lines.append(f"     한국섹터: {sec}")
+            if cand_names:
+                lines.append(f"     후보: {cand_names}")
+            if item.get("confirm_signal"):
+                lines.append(f"     확인: {item.get('confirm_signal','')}")
+    if bears:
+        lines.append("  🔵 <b>하방 시나리오</b>")
+        for item in bears[: max(1, max_events // 2 + 1)]:
+            cand_names = "/".join([str(v.get("name", "") or "") for v in list(item.get("kr_stock_candidates_short", []) or [])[:max_stocks]])
+            sec = ", ".join(list(item.get("kr_sector_bear", []) or [])[:3])
+            lines.append(f"   • {item.get('event_name','')} — {str(item.get('cause','') or '')[:36]}")
+            if sec:
+                lines.append(f"     약세섹터: {sec}")
+            if cand_names:
+                lines.append(f"     회피/경계: {cand_names}")
+            if item.get("confirm_signal"):
+                lines.append(f"     확인: {item.get('confirm_signal','')}")
+    return "\n".join(lines)
+
+
+def _build_market_scenario_digest_text(force: bool = False) -> str:
+    state = collect_market_scenarios_24h(force=force)
+    items = list((state or {}).get("items", []) or [])
+    if not items:
+        return ""
+    lines = ["🧭 <b>장후 시나리오 요약</b>", "━━━━━━━━━━━━━━━"]
+    for item in items[:5]:
+        direction_emoji = "🔴" if item.get("direction") == "up" else "🔵" if item.get("direction") == "down" else "🟡"
+        focus_sectors = item.get("kr_sector_bull", []) if item.get("direction") == "up" else item.get("kr_sector_bear", [])
+        focus_candidates = item.get("kr_stock_candidates_long", []) if item.get("direction") == "up" else item.get("kr_stock_candidates_short", [])
+        cand_names = "/".join([str(v.get("name", "") or "") for v in list(focus_candidates or [])[:3]])
+        lines.append(f"{direction_emoji} {item.get('event_name','')} | {_scenario_direction_label(item.get('direction','neutral'))}")
+        lines.append(f"  원인: {str(item.get('cause','') or '')[:52]}")
+        if focus_sectors:
+            lines.append(f"  한국섹터: {', '.join(list(focus_sectors)[:3])}")
+        if cand_names:
+            lines.append(f"  후보: {cand_names}")
+    return "\n".join(lines)
+
+
 def _format_overnight_watchlist_block() -> str:
     """장전 브리핑용 야간 워치리스트 블록 생성"""
     if not _overnight_watchlist:
         return ""
     try:
-        lines = ["🌙 <b>야간 이벤트 수혜 예상 종목</b>"]
+        lines = ["🌙 <b>야간 시나리오 상방 후보</b>"]
         by_event: dict = {}
         for c, v in _overnight_watchlist.items():
             ev = v.get("event", "기타")
             by_event.setdefault(ev, []).append((c, v))
-        for ev, items in by_event.items():
+        for ev, items in list(by_event.items())[:4]:
             kws = items[0][1].get("keywords", [])[:3]
+            cause = str(items[0][1].get("cause", "") or "")[:32]
             lines.append(f"  📌 <b>{ev}</b>  ({', '.join(kws)})")
+            if cause:
+                lines.append(f"    - {cause}")
             for c, v in items[:4]:
                 lines.append(f"    • {v['name']} <code>{c}</code>")
         return "\n".join(lines)
     except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
+        _swallow_exception(e)
         return ""
 def _default_market_flow_state() -> dict:
     return {"themes": {}, "updated_ts": 0.0}
@@ -14438,6 +15057,7 @@ def run_overnight_monitor():
             return
         _sync_overnight_state_from_persisted(_load_overnight_active_state())
         us = get_us_market_signals()
+        collect_market_scenarios_24h(force=False, us=us)
         alerts = _collect_overnight_market_alerts(us)
         _append_overnight_summary_lines(now_dt, alerts)
         _persist_overnight_monitor_state()
@@ -24392,6 +25012,7 @@ def run_geo_news_scan():
         if not geo:
             return
         _store_geo_event_state(geo)
+        collect_market_scenarios_24h(force=True, external_headlines=headlines_by_source)
         msg = _build_geo_event_message(geo, headlines_by_source)
         _maybe_send_geo_event_message(msg)
         _maybe_refresh_geo_overnight_watchlist(headlines_by_source)
@@ -24733,12 +25354,30 @@ def _is_material_first_extended_window(now: datetime | None = None) -> bool:
     return MATERIAL_FIRST_OFFHOURS_START <= now_t <= MATERIAL_FIRST_OFFHOURS_END
 
 
+def _get_theme_scenario_bonus(theme_key: str) -> int:
+    theme_key = str(theme_key or "").strip()
+    theme_info = THEME_MAP.get(theme_key, {}) if isinstance(THEME_MAP, dict) else {}
+    theme_tokens = {theme_key.lower()}
+    for sector in list(theme_info.get("sectors", []) or []):
+        token = str(sector or "").strip().lower()
+        if token:
+            theme_tokens.add(token)
+    score = 0
+    board = _load_premarket_action_board()
+    for item in list((board or {}).get("items", []) or [])[:PREMARKET_ACTION_BOARD_MAX_ITEMS]:
+        sectors = [str(v or "").strip().lower() for v in list(item.get("kr_sector_bull", []) or []) + list(item.get("kr_sector_bear", []) or [])]
+        if any(tok and (tok in sec or sec in tok) for tok in theme_tokens for sec in sectors if sec):
+            score += 1
+    return min(3, score)
+
+
 def _score_material_seed_quality(theme_key: str, matched: list, stock_status: list[dict]) -> dict:
     matched_cnt = len(matched or [])
     reacted_cnt = sum(1 for s in stock_status if safe_float(s.get("change_rate", 0.0), 0.0) >= ISSUE_PREWATCH_REACTION_MIN_CHANGE)
     vol_on_cnt = sum(1 for s in stock_status if safe_float(s.get("volume_ratio", 0.0), 0.0) >= ISSUE_PREWATCH_REACTION_MIN_VOLUME)
     leader_cnt = sum(1 for s in stock_status if safe_float(s.get("change_rate", 0.0), 0.0) >= 2.5 and safe_float(s.get("volume_ratio", 0.0), 0.0) >= 1.5)
-    score = min(3, matched_cnt) + min(2, reacted_cnt) + min(2, vol_on_cnt) + min(2, leader_cnt)
+    scenario_bonus = _get_theme_scenario_bonus(theme_key)
+    score = min(3, matched_cnt) + min(2, reacted_cnt) + min(2, vol_on_cnt) + min(2, leader_cnt) + min(3, scenario_bonus)
     passes = score >= MATERIAL_PREWATCH_SEED_SCORE_MIN and matched_cnt >= MATERIAL_PREWATCH_HEADLINE_MIN
     return {
         "theme_key": theme_key,
@@ -24746,6 +25385,7 @@ def _score_material_seed_quality(theme_key: str, matched: list, stock_status: li
         "reacted_cnt": reacted_cnt,
         "vol_on_cnt": vol_on_cnt,
         "leader_cnt": leader_cnt,
+        "scenario_bonus": scenario_bonus,
         "score": score,
         "passes": passes,
         "strong": score >= MATERIAL_PREWATCH_STRONG_SEED_SCORE,
@@ -24860,7 +25500,8 @@ def run_material_first_scan() -> None:
         return
     _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 재료-first 스캔{' [실시간]' if live_market else ' [장외/장전]'}...")
     try:
-        headlines = _get_material_signal_headlines()
+        collect_market_scenarios_24h(force=not live_market)
+        headlines = _get_material_signal_headlines(force=not live_market)
         if not headlines:
             return
         threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
@@ -27714,6 +28355,7 @@ def _build_premarket_macro_sections(now_dt: datetime) -> str:
     parts = []
     try:
         us = get_us_market_signals()
+        collect_market_scenarios_24h(force=False, us=us)
         if us.get("summary"):
             gap_emoji = {"gap_up": "⬆️ 갭상승 기대", "flat": "➡️ 갭 없음", "gap_down": "⬇️ 갭하락 주의"}
             parts.append(
@@ -27721,6 +28363,9 @@ def _build_premarket_macro_sections(now_dt: datetime) -> str:
                 f"  {us['summary']}\n"
                 f"  {gap_emoji.get(us.get('gap_signal', 'flat'), '➡️')}\n"
             )
+        scenario_block = _format_premarket_action_board_block(max_events=4, max_stocks=3)
+        if scenario_block:
+            parts.append("\n" + scenario_block + "\n")
         overnight_lines = _get_effective_overnight_lines(now_dt)
         if overnight_lines:
             parts.append("\n🌙 <b>오버나이트 이벤트</b>\n" + "".join(f"  {line}\n" for line in overnight_lines[-5:]))
@@ -28746,6 +29391,7 @@ def get_us_market_signals() -> dict:
         result.update(_evaluate_us_market_signal_result(values))
         result["ts"] = time.time()
         result["summary"] = _compose_us_market_signal_summary(result)
+        result["macro_drivers"] = [item.get("event_name", "") for item in _build_macro_signal_scenarios(result)[:4]]
         MARKET_REGIME.update(compute_market_regime(result["nasdaq_chg"], result["vix"], result["dxy"]))
         _us_cache.update(result)
         _log_info_msg(f"  🌐 미국 시장: {result['summary']}")
@@ -29210,6 +29856,46 @@ def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool
                 continue
     except Exception as _e:
         _log_warn_msg(f"  ⚠️ 야간 워치리스트 우선 스캔 오류: {_e}")
+def _scan_scenario_action_board_candidates(alerts: list, seen: set, krx_open: bool) -> None:
+    try:
+        if not krx_open:
+            return
+        board = _load_premarket_action_board()
+        if not board.get("items"):
+            return
+        scanned = 0
+        for item in list(board.get("items", []) or []):
+            if str(item.get("direction", "")) != "up":
+                continue
+            for cand in list(item.get("kr_stock_candidates_long", []) or [])[:3]:
+                code = normalize_stock_code(cand.get("code"))
+                if not code or code in seen:
+                    continue
+                cur = get_stock_price(code)
+                if not cur or not cur.get("price", 0):
+                    continue
+                stock = {
+                    "code": code,
+                    "name": _resolve_stock_name(code, cand.get("name", "")),
+                    "price": cur.get("price", 0),
+                    "change_rate": cur.get("change_rate", 0),
+                    "volume_ratio": cur.get("volume_ratio", 0),
+                    "today_vol": cur.get("today_vol", 0),
+                    "scenario_event": item.get("event_name", ""),
+                }
+                result = analyze(stock)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result.setdefault("reasons", []).append(f"🧭 24H 시나리오 후보: {str(item.get('event_name','') or '')[:24]}")
+                _append_scan_alert(alerts, seen, result, hist_key=code, seen_code=code)
+                scanned += 1
+                if scanned >= SCENARIO_SCAN_LIMIT:
+                    return
+                time.sleep(0.1)
+    except Exception as e:
+        _log_warn_msg(f"  ⚠️ 시나리오 액션보드 우선 스캔 오류: {e}")
+
+
 def _scan_issue_prewatch_candidates(alerts: list, seen: set) -> None:
     if not _news_issue_prewatch or not is_any_market_open():
         return
@@ -29468,6 +30154,7 @@ def run_scan():
         _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
         _scan_overnight_watchlist_candidates(alerts, seen, ctx["krx_open"])
+        _scan_scenario_action_board_candidates(alerts, seen, ctx["krx_open"])
         _scan_issue_prewatch_candidates(alerts, seen)
         if ctx["krx_open"]:
             _scan_krx_market_candidates(alerts, seen)
@@ -29605,8 +30292,8 @@ if __name__ == "__main__":
     ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
-    schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_material_downside_digest()))
-    schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_material_downside_digest(force=True)))
+    schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
+    schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest(force=True)))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
     for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
@@ -29634,6 +30321,8 @@ if __name__ == "__main__":
             _log_info_msg("📡 NXT 마감(20:00) — 재진입 감시 전체 초기화")
         ) if not is_holiday() else None
     ))
+    # 24시간 시나리오 수집 (20분마다)
+    schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
     # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
     schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
     # 지정학 뉴스 스캔 (1시간마다)
