@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v142
+버전: v143
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v143 (2026-03-31): EARLY/NXT 지속성·섹터 breadth 실확인 강화 — 상위주 공통 생존 조건과 오전 급락 포착 종목의 공통 붕괴 조건을 함께 반영해, NXT/조기포착에서 후속 거래량·호가 지속성과 실제 섹터 breadth를 더 강하게 확인하도록 조정했다. NXT 장전은 live hoga gate를 필수로 보고, intraday NXT는 confirm 3회와 persistence gate를 적용하며, `early_guard_external_delay_reason`이 NXT 점수 예외보다 우선한다. 또한 fake breakout은 돌파 유지 실패까지 포함해 진입 차단을 보강한다.
 - v142 (2026-03-31): 하향 추세 조기포착 차단 강화 + 추세전환 예외 제한 허용 — 다중 타임프레임 하락 추세 판정을 더 보수적으로 강화하고, 일반적인 하향/비상승 구조의 EARLY_DETECT·SURGE류 포착을 더 일찍 차단하도록 조정했다. 대신 직접뉴스·강한 테마 동조·ORB/전고 돌파·quiet absorption·연속 재상승 같은 추세전환 토큰이 충분할 때만 제한적으로 예외 허용해 반전 초입 후보만 남긴다.
 - v141 (2026-03-31): 장중 포착 확대 + 약화 기반 청산/가짜 돌파 가드 — session/focus scan limit를 18/30으로 높이고 strict 최소점수를 62로 낮췄으며, KRX EARLY_DETECT 외부허용을 74점 A + 진입가 확정 + 체결/호가 확인으로 완화했다. 동시에 tracking weakness 점수로 분할익절/트레일링 정리를 앞당기고, 거래량 기준 미달 + 윗꼬리 부담 돌파는 진입 단계에서 fake breakout으로 차단한다.
 - v139 (2026-03-30): KIS 유량 절약형 quiet scan + 거래량 rank 30 우회 — quiet scan 후보 풀과 deep-fetch 대상을 분리하고 KIS 호가/체결/투자자 snapshot에 짧은 TTL 캐시·사이클 budget·rotate selection을 추가해 REST 호출량을 줄였으며, KRX 거래량 rank는 KIS 30건 응답 이후 rank/universe snapshot으로 보강해 실질 80 후보 폭을 유지하도록 조정.
@@ -4823,6 +4824,17 @@ FAKE_BREAKOUT_UPPER_WICK_HARD = float(os.getenv("FAKE_BREAKOUT_UPPER_WICK_HARD",
 EARLY_EXTERNAL_KRX_SCORE_MIN = int(os.getenv("EARLY_EXTERNAL_KRX_SCORE_MIN", "74") or "74")
 EARLY_EXTERNAL_KRX_EXEC_SCORE_MIN = int(os.getenv("EARLY_EXTERNAL_KRX_EXEC_SCORE_MIN", "52") or "52")
 EARLY_EXTERNAL_KRX_BID_ASK_MIN = float(os.getenv("EARLY_EXTERNAL_KRX_BID_ASK_MIN", "1.2") or "1.2")
+EARLY_NXT_CONFIRM_COUNT = int(os.getenv("EARLY_NXT_CONFIRM_COUNT", "3") or "3")
+EARLY_PERSIST_VOLUME_FLOOR = float(os.getenv("EARLY_PERSIST_VOLUME_FLOOR", "0.60") or "0.60")
+EARLY_NXT_PERSIST_VOLUME_FLOOR = float(os.getenv("EARLY_NXT_PERSIST_VOLUME_FLOOR", "0.72") or "0.72")
+EARLY_PERSIST_BID_ASK_MIN = float(os.getenv("EARLY_PERSIST_BID_ASK_MIN", "1.05") or "1.05")
+EARLY_NXT_PERSIST_BID_ASK_MIN = float(os.getenv("EARLY_NXT_PERSIST_BID_ASK_MIN", "1.15") or "1.15")
+EARLY_PERSIST_MIN_VOLUME_RATIO = float(os.getenv("EARLY_PERSIST_MIN_VOLUME_RATIO", "1.30") or "1.30")
+EARLY_NXT_PERSIST_MIN_VOLUME_RATIO = float(os.getenv("EARLY_NXT_PERSIST_MIN_VOLUME_RATIO", "1.60") or "1.60")
+EARLY_SECTOR_REACT_MIN_COUNT = int(os.getenv("EARLY_SECTOR_REACT_MIN_COUNT", "1") or "1")
+EARLY_SECTOR_LEADER_MIN_CHANGE = float(os.getenv("EARLY_SECTOR_LEADER_MIN_CHANGE", "1.0") or "1.0")
+EARLY_NXT_SECTOR_LEADER_MIN_CHANGE = float(os.getenv("EARLY_NXT_SECTOR_LEADER_MIN_CHANGE", "1.2") or "1.2")
+EARLY_NXT_NO_BREADTH_SCORE_MIN = int(os.getenv("EARLY_NXT_NO_BREADTH_SCORE_MIN", "82") or "82")
 # ── 오늘의 최우선 종목 ──
 _today_top_signals: dict = {}
 TOP_SIGNAL_SEND_AT       = "10:00"  # 시작 시각 (이후 1시간마다 반복)
@@ -16217,6 +16229,58 @@ def _count_multi_tf_reversal_tokens(signal_meta: dict | None = None) -> int:
         hits += 1
     return hits
 
+def _has_early_non_news_reversal_support(signal_meta: dict | None = None) -> bool:
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    reasons = " ".join(str(x) for x in list(meta.get("reasons") or []))
+    crossday_reclaim = safe_float(meta.get("crossday_episode_reclaim_ratio", 0.0), 0.0)
+    return bool(
+        meta.get("quiet_absorption")
+        or "조용한 선매집" in reasons
+        or meta.get("turnaround_confirmed")
+        or meta.get("resurge_mode")
+        or meta.get("crossday_episode_confirmed")
+        or (meta.get("crossday_episode_active") and crossday_reclaim >= 0.35)
+    )
+
+def _calc_sector_breadth_strength(sector_info: dict | None = None, leader_change_hint: float = 0.0) -> dict:
+    sector_info = sector_info if isinstance(sector_info, dict) else {}
+    theme = str(sector_info.get("theme", "") or sector_info.get("theme_key", "") or "")
+    bonus = int(sector_info.get("bonus", 0) or 0)
+    rising = [r for r in list(sector_info.get("rising") or []) if isinstance(r, dict)]
+    leader = sector_info.get("leader") if isinstance(sector_info.get("leader"), dict) else {}
+    leader_change = max(
+        safe_float(leader.get("cr", 0.0), 0.0),
+        safe_float(leader.get("change_rate", 0.0), 0.0),
+        safe_float(leader_change_hint, 0.0),
+    )
+    react_cnt = len(rising)
+    has_theme = theme not in ("", "기타업종", "unknown", "미분류")
+    return {"theme": theme, "bonus": bonus, "react_cnt": react_cnt, "leader_change": round(leader_change, 2), "has_theme": has_theme}
+
+def _evaluate_early_sector_breadth_gate(signal_meta: dict | None = None) -> dict:
+    meta = signal_meta if isinstance(signal_meta, dict) else {}
+    market = str(meta.get("market", "") or "").upper()
+    direct_like = bool(meta.get("direct_news_hit"))
+    score = safe_int(meta.get("score", 0), 0)
+    breadth = _calc_sector_breadth_strength(meta.get("sector_info"), leader_change_hint=safe_float(meta.get("leader_change", 0.0), 0.0))
+    out = {"allow": True, "hard_block": False, "external_delay": False, "reason": "", "breadth": breadth}
+    if not breadth.get("has_theme") or (breadth.get("bonus", 0) <= 0 and not direct_like):
+        return out
+    if _has_early_non_news_reversal_support(meta):
+        return out
+    min_leader = EARLY_NXT_SECTOR_LEADER_MIN_CHANGE if market == "NXT" else EARLY_SECTOR_LEADER_MIN_CHANGE
+    breadth_ok = bool(breadth.get("react_cnt", 0) >= EARLY_SECTOR_REACT_MIN_COUNT and safe_float(breadth.get("leader_change", 0.0), 0.0) >= min_leader)
+    if breadth_ok:
+        return out
+    react_cnt = int(breadth.get("react_cnt", 0) or 0)
+    leader_change = safe_float(breadth.get("leader_change", 0.0), 0.0)
+    label = f"섹터 breadth 미확인 ({react_cnt}/{EARLY_SECTOR_REACT_MIN_COUNT}, 대장 {leader_change:+.1f}%)"
+    if market == "NXT" and (direct_like or breadth.get("bonus", 0) >= 5 or react_cnt == 0):
+        return {**out, "allow": False, "hard_block": True, "reason": label, "breadth": breadth}
+    if direct_like and score < EARLY_NXT_NO_BREADTH_SCORE_MIN:
+        return {**out, "allow": False, "hard_block": True, "reason": label, "breadth": breadth}
+    return {**out, "external_delay": True, "reason": label, "breadth": breadth}
+
 def _should_override_multi_tf_downtrend_block(signal_type: str, signal_meta: dict | None = None, ctx: dict | None = None) -> tuple[bool, str]:
     sig = str(signal_type or "").upper()
     meta = signal_meta if isinstance(signal_meta, dict) else {}
@@ -17059,10 +17123,12 @@ def _score_fake_breakout_risk(cur: dict, watch: dict, price: int, entry: int) ->
     required_vol = get_effective_volume_ratio(ref_sig_type, current_time)
     required_vol, _ = _relax_opening_general_required_volume(required_vol, ref_sig_type, change_rate, current_time, market=str(watch.get("market", cur.get("market", "")) or ""))
     upper_wick_ratio = _calc_upper_wick_ratio(cur, price)
+    high_price = safe_int(cur.get("high", cur.get("stck_hgpr", cur.get("today_high", 0))), 0)
+    hold_failure = bool(high_price > 0 and price <= int(high_price * 0.988))
     exec_m = watch.get("execution_metrics") or {}
     exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
     bid_ask_ratio = _signal_bid_ask_ratio_hint(watch)
-    reasons: list[str] = []
+    reasons = []
     score = 0
     hard_volume_fail = vol_ratio < required_vol * FAKE_BREAKOUT_VOLUME_HARD_MULT
     soft_volume_fail = vol_ratio < required_vol * FAKE_BREAKOUT_VOLUME_SOFT_MULT
@@ -17080,22 +17146,19 @@ def _score_fake_breakout_risk(cur: dict, watch: dict, price: int, entry: int) ->
     elif soft_wick:
         score += 15
         reasons.append(f"윗꼬리 부담 ({upper_wick_ratio*100:.0f}%)")
+    if hold_failure:
+        score += 10
+        reasons.append("돌파 유지 실패")
     if exec_score and exec_score < 48:
         score += 10
         reasons.append(f"체결 둔화 {exec_score}점")
     if 0 < bid_ask_ratio < 1.0:
         score += 10
         reasons.append(f"호가 우위 약함 {bid_ask_ratio:.1f}배")
-    block = soft_volume_fail and soft_wick and score >= 40
-    out.update({
-        "block": bool(block),
-        "score": int(score),
-        "reasons": reasons,
-        "required_vol": round(required_vol, 2),
-        "vol_ratio": round(vol_ratio, 2),
-        "upper_wick_ratio": round(upper_wick_ratio, 3),
-    })
+    block = soft_volume_fail and soft_wick and (hold_failure or exec_score < 48 or (0 < bid_ask_ratio < 1.0)) and score >= 40
+    out.update({"block": bool(block), "score": int(score), "reasons": reasons, "required_vol": round(required_vol, 2), "vol_ratio": round(vol_ratio, 2), "upper_wick_ratio": round(upper_wick_ratio, 3)})
     return out
+
 def _get_trading_halt_reason_label(code: str) -> str:
     """거래정지 취소 알림에 노출할 사용자용 사유 라벨을 정리한다."""
     _fallback = "주권매매거래정지"
@@ -20317,6 +20380,8 @@ def _build_nxt_preopen_context(stock: dict) -> dict:
     code = stock.get("code", "")
     change_rate = stock.get("change_rate", 0)
     volume_ratio = stock.get("volume_ratio", 0)
+    stock = dict(stock or {})
+    stock["market"] = "NXT"
     return {"stock": stock, "code": code, "price": stock.get("price", 0), "change_rate": change_rate, "volume_ratio": volume_ratio, "nxt": get_nxt_info(code), "pre_score": NXT_PREOPEN_BASE_SCORE, "pre_reasons": ["🌅 장 전 NXT 선포착!", f"📈 NXT 현재 +{change_rate:.1f}%  (KRX 개장 전)", f"💥 NXT 거래량 {volume_ratio:.1f}배"], "sector_info": calc_sector_momentum(code, stock.get("name", code)) or {}, "direct_news_hit": False}
 def _apply_nxt_preopen_sector_context(ctx: dict) -> None:
     nxt = ctx["nxt"]
@@ -20381,17 +20446,37 @@ def _apply_nxt_preopen_theme_context(ctx: dict) -> None:
 def _finalize_nxt_preopen_signal(ctx: dict) -> dict:
     if ctx["pre_score"] < NXT_PREOPEN_ALERT_MIN_SCORE:
         return {}
+    hoga = _passes_early_detection_hoga_gate(ctx["code"], market="NXT")
+    if not hoga:
+        _log_suppressed_alert(ctx["code"], ctx["stock"].get("name", ctx["code"]), "NXT 장전 호가 우위 미달", "EARLY_DETECT", {"market": "NXT", "change_rate": ctx["change_rate"], "score": ctx["pre_score"]})
+        return {}
+    _detail, bid_qty, ask_qty = hoga
     entry = ctx["price"]
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(ctx["code"], entry, signal_type="EARLY_DETECT")
     pre_score, pre_reasons, similar_pattern_stats = _apply_similar_pattern_score(ctx["pre_score"], ctx["pre_reasons"], ctx["code"], "EARLY_DETECT", ctx["change_rate"], ctx["volume_ratio"], weight_mode="strong")
-    tf_block = _should_block_multi_tf_downtrend_capture(ctx["code"], "EARLY_DETECT")
+    pattern_ctx = ctx.get("pattern_ctx") if isinstance(ctx.get("pattern_ctx"), dict) else {}
+    guard_meta = _build_early_guard_signal_meta("EARLY_DETECT", score=pre_score, stock=ctx["stock"], sector_info=ctx["sector_info"], direct_news_hit=ctx["direct_news_hit"], reasons=pre_reasons, change_rate=ctx["change_rate"], vol_ratio=ctx["volume_ratio"], pattern_ctx=pattern_ctx, crossday=None)
+    breadth_gate = _evaluate_early_sector_breadth_gate(guard_meta)
+    if breadth_gate.get("hard_block"):
+        _log_suppressed_alert(ctx["code"], ctx["stock"].get("name", ctx["code"]), breadth_gate.get("reason", "섹터 breadth 미확인"), "EARLY_DETECT", {"market": "NXT", "change_rate": ctx["change_rate"], "score": pre_score})
+        return {}
+    persistence_gate = _evaluate_early_persistence_gate({**ctx, "vol_ratio": ctx["volume_ratio"], "stock": ctx["stock"]}, bid_qty, ask_qty, profile=None)
+    if persistence_gate.get("hard_block"):
+        _log_suppressed_alert(ctx["code"], ctx["stock"].get("name", ctx["code"]), persistence_gate.get("reason", "후속체결 지속성 미달"), "EARLY_DETECT", {"market": "NXT", "change_rate": ctx["change_rate"], "score": pre_score, "volume_ratio": ctx["volume_ratio"]})
+        return {}
+    tf_block = _should_block_multi_tf_downtrend_capture(ctx["code"], "EARLY_DETECT", signal_meta={**guard_meta, "bid_ask_ratio": persistence_gate.get("bid_ask_ratio", 0.0)})
     if tf_block.get("block"):
         block_ctx = tf_block.get("context", {}) or {}
         _log_suppressed_alert(ctx["code"], ctx["stock"].get("name", ctx["code"]), tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"), "EARLY_DETECT", {"daily_ret20": block_ctx.get("daily_ret20", 0.0), "weekly_ret8": block_ctx.get("weekly_ret8", 0.0), "daily_flags": block_ctx.get("daily_flags", 0), "weekly_flags": block_ctx.get("weekly_flags", 0), "change_rate": ctx["change_rate"], "score": pre_score, "market": "NXT"})
         return {}
     grade = _derive_general_signal_grade("EARLY_DETECT", pre_score, change_rate=ctx["change_rate"], vol_ratio=ctx["volume_ratio"], sector_info=ctx["sector_info"], direct_news_hit=ctx["direct_news_hit"], nxt_delta=int(ctx["nxt"].get("vs_krx_pct", 0) or 0), market="NXT", reasons=pre_reasons)
     position = calc_position_size("EARLY_DETECT", pre_score, grade)
-    return {"code": ctx["code"], "name": ctx["stock"].get("name", ctx["code"]), "price": ctx["price"], "change_rate": ctx["change_rate"], "volume_ratio": ctx["volume_ratio"], "signal_type": "EARLY_DETECT", "score": pre_score, "grade": grade, "execution_grade": grade, "pattern_grade": grade, "sector_info": ctx["sector_info"], "sector_theme": ctx["sector_info"].get("theme", ""), "direct_news_hit": ctx["direct_news_hit"], "market": "NXT", "similar_pattern_stats": similar_pattern_stats, "position": position, "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used, "prev_upper": False, "reasons": pre_reasons, "detected_at": datetime.now()}
+    guard_delay_reason = " / ".join(x for x in [breadth_gate.get("reason", "") if breadth_gate.get("external_delay") else "", persistence_gate.get("reason", "") if persistence_gate.get("external_delay") else ""] if x)
+    if guard_delay_reason:
+        pre_reasons.append(f"🧭 {guard_delay_reason} — 재확인 후 실행형 알림")
+    bid_ask_ratio = persistence_gate.get("bid_ask_ratio", 0.0)
+    return {"code": ctx["code"], "name": ctx["stock"].get("name", ctx["code"]), "price": ctx["price"], "change_rate": ctx["change_rate"], "volume_ratio": ctx["volume_ratio"], "signal_type": "EARLY_DETECT", "score": pre_score, "grade": grade, "execution_grade": grade, "pattern_grade": grade, "sector_info": ctx["sector_info"], "sector_theme": ctx["sector_info"].get("theme", ""), "direct_news_hit": ctx["direct_news_hit"], "market": "NXT", "similar_pattern_stats": similar_pattern_stats, "position": position, "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used, "prev_upper": False, "reasons": pre_reasons, "detected_at": datetime.now(), "execution_setup_required": bool(guard_delay_reason), "entry_execution_focus": bool(guard_delay_reason), "early_guard_external_delay_reason": guard_delay_reason, "bid_ask_ratio": bid_ask_ratio, "execution_metrics": {"avg_bid_ask_ratio": bid_ask_ratio}}
+
 def check_nxt_preopen_detection(existing_codes=None) -> list:
     signals = []
     existing = set(existing_codes or [])
@@ -20590,6 +20675,7 @@ def _build_early_detection_candidate_context(stock: dict) -> dict | None:
     change_rate = float(stock.get("change_rate", 0) or 0)
     vol_ratio = float(stock.get("volume_ratio", 0) or 0)
     price = int(stock.get("price", 0) or 0)
+    market = str(stock.get("market", "") or "").upper()
     if not code or price < MIN_TRADABLE_SIGNAL_PRICE or change_rate >= UPPER_LIMIT_THRESHOLD:
         return None
     now = datetime.now()
@@ -20599,9 +20685,12 @@ def _build_early_detection_candidate_context(stock: dict) -> dict | None:
     price_min = min(price_min, float(profile.get("early_min_change", price_min) or price_min))
     volume_min = min(volume_min, float(profile.get("early_min_vol", volume_min) or volume_min))
     confirm_need = max(1, min(EARLY_CONFIRM_COUNT, int(profile.get("confirm_count", EARLY_CONFIRM_COUNT) or EARLY_CONFIRM_COUNT)))
+    if market == "NXT":
+        confirm_need = max(confirm_need, EARLY_NXT_CONFIRM_COUNT)
     if change_rate < price_min or vol_ratio < volume_min:
         return None
-    return {"stock": stock, "code": code, "change_rate": change_rate, "vol_ratio": vol_ratio, "price": price, "now": now, "confirm_need": confirm_need}
+    return {"stock": stock, "code": code, "change_rate": change_rate, "vol_ratio": vol_ratio, "price": price, "now": now, "confirm_need": confirm_need, "market": market}
+
 def _passes_early_detection_hoga_gate(code: str, market: str = "KRX") -> tuple[dict, int, int] | None:
     try:
         detail = get_nxt_stock_price(code) if str(market).upper() == "NXT" else get_stock_price(code)
@@ -20639,27 +20728,33 @@ def _record_nxt_intraday_candidate_stage(stock: dict, stage: str, reason: str, e
         )
     except Exception as e:
         _swallow_exception(e)
-def _update_early_detection_cache(code: str, price: int, now: datetime, confirm_need: int) -> bool:
+def _update_early_detection_cache(code: str, price: int, now: datetime, confirm_need: int, vol_ratio: float = 0.0, bid_ask_ratio: float = 0.0) -> dict | None:
+    current_vol = safe_float(vol_ratio, 0.0)
+    current_bid_ask = safe_float(bid_ask_ratio, 0.0)
+    seed = {"count": 1, "first_price": price, "last_price": price, "peak_price": price, "last_time": now, "first_vol_ratio": current_vol, "last_vol_ratio": current_vol, "peak_vol_ratio": current_vol, "first_bid_ask_ratio": current_bid_ask, "last_bid_ask_ratio": current_bid_ask, "peak_bid_ask_ratio": current_bid_ask}
     cache = _early_cache.get(code)
     if cache is None:
-        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-        return False
+        _early_cache[code] = seed
+        return None
     elapsed = (now - cache["last_time"]).seconds
-    if 15 <= elapsed <= 80:
-        if price >= cache["last_price"]:
-            cache["count"] += 1
-            cache["last_price"] = price
-            cache["last_time"] = now
-        else:
-            _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-            return False
+    if 15 <= elapsed <= 80 and price >= safe_int(cache.get("last_price", 0), 0):
+        cache["count"] = int(cache.get("count", 0) or 0) + 1
+        cache["last_price"] = price
+        cache["peak_price"] = max(safe_int(cache.get("peak_price", price), price), price)
+        cache["last_time"] = now
+        cache["last_vol_ratio"] = current_vol
+        cache["peak_vol_ratio"] = max(safe_float(cache.get("peak_vol_ratio", 0.0), 0.0), current_vol)
+        cache["last_bid_ask_ratio"] = current_bid_ask
+        cache["peak_bid_ask_ratio"] = max(safe_float(cache.get("peak_bid_ask_ratio", 0.0), 0.0), current_bid_ask)
     else:
-        _early_cache[code] = {"count": 1, "last_price": price, "last_time": now}
-        return False
-    if cache["count"] < confirm_need:
-        return False
+        _early_cache[code] = seed
+        return None
+    if int(cache.get("count", 0) or 0) < confirm_need:
+        return None
+    profile = dict(cache)
     del _early_cache[code]
-    return True
+    return profile
+
 def _build_early_detection_entry_context(ctx: dict, detail: dict, bid_qty: int, ask_qty: int) -> dict:
     price = ctx["price"]
     change_rate = ctx["change_rate"]
@@ -20670,25 +20765,12 @@ def _build_early_detection_entry_context(ctx: dict, detail: dict, bid_qty: int, 
     hoga_text = f"{bid_qty / ask_qty:.1f}배" if ask_qty > 0 else "압도적"
     prev_upper = was_upper_limit_yesterday(ctx["code"])
     early_score = 85 + (10 if prev_upper else 0)
-    reasons = [
-        "🔍 조기 포착!", f"📈 현재 +{change_rate:.1f}%", f"💥 거래량 {ctx['vol_ratio']:.1f}배 (5일 평균 대비)",
-        f"📊 매수/매도 잔량 {hoga_text}", "✅ 2분 연속 상승 확인",
-    ]
+    confirm_label = f"✅ 연속 상승 확인 {int(ctx.get('confirm_need', 2) or 2)}회"
+    reasons = ["🔍 조기 포착!", f"📈 현재 +{change_rate:.1f}%", f"💥 거래량 {ctx['vol_ratio']:.1f}배 (5일 평균 대비)", f"📊 매수/매도 잔량 {hoga_text}", confirm_label]
     if prev_upper:
         reasons.append("🔁 전일 상한가 → 연속 상한가 가능성")
-    return {
-        **ctx,
-        "detail": detail,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "stop_pct": stop_pct,
-        "target_pct": target_pct,
-        "atr_used": atr_used,
-        "prev_upper": prev_upper,
-        "early_score": early_score,
-        "reasons": reasons,
-    }
+    return {**ctx, "detail": detail, "bid_qty": bid_qty, "ask_qty": ask_qty, "bid_ask_ratio": round((bid_qty / ask_qty), 2) if ask_qty > 0 else 9.9, "entry": entry, "stop": stop, "target": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used, "prev_upper": prev_upper, "early_score": early_score, "reasons": reasons}
+
 def _apply_early_detection_strength_context(code: str, detail: dict, change_rate: float, early_score: int, reasons: list) -> tuple[int, list, float]:
     rs = get_relative_strength(change_rate)
     if rs >= RS_MIN:
@@ -20751,37 +20833,62 @@ def _build_early_detection_result(ctx: dict, name: str, sig_type: str, early_sco
         "crossday_episode_confirmed": bool(crossday.get("confirmed")), "crossday_episode_reason": str(crossday.get("reason", "") or ""),
         "crossday_episode_reclaim_ratio": float(crossday.get("reclaim_ratio", 0.0) or 0.0),
     }
+def _build_early_guard_signal_meta(signal_type: str, *, score: int, stock: dict, sector_info: dict, direct_news_hit: bool, reasons: list, change_rate: float, vol_ratio: float, pattern_ctx: dict | None = None, crossday: dict | None = None) -> dict:
+    pattern_ctx = pattern_ctx if isinstance(pattern_ctx, dict) else {}
+    crossday = crossday if isinstance(crossday, dict) else {}
+    return {"signal_type": signal_type, "score": score, "change_rate": change_rate, "vol_ratio": vol_ratio, "sector_info": sector_info if isinstance(sector_info, dict) else {}, "direct_news_hit": bool(direct_news_hit), "market": str((stock or {}).get("market", "") or ""), "reasons": list(reasons or []), "recent_high_breakout": bool(pattern_ctx.get("recent_high_breakout")), "orb_breakout": bool(pattern_ctx.get("orb_breakout")), "breakout_to_surge": bool(pattern_ctx.get("breakout_to_surge")), "breakout_to_early": bool(pattern_ctx.get("breakout_to_early")), "crossday_episode_active": bool(crossday.get("episode_active")), "crossday_episode_confirmed": bool(crossday.get("confirmed")), "crossday_episode_reclaim_ratio": float(crossday.get("reclaim_ratio", 0.0) or 0.0)}
+
+def _evaluate_early_persistence_gate(ctx: dict, bid_qty: int, ask_qty: int, profile: dict | None = None) -> dict:
+    profile = profile if isinstance(profile, dict) else {}
+    market = str(((ctx.get("stock") or {}).get("market", "") or ctx.get("market", "")) or "").upper()
+    current_vol = safe_float(ctx.get("vol_ratio", 0.0), 0.0)
+    bid_ask_ratio = round((bid_qty / ask_qty), 3) if ask_qty > 0 else 9.9
+    peak_vol = max(current_vol, safe_float(profile.get("peak_vol_ratio", 0.0), 0.0))
+    base_vol = max(current_vol, safe_float(profile.get("first_vol_ratio", 0.0), 0.0))
+    floor_mult = EARLY_NXT_PERSIST_VOLUME_FLOOR if market == "NXT" else EARLY_PERSIST_VOLUME_FLOOR
+    min_live_vol = max(EARLY_NXT_PERSIST_MIN_VOLUME_RATIO if market == "NXT" else EARLY_PERSIST_MIN_VOLUME_RATIO, peak_vol * floor_mult)
+    min_bid_ask = EARLY_NXT_PERSIST_BID_ASK_MIN if market == "NXT" else EARLY_PERSIST_BID_ASK_MIN
+    reasons = []
+    hard_block = False
+    external_delay = False
+    if current_vol < min_live_vol:
+        reasons.append(f"후속 거래량 유지 부족 ({current_vol:.1f}/{min_live_vol:.1f}배)")
+        if market == "NXT" or current_vol < max(EARLY_NXT_PERSIST_MIN_VOLUME_RATIO if market == "NXT" else EARLY_PERSIST_MIN_VOLUME_RATIO, base_vol * max(0.45, floor_mult - 0.08)):
+            hard_block = True
+        else:
+            external_delay = True
+    if bid_ask_ratio < min_bid_ask:
+        reasons.append(f"후속 호가 유지 부족 ({bid_ask_ratio:.1f}배)")
+        if market == "NXT" or current_vol < min_live_vol * 1.05:
+            hard_block = True
+        else:
+            external_delay = True
+    return {"allow": not hard_block, "hard_block": bool(hard_block), "external_delay": bool(external_delay and not hard_block), "reason": " / ".join(reasons[:2]), "bid_ask_ratio": bid_ask_ratio, "min_live_vol": round(min_live_vol, 2), "current_vol": round(current_vol, 2)}
+
 def _apply_early_detection_market_context(ctx: dict) -> dict | None:
     code = ctx["code"]
     stock = ctx["stock"]
     reasons = list(ctx["reasons"])
-    early_score, reasons, rs = _apply_early_detection_strength_context(code, ctx["detail"], ctx["change_rate"], int(ctx["early_score"]), reasons)
+    early_score, reasons, _rs = _apply_early_detection_strength_context(code, ctx["detail"], ctx["change_rate"], int(ctx["early_score"]), reasons)
     early_score, reasons, sector_info, direct_news_hit, similar_pattern_stats = _apply_early_detection_sector_theme_context(code, stock, ctx["change_rate"], ctx["vol_ratio"], early_score, reasons)
     pattern_stock = dict(stock or {})
     pattern_stock.setdefault("today_vol", safe_int((ctx.get("detail") or {}).get("today_vol", 0), 0))
     pattern_ctx = _build_global_pattern_context(pattern_stock, current_time=ctx["now"].strftime("%H:%M:%S"), change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"])
-    tf_block = _should_block_multi_tf_downtrend_capture(
-        code,
-        "EARLY_DETECT",
-        signal_meta={
-            "score": early_score,
-            "change_rate": ctx["change_rate"],
-            "vol_ratio": ctx["vol_ratio"],
-            "sector_info": sector_info,
-            "direct_news_hit": direct_news_hit,
-            "market": stock.get("market", ""),
-            "reasons": reasons,
-            "recent_high_breakout": bool(pattern_ctx.get("recent_high_breakout")),
-            "orb_breakout": bool(pattern_ctx.get("orb_breakout")),
-            "breakout_to_surge": bool(pattern_ctx.get("breakout_to_surge")),
-            "breakout_to_early": bool(pattern_ctx.get("breakout_to_early")),
-        },
-    )
+    crossday = _get_crossday_episode_context(code, current_price=ctx["price"], change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"])
+    guard_meta = _build_early_guard_signal_meta("EARLY_DETECT", score=early_score, stock=stock, sector_info=sector_info, direct_news_hit=direct_news_hit, reasons=reasons, change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"], pattern_ctx=pattern_ctx, crossday=crossday)
+    breadth_gate = _evaluate_early_sector_breadth_gate(guard_meta)
+    if breadth_gate.get("hard_block"):
+        _log_suppressed_alert(code, stock.get("name", code), breadth_gate.get("reason", "섹터 breadth 미확인"), "EARLY_DETECT", {"change_rate": ctx["change_rate"], "score": early_score, "market": stock.get("market", ""), "volume_ratio": ctx["vol_ratio"]})
+        return None
+    persistence_gate = _evaluate_early_persistence_gate(ctx, safe_int(ctx.get("bid_qty", 0), 0), safe_int(ctx.get("ask_qty", 0), 0), ctx.get("early_confirm_profile"))
+    if persistence_gate.get("hard_block"):
+        _log_suppressed_alert(code, stock.get("name", code), persistence_gate.get("reason", "후속체결 지속성 미달"), "EARLY_DETECT", {"change_rate": ctx["change_rate"], "score": early_score, "market": stock.get("market", ""), "volume_ratio": ctx["vol_ratio"]})
+        return None
+    tf_block = _should_block_multi_tf_downtrend_capture(code, "EARLY_DETECT", signal_meta={**guard_meta, "bid_ask_ratio": persistence_gate.get("bid_ask_ratio", 0.0)})
     if tf_block.get("block"):
         block_ctx = tf_block.get("context", {}) or {}
-        _log_suppressed_alert(code, stock.get("name", code), tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"), "EARLY_DETECT", {"daily_ret20": block_ctx.get("daily_ret20", 0.0), "weekly_ret8": block_ctx.get("weekly_ret8", 0.0), "daily_flags": block_ctx.get("daily_flags", 0), "weekly_flags": block_ctx.get("weekly_flags", 0), "change_rate": ctx["change_rate"], "score": early_score, "market": stock.get("market", "")})
+        _log_suppressed_alert(code, stock.get("name", code), tf_block.get("reason", "주봉·일봉 하향 추세 차단"), "EARLY_DETECT", {"daily_ret20": block_ctx.get("daily_ret20", 0.0), "weekly_ret8": block_ctx.get("weekly_ret8", 0.0), "daily_flags": block_ctx.get("daily_flags", 0), "weekly_flags": block_ctx.get("weekly_flags", 0), "change_rate": ctx["change_rate"], "score": early_score, "market": stock.get("market", "")})
         return None
-    crossday = _get_crossday_episode_context(code, current_price=ctx["price"], change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"])
     sig_type = _maybe_promote_signal_from_crossday_episode("EARLY_DETECT", crossday, change_rate=ctx["change_rate"])
     if crossday.get("episode_active"):
         early_score += int(crossday.get("score_bonus", 0) or 0)
@@ -20794,9 +20901,17 @@ def _apply_early_detection_market_context(ctx: dict) -> dict | None:
         if flow_bonus:
             early_score += int(flow_bonus)
     exec_setup = _should_require_execution_setup_from_crossday(sig_type, crossday, change_rate=ctx["change_rate"], vol_ratio=ctx["vol_ratio"])
+    guard_delay_reason = " / ".join(x for x in [breadth_gate.get("reason", "") if breadth_gate.get("external_delay") else "", persistence_gate.get("reason", "") if persistence_gate.get("external_delay") else ""] if x)
     if exec_setup:
         reasons.append("🧭 초기 강세 내부포착 유지 — 재상승 체결 확인 후 실행형 알림")
-    return _build_early_detection_result(ctx, stock.get("name", code), sig_type, early_score, reasons, sector_info, direct_news_hit, similar_pattern_stats, crossday, exec_setup)
+    if guard_delay_reason:
+        reasons.append(f"🧭 {guard_delay_reason} — 재확인 후 실행형 알림")
+    result = _build_early_detection_result(ctx, stock.get("name", code), sig_type, early_score, reasons, sector_info, direct_news_hit, similar_pattern_stats, crossday, exec_setup or bool(guard_delay_reason))
+    result["bid_ask_ratio"] = persistence_gate.get("bid_ask_ratio", 0.0)
+    result["execution_metrics"] = {"avg_bid_ask_ratio": persistence_gate.get("bid_ask_ratio", 0.0)}
+    result["early_guard_external_delay_reason"] = guard_delay_reason
+    return result
+
 def check_early_detection() -> list:
     signals = []
     for stock in get_volume_surge_stocks():
@@ -20807,9 +20922,12 @@ def check_early_detection() -> list:
         if not hoga:
             continue
         detail, bid_qty, ask_qty = hoga
-        if not _update_early_detection_cache(ctx["code"], ctx["price"], ctx["now"], ctx["confirm_need"]):
+        profile = _update_early_detection_cache(ctx["code"], ctx["price"], ctx["now"], ctx["confirm_need"], vol_ratio=ctx["vol_ratio"], bid_ask_ratio=(bid_qty / ask_qty) if ask_qty > 0 else 9.9)
+        if not profile:
             continue
-        signal = _apply_early_detection_market_context(_build_early_detection_entry_context(ctx, detail, bid_qty, ask_qty))
+        entry_ctx = _build_early_detection_entry_context(ctx, detail, bid_qty, ask_qty)
+        entry_ctx["early_confirm_profile"] = profile
+        signal = _apply_early_detection_market_context(entry_ctx)
         if signal:
             signals.append(signal)
     signals.extend(check_nxt_preopen_detection(existing_codes={s["code"] for s in signals}))
@@ -20833,10 +20951,13 @@ def check_nxt_intraday_early_detection(existing_codes=None) -> list:
             continue
         detail, bid_qty, ask_qty = hoga
         cache_key = f"NXT:{ctx['code']}"
-        if not _update_early_detection_cache(cache_key, ctx["price"], ctx["now"], ctx["confirm_need"]):
+        profile = _update_early_detection_cache(cache_key, ctx["price"], ctx["now"], ctx["confirm_need"], vol_ratio=ctx["vol_ratio"], bid_ask_ratio=(bid_qty / ask_qty) if ask_qty > 0 else 9.9)
+        if not profile:
             _record_nxt_intraday_candidate_stage(stock, "confirm", "nxt_early_confirm_wait", {"confirm_need": ctx["confirm_need"]})
             continue
-        signal = _apply_early_detection_market_context(_build_early_detection_entry_context(ctx, detail, bid_qty, ask_qty))
+        entry_ctx = _build_early_detection_entry_context(ctx, detail, bid_qty, ask_qty)
+        entry_ctx["early_confirm_profile"] = profile
+        signal = _apply_early_detection_market_context(entry_ctx)
         if not signal:
             _record_nxt_intraday_candidate_stage(stock, "analyze", "nxt_early_analyze_gate")
             continue
@@ -21358,6 +21479,9 @@ def _should_delay_external_general_capture(signal: dict) -> str:
     sig_type = str(signal.get("signal_type") or "").upper()
     entry_price = safe_int(signal.get("entry_price", 0), 0)
     if sig_type == "EARLY_DETECT":
+        guard_delay_reason = str(signal.get("early_guard_external_delay_reason") or "").strip()
+        if guard_delay_reason:
+            return guard_delay_reason
         grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
         score = safe_int(signal.get("score", 0), 0)
         market = str(signal.get("market") or "").upper()
