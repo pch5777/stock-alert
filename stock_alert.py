@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v144
+버전: v145
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v145 (2026-03-31): 포착 후 탈락 종료 안내 + 텔레그램 포착 모니터 메뉴 추가 — 진입 전 `근거약화_신호강도약함`·`근거약화_거래량폭락`으로 감시에서 탈락한 종목은 사용자에게 `감시 종료 — 재포착 전 신규 진입 보류` 안내를 즉시 발송하도록 보강했다. 또한 `/watch` 명령과 메뉴 버튼을 추가해 `_entry_watch`에 남아 있는 현재 포착 모니터링 종목만 따로 조회할 수 있게 했고, intraday NXT confirm 3회는 세션 프로파일 표 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override가 최종 적용된다는 표현을 문서에도 유지했다.
 - v144 (2026-03-31): run_scan code 결측 내성 강화 + intraday NXT confirm 문구 명확화 — run_scan 본류와 scan helper들이 `code` 없는 후보/신호를 만나도 즉시 중단하지 않고 건너뛰도록 정리했으며, `analyze()` 결과에 `code`가 빠진 경우 `seen_code`로 복구 후 alert pipeline에 태우도록 보강했다. 또한 malformed alert 정리 helper를 추가해 섹터/포트폴리오 필터 진입 전 `code` 결측을 제거하고, intraday NXT confirm 3회는 세션 프로파일 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override로 강제된다는 점을 changelog/문서에 명확히 남겼다.
 - v143 (2026-03-31): EARLY/NXT 지속성·섹터 breadth 실확인 강화 — 상위주 공통 생존 조건과 오전 급락 포착 종목의 공통 붕괴 조건을 함께 반영해, NXT/조기포착에서 후속 거래량·호가 지속성과 실제 섹터 breadth를 더 강하게 확인하도록 조정했다. NXT 장전은 live hoga gate를 필수로 보고, intraday NXT는 confirm 3회와 persistence gate를 적용하며, `early_guard_external_delay_reason`이 NXT 점수 예외보다 우선한다. 또한 fake breakout은 돌파 유지 실패까지 포함해 진입 차단을 보강한다.
 - v142 (2026-03-31): 하향 추세 조기포착 차단 강화 + 추세전환 예외 제한 허용 — 다중 타임프레임 하락 추세 판정을 더 보수적으로 강화하고, 일반적인 하향/비상승 구조의 EARLY_DETECT·SURGE류 포착을 더 일찍 차단하도록 조정했다. 대신 직접뉴스·강한 테마 동조·ORB/전고 돌파·quiet absorption·연속 재상승 같은 추세전환 토큰이 충분할 때만 제한적으로 예외 허용해 반전 초입 후보만 남긴다.
@@ -17095,6 +17096,72 @@ def _entry_guard_reason_label(reason: str) -> str:
         "fake_breakout_risk": "가짜 돌파 위험",
     }
     return mapping.get(str(reason or ""), str(reason or "사유 미상"))
+def _entry_watch_termination_summary(reason: str) -> tuple[str, str]:
+    reason_key = str(reason or "").strip()
+    mapping = {
+        "근거약화_신호강도약함": ("신호강도 약화", "포착 당시 근거가 약해져 재포착 전까지 신규 진입을 보류합니다."),
+        "근거약화_거래량폭락": ("거래량 급감", "포착 직후 후속 거래량이 급감해 현재 흐름은 더 보지 않는 편이 낫습니다."),
+        "기간만료": ("감시 기간 만료", "정해진 감시 기간 안에 진입 근거가 다시 살아나지 않아 감시를 종료합니다."),
+        "알림횟수만료": ("감시 횟수 만료", "반복 재확인에도 실행 근거가 이어지지 않아 감시를 종료합니다."),
+        "정책제외": ("정책 제외", "현재 정책 기준상 실행 후보에서 제외되어 감시를 종료합니다."),
+    }
+    return mapping.get(reason_key, (_entry_guard_reason_label(reason_key), "현재 포착 근거가 유지되지 않아 감시를 종료합니다."))
+
+
+def _notify_entry_watch_terminated(watch: dict, reason: str, current_price: int = 0, *, detail: str = "") -> bool:
+    try:
+        if not isinstance(watch, dict):
+            return False
+        if watch.get("entry_hit") or watch.get("entry_hit_locked"):
+            return False
+        notice_key = f"{str(watch.get('signal_log_key') or '')}|{str(reason or '')}"
+        if watch.get("termination_notice_key") == notice_key:
+            return False
+        label, default_detail = _entry_watch_termination_summary(reason)
+        code = normalize_stock_code(watch.get("code"))
+        if not code:
+            return False
+        name = watch.get("name") or _resolve_stock_name(code) or code
+        entry = safe_int(watch.get("entry_price", 0), 0)
+        price = safe_int(current_price or watch.get("last_price", 0) or watch.get("price", 0), 0)
+        detect_label = _format_capture_datetime_label(
+            detect_date=watch.get("detect_date", ""),
+            detect_time=watch.get("detect_time", ""),
+        )
+        parts = [
+            "🚫 <b>[감시 종료 — 재포착 전 신규 진입 보류]</b>",
+            "━━━━━━━━━━━━━━━",
+            f"<b>{name}</b>  <code>{code}</code>",
+        ]
+        signal_type = str(watch.get("signal_type") or "").strip()
+        if signal_type:
+            parts.append(f"원신호: {signal_type}")
+        if detect_label:
+            parts.append(f"포착시각: {detect_label}")
+        detail_bits = []
+        if price > 0:
+            detail_bits.append(f"현재가 {price:,}원")
+        if entry > 0:
+            detail_bits.append(f"진입가 {entry:,}원")
+        if detail_bits:
+            parts.append("  |  ".join(detail_bits))
+        parts.extend([
+            "━━━━━━━━━━━━━━━",
+            f"📋 사유: {label}",
+            f"• {detail or default_detail}",
+            "• 현재 감시에서는 제외합니다.",
+            "• 다시 살아나면 새 포착 알림으로 재안내합니다.",
+        ])
+        send_with_chart_buttons("\n".join([part for part in parts if part]), code, name)
+        watch["termination_notice_key"] = notice_key
+        watch["termination_notice_reason"] = str(reason or "")
+        watch["termination_notice_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return True
+    except Exception as e:
+        _swallow_exception(e)
+        return False
+
+
 def _calc_upper_wick_ratio(cur: dict | None = None, price: int = 0) -> float:
     cur = cur if isinstance(cur, dict) else {}
     last_price = safe_int(price or cur.get("price", cur.get("stck_prpr", 0)), 0)
@@ -18281,6 +18348,7 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
             if _notify_entry_guard_followup(watch, "근거약화_신호강도약함", price, entry, use_nxt=use_nxt, detail="1차 도달 이후 신호 강도가 약화되어 신규 진입은 보류가 적절합니다."):
                 changed = True
             return True, changed, None
+        _notify_entry_watch_terminated(watch, "근거약화_신호강도약함", price, detail="포착 당시 근거가 약해져 지금은 다시 볼 필요가 없습니다.")
         _record_entry_dropped(watch, "근거약화_신호강도약함", price)
         return True, changed, ("근거약화_신호강도약함", "근거탈락")
     if vol_at_detect > 0 and vol_now < vol_at_detect * 0.5:
@@ -18289,6 +18357,7 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
             if _notify_entry_guard_followup(watch, "근거약화_거래량폭락", price, entry, use_nxt=use_nxt, detail=f"포착 대비 거래량이 {ratio:.2f}배 수준으로 약화되었습니다."):
                 changed = True
             return True, changed, None
+        _notify_entry_watch_terminated(watch, "근거약화_거래량폭락", price, detail="포착 직후 후속 거래량이 무너져 현재 흐름은 보지 않는 편이 낫습니다.")
         _record_entry_dropped(watch, "근거약화_거래량폭락", price)
         return True, changed, ("근거약화_거래량폭락", "근거탈락")
     return False, changed, None
@@ -25026,6 +25095,7 @@ def _send_menu(title: str = ""):
             [
                 {"text": "🤖 봇 상태",        "callback_data": "cmd_status"},
                 {"text": "📋 감시 종목",       "callback_data": "cmd_list"},
+                {"text": "🎯 포착 모니터",     "callback_data": "cmd_watch"},
                 {"text": "🏆 오늘 TOP 5",      "callback_data": "cmd_top"},
             ],
             [
@@ -25057,6 +25127,7 @@ def _handle_callback(callback_id: str, data: str):
     cmd_map = {
         "cmd_status":  "/status",
         "cmd_list":    "/list",
+        "cmd_watch":   "/watch",
         "cmd_top":     "/top",
         "cmd_daily":   "/daily",
         "cmd_nxt":     "/nxt",
@@ -25114,12 +25185,12 @@ def _send_telegram_status_summary():
         f"💬 /result 종목명 수익률  로 결과 기록\n"
         f"예) /result 대주산업 +12.5"
     )
-def _handle_telegram_list_command():
-    pending_lines = []
-    active_lines = []
-    seen_pending = set()
-    seen_active = set()
-    quote_cache = {}
+def _collect_watch_list_lines(*, include_detected: bool = True) -> tuple[list[str], list[str]]:
+    pending_lines: list[str] = []
+    active_lines: list[str] = []
+    seen_pending: set[str] = set()
+    seen_active: set[str] = set()
+    quote_cache: dict = {}
     try:
         for _, watch in (_entry_watch or {}).items():
             try:
@@ -25164,36 +25235,64 @@ def _handle_telegram_list_command():
                 continue
     except Exception as e:
         _swallow_exception(e)
-    try:
-        for code, rec in (_detected_stocks or {}).items():
-            try:
-                code = str(code or "").strip()
-                if not code or code in seen_pending or code in seen_active:
+    if include_detected:
+        try:
+            for code, rec in (_detected_stocks or {}).items():
+                try:
+                    code = str(code or "").strip()
+                    if not code or code in seen_pending or code in seen_active:
+                        continue
+                    name = rec.get("name") or _resolve_stock_name(code) or code
+                    carry_day = int(rec.get("carry_day", 0) or 0)
+                    cur_info = _get_watch_list_current_price(code, rec, quote_cache)
+                    cur_price = safe_int(cur_info.get("price", 0), 0)
+                    line = f"• <b>{name}</b> ({code})"
+                    if carry_day > 0:
+                        line += f" — {carry_day}일차"
+                    if cur_price > 0:
+                        line += f"\n  📍 현재가 {cur_price:,}원"
+                    pending_lines.append(line)
+                    seen_pending.add(code)
+                except Exception as e:
+                    _swallow_exception(e)
                     continue
-                name = rec.get("name") or _resolve_stock_name(code) or code
-                carry_day = int(rec.get("carry_day", 0) or 0)
-                cur_info = _get_watch_list_current_price(code, rec, quote_cache)
-                cur_price = safe_int(cur_info.get("price", 0), 0)
-                line = f"• <b>{name}</b> ({code})"
-                if carry_day > 0:
-                    line += f" — {carry_day}일차"
-                if cur_price > 0:
-                    line += f"\n  📍 현재가 {cur_price:,}원"
-                pending_lines.append(line)
-                seen_pending.add(code)
-            except Exception as e:
-                _swallow_exception(e)
-                continue
-    except Exception as e:
-        _swallow_exception(e)
+        except Exception as e:
+            _swallow_exception(e)
+    return pending_lines, active_lines
+
+
+def _send_watch_list_message(*, title: str, include_detected: bool, empty_text: str, pending_title: str, active_title: str) -> None:
+    pending_lines, active_lines = _collect_watch_list_lines(include_detected=include_detected)
     if not pending_lines and not active_lines:
-        send("📋 감시 중인 종목 없음")
+        send(empty_text)
         return
-    parts = ["📋 <b>감시 종목 현황</b>", "\n🎯 <b>진입가 감시중 종목</b>"]
+    parts = [title, pending_title]
     parts.append("\n".join(pending_lines) if pending_lines else "- 없음")
-    parts.append("\n🏆 <b>진입가 도달 후 목표가 추적중 종목</b>")
+    parts.append(active_title)
     parts.append("\n".join(active_lines) if active_lines else "- 없음")
     send("\n".join(parts))
+
+
+def _handle_telegram_watch_command():
+    _send_watch_list_message(
+        title="🎯 <b>현재 포착 모니터링 종목</b>",
+        include_detected=False,
+        empty_text="🎯 현재 포착되어 모니터링 중인 종목 없음",
+        pending_title="\n🟡 <b>진입가 대기/감시 중</b>",
+        active_title="\n🏆 <b>진입가 도달 후 추적 중</b>",
+    )
+
+
+def _handle_telegram_list_command():
+    _send_watch_list_message(
+        title="📋 <b>감시 종목 현황</b>",
+        include_detected=True,
+        empty_text="📋 감시 중인 종목 없음",
+        pending_title="\n🎯 <b>진입가 감시중 종목</b>",
+        active_title="\n🏆 <b>진입가 도달 후 목표가 추적중 종목</b>",
+    )
+
+
 def _handle_telegram_compact_toggle():
     global _compact_mode
     _compact_mode = not _compact_mode
@@ -25353,7 +25452,8 @@ def _send_telegram_setup_guide():
         "━━━━━━━━━━━━━━━\n"
         "<code>"
         "status - 🤖 봇 상태 및 버전 확인\n"
-        "list - 📋 현재 감시 중인 종목 목록\n"
+        "list - 📋 전체 감시 종목 현황\n"
+        "watch - 🎯 현재 포착 모니터링 종목\n"
         "top - 🏆 오늘의 최우선 종목 TOP 5\n"
         "daily - 📊 오늘 일일 성과 즉시 조회\n"
         "nxt - 🟡 NXT 넥스트레이드 실시간 동향\n"
@@ -25455,6 +25555,8 @@ def _dispatch_telegram_command(raw: str, text: str):
     exact_handlers = {
         "/status": _send_telegram_status_summary,
         "/list": _handle_telegram_list_command,
+        "/watch": _handle_telegram_watch_command,
+        "/포착감시": _handle_telegram_watch_command,
         "/top": _handle_telegram_top_command,
         "/nxt": _handle_telegram_nxt_command,
         "/week": _handle_telegram_week_command,
