@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v148
+버전: v149
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v149 (2026-03-31): run_scan `change_rate` 결측 hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -21785,11 +21786,11 @@ def _handle_general_alert_external_policy(ctx: dict, source_label: str) -> bool:
     )
     if promoted:
         _log_info_msg(
-            f"  ⏭ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 외부억제/내부감시 자동승격"
+            f"  ⏭ {s.get('name', s.get('code',''))}{ctx['mkt_tag']} {safe_float(s.get('change_rate', 0.0), 0.0):+.1f}% [{s.get('signal_type', '')}] {safe_int(s.get('score', 0), 0)}점 [{grade_upper}] — 외부억제/내부감시 자동승격"
         )
     else:
         _log_info_msg(
-            f"  ⏭ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{grade_upper}] — 내부기록만 유지"
+            f"  ⏭ {s.get('name', s.get('code',''))}{ctx['mkt_tag']} {safe_float(s.get('change_rate', 0.0), 0.0):+.1f}% [{s.get('signal_type', '')}] {safe_int(s.get('score', 0), 0)}점 [{grade_upper}] — 내부기록만 유지"
         )
     return False
 def _trigger_general_alert_phase2_upgrade(s: dict, existing_hit_watch: dict, old_sig_type: str, new_sig_type: str) -> bool:
@@ -28605,6 +28606,23 @@ def _normalize_scan_signal_code(payload: dict | None = None, fallback_code: str 
         return code
     return normalize_stock_code(fallback_code or "")
 
+def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
+    item = dict(payload or {})
+    code = _normalize_scan_signal_code(item, fallback_code=fallback_code)
+    if code:
+        item["code"] = code
+    item["change_rate"] = safe_float(item.get("change_rate", 0.0), 0.0)
+    item["volume_ratio"] = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    item["score"] = safe_int(item.get("score", 0), 0)
+    item["price"] = safe_int(item.get("price", 0), 0)
+    item["today_vol"] = safe_int(item.get("today_vol", 0), 0)
+    item["market"] = str(item.get("market", "") or "")
+    if "signal_type" not in item or item.get("signal_type") is None:
+        item["signal_type"] = ""
+    if "name" not in item or item.get("name") is None:
+        item["name"] = ""
+    return item
+
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     cleaned = []
     dropped = 0
@@ -28617,9 +28635,7 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             dropped += 1
             _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
             continue
-        if item.get("code") != code:
-            item = dict(item)
-            item["code"] = code
+        item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
         cleaned.append(item)
     if dropped > 0:
         _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}")
@@ -28633,9 +28649,7 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
     if not result_code:
         _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
         return
-    if result.get("code") != result_code:
-        result = dict(result)
-        result["code"] = result_code
+    result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
     if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
         return
