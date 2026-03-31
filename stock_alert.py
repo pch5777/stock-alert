@@ -3,10 +3,12 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v145
+버전: v147
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
+- v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
 - v145 (2026-03-31): 포착 후 탈락 종료 안내 + 텔레그램 포착 모니터 메뉴 추가 — 진입 전 `근거약화_신호강도약함`·`근거약화_거래량폭락`으로 감시에서 탈락한 종목은 사용자에게 `감시 종료 — 재포착 전 신규 진입 보류` 안내를 즉시 발송하도록 보강했다. 또한 `/watch` 명령과 메뉴 버튼을 추가해 `_entry_watch`에 남아 있는 현재 포착 모니터링 종목만 따로 조회할 수 있게 했고, intraday NXT confirm 3회는 세션 프로파일 표 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override가 최종 적용된다는 표현을 문서에도 유지했다.
 - v144 (2026-03-31): run_scan code 결측 내성 강화 + intraday NXT confirm 문구 명확화 — run_scan 본류와 scan helper들이 `code` 없는 후보/신호를 만나도 즉시 중단하지 않고 건너뛰도록 정리했으며, `analyze()` 결과에 `code`가 빠진 경우 `seen_code`로 복구 후 alert pipeline에 태우도록 보강했다. 또한 malformed alert 정리 helper를 추가해 섹터/포트폴리오 필터 진입 전 `code` 결측을 제거하고, intraday NXT confirm 3회는 세션 프로파일 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override로 강제된다는 점을 changelog/문서에 명확히 남겼다.
 - v143 (2026-03-31): EARLY/NXT 지속성·섹터 breadth 실확인 강화 — 상위주 공통 생존 조건과 오전 급락 포착 종목의 공통 붕괴 조건을 함께 반영해, NXT/조기포착에서 후속 거래량·호가 지속성과 실제 섹터 breadth를 더 강하게 확인하도록 조정했다. NXT 장전은 live hoga gate를 필수로 보고, intraday NXT는 confirm 3회와 persistence gate를 적용하며, `early_guard_external_delay_reason`이 NXT 점수 예외보다 우선한다. 또한 fake breakout은 돌파 유지 실패까지 포함해 진입 차단을 보강한다.
@@ -4508,6 +4510,14 @@ ISSUE_PREWATCH_REACTION_MIN_CHANGE = float(os.getenv("ISSUE_PREWATCH_REACTION_MI
 ISSUE_PREWATCH_REACTION_MIN_VOLUME = float(os.getenv("ISSUE_PREWATCH_REACTION_MIN_VOLUME", "1.5") or "1.5")
 ISSUE_PREWATCH_REACT_LIMIT = int(os.getenv("ISSUE_PREWATCH_REACT_LIMIT", "5") or "5")
 ISSUE_PREWATCH_FIRED_TTL_SEC = int(os.getenv("ISSUE_PREWATCH_FIRED_TTL_SEC", "28800") or "28800")
+MATERIAL_FIRST_OFFHOURS_MIN_SEC = int(os.getenv("MATERIAL_FIRST_OFFHOURS_MIN_SEC", "300") or "300")
+MATERIAL_FIRST_OFFHOURS_START = dtime(6, 0)
+MATERIAL_FIRST_OFFHOURS_END = dtime(23, 30)
+MATERIAL_PREWATCH_SCAN_LIMIT = int(os.getenv("MATERIAL_PREWATCH_SCAN_LIMIT", "4") or "4")
+MATERIAL_PREWATCH_HEADLINE_MIN = int(os.getenv("MATERIAL_PREWATCH_HEADLINE_MIN", "2") or "2")
+MATERIAL_PREWATCH_SEED_SCORE_MIN = int(os.getenv("MATERIAL_PREWATCH_SEED_SCORE_MIN", "3") or "3")
+MATERIAL_PREWATCH_STRONG_SEED_SCORE = int(os.getenv("MATERIAL_PREWATCH_STRONG_SEED_SCORE", "5") or "5")
+MATERIAL_PREWATCH_STOCK_COOLDOWN_SEC = int(os.getenv("MATERIAL_PREWATCH_STOCK_COOLDOWN_SEC", "5400") or "5400")
 GEO_PREWATCH_MAX_STOCKS = int(os.getenv("GEO_PREWATCH_MAX_STOCKS", "5") or "5")
 GEO_PREWATCH_POLL_DELAY_SEC = float(os.getenv("GEO_PREWATCH_POLL_DELAY_SEC", "0.15") or "0.15")
 WATCHDOG_RANK_MIN_CHANGE = float(os.getenv("WATCHDOG_RANK_MIN_CHANGE", "3.0") or "3.0")
@@ -4727,6 +4737,7 @@ _news_stock_alert_history = {}
 _news_issue_prewatch: dict = {}
 # v78 #1: prewatch 알람 발송 후 중복 차단 (theme_key → ts)
 _news_prewatch_fired: dict = {}
+_material_first_state: dict = {"last_offhours_ts": 0.0, "last_seed_cnt": 0}
 _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
@@ -22417,6 +22428,7 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
         1 if alert.get("leader_priority_hit") else 0,
         1 if alert.get("nxt_post_leader_hit") else 0,
         1 if alert.get("sector_leader_follow_hit") else 0,
+        1 if alert.get("material_first_priority_hit") else 0,
         1 if alert.get("direct_news_hit") else 0,
         1 if alert.get("theme_drive_hit") else 0,
         1 if alert.get("adaptive_feedback_hit") else 0,
@@ -24192,6 +24204,162 @@ def analyze_news_sentiment(headlines: list, stock_name: str = "") -> dict:
     matched = [h for h in targets if
                any(kw in h for kw in _POSITIVE_KEYWORDS + _NEGATIVE_KEYWORDS)][:3]
     return {"score": raw_score, "label": label, "pos": pos, "neg": neg, "matched": matched}
+def _is_material_first_extended_window(now: datetime | None = None) -> bool:
+    now = now or _now_kst()
+    if is_holiday():
+        return False
+    now_t = now.time()
+    return MATERIAL_FIRST_OFFHOURS_START <= now_t <= MATERIAL_FIRST_OFFHOURS_END
+
+
+def _score_material_seed_quality(theme_key: str, matched: list, stock_status: list[dict]) -> dict:
+    matched_cnt = len(matched or [])
+    reacted_cnt = sum(1 for s in stock_status if safe_float(s.get("change_rate", 0.0), 0.0) >= ISSUE_PREWATCH_REACTION_MIN_CHANGE)
+    vol_on_cnt = sum(1 for s in stock_status if safe_float(s.get("volume_ratio", 0.0), 0.0) >= ISSUE_PREWATCH_REACTION_MIN_VOLUME)
+    leader_cnt = sum(1 for s in stock_status if safe_float(s.get("change_rate", 0.0), 0.0) >= 2.5 and safe_float(s.get("volume_ratio", 0.0), 0.0) >= 1.5)
+    score = min(3, matched_cnt) + min(2, reacted_cnt) + min(2, vol_on_cnt) + min(2, leader_cnt)
+    passes = score >= MATERIAL_PREWATCH_SEED_SCORE_MIN and matched_cnt >= MATERIAL_PREWATCH_HEADLINE_MIN
+    return {
+        "theme_key": theme_key,
+        "matched_cnt": matched_cnt,
+        "reacted_cnt": reacted_cnt,
+        "vol_on_cnt": vol_on_cnt,
+        "leader_cnt": leader_cnt,
+        "score": score,
+        "passes": passes,
+        "strong": score >= MATERIAL_PREWATCH_STRONG_SEED_SCORE,
+    }
+
+
+def _material_first_stock_alert_key(code: str, theme_key: str = "") -> str:
+    code = normalize_stock_code(code or "")
+    theme_key = str(theme_key or "").strip()
+    return f"{theme_key}:{code}" if theme_key else code
+
+
+def _is_material_first_stock_cooldown(code: str, theme_key: str = "") -> bool:
+    key = _material_first_stock_alert_key(code, theme_key)
+    if not key:
+        return False
+    return (time.time() - float(_news_stock_alert_history.get(key, 0) or 0)) < MATERIAL_PREWATCH_STOCK_COOLDOWN_SEC
+
+
+def _mark_material_first_stock_alerted(code: str, theme_key: str = "") -> None:
+    key = _material_first_stock_alert_key(code, theme_key)
+    if key:
+        _news_stock_alert_history[key] = time.time()
+
+
+def _summarize_material_reaction(reacted: list[dict], pw: dict | None = None) -> dict:
+    reacted = list(reacted or [])
+    pw = dict(pw or {})
+    reacted_cnt = len(reacted)
+    strong_cnt = sum(1 for item in reacted if safe_float(item.get("change_rate", 0.0), 0.0) >= 2.0 and safe_float(item.get("volume_ratio", 0.0), 0.0) >= 1.8)
+    leader_cnt = sum(1 for item in reacted if safe_float(item.get("change_rate", 0.0), 0.0) >= COMMON_THRESHOLD_3P0)
+    seed_score = safe_int(pw.get("quality_score", 0), 0)
+    passes = reacted_cnt >= 1 and (strong_cnt >= 1 or leader_cnt >= 1 or seed_score >= MATERIAL_PREWATCH_STRONG_SEED_SCORE)
+    return {
+        "reacted_cnt": reacted_cnt,
+        "strong_cnt": strong_cnt,
+        "leader_cnt": leader_cnt,
+        "seed_score": seed_score,
+        "passes": passes,
+        "strong": strong_cnt >= 2 or leader_cnt >= 1 or seed_score >= MATERIAL_PREWATCH_STRONG_SEED_SCORE,
+    }
+
+
+def _material_reacted_priority_score(item: dict, pw: dict | None = None, summary: dict | None = None) -> float:
+    pw = dict(pw or {})
+    summary = dict(summary or {})
+    change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
+    vol_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    seed_score = safe_int(summary.get("seed_score", pw.get("quality_score", 0)), 0)
+    return round(change_rate * 10.0 + vol_ratio * 8.0 + seed_score * 6.0 + safe_int(summary.get("strong_cnt", 0), 0) * 4.0, 2)
+
+
+def _register_material_seed_prewatch(headlines: list, source_label: str = "material_first") -> int:
+    added = 0
+    if not headlines:
+        return 0
+    now_ts = time.time()
+    for theme_key, theme_info in THEME_MAP.items():
+        try:
+            if theme_key in _news_issue_prewatch:
+                continue
+            if now_ts - _news_prewatch_fired.get(theme_key, 0) < 14400:
+                continue
+            matched = [h for h in headlines if theme_key in h or any(s in h for s in theme_info.get("sectors", []))]
+            if not matched:
+                continue
+            stock_status = []
+            for code, name in theme_info.get("stocks", [])[:10]:
+                try:
+                    cur = get_stock_price(code) or {}
+                    stock_status.append({
+                        "code": code,
+                        "name": name,
+                        "price": int(cur.get("price", 0) or 0),
+                        "change_rate": float(cur.get("change_rate", 0) or 0),
+                        "volume_ratio": float(cur.get("volume_ratio", 0) or 0),
+                        "source": source_label,
+                    })
+                    time.sleep(0.1)
+                except Exception as e:
+                    _swallow_exception(e)
+                    continue
+            if not stock_status:
+                continue
+            quality = _score_material_seed_quality(theme_key, matched, stock_status)
+            if not quality.get("passes"):
+                continue
+            _news_issue_prewatch[theme_key] = {
+                "stocks": stock_status,
+                "headline": matched[0][:60],
+                "theme_desc": theme_info.get("desc", theme_key),
+                "ts": now_ts,
+                "source": source_label,
+                "quality_score": quality.get("score", 0),
+                "headline_count": quality.get("matched_cnt", 0),
+                "reacted_count": quality.get("reacted_cnt", 0),
+            }
+            added += 1
+        except Exception as e:
+            _swallow_exception(e)
+    return added
+
+
+def run_material_first_scan() -> None:
+    if _bot_paused or is_holiday():
+        return
+    live_market = is_any_market_open()
+    if not live_market and not _is_material_first_extended_window():
+        return
+    now_ts = time.time()
+    if not live_market and now_ts - float(_material_first_state.get("last_offhours_ts", 0) or 0) < MATERIAL_FIRST_OFFHOURS_MIN_SEC:
+        return
+    _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 재료-first 스캔{' [실시간]' if live_market else ' [장외/장전]'}...")
+    try:
+        headlines = fetch_all_news()
+        if not headlines:
+            return
+        threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
+        if live_market:
+            for signal in analyze_news_theme(headlines=headlines):
+                send_news_theme_alert(signal)
+            try:
+                check_issue_prewatch()
+            except Exception as e:
+                _log_error("run_material_first_scan/check_issue_prewatch", e)
+        else:
+            added = _register_material_seed_prewatch(headlines, source_label="offhours")
+            _material_first_state["last_offhours_ts"] = now_ts
+            _material_first_state["last_seed_cnt"] = added
+            if added > 0:
+                _log_info_msg(f"  👁 장외 재료-first prewatch seed 등록: {added}개")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 재료-first 스캔 오류: {e}")
+
+
 def analyze_news_theme(headlines: list = None) -> list:
     signals = []
     if headlines is None:
@@ -24227,16 +24395,22 @@ def analyze_news_theme(headlines: list = None) -> list:
         rising_stocks = [s for s in stock_status if s["rising"]]
         if not rising_stocks:
             now_ts = time.time()
+            quality = _score_material_seed_quality(theme_key, matched, stock_status)
             if time.time() - _news_prewatch_fired.get(theme_key, 0) < 14400 or theme_key in _news_issue_prewatch:
                 _log_info_msg(f"  ⏭ [{theme_key}] 뉴스 있지만 주가 반응 없음 → 스킵")
+            elif not quality.get("passes"):
+                _log_info_msg(f"  ⏭ [{theme_key}] material seed 품질 미달({quality.get('score', 0)}점/{quality.get('matched_cnt', 0)}헤드라인)")
             else:
                 _news_issue_prewatch[theme_key] = {
                     "stocks": stock_status,
                     "headline": matched[0][:60],
                     "theme_desc": theme_info["desc"],
                     "ts": now_ts,
+                    "quality_score": quality.get("score", 0),
+                    "headline_count": quality.get("matched_cnt", 0),
+                    "reacted_count": quality.get("reacted_cnt", 0),
                 }
-                _log_info_msg(f"  👁 [{theme_key}] 뉴스 감지 → prewatch 등록 ({len(stock_status)}종목 대기)")
+                _log_info_msg(f"  👁 [{theme_key}] 뉴스 감지 → prewatch 등록 ({len(stock_status)}종목 대기, {quality.get('score', 0)}점)")
             continue
         total = len(stock_status)
         react_ratio = len(rising_stocks) / total
@@ -24361,16 +24535,24 @@ def _collect_issue_prewatch_reacted(stocks: list[dict]) -> list[dict]:
     return reacted
 def _dispatch_issue_prewatch_reacted(pw: dict, reacted: list[dict]) -> set[str]:
     dispatched_codes = set()
-    for item in reacted[:ISSUE_PREWATCH_REACT_LIMIT]:
+    theme_key = str((pw or {}).get("theme_key") or "")
+    summary = _summarize_material_reaction(reacted, pw)
+    reacted_sorted = sorted(reacted, key=lambda item: _material_reacted_priority_score(item, pw, summary), reverse=True)
+    for item in reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]:
         code = item["code"]
         name = item["name"]
+        if _is_material_first_stock_cooldown(code, theme_key):
+            continue
         try:
             analyzed = analyze(item)
             if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
                 analyzed.setdefault("reasons", []).append(f"👁 이슈 선감지: {pw['theme_desc'][:30]}")
+                analyzed["material_first_hint"] = True
+                analyzed["material_first_priority_hit"] = bool(summary.get("strong"))
                 dispatched = _dispatch_general_alert_signal(analyzed, source_label="이슈 선감지")
                 if dispatched:
                     dispatched_codes.add(code)
+                    _mark_material_first_stock_alerted(code, theme_key)
                     _log_info_msg(f"  👁 이슈→A급 진입 체인: {name} {item['change_rate']:+.1f}% 등급A")
                     continue
         except Exception as e:
@@ -24388,6 +24570,8 @@ def check_issue_prewatch() -> None:
             expired_keys.append(theme_key)
             continue
         try:
+            pw = dict(pw)
+            pw.setdefault("theme_key", theme_key)
             reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []))
             if not reacted:
                 continue
@@ -27347,23 +27531,9 @@ def _send_ai_analysis(week_recs: list, summary: str):
     except Exception as e:
         _log_warn_msg(f"⚠️ AI 분석 오류: {e}")
 def run_news_scan():
-    if not is_any_market_open() or _bot_paused: return   # NXT 포함 체크
-    _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 뉴스 스캔...")
-    try:
-        headlines = fetch_all_news()   # 한 번만 호출
-        if not headlines: return
-        # 뉴스 공동언급 DB 업데이트 (백그라운드)
-        threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
-        # 테마 분석은 가져온 헤드라인 재사용 (이중 크롤링 제거)
-        for signal in analyze_news_theme(headlines=headlines):
-            send_news_theme_alert(signal)
-    except Exception as e:
-        _log_warn_msg(f"⚠️ 뉴스 오류: {e}")
-    # v78 #4: prewatch 종목 주가 반응 체크 (이슈 선감지 알람 체인)
-    try:
-        check_issue_prewatch()
-    except Exception as e:
-        _log_error("run_news_scan/check_issue_prewatch", e)
+    """호환 유지용 wrapper — 실제 뉴스/이슈 파이프라인은 run_material_first_scan()이 담당."""
+    run_material_first_scan()
+
 # ── v41.61 #5: 레짐 전환 알림 ──
 _last_regime_notify_mode: str = ""   # 중복 발송 방지
 def _notify_regime_change(prev_mode: str, new_mode: str):
@@ -28496,6 +28666,55 @@ def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool
                 continue
     except Exception as _e:
         _log_warn_msg(f"  ⚠️ 야간 워치리스트 우선 스캔 오류: {_e}")
+def _scan_issue_prewatch_candidates(alerts: list, seen: set) -> None:
+    if not _news_issue_prewatch or not is_any_market_open():
+        return
+    now = time.time()
+    expired_keys = []
+    for theme_key, pw in list(_news_issue_prewatch.items())[:MATERIAL_PREWATCH_SCAN_LIMIT]:
+        if _should_expire_issue_prewatch(theme_key, pw, now):
+            expired_keys.append(theme_key)
+            continue
+        try:
+            pw = dict(pw)
+            pw.setdefault("theme_key", theme_key)
+            reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []))
+            if not reacted:
+                continue
+            summary = _summarize_material_reaction(reacted, pw)
+            if not summary.get("passes"):
+                continue
+            reacted_sorted = sorted(reacted, key=lambda item: _material_reacted_priority_score(item, pw, summary), reverse=True)
+            dispatched_codes = set()
+            for item in reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]:
+                code = normalize_stock_code(item.get("code", ""))
+                if not code or code in seen or _is_material_first_stock_cooldown(code, theme_key):
+                    continue
+                result = analyze(item)
+                if not isinstance(result, dict):
+                    continue
+                if result.get("grade") != "A" or int(result.get("entry_price", 0) or 0) <= 0:
+                    continue
+                result = dict(result)
+                result.setdefault("reasons", []).append(f"👁 재료-first prewatch: {str(pw.get('theme_desc', '') or '')[:30]}")
+                result["material_first_hint"] = True
+                result["material_first_priority_hit"] = bool(summary.get("strong"))
+                result["material_first_theme"] = theme_key
+                result["material_first_seed_score"] = summary.get("seed_score", 0)
+                result["material_first_reacted_cnt"] = summary.get("reacted_cnt", 0)
+                _append_scan_alert(alerts, seen, result, hist_key=code, seen_code=code)
+                _mark_material_first_stock_alerted(code, theme_key)
+                dispatched_codes.add(code)
+            if dispatched_codes:
+                _news_prewatch_fired[theme_key] = now
+                expired_keys.append(theme_key)
+                _log_info_msg(f"  👁 재료-first prewatch→본스캔 합류: [{theme_key}] {len(dispatched_codes)}종목")
+        except Exception as e:
+            _log_error("_scan_issue_prewatch_candidates", e)
+    for key in expired_keys:
+        _news_issue_prewatch.pop(key, None)
+
+
 def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
     today_date = datetime.now().strftime("%Y%m%d")
     for stock in get_upper_limit_stocks():
@@ -28691,6 +28910,10 @@ def _run_scan_followup_hooks() -> None:
     run_entry_defense_monitor()
     check_reentry_watch()
     track_signal_results()
+def run_price_first_scan() -> None:
+    run_scan()
+
+
 def run_scan():
     code = ""
     ctx = _build_scan_runtime_context()
@@ -28701,6 +28924,7 @@ def run_scan():
         _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
         _scan_overnight_watchlist_candidates(alerts, seen, ctx["krx_open"])
+        _scan_issue_prewatch_candidates(alerts, seen)
         if ctx["krx_open"]:
             _scan_krx_market_candidates(alerts, seen)
         if ctx["nxt_open"]:
@@ -28813,8 +29037,8 @@ if __name__ == "__main__":
             _send_startup_banner_once()
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
-    schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_scan))
-    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_news_scan))
+    schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
+    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_material_first_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
@@ -28902,8 +29126,8 @@ if __name__ == "__main__":
                 _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
     _maybe_run_preclose_gap_alert_catchup()
     if _try_acquire_leader_lock() and _enforce_runtime_version_lock(notify=False):
-        run_scan()
-        run_news_scan()
+        run_price_first_scan()
+        run_material_first_scan()
         run_mid_pullback_scan()
     while True:
         try:
