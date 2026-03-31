@@ -3,11 +3,12 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v149
+버전: v150
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v149 (2026-03-31): run_scan 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
+- v150 (2026-03-31): 상방/하방 재료 시나리오 강화 + 하방 재료 전구간 차단/알림 — 재료 엔진이 직접뉴스·테마동조·섹터확산·market flow·material-first 선감지가 겹칠수록 추가 가점을 더 크게 주도록 `재료 시나리오 결속` 보너스를 도입했다. 동시에 감사보고서 제출기한 연장신고/지연·감사의견·관리/상장폐지/거래정지·횡령/배임·회생류 하방 재료를 DART/뉴스/옵션형 유튜브 최근성 감시에서 시나리오로 묶어 후보 부트스트랩과 최종 진입 필터 양쪽에서 즉시 차단하고, 이미 걸린 entry/reentry/execution/preclose 감시도 `하방재료차단`으로 정리하며 즉시 알림과 장마감 묶음 요약을 함께 남기도록 확장했다.
+- v149 (2026-03-31): run_scan `change_rate` 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -1706,63 +1707,17 @@ print = _runtime_print
 # requests 직접 호출 기본 timeout/로그 일관화
 _REQUESTS_GET_RAW = requests.get
 _REQUESTS_POST_RAW = requests.post
-def _is_connection_reset_request_error(exc: Exception) -> bool:
-    try:
-        if exc is None:
-            return False
-        stack = [exc]
-        seen: set[int] = set()
-        while stack:
-            cur = stack.pop()
-            if cur is None:
-                continue
-            obj_id = id(cur)
-            if obj_id in seen:
-                continue
-            seen.add(obj_id)
-            if isinstance(cur, ConnectionResetError):
-                return True
-            msg = str(cur)
-            if "Connection reset by peer" in msg or "Connection aborted" in msg:
-                return True
-            for child in (getattr(cur, "__cause__", None), getattr(cur, "__context__", None)):
-                if child is not None:
-                    stack.append(child)
-            args = getattr(cur, "args", ())
-            if isinstance(args, tuple):
-                for item in args:
-                    if isinstance(item, BaseException):
-                        stack.append(item)
-                    elif isinstance(item, str) and "Connection reset by peer" in item:
-                        return True
-        return False
-    except Exception as inner_exc:
-        _swallow_exception(inner_exc)
-        return False
 def _requests_get_with_defaults(*args, **kwargs):
     kwargs.setdefault("timeout", (5, 15))
     url = str(args[0]) if args else str(kwargs.get("url", "") or "")
-    connection_reset_retry = int(kwargs.pop("_connection_reset_retry", 0) or 0)
     try:
         return _REQUESTS_GET_RAW(*args, **kwargs)
     except Exception as e:
-        is_telegram_timeout = "api.telegram.org" in url and isinstance(e, requests.exceptions.Timeout)
-        is_connection_reset = _is_connection_reset_request_error(e)
-        if is_telegram_timeout:
+        if "api.telegram.org" in url and isinstance(e, requests.exceptions.Timeout):
             _warn_throttled_once("telegram_api_timeout", f"⚠️ 텔레그램 API timeout → 다음 루프로 이월 ({type(e).__name__})", cooldown_sec=600.0)
-        elif is_connection_reset:
-            retry_key = f"requests_get_connection_reset:{url.split('?')[0][:120]}"
-            if connection_reset_retry < 1:
-                _warn_throttled_once(retry_key, f"⚠️ requests.get 연결 재설정 감지 → 1회 재시도 ({url.split('?')[0][:120]})", cooldown_sec=300.0)
-                time.sleep(0.35)
-                retry_kwargs = dict(kwargs)
-                retry_kwargs["_connection_reset_retry"] = connection_reset_retry + 1
-                return _requests_get_with_defaults(*args, **retry_kwargs)
-            _warn_throttled_once(f"{retry_key}:giveup", f"⚠️ requests.get 연결 재설정 지속 → 이번 루프는 건너뜀 ({url.split('?')[0][:120]})", cooldown_sec=300.0)
         else:
             _swallow_exception(e, note="requests.get", level=logging.ERROR)
         raise
-
 def _requests_post_with_defaults(*args, **kwargs):
     kwargs.setdefault("timeout", (5, 15))
     try:
@@ -4718,6 +4673,58 @@ DART_URGENT_KEYWORDS = [
 ]
 DART_RISK_KEYWORDS = ["거래정지","상장폐지","횡령","배임","파산","워크아웃",
                       "감사의견","영업정지","회생","관리종목","분식","조사"]
+MATERIAL_SIGNAL_HEADLINE_CACHE_TTL_SEC = int(os.getenv("MATERIAL_SIGNAL_HEADLINE_CACHE_TTL_SEC", "180") or "180")
+MATERIAL_SCENARIO_CACHE_TTL_SEC = int(os.getenv("MATERIAL_SCENARIO_CACHE_TTL_SEC", "600") or "600")
+MATERIAL_SCENARIO_STACK_BONUS = int(os.getenv("MATERIAL_SCENARIO_STACK_BONUS", "4") or "4")
+MATERIAL_SCENARIO_MAX_BONUS = int(os.getenv("MATERIAL_SCENARIO_MAX_BONUS", "12") or "12")
+MATERIAL_BLOCK_ALERT_COOLDOWN_SEC = int(os.getenv("MATERIAL_BLOCK_ALERT_COOLDOWN_SEC", "14400") or "14400")
+MATERIAL_BLOCK_ALERT_BURST_WINDOW_SEC = int(os.getenv("MATERIAL_BLOCK_ALERT_BURST_WINDOW_SEC", "900") or "900")
+MATERIAL_BLOCK_ALERT_BURST_LIMIT = int(os.getenv("MATERIAL_BLOCK_ALERT_BURST_LIMIT", "4") or "4")
+MATERIAL_BLOCK_DIGEST_LIMIT = int(os.getenv("MATERIAL_BLOCK_DIGEST_LIMIT", "12") or "12")
+YOUTUBE_API_KEY = str(os.getenv("YOUTUBE_API_KEY", "") or "").strip()
+YOUTUBE_WATCH_CHANNEL_IDS = [x.strip() for x in str(os.getenv("YOUTUBE_WATCH_CHANNEL_IDS", "") or "").split(",") if x.strip()]
+YOUTUBE_MATERIAL_QUERY = str(os.getenv("YOUTUBE_MATERIAL_QUERY", "주식 재료 OR 급등 OR 공시 OR 감사보고서") or "").strip()
+YOUTUBE_LOOKBACK_HOURS = int(os.getenv("YOUTUBE_LOOKBACK_HOURS", "48") or "48")
+YOUTUBE_MAX_RESULTS_PER_CHANNEL = int(os.getenv("YOUTUBE_MAX_RESULTS_PER_CHANNEL", "5") or "5")
+MATERIAL_DOWNSIDE_SCENARIOS = [
+    {
+        "id": "audit_report_delay",
+        "label": "감사/정기보고서 지연",
+        "severity": "critical",
+        "keywords": [
+            "사업보고서제출기한연장신고", "반기보고서제출기한연장신고", "분기보고서제출기한연장신고",
+            "제출기한 연장신고", "사업보고서 미제출", "감사보고서 미제출", "감사보고서 지연 제출",
+            "감사보고서 제출 지연", "사업보고서 제출 지연", "제출기한 연장",
+        ],
+    },
+    {
+        "id": "audit_opinion",
+        "label": "감사의견/회계 리스크",
+        "severity": "critical",
+        "keywords": [
+            "감사의견", "의견거절", "의견 거절", "부적정", "한정의견",
+            "내부회계관리제도", "회계처리기준 위반", "감사범위 제한", "감사의견 비적정",
+        ],
+    },
+    {
+        "id": "listing_risk",
+        "label": "관리/상폐/거래정지 리스크",
+        "severity": "critical",
+        "keywords": [
+            "관리종목", "투자주의환기", "실질심사", "상장폐지", "상장적격성 실질심사",
+            "주권매매거래정지", "매매거래정지", "거래정지", "상장폐지 사유",
+        ],
+    },
+    {
+        "id": "fraud_distress",
+        "label": "횡령/배임/회생 리스크",
+        "severity": "critical",
+        "keywords": [
+            "횡령", "배임", "파산", "회생", "워크아웃", "부도", "영업정지", "채무불이행",
+        ],
+    },
+]
+MATERIAL_DOWNSIDE_HARD_SCENARIO_IDS = {rec["id"] for rec in MATERIAL_DOWNSIDE_SCENARIOS}
 DART_EVENT_DEDUPE_HOURS = int(os.getenv("DART_EVENT_DEDUPE_HOURS", "12") or "12")
 DART_EVENT_SEEN_KEEP_DAYS = int(os.getenv("DART_EVENT_SEEN_KEEP_DAYS", "7") or "7")
 DART_EXEC_MIN_RR = float(os.getenv("DART_EXEC_MIN_RR", "1.15") or "1.15")
@@ -4746,6 +4753,359 @@ def _random_ua() -> dict:
     return {"User-Agent": random.choice(_UA_POOL),
             "Accept-Language": "ko-KR,ko;q=0.9",
             "Referer": "https://finance.naver.com/"}
+
+
+def _build_youtube_published_after_iso(hours: int) -> str:
+    lookback = max(1, int(hours or 1))
+    cutoff = datetime.utcnow() - timedelta(hours=lookback)
+    return cutoff.replace(microsecond=0).isoformat() + "Z"
+
+
+def _fetch_youtube_material_headline_rows() -> list[dict]:
+    if not YOUTUBE_API_KEY or not YOUTUBE_WATCH_CHANNEL_IDS:
+        return []
+    rows = []
+    published_after = _build_youtube_published_after_iso(YOUTUBE_LOOKBACK_HOURS)
+    for channel_id in YOUTUBE_WATCH_CHANNEL_IDS[:5]:
+        try:
+            resp = requests.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "part": "snippet",
+                    "type": "video",
+                    "order": "date",
+                    "maxResults": max(1, int(YOUTUBE_MAX_RESULTS_PER_CHANNEL or 5)),
+                    "q": YOUTUBE_MATERIAL_QUERY,
+                    "publishedAfter": published_after,
+                    "channelId": channel_id,
+                    "key": YOUTUBE_API_KEY,
+                },
+                timeout=10,
+            )
+            for item in resp.json().get("items", []):
+                snippet = item.get("snippet", {}) if isinstance(item, dict) else {}
+                title = str(snippet.get("title", "") or "").strip()
+                if not title:
+                    continue
+                rows.append({
+                    "title": title,
+                    "source": "YOUTUBE",
+                    "published_at": str(snippet.get("publishedAt", "") or ""),
+                    "channel_id": channel_id,
+                    "live": str(snippet.get("liveBroadcastContent", "") or ""),
+                })
+        except Exception as e:
+            _warn_throttled_once(
+                f"youtube_material_fetch:{channel_id}",
+                f"⚠️ 유튜브 재료 감시 실패 [{channel_id[:8]}]: {type(e).__name__}",
+                cooldown_sec=1800.0,
+            )
+    return rows
+
+
+def _get_material_signal_headline_rows(force: bool = False) -> list[dict]:
+    now = time.time()
+    cache = _material_signal_headline_cache if isinstance(_material_signal_headline_cache, dict) else {}
+    if (
+        not force
+        and cache.get("rows")
+        and now - float(cache.get("ts", 0) or 0) < MATERIAL_SIGNAL_HEADLINE_CACHE_TTL_SEC
+    ):
+        return [dict(row) for row in list(cache.get("rows", []))]
+    rows = []
+    try:
+        rows.extend({"title": title, "source": "NEWS", "published_at": ""} for title in fetch_all_news() if title)
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        rows.extend(_fetch_youtube_material_headline_rows())
+    except Exception as e:
+        _swallow_exception(e)
+    deduped = []
+    seen = set()
+    for row in rows:
+        title = str((row or {}).get("title", "") or "").strip()
+        source = str((row or {}).get("source", "") or "")
+        key = (source, title)
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "title": title,
+            "source": source,
+            "published_at": str((row or {}).get("published_at", "") or ""),
+            "channel_id": str((row or {}).get("channel_id", "") or ""),
+            "live": str((row or {}).get("live", "") or ""),
+        })
+    _material_signal_headline_cache["ts"] = now
+    _material_signal_headline_cache["rows"] = list(deduped)
+    return [dict(row) for row in deduped]
+
+
+def _get_material_signal_headlines(force: bool = False) -> list[str]:
+    return [str(row.get("title", "") or "") for row in _get_material_signal_headline_rows(force=force)]
+
+
+def _match_material_downside_scenario_rows(rows: list[dict]) -> dict:
+    matched = {}
+    source_weight = {"DART": 4, "KIND": 4, "NEWS": 2, "YOUTUBE": 1}
+    for row in rows or []:
+        text = str((row or {}).get("title") or (row or {}).get("text") or "").strip()
+        source = str((row or {}).get("source", "") or "NEWS").strip().upper()
+        if not text:
+            continue
+        for scenario in MATERIAL_DOWNSIDE_SCENARIOS:
+            hits = [kw for kw in scenario.get("keywords", []) if kw and kw in text]
+            if not hits:
+                continue
+            rec = matched.setdefault(
+                scenario["id"],
+                {
+                    "scenario_id": scenario["id"],
+                    "label": scenario["label"],
+                    "severity": scenario.get("severity", "high"),
+                    "hits": [],
+                    "sources": set(),
+                    "examples": [],
+                    "official": False,
+                    "score": 0,
+                },
+            )
+            rec["hits"].extend(hits)
+            rec["sources"].add(source)
+            if text not in rec["examples"]:
+                rec["examples"].append(text)
+            if source in ("DART", "KIND"):
+                rec["official"] = True
+    best = {}
+    for rec in matched.values():
+        uniq_hits = list(dict.fromkeys(rec.get("hits", [])))
+        sources = sorted(rec.get("sources", set()))
+        score = len(uniq_hits) + (max(source_weight.get(src, 0) for src in sources) if sources else 0)
+        if rec.get("official"):
+            score += 3
+        if len(sources) >= 2:
+            score += 2
+        if rec.get("severity") == "critical":
+            score += 1
+        rec["hits"] = uniq_hits
+        rec["sources"] = sources
+        rec["score"] = score
+        if not best or score > int(best.get("score", -1) or -1):
+            best = rec
+    return best
+
+
+def _get_recent_stock_material_rows(name: str) -> list[dict]:
+    stock_name = str(name or "").strip()
+    if not stock_name:
+        return []
+    rows = []
+    for row in _get_material_signal_headline_rows():
+        title = str(row.get("title", "") or "").strip()
+        if stock_name and stock_name in title:
+            rows.append(dict(row))
+    return rows[:12]
+
+
+def _queue_material_block_digest_row(code: str, name: str, meta: dict, stage: str = "") -> None:
+    code = normalize_stock_code(code)
+    runtime = _material_block_runtime if isinstance(_material_block_runtime, dict) else {}
+    rows = runtime.setdefault("digest_rows", [])
+    row_key = f"{datetime.now().strftime('%Y%m%d')}|{str(meta.get('scenario_id', ''))}|{code}"
+    if any(str(row.get("row_key", "")) == row_key for row in rows):
+        return
+    rows.append({
+        "row_key": row_key,
+        "code": code,
+        "name": str(name or code),
+        "label": str(meta.get("label", "하방 재료") or "하방 재료"),
+        "title": str(meta.get("title", "") or ""),
+        "stage": str(stage or ""),
+        "source": str(meta.get("source", "") or ""),
+        "matched": list(meta.get("matched_keywords", []) or [])[:4],
+        "ts": time.time(),
+    })
+
+
+def _send_material_downside_digest(force: bool = False) -> None:
+    runtime = _material_block_runtime if isinstance(_material_block_runtime, dict) else {}
+    rows = list(runtime.get("digest_rows", []) or [])
+    if not rows:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not force and runtime.get("last_digest_sent_date") == today:
+        return
+    if not force and is_any_market_open():
+        return
+    lines = [
+        "🧾 <b>장마감 하방 재료 차단 요약</b>",
+        "━━━━━━━━━━━━━━━",
+        f"누적 {len(rows)}건",
+    ]
+    for row in rows[:MATERIAL_BLOCK_DIGEST_LIMIT]:
+        matched = ", ".join(list(row.get("matched", []) or [])[:3])
+        title = str(row.get("title", "") or "")[:44]
+        lines.append(
+            f"• {row.get('name','')} {row.get('code','')} | {row.get('label','')}"
+            + (f" | {title}" if title else "")
+            + (f" | {matched}" if matched else "")
+        )
+    if len(rows) > MATERIAL_BLOCK_DIGEST_LIMIT:
+        lines.append(f"• 외 {len(rows) - MATERIAL_BLOCK_DIGEST_LIMIT}건")
+    send("\n".join(lines))
+    runtime["digest_rows"] = []
+    runtime["last_digest_sent_date"] = today
+
+
+def _send_material_downside_block_message(code: str, name: str, meta: dict, stage: str = "") -> None:
+    source = str(meta.get("source", "") or "")
+    title = str(meta.get("title", "") or "")[:72]
+    matched = ", ".join(list(meta.get("matched_keywords", []) or [])[:4])
+    lines = [
+        "🚫 <b>[하방 재료 차단]</b>",
+        "━━━━━━━━━━━━━━━",
+        f"<b>{name}</b>  <code>{code}</code>",
+        f"감지시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"사유군: {meta.get('label','하방 재료')}",
+    ]
+    stage_bits = []
+    if source:
+        stage_bits.append(f"소스 {source}")
+    if stage:
+        stage_bits.append(f"단계 {stage}")
+    if stage_bits:
+        lines.append("  |  ".join(stage_bits))
+    if title:
+        lines.append(f"근거: {title}")
+    if matched:
+        lines.append(f"키워드: {matched}")
+    lines.extend([
+        "━━━━━━━━━━━━━━━",
+        "• 신규 포착/재포착/진입감시를 즉시 차단합니다.",
+        "• 이미 걸린 감시는 정책 제외로 정리합니다.",
+    ])
+    send_with_chart_buttons("\n".join(lines), code, name)
+
+
+def _notify_material_downside_block(code: str, name: str, meta: dict, stage: str = "") -> bool:
+    code = normalize_stock_code(code)
+    if not code or not isinstance(meta, dict) or not meta.get("block"):
+        return False
+    runtime = _material_block_runtime if isinstance(_material_block_runtime, dict) else {}
+    now = time.time()
+    alert_history = runtime.setdefault("alert_history", {})
+    burst_events = runtime.setdefault("burst_events", [])
+    burst_events[:] = [ts for ts in burst_events if now - float(ts or 0) < MATERIAL_BLOCK_ALERT_BURST_WINDOW_SEC]
+    key = f"{str(meta.get('scenario_id', 'risk'))}|{code}"
+    last_ts = float(alert_history.get(key, 0) or 0)
+    _queue_material_block_digest_row(code, name, meta, stage=stage)
+    if last_ts and now - last_ts < MATERIAL_BLOCK_ALERT_COOLDOWN_SEC:
+        return False
+    alert_history[key] = now
+    if len(burst_events) >= MATERIAL_BLOCK_ALERT_BURST_LIMIT:
+        runtime["last_overflow_ts"] = now
+        return False
+    burst_events.append(now)
+    _send_material_downside_block_message(code, name, meta, stage=stage)
+    return True
+
+
+def _purge_code_from_runtime_watches(code: str, *, reason: str = "정책제외", detail: str = "", current_price: int = 0) -> None:
+    code = normalize_stock_code(code)
+    if not code:
+        return
+    removed_entry = False
+    for watch_key, watch in list((_entry_watch or {}).items()):
+        if normalize_stock_code((watch or {}).get("code", "")) != code:
+            continue
+        removed = _entry_watch.pop(watch_key, None)
+        if not removed:
+            continue
+        _archive_entry_watch_record(watch_key, removed, consume_reason=reason, final_status=reason)
+        _notify_entry_watch_terminated(removed, "하방재료차단", current_price=current_price, detail=detail or "하방 재료가 감지되어 재포착 전까지 신규 진입을 보류합니다.")
+        removed_entry = True
+    if removed_entry:
+        _save_entry_watch_active()
+    removed_setup = False
+    for watch_key, watch in list((_execution_setup_watch or {}).items()):
+        if normalize_stock_code((watch or {}).get("code", "")) != code:
+            continue
+        _execution_setup_watch.pop(watch_key, None)
+        removed_setup = True
+    if removed_setup:
+        _save_execution_setup_watch(force=True)
+    removed_preclose = False
+    for watch_key, watch in list((_preclose_gap_entry_watch or {}).items()):
+        if normalize_stock_code((watch or {}).get("code", "")) != code:
+            continue
+        _preclose_gap_entry_watch.pop(watch_key, None)
+        removed_preclose = True
+    if removed_preclose:
+        _save_preclose_gap_entry_watch()
+    removed_reentry = False
+    for watch_key, watch in list((_reentry_watch or {}).items()):
+        if normalize_stock_code((watch or {}).get("code", "")) != code:
+            continue
+        _reentry_watch.pop(watch_key, None)
+        removed_reentry = True
+    if removed_reentry:
+        _save_reentry_watch()
+
+
+def _check_material_downside_risk(code: str, name: str, dart_meta: dict | None = None) -> dict:
+    code = normalize_stock_code(code)
+    name = str(name or code or "").strip()
+    cached = _material_downside_cache.get(code) if isinstance(_material_downside_cache, dict) else None
+    now = time.time()
+    if cached and now - float(cached.get("ts", 0) or 0) < MATERIAL_SCENARIO_CACHE_TTL_SEC:
+        return dict(cached)
+    result = {
+        "block": False,
+        "scenario_id": "",
+        "label": "",
+        "title": "",
+        "source": "",
+        "official": False,
+        "matched_keywords": [],
+        "supporting_sources": [],
+        "ts": now,
+    }
+    dart_meta = dict(dart_meta or {})
+    if dart_meta.get("is_risk"):
+        result.update({
+            "block": True,
+            "scenario_id": str(dart_meta.get("scenario_id", "dart_risk") or "dart_risk"),
+            "label": str(dart_meta.get("scenario_label", "DART 리스크") or "DART 리스크"),
+            "title": str(dart_meta.get("title", "") or ""),
+            "source": "DART",
+            "official": True,
+            "matched_keywords": list(dart_meta.get("matched_keywords", []) or [])[:5],
+            "supporting_sources": ["DART"],
+        })
+        _material_downside_cache[code] = dict(result)
+        return result
+    rows = _get_recent_stock_material_rows(name)
+    best = _match_material_downside_scenario_rows(rows) if rows else {}
+    if best:
+        sources = list(best.get("sources", []) or [])
+        block = False
+        if best.get("official"):
+            block = True
+        elif "NEWS" in sources and (best.get("scenario_id") in MATERIAL_DOWNSIDE_HARD_SCENARIO_IDS or int(best.get("score", 0) or 0) >= 4):
+            block = True
+        result.update({
+            "block": bool(block),
+            "scenario_id": str(best.get("scenario_id", "") or ""),
+            "label": str(best.get("label", "") or ""),
+            "title": str((best.get("examples", [""])[0]) or ""),
+            "source": "+".join(sources[:2]),
+            "official": bool(best.get("official")),
+            "matched_keywords": list(best.get("hits", []) or [])[:5],
+            "supporting_sources": sources,
+        })
+    _material_downside_cache[code] = dict(result)
+    return result
 # ============================================================
 # 🌐 상태 변수
 # ============================================================
@@ -4786,6 +5146,15 @@ _news_issue_prewatch: dict = {}
 # v78 #1: prewatch 알람 발송 후 중복 차단 (theme_key → ts)
 _news_prewatch_fired: dict = {}
 _material_first_state: dict = {"last_offhours_ts": 0.0, "last_seed_cnt": 0}
+_material_signal_headline_cache: dict = {"ts": 0.0, "rows": []}
+_material_downside_cache: dict = {}
+_material_block_runtime: dict = {
+    "alert_history": {},
+    "burst_events": [],
+    "digest_rows": [],
+    "last_digest_sent_date": "",
+    "last_overflow_ts": 0.0,
+}
 _early_cache        = {}
 _sector_cache       = {}
 _dart_seen_ids      = set()
@@ -17172,6 +17541,7 @@ def _entry_watch_termination_summary(reason: str) -> tuple[str, str]:
         "기간만료": ("감시 기간 만료", "정해진 감시 기간 안에 진입 근거가 다시 살아나지 않아 감시를 종료합니다."),
         "알림횟수만료": ("감시 횟수 만료", "반복 재확인에도 실행 근거가 이어지지 않아 감시를 종료합니다."),
         "정책제외": ("정책 제외", "현재 정책 기준상 실행 후보에서 제외되어 감시를 종료합니다."),
+        "하방재료차단": ("하방 재료 차단", "급락/상장폐지 위험 재료가 감지되어 재포착 전까지 신규 진입을 보류합니다."),
     }
     return mapping.get(reason_key, (_entry_guard_reason_label(reason_key), "현재 포착 근거가 유지되지 않아 감시를 종료합니다."))
 
@@ -19703,6 +20073,8 @@ def _finalize_bootstrap_analyze_context(ctx: dict) -> dict:
         "current_time": ctx["current_time"],
         "pattern_ctx": ctx["pattern_ctx"],
         "crossday_ctx": ctx["crossday_ctx"],
+        "pre_dart_risk_meta": ctx.get("pre_dart_risk_meta", {}),
+        "material_downside_meta": ctx.get("material_downside_meta", {}),
         "_regime_mode": ctx["_regime_mode"],
         "_regime_mult": ctx["_regime_mult"],
         "_nxt_score_mult": ctx["_nxt_score_mult"],
@@ -19753,6 +20125,27 @@ def _build_nxt_investor_label(nxt: dict) -> str:
 def _bootstrap_analyze_context(stock: dict) -> dict:
     ctx = _build_bootstrap_analyze_base_context(stock)
     if not ctx:
+        return {}
+    code = normalize_stock_code(ctx.get("code", ""))
+    stock_name = str((ctx.get("stock") or {}).get("name", code) or code)
+    pre_dart_risk_meta = check_dart_risk(code) if code else {"is_risk": False, "title": ""}
+    material_downside_meta = _check_material_downside_risk(code, stock_name, dart_meta=pre_dart_risk_meta) if code else {"block": False}
+    ctx["pre_dart_risk_meta"] = pre_dart_risk_meta
+    ctx["material_downside_meta"] = material_downside_meta
+    if material_downside_meta.get("block"):
+        reason = f"하방 재료 시나리오 차단 ({material_downside_meta.get('label','하방 재료')})"
+        _log_suppressed_alert(code, stock_name, reason, "MATERIAL_RISK", {
+            "source": material_downside_meta.get("source", ""),
+            "title": material_downside_meta.get("title", ""),
+            "matched_keywords": material_downside_meta.get("matched_keywords", []),
+        })
+        _notify_material_downside_block(code, stock_name, material_downside_meta, stage="analyze_bootstrap")
+        _purge_code_from_runtime_watches(
+            code,
+            reason="하방재료차단",
+            detail=f"{material_downside_meta.get('label','하방 재료')}이 감지되어 재포착 전까지 신규 진입을 보류합니다.",
+            current_price=safe_int(ctx.get("price", 0), 0),
+        )
         return {}
     _apply_bootstrap_signal_activation(ctx)
     if not ctx.get("signal_type"):
@@ -20030,6 +20423,40 @@ def _apply_direct_news_synergy(signal_type: str, direct_news_hit: bool, score: i
     except Exception as e:
         _swallow_exception(e)
     return score
+
+
+def _apply_material_scenario_priority_bonus(ctx: dict, score: int, reasons: list, *, direct_news_hit: bool, emergent_theme_hit: bool) -> tuple[int, list[str], bool, int]:
+    hits = []
+    if direct_news_hit:
+        hits.append("직접뉴스")
+    if emergent_theme_hit:
+        hits.append("신규이슈")
+    if bool(ctx.get("theme_drive_hit")):
+        hits.append("테마동조")
+    if bool(ctx.get("market_flow_hit")):
+        hits.append("자금이동")
+    if bool(ctx.get("theme_expansion_hit")) or float(ctx.get("theme_breadth_ratio", 0.0) or 0.0) >= GLOBAL_PATTERN_THEME_EXPANSION_MIN_BREADTH:
+        hits.append("섹터확산")
+    if bool((ctx.get("stock") or {}).get("material_first_hint")) or bool(ctx.get("material_first_hint")):
+        hits.append("선감지")
+    bonus = 0
+    hit_set = set(hits)
+    if {"직접뉴스", "테마동조"}.issubset(hit_set):
+        bonus += 4
+    if {"테마동조", "섹터확산"}.issubset(hit_set):
+        bonus += 3
+    if "선감지" in hit_set and ({"직접뉴스", "신규이슈"} & hit_set):
+        bonus += 3
+    if "자금이동" in hit_set and ({"테마동조", "섹터확산"} & hit_set):
+        bonus += 2
+    if len(hit_set) >= 3:
+        bonus += MATERIAL_SCENARIO_STACK_BONUS
+    bonus = min(MATERIAL_SCENARIO_MAX_BONUS, int(bonus or 0))
+    if bonus > 0:
+        score += bonus
+        reasons.append(f"🧠 재료 시나리오 결속 [{', '.join(hits[:4])}] +{bonus}점")
+        return score, reasons, True, bonus
+    return score, reasons, False, 0
 def _apply_geo_sector_context(ctx: dict, score: int, reasons: list) -> int:
     stock = ctx["stock"]
     code = ctx["code"]
@@ -20143,6 +20570,9 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
     score = _apply_direct_news_synergy(signal_type, direct_news_hit, score, reasons)
     score = _apply_geo_sector_context(ctx, score, reasons)
     score = _apply_theme_rotation_context(stock, score, reasons)
+    score, reasons, material_scenario_hit, material_scenario_bonus = _apply_material_scenario_priority_bonus(
+        ctx, score, reasons, direct_news_hit=direct_news_hit, emergent_theme_hit=emergent_theme_hit
+    )
     ok, score, earnings = _apply_earnings_risk_context(ctx, score, reasons)
     if not ok:
         return False
@@ -20151,6 +20581,7 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
         "short_ratio": short_ratio, "f_days": f_days, "i_days": i_days,
         "news_articles": news_articles, "news_analysis": news_analysis,
         "direct_news_hit": direct_news_hit, "emergent_theme_hit": emergent_theme_hit,
+        "material_scenario_hit": bool(material_scenario_hit), "material_scenario_bonus": int(material_scenario_bonus or 0),
         "earnings": earnings, "regime_mode": regime_mode,
     })
     return True
@@ -20166,9 +20597,17 @@ def _apply_analyze_entry_and_filters(ctx: dict) -> bool:
     sector_info = ctx.get("sector_info", {}) or {}
     direct_news_hit = bool(ctx.get("direct_news_hit"))
     _cached_price = ctx.get("_cached_price", {}) or {}
-    _dart_r = check_dart_risk(code)
-    if _dart_r["is_risk"] and signal_type not in ("UPPER_LIMIT",):
-        _log_info_msg(f"  🚫 DART리스크차단 [{stock.get('name', code)}]: {_dart_r['title']}")
+    _dart_r = ctx.get("pre_dart_risk_meta") if isinstance(ctx.get("pre_dart_risk_meta"), dict) else check_dart_risk(code)
+    _material_downside = ctx.get("material_downside_meta") if isinstance(ctx.get("material_downside_meta"), dict) else _check_material_downside_risk(code, stock.get("name", code), dart_meta=_dart_r)
+    if _material_downside.get("block") and signal_type not in ("UPPER_LIMIT",):
+        _log_info_msg(f"  🚫 하방재료차단 [{stock.get('name', code)}]: {_material_downside.get('title','') or _material_downside.get('label','하방 재료')}")
+        _notify_material_downside_block(code, stock.get("name", code), _material_downside, stage="analyze_filters")
+        _purge_code_from_runtime_watches(
+            code,
+            reason="하방재료차단",
+            detail=f"{_material_downside.get('label','하방 재료')}이 감지되어 재포착 전까지 신규 진입을 보류합니다.",
+            current_price=safe_int(price, 0),
+        )
         return False
     open_est = price / (1 + change_rate / 100)
     _pullback_r = _dynamic.get("entry_pullback_ratio", get_regime_pullback_ratio())
@@ -20409,6 +20848,7 @@ def _apply_analyze_theme_context(ctx: dict) -> None:
         "theme_expansion_hit": bool(theme_expansion_hit),
         "theme_expansion_bonus": int(theme_expansion_bonus or 0),
         "theme_breadth_ratio": float(breadth_ratio or 0.0),
+        "material_first_hint": bool(stock.get("material_first_hint") or ctx.get("material_first_hint")),
     })
 def _resolve_analyze_result_grade(signal_type: str, score: int, stock: dict, reasons: list, change_rate: float, vol_ratio: float, sector_info: dict, direct_news_hit: bool, nxt_delta: float, countertrend_ctx: dict) -> tuple[str, bool]:
     execution_setup_required = _should_require_execution_setup_from_crossday(signal_type, stock.get("crossday_ctx", {}), change_rate=change_rate, vol_ratio=vol_ratio)
@@ -20451,6 +20891,7 @@ def _build_analyze_result(ctx: dict) -> dict:
         "theme_drive_hit": bool(ctx.get("theme_drive_hit")), "adaptive_feedback_hit": bool(ctx.get("adaptive_feedback_hit")),
         "market_flow_hit": bool(ctx.get("market_flow_hit")), "market_flow_bonus": int(ctx.get("market_flow_bonus", 0) or 0),
         "sector_leader_follow_hit": bool(ctx.get("sector_leader_follow_hit")), "sector_leader_follow_bonus": ctx.get("sector_leader_follow_bonus", 0),
+        "material_scenario_hit": bool(ctx.get("material_scenario_hit")), "material_scenario_bonus": int(ctx.get("material_scenario_bonus", 0) or 0),
         "adaptive_feedback_bonus": ctx.get("adaptive_feedback_bonus", 0), "miss_theme_leader_hit": bool(ctx.get("miss_theme_leader_hit")),
         "miss_theme_leader_bonus": ctx.get("miss_theme_leader_bonus", 0), "nxt_post_leader_hit": bool(ctx.get("nxt_post_leader_hit")),
         "nxt_post_leader_bonus": ctx.get("nxt_post_leader_bonus", 0), "theme_expansion_hit": bool(ctx.get("theme_expansion_hit")),
@@ -22610,9 +23051,13 @@ def check_dart_risk(code: str) -> dict:
             },
             timeout=8
         )
+        dart_rows = []
+        result.update({"scenario_id": "", "scenario_label": "", "matched_keywords": [], "source": "", "official": False, "titles": []})
         for item in resp.json().get("list", []):
             title = item.get("report_nm", "")
             rcept_dt = str(item.get("rcept_dt", "") or "")
+            if title:
+                dart_rows.append({"title": title, "source": "DART", "rcept_dt": rcept_dt})
             # v80/v92: 거래재개/정지해제 공시는 즉시 halt 해제
             if _is_trade_resume_title(title):
                 result["is_risk"] = False
@@ -22623,17 +23068,44 @@ def check_dart_risk(code: str) -> dict:
             # v92: halt 제목은 same-day 직접 거래정지 제목만 리스크/영속 halt로 인정
             if _is_trade_halt_title(title):
                 if _should_persist_trade_halt_title(title, rcept_dt=rcept_dt):
-                    result["is_risk"] = True
-                    result["title"]   = title
-                    result["ts"] = 0   # 오늘 직접 거래정지 확정 마커
+                    result.update({
+                        "is_risk": True,
+                        "title": title,
+                        "ts": 0,
+                        "scenario_id": "listing_risk",
+                        "scenario_label": "관리/상폐/거래정지 리스크",
+                        "matched_keywords": ["거래정지"],
+                        "source": "DART",
+                        "official": True,
+                    })
                     _mark_trading_halt_state(code, title=title, source="DART")
                     break
                 # 기간변경/복합 제목/과거 이력은 내부 조회만 하고 위험 차단/영속 저장은 하지 않음
                 continue
-            if any(kw in title for kw in DART_RISK_KEYWORDS):
-                result["is_risk"] = True
-                result["title"]   = title
+            _scenario_meta = _match_material_downside_scenario_rows([{"title": title, "source": "DART"}])
+            if _scenario_meta:
+                result.update({
+                    "is_risk": True,
+                    "title": title,
+                    "scenario_id": _scenario_meta.get("scenario_id", ""),
+                    "scenario_label": _scenario_meta.get("label", "DART 리스크"),
+                    "matched_keywords": list(_scenario_meta.get("hits", []) or [])[:5],
+                    "source": "DART",
+                    "official": True,
+                })
                 break
+            if any(kw in title for kw in DART_RISK_KEYWORDS):
+                result.update({
+                    "is_risk": True,
+                    "title": title,
+                    "scenario_id": "dart_risk",
+                    "scenario_label": "DART 리스크",
+                    "matched_keywords": [kw for kw in DART_RISK_KEYWORDS if kw in title][:5],
+                    "source": "DART",
+                    "official": True,
+                })
+                break
+        result["titles"] = [str(row.get("title", "") or "") for row in dart_rows[:10]]
     except Exception as e:
         _log_warn_msg(f"  ⚠️ DART리스크체크오류 [{code}]: {e}")
     _dart_risk_cache[code] = result
@@ -24388,7 +24860,7 @@ def run_material_first_scan() -> None:
         return
     _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 재료-first 스캔{' [실시간]' if live_market else ' [장외/장전]'}...")
     try:
-        headlines = fetch_all_news()
+        headlines = _get_material_signal_headlines()
         if not headlines:
             return
         threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
@@ -24412,7 +24884,7 @@ def run_material_first_scan() -> None:
 def analyze_news_theme(headlines: list = None) -> list:
     signals = []
     if headlines is None:
-        headlines = fetch_all_news()
+        headlines = _get_material_signal_headlines()
     if not headlines:
         return []
     _log_info_msg(f"  📰 뉴스 {len(headlines)}건 ({len(DOMESTIC_NEWS_SOURCE_FUNCS)}개 소스)")
@@ -29133,6 +29605,8 @@ if __name__ == "__main__":
     ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
+    schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_material_downside_digest()))
+    schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_material_downside_digest(force=True)))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
     # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
     for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
