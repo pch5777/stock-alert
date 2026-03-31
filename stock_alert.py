@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v143
+버전: v144
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v144 (2026-03-31): run_scan code 결측 내성 강화 + intraday NXT confirm 문구 명확화 — run_scan 본류와 scan helper들이 `code` 없는 후보/신호를 만나도 즉시 중단하지 않고 건너뛰도록 정리했으며, `analyze()` 결과에 `code`가 빠진 경우 `seen_code`로 복구 후 alert pipeline에 태우도록 보강했다. 또한 malformed alert 정리 helper를 추가해 섹터/포트폴리오 필터 진입 전 `code` 결측을 제거하고, intraday NXT confirm 3회는 세션 프로파일 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override로 강제된다는 점을 changelog/문서에 명확히 남겼다.
 - v143 (2026-03-31): EARLY/NXT 지속성·섹터 breadth 실확인 강화 — 상위주 공통 생존 조건과 오전 급락 포착 종목의 공통 붕괴 조건을 함께 반영해, NXT/조기포착에서 후속 거래량·호가 지속성과 실제 섹터 breadth를 더 강하게 확인하도록 조정했다. NXT 장전은 live hoga gate를 필수로 보고, intraday NXT는 confirm 3회와 persistence gate를 적용하며, `early_guard_external_delay_reason`이 NXT 점수 예외보다 우선한다. 또한 fake breakout은 돌파 유지 실패까지 포함해 진입 차단을 보강한다.
 - v142 (2026-03-31): 하향 추세 조기포착 차단 강화 + 추세전환 예외 제한 허용 — 다중 타임프레임 하락 추세 판정을 더 보수적으로 강화하고, 일반적인 하향/비상승 구조의 EARLY_DETECT·SURGE류 포착을 더 일찍 차단하도록 조정했다. 대신 직접뉴스·강한 테마 동조·ORB/전고 돌파·quiet absorption·연속 재상승 같은 추세전환 토큰이 충분할 때만 제한적으로 예외 허용해 반전 초입 후보만 남긴다.
 - v141 (2026-03-31): 장중 포착 확대 + 약화 기반 청산/가짜 돌파 가드 — session/focus scan limit를 18/30으로 높이고 strict 최소점수를 62로 낮췄으며, KRX EARLY_DETECT 외부허용을 74점 A + 진입가 확정 + 체결/호가 확인으로 완화했다. 동시에 tracking weakness 점수로 분할익절/트레일링 정리를 앞당기고, 거래량 기준 미달 + 윗꼬리 부담 돌파는 진입 단계에서 fake breakout으로 차단한다.
@@ -28325,14 +28326,48 @@ def _build_scan_runtime_context() -> dict:
     strict_tag = " [엄격]" if is_strict_time() else ""
     mkt_tag = "KRX+NXT" if krx_open and nxt_open else ("NXT전용" if nxt_open else "KRX")
     return {"krx_open": krx_open, "nxt_open": nxt_open, "strict_tag": strict_tag, "mkt_tag": mkt_tag}
+def _normalize_scan_signal_code(payload: dict | None = None, fallback_code: str | None = None) -> str:
+    code = normalize_stock_code((payload or {}).get("code", ""))
+    if code:
+        return code
+    return normalize_stock_code(fallback_code or "")
+
+def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
+    cleaned = []
+    dropped = 0
+    for item in list(alerts or []):
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        code = _normalize_scan_signal_code(item)
+        if not code:
+            dropped += 1
+            _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
+            continue
+        if item.get("code") != code:
+            item = dict(item)
+            item["code"] = code
+        cleaned.append(item)
+    if dropped > 0:
+        _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}")
+    return cleaned
+
 def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str | None = None, seen_code: str | None = None) -> None:
-    if not result:
+    if not isinstance(result, dict):
         return
-    resolved_hist_key = hist_key or (f"NXT_{result['code']}" if result.get("market") == "NXT" else result["code"])
+    normalized_seen_code = normalize_stock_code(seen_code or "")
+    result_code = _normalize_scan_signal_code(result, fallback_code=normalized_seen_code)
+    if not result_code:
+        _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
+        return
+    if result.get("code") != result_code:
+        result = dict(result)
+        result["code"] = result_code
+    resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
     if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
         return
     alerts.append(result)
-    seen.add(seen_code or result["code"])
+    seen.add(normalized_seen_code or result_code)
 def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool) -> None:
     try:
         if not (_overnight_watchlist and krx_open):
@@ -28362,33 +28397,53 @@ def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool
 def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
     today_date = datetime.now().strftime("%Y%m%d")
     for stock in get_upper_limit_stocks():
-        _register_sector_leader_follow_seed(stock)
-        if stock["code"] in seen:
+        code = normalize_stock_code(stock.get("code", ""))
+        if not code:
+            _log_warn_msg("⚠️ run_scan upper_limit 후보 code 누락 스킵")
             continue
-        _ul_rec = _upper_limit_day_alerted.get(stock["code"])
+        stock = dict(stock)
+        stock["code"] = code
+        _register_sector_leader_follow_seed(stock)
+        if code in seen:
+            continue
+        _ul_rec = _upper_limit_day_alerted.get(code)
         if _ul_rec and _ul_rec.get("date") == today_date:
             cr = stock.get("change_rate", 0)
             if cr >= 29.0:
                 continue
-            _upper_limit_day_alerted.pop(stock["code"], None)
+            _upper_limit_day_alerted.pop(code, None)
         r = analyze(stock)
-        if r and r.get("signal_type") in ("UPPER_LIMIT", "NEAR_UPPER"):
-            _upper_limit_day_alerted[r["code"]] = {"date": today_date, "alerted": True}
-        _append_scan_alert(alerts, seen, r)
+        result_code = _normalize_scan_signal_code(r, fallback_code=code) if isinstance(r, dict) else ""
+        if isinstance(r, dict) and r.get("signal_type") in ("UPPER_LIMIT", "NEAR_UPPER") and result_code:
+            _upper_limit_day_alerted[result_code] = {"date": today_date, "alerted": True}
+        _append_scan_alert(alerts, seen, r, seen_code=code)
     for stock in get_volume_surge_stocks():
-        _register_sector_leader_follow_seed(stock)
-        if stock["code"] in seen:
+        code = normalize_stock_code(stock.get("code", ""))
+        if not code:
+            _log_warn_msg("⚠️ run_scan volume_surge 후보 code 누락 스킵")
             continue
-        _append_scan_alert(alerts, seen, analyze(stock))
+        stock = dict(stock)
+        stock["code"] = code
+        _register_sector_leader_follow_seed(stock)
+        if code in seen:
+            continue
+        _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
 def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
     for stock in get_nxt_surge_stocks():
+        code = normalize_stock_code(stock.get("code", ""))
+        if not code:
+            _log_warn_msg("⚠️ run_scan NXT 후보 code 누락 스킵")
+            continue
+        stock = dict(stock)
+        stock["code"] = code
         _register_sector_leader_follow_seed(stock)
-        if stock["code"] in seen:
+        if code in seen:
             continue
         r = analyze(stock)
-        if r:
+        if isinstance(r, dict):
             r["market"] = "NXT"
-        _append_scan_alert(alerts, seen, r, hist_key=(f"NXT_{r['code']}" if r else None), seen_code=stock["code"])
+        hist_code = _normalize_scan_signal_code(r, fallback_code=code) if isinstance(r, dict) else code
+        _append_scan_alert(alerts, seen, r, hist_key=f"NXT_{hist_code}", seen_code=code)
 def _collect_quiet_absorption_scan_pool(existing_codes: set | None = None) -> list[dict]:
     scan_limit = max(2, int(MARKET_FLOW_QUIET_SCAN_LIMIT_PER_MARKET or 2))
     pool: list[dict] = []
@@ -28456,23 +28511,46 @@ def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
 def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt_open: bool) -> None:
     if krx_open:
         for s in check_early_detection():
-            hist_key = f"NXT_{s['code']}" if s.get("market") == "NXT" else s["code"]
-            if s["code"] not in seen:
-                _append_scan_alert(alerts, seen, s, hist_key=hist_key, seen_code=s["code"])
+            code = _normalize_scan_signal_code(s)
+            if not code:
+                _log_warn_msg("⚠️ run_scan EARLY_DETECT 결과 code 누락 스킵")
+                continue
+            hist_key = f"NXT_{code}" if s.get("market") == "NXT" else code
+            if code not in seen:
+                _append_scan_alert(alerts, seen, s, hist_key=hist_key, seen_code=code)
         for s in check_pullback_signals():
-            if s["code"] not in seen and s["code"] not in _mid_pullback_alert_history:
+            code = _normalize_scan_signal_code(s)
+            if not code:
+                _log_warn_msg("⚠️ run_scan pullback 결과 code 누락 스킵")
+                continue
+            if s.get("code") != code:
+                s = dict(s)
+                s["code"] = code
+            if code not in seen and code not in _mid_pullback_alert_history:
                 alerts.append(s)
-                seen.add(s["code"])
+                seen.add(code)
     elif nxt_open:
         for s in check_nxt_intraday_early_detection(existing_codes=seen):
-            if s["code"] not in seen:
-                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{s['code']}", seen_code=s["code"])
+            code = _normalize_scan_signal_code(s)
+            if not code:
+                _log_warn_msg("⚠️ run_scan NXT intraday EARLY 결과 code 누락 스킵")
+                continue
+            if code not in seen:
+                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
         for s in check_nxt_preopen_detection(existing_codes=seen):
-            if s["code"] not in seen:
-                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{s['code']}", seen_code=s["code"])
+            code = _normalize_scan_signal_code(s)
+            if not code:
+                _log_warn_msg("⚠️ run_scan NXT preopen 결과 code 누락 스킵")
+                continue
+            if code not in seen:
+                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
         for s in check_nxt_postmarket_detection(existing_codes=seen):
-            if s["code"] not in seen:
-                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{s['code']}", seen_code=s["code"])
+            code = _normalize_scan_signal_code(s)
+            if not code:
+                _log_warn_msg("⚠️ run_scan NXT postmarket 결과 code 누락 스킵")
+                continue
+            if code not in seen:
+                _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
 def _apply_scan_sector_gate(alerts: list) -> list:
     alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
     max_signals_per_sector = 3
@@ -28529,8 +28607,11 @@ def run_scan():
         _scan_rank_and_theme_candidates(alerts, seen)
         _scan_sector_leader_follow_candidates(alerts, seen)
         _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
+        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_sector_gate")
         alerts = _apply_scan_sector_gate(alerts)
+        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
         alerts = filter_portfolio_signals(alerts)
+        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
         _dispatch_scan_alerts(alerts)
         _run_scan_followup_hooks()
     except Exception as e:
