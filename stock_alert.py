@@ -18979,7 +18979,7 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
     """
     중요도별 알림 발송
     CRITICAL / NORMAL → 즉시 발송
-    INFO              → _pending_info_alerts 대기열에 추가 (10분마다 묶음 발송)
+    INFO              → 사용자 텔레그램 발송 안 함
     """
     if level in (ALERT_LEVEL_CRITICAL, ALERT_LEVEL_NORMAL):
         if code and name:
@@ -18987,27 +18987,14 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
         else:
             send(text)
     else:  # INFO
-        _pending_info_alerts.append({"text": text, "ts": time.time()})
+        return
+
 def flush_info_alerts():
-    """INFO 알림 묶음 발송 (5분마다 스케줄) + 오래된 항목 자동 제거"""
-    if not _pending_info_alerts: return
-    now = time.time()
-    # v37.0: 슬라이스 할당으로 안전한 리스트 수정 (동시접근 경쟁 조건 제거)
-    # 1시간 이상 된 항목 제거 + 최대 20개 유지
-    fresh = [a for a in _pending_info_alerts if now - a["ts"] <= 3600][-20:]
-    # 5분 이상 된 것만 발송 대상
-    to_send = [a for a in fresh if now - a["ts"] >= 300]
-    remaining = [a for a in fresh if now - a["ts"] < 300]
-    _pending_info_alerts[:] = remaining  # 원자적 교체
-    if not to_send: return
-    if len(to_send) == 1:
-        send(to_send[0]["text"])
-    else:
-        combined = f"🟡 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
-        for a in to_send:
-            first_line = a["text"].split("\n")[0][:60]
-            combined  += f"• {first_line}\n"
-        send(combined)
+    """INFO 큐 정리만 수행 (사용자 묶음 발송 비활성)"""
+    if not _pending_info_alerts:
+        return
+    _pending_info_alerts.clear()
+
 def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     """
     신호 유형 + 점수 → 중요도 레벨 결정
