@@ -7,8 +7,7 @@
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v149 (2026-03-31): run_scan `change_rate` 결측 hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다.
-- v149 hotfix (2026-03-31): run_scan `entry_price` 결측 hotfix — run_scan 후보/신호 중 일부가 `entry_price` 없이 일반 포착 발송 단계에 들어오며 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `entry_price`·`planned_entry_price`·`execution_hint_entry_price`·`stop_loss`·`target_price`·`detected_at` 기본값도 함께 강제하고, `_finalize_general_alert_dispatch()` 역시 정리 helper를 마지막으로 한 번 더 거쳐 결측 payload가 와도 스캔 전체가 중단되지 않는다.
+- v149 (2026-03-31): run_scan 결측 필드 + KIS 만료 토큰/빈 JSON hotfix — run_scan 후보·신호 중 `change_rate`·`entry_price` 등 핵심 필드가 빠져도 일반 포착 발송 단계에서 KeyError가 나지 않도록 기본값 정규화를 보강했다. 또한 KIS 응답 `EGW00123`/`기간이 만료된 token`을 만료 토큰으로 감지해 자동 재발급 재시도를 수행하고, `safe_json_response()`·심층뉴스·한국ETF 파싱 경로는 빈/비JSON 응답을 조용히 `{}` 또는 fallback으로 처리해 JSONDecodeError 노이즈를 줄인다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -1547,19 +1546,39 @@ GEO_SECTOR_BIAS: dict = {}
 # MARKET_REGIME: 176줄에서 1회만 선언 (v38.3: 중복 제거)
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
-    """Return resp.json() safely; if invalid/empty/HTML, return {}."""
+    """Return parsed JSON safely; invalid/empty/non-JSON payloads return {} without noisy exceptions."""
     try:
         txt = (getattr(resp, "text", "") or "")
-        if not txt.strip():
+        if not txt or not txt.strip():
             return {}
-        ct = (getattr(resp, "headers", {}) or {}).get("Content-Type", "")
-        ct = (ct or "").lower()
-        if "json" not in ct and txt.lstrip().startswith("<"):
+        txt = txt.strip()
+        ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "").lower()
+        if txt.startswith("<"):
             return {}
-        return resp.json()
+        if "json" not in ct and txt[:1] not in "[{":
+            return {}
+        try:
+            return json.loads(txt)
+        except Exception as e:
+            _ = e
+            return {}
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return {}
+
+def _kis_response_has_expired_token(resp=None, payload=None) -> bool:
+    """Detect KIS expired token responses (403 or EGW00123 body) so callers can refresh and retry."""
+    try:
+        data = payload if isinstance(payload, dict) else safe_json_response(resp)
+        if not isinstance(data, dict):
+            data = {}
+        msg_cd = str(data.get("msg_cd") or data.get("error_code") or data.get("code") or "").strip()
+        msg = str(data.get("msg1") or data.get("message") or data.get("error_description") or data.get("error") or "").strip()
+        status = getattr(resp, "status_code", None)
+        return status == 403 or msg_cd == "EGW00123" or "기간이 만료된 token" in msg
+    except Exception as e:
+        _swallow_exception(e)
+        return False
 # --- HOTFIX: safe parsing helpers ---
 def safe_int(value, default=0):
     """Convert value to int safely. Handles '', '-', None, commas, floats."""
@@ -5082,20 +5101,6 @@ def _kis_http_error_body_snippet(resp) -> str:
     except Exception as e:
         _swallow_exception(e)
         return ""
-
-def _kis_response_has_expired_token(resp) -> bool:
-    try:
-        if resp is None:
-            return False
-        data = safe_json_response(resp)
-        if not isinstance(data, dict):
-            return False
-        msg_cd = str(data.get("msg_cd") or data.get("error_code") or data.get("code") or "").strip().upper()
-        msg1 = str(data.get("msg1") or data.get("message") or data.get("error_description") or data.get("error") or "").strip()
-        return msg_cd == "EGW00123" or "기간이 만료된 token" in msg1 or "expired token" in msg1.lower()
-    except Exception as e:
-        _swallow_exception(e)
-        return False
 def get_token(retry: int = 3) -> str:
     global _access_token, _token_expires
     _validate_kis_oauth_config()
@@ -5145,7 +5150,6 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
     return_meta=True → (data, status, ct, body_snippet) 4-tuple.
     return_meta=False(기본) → dict만 반환.
     """
-    global _access_token, _token_expires
     last_exc = None; last_status = None; last_ct = ""; last_body_snip = ""; last_url = url
     for attempt in range(3):
         try:
@@ -5154,24 +5158,20 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
             last_status = getattr(resp, "status_code", None)
             last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
             last_url = getattr(resp, "url", url) or url
-            if last_status == 403 or _kis_response_has_expired_token(resp):
+            payload = safe_json_response(resp)
+            if _kis_response_has_expired_token(resp, payload):
+                global _access_token, _token_expires
                 _access_token = None
                 _token_expires = 0
                 _clear_kis_token_state()
-                _wait_for_kis_rest_slot("rest")
-                resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
-                last_status = getattr(resp, "status_code", None)
-                last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
-                last_url = getattr(resp, "url", url) or url
+                if attempt < 2:
+                    try:
+                        time.sleep(0.2)
+                    except Exception as e:
+                        _swallow_exception(e)
+                    continue
             if last_status == 200:
-                data = safe_json_response(resp)
-                return (data, last_status, last_ct, "") if return_meta else data
-            if _kis_response_has_expired_token(resp):
-                _access_token = None
-                _token_expires = 0
-                _clear_kis_token_state()
-                last_exc = "expired_token_auto_refresh_failed"
-                continue
+                return (payload, last_status, last_ct, "") if return_meta else payload
             try:
                 raw = (getattr(resp, "text", "") or "").strip()
                 last_body_snip = " ".join(raw.split())[:200]
@@ -5180,11 +5180,10 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
                 last_body_snip = ""
             if return_meta:
                 break
-            j = safe_json_response(resp)
-            if isinstance(j, dict) and j:
-                msg_cd = j.get("msg_cd") or j.get("error_code") or j.get("code")
-                msg1 = j.get("msg1") or j.get("message") or j.get("error_description") or j.get("error")
-                last_exc = f"rt_cd={j.get('rt_cd')} msg_cd={msg_cd} msg={msg1}"
+            if isinstance(payload, dict) and payload:
+                msg_cd = payload.get("msg_cd") or payload.get("error_code") or payload.get("code")
+                msg1 = payload.get("msg1") or payload.get("message") or payload.get("error_description") or payload.get("error")
+                last_exc = f"rt_cd={payload.get('rt_cd')} msg_cd={msg_cd} msg={msg1}"
             else:
                 last_exc = None
         except Exception as e:
@@ -13683,7 +13682,6 @@ def save_signal_log(stock: dict):
     - 이후 track_signal_results()가 목표가·손절가 도달 여부를 자동 체크
     """
     try:
-        stock = _coerce_run_scan_signal_defaults(stock, fallback_code=(stock or {}).get("code", ""))
         data = _load_signal_log_data()
         ctx = _build_signal_log_context(stock)
         if _update_representative_signal_log_record(data, stock, ctx):
@@ -18919,7 +18917,7 @@ def update_dashboard(force: bool = False) -> None:
     except Exception as e:
         _swallow_exception(e)
     """대시보드 메시지(1개)를 편집 업데이트 — v39.4: 변동사항 있을 때만."""
-    global _LAST_DASHBOARD_TS
+    global _LAST_DASHBOARD_TS, _LAST_DASHBOARD_HASH
     now = time.time()
     if (not force) and (now - _LAST_DASHBOARD_TS) < DASHBOARD_UPDATE_EVERY_SEC:
         return
@@ -21914,9 +21912,8 @@ def _handle_general_alert_existing_entry_hit(ctx: dict) -> bool | None:
     save_signal_log(s)
     return False
 def _finalize_general_alert_dispatch(ctx: dict) -> bool:
-    s = _coerce_run_scan_signal_defaults(ctx["signal"], fallback_code=(ctx["signal"] or {}).get("code", ""))
-    ctx["signal"] = s
-    _log_info_msg(f"  ✓ {s.get('name', s.get('code', ''))}{ctx['mkt_tag']} {safe_float(s.get('change_rate', 0.0), 0.0):+.1f}% [{s.get('signal_type', '')}] {safe_int(s.get('score', 0), 0)}점 [{ctx['grade_upper']}]")
+    s = ctx["signal"]
+    _log_info_msg(f"  ✓ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{ctx['grade_upper']}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
     save_signal_log(s)
@@ -24112,7 +24109,7 @@ def analyze_news_deep(articles: list, stock_name: str, code: str = "") -> dict:
         try:
             data = json.loads(raw)
         except Exception as e:
-            _swallow_exception(e)
+            _ = e
             return _default_deep_news_result(reason="(요약 실패)")
         result = _normalize_deep_news_result(data)
         _deep_news_cache[cache_key] = result
@@ -28037,9 +28034,11 @@ def get_korea_etf_signals() -> dict:
             try:
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
                 resp = requests.get(url, timeout=8, headers=_random_ua())
-                data = resp.json()
-                meta = data["chart"]["result"][0]["meta"]
-                prev = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                data = safe_json_response(resp)
+                chart = data.get("chart", {}) if isinstance(data, dict) else {}
+                result0 = (((chart.get("result") or [None])[0]) or {}) if chart else {}
+                meta = result0.get("meta", {}) if isinstance(result0, dict) else {}
+                prev = ((((result0.get("indicators") or {}).get("quote") or [{}])[0]) or {}).get("close", [])
                 prev_close = [c for c in prev if c is not None]
                 cur_price = float(meta.get("regularMarketPrice", 0) or 0)
                 if cur_price and prev_close:
@@ -28542,10 +28541,6 @@ def filter_portfolio_signals(alerts: list) -> list:
     max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
     carry_count, carry_codes = _get_carry_position_context()
     alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
-    alerts = [
-        _coerce_run_scan_signal_defaults(a, fallback_code=(a or {}).get("code", ""))
-        for a in list(alerts or []) if isinstance(a, dict)
-    ]
     # 신규 리더 우선 + stale 눌림목 후순위 정렬
     sorted_alerts = sorted(
         alerts,
@@ -28573,33 +28568,27 @@ def filter_portfolio_signals(alerts: list) -> list:
     for i, s in enumerate(sorted_alerts):
         if len(passed) >= max_total:
             break
-        s_code = normalize_stock_code(s.get("code", ""))
-        if not s_code:
+        if s["code"] in excluded:
             continue
-        if s_code in excluded:
-            continue
-        s["code"] = s_code
         passed.append(s)
         # 아직 통과 안 된 뒤 신호들과 실질 섹터 비교
         for j in range(i + 1, len(sorted_alerts)):
             peer = sorted_alerts[j]
-            peer_code = normalize_stock_code(peer.get("code", ""))
-            if not peer_code or peer_code in excluded:
+            if peer["code"] in excluded:
                 continue
-            peer["code"] = peer_code
             try:
-                rs = calc_real_sector_score(s["code"], peer_code,
-                                            s.get("name", ""), peer.get("name", ""))
+                rs = calc_real_sector_score(s["code"], peer["code"],
+                                            s["name"], peer["name"])
                 if rs["score"] >= 50:
                     # 같은 섹터 내 max_same_sector 개수까지는 허용
                     same_sector_passed = sum(
                         1 for p in passed
-                        if calc_real_sector_score(s["code"], p.get("code", ""), s.get("name", ""), p.get("name", "")).get("score", 0) >= 50
+                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
                     )
                     _max_same = _dynamic.get("max_same_sector", 2)
                     if same_sector_passed >= _max_same:
-                        excluded.add(peer_code)
-                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer_code, peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
+                        excluded.add(peer["code"])
+                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
             except Exception as e:
                 _swallow_exception(e)
     if len(passed) < len(sorted_alerts):
@@ -28649,22 +28638,11 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
     item["score"] = safe_int(item.get("score", 0), 0)
     item["price"] = safe_int(item.get("price", 0), 0)
     item["today_vol"] = safe_int(item.get("today_vol", 0), 0)
-    item["entry_price"] = safe_int(item.get("entry_price", item.get("price", 0)), 0)
-    item["planned_entry_price"] = safe_int(item.get("planned_entry_price", item.get("entry_price", item.get("price", 0))), 0)
-    item["execution_hint_entry_price"] = safe_int(item.get("execution_hint_entry_price", item.get("entry_price", item.get("price", 0))), 0)
-    item["stop_loss"] = safe_int(item.get("stop_loss", 0), 0)
-    item["target_price"] = safe_int(item.get("target_price", 0), 0)
     item["market"] = str(item.get("market", "") or "")
     if "signal_type" not in item or item.get("signal_type") is None:
         item["signal_type"] = ""
     if "name" not in item or item.get("name") is None:
         item["name"] = ""
-    if "grade" not in item or item.get("grade") is None:
-        item["grade"] = ""
-    if not isinstance(item.get("reasons"), list):
-        item["reasons"] = list(item.get("reasons") or []) if isinstance(item.get("reasons"), (tuple, set)) else []
-    if not item.get("detected_at"):
-        item["detected_at"] = datetime.now()
     return item
 
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
