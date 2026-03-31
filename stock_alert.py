@@ -7,7 +7,7 @@
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v149 (2026-03-31): run_scan 결측 필드 + KIS 만료 토큰/빈 JSON + INFO 참고 알림 비활성 hotfix — run_scan 후보·신호 중 `change_rate`·`entry_price` 등 핵심 필드가 빠져도 일반 포착 발송 단계에서 KeyError가 나지 않도록 기본값 정규화를 보강했다. 또한 KIS 응답 `EGW00123`/`기간이 만료된 token`을 만료 토큰으로 감지해 자동 재발급 재시도를 수행하고, `safe_json_response()`·심층뉴스·한국ETF 파싱 경로는 빈/비JSON 응답을 조용히 `{}` 또는 fallback으로 처리해 JSONDecodeError 노이즈를 줄인다. 또한 중요하지 않은 INFO 참고 알림 묶음은 사용자 텔레그램으로 보내지 않는다.
+- v149 (2026-03-31): run_scan 결측 필드 + KIS 만료 토큰/빈 JSON + INFO 참고 알림 비활성 hotfix — run_scan 후보·신호 중 `change_rate`·`entry_price` 등 핵심 필드가 빠져도 일반 포착 발송 단계에서 KeyError가 나지 않도록 기본값 정규화를 보강했다. 또한 KIS 응답 `EGW00123`/`기간이 만료된 token`을 만료 토큰으로 감지해 자동 재발급 재시도를 수행하고, `safe_json_response()`·심층뉴스·한국ETF 파싱 경로는 빈/비JSON 응답을 조용히 `{}` 또는 fallback으로 처리해 JSONDecodeError 노이즈를 줄인다. 또한 중요하지 않은 INFO 참고 알림 묶음은 사용자 텔레그램으로 보내지 않고, 큐 적재/flush 스케줄도 비활성화한다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -18979,21 +18979,31 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
     """
     중요도별 알림 발송
     CRITICAL / NORMAL → 즉시 발송
-    INFO              → 사용자 텔레그램 발송 안 함
+    INFO              → 사용자 텔레그램 발송 완전 차단
     """
+    if level == ALERT_LEVEL_INFO:
+        try:
+            _pending_info_alerts.clear()
+        except Exception as exc:
+            _swallow_exception(exc, "send_by_level.info_clear")
+        return
+
     if level in (ALERT_LEVEL_CRITICAL, ALERT_LEVEL_NORMAL):
         if code and name:
             send_with_chart_buttons(text, code, name)
         else:
             send(text)
-    else:  # INFO
         return
 
+    return
+
 def flush_info_alerts():
-    """INFO 큐 정리만 수행 (사용자 묶음 발송 비활성)"""
-    if not _pending_info_alerts:
-        return
-    _pending_info_alerts.clear()
+    """INFO 큐 폐기만 수행 (사용자 묶음 발송 완전 비활성)"""
+    try:
+        _pending_info_alerts.clear()
+    except Exception as exc:
+        _swallow_exception(exc, "flush_info_alerts.clear")
+    return
 
 def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     """
@@ -29078,7 +29088,7 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
-    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))
+    # INFO 참고 알림 묶음 스케줄 비활성
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
     schedule.every().day.at("05:00").do(reset_daily_caches)  # [v41.84]
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))
