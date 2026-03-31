@@ -18919,7 +18919,7 @@ def update_dashboard(force: bool = False) -> None:
     except Exception as e:
         _swallow_exception(e)
     """대시보드 메시지(1개)를 편집 업데이트 — v39.4: 변동사항 있을 때만."""
-    global _LAST_DASHBOARD_TS, _LAST_DASHBOARD_HASH
+    global _LAST_DASHBOARD_TS
     now = time.time()
     if (not force) and (now - _LAST_DASHBOARD_TS) < DASHBOARD_UPDATE_EVERY_SEC:
         return
