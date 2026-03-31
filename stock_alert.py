@@ -7,7 +7,7 @@
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v149 (2026-03-31): run_scan `change_rate` 결측 hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다.
+- v149 (2026-03-31): run_scan 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
 - v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
@@ -1706,17 +1706,63 @@ print = _runtime_print
 # requests 직접 호출 기본 timeout/로그 일관화
 _REQUESTS_GET_RAW = requests.get
 _REQUESTS_POST_RAW = requests.post
+def _is_connection_reset_request_error(exc: Exception) -> bool:
+    try:
+        if exc is None:
+            return False
+        stack = [exc]
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur is None:
+                continue
+            obj_id = id(cur)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            if isinstance(cur, ConnectionResetError):
+                return True
+            msg = str(cur)
+            if "Connection reset by peer" in msg or "Connection aborted" in msg:
+                return True
+            for child in (getattr(cur, "__cause__", None), getattr(cur, "__context__", None)):
+                if child is not None:
+                    stack.append(child)
+            args = getattr(cur, "args", ())
+            if isinstance(args, tuple):
+                for item in args:
+                    if isinstance(item, BaseException):
+                        stack.append(item)
+                    elif isinstance(item, str) and "Connection reset by peer" in item:
+                        return True
+        return False
+    except Exception as inner_exc:
+        _swallow_exception(inner_exc)
+        return False
 def _requests_get_with_defaults(*args, **kwargs):
     kwargs.setdefault("timeout", (5, 15))
     url = str(args[0]) if args else str(kwargs.get("url", "") or "")
+    connection_reset_retry = int(kwargs.pop("_connection_reset_retry", 0) or 0)
     try:
         return _REQUESTS_GET_RAW(*args, **kwargs)
     except Exception as e:
-        if "api.telegram.org" in url and isinstance(e, requests.exceptions.Timeout):
+        is_telegram_timeout = "api.telegram.org" in url and isinstance(e, requests.exceptions.Timeout)
+        is_connection_reset = _is_connection_reset_request_error(e)
+        if is_telegram_timeout:
             _warn_throttled_once("telegram_api_timeout", f"⚠️ 텔레그램 API timeout → 다음 루프로 이월 ({type(e).__name__})", cooldown_sec=600.0)
+        elif is_connection_reset:
+            retry_key = f"requests_get_connection_reset:{url.split('?')[0][:120]}"
+            if connection_reset_retry < 1:
+                _warn_throttled_once(retry_key, f"⚠️ requests.get 연결 재설정 감지 → 1회 재시도 ({url.split('?')[0][:120]})", cooldown_sec=300.0)
+                time.sleep(0.35)
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["_connection_reset_retry"] = connection_reset_retry + 1
+                return _requests_get_with_defaults(*args, **retry_kwargs)
+            _warn_throttled_once(f"{retry_key}:giveup", f"⚠️ requests.get 연결 재설정 지속 → 이번 루프는 건너뜀 ({url.split('?')[0][:120]})", cooldown_sec=300.0)
         else:
             _swallow_exception(e, note="requests.get", level=logging.ERROR)
         raise
+
 def _requests_post_with_defaults(*args, **kwargs):
     kwargs.setdefault("timeout", (5, 15))
     try:
