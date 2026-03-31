@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v147
+버전: v148
 날짜: 2026-03-31
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v148 (2026-03-31): KRX 선진입 후보 catch-up NameError hotfix — `_collect_next_open_gap_candidate_codes()` 내부에서 gap 전용 helper 이름과 carry/signal_log 수집 경로가 어긋나던 문제를 바로잡아, `_push_watch_code` 미정의로 KRX 선진입 후보 catch-up이 중단되던 오류를 제거했다. 같은 함수의 pool 수집이 끝까지 진행되도록 정리해 장후반 선진입 후보 점검이 다시 정상 동작한다.
 - v147 (2026-03-31): material prewatch 품질·중복·우선순위 보강 — material prewatch seed를 headline/반응 품질 점수로 거르고, 종목 단위 cooldown을 추가해 material-first와 price-first 사이의 중복 알림을 더 줄였다. 또한 active issue prewatch 후보는 breadth·seed 품질을 함께 확인한 뒤 본 스캔에 합류시키고, `material_first_priority_hit`를 sector gate 정렬에 반영해 실제 재료형 상위주가 같은 섹터 내에서 덜 밀리도록 조정했다.
 - v146 (2026-03-31): 재료-first 독립 감시 파이프라인 추가 + material prewatch 후보를 본 스캔에 조기 합류 — 기존 `run_news_scan()`의 장중 전용 흐름을 `run_material_first_scan()`으로 확장해, 장중에는 뉴스/이슈 테마를 즉시 분석·발송하고 장마감 뒤·장전에는 관련 테마를 prewatch seed로 등록해 다음 실시간 구간까지 유지하도록 바꿨다. 또한 active issue prewatch 후보를 `run_scan()` 본류 초반에 별도 스캔해 가격-first 후보와 마지막 단계에서 합류시키고, 관련 스케줄도 price-first / material-first 두 파이프라인으로 분리했다.
 - v145 (2026-03-31): 포착 후 탈락 종료 안내 + 텔레그램 포착 모니터 메뉴 추가 — 진입 전 `근거약화_신호강도약함`·`근거약화_거래량폭락`으로 감시에서 탈락한 종목은 사용자에게 `감시 종료 — 재포착 전 신규 진입 보류` 안내를 즉시 발송하도록 보강했다. 또한 `/watch` 명령과 메뉴 버튼을 추가해 `_entry_watch`에 남아 있는 현재 포착 모니터링 종목만 따로 조회할 수 있게 했고, intraday NXT confirm 3회는 세션 프로파일 표 값이 아니라 `EARLY_NXT_CONFIRM_COUNT=3` override가 최종 적용된다는 표현을 문서에도 유지했다.
@@ -8716,10 +8717,10 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
         carry = _read_json_safe(_state_path("carry_stocks.json"), {})
         if isinstance(carry, dict):
             for k in carry.keys():
-                _push_watch_code(k)
+                _push_gap_code(k)
         elif isinstance(carry, list):
             for item in carry:
-                _push_watch_code(item.get("code") if isinstance(item, dict) else item)
+                _push_gap_code(item.get("code") if isinstance(item, dict) else item)
     except Exception as e:
         _swallow_exception(e)
     siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
@@ -8731,7 +8732,7 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
         recs = []
     recs.sort(key=lambda r: f"{r.get('detect_date','')}{r.get('detect_time','')}", reverse=True)
     for rec in recs[:300]:
-        _push_watch_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
+        _push_gap_code(rec.get("code") or rec.get("stock_code") or rec.get("종목코드"))
         if len(codes) >= max_codes:
             break
     if len(codes) < max_codes:
