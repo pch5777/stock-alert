@@ -10055,6 +10055,7 @@ def _should_skip_mid_pullback_entry(signal: dict) -> bool:
     _log_suppressed_alert(signal["code"], signal["name"], f"눌림목 진입 신호 차단 ({blocked_reason})", signal.get("signal_type", ""), {"entry_price": entry, "blocked_price": live_price, "change_rate": (live or {}).get("change_rate", 0), "ask_qty": (live or {}).get("ask_qty", 0), "bid_qty": (live or {}).get("bid_qty", 0), "internal_watch_kept": bool(kept_internal)})
     return True
 def _handle_mid_pullback_internal_paths(signal: dict) -> bool:
+    signal = _coerce_run_scan_signal_defaults(signal, fallback_code=signal.get("code"))
     tag = "[장중돌파]" if signal.get("is_intraday") else "[일봉]"
     if _should_suppress_mid_pullback_c_alert(signal):
         _log_suppressed_alert(signal["code"], signal["name"], "눌림목 C등급 실알림 억제", signal.get("signal_type", ""), {"score": signal.get("score", 0), "grade": signal.get("grade", ""), "resurge_mode": bool(signal.get("resurge_mode")), "direct_news_hit": bool(signal.get("direct_news_hit")), "entry_price": signal.get("entry_price", 0)})
@@ -10062,30 +10063,33 @@ def _handle_mid_pullback_internal_paths(signal: dict) -> bool:
         if not promoted:
             save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal['name']} [{signal['grade']}등급] {signal['score']}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
+        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
         return True
     if not _should_send_external_grade_alert(signal):
-        logged = _record_internal_only_alert(signal["code"], signal, f"눌림목 {str(signal.get('grade', 'C')).upper()}등급 외부알림 억제(A전용)")
-        promoted = _promote_internal_capture_watch(signal, hist_key=signal["code"], source_label="눌림목", reason=f"{str(signal.get('grade', 'C')).upper()}등급 near-A/체결 확증")
+        grade = str(signal.get('grade', 'C')).upper()
+        logged = _record_internal_only_alert(signal["code"], signal, f"눌림목 {grade}등급 외부알림 억제(A전용)")
+        promoted = _promote_internal_capture_watch(signal, hist_key=signal["code"], source_label="눌림목", reason=f"{grade}등급 near-A/체결 확증")
         if logged and not promoted:
             save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal['name']} [{signal['grade']}등급] {signal['score']}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
+        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
         return True
     _, existing_hit_watch = _find_existing_entry_hit_watch(signal.get("code", ""))
     if existing_hit_watch is not None:
         save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal['name']} — 기존 entry_hit 유지, 외부알림 생략")
+        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} — 기존 entry_hit 유지, 외부알림 생략")
         return True
     return False
 def _dispatch_mid_pullback_signal(signal: dict) -> None:
+    signal = _coerce_run_scan_signal_defaults(signal, fallback_code=signal.get("code"))
     if is_scoring_only_instrument(signal.get("code", ""), signal.get("name", "")):
         _log_info_msg(f"  ⏭ 점수전용 종목 제외: {signal.get('name', signal.get('code', ''))}")
         return
     signal = _apply_execution_speed_to_signal(signal)
     if str(signal.get("grade") or "").upper() == "C":
         signal = _enrich_mid_pullback_direct_news(signal)
+    signal = _coerce_run_scan_signal_defaults(signal, fallback_code=signal.get("code"))
     if _should_skip_mid_pullback_entry(signal):
         return
     if _handle_mid_pullback_internal_paths(signal):
@@ -10103,7 +10107,7 @@ def _dispatch_mid_pullback_signal(signal: dict) -> None:
         start_sector_monitor(signal["code"], signal["name"], signal.get("signal_type", ""), signal.get("detect_time", ""), True, alert_snapshot=retry_snap)
     _record_mid_pullback_alert_state(signal)
     tag = "[장중돌파]" if signal.get("is_intraday") else "[일봉]"
-    _log_info_msg(f"  ✓ 눌림목 {tag}: {signal['name']} [{signal['grade']}등급] {signal['score']}점")
+    _log_info_msg(f"  ✓ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점")
 def run_mid_pullback_scan():
     """90초마다 전체 후보군 눌림목 체크"""
     krx_open = is_market_open()
@@ -16378,14 +16382,19 @@ def _signal_age_minutes_for_retry(s: dict | None) -> int:
     if isinstance(detected_at, datetime):
         return max(0, minutes_since(detected_at))
     if isinstance(detected_at, str):
+        detected_at = detected_at.strip()
+        if not detected_at:
+            return 10**9
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S"):
             try:
                 parsed = datetime.strptime(detected_at, fmt)
                 if fmt == "%H:%M:%S":
                     parsed = datetime.now().replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
                 return max(0, int((datetime.now() - parsed).total_seconds() // 60))
+            except ValueError:
+                continue
             except Exception as e:
-                _swallow_exception(e)  # v105 structured silent-exception log
+                _swallow_exception(e)
                 continue
     return 10**9
 def _latest_entry_watch_by_code(code: str) -> dict | None:
@@ -18959,35 +18968,24 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
     """
     중요도별 알림 발송
     CRITICAL / NORMAL → 즉시 발송
-    INFO              → _pending_info_alerts 대기열에 추가 (10분마다 묶음 발송)
+    INFO              → 사용자 발송 안 함
     """
-    if level in (ALERT_LEVEL_CRITICAL, ALERT_LEVEL_NORMAL):
-        if code and name:
-            send_with_chart_buttons(text, code, name)
-        else:
-            send(text)
-    else:  # INFO
-        _pending_info_alerts.append({"text": text, "ts": time.time()})
-def flush_info_alerts():
-    """INFO 알림 묶음 발송 (5분마다 스케줄) + 오래된 항목 자동 제거"""
-    if not _pending_info_alerts: return
-    now = time.time()
-    # v37.0: 슬라이스 할당으로 안전한 리스트 수정 (동시접근 경쟁 조건 제거)
-    # 1시간 이상 된 항목 제거 + 최대 20개 유지
-    fresh = [a for a in _pending_info_alerts if now - a["ts"] <= 3600][-20:]
-    # 5분 이상 된 것만 발송 대상
-    to_send = [a for a in fresh if now - a["ts"] >= 300]
-    remaining = [a for a in fresh if now - a["ts"] < 300]
-    _pending_info_alerts[:] = remaining  # 원자적 교체
-    if not to_send: return
-    if len(to_send) == 1:
-        send(to_send[0]["text"])
+    if level == ALERT_LEVEL_INFO:
+        try:
+            _pending_info_alerts.clear()
+        except Exception as e:
+            _swallow_exception(e)
+        return
+    if code and name:
+        send_with_chart_buttons(text, code, name)
     else:
-        combined = f"🟡 <b>참고 알림 묶음</b>  {len(to_send)}건\n━━━━━━━━━━━━━━━\n"
-        for a in to_send:
-            first_line = a["text"].split("\n")[0][:60]
-            combined  += f"• {first_line}\n"
-        send(combined)
+        send(text)
+def flush_info_alerts():
+    """INFO 알림은 사용자 발송 없이 큐만 정리"""
+    try:
+        _pending_info_alerts.clear()
+    except Exception as e:
+        _swallow_exception(e)
 def get_alert_level(signal_type: str, score: int, nxt_delta: int = 0) -> str:
     """
     신호 유형 + 점수 → 중요도 레벨 결정
@@ -21663,6 +21661,7 @@ def _persist_blocked_capture_watch(signal: dict, source_label: str = "", blocked
 def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict | None:
     if not isinstance(s, dict) or not s.get("code"):
         return None
+    s = _coerce_run_scan_signal_defaults(s, fallback_code=s.get("code"))
     if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
         _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
         return None
@@ -21670,6 +21669,7 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
     resolved_hist_key = hist_key or (f"NXT_{s['code']}" if is_nxt else s["code"])
     mkt_tag = " 🟡NXT" if is_nxt else ""
     s = _apply_execution_speed_to_signal(s)
+    s = _coerce_run_scan_signal_defaults(s, fallback_code=s.get("code"))
     live = _get_live_quote_for_signal(s)
     live_price = safe_int((live or {}).get("price", s.get("price", 0)), 0)
     entry = safe_int(s.get("entry_price", 0), 0)
@@ -21892,46 +21892,47 @@ def _handle_general_alert_existing_entry_hit(ctx: dict) -> bool | None:
     save_signal_log(s)
     return False
 def _finalize_general_alert_dispatch(ctx: dict) -> bool:
-    s = ctx["signal"]
-    _log_info_msg(f"  ✓ {s['name']}{ctx['mkt_tag']} {s['change_rate']:+.1f}% [{s['signal_type']}] {s['score']}점 [{ctx['grade_upper']}]")
+    s = _coerce_run_scan_signal_defaults(ctx.get("signal"), fallback_code=(ctx.get("signal") or {}).get("code"))
+    ctx["signal"] = s
+    name = s.get("name", s.get("code", ""))
+    code = s.get("code", "")
+    signal_type = s.get("signal_type", "")
+    grade_upper = str(ctx.get("grade_upper") or s.get("execution_grade") or s.get("grade") or "C").upper()
+    _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
     save_signal_log(s)
-    if s.get("signal_type") == "EARLY_DETECT":
+    if signal_type == "EARLY_DETECT":
         save_early_detect(s)
     register_entry_watch(s)
     register_top_signal(s)
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
         sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
         sector_retry_snap["_alert_sender"] = "send_alert"
-        start_sector_monitor(s["code"], s["name"], s.get("signal_type", ""), s.get("detect_time", ""), True, alert_snapshot=sector_retry_snap)
+        start_sector_monitor(code, name, signal_type, s.get("detect_time", ""), True, alert_snapshot=sector_retry_snap)
     try:
-        threading.Thread(target=auto_update_theme, args=(s["code"], s["name"], s["signal_type"]), daemon=True).start()
+        threading.Thread(target=auto_update_theme, args=(code, name, signal_type), daemon=True).start()
     except Exception as e:
         _swallow_exception(e)
     try:
-        if s.get("change_rate", 0) >= 5.0:
+        if safe_float(s.get("change_rate", 0), 0.0) >= 5.0:
             news_titles = [r for r in s.get("reasons", []) if isinstance(r, str)]
-            threading.Thread(
-                target=_discover_new_theme_from_surge,
-                args=(s["code"], s["name"], news_titles, s.get("change_rate", 0)),
-                daemon=True,
-            ).start()
+            threading.Thread(target=_discover_new_theme_from_surge, args=(code, name, news_titles, safe_float(s.get("change_rate", 0), 0.0)), daemon=True).start()
     except Exception as e:
         _swallow_exception(e)
-    if s.get("signal_type") != "ENTRY_POINT":
-        if s["code"] not in _detected_stocks:
-            _detected_stocks[s["code"]] = {
-                "name": s["name"],
-                "high_price": s["price"],
-                "entry_price": s["entry_price"],
-                "stop_loss": s["stop_loss"],
-                "target_price": s["target_price"],
-                "detected_at": s["detected_at"],
+    if signal_type != "ENTRY_POINT" and code:
+        if code not in _detected_stocks:
+            _detected_stocks[code] = {
+                "name": name,
+                "high_price": safe_int(s.get("price", 0), 0),
+                "entry_price": safe_int(s.get("entry_price", 0), 0),
+                "stop_loss": safe_int(s.get("stop_loss", 0), 0),
+                "target_price": safe_int(s.get("target_price", 0), 0),
+                "detected_at": s.get("detected_at", datetime.now()),
                 "carry_day": 0,
             }
-        elif s.get("price", 0) > _detected_stocks[s["code"]].get("high_price", 0):
-            _detected_stocks[s["code"]]["high_price"] = s["price"]
+        elif safe_int(s.get("price", 0), 0) > safe_int(_detected_stocks[code].get("high_price", 0), 0):
+            _detected_stocks[code]["high_price"] = safe_int(s.get("price", 0), 0)
     return True
 def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_label: str = "일반 포착") -> bool:
     ctx = _build_general_alert_dispatch_context(s, hist_key)
@@ -28616,13 +28617,23 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
     item["score"] = safe_int(item.get("score", 0), 0)
     item["price"] = safe_int(item.get("price", 0), 0)
     item["today_vol"] = safe_int(item.get("today_vol", 0), 0)
+    item["entry_price"] = safe_int(item.get("entry_price", 0), 0)
+    item["planned_entry_price"] = safe_int(item.get("planned_entry_price", item.get("entry_price", 0)), 0)
+    item["execution_hint_entry_price"] = safe_int(item.get("execution_hint_entry_price", 0), 0)
+    item["stop_loss"] = safe_int(item.get("stop_loss", 0), 0)
+    item["target_price"] = safe_int(item.get("target_price", 0), 0)
     item["market"] = str(item.get("market", "") or "")
+    item["grade"] = str(item.get("execution_grade") or item.get("grade") or "C").upper()
+    item["execution_grade"] = str(item.get("execution_grade") or item.get("grade") or item["grade"] or "C").upper()
     if "signal_type" not in item or item.get("signal_type") is None:
         item["signal_type"] = ""
     if "name" not in item or item.get("name") is None:
         item["name"] = ""
+    if "reasons" not in item or not isinstance(item.get("reasons"), list):
+        item["reasons"] = list(item.get("reasons") or []) if item.get("reasons") else []
+    if "detected_at" not in item or item.get("detected_at") in (None, ""):
+        item["detected_at"] = datetime.now()
     return item
-
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     cleaned = []
     dropped = 0
@@ -29057,7 +29068,7 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
-    schedule.every(INFO_FLUSH_INTERVAL).seconds.do(_leader_job(flush_info_alerts))
+    # INFO 참고 알림은 사용자 발송하지 않음
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
     schedule.every().day.at("05:00").do(reset_daily_caches)  # [v41.84]
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))
