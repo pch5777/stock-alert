@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v158
+버전: v159
 날짜: 2026-04-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v159 (2026-04-01): NXT 진입감시 거래량 급감 종료 완화 — `_check_entry_watch_strength_guard()`에 NXT 전용 거래량 guard profile을 추가해 장전/장후 NXT는 정규장보다 더 낮은 거래량 폭락 기준과 더 긴 유예시간·재확인 횟수를 적용한다. 특히 NXT 장후 후반은 포착 대비 거래량이 더 크게 줄어도 즉시 `감시 종료 — 재포착 전 신규 진입 보류`로 자르지 않도록 조정하고, direct/theme-chain 재료형 후보에는 추가 유예를 부여해 NXT 저유동성 특성을 감안한 뒤 종료 판단하게 맞춘다.
 - v158 (2026-04-01): v152~v156 핵심 변경 복구 통합 + SURGE/테마체인/추적 결과 정상화 — 누락됐던 테마체인 직승격/실행형 진입가 보완, 즉시 1차 진입가 도달 helper, trailing_active 5일 시간초과 제외, 추적 결과 MFE 표시 및 종료 라벨 공통 저장을 다시 합쳤다. 또한 뉴스테마/이슈 선감지 상위 반응 종목이 `뉴스테마 A급 미달`로만 묻히지 않도록 direct 승격 경로를 복구하고, 일반 포착은 현재가≤진입가일 때 헤더에 `+ 1차 진입가 도달`을 반영한 뒤 같은 루프에서 즉시 phase1 진입가 도달을 시도한다.
 - v157 (2026-04-01): 시장 주도 섹터 datetime timezone hotfix — `_parse_compact_datetime(value, time_value=None)`가 날짜/시간 분리 입력을 함께 파싱하도록 확장하고, `_has_recent_actionable_tracking_state()`가 KST aware 기준 시각과 naive/aware 후보 시각을 같은 기준으로 정렬해 `send_market_leading_sector_update` 경로의 `can't subtract offset-naive and offset-aware datetimes` 오류를 제거했다. 같은 보정으로 carry/tracking datetime 파싱도 안전하게 처리한다.
 - v156 (2026-04-01): 매우강함·강함 뉴스테마/이슈 종목 direct 승격 + 시장 주도 섹터 TypeError hotfix — 뉴스테마/이슈 선감지의 상위 반응 종목을 `_should_force_theme_chain_direct()` / `_build_theme_chain_direct_candidate()`로 직접 승격하고, direct 승격 종목은 현재가 기준 실행형 진입가·손절가·목표가와 `force_external_capture_alert`를 함께 세팅해 실제 종목 외부알림으로 바로 연결되도록 보강했다. 동시에 `_parse_compact_datetime(value, time_value)` 확장으로 `send_market_leading_sector_update` 인자 불일치 TypeError를 제거했다.
@@ -19457,6 +19458,28 @@ def _handle_entry_watch_reference_reach(watch: dict, price: int, entry: int, ref
         {"entry_price": entry, "reference_price": int(price or 0), "market": "NXT"}
     )
     return True
+def _get_entry_watch_volume_guard_profile(watch: dict, use_nxt: bool) -> dict:
+    profile = {
+        "drop_ratio": 0.50,
+        "pre_entry_grace_sec": 60.0,
+        "min_observe_count": 2,
+    }
+    if use_nxt:
+        slot = _get_nxt_time_slot()
+        if slot == "post_late":
+            profile.update({"drop_ratio": 0.22, "pre_entry_grace_sec": 240.0, "min_observe_count": 4})
+        elif slot == "post_early":
+            profile.update({"drop_ratio": 0.28, "pre_entry_grace_sec": 180.0, "min_observe_count": 3})
+        elif slot == "pre":
+            profile.update({"drop_ratio": 0.30, "pre_entry_grace_sec": 180.0, "min_observe_count": 3})
+        else:
+            profile.update({"drop_ratio": 0.35, "pre_entry_grace_sec": 120.0, "min_observe_count": 3})
+        if watch.get("theme_chain_force_hit") or watch.get("theme_chain_capture_hit") or watch.get("direct_news_hit"):
+            profile["drop_ratio"] = max(0.15, float(profile["drop_ratio"]) * 0.85)
+            profile["pre_entry_grace_sec"] = float(profile["pre_entry_grace_sec"]) + 60.0
+            profile["min_observe_count"] = int(profile["min_observe_count"]) + 1
+    return profile
+
 def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry: int, use_nxt: bool) -> tuple[bool, bool, tuple | None]:
     changed = False
     entry_exec_metrics = get_execution_speed_metrics(watch["code"], current_price=price)
@@ -19470,11 +19493,14 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
     except Exception as e:
         _swallow_exception(e)
         age_sec = 0.0
-    pre_entry_grace = (not watch.get("entry_hit")) and age_sec < 60.0
+    volume_guard = _get_entry_watch_volume_guard_profile(watch, use_nxt)
+    pre_entry_grace = (not watch.get("entry_hit")) and age_sec < float(volume_guard.get("pre_entry_grace_sec", 60.0) or 60.0)
+    min_observe_count = int(volume_guard.get("min_observe_count", 2) or 2)
+    volume_drop_ratio = float(volume_guard.get("drop_ratio", 0.50) or 0.50)
     observe_count = int(watch.get("strength_guard_observe_count", 0) or 0) + 1
     watch["strength_guard_observe_count"] = observe_count
     if strength_now == "약한":
-        if pre_entry_grace or observe_count < 2:
+        if pre_entry_grace or observe_count < min_observe_count:
             watch["strength_guard_pending_reason"] = "근거약화_신호강도약함"
             watch["strength_guard_pending_price"] = int(price or 0)
             watch["strength_guard_pending_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -19486,9 +19512,9 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
         _notify_entry_watch_terminated(watch, "근거약화_신호강도약함", price, detail="포착 당시 근거가 약해져 지금은 다시 볼 필요가 없습니다.")
         _record_entry_dropped(watch, "근거약화_신호강도약함", price)
         return True, changed, ("근거약화_신호강도약함", "근거탈락")
-    if vol_at_detect > 0 and vol_now < vol_at_detect * 0.5:
+    if vol_at_detect > 0 and vol_now < vol_at_detect * volume_drop_ratio:
         ratio = (vol_now / vol_at_detect) if vol_at_detect else 0.0
-        if pre_entry_grace or observe_count < 2:
+        if pre_entry_grace or observe_count < min_observe_count:
             watch["strength_guard_pending_reason"] = "근거약화_거래량폭락"
             watch["strength_guard_pending_ratio"] = float(ratio)
             watch["strength_guard_pending_price"] = int(price or 0)
