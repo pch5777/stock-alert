@@ -3,11 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v156
-날짜: 2026-03-31
+버전: v157
+날짜: 2026-04-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v156 (2026-04-01): 강한 뉴스테마/이슈 종목 direct 승격 + 시장 주도 섹터 datetime hotfix — `send_news_theme_alert()`와 `_dispatch_issue_prewatch_reacted()`가 매우강함/강함 테마의 상위 반응 종목을 `A` 실행형 후보로 직접 승격하도록 `_should_force_theme_chain_direct()`와 `_build_theme_chain_direct_candidate()`를 추가했다. 이 direct 후보는 현재가 기준 진입가·손절가·목표가를 즉시 보완하고 `force_external_capture_alert`/`theme_chain_force_hit`/`direct_news_hit`를 함께 세팅해 마지막 외부알림 게이트를 실제로 통과시키도록 조정했다. 또한 `send_market_leading_sector_update` 반복 오류의 원인이던 `_parse_compact_datetime()`를 날짜+시간 2인자 입력까지 파싱하도록 확장해 시장 주도 섹터 업데이트 TypeError를 제거했다.
+- v157 (2026-04-01): 시장 주도 섹터 datetime timezone hotfix — `_parse_compact_datetime(value, time_value=None)`가 날짜/시간 분리 입력을 함께 파싱하도록 확장하고, `_has_recent_actionable_tracking_state()`가 KST aware 기준 시각과 naive/aware 후보 시각을 같은 기준으로 정렬해 `send_market_leading_sector_update` 경로의 `can't subtract offset-naive and offset-aware datetimes` 오류를 제거했다. 같은 보정으로 carry/tracking datetime 파싱도 안전하게 처리한다.
 - v151 (2026-04-01): 24시간 시나리오 수집 + 장후/장전 액션보드 연결 — 미국장·미국 이슈·환율·금리·유가·지정학·뉴스/옵션형 유튜브를 공통 시나리오 객체로 묶는 `collect_market_scenarios_24h()`와 `run_market_scenario_collection_cycle()`를 추가했다. 각 재료는 이벤트명·방향·원인·한국 상방/하방 섹터·한국 종목 후보까지 내려와 `premarket_action_board`와 `overnight_watchlist`를 동시에 갱신하고, 재료-first headline 입력에도 같은 시나리오 행을 주입한다. 또한 15:45/20:10 장후 알림은 하방 차단 요약에 더해 상·하방 핵심 시나리오와 한국 후보를 함께 보내고, 07:30/08:50 장전 알림은 기존 단순 워치리스트 대신 액션형 시나리오 보드 중심으로 재구성했으며, 본스캔에도 상방 시나리오 후보를 직접 우선 편입한다.
 - v150 (2026-03-31): 상방/하방 재료 시나리오 강화 + 하방 재료 전구간 차단/알림 — 재료 엔진이 직접뉴스·테마동조·섹터확산·market flow·material-first 선감지가 겹칠수록 추가 가점을 더 크게 주도록 `재료 시나리오 결속` 보너스를 도입했다. 동시에 감사보고서 제출기한 연장신고/지연·감사의견·관리/상장폐지/거래정지·횡령/배임·회생류 하방 재료를 DART/뉴스/옵션형 유튜브 최근성 감시에서 시나리오로 묶어 후보 부트스트랩과 최종 진입 필터 양쪽에서 즉시 차단하고, 이미 걸린 entry/reentry/execution/preclose 감시도 `하방재료차단`으로 정리하며 즉시 알림과 장마감 묶음 요약을 함께 남기도록 확장했다.
 - v149 (2026-03-31): run_scan `change_rate` 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
@@ -8831,41 +8831,49 @@ def _is_orphan_carry_snapshot(info: dict | None) -> bool:
     )
 def _parse_compact_datetime(value, time_value=None) -> datetime | None:
     if isinstance(value, datetime):
-        return value
-    raw_value = str(value or "").strip()
-    raw_time = str(time_value or "").strip()
-    if raw_value and raw_time:
-        date_candidates = [raw_value]
-        if raw_value.isdigit() and len(raw_value) == 8:
-            date_candidates.append(f"{raw_value[:4]}-{raw_value[4:6]}-{raw_value[6:]}")
-        time_candidates = [raw_time]
-        time_digits = re.sub(r"[^0-9]", "", raw_time)
-        if time_digits:
-            if len(time_digits) >= 6:
-                hhmmss = f"{time_digits[:2]}:{time_digits[2:4]}:{time_digits[4:6]}"
-                time_candidates.append(hhmmss)
-            elif len(time_digits) == 4:
-                hhmm = f"{time_digits[:2]}:{time_digits[2:4]}"
-                time_candidates.append(hhmm)
-        for d_val in date_candidates:
-            for t_val in time_candidates:
-                combo = f"{d_val} {t_val}".strip()
-                for fmt in ("%Y%m%d %H%M%S", "%Y%m%d %H:%M:%S", "%Y%m%d %H%M", "%Y%m%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-                    try:
-                        return datetime.strptime(combo, fmt)
-                    except Exception as e:
-                        _swallow_exception(e)
-                        continue
-    value = raw_value
-    if not value:
-        return None
-    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value, fmt)
-        except Exception as e:
-            _swallow_exception(e)  # v105 structured silent-exception log
-            continue
-    return None
+        dt = value
+    else:
+        value = str(value or "").strip()
+        time_value = str(time_value or "").strip()
+        if not value and not time_value:
+            return None
+        raw_candidates = []
+        if value and time_value:
+            raw_candidates.extend([
+                f"{value}{time_value.replace(':', '')}",
+                f"{value} {time_value}",
+            ])
+        if value:
+            raw_candidates.append(value)
+        for raw in raw_candidates:
+            raw = str(raw or "").strip()
+            if not raw:
+                continue
+            for fmt in (
+                "%Y%m%d%H%M%S",
+                "%Y%m%d%H%M",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y%m%d",
+                "%Y-%m-%d",
+            ):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    break
+                except Exception as e:
+                    _swallow_exception(e)  # v105 structured silent-exception log
+                    dt = None
+            if dt is not None:
+                break
+        else:
+            return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_KST)
+    try:
+        return dt.astimezone(_KST)
+    except Exception as e:
+        _swallow_exception(e)
+        return dt
 def _build_latest_tracking_by_code(data: dict | None = None) -> dict[str, dict]:
     latest_by_code = {}
     latest_key_by_code = {}
@@ -8889,7 +8897,7 @@ def _is_active_carry_snapshot(info: dict | None, latest_rec: dict | None = None,
     detected_at = _parse_compact_datetime(info.get("detected_at"))
     if detected_at is not None:
         stale_days = max(MAX_CARRY_DAYS + 1, TRACK_MAX_DAYS)
-        if (datetime.now() - detected_at).days >= stale_days:
+        if (_now_kst() - detected_at).days >= stale_days:
             return False
     if latest_rec is None:
         return True
@@ -15968,7 +15976,7 @@ def _restore_carry_snapshot(sig_data: dict) -> None:
         if dropped_codes:
             _log_info_msg(f"  🧹 stale carry 정리: {len(dropped_codes)}개 제거")
         for code, info in data.items():
-            detected_at = _parse_compact_datetime(info.get("detected_at")) or datetime.now()
+            detected_at = _parse_compact_datetime(info.get("detected_at")) or _now_kst()
             _detected_stocks[code] = {
                 "name": info.get("name", code),
                 "high_price": safe_int(info.get("high_price", 0), 0),
@@ -22578,6 +22586,10 @@ def _has_recent_actionable_tracking_state(code: str, max_age_minutes: int = 240)
             newest_dt = cand_dt
     if not newest_dt:
         return False
+    if newest_dt.tzinfo is None:
+        newest_dt = newest_dt.replace(tzinfo=_KST)
+    else:
+        newest_dt = newest_dt.astimezone(_KST)
     return (now_dt - newest_dt).total_seconds() <= max(900, int(max_age_minutes) * 60)
 def _should_promote_internal_capture_watch(signal: dict, source_label: str = "") -> bool:
     if not isinstance(signal, dict):
@@ -25615,113 +25627,6 @@ def analyze_news_theme(headlines: list = None) -> list:
             "signal_strength": strength, "total": total,
         })
     return signals
-def _theme_chain_direct_limit(signal_strength: str = "") -> int:
-    strength = str(signal_strength or "").strip()
-    if strength == "매우강함":
-        return 3
-    if strength == "강함":
-        return 2
-    return 1
-
-def _should_force_theme_chain_direct(theme_signal: dict, item: dict, analyzed: dict | None = None, rank_idx: int = 0) -> bool:
-    limit = _theme_chain_direct_limit((theme_signal or {}).get("signal_strength", ""))
-    if rank_idx >= max(1, limit):
-        return False
-    react_ratio = safe_float((theme_signal or {}).get("react_ratio", 0), 0.0)
-    total = safe_int((theme_signal or {}).get("total", 0), 0)
-    rising_cnt = len((theme_signal or {}).get("rising", []) or [])
-    change_rate = safe_float((item or {}).get("change_rate", (analyzed or {}).get("change_rate", 0)), 0.0)
-    vol_ratio = safe_float((item or {}).get("volume_ratio", (analyzed or {}).get("volume_ratio", 0)), 0.0)
-    score = safe_int((analyzed or {}).get("score", 0), 0)
-    strength = str((theme_signal or {}).get("signal_strength") or "")
-    if strength == "매우강함" and react_ratio >= 0.99 and change_rate >= 5.0 and (vol_ratio >= 1.3 or rank_idx == 0):
-        return True
-    if strength in ("매우강함", "강함") and react_ratio >= 0.80 and rising_cnt >= max(1, min(total, 2)) and change_rate >= 7.0 and (vol_ratio >= 1.1 or score >= 70):
-        return True
-    return False
-
-def _build_theme_chain_direct_candidate(theme_signal: dict, item: dict, analyzed: dict | None = None, source_label: str = "뉴스테마 상승") -> dict | None:
-    base = dict(analyzed if isinstance(analyzed, dict) else item if isinstance(item, dict) else {})
-    code = normalize_stock_code(base.get("code") or (item or {}).get("code"))
-    if not code:
-        return None
-    name = str(base.get("name") or (item or {}).get("name") or code)
-    price = safe_int((item or {}).get("price", base.get("price", 0)), 0)
-    if price <= 0:
-        return None
-    sig_type = str(base.get("signal_type") or "").upper()
-    if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT"):
-        sig_type = "SURGE" if safe_float((item or {}).get("change_rate", base.get("change_rate", 0)), 0.0) >= 5.0 else "STRONG_BUY"
-    entry_price = safe_int(base.get("entry_price", 0), 0) or price
-    stop_price = safe_int(base.get("stop_loss", 0), 0)
-    target_price = safe_int(base.get("target_price", 0), 0)
-    stop_pct = safe_float(base.get("stop_pct", 0), 0.0)
-    target_pct = safe_float(base.get("target_pct", 0), 0.0)
-    atr_used = bool(base.get("atr_used"))
-    try:
-        calc_stop, calc_target, calc_stop_pct, calc_target_pct, calc_atr = calc_stop_target(code, entry_price, signal_type=sig_type)
-        if calc_stop > 0 and calc_target > entry_price:
-            stop_price, target_price = int(calc_stop), int(calc_target)
-            stop_pct, target_pct = float(calc_stop_pct), float(calc_target_pct)
-            atr_used = bool(calc_atr)
-    except Exception as e:
-        _swallow_exception(e)
-    if stop_price <= 0:
-        stop_price = max(1, int(round(entry_price * 0.965)))
-        stop_pct = round((stop_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
-    if target_price <= entry_price:
-        target_price = max(entry_price + 1, int(round(entry_price * 1.07)))
-        target_pct = round((target_price - entry_price) / entry_price * 100, 1) if entry_price else 0.0
-    reasons = list(base.get("reasons") or [])
-    theme_desc = str((theme_signal or {}).get("theme_desc") or "")
-    strength = str((theme_signal or {}).get("signal_strength") or "")
-    reasons.append(f"📰 {source_label}: {theme_desc[:25]}")
-    reasons.append(f"🔥 뉴스+주가 연동 {strength} direct 승격")
-    reasons.append("⚡ 테마체인 직승격 — 상위 반응 종목 즉시 실행 후보")
-    sector_info = dict(base.get("sector_info") or {})
-    if not sector_info and theme_desc:
-        sector_info = {"theme": theme_desc, "bonus": 15, "react_cnt": len((theme_signal or {}).get("rising", []) or [])}
-    boosted_score = max(safe_int(base.get("score", 0), 0), 78 if strength == "매우강함" else 74)
-    base.update({
-        "code": code,
-        "name": name,
-        "price": price,
-        "change_rate": safe_float((item or {}).get("change_rate", base.get("change_rate", 0)), 0.0),
-        "volume_ratio": safe_float((item or {}).get("volume_ratio", base.get("volume_ratio", 0)), 0.0),
-        "today_vol": safe_int((item or {}).get("today_vol", base.get("today_vol", 0)), 0),
-        "ask_qty": safe_int((item or {}).get("ask_qty", base.get("ask_qty", 0)), 0),
-        "bid_qty": safe_int((item or {}).get("bid_qty", base.get("bid_qty", 0)), 0),
-        "prev_close": safe_int((item or {}).get("prev_close", base.get("prev_close", 0)), 0),
-        "high": safe_int((item or {}).get("high", base.get("high", 0)), 0),
-        "open": safe_int((item or {}).get("open", base.get("open", 0)), 0),
-        "mktcap": safe_int((item or {}).get("mktcap", base.get("mktcap", 0)), 0),
-        "cap_size": str((item or {}).get("cap_size", base.get("cap_size", "small")) or "small"),
-        "signal_type": sig_type,
-        "score": boosted_score,
-        "grade": "A",
-        "execution_grade": "A",
-        "pattern_grade": "A",
-        "entry_price": int(entry_price),
-        "stop_loss": int(stop_price),
-        "target_price": int(target_price),
-        "stop_pct": float(stop_pct),
-        "target_pct": float(target_pct),
-        "atr_used": bool(atr_used),
-        "sector_info": sector_info,
-        "sector_theme": str(sector_info.get("theme", theme_desc) or theme_desc),
-        "direct_news_hit": True,
-        "theme_drive_hit": True,
-        "material_first_priority_hit": True,
-        "theme_chain_force_hit": True,
-        "theme_chain_capture_hit": True,
-        "theme_chain_execution_plan_hit": True,
-        "theme_chain_a_relax_hit": True,
-        "force_external_capture_alert": True,
-        "entry_soft_block_allowed": True,
-        "reasons": reasons,
-    })
-    return base
-
 def send_news_theme_alert(signal: dict):
     emoji = {"매우강함":"🔥","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"📢")
     react_pct = int(signal["react_ratio"]*100)
@@ -25752,7 +25657,7 @@ def send_news_theme_alert(signal: dict):
          +"━━━━━━━━━━━━━━━")
     # v81 #1: rising 종목 A급 진입 체인 연결
     # 정보 알람 발송 후 각 상승 종목에 대해 analyze() → A급이면 _dispatch_general_alert_signal()
-    for idx, r in enumerate(signal.get("rising", [])):
+    for r in signal.get("rising", []):
         try:
             cur = get_stock_price(r["code"])
             if not cur:
@@ -25773,7 +25678,6 @@ def send_news_theme_alert(signal: dict):
                 "mktcap":       cur.get("mktcap", 0),
             }
             analyzed = analyze(stock_input)
-            dispatched = False
             if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
                 analyzed.setdefault("reasons", []).append(
                     f"📰 뉴스+주가 연동: {signal['theme_desc'][:25]}"
@@ -25784,16 +25688,7 @@ def send_news_theme_alert(signal: dict):
                 )
                 if dispatched:
                     _log_info_msg(f"  📰 뉴스테마→A급 진입 체인: {r['name']} {r['change_rate']:+.1f}%")
-            elif _should_force_theme_chain_direct(signal, stock_input, analyzed, rank_idx=idx):
-                direct_sig = _build_theme_chain_direct_candidate(signal, stock_input, analyzed, source_label="뉴스테마 상승")
-                if direct_sig:
-                    dispatched = _dispatch_general_alert_signal(
-                        direct_sig,
-                        source_label="뉴스테마 직승격"
-                    )
-                    if dispatched:
-                        _log_info_msg(f"  🚀 뉴스테마 직승격: {r['name']} {r.get('change_rate',0):+.1f}%")
-            if not dispatched:
+            else:
                 _log_info_msg(f"  ⏭ 뉴스테마 A급 미달: {r['name']} {r.get('change_rate',0):+.1f}% — 내부 기록만")
             time.sleep(0.2)
         except Exception as _e:
@@ -25842,21 +25737,13 @@ def _dispatch_issue_prewatch_reacted(pw: dict, reacted: list[dict]) -> set[str]:
     theme_key = str((pw or {}).get("theme_key") or "")
     summary = _summarize_material_reaction(reacted, pw)
     reacted_sorted = sorted(reacted, key=lambda item: _material_reacted_priority_score(item, pw, summary), reverse=True)
-    theme_signal = {
-        "signal_strength": "매우강함" if bool(summary.get("strong")) else "강함",
-        "react_ratio": safe_float(summary.get("react_ratio", 0), 0.0),
-        "total": safe_int(summary.get("total", 0), 0),
-        "rising": reacted_sorted,
-        "theme_desc": str((pw or {}).get("theme_desc") or ""),
-    }
-    for idx, item in enumerate(reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]):
+    for item in reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]:
         code = item["code"]
         name = item["name"]
         if _is_material_first_stock_cooldown(code, theme_key):
             continue
         try:
             analyzed = analyze(item)
-            dispatched = False
             if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
                 analyzed.setdefault("reasons", []).append(f"👁 이슈 선감지: {pw['theme_desc'][:30]}")
                 analyzed["material_first_hint"] = True
@@ -25867,17 +25754,6 @@ def _dispatch_issue_prewatch_reacted(pw: dict, reacted: list[dict]) -> set[str]:
                     _mark_material_first_stock_alerted(code, theme_key)
                     _log_info_msg(f"  👁 이슈→A급 진입 체인: {name} {item['change_rate']:+.1f}% 등급A")
                     continue
-            elif _should_force_theme_chain_direct(theme_signal, item, analyzed, rank_idx=idx):
-                direct_sig = _build_theme_chain_direct_candidate(theme_signal, item, analyzed, source_label="이슈 선감지")
-                if direct_sig:
-                    direct_sig["material_first_hint"] = True
-                    direct_sig["material_first_priority_hit"] = bool(summary.get("strong"))
-                    dispatched = _dispatch_general_alert_signal(direct_sig, source_label="이슈 직승격")
-                    if dispatched:
-                        dispatched_codes.add(code)
-                        _mark_material_first_stock_alerted(code, theme_key)
-                        _log_info_msg(f"  🚀 이슈 직승격: {name} {item['change_rate']:+.1f}%")
-                        continue
         except Exception as e:
             _log_error(f"check_issue_prewatch/analyze({name})", e)
         _log_info_msg(f"  ⏭ 이슈 선감지 A급 미달: {name} {item['change_rate']:+.1f}% — 내부 기록만")
