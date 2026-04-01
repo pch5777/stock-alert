@@ -3,18 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v159
-날짜: 2026-04-01
+버전: v160
+날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v159 (2026-04-01): NXT 진입감시 거래량 급감 종료 완화 — `_check_entry_watch_strength_guard()`에 NXT 전용 거래량 guard profile을 추가해 장전/장후 NXT는 정규장보다 더 낮은 거래량 폭락 기준과 더 긴 유예시간·재확인 횟수를 적용한다. 특히 NXT 장후 후반은 포착 대비 거래량이 더 크게 줄어도 즉시 `감시 종료 — 재포착 전 신규 진입 보류`로 자르지 않도록 조정하고, direct/theme-chain 재료형 후보에는 추가 유예를 부여해 NXT 저유동성 특성을 감안한 뒤 종료 판단하게 맞춘다.
-- v158 (2026-04-01): v152~v156 핵심 변경 복구 통합 + SURGE/테마체인/추적 결과 정상화 — 누락됐던 테마체인 직승격/실행형 진입가 보완, 즉시 1차 진입가 도달 helper, trailing_active 5일 시간초과 제외, 추적 결과 MFE 표시 및 종료 라벨 공통 저장을 다시 합쳤다. 또한 뉴스테마/이슈 선감지 상위 반응 종목이 `뉴스테마 A급 미달`로만 묻히지 않도록 direct 승격 경로를 복구하고, 일반 포착은 현재가≤진입가일 때 헤더에 `+ 1차 진입가 도달`을 반영한 뒤 같은 루프에서 즉시 phase1 진입가 도달을 시도한다.
-- v157 (2026-04-01): 시장 주도 섹터 datetime timezone hotfix — `_parse_compact_datetime(value, time_value=None)`가 날짜/시간 분리 입력을 함께 파싱하도록 확장하고, `_has_recent_actionable_tracking_state()`가 KST aware 기준 시각과 naive/aware 후보 시각을 같은 기준으로 정렬해 `send_market_leading_sector_update` 경로의 `can't subtract offset-naive and offset-aware datetimes` 오류를 제거했다. 같은 보정으로 carry/tracking datetime 파싱도 안전하게 처리한다.
-- v156 (2026-04-01): 매우강함·강함 뉴스테마/이슈 종목 direct 승격 + 시장 주도 섹터 TypeError hotfix — 뉴스테마/이슈 선감지의 상위 반응 종목을 `_should_force_theme_chain_direct()` / `_build_theme_chain_direct_candidate()`로 직접 승격하고, direct 승격 종목은 현재가 기준 실행형 진입가·손절가·목표가와 `force_external_capture_alert`를 함께 세팅해 실제 종목 외부알림으로 바로 연결되도록 보강했다. 동시에 `_parse_compact_datetime(value, time_value)` 확장으로 `send_market_leading_sector_update` 인자 불일치 TypeError를 제거했다.
-- v155 (2026-04-01): 테마 알림만 오고 종목 알림이 묻히던 마지막 게이트 해제 — 강한 뉴스테마/이슈 종목에 `theme_chain_capture_hit`/`theme_chain_execution_plan_hit`를 붙여 실행형 후보로 재분류하고, `no_ask_liquidity` soft allow·기타업종 섹터 게이트 완화·실행형 진입가 보완을 연결해 테마 알림이 실제 종목 알림으로 더 잘 이어지도록 조정했다.
-- v154 (2026-04-01): 뉴스테마/이슈 near-A 승격 보강 — `_apply_theme_chain_capture_adjustment()`와 테마체인 실행계획 보강으로 매우강함·강함 뉴스테마/이슈 종목이 near-A여도 A권으로 더 잘 올라오도록 조정하고, `뉴스+주가 연동`·`뉴스테마 상승`·`이슈 선감지`·`테마체인 A승격` 근거를 일반 신호 A게이트 완화 사유에 반영했다.
-- v153 (2026-04-01): EARLY_DETECT 즉시 1차도달 + 추적 결과 학습 라벨 정합화 — 일반 포착에서 현재가≤진입가면 헤더에 `+ 1차 진입가 도달`을 붙이고 같은 루프에서 즉시 phase1 진입가 도달을 시도하도록 확장했으며, 목표가 도달 후 `trailing_active` 종목은 5일 시간초과에서 제외하고 손절/시간초과/트레일링 종료 전부에 `_apply_result_labels()`를 공통 적용해 `mfe_pct`/`mae_pct`/`hold_minutes`/`outcome`이 일관 저장되도록 정리했다. 자동 추적 결과 메시지에는 `최대수익(MFE)` 표시를 추가했다.
-- v152 (2026-04-01): 강한 뉴스테마/이슈 종목 실행형 종목 알림 직접 승격 — `뉴스+주가 연동`과 `이슈 선감지`에서 강하게 반응한 상위 종목을 direct 승격 후보로 분기하고, 실행형 진입가/손절가/목표가를 즉시 보완해 `뉴스테마 A급 미달`로만 묻히지 않도록 했다.
+- v160 (2026-04-02): 구조 버전별 성과 cohort 분리 + /reset_stats 명령 추가 — 큰 구조 변경은 정수 버전(v160, v161 …)으로 올리고 해당 버전이 곧 새로운 성과 cohort가 되도록 버전 체계를 정리했다. 같은 구조 안의 버그/경미 수정은 소수점 버전(v160.1, v160.2 …)을 쓰도록 helpers를 추가했고, signal_log 신규 레코드에 `bot_version`·`stats_cohort`를 저장한다. `/stats`는 이제 현재 cohort 기준으로만 승률을 계산하며, `/reset_stats 확인`은 signal_log를 백업한 뒤 현재 cohort의 통계 시작 시각만 초기화해 과거 기록은 보존하고 현재 구조 성과만 새로 측정한다.
 - v151 (2026-04-01): 24시간 시나리오 수집 + 장후/장전 액션보드 연결 — 미국장·미국 이슈·환율·금리·유가·지정학·뉴스/옵션형 유튜브를 공통 시나리오 객체로 묶는 `collect_market_scenarios_24h()`와 `run_market_scenario_collection_cycle()`를 추가했다. 각 재료는 이벤트명·방향·원인·한국 상방/하방 섹터·한국 종목 후보까지 내려와 `premarket_action_board`와 `overnight_watchlist`를 동시에 갱신하고, 재료-first headline 입력에도 같은 시나리오 행을 주입한다. 또한 15:45/20:10 장후 알림은 하방 차단 요약에 더해 상·하방 핵심 시나리오와 한국 후보를 함께 보내고, 07:30/08:50 장전 알림은 기존 단순 워치리스트 대신 액션형 시나리오 보드 중심으로 재구성했으며, 본스캔에도 상방 시나리오 후보를 직접 우선 편입한다.
 - v150 (2026-03-31): 상방/하방 재료 시나리오 강화 + 하방 재료 전구간 차단/알림 — 재료 엔진이 직접뉴스·테마동조·섹터확산·market flow·material-first 선감지가 겹칠수록 추가 가점을 더 크게 주도록 `재료 시나리오 결속` 보너스를 도입했다. 동시에 감사보고서 제출기한 연장신고/지연·감사의견·관리/상장폐지/거래정지·횡령/배임·회생류 하방 재료를 DART/뉴스/옵션형 유튜브 최근성 감시에서 시나리오로 묶어 후보 부트스트랩과 최종 진입 필터 양쪽에서 즉시 차단하고, 이미 걸린 entry/reentry/execution/preclose 감시도 `하방재료차단`으로 정리하며 즉시 알림과 장마감 묶음 요약을 함께 남기도록 확장했다.
 - v149 (2026-03-31): run_scan `change_rate` 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
@@ -1594,6 +1587,27 @@ _ver_match = _re.search(r"버전:\s*(v[0-9][0-9A-Za-z._-]*)", __doc__ or "")
 BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
 _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
+_BOT_VER_FULLMATCH = _re.fullmatch(r"v(\d+)(?:\.(\d+))?", BOT_VERSION or "")
+if _BOT_VER_FULLMATCH:
+    _BOT_VER_MAJOR = int(_BOT_VER_FULLMATCH.group(1))
+    _BOT_VER_MINOR = int(_BOT_VER_FULLMATCH.group(2) or 0)
+    BOT_VERSION_SERIES = f"v{_BOT_VER_MAJOR}"
+else:
+    _BOT_VER_MAJOR = None
+    _BOT_VER_MINOR = 0
+    BOT_VERSION_SERIES = (BOT_VERSION.split(".", 1)[0] or BOT_VERSION or "legacy")
+BOT_STATS_COHORT = BOT_VERSION_SERIES
+BOT_VERSION_IS_MINOR = _BOT_VER_MINOR > 0
+
+def _derive_stats_cohort(version: str | None) -> str:
+    ver = str(version or "").strip()
+    if not ver:
+        return "legacy"
+    m = _re.fullmatch(r"v(\d+)(?:\.(\d+))?", ver)
+    if m:
+        return f"v{int(m.group(1))}"
+    return ver.split(".", 1)[0] or ver
+
 import os, requests, time, schedule, json, random, threading, math
 from collections import deque, defaultdict
 import xml.etree.ElementTree as ET
@@ -2398,6 +2412,154 @@ def _read_json_locked(file_path: str, default=None):
     """v38.3-P1-6: Lock 보호 JSON 읽기 (스레드 안전)"""
     with _file_lock:
         return _read_json_unlocked(file_path, default=default)
+def _backup_runtime_json_file(file_path: str, tag: str = "manual") -> str:
+    _ensure_dir(_BACKUP_DIR)
+    stamp = _now_kst().strftime("%Y%m%d_%H%M%S")
+    base = os.path.basename(file_path)
+    backup = os.path.join(_BACKUP_DIR, f"{tag}_{stamp}_{base}")
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as rf, open(backup, "wb") as wf:
+                wf.write(rf.read())
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 백업 실패: {base} ({e})")
+        return ""
+    return backup
+
+def _parse_stats_scope_datetime(value: str | None) -> datetime | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d %H:%M:%S", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=_KST)
+        except Exception:
+            pass
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+    except Exception:
+        return None
+
+def _record_detected_datetime(rec: dict) -> datetime | None:
+    if not isinstance(rec, dict):
+        return None
+    d = str(rec.get("detect_date") or rec.get("first_detect_date") or rec.get("exit_date") or "").strip()
+    t = str(rec.get("detect_time") or rec.get("first_detect_time") or rec.get("exit_time") or "00:00:00").strip()
+    if not d:
+        return None
+    if len(d) == 8 and d.isdigit():
+        try:
+            return datetime.strptime(f"{d} {t[:8]}", "%Y%m%d %H:%M:%S").replace(tzinfo=_KST)
+        except Exception:
+            return None
+    try:
+        dt = datetime.fromisoformat(f"{d} {t[:8]}")
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+    except Exception:
+        return None
+
+def _ensure_record_stats_meta(rec: dict) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    changed = False
+    bot_version = str(rec.get("bot_version") or rec.get("version") or rec.get("signal_version") or "").strip()
+    if not bot_version:
+        rec["bot_version"] = "legacy"
+        bot_version = "legacy"
+        changed = True
+    stats_cohort = str(rec.get("stats_cohort") or rec.get("structure_cohort") or "").strip()
+    if not stats_cohort:
+        rec["stats_cohort"] = _derive_stats_cohort(bot_version)
+        stats_cohort = rec["stats_cohort"]
+        changed = True
+    if not str(rec.get("structure_cohort") or "").strip():
+        rec["structure_cohort"] = stats_cohort
+        changed = True
+    return changed
+
+def _normalize_signal_log_meta_fields(data: dict) -> int:
+    if not isinstance(data, dict):
+        return 0
+    changed = 0
+    for rec in data.values():
+        if _ensure_record_stats_meta(rec):
+            changed += 1
+    return changed
+
+def _load_stats_scope_state() -> dict:
+    state = _read_json_locked(STATS_SCOPE_FILE, default={})
+    if not isinstance(state, dict):
+        state = {}
+    cohorts = state.get("cohorts")
+    if not isinstance(cohorts, dict):
+        cohorts = {}
+    state["cohorts"] = cohorts
+    if not state.get("active_cohort"):
+        state["active_cohort"] = BOT_STATS_COHORT
+    if BOT_STATS_COHORT not in cohorts:
+        cohorts[BOT_STATS_COHORT] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json_atomic(STATS_SCOPE_FILE, state, indent=2)
+    return state
+
+def _get_stats_scope_start(cohort: str | None = None) -> datetime | None:
+    state = _load_stats_scope_state()
+    target = str(cohort or BOT_STATS_COHORT or "").strip() or BOT_STATS_COHORT
+    return _parse_stats_scope_datetime((state.get("cohorts") or {}).get(target))
+
+def _record_matches_stats_scope(rec: dict, cohort: str | None = None) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    target = str(cohort or BOT_STATS_COHORT or "").strip() or BOT_STATS_COHORT
+    rec_cohort = str(rec.get("stats_cohort") or rec.get("structure_cohort") or _derive_stats_cohort(rec.get("bot_version"))).strip()
+    if rec_cohort != target:
+        return False
+    anchor = _get_stats_scope_start(target)
+    if anchor is None:
+        return True
+    rec_dt = _record_detected_datetime(rec)
+    if rec_dt is None:
+        return False
+    return rec_dt >= anchor
+
+def _filter_records_by_stats_scope(records, cohort: str | None = None) -> list:
+    return [rec for rec in (records or []) if _record_matches_stats_scope(rec, cohort=cohort)]
+
+def _handle_reset_stats_command(raw: str):
+    parts = raw.strip().split()
+    if len(parts) < 2 or parts[1] not in ("확인", "confirm"):
+        data = _load_signal_log_data()
+        cohort_count = sum(1 for rec in data.values() if _record_matches_stats_scope(rec))
+        send(
+            f"⚠️ 현재 구조 cohort <b>{BOT_STATS_COHORT}</b> 승률을 초기화합니다.\n"
+            f"대상 기록: {cohort_count}건\n"
+            f"signal_log는 백업하고, 현재 cohort의 통계 시작 시각만 지금으로 재설정합니다.\n"
+            f"실행: <code>/reset_stats 확인</code>"
+        )
+        return
+    backup = _backup_runtime_json_file(SIGNAL_LOG_FILE, tag="reset_stats")
+    state = _load_stats_scope_state()
+    stamp = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    state["active_cohort"] = BOT_STATS_COHORT
+    state.setdefault("cohorts", {})[BOT_STATS_COHORT] = stamp
+    state.setdefault("last_reset", {})[BOT_STATS_COHORT] = stamp
+    _write_json_atomic(STATS_SCOPE_FILE, state, indent=2)
+    try:
+        _history_cache["data"] = {}
+        _history_cache["ts"] = 0
+    except Exception:
+        pass
+    send(
+        f"♻️ <b>승률 초기화 완료</b>\n"
+        f"cohort: <b>{BOT_STATS_COHORT}</b>\n"
+        f"시작 시각: {stamp}\n"
+        f"백업: {os.path.basename(backup) if backup else '생략'}"
+    )
+
 def _migrate_legacy_files():
     """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
     try:
@@ -4164,7 +4326,7 @@ def run_intraday_watchdog() -> None:
 # ============================================================
 # v40.0-#9: 이벤트 유형별 승률 분리
 # ============================================================
-def get_signal_type_stats(signal_log_data: dict = None) -> dict:
+def get_signal_type_stats(signal_log_data: dict = None, cohort: str | None = BOT_STATS_COHORT) -> dict:
     """신호 유형별 승률·수익률 통계 반환.
     반환: {signal_type: {count, wins, win_rate, avg_pnl}}
     """
@@ -4179,6 +4341,8 @@ def get_signal_type_stats(signal_log_data: dict = None) -> dict:
             if not isinstance(rec, dict):
                 continue
             st = rec.get("status", "")
+            if cohort is not None and not _record_matches_stats_scope(rec, cohort=cohort):
+                continue
             if st not in ("수익", "손실", "본전"):
                 continue
             sig = rec.get("signal_type", "UNKNOWN")
@@ -5833,7 +5997,7 @@ def _get_similar_pattern_stats(code: str, signal_type: str, change_rate: float, 
     """유사패턴 통계 공통 계산 (상세 표시 / 요약 표시 / 내부 점수화 공용)."""
     try:
         data = _load_signal_history()
-        completed = _get_completed_signals(data)
+        completed = _get_completed_signals(data, cohort=BOT_STATS_COHORT)
         if len(completed) < 3:
             return {}
         out = {"same_stock": {}, "similar": {}, "primary": {}}
@@ -5961,13 +6125,15 @@ def _load_signal_history() -> dict:
         _swallow_exception(e)  # v105 structured silent-exception log
         _history_cache["data"] = {}
     return _history_cache["data"]
-def _get_completed_signals(data: dict = None) -> list:
-    """완료된 신호만 추출 (net_pnl_pct 우선)"""
+def _get_completed_signals(data: dict = None, cohort: str | None = BOT_STATS_COHORT) -> list:
+    """완료된 신호만 추출 (현재 구조 cohort 기준, net_pnl_pct 우선)"""
     if data is None:
         data = _load_signal_history()
     completed = []
     for v in data.values():
         if not isinstance(v, dict):
+            continue
+        if cohort is not None and not _record_matches_stats_scope(v, cohort=cohort):
             continue
         if v.get("status") not in ("수익", "손실", "본전"):
             continue
@@ -8836,51 +9002,19 @@ def _is_orphan_carry_snapshot(info: dict | None) -> bool:
         info.get("stop_loss", info.get("stop_price", info.get("stop", 0))),
         info.get("target_price", info.get("target", 0)),
     )
-def _parse_compact_datetime(value, time_value=None) -> datetime | None:
+def _parse_compact_datetime(value) -> datetime | None:
     if isinstance(value, datetime):
-        dt = value
-    else:
-        value = str(value or "").strip()
-        time_value = str(time_value or "").strip()
-        if not value and not time_value:
-            return None
-        raw_candidates = []
-        if value and time_value:
-            raw_candidates.extend([
-                f"{value}{time_value.replace(':', '')}",
-                f"{value} {time_value}",
-            ])
-        if value:
-            raw_candidates.append(value)
-        for raw in raw_candidates:
-            raw = str(raw or "").strip()
-            if not raw:
-                continue
-            for fmt in (
-                "%Y%m%d%H%M%S",
-                "%Y%m%d%H%M",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %H:%M",
-                "%Y%m%d",
-                "%Y-%m-%d",
-            ):
-                try:
-                    dt = datetime.strptime(raw, fmt)
-                    break
-                except Exception as e:
-                    _swallow_exception(e)  # v105 structured silent-exception log
-                    dt = None
-            if dt is not None:
-                break
-        else:
-            return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=_KST)
-    try:
-        return dt.astimezone(_KST)
-    except Exception as e:
-        _swallow_exception(e)
-        return dt
+        return value
+    value = str(value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except Exception as e:
+            _swallow_exception(e)  # v105 structured silent-exception log
+            continue
+    return None
 def _build_latest_tracking_by_code(data: dict | None = None) -> dict[str, dict]:
     latest_by_code = {}
     latest_key_by_code = {}
@@ -8904,7 +9038,7 @@ def _is_active_carry_snapshot(info: dict | None, latest_rec: dict | None = None,
     detected_at = _parse_compact_datetime(info.get("detected_at"))
     if detected_at is not None:
         stale_days = max(MAX_CARRY_DAYS + 1, TRACK_MAX_DAYS)
-        if (_now_kst() - detected_at).days >= stale_days:
+        if (datetime.now() - detected_at).days >= stale_days:
             return False
     if latest_rec is None:
         return True
@@ -13762,6 +13896,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
 SIGNAL_LOG_FILE = _state_path("signal_log.json")   # 모든 신호 추적 (신규)
+STATS_SCOPE_FILE = _state_path("stats_scope.json")
 CAPTURE_FUNNEL_FILE = _state_path("capture_funnel.json")  # saved/watch/reached 전환율 집계
 # ============================================================
 # 🎯 최적조건 만들기용 데이터/튜닝 설정
@@ -13920,6 +14055,8 @@ def _normalize_signal_log_pnl_fields(data: dict) -> int:
     changed = 0
     for rec in data.values():
         if _sync_record_pnl_fields(rec):
+            changed += 1
+        if _ensure_record_stats_meta(rec):
             changed += 1
     return changed
 def migrate_signal_log_pnl_fields() -> None:
@@ -14471,7 +14608,10 @@ def _merge_tracking_episode_records(data: dict | None, code: str, representative
     return changed
 def _load_signal_log_data() -> dict:
     try:
-        return _read_json_locked(SIGNAL_LOG_FILE)
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if isinstance(data, dict):
+            _normalize_signal_log_pnl_fields(data)
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         _swallow_exception(e)
         return {}
@@ -14662,6 +14802,9 @@ def _build_new_signal_log_record(stock: dict, ctx: dict) -> dict:
         "code": ctx["code"],
         "name": ctx["stock_name"],
         "signal_type": ctx["sig_type"],
+        "bot_version": BOT_VERSION,
+        "stats_cohort": BOT_STATS_COHORT,
+        "structure_cohort": BOT_STATS_COHORT,
         "signal_type_history": [ctx["sig_type"]] if ctx["sig_type"] else [],
         "score": stock.get("score", 0),
         "grade": stock.get("grade", "B"),
@@ -15565,11 +15708,6 @@ def _handle_tracking_target_reached(data, log_key, rec, code, price, entry, targ
     weakness_score = int(weakness.get("score", 0) or 0)
     rec["tracking_weakness_score_latest"] = weakness_score
     rec["tracking_weakness_reasons_latest"] = list(weakness.get("reasons") or [])[:4]
-    now_dt = datetime.now()
-    rec["target_hit_price"] = int(price or 0)
-    rec["target_hit_time"] = now_dt.strftime('%Y-%m-%d %H:%M:%S')
-    rec["target_hit_date"] = now_dt.strftime('%Y%m%d')
-    rec["target_hit_clock"] = now_dt.strftime('%H:%M:%S')
     rec["trailing_active"] = True
     base_trail = calc_trailing_stop(code, price)
     max_price = max(safe_int(rec.get("max_price", 0), 0), safe_int(price, 0))
@@ -15621,7 +15759,6 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
     rec["round_trip_cost_pct"] = round(ROUND_TRIP_COST_PCT, 4)
     rec["pnl_pct"] = net_pnl_pct
     rec["exit_reason"] = exit_reason
-    _apply_result_labels(rec)
     if ACTUAL_ENTRY_CONFIRM_ENABLED and rec.get("actual_entry") is None and exit_reason != TRACK_TIMEOUT_RESULT:
         _request_actual_entry_confirm(rec)
     _tracking_notified.add(log_key)
@@ -15697,7 +15834,7 @@ def _process_tracking_result_record(data, today, log_key, rec):
     exit_reason = None
     if price <= stop:
         exit_reason = "손절가"
-    elif elapsed_days >= TRACK_MAX_DAYS and not rec.get("trailing_active"):
+    elif elapsed_days >= TRACK_MAX_DAYS:
         exit_reason = TRACK_TIMEOUT_RESULT
     if not exit_reason:
         return True
@@ -15826,14 +15963,6 @@ def _build_tracking_result_message(rec: dict, display_rec: dict, header: dict, c
     exit_p = rec["exit_price"]
     max_p = rec.get("max_price", exit_p)
     min_p = rec.get("min_price", exit_p)
-    mfe_pct = safe_float(rec.get("mfe_pct", 0.0), 0.0)
-    if not mfe_pct and header["entry"]:
-        try:
-            mfe_pct = round(((max_p - header["entry"]) / header["entry"]) * 100.0, 1)
-        except Exception as e:
-            _swallow_exception(e)
-            mfe_pct = 0.0
-    mfe_text = "수익 없음 🟢" if mfe_pct <= 0 else f"{mfe_pct:+.1f}%"
     mdd_text = "낙폭 없음 🟢" if header["mdd"] > 0 else f"{header['mdd']:+.1f}%"
     return (
         f"{header['emoji']} <b>[자동 추적 결과]</b>  {header['title']}\n"
@@ -15847,7 +15976,7 @@ def _build_tracking_result_message(rec: dict, display_rec: dict, header: dict, c
         f"청산가:  <b>{exit_p:,}원</b>  ({header['reason']})\n"
         f"현재가:  <b>{rec.get('current_price', exit_p):,}원</b>\n"
         f"최고가:  {max_p:,}원  |  최저가: {min_p:,}원\n"
-        f"최대수익: {mfe_text}  |  최대낙폭: {mdd_text}\n"
+        f"최대낙폭: {mdd_text}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{header['pnl_emoji']} <b>수익률: {header['pnl']:+.1f}%</b>{cause_block}{profit_guide}"
     )
@@ -15997,7 +16126,7 @@ def _restore_carry_snapshot(sig_data: dict) -> None:
         if dropped_codes:
             _log_info_msg(f"  🧹 stale carry 정리: {len(dropped_codes)}개 제거")
         for code, info in data.items():
-            detected_at = _parse_compact_datetime(info.get("detected_at")) or _now_kst()
+            detected_at = _parse_compact_datetime(info.get("detected_at")) or datetime.now()
             _detected_stocks[code] = {
                 "name": info.get("name", code),
                 "high_price": safe_int(info.get("high_price", 0), 0),
@@ -18692,22 +18821,11 @@ def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_
         _send_phase2_entry_alert_message(watch, cur, price, entry, ctx)
     _finalize_entry_phase_alert(watch, price, entry, reach_via_recovery, ctx, is_phase1)
     return True
-def _should_immediate_first_entry_hit_from_signal(signal: dict | None = None) -> bool:
-    signal = signal if isinstance(signal, dict) else {}
-    sig_type = str(signal.get("signal_type") or "").upper()
-    if sig_type not in ("MID_PULLBACK", "ENTRY_POINT", "SURGE", "EARLY_DETECT", "NEAR_UPPER", "UPPER_LIMIT", "STRONG_BUY"):
-        return False
-    price = safe_int(signal.get("price", 0), 0)
-    entry = safe_int(signal.get("entry_price", 0), 0)
-    if price <= 0 or entry <= 0:
-        return False
-    return price <= entry
-
 def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | None = None, merge_capture_phase1: bool = False) -> bool:
     if not isinstance(signal, dict):
         return False
     sig_type = str(signal.get("signal_type") or "").upper()
-    if sig_type not in ("MID_PULLBACK", "ENTRY_POINT", "SURGE", "EARLY_DETECT", "NEAR_UPPER", "UPPER_LIMIT", "STRONG_BUY"):
+    if sig_type not in ("MID_PULLBACK", "ENTRY_POINT"):
         return False
     if not watch_key or watch_key not in _entry_watch:
         return False
@@ -19458,28 +19576,6 @@ def _handle_entry_watch_reference_reach(watch: dict, price: int, entry: int, ref
         {"entry_price": entry, "reference_price": int(price or 0), "market": "NXT"}
     )
     return True
-def _get_entry_watch_volume_guard_profile(watch: dict, use_nxt: bool) -> dict:
-    profile = {
-        "drop_ratio": 0.50,
-        "pre_entry_grace_sec": 60.0,
-        "min_observe_count": 2,
-    }
-    if use_nxt:
-        slot = _get_nxt_time_slot()
-        if slot == "post_late":
-            profile.update({"drop_ratio": 0.22, "pre_entry_grace_sec": 240.0, "min_observe_count": 4})
-        elif slot == "post_early":
-            profile.update({"drop_ratio": 0.28, "pre_entry_grace_sec": 180.0, "min_observe_count": 3})
-        elif slot == "pre":
-            profile.update({"drop_ratio": 0.30, "pre_entry_grace_sec": 180.0, "min_observe_count": 3})
-        else:
-            profile.update({"drop_ratio": 0.35, "pre_entry_grace_sec": 120.0, "min_observe_count": 3})
-        if watch.get("theme_chain_force_hit") or watch.get("theme_chain_capture_hit") or watch.get("direct_news_hit"):
-            profile["drop_ratio"] = max(0.15, float(profile["drop_ratio"]) * 0.85)
-            profile["pre_entry_grace_sec"] = float(profile["pre_entry_grace_sec"]) + 60.0
-            profile["min_observe_count"] = int(profile["min_observe_count"]) + 1
-    return profile
-
 def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry: int, use_nxt: bool) -> tuple[bool, bool, tuple | None]:
     changed = False
     entry_exec_metrics = get_execution_speed_metrics(watch["code"], current_price=price)
@@ -19488,23 +19584,7 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
     strength_now = _classify_signal_strength(watch, entry_exec_metrics)
     vol_now = float(cur.get("volume_ratio", watch.get("volume_ratio", 0)) or 0)
     vol_at_detect = float(watch.get("volume_ratio_at_detect", watch.get("volume_ratio", vol_now)) or vol_now)
-    try:
-        age_sec = max(0.0, time.time() - float(watch.get("registered_ts") or watch.get("ts") or 0.0))
-    except Exception as e:
-        _swallow_exception(e)
-        age_sec = 0.0
-    volume_guard = _get_entry_watch_volume_guard_profile(watch, use_nxt)
-    pre_entry_grace = (not watch.get("entry_hit")) and age_sec < float(volume_guard.get("pre_entry_grace_sec", 60.0) or 60.0)
-    min_observe_count = int(volume_guard.get("min_observe_count", 2) or 2)
-    volume_drop_ratio = float(volume_guard.get("drop_ratio", 0.50) or 0.50)
-    observe_count = int(watch.get("strength_guard_observe_count", 0) or 0) + 1
-    watch["strength_guard_observe_count"] = observe_count
     if strength_now == "약한":
-        if pre_entry_grace or observe_count < min_observe_count:
-            watch["strength_guard_pending_reason"] = "근거약화_신호강도약함"
-            watch["strength_guard_pending_price"] = int(price or 0)
-            watch["strength_guard_pending_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            return False, True, None
         if watch.get("entry_hit"):
             if _notify_entry_guard_followup(watch, "근거약화_신호강도약함", price, entry, use_nxt=use_nxt, detail="1차 도달 이후 신호 강도가 약화되어 신규 진입은 보류가 적절합니다."):
                 changed = True
@@ -19512,23 +19592,15 @@ def _check_entry_watch_strength_guard(watch: dict, cur: dict, price: int, entry:
         _notify_entry_watch_terminated(watch, "근거약화_신호강도약함", price, detail="포착 당시 근거가 약해져 지금은 다시 볼 필요가 없습니다.")
         _record_entry_dropped(watch, "근거약화_신호강도약함", price)
         return True, changed, ("근거약화_신호강도약함", "근거탈락")
-    if vol_at_detect > 0 and vol_now < vol_at_detect * volume_drop_ratio:
-        ratio = (vol_now / vol_at_detect) if vol_at_detect else 0.0
-        if pre_entry_grace or observe_count < min_observe_count:
-            watch["strength_guard_pending_reason"] = "근거약화_거래량폭락"
-            watch["strength_guard_pending_ratio"] = float(ratio)
-            watch["strength_guard_pending_price"] = int(price or 0)
-            watch["strength_guard_pending_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            return False, True, None
+    if vol_at_detect > 0 and vol_now < vol_at_detect * 0.5:
         if watch.get("entry_hit"):
+            ratio = (vol_now / vol_at_detect) if vol_at_detect else 0.0
             if _notify_entry_guard_followup(watch, "근거약화_거래량폭락", price, entry, use_nxt=use_nxt, detail=f"포착 대비 거래량이 {ratio:.2f}배 수준으로 약화되었습니다."):
                 changed = True
             return True, changed, None
         _notify_entry_watch_terminated(watch, "근거약화_거래량폭락", price, detail="포착 직후 후속 거래량이 무너져 현재 흐름은 보지 않는 편이 낫습니다.")
         _record_entry_dropped(watch, "근거약화_거래량폭락", price)
         return True, changed, ("근거약화_거래량폭락", "근거탈락")
-    watch.pop("strength_guard_pending_reason", None)
-    watch.pop("strength_guard_pending_ratio", None)
     return False, changed, None
 def _evaluate_entry_watch_sector_guard(watch: dict) -> tuple[bool, float | None]:
     sector_blocked = False
@@ -22582,7 +22654,6 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
         vol_ratio = float(signal.get("volume_ratio", 0.0) or 0.0)
     score = int(signal.get("score", 0) or 0)
     direct_news = bool(signal.get("direct_news_hit") or signal.get("direct_news_theme"))
-    theme_chain_priority = bool(signal.get("theme_chain_capture_hit") or signal.get("theme_chain_force_hit") or signal.get("theme_chain_execution_plan_hit"))
     sector_bonus = int(((signal.get("sector_info") or {}).get("bonus", 0)) or 0)
     sector_live = _extract_alert_sector_theme(signal) != "기타"
     nxt_order_flow = any("NXT 외인+기관 동시매수" in str(r or "") for r in (signal.get("reasons") or []))
@@ -22599,8 +22670,6 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
         vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
     )
     if direct_news and change_rate >= max(2.0, GENERAL_SOFT_ALLOW_MIN_CHANGE - 2.0):
-        return True
-    if theme_chain_priority and change_rate >= max(3.2, GENERAL_SOFT_ALLOW_MIN_CHANGE - 1.3) and (vol_ratio >= max(1.4, GENERAL_SOFT_ALLOW_MIN_VOLUME - 1.1) or sector_live or direct_news):
         return True
     if str(signal.get("market") or "") == "NXT" and score >= GENERAL_SOFT_ALLOW_MIN_SCORE - 5 and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and vol_ratio >= 2.0:
         return True
@@ -22667,10 +22736,6 @@ def _has_recent_actionable_tracking_state(code: str, max_age_minutes: int = 240)
             newest_dt = cand_dt
     if not newest_dt:
         return False
-    if newest_dt.tzinfo is None:
-        newest_dt = newest_dt.replace(tzinfo=_KST)
-    else:
-        newest_dt = newest_dt.astimezone(_KST)
     return (now_dt - newest_dt).total_seconds() <= max(900, int(max_age_minutes) * 60)
 def _should_promote_internal_capture_watch(signal: dict, source_label: str = "") -> bool:
     if not isinstance(signal, dict):
@@ -22986,9 +23051,6 @@ def _handle_general_alert_external_policy(ctx: dict, source_label: str) -> bool:
     delay_reason = _should_delay_external_general_capture(s)
     if delay_reason:
         return _persist_general_capture_without_external(s, hist_key, source_label, delay_reason)
-    if bool(s.get("theme_chain_force_hit")) and safe_int(s.get("entry_price", 0), 0) > 0:
-        _internal_only_alert_history.pop(hist_key, None)
-        return True
     if _should_send_external_grade_alert(s):
         _internal_only_alert_history.pop(hist_key, None)
         return True
@@ -23126,22 +23188,14 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     code = s.get("code", "")
     signal_type = s.get("signal_type", "")
     grade_upper = str(ctx.get("grade_upper") or s.get("execution_grade") or s.get("grade") or "C").upper()
-    immediate_first_hit = _should_immediate_first_entry_hit_from_signal(s)
-    if immediate_first_hit:
-        s["first_entry_reached"] = True
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
-    watch_key = register_entry_watch(s)
+    register_entry_watch(s)
     register_top_signal(s)
-    if immediate_first_hit and watch_key:
-        try:
-            _maybe_send_immediate_entry_hit_from_signal(s, watch_key, merge_capture_phase1=False)
-        except Exception as e:
-            _swallow_exception(e)
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
         sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
         sector_retry_snap["_alert_sender"] = "send_alert"
@@ -23556,7 +23610,7 @@ def _build_general_a_support_profile(change_rate: float = 0.0, vol_ratio: float 
     premium_flow = _vr >= COMMON_THRESHOLD_3P0 or int(nxt_delta or 0) >= 8
     theme = _extract_alert_sector_theme({"sector_info": sector_info or {}, "sector_theme": (sector_info or {}).get("theme", "")})
     meaningful_theme = theme != "기타"
-    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "섹터 대장 후속 강제감시", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해", "뉴스+주가 연동", "뉴스테마 상승", "이슈 선감지", "테마체인 A승격", "테마체인 직승격"))
+    direct_like = bool(direct_news_hit) or any(token in joined_reasons for token in ("직접뉴스 테마", "신규이슈 자동감지", "테마 동조강세", "섹터 확산", "반복 miss 테마 신규 리더", "섹터 대장 후속 강제감시", "LNG", "플랜트", "열교환기", "암모니아", "수소", "수주", "탈 플라스틱", "친환경", "생분해"))
     intraday_support = any(token in joined_reasons for token in ("거래량 이상 급증", "거래대금 급증", "고가 유지", "코스피 상대강도", "코스닥 상대강도", "장초반 ORB", "전고 돌파", "장중 돌파", "장중돌파", "재상승", "거래량 회복", "20일선 회복", "외국인 음→양 전환", "상한가 근접", "상한가 도달", "전일 포함 연속 패턴", "cross-day", "연속 패턴", "섹터 확산", "follow-up 감시"))
     flow_support = strong_flow or premium_flow
     support_count = sum(1 for flag in (direct_like, meaningful_theme, flow_support, intraday_support) if flag)
@@ -23635,8 +23689,6 @@ def _derive_general_signal_grade(signal_type: str, score: int, change_rate: floa
     return "C"
 def _should_send_external_grade_alert(signal: dict | None) -> bool:
     grade = str((signal or {}).get("execution_grade") or (signal or {}).get("grade") or "").upper()
-    if bool((signal or {}).get("theme_chain_force_hit")) and safe_int((signal or {}).get("entry_price", 0), 0) > 0:
-        return True
     return grade == "A"
 def _record_internal_only_alert(hist_key: str, signal: dict, reason: str) -> bool:
     if not hist_key or not isinstance(signal, dict):
@@ -23669,8 +23721,6 @@ def _sector_gate_sort_key(alert: dict) -> tuple:
         1 if alert.get("leader_priority_hit") else 0,
         1 if alert.get("nxt_post_leader_hit") else 0,
         1 if alert.get("sector_leader_follow_hit") else 0,
-        1 if alert.get("theme_chain_force_hit") else 0,
-        1 if alert.get("theme_chain_capture_hit") else 0,
         1 if alert.get("material_first_priority_hit") else 0,
         1 if alert.get("direct_news_hit") else 0,
         1 if alert.get("theme_drive_hit") else 0,
@@ -25723,108 +25773,6 @@ def analyze_news_theme(headlines: list = None) -> list:
             "signal_strength": strength, "total": total,
         })
     return signals
-def _theme_chain_direct_limit(signal: dict | None = None) -> int:
-    signal = signal if isinstance(signal, dict) else {}
-    strength = str(signal.get("signal_strength") or "")
-    try:
-        react_ratio = float(signal.get("react_ratio", 0.0) or 0.0)
-    except Exception as e:
-        _swallow_exception(e)
-        react_ratio = 0.0
-    total = max(1, safe_int(signal.get("total", 0), 0))
-    if strength == "매우강함":
-        return min(3, total) if react_ratio >= 0.75 else min(2, total)
-    if strength == "강함":
-        return min(2, total) if react_ratio >= 0.5 else 1
-    return 1
-
-def _should_force_theme_chain_direct(signal: dict | None, item: dict | None, rank: int = 0) -> bool:
-    signal = signal if isinstance(signal, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    if rank >= _theme_chain_direct_limit(signal):
-        return False
-    strength = str(signal.get("signal_strength") or "")
-    change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
-    vol_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
-    react_ratio = safe_float(signal.get("react_ratio", 0.0), 0.0)
-    sector_bonus = safe_int(signal.get("sector_bonus", 0), 0)
-    surging = bool(item.get("surging"))
-    if strength == "매우강함":
-        return surging or change_rate >= 4.0 or (react_ratio >= 0.8 and sector_bonus >= 15)
-    if strength == "강함":
-        return surging or (change_rate >= 5.0 and (vol_ratio >= 1.8 or sector_bonus >= 15))
-    return False
-
-def _build_theme_chain_direct_candidate(analyzed: dict | None, signal: dict | None = None, item: dict | None = None, source_label: str = "뉴스테마 상승") -> dict | None:
-    if not isinstance(analyzed, dict):
-        return None
-    signal = signal if isinstance(signal, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    result = dict(analyzed)
-    code = normalize_stock_code(result.get("code") or item.get("code"))
-    if not code:
-        return None
-    result["code"] = code
-    result["name"] = _resolve_stock_name(code, result.get("name") or item.get("name") or code)
-    price = safe_int(item.get("price", 0), safe_int(result.get("price", 0), 0))
-    if price <= 0:
-        return None
-    result["price"] = price
-    signal_type = str(result.get("signal_type") or "SURGE")
-    entry_price = safe_int(result.get("entry_price", 0), 0)
-    if entry_price <= 0 or entry_price > price:
-        entry_price = price
-    stop_price, target_price, stop_pct, target_pct, atr_used = calc_stop_target(code, entry_price, signal_type=signal_type)
-    if stop_price <= 0 or target_price <= entry_price:
-        return None
-    result["entry_price"] = int(entry_price)
-    result["planned_entry_price"] = int(entry_price)
-    result["stop_loss"] = int(stop_price)
-    result["target_price"] = int(target_price)
-    result["stop_pct"] = float(stop_pct or 0.0)
-    result["target_pct"] = float(target_pct or 0.0)
-    result["atr_used"] = bool(atr_used)
-    result["change_rate"] = safe_float(item.get("change_rate", result.get("change_rate", 0.0)), 0.0)
-    result["volume_ratio"] = safe_float(item.get("volume_ratio", result.get("volume_ratio", 0.0)), 0.0)
-    result["today_vol"] = safe_int(item.get("today_vol", result.get("today_vol", 0)), 0)
-    result["ask_qty"] = safe_int(item.get("ask_qty", result.get("ask_qty", 0)), 0)
-    result["bid_qty"] = safe_int(item.get("bid_qty", result.get("bid_qty", 0)), 0)
-    result["theme_chain_execution_plan_hit"] = True
-    result["theme_chain_capture_hit"] = True
-    result["theme_chain_force_hit"] = True
-    result["force_external_capture_alert"] = True
-    result["direct_news_hit"] = True
-    result["material_first_priority_hit"] = True
-    score_floor = 80 if str(signal.get("signal_strength") or "") == "매우강함" else 78
-    result["score"] = max(safe_int(result.get("score", 0), 0), score_floor)
-    result["grade"] = "A"
-    result["execution_grade"] = "A"
-    result["pattern_grade"] = "A"
-    reasons = list(result.get("reasons") or [])
-    theme_desc = str(signal.get("theme_desc") or "")
-    strength = str(signal.get("signal_strength") or "")
-    reasons.append(f"📰 {source_label}: {theme_desc[:28]} ({strength or '강함'})")
-    reasons.append("🏷 테마체인 직승격 A")
-    result["reasons"] = reasons
-    return result
-
-def _apply_theme_chain_capture_adjustment(analyzed: dict | None, signal: dict | None = None, item: dict | None = None, *, source_label: str = "뉴스테마 상승", rank: int = 0) -> dict | None:
-    if not isinstance(analyzed, dict):
-        return analyzed
-    signal = signal if isinstance(signal, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    result = dict(analyzed)
-    reasons = list(result.get("reasons") or [])
-    theme_desc = str(signal.get("theme_desc") or "")
-    strength = str(signal.get("signal_strength") or "")
-    reasons.append(f"📰 {source_label}: {theme_desc[:28]} ({strength or '강함'})")
-    result["reasons"] = reasons
-    result["theme_chain_capture_hit"] = True
-    if _should_force_theme_chain_direct(signal, item, rank=rank):
-        forced = _build_theme_chain_direct_candidate(result, signal=signal, item=item, source_label=source_label)
-        return forced if forced else result
-    return result
-
 def send_news_theme_alert(signal: dict):
     emoji = {"매우강함":"🔥","강함":"✅","보통":"🟡"}.get(signal["signal_strength"],"📢")
     react_pct = int(signal["react_ratio"]*100)
@@ -25855,8 +25803,7 @@ def send_news_theme_alert(signal: dict):
          +"━━━━━━━━━━━━━━━")
     # v81 #1: rising 종목 A급 진입 체인 연결
     # 정보 알람 발송 후 각 상승 종목에 대해 analyze() → A급이면 _dispatch_general_alert_signal()
-    ranked_rising = sorted(signal.get("rising", []), key=lambda item: (1 if item.get("surging") else 0, safe_float(item.get("change_rate", 0.0), 0.0), safe_float(item.get("volume_ratio", 0.0), 0.0)), reverse=True)
-    for rank, r in enumerate(ranked_rising):
+    for r in signal.get("rising", []):
         try:
             cur = get_stock_price(r["code"])
             if not cur:
@@ -25877,14 +25824,16 @@ def send_news_theme_alert(signal: dict):
                 "mktcap":       cur.get("mktcap", 0),
             }
             analyzed = analyze(stock_input)
-            analyzed = _apply_theme_chain_capture_adjustment(analyzed, signal, stock_input, source_label="뉴스테마 상승", rank=rank)
             if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
+                analyzed.setdefault("reasons", []).append(
+                    f"📰 뉴스+주가 연동: {signal['theme_desc'][:25]}"
+                )
                 dispatched = _dispatch_general_alert_signal(
                     analyzed,
                     source_label="뉴스테마 상승"
                 )
                 if dispatched:
-                    _log_info_msg(f"  📰 뉴스테마→A급 진입 체인: {r['name']} {safe_float(stock_input.get('change_rate',0),0.0):+.1f}%")
+                    _log_info_msg(f"  📰 뉴스테마→A급 진입 체인: {r['name']} {r['change_rate']:+.1f}%")
             else:
                 _log_info_msg(f"  ⏭ 뉴스테마 A급 미달: {r['name']} {r.get('change_rate',0):+.1f}% — 내부 기록만")
             time.sleep(0.2)
@@ -25934,22 +25883,15 @@ def _dispatch_issue_prewatch_reacted(pw: dict, reacted: list[dict]) -> set[str]:
     theme_key = str((pw or {}).get("theme_key") or "")
     summary = _summarize_material_reaction(reacted, pw)
     reacted_sorted = sorted(reacted, key=lambda item: _material_reacted_priority_score(item, pw, summary), reverse=True)
-    theme_signal = {
-        "theme_desc": str((pw or {}).get("theme_desc") or (pw or {}).get("headline") or theme_key),
-        "signal_strength": "매우강함" if bool(summary.get("strong")) else "강함",
-        "react_ratio": 1.0 if reacted_sorted else 0.0,
-        "sector_bonus": 15 if bool(summary.get("strong")) else 10,
-        "total": max(1, len(reacted_sorted)),
-    }
-    for rank, item in enumerate(reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]):
+    for item in reacted_sorted[:ISSUE_PREWATCH_REACT_LIMIT]:
         code = item["code"]
         name = item["name"]
         if _is_material_first_stock_cooldown(code, theme_key):
             continue
         try:
             analyzed = analyze(item)
-            analyzed = _apply_theme_chain_capture_adjustment(analyzed, theme_signal, item, source_label="이슈 선감지", rank=rank)
             if analyzed and analyzed.get("grade") == "A" and analyzed.get("entry_price", 0) > 0:
+                analyzed.setdefault("reasons", []).append(f"👁 이슈 선감지: {pw['theme_desc'][:30]}")
                 analyzed["material_first_hint"] = True
                 analyzed["material_first_priority_hit"] = bool(summary.get("strong"))
                 dispatched = _dispatch_general_alert_signal(analyzed, source_label="이슈 선감지")
@@ -26689,6 +26631,7 @@ def _send_menu(title: str = ""):
                 {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
                 {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
                 {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
+                {"text": "♻️ 승률 초기화",     "callback_data": "cmd_reset_stats"},
             ],
             [
                 {"text": "🟡 NXT 현황",        "callback_data": "cmd_nxt"},
@@ -26720,6 +26663,7 @@ def _handle_callback(callback_id: str, data: str):
         "cmd_nxt":     "/nxt",
         "cmd_week":    "/week",
         "cmd_stats":   "/stats",
+        "cmd_reset_stats": "/reset_stats",
         "cmd_stop":    "/stop",
         "cmd_resume":  "/resume",
         "cmd_compact": "/compact",
@@ -27133,7 +27077,8 @@ def _handle_telegram_test_command():
         f"/us — 미국 시장 현황\n"
         f"/geo — 지정학 뉴스 분석\n"
         f"/overnight — 오버나이트 위험도\n"
-        f"/stats — 신호 통계\n"
+        f"/stats — 현재 구조 승률 통계\n"
+        f"/reset_stats — 현재 구조 승률 초기화\n"
         f"/top — 오늘 TOP 5\n"
         f"/nxt — NXT 동향"
     )
@@ -27150,6 +27095,8 @@ def _dispatch_telegram_command(raw: str, text: str):
         "/daily": _handle_telegram_daily_command,
         "/오늘": _handle_telegram_daily_command,
         "/stats": _send_stats,
+        "/reset_stats": lambda: _handle_reset_stats_command("/reset_stats"),
+        "/승률초기화": lambda: _handle_reset_stats_command("/reset_stats"),
         "/menu": _send_menu,
         "/도움": _send_menu,
         "/help": _send_menu,
@@ -27181,6 +27128,9 @@ def _dispatch_telegram_command(raw: str, text: str):
         return
     if text.startswith("/skip"):
         _handle_skip_command(raw)
+        return
+    if text.startswith("/reset_stats") or text.startswith("/승률초기화"):
+        _handle_reset_stats_command(raw)
         return
     if text.startswith("/test"):
         _handle_telegram_test_command()
@@ -27394,6 +27344,7 @@ def _maybe_warn_result_pnl_gap(rec: dict, pnl: float) -> None:
         _swallow_exception(e)
 def _apply_result_signal_update(sig_data: dict, sig_matched_key: str, pnl: float, status_bundle: dict) -> None:
     rec = sig_data[sig_matched_key]
+    _ensure_record_stats_meta(rec)
     if not rec.get("pnl_pct"):
         rec["gross_pnl_pct"] = pnl
         rec["net_pnl_pct"] = pnl
@@ -27427,6 +27378,9 @@ def _build_manual_result_record(name_input: str, pnl: float, status_bundle: dict
         "code": new_key,
         "name": name_input,
         "signal_type": "MANUAL",
+        "bot_version": BOT_VERSION,
+        "stats_cohort": BOT_STATS_COHORT,
+        "structure_cohort": BOT_STATS_COHORT,
         "detect_date": status_bundle["today"],
         "detect_time": status_bundle["exit_time"],
         "detect_price": 0,
@@ -27620,7 +27574,8 @@ def get_missed_profit_summary() -> dict:
         except Exception as e:
             _swallow_exception(e)
         missed = [v for v in data.values()
-                  if v.get("actual_entry") in (False, None)
+                  if _record_matches_stats_scope(v)
+                  and v.get("actual_entry") in (False, None)
                   and v.get("status") in ("수익", "손실", "본전")
                   and v.get("pnl_pct") is not None]
         if not missed:
@@ -27638,17 +27593,21 @@ def get_missed_profit_summary() -> dict:
         _swallow_exception(e)  # v105 structured silent-exception log
         return {"count": 0, "avg_pnl": 0.0, "total_pnl": 0.0, "best": None}
 def _build_signal_stats_context(data: dict) -> dict:
-    completed = [v for v in data.values() if v.get("status") in ["수익", "손실", "본전"]]
-    tracking = _get_valid_tracking(data)
-    actual_entered = [v for v in data.values() if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
-    skipped = [v for v in data.values() if v.get("actual_entry") is False]
+    scoped = _filter_records_by_stats_scope(list(data.values()), cohort=BOT_STATS_COHORT)
+    completed = [v for v in scoped if v.get("status") in ["수익", "손실", "본전"]]
+    tracking = _filter_records_by_stats_scope(_get_valid_tracking(data), cohort=BOT_STATS_COHORT)
+    actual_entered = [v for v in scoped if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
+    skipped = [v for v in scoped if v.get("actual_entry") is False]
     unconfirmed = [v for v in completed if v.get("actual_entry") is None]
     return {
+        "scoped": scoped,
         "completed": completed,
         "tracking": tracking,
         "actual_entered": actual_entered,
         "skipped": skipped,
         "unconfirmed": unconfirmed,
+        "stats_cohort": BOT_STATS_COHORT,
+        "version_label": BOT_VERSION,
         "type_labels": {
             "UPPER_LIMIT": "🚨 상한가",
             "NEAR_UPPER": "🔥 상한가근접",
@@ -27690,7 +27649,7 @@ def _build_signal_stats_header(data: dict, ctx: dict) -> str:
         skip_pnls = [v.get("pnl_pct", 0) for v in skipped if v.get("pnl_pct")]
         opp_cost = sum(skip_pnls) / len(skip_pnls) if skip_pnls else 0
         skip_msg = f"⏭ <b>스킵</b>  {len(skipped)}건  (이론 평균 {opp_cost:+.1f}%)\n  이유: {skip_str}\n"
-    miss_all = [v for v in data.values() if v.get("status") in ["진입미달", "진입가변경"]]
+    miss_all = [v for v in data.values() if _record_matches_stats_scope(v) and v.get("status") in ["진입미달", "진입가변경"]]
     miss_surge = sum(1 for v in miss_all if "상승이탈" in str(v.get("exit_reason", "")))
     miss_expire = sum(1 for v in miss_all if "기간만료" in str(v.get("exit_reason", "")))
     miss_reentry = sum(1 for v in miss_all if "진입가변경" in str(v.get("exit_reason", "")))
@@ -27701,7 +27660,8 @@ def _build_signal_stats_header(data: dict, ctx: dict) -> str:
     return (
         f"📊 <b>신호 성과 통계</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>이론 수익률</b> (봇 학습 기준)  {len(completed)}건\n"
+        f"🧬 <b>현재 구조 cohort</b>  {ctx['stats_cohort']}  (실행 버전 {ctx['version_label']})\n"
+        f"🤖 <b>이론 수익률</b> (현재 구조 기준)  {len(completed)}건\n"
         f"  승률 <b>{total_rate:.0f}%</b>  평균 <b>{avg_pnl:+.1f}%</b>  추적중 {len(tracking)}건\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{actual_msg}{skip_msg}{miss_msg}━━━━━━━━━━━━━━━\n"
@@ -30351,10 +30311,7 @@ def _apply_scan_sector_gate(alerts: list) -> list:
     filtered_alerts = []
     for s in alerts:
         sec = _extract_alert_sector_theme(s)
-        theme_chain_priority = bool(s.get("theme_chain_force_hit") or s.get("theme_chain_capture_hit") or s.get("theme_chain_execution_plan_hit") or s.get("material_first_priority_hit") or s.get("direct_news_hit"))
         sec_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
-        if theme_chain_priority:
-            sec_limit += 2 if sec == "기타" else 1
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
         if sector_counts[sec] <= sec_limit:
             if not s.get("sector_theme") and sec != "기타":
