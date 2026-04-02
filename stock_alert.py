@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.2
+버전: v160.4
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.4 (2026-04-02): v160.2 기능 보존 상태에서 startup 비동기 catch-up + datetime aware 정리 + 삭제방지 검증 강화 — `v160.2`의 stale runtime lock 복구/NXT·오픈 버스트/KPI cohort reset 보강을 그대로 유지한 채, `__main__` 시작부의 동기 `refresh_dynamic_candidates()` 호출과 즉시 스캔 실행을 제거하고 `_schedule_startup_scan_catchup()` 기반 비동기 catch-up으로 전환했다. 또한 carry/priority hint/minutes helper의 datetime 계산을 KST aware 기준으로 통일해 `can't subtract offset-naive and offset-aware datetimes` 잔여 오류를 줄였고, smoke test에는 직전 정상본 핵심 변경사항·변경이력 보존·삭제 금지 규칙 검증을 추가했다.
 - v160.2 (2026-04-02): stale 상위 버전 락 복구 + 장전/NXT·오픈 버스트 + cohort reset 보강 — `runtime_version_lock.json`에 lease/heartbeat 개념을 추가해 죽은 상위 버전 락은 자동 복구하고, 살아 있는 상위 버전만 구버전 런타임을 차단하도록 정리했다. 또한 08:00~09:00 NXT 장전 버스트와 09:00~09:03 KRX 오픈 버스트를 추가해 `refresh_dynamic_candidates(force_rank=True)`·`run_material_first_scan()`·`run_scan()`를 더 촘촘히 돌리도록 보강했다. `compute_signal_kpi()` 경로는 현재 cohort 필터를 강제하고, `/reset_stats 확인`은 signal_log 백업 뒤 통계 시작 시각뿐 아니라 동적 파라미터 baseline·emergency state·연속 손익 카운터까지 함께 초기화한다. 마지막으로 동적 후보군 로그를 `KRX_seed/KRX_rank/NXT_seed/NXT_rank/material_prewatch` 기준으로 분리해 운영 판단이 바로 되도록 정리했다.
 - v160.1 (2026-04-02): v151 기준 누락 기능 재적용 — `현재가<=진입가` 전 신호 공통 1차 진입가 도달 helper와 `/list`·`/watch` 도달 분류 보정, `+ 1차 진입가 도달` 표시를 복구했다. 또한 `EARLY_DETECT`/일반 포착 즉시 도달 연계, `trailing_active` 5일 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시, `send_market_leading_sector_update`용 `_parse_compact_datetime(value, time_value=None)` 및 KST aware 계산을 보강했다. 마지막으로 강한 뉴스테마/이슈 종목 direct 승격과 NXT 거래량 급감 guard 완화를 다시 연결했다.
 - v160 (2026-04-02): 구조 버전별 성과 cohort 분리 + /reset_stats 명령 추가 — 큰 구조 변경은 정수 버전(v160, v161 …)으로 올리고 해당 버전이 곧 새로운 성과 cohort가 되도록 버전 체계를 정리했다. 같은 구조 안의 버그/경미 수정은 소수점 버전(v160.1, v160.2 …)을 쓰도록 helpers를 추가했고, signal_log 신규 레코드에 `bot_version`·`stats_cohort`를 저장한다. `/stats`는 이제 현재 cohort 기준으로만 승률을 계산하며, `/reset_stats 확인`은 signal_log를 백업한 뒤 현재 cohort의 통계 시작 시각만 초기화해 과거 기록은 보존하고 현재 구조 성과만 새로 측정한다.
@@ -3213,8 +3214,10 @@ def _get_tracking_priority_hint(code: str) -> dict:
     row = dict((rows or {}).get(code) or {})
     first_dt = row.get("first_dt")
     last_dt = row.get("last_dt")
-    row["age_hours"] = max(0.0, round((datetime.now() - first_dt).total_seconds() / 3600.0, 2)) if isinstance(first_dt, datetime) else 0.0
-    row["last_seen_hours"] = max(0.0, round((datetime.now() - last_dt).total_seconds() / 3600.0, 2)) if isinstance(last_dt, datetime) else 0.0
+    age_seconds = _kst_seconds_since(first_dt)
+    last_seen_seconds = _kst_seconds_since(last_dt)
+    row["age_hours"] = max(0.0, round(age_seconds / 3600.0, 2)) if age_seconds is not None else 0.0
+    row["last_seen_hours"] = max(0.0, round(last_seen_seconds / 3600.0, 2)) if last_seen_seconds is not None else 0.0
     return row
 def _empty_crossday_episode_context() -> dict:
     return {
@@ -5673,7 +5676,10 @@ def is_nxt_listed(code: str) -> bool:
     """
     return code not in _nxt_unavailable
 def minutes_since(dt: datetime) -> int:
-    return int((datetime.now() - dt).total_seconds() // 60)
+    seconds = _kst_seconds_since(dt)
+    if seconds is None:
+        return 0
+    return int(seconds // 60)
 def is_strict_time() -> bool:
     """v40.0: KRX + NXT 장 초반/후반 엄격 시간대 판별
     v40.0-#8: 14:30 이후 + 금요일 14:00 이후 추가 엄격 판정
@@ -9083,6 +9089,29 @@ def _parse_compact_datetime(value, time_value=None) -> datetime | None:
     except Exception as e:
         _swallow_exception(e)
         return dt
+
+
+def _coerce_kst_datetime(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=_KST)
+        return value.astimezone(_KST)
+    except Exception as e:
+        _swallow_exception(e)
+        return value
+
+def _kst_seconds_since(value: datetime | None, now_dt: datetime | None = None) -> float | None:
+    target = _coerce_kst_datetime(value)
+    if target is None:
+        return None
+    ref = _coerce_kst_datetime(now_dt or _now_kst()) or _now_kst()
+    try:
+        return (ref - target).total_seconds()
+    except Exception as e:
+        _swallow_exception(e)
+        return None
 def _build_latest_tracking_by_code(data: dict | None = None) -> dict[str, dict]:
     latest_by_code = {}
     latest_key_by_code = {}
@@ -9103,10 +9132,11 @@ def _is_active_carry_snapshot(info: dict | None, latest_rec: dict | None = None,
     carry_day = safe_int(info.get("carry_day", 0), 0)
     if carry_day < 0 or carry_day >= MAX_CARRY_DAYS:
         return False
-    detected_at = _parse_compact_datetime(info.get("detected_at"))
+    detected_at = _coerce_kst_datetime(_parse_compact_datetime(info.get("detected_at")))
     if detected_at is not None:
         stale_days = max(MAX_CARRY_DAYS + 1, TRACK_MAX_DAYS)
-        if (datetime.now() - detected_at).days >= stale_days:
+        stale_seconds = _kst_seconds_since(detected_at)
+        if stale_seconds is not None and stale_seconds >= stale_days * 86400:
             return False
     if latest_rec is None:
         return True
@@ -10573,22 +10603,49 @@ def _run_krx_open_burst_scan() -> None:
     _run_scan_burst_window("krx_open", KRX_OPEN_BURST_INTERVAL_SEC)
 
 
+STARTUP_CATCHUP_DELAY_SEC = int(os.getenv("STARTUP_CATCHUP_DELAY_SEC", "3") or "3")
 def _run_startup_scan_catchup() -> None:
-    now = _now_kst()
-    if not is_any_market_open():
-        return
-    window_key = now.strftime("%Y%m%d")
-    if _BURST_SCAN_STATE.get("startup_catchup_done") == window_key:
-        return
-    cur = now.timetz().replace(tzinfo=None)
-    should_run = _is_nxt_premarket_burst_window(now) or _is_krx_open_burst_window(now) or (is_market_open() and dtime(9, 0, 0) <= cur <= dtime(9, 15, 0))
-    if not should_run:
-        return
-    _BURST_SCAN_STATE["startup_catchup_done"] = window_key
-    _log_info_msg("🚀 재시작 catch-up 스캔 시작")
-    refresh_dynamic_candidates(force_rank=True)
-    run_material_first_scan()
-    run_scan()
+    """부팅 직후 메인 루프를 막지 않도록 catch-up 스캔을 비동기로 실행."""
+    try:
+        if is_holiday() or not is_any_market_open():
+            return
+        time.sleep(max(1, STARTUP_CATCHUP_DELAY_SEC))
+        if _runtime_version_blocked:
+            return
+        if not _try_acquire_leader_lock():
+            _log_info_msg("⏸ 시작 직후 catch-up 생략 — passive 모드")
+            return
+        if not _enforce_runtime_version_lock(notify=False):
+            return
+        _send_startup_banner_once()
+        now = _now_kst()
+        window_key = now.strftime("%Y%m%d")
+        cur = now.timetz().replace(tzinfo=None)
+        should_burst = (
+            _is_nxt_premarket_burst_window(now)
+            or _is_krx_open_burst_window(now)
+            or (is_market_open() and dtime(9, 0, 0) <= cur <= dtime(9, 15, 0))
+        )
+        if should_burst and _BURST_SCAN_STATE.get("startup_catchup_done") != window_key:
+            _BURST_SCAN_STATE["startup_catchup_done"] = window_key
+            _log_info_msg("🔄 시작 직후 비동기 burst catch-up 스캔 시작")
+            refresh_dynamic_candidates(force_rank=True)
+            run_material_first_scan()
+            run_scan()
+            return
+        _log_info_msg("🔄 시작 직후 비동기 기본 catch-up 스캔 시작")
+        run_price_first_scan()
+        run_material_first_scan()
+        run_mid_pullback_scan()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 시작 직후 catch-up 스캔 오류: {e}")
+
+def _schedule_startup_scan_catchup() -> None:
+    try:
+        threading.Thread(target=_run_startup_scan_catchup, daemon=True).start()
+        _log_info_msg(f"🪄 시작 직후 catch-up 스캔 예약 ({STARTUP_CATCHUP_DELAY_SEC}s)")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 시작 직후 catch-up 예약 실패: {e}")
 
 def get_all_scan_candidates() -> list:
     """
@@ -16268,7 +16325,7 @@ def _restore_carry_snapshot(sig_data: dict) -> None:
         if dropped_codes:
             _log_info_msg(f"  🧹 stale carry 정리: {len(dropped_codes)}개 제거")
         for code, info in data.items():
-            detected_at = _parse_compact_datetime(info.get("detected_at")) or datetime.now()
+            detected_at = _coerce_kst_datetime(_parse_compact_datetime(info.get("detected_at"))) or _now_kst()
             _detected_stocks[code] = {
                 "name": info.get("name", code),
                 "high_price": safe_int(info.get("high_price", 0), 0),
@@ -30765,12 +30822,10 @@ if __name__ == "__main__":
     _load_market_flow_state()
     load_adaptive_capture_feedback()
     load_stale_replay_penalty_profile()
-    refresh_dynamic_candidates()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
     if _try_acquire_leader_lock():
         if _enforce_runtime_version_lock(notify=True):
             _send_startup_banner_once()
-            _run_startup_scan_catchup()
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
     schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
@@ -30867,10 +30922,7 @@ if __name__ == "__main__":
             except Exception as e:
                 _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
     _maybe_run_preclose_gap_alert_catchup()
-    if _try_acquire_leader_lock() and _enforce_runtime_version_lock(notify=False):
-        run_price_first_scan()
-        run_material_first_scan()
-        run_mid_pullback_scan()
+    _schedule_startup_scan_catchup()
     while True:
         try:
             schedule.run_pending(); time.sleep(1)
