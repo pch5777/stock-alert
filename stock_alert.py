@@ -3,10 +3,13 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.6
+버전: v160.9
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.9 (2026-04-02): NXT/KRX 익일 오픈 평가 시각 분리 — `PRECLOSE_GAP_ENTRY`의 익일 오픈 체크를 시장별로 분리해 NXT는 08:05, KRX는 09:05에 각각 평가하도록 수정했다. `update_preclose_gap_open_outcomes(stage=...)`가 signal별 stage를 읽어 해당 시장만 기록하고, 고우선 정리 메모도 `08:05/09:05`를 시장별로 다르게 표기한다. 또한 startup catch-up도 NXT 08:05 / KRX 09:05 기준으로 다시 확인해, NXT 종가베팅 후보를 KRX와 같은 시각에 늦게 평가하던 문제를 막았다.
+- v160.8 (2026-04-02): NXT 19:20도 종가베팅 final confirm 동일 적용 — v160.7에서 KRX 15:18에만 붙였던 종가베팅 final confirm을 NXT 19:20에도 같은 기준으로 확장했다. 이제 NXT 선진입 후보도 `phase="final"`로 처리되어 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 외국인·기관 수급, 1분봉 20선 지지를 같은 축으로 다시 확인하고, 최종 점수 문턱과 안내 문구도 final 기준을 사용한다.
+- v160.7 (2026-04-02): 종가베팅 final confirm + 전고/윗꼬리/눌림/수급 필터 + 익일 09:05 청산우선도 — 기존 `PRECLOSE_GAP_ENTRY` 구조는 유지한 채 KRX 14:45 1차 선별 뒤 15:18 최종 확정 스캔을 추가했다. 종가선진입 점수화에는 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 1분봉 20선 지지, 외국인·기관 수급 우호를 반영해 종가베팅형 후보를 더 보수적으로 재평가한다. 또한 `update_preclose_gap_open_outcomes()`는 익일 09:05 기록 시 갭상승·시초 약세 기준의 청산 우선도와 메모를 함께 남기고, 우선 정리 필요 종목은 묶음 안내로 정리한다.
 - v160.6 (2026-04-02): 정규장 재료 prewatch 반응 완화 + 오전 NXT 저품질 후보 축소 — 하향추세 차단은 유지한 채 정규장에서는 강한 재료 seed의 prewatch 반응 기준을 `quality_score/headline_count` 기반으로 완화해 `뉴스 있지만 주가 반응 없음`으로 오래 묻히는 종목이 더 빨리 본스캔에 합류하도록 조정했다. 동시에 오전 NXT는 `_get_nxt_premarket_quality_gate()`를 추가해 0점/C급/진입가 미확정으로 반복 쌓이던 저품질 후보를 사전 제거하고, 장전 NXT 본스캔도 같은 gate를 통과한 후보만 돌도록 정리했다. 이로써 현대로템 같은 주봉·일봉 하향 추세 차단은 그대로 유지하면서도 정규장 진짜 재료 반응형과 오전 NXT 실행형 후보의 품질을 더 보수적으로 맞췄다.
 - v160.5 (2026-04-02): 네이버 코스닥 상승/거래량 순위 URL 404 복구 — `_fetch_naver_rank()`를 코스피/코스닥 분리 경로(`*_kosdaq.naver`) 대신 공통 `sise_rise.naver`/`sise_quant.naver`에 `sosok=0/1` 파라미터를 붙여 요청하도록 바꿨다. 코스닥 direct path 404를 제거하고, 응답 인코딩도 `apparent_encoding`/`euc-kr` 기준으로 보정해 외부 fallback 품질을 유지했다. 또한 smoke test에 구형 `*_kosdaq.naver` URL 금지와 `sosok` 파라미터 기반 요청 검증을 추가했다.
 - v160.4 (2026-04-02): v160.2 기능 보존 상태에서 startup 비동기 catch-up + datetime aware 정리 + 삭제방지 검증 강화 — `v160.2`의 stale runtime lock 복구/NXT·오픈 버스트/KPI cohort reset 보강을 그대로 유지한 채, `__main__` 시작부의 동기 `refresh_dynamic_candidates()` 호출과 즉시 스캔 실행을 제거하고 `_schedule_startup_scan_catchup()` 기반 비동기 catch-up으로 전환했다. 또한 carry/priority hint/minutes helper의 datetime 계산을 KST aware 기준으로 통일해 `can't subtract offset-naive and offset-aware datetimes` 잔여 오류를 줄였고, smoke test에는 직전 정상본 핵심 변경사항·변경이력 보존·삭제 금지 규칙 검증을 추가했다.
@@ -4771,10 +4774,20 @@ NXT_SURGE_REENTRY_RAISE_THRESHOLD = float(os.getenv("NXT_SURGE_REENTRY_RAISE_THR
 NXT_SURGE_REENTRY_PULLBACK_FACTOR = float(os.getenv("NXT_SURGE_REENTRY_PULLBACK_FACTOR", "0.97") or "0.97")
 PRECLOSE_GAP_KRX_CATCHUP_START = dtime(14, 45)
 PRECLOSE_GAP_KRX_CATCHUP_END = dtime(15, 5)
+PRECLOSE_GAP_FINAL_CONFIRM_START = dtime(15, 18)
+PRECLOSE_GAP_FINAL_CONFIRM_END = dtime(15, 20)
 PRECLOSE_GAP_NXT_CATCHUP_START = dtime(19, 20)
 PRECLOSE_GAP_NXT_CATCHUP_END = dtime(19, 35)
-PRECLOSE_GAP_STAGE_LABEL_KRX = "KRX 14:45"
+PRECLOSE_GAP_STAGE_LABEL_KRX = "KRX 14:45 1차"
+PRECLOSE_GAP_STAGE_LABEL_KRX_FINAL = "KRX 15:18 최종"
 PRECLOSE_GAP_STAGE_LABEL_NXT = "NXT 19:20"
+PRECLOSE_GAP_STAGE_LABEL_NXT_FINAL = "NXT 19:20 최종"
+PRECLOSE_GAP_FINAL_MIN_SCORE_BONUS = int(os.getenv("PRECLOSE_GAP_FINAL_MIN_SCORE_BONUS", "5") or "5")
+PRECLOSE_GAP_FINAL_NEAR_HIGH_MAX_DIST_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_NEAR_HIGH_MAX_DIST_PCT", "2.2") or "2.2")
+PRECLOSE_GAP_FINAL_VALUE_RATIO_STRONG = float(os.getenv("PRECLOSE_GAP_FINAL_VALUE_RATIO_STRONG", "2.8") or "2.8")
+PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT", "0.8") or "0.8")
+PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT", "1.8") or "1.8")
+PRECLOSE_GAP_FINAL_OPEN_EXIT_PULLBACK_FROM_HIGH_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_OPEN_EXIT_PULLBACK_FROM_HIGH_PCT", "1.2") or "1.2")
 CROSSDAY_EPISODE_MAX_HOURS = float(os.getenv("CROSSDAY_EPISODE_MAX_HOURS", "42") or "42")
 CROSSDAY_PRIOR_SURGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_SURGE_MIN_PCT", "7.0") or "7.0")
 CROSSDAY_PRIOR_RANGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_RANGE_MIN_PCT", "9.0") or "9.0")
@@ -7521,7 +7534,8 @@ PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
 PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
 PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.00") or "1.00")
 PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT", "0.8") or "0.8")
-PRECLOSE_GAP_OPEN_EVAL_TIME = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME", "09:05") or "09:05"
+PRECLOSE_GAP_OPEN_EVAL_TIME_KRX = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_KRX", "09:05") or "09:05"
+PRECLOSE_GAP_OPEN_EVAL_TIME_NXT = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_NXT", "08:05") or "08:05"
 _preclose_gap_entry_watch: dict = {}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
 def _read_json_safe(path: str, default):
@@ -9547,6 +9561,27 @@ def _round_price_up(price: float) -> int:
     except Exception as e:
         _swallow_exception(e)
         return int(price or 0)
+def _normalize_preclose_gap_phase(phase: str | None) -> str:
+    return "final" if str(phase or "").strip().lower() == "final" else "initial"
+
+def _get_preclose_gap_stage_label(stage: str, phase: str = "initial") -> str:
+    stage = "nxt" if str(stage or "").lower() == "nxt" else "krx"
+    phase = _normalize_preclose_gap_phase(phase)
+    if stage == "nxt":
+        return PRECLOSE_GAP_STAGE_LABEL_NXT_FINAL if phase == "final" else PRECLOSE_GAP_STAGE_LABEL_NXT
+    if phase == "final":
+        return PRECLOSE_GAP_STAGE_LABEL_KRX_FINAL
+    return PRECLOSE_GAP_STAGE_LABEL_KRX
+
+def _get_preclose_gap_stage_summary(stage: str, phase: str = "initial") -> str:
+    stage = "nxt" if str(stage or "").lower() == "nxt" else "krx"
+    phase = _normalize_preclose_gap_phase(phase)
+    if stage == "nxt":
+        return "NXT 종가베팅 최종 확정" if phase == "final" else "최종 보정"
+    if phase == "final":
+        return "종가베팅 최종 확정"
+    return "1차 선별"
+
 def _resolve_preclose_gap_live_quote(code: str, stage: str) -> dict:
     use_nxt = bool(str(stage or "").lower() == "nxt" and is_nxt_open() and is_nxt_listed(code))
     try:
@@ -9641,6 +9676,214 @@ def _load_next_open_gap_candidate_context(code: str, stage: str) -> dict | None:
         "change_rate": float(cur.get("change_rate", 0.0) or 0.0),
         "volume_ratio": float(cur.get("volume_ratio", 0.0) or 0.0),
     }
+def _get_preclose_gap_trade_value_context(code: str, ctx: dict) -> dict:
+    cur = ctx.get("cur") if isinstance(ctx.get("cur"), dict) else {}
+    price = safe_int(ctx.get("price", 0), 0)
+    today_vol = safe_int(cur.get("today_vol", 0), 0)
+    trade_amount = safe_int(cur.get("trade_amount", 0), 0)
+    if trade_amount <= 0 and price > 0 and today_vol > 0:
+        trade_amount = int(price * today_vol)
+    avg_trade_amount = _get_recent_avg_trade_amount(code)
+    value_ratio = round((trade_amount / avg_trade_amount), 2) if trade_amount > 0 and avg_trade_amount > 0 else 0.0
+    return {"trade_amount": trade_amount, "avg_trade_amount": avg_trade_amount, "value_ratio": value_ratio}
+
+def _get_preclose_gap_intraday_candle_context(ctx: dict) -> dict:
+    cur = ctx.get("cur") if isinstance(ctx.get("cur"), dict) else {}
+    price = safe_int(ctx.get("price", 0), 0)
+    high = safe_int(ctx.get("high", 0), 0)
+    open_price = safe_int(cur.get("open", 0), 0)
+    low = safe_int(cur.get("low", 0), 0)
+    body = abs(price - open_price) if price > 0 and open_price > 0 else 0
+    upper_shadow = max(high - max(price, open_price), 0) if high > 0 else 0
+    full_range = max(high - min(price if price > 0 else high, open_price if open_price > 0 else high), 1) if high > 0 else 1
+    upper_shadow_body_ratio = round((upper_shadow / max(body, 1)), 2) if high > 0 else 0.0
+    close_ratio = round((price / high), 4) if price > 0 and high > 0 else 0.0
+    green_close = bool(price > 0 and open_price > 0 and price >= open_price)
+    return {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "body": body,
+        "upper_shadow": upper_shadow,
+        "upper_shadow_body_ratio": upper_shadow_body_ratio,
+        "close_ratio": close_ratio,
+        "green_close": green_close,
+        "full_range": full_range,
+    }
+
+def _get_preclose_gap_pullback_context(code: str, current_price: int) -> dict:
+    items = get_daily_data(code, 25)
+    if len(items) < 6:
+        return {}
+    today = datetime.now().strftime("%Y%m%d")
+    hist = [row for row in items if str(row.get("date", "") or "") < today]
+    recent = hist[-12:]
+    if len(recent) < 5:
+        return {}
+    highs = [safe_int(row.get("high", 0), 0) for row in recent if safe_int(row.get("high", 0), 0) > 0]
+    if not highs:
+        return {}
+    recent_high = max(highs)
+    anchor_idx = 0
+    for idx, row in enumerate(recent):
+        if safe_int(row.get("high", 0), 0) == recent_high:
+            anchor_idx = idx
+    after_anchor = recent[anchor_idx + 1:]
+    pullback_low = min((safe_int(row.get("low", 0), 0) for row in after_anchor if safe_int(row.get("low", 0), 0) > 0), default=0)
+    pullback_days = len(after_anchor)
+    pullback_pct = round((recent_high - pullback_low) / recent_high * 100.0, 2) if recent_high > 0 and pullback_low > 0 else 0.0
+    lows_tail = [safe_int(row.get("low", 0), 0) for row in recent[-4:] if safe_int(row.get("low", 0), 0) > 0]
+    higher_low = len(lows_tail) >= 3 and lows_tail[-3] < lows_tail[-2] <= lows_tail[-1]
+    closes_tail = [safe_int(row.get("close", 0), 0) for row in recent[-3:] if safe_int(row.get("close", 0), 0) > 0]
+    reclaim_ready = len(closes_tail) >= 2 and safe_int(current_price, 0) >= max(closes_tail[-2:])
+    healthy_pullback = bool(pullback_days >= 2 and 4.0 <= pullback_pct <= 18.0 and reclaim_ready)
+    return {
+        "recent_high": recent_high,
+        "pullback_low": pullback_low,
+        "pullback_days": pullback_days,
+        "pullback_pct": pullback_pct,
+        "higher_low": higher_low,
+        "reclaim_ready": reclaim_ready,
+        "healthy_pullback": healthy_pullback,
+    }
+
+def _get_preclose_gap_minute_support_context(code: str, current_price: int) -> dict:
+    mins = _get_minute_data(code, count=24)
+    closes = [safe_int(item.get("close", 0), 0) for item in mins if safe_int(item.get("close", 0), 0) > 0]
+    if len(closes) < 20 or safe_int(current_price, 0) <= 0:
+        return {}
+    ma20 = sum(closes[-20:]) / 20.0
+    recent_high = max(closes[-5:]) if len(closes) >= 5 else max(closes)
+    pullback_pct = round((recent_high - closes[-1]) / max(recent_high, 1) * 100.0, 2) if recent_high > 0 else 0.0
+    support_gap_pct = round((safe_int(current_price, 0) - ma20) / max(ma20, 1) * 100.0, 2) if ma20 > 0 else 0.0
+    ma20_supported = bool(support_gap_pct >= -PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT and pullback_pct >= 0.15)
+    below_ma20 = bool(support_gap_pct < -PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT)
+    return {
+        "ma20": round(ma20, 1),
+        "support_gap_pct": support_gap_pct,
+        "pullback_pct": pullback_pct,
+        "ma20_supported": ma20_supported,
+        "below_ma20": below_ma20,
+    }
+
+def _apply_preclose_gap_close_betting_context(score: int, reasons: list[str], cautions: list[str],
+                                              ctx: dict, stage: str, phase: str) -> tuple[int, list[str], list[str]]:
+    breakout = _get_recent_high_breakout_context(ctx.get("code", ""), ctx.get("price", 0), lookback_days=20)
+    distance_pct = float(breakout.get("distance_pct", -99.0) or -99.0)
+    if distance_pct >= 0:
+        score += 10; reasons.append(f"🏁 신고가/전고 돌파 {distance_pct:+.1f}% +10")
+    elif distance_pct >= -PRECLOSE_GAP_FINAL_NEAR_HIGH_MAX_DIST_PCT:
+        score += 7; reasons.append(f"🏁 전고 {abs(distance_pct):.1f}% 이내 +7")
+    elif distance_pct >= -4.5:
+        score += 3; reasons.append(f"🏁 전고 근접 {abs(distance_pct):.1f}% +3")
+    else:
+        cautions.append(f"📏 전고 이격 {abs(distance_pct):.1f}%")
+    candle = _get_preclose_gap_intraday_candle_context(ctx)
+    upper_shadow_body_ratio = float(candle.get("upper_shadow_body_ratio", 0.0) or 0.0)
+    close_ratio = float(candle.get("close_ratio", 0.0) or 0.0)
+    if candle.get("green_close") and close_ratio >= 0.987 and upper_shadow_body_ratio <= 0.45:
+        score += 7; reasons.append("🕯 윗꼬리 짧은 양봉 +7")
+    elif upper_shadow_body_ratio >= 1.2 and close_ratio < 0.992:
+        score -= 6; cautions.append("🕯 윗꼬리 부담 -6")
+    elif not candle.get("green_close") and safe_int(candle.get("open", 0), 0) > 0:
+        cautions.append("🕯 종가 음봉/몸통 약화")
+    trade_ctx = _get_preclose_gap_trade_value_context(ctx.get("code", ""), ctx)
+    value_ratio = float(trade_ctx.get("value_ratio", 0.0) or 0.0)
+    if value_ratio >= PRECLOSE_GAP_FINAL_VALUE_RATIO_STRONG:
+        score += 8; reasons.append(f"💵 거래대금 {value_ratio:.1f}배 +8")
+    elif value_ratio >= 1.6:
+        score += 4; reasons.append(f"💵 거래대금 {value_ratio:.1f}배 +4")
+    pullback = _get_preclose_gap_pullback_context(ctx.get("code", ""), ctx.get("price", 0))
+    if pullback.get("healthy_pullback"):
+        score += 6; reasons.append(f"📐 조정 {pullback.get('pullback_pct',0):.1f}% 후 재상승 +6")
+    if pullback.get("higher_low"):
+        score += 5; reasons.append("📐 저점 상승 구조 +5")
+    sentiment = detect_foreign_institution_turnaround(ctx.get("code", ""))
+    foreign_net = safe_int(sentiment.get("foreign_net", 0), 0)
+    institution_net = safe_int(sentiment.get("institution_net", 0), 0)
+    if sentiment.get("foreign_turnaround") and sentiment.get("institution_buying"):
+        score += 8; reasons.append("🧲 외국인 전환 + 기관 순매수 +8")
+    elif foreign_net > 0 and institution_net > 0:
+        score += 4; reasons.append("🧲 외국인·기관 동시 순매수 +4")
+    elif institution_net < 0 and foreign_net < 0:
+        cautions.append("🧲 외국인·기관 동반 순매도")
+    if _normalize_preclose_gap_phase(phase) == "final":
+        minute_ctx = _get_preclose_gap_minute_support_context(ctx.get("code", ""), ctx.get("price", 0))
+        if minute_ctx.get("ma20_supported"):
+            score += 6; reasons.append(f"⏱ 1분봉 20선 지지 {minute_ctx.get('support_gap_pct',0):+.1f}% +6")
+        elif minute_ctx.get("below_ma20"):
+            score -= 5; cautions.append(f"⏱ 1분봉 20선 이탈 -5 ({minute_ctx.get('support_gap_pct',0):+.1f}%)")
+    return score, reasons, cautions
+
+
+
+def _get_preclose_gap_signal_stage(rec: dict) -> str:
+    meta = rec.get("gap_entry_meta") or {}
+    if isinstance(meta, dict):
+        stage = str(meta.get("stage", "") or "").lower()
+        market_basis = str(meta.get("market_basis", "") or "").upper()
+        if stage == "nxt" or market_basis == "NXT":
+            return "nxt"
+    return "krx"
+
+def _get_preclose_gap_open_eval_label(stage: str) -> str:
+    return PRECLOSE_GAP_OPEN_EVAL_TIME_NXT if str(stage).lower() == "nxt" else PRECLOSE_GAP_OPEN_EVAL_TIME_KRX
+
+def _is_preclose_gap_open_eval_due(stage: str, grace_minutes: int = 10) -> bool:
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    target_hhmm = _get_preclose_gap_open_eval_label(stage)
+    try:
+        hh, mm = [int(x) for x in str(target_hhmm).split(":", 1)]
+    except Exception:
+        return False
+    now = _now_kst()
+    target_dt = datetime.combine(now.date(), dtime(hh, mm), tzinfo=_KST)
+    delta_sec = (now - target_dt).total_seconds()
+    return 0 <= delta_sec <= grace_minutes * 60
+
+
+def _build_preclose_gap_open_exit_priority(rec: dict, open_price: int, day_high: int, current_price: int) -> dict:
+    stage = _get_preclose_gap_signal_stage(rec)
+    eval_label = _get_preclose_gap_open_eval_label(stage)
+    entry = safe_int(rec.get("entry_price", 0), 0)
+    if entry <= 0 or open_price <= 0:
+        return {"priority": "normal", "note": "", "gap_pct": 0.0}
+    gap_pct = round((open_price - entry) / entry * 100.0, 2)
+    current_from_open_pct = round((current_price - open_price) / max(open_price, 1) * 100.0, 2) if current_price > 0 else 0.0
+    high_pullback_pct = round((day_high - current_price) / max(day_high, 1) * 100.0, 2) if day_high > 0 and current_price > 0 else 0.0
+    if open_price < entry:
+        return {"priority": "high", "note": f"시초가가 진입가 대비 {gap_pct:+.1f}% — 시초 약세, 즉시 방어 우선", "gap_pct": gap_pct}
+    if gap_pct >= PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT and (current_from_open_pct <= -0.2 or high_pullback_pct >= PRECLOSE_GAP_FINAL_OPEN_EXIT_PULLBACK_FROM_HIGH_PCT):
+        return {"priority": "high", "note": f"시초 갭 {gap_pct:+.1f}% 후 탄력 둔화 — {eval_label} 이내 청산 우선", "gap_pct": gap_pct}
+    if gap_pct >= PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT:
+        return {"priority": "high", "note": f"시초 갭 {gap_pct:+.1f}% 확보 — {eval_label} 이내 익절 우선", "gap_pct": gap_pct}
+    if current_from_open_pct <= -0.7:
+        return {"priority": "high", "note": f"시초 대비 {current_from_open_pct:+.1f}% 약세 — {eval_label} 이내 방어 우선", "gap_pct": gap_pct}
+    return {"priority": "normal", "note": "", "gap_pct": gap_pct}
+
+
+
+def _send_preclose_gap_open_exit_brief(rows: list[dict], stage: str = "krx") -> None:
+    rows = [row for row in rows if isinstance(row, dict)]
+    if not rows:
+        return
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    eval_label = _get_preclose_gap_open_eval_label(stage)
+    market_label = "NXT" if stage == "nxt" else "KRX"
+    msg = (
+        f"🟠 <b>[종가선진입 익일 오픈 체크 - {market_label}]</b>  {datetime.now().strftime('%H:%M')}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📌 {eval_label} 기준 고우선 정리 후보\n"
+    )
+    for idx, row in enumerate(rows[:6], 1):
+        msg += (
+            f"\n{idx}) <b>{row.get('name','')}</b>  {row.get('code','')}\n"
+            f"  🎯 진입 {int(row.get('entry_price',0) or 0):,}원  →  시초 {int(row.get('open_price',0) or 0):,}원  ({float(row.get('gap_pct',0.0) or 0.0):+.1f}%)\n"
+            f"  📝 {row.get('note','')}\n"
+        )
+    msg += "\n⚠️ 종가베팅 전용 익일 오픈 관리 메모입니다. 실제 체결 여부는 사용자 기준으로 최종 확인하세요."
+    send_by_level(msg, level=ALERT_LEVEL_NORMAL)
+
 def _score_next_open_gap_price_volume(ctx: dict) -> tuple[int, list[str], list[str]]:
     price = int(ctx.get("price", 0) or 0)
     high = int(ctx.get("high", 0) or 0)
@@ -9741,7 +9984,7 @@ def _apply_next_open_gap_flow_context(score: int, reasons: list[str], ctx: dict,
     return score, reasons
 def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | None, us: dict,
                                       sector_info: dict, score: int, reasons: list[str], cautions: list[str],
-                                      similar_pattern_stats: dict, similar_pattern_summary: str) -> dict | None:
+                                      similar_pattern_stats: dict, similar_pattern_summary: str, phase: str = "initial") -> dict | None:
     plan = _build_preclose_gap_entry_plan(ctx["code"], ctx["price"], ctx["change_rate"], stage)
     if not plan:
         return None
@@ -9758,7 +10001,8 @@ def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | 
     if entry_slippage_pct > 0:
         cautions.append(f"📐 현재가 대비 진입 슬리피지 {entry_slippage_pct:.1f}%")
     score = int(round(score))
-    min_score = NEXT_OPEN_GAP_MIN_SCORE - (2 if stage == "nxt" else 0)
+    phase = _normalize_preclose_gap_phase(phase)
+    min_score = NEXT_OPEN_GAP_MIN_SCORE - (2 if stage == "nxt" else 0) + (PRECLOSE_GAP_FINAL_MIN_SCORE_BONUS if phase == "final" else 0)
     if score < min_score:
         return None
     sig_type = latest_rec.get("signal_type", "") if latest_rec else ""
@@ -9793,9 +10037,10 @@ def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | 
         "atr_used": bool(plan["atr_used"]),
         "gap_signal": str(us.get("gap_signal", "flat") or "flat"),
         "market_basis": "NXT" if ctx.get("use_nxt") else "KRX",
+        "phase": phase,
     }
 def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | None,
-                                   us: dict, strong_dart_codes: set) -> dict | None:
+                                   us: dict, strong_dart_codes: set, phase: str = "initial") -> dict | None:
     ctx = _load_next_open_gap_candidate_context(code, stage)
     if not ctx:
         return None
@@ -9806,12 +10051,15 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
     )
     similar_pattern_summary = _build_similar_pattern_summary_block(similar_pattern_stats)
     score, reasons = _apply_next_open_gap_flow_context(score, reasons, ctx, stage)
+    score, reasons, cautions = _apply_preclose_gap_close_betting_context(score, reasons, cautions, ctx, stage, phase)
     score, reasons, cautions = _apply_next_open_gap_market_context(score, reasons, cautions, ctx, us, strong_dart_codes)
-    return _finalize_next_open_gap_candidate(ctx, stage, latest_rec, us, sector_info, score, reasons, cautions, similar_pattern_stats, similar_pattern_summary)
-def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPEN_GAP_MAX_SHOW) -> dict:
+    return _finalize_next_open_gap_candidate(ctx, stage, latest_rec, us, sector_info, score, reasons, cautions, similar_pattern_stats, similar_pattern_summary, phase=phase)
+def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPEN_GAP_MAX_SHOW, phase: str = "initial") -> dict:
     """장후반/NXT 후반 기준 익영업일 갭상승 선진입 후보를 점수화해 저장."""
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
-    stage_label = "1차 선별" if stage == "krx" else "최종 보정"
+    phase = _normalize_preclose_gap_phase(phase)
+    stage_label = _get_preclose_gap_stage_summary(stage, phase)
+    stage_tag = _get_preclose_gap_stage_label(stage, phase)
     signal_data = _read_json_safe(SIGNAL_LOG_FILE, {})
     if isinstance(signal_data, dict):
         signal_records = [v for v in signal_data.values() if isinstance(v, dict)]
@@ -9845,7 +10093,7 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
             continue
         latest_rec = _latest_signal_record_by_code(code, signal_records)
         try:
-            scored = _score_next_open_gap_candidate(code, stage, latest_rec, us, strong_dart_codes)
+            scored = _score_next_open_gap_candidate(code, stage, latest_rec, us, strong_dart_codes, phase=phase)
             if scored:
                 candidates.append(scored)
         except Exception as e:
@@ -9859,6 +10107,8 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
         "time": datetime.now().strftime("%H:%M"),
         "stage": stage,
         "stage_label": stage_label,
+        "stage_tag": stage_tag,
+        "phase": phase,
         "market_basis": "NXT" if stage == "nxt" else "KRX",
         "us_gap_signal": us.get("gap_signal", "flat"),
         "pool_count": len(pool_codes),
@@ -9887,6 +10137,7 @@ def _build_preclose_gap_signal_stock(candidate: dict, stage: str, now_dt: dateti
             "rr": float(candidate.get("rr", 0.0) or 0.0), "pullback_pct": float(candidate.get("pullback_pct", 0.0) or 0.0),
             "entry_slippage_pct": float(candidate.get("entry_slippage_pct", 0.0) or 0.0), "entry_basis": candidate.get("entry_basis", "last_price"),
             "actionable_now": bool(candidate.get("actionable_now", True)),
+            "phase": candidate.get("phase", "initial"),
             "gap_signal": candidate.get("gap_signal", "flat"), "origin_signal_type": candidate.get("origin_signal_type", ""),
         },
     }
@@ -10079,17 +10330,26 @@ def check_preclose_gap_entry_watch() -> None:
         changed = True
     if changed:
         _save_preclose_gap_entry_watch()
-def update_preclose_gap_open_outcomes() -> None:
-    """전일 PRECLOSE_GAP_ENTRY 신호의 익일 시초가/갭률을 signal_log에 기록."""
+
+def update_preclose_gap_open_outcomes(stage: str = "all") -> None:
+    """전일 PRECLOSE_GAP_ENTRY 신호의 익일 시초가/갭률을 시장별 오픈 시각에 맞춰 기록."""
     try:
-        if is_holiday() or not is_market_open():
+        if is_holiday():
             return
+        stage = str(stage or "all").lower()
+        if stage == "nxt" and not is_nxt_open():
+            return
+        if stage == "krx" and not is_market_open():
+            return
+        if stage not in {"all", "krx", "nxt"}:
+            stage = "all"
         data = _read_json_safe(SIGNAL_LOG_FILE, {})
         if not isinstance(data, dict):
             return
         today = datetime.now().strftime("%Y%m%d")
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         changed = False
+        exit_rows_by_stage = {"krx": [], "nxt": []}
         for rec in data.values():
             if not isinstance(rec, dict):
                 continue
@@ -10100,6 +10360,14 @@ def update_preclose_gap_open_outcomes() -> None:
                 continue
             if rec.get("next_open_date") == today:
                 continue
+            rec_stage = _get_preclose_gap_signal_stage(rec)
+            if stage in {"krx", "nxt"} and rec_stage != stage:
+                continue
+            if stage == "all":
+                if rec_stage == "nxt" and not is_nxt_open():
+                    continue
+                if rec_stage == "krx" and not is_market_open():
+                    continue
             code = normalize_stock_code(rec.get("code"))
             if not code:
                 continue
@@ -10109,6 +10377,8 @@ def update_preclose_gap_open_outcomes() -> None:
             open_price = int(cur.get("open", 0) or 0)
             if open_price <= 0:
                 continue
+            current_price = int(cur.get("price", 0) or 0)
+            day_high = int(cur.get("high", 0) or 0)
             entry = int(rec.get("entry_price", 0) or 0)
             rec["next_open_date"] = today
             rec["next_open_eval_time"] = now_s
@@ -10116,16 +10386,31 @@ def update_preclose_gap_open_outcomes() -> None:
             if entry > 0:
                 rec["next_open_gap_pct"] = round((open_price - entry) / entry * 100, 2)
                 try:
-                    day_high = int(cur.get("high", 0) or 0)
                     if day_high > 0:
                         rec["next_open_day_high_pct"] = round((day_high - entry) / entry * 100, 2)
                 except Exception as e:
                     _swallow_exception(e)
+                exit_ctx = _build_preclose_gap_open_exit_priority(rec, open_price, day_high, current_price)
+                rec["next_open_exit_priority"] = exit_ctx.get("priority", "normal")
+                rec["next_open_exit_note"] = exit_ctx.get("note", "")
+                if exit_ctx.get("priority") == "high":
+                    exit_rows_by_stage.setdefault(rec_stage, []).append({
+                        "code": code,
+                        "name": rec.get("name", code),
+                        "entry_price": entry,
+                        "open_price": open_price,
+                        "gap_pct": exit_ctx.get("gap_pct", rec.get("next_open_gap_pct", 0.0)),
+                        "note": exit_ctx.get("note", ""),
+                    })
             changed = True
         if changed:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        for exit_stage, rows in exit_rows_by_stage.items():
+            if rows:
+                _send_preclose_gap_open_exit_brief(rows, stage=exit_stage)
     except Exception as e:
         _log_warn_msg(f"⚠️ preclose gap open outcome 기록 오류: {e}")
+
 def _get_preclose_gap_run_state() -> dict:
     try:
         st = _read_json_safe(PRECLOSE_GAP_RUN_STATE_FILE, {})
@@ -10138,11 +10423,12 @@ def _save_preclose_gap_run_state(state: dict):
         _write_json_atomic(PRECLOSE_GAP_RUN_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
     except Exception as e:
         _log_warn_msg(f"⚠️ preclose_gap_run_state 저장 오류: {e}")
-def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0):
+def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0, phase: str = "initial"):
     st = _get_preclose_gap_run_state()
     today = datetime.now().strftime("%Y%m%d")
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
-    st_key = f"{today}_{stage}"
+    phase = _normalize_preclose_gap_phase(phase)
+    st_key = f"{today}_{stage}_{phase}"
     st[st_key] = {
         "date": today,
         "stage": stage,
@@ -10150,17 +10436,32 @@ def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0):
         "candidate_count": int(candidate_count or 0),
         "ts": time.time(),
         "time": datetime.now().strftime("%H:%M:%S"),
+        "phase": phase,
     }
     _save_preclose_gap_run_state(st)
-def _was_preclose_gap_run(stage: str) -> bool:
+def _was_preclose_gap_run(stage: str, phase: str = "initial") -> bool:
     st = _get_preclose_gap_run_state()
     today = datetime.now().strftime("%Y%m%d")
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
-    return f"{today}_{stage}" in st
+    phase = _normalize_preclose_gap_phase(phase)
+    return f"{today}_{stage}_{phase}" in st
+
 def _maybe_run_preclose_gap_alert_catchup():
     if is_holiday() or not _try_acquire_leader_lock():
         return
     now_t = datetime.now().time()
+    try:
+        if _is_preclose_gap_open_eval_due("nxt"):
+            _log_info_msg("🕒 NXT 익일 오픈 평가 catch-up 점검")
+            update_preclose_gap_open_outcomes(stage="nxt")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ NXT 익일 오픈 평가 catch-up 실패: {e}")
+    try:
+        if _is_preclose_gap_open_eval_due("krx"):
+            _log_info_msg("🕒 KRX 익일 오픈 평가 catch-up 점검")
+            update_preclose_gap_open_outcomes(stage="krx")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ KRX 익일 오픈 평가 catch-up 실패: {e}")
     try:
         if PRECLOSE_GAP_KRX_CATCHUP_START <= now_t <= PRECLOSE_GAP_KRX_CATCHUP_END:
             _log_info_msg("🕒 KRX 선진입 후보 catch-up 점검")
@@ -10168,19 +10469,27 @@ def _maybe_run_preclose_gap_alert_catchup():
     except Exception as e:
         _log_warn_msg(f"⚠️ KRX 선진입 후보 catch-up 실패: {e}")
     try:
+        if PRECLOSE_GAP_FINAL_CONFIRM_START <= now_t <= PRECLOSE_GAP_FINAL_CONFIRM_END:
+            _log_info_msg("🕒 KRX 종가베팅 final confirm 점검")
+            send_next_open_gap_alert(stage="krx", phase="final")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ KRX 종가베팅 final confirm 실패: {e}")
+    try:
         if PRECLOSE_GAP_NXT_CATCHUP_START <= now_t <= PRECLOSE_GAP_NXT_CATCHUP_END:
             _log_info_msg("🕒 NXT 선진입 후보 catch-up 점검")
-            send_next_open_gap_alert(stage="nxt")
+            send_next_open_gap_alert(stage="nxt", phase="final")
     except Exception as e:
         _log_warn_msg(f"⚠️ NXT 선진입 후보 catch-up 실패: {e}")
-def send_next_open_gap_alert(stage: str = "krx"):
+
+def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
     """장마감 전에 익영업일 갭상승 선진입 후보를 보수적으로 발송."""
     if is_holiday():
         _log_info_msg("⏸ 선진입 후보 스캔 생략 — 공휴일")
         return
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
-    stage_tag = PRECLOSE_GAP_STAGE_LABEL_NXT if stage == "nxt" else PRECLOSE_GAP_STAGE_LABEL_KRX
-    if _was_preclose_gap_run(stage):
+    phase = _normalize_preclose_gap_phase(phase)
+    stage_tag = _get_preclose_gap_stage_label(stage, phase)
+    if _was_preclose_gap_run(stage, phase=phase):
         _log_info_msg(f"⏭️ [{stage_tag}] 선진입 후보 스캔 중복 생략 — 오늘 이미 처리됨")
         return
     if stage == "krx" and not is_market_open():
@@ -10190,23 +10499,24 @@ def send_next_open_gap_alert(stage: str = "krx"):
         _log_info_msg(f"⏸ [{stage_tag}] 선진입 후보 스캔 생략 — NXT 장 미운영")
         return
     _log_info_msg(f"🕒 [{stage_tag}] 선진입 후보 스캔 시작")
-    payload = build_next_open_gap_candidates(stage=stage, max_items=NEXT_OPEN_GAP_MAX_SHOW)
+    payload = build_next_open_gap_candidates(stage=stage, max_items=NEXT_OPEN_GAP_MAX_SHOW, phase=phase)
     cand = payload.get("candidates") or []
     pool_count = int(payload.get("pool_count", 0) or 0)
     candidate_count = int(payload.get("candidate_count", len(cand)) or len(cand))
     if not cand:
         _log_info_msg(f"📭 [{stage_tag}] 후보 0건 (pool={pool_count}, candidate={candidate_count})")
-        _mark_preclose_gap_run(stage, status="zero", candidate_count=0)
+        _mark_preclose_gap_run(stage, status="zero", candidate_count=0, phase=phase)
         return
     for item in cand:
         item["stage"] = stage
-        item["stage_label"] = payload.get("stage_label", "1차 선별" if stage == "krx" else "최종 보정")
+        item["phase"] = phase
+        item["stage_label"] = payload.get("stage_label", _get_preclose_gap_stage_summary(stage, phase))
         item["market_basis"] = payload.get("market_basis", "KRX")
         _upsert_preclose_gap_signal(item, stage=stage)
     msg = (
         f"🚀 <b>[익영업일 갭상승 실전 선진입]</b>  {payload.get('time','')}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🕒 {payload.get('stage_label','')}  ·  {payload.get('market_basis','KRX')} 기준\n"
+        f"🕒 {payload.get('stage_tag', payload.get('stage_label',''))}  ·  {payload.get('market_basis','KRX')} 기준\n"
     )
     for idx, item in enumerate(cand, 1):
         sim_summary = str(item.get("similar_pattern_summary", "") or "").strip()
@@ -10226,9 +10536,12 @@ def send_next_open_gap_alert(stage: str = "krx"):
     summary = str(us.get("summary", "") or "").splitlines()[0].strip()
     if summary:
         msg += f"\n━━━━━━━━━━━━━━━\n🌐 {summary}\n"
+    if phase == "final":
+        final_label = "15:18 종가베팅 final confirm" if stage == "krx" else "19:20 NXT 종가베팅 final confirm"
+        msg += f"⚠️ 본 묶음은 {final_label} 결과입니다. 전고 근접·윗꼬리·1분봉 20선 지지를 다시 확인했습니다.\n"
     msg += "⚠️ 이 알림은 장마감 전 즉시 체결 가능한 가격 기준 실전 선진입 플랜입니다. 현재가보다 낮은 눌림 대기 진입가는 사용하지 않습니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
-    _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand))
+    _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand), phase=phase)
     _log_info_msg(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
 def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
     """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
@@ -30935,14 +31248,20 @@ if __name__ == "__main__":
     schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
     schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
-    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME).do(_leader_job(
-        lambda: None if is_holiday() else update_preclose_gap_open_outcomes()
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_leader_job(
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
+    ))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_leader_job(
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
     ))
     schedule.every().day.at("14:45").do(_leader_job(
-        lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx")
+        lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="initial")
+    ))
+    schedule.every().day.at("15:18").do(_leader_job(
+        lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="final")
     ))
     schedule.every().day.at("19:20").do(_leader_job(
-        lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt")
+        lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt", phase="final")
     ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
