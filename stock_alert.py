@@ -3,11 +3,12 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161
+버전: v162
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v161 (2026-04-02): 눌림목 3종 실전 패턴 확장 — `MID_PULLBACK`/`intraday_reclaim` 경로에 (1) 갭상승 후 시가 회복 돌파, (2) 박스권 상단 돌파·하단 지지, (3) higher low + 거래대금 재유입 구조를 추가 반영했다. 일봉 눌림목은 박스 구조·전고 근접·저점 상승 가점을 받아 주도주 조정 재개형을 더 잘 살리고, 장중 재상승은 1분봉 기반 시가 회복/박스 돌파/저점 상승 구조가 확인되면 별도 가점과 final 이유로 승격된다. 실행등급 프로필에도 `시가회복/박스돌파/박스지지/저점상승/전고근접` 토큰을 연결해 좋은 재상승형 종목 누락을 줄이되 하향추세 차단과 A 외부알림 보수성은 유지한다.
+- v162 (2026-04-02): v160.10 기준에서 눌림목 3종 포착 보강 재적용 — 오류본 v161에서 유효했던 포착 보강만 직전 정상본 v160.10 위에 다시 얹었다. `MID_PULLBACK`/`intraday_reclaim` 경로에 (1) 갭상승 후 시가 회복 돌파, (2) 박스권 상단 돌파·하단 지지, (3) higher low + 거래대금 재유입 구조를 재반영해 좋은 재상승형 종목 누락을 줄였다. 일봉 눌림목은 박스 구조·전고 근접·저점 상승 가점을 받고, 장중 재상승은 1분봉 기반 시가 회복/박스 돌파/저점 상승 구조가 확인되면 별도 가점과 이유로 승격된다. 실행등급 프로필에도 `시가회복/박스돌파/박스지지/저점상승/전고근접` 토큰을 다시 연결하되, v160.10의 timezone/업종 fallback/run_scan 결측 복구 수정은 그대로 유지한다.
+- v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
 - v160.9 (2026-04-02): NXT/KRX 익일 오픈 평가 시각 분리 — `PRECLOSE_GAP_ENTRY`의 익일 오픈 체크를 시장별로 분리해 NXT는 08:05, KRX는 09:05에 각각 평가하도록 수정했다. `update_preclose_gap_open_outcomes(stage=...)`가 signal별 stage를 읽어 해당 시장만 기록하고, 고우선 정리 메모도 `08:05/09:05`를 시장별로 다르게 표기한다. 또한 startup catch-up도 NXT 08:05 / KRX 09:05 기준으로 다시 확인해, NXT 종가베팅 후보를 KRX와 같은 시각에 늦게 평가하던 문제를 막았다.
 - v160.8 (2026-04-02): NXT 19:20도 종가베팅 final confirm 동일 적용 — v160.7에서 KRX 15:18에만 붙였던 종가베팅 final confirm을 NXT 19:20에도 같은 기준으로 확장했다. 이제 NXT 선진입 후보도 `phase="final"`로 처리되어 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 외국인·기관 수급, 1분봉 20선 지지를 같은 축으로 다시 확인하고, 최종 점수 문턱과 안내 문구도 final 기준을 사용한다.
 - v160.7 (2026-04-02): 종가베팅 final confirm + 전고/윗꼬리/눌림/수급 필터 + 익일 09:05 청산우선도 — 기존 `PRECLOSE_GAP_ENTRY` 구조는 유지한 채 KRX 14:45 1차 선별 뒤 15:18 최종 확정 스캔을 추가했다. 종가선진입 점수화에는 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 1분봉 20선 지지, 외국인·기관 수급 우호를 반영해 종가베팅형 후보를 더 보수적으로 재평가한다. 또한 `update_preclose_gap_open_outcomes()`는 익일 09:05 기록 시 갭상승·시초 약세 기준의 청산 우선도와 메모를 함께 남기고, 우선 정리 필요 종목은 묶음 안내로 정리한다.
@@ -7300,8 +7301,6 @@ def _build_mid_pullback_today_context(items: list[dict], today: dict, avg_pullba
         "current_pullback": current_pullback,
         "today_chg": today_chg,
     }
-
-
 def _build_mid_pullback_structure_context(after_peak: list[dict], today: dict, avg_pullback_vol: float) -> dict:
     tail_rows = [row for row in (after_peak or []) if isinstance(row, dict)]
     if not tail_rows:
@@ -7343,6 +7342,7 @@ def _build_mid_pullback_structure_context(after_peak: list[dict], today: dict, a
         "recent_high_gap_pct": recent_high_gap_pct,
         "near_recent_high": near_recent_high,
     }
+
 def _build_mid_pullback_base_context(code: str) -> dict:
     items = _load_mid_pullback_items(code)
     if not items:
@@ -7412,8 +7412,6 @@ def _score_mid_pullback_recovery_signals(ctx: dict, score: int, reasons: list[st
     if MA20_DISCOUNT_MAX <= ctx["ma20_dev"] <= MA20_DISCOUNT_MIN:
         score += 5; reasons.append(f"📐 20일선 저점 근접 ({ctx['ma20_dev']:+.1f}%)")
     return score, reasons
-
-
 def _score_mid_pullback_structure_signals(ctx: dict, score: int, reasons: list[str]) -> tuple[int, list[str]]:
     structure_ctx = ctx.get("structure_ctx") or {}
     if bool(structure_ctx.get("higher_low_active")):
@@ -7425,6 +7423,7 @@ def _score_mid_pullback_structure_signals(ctx: dict, score: int, reasons: list[s
     if bool(structure_ctx.get("near_recent_high")):
         score += 7; reasons.append(f"🏁 전고 {structure_ctx.get('recent_high_gap_pct', 0):.1f}% 이내 +7")
     return score, reasons
+
 def _score_mid_pullback_market_signals(code: str, ctx: dict, score: int, reasons: list[str]) -> tuple[int, list[str], float, float]:
     kospi_chg = get_kospi_change()
     rs = get_relative_strength(ctx["today_chg"])
@@ -8596,17 +8595,14 @@ def confirm_bottom_and_signal(watch: dict, current_price: int, current_data: dic
         strength = _classify_signal_strength(watch, exec_metrics)
         low_price_time = watch.get("low_price_time") or ""
         if isinstance(low_price_time, datetime):
-            low_dt = low_price_time
+            low_dt = _coerce_kst_datetime(low_price_time) or _now_kst()
         else:
-            try:
-                low_dt = datetime.strptime(str(low_price_time), "%Y-%m-%d %H:%M:%S")
-            except Exception as e:
-                _swallow_exception(e)  # v105 structured silent-exception log
-                low_dt = datetime.now()
+            low_dt = _parse_compact_datetime(low_price_time) or _now_kst()
+        low_age_sec = _kst_seconds_since(low_dt)
         essential_check = {
             "volume": volume_ratio >= 2.5,
             "strength": strength in ("강한",),
-            "time": (datetime.now() - low_dt).total_seconds() <= 1800,
+            "time": low_age_sec is not None and low_age_sec <= 1800,
         }
         if not all(essential_check.values()):
             result["reason"] = "필수조건 미충족"
@@ -11115,8 +11111,6 @@ def _find_intraday_pullback_surge(hist: list[dict]) -> dict:
             surge_pct = round(pct, 1)
             surge_peak_idx = i
     return {} if surge_peak_idx < 0 or surge_peak_price == 0 else {"surge_peak_price": surge_peak_price, "surge_pct": surge_pct, "surge_peak_idx": surge_peak_idx}
-
-
 def _build_intraday_reclaim_structure_context(ctx: dict) -> dict:
     mins = _get_minute_data(ctx.get("code", ""), count=max(24, MID_PULLBACK_INTRADAY_BOX_LOOKBACK + 12))
     if len(mins) < 12:
@@ -11176,6 +11170,7 @@ def _build_intraday_reclaim_structure_context(ctx: dict) -> dict:
         "box_breakout_hit": box_breakout_hit,
         "gap_up_reclaim_hit": gap_up_reclaim_hit,
     }
+
 def _analyze_intraday_pullback_window(ctx: dict, surge_meta: dict) -> dict:
     hist = ctx["hist"]
     surge_peak_idx = surge_meta["surge_peak_idx"]
@@ -14339,10 +14334,14 @@ def get_theme_sector_stocks(code: str) -> tuple:
                     peers_all[c] = (n, "동적테마", ti["desc"])
             break
     # 3. KIS 업종코드 매칭 (나머지 채우기용)
+    base_ctx = _load_sector_stock_base_context(code) if code else {}
+    kis_sector_name = str((base_ctx or {}).get("bstp_name", "") or "").strip()
+    if theme_name == "기타업종" and kis_sector_name not in ("", "동일업종", "업종미상", "미분류", "unknown"):
+        theme_name = kis_sector_name
     kis_peers = get_sector_stocks_from_kis(code)
     for c, n in kis_peers:
         if c not in peers_all:
-            peers_all[c] = (n, "업종코드", "")
+            peers_all[c] = (n, "업종코드", kis_sector_name)
     peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
     return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
 # ════════════════════════════════════════════════════════════
@@ -18317,22 +18316,23 @@ def _signal_age_minutes_for_retry(s: dict | None) -> int:
         return 10**9
     detected_at = s.get("detected_at")
     if isinstance(detected_at, datetime):
-        return max(0, minutes_since(detected_at))
+        secs = _kst_seconds_since(detected_at)
+        return max(0, int((secs or 0) // 60)) if secs is not None else 10**9
     if isinstance(detected_at, str):
         detected_at = detected_at.strip()
         if not detected_at:
             return 10**9
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S"):
+        parsed = _parse_compact_datetime(detected_at)
+        if parsed is None and len(detected_at) == 8 and detected_at.count(":") == 2:
+            now_dt = _now_kst()
             try:
-                parsed = datetime.strptime(detected_at, fmt)
-                if fmt == "%H:%M:%S":
-                    parsed = datetime.now().replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
-                return max(0, int((datetime.now() - parsed).total_seconds() // 60))
-            except ValueError:
-                continue
+                hh, mm, ss = [int(x) for x in detected_at.split(":")[:3]]
+                parsed = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             except Exception as e:
                 _swallow_exception(e)
-                continue
+                parsed = None
+        secs = _kst_seconds_since(parsed)
+        return max(0, int((secs or 0) // 60)) if secs is not None else 10**9
     return 10**9
 def _latest_entry_watch_by_code(code: str) -> dict | None:
     if not code or not _entry_watch:
@@ -18365,8 +18365,9 @@ def _sector_resend_relevance_ok(alert_snapshot: dict, si_retry: dict) -> bool:
         hit_time = str(watch.get("entry_hit_time") or "").strip()
         if hit_time:
             try:
-                parsed = datetime.strptime(hit_time, "%Y-%m-%d %H:%M:%S")
-                if (datetime.now() - parsed).total_seconds() / 60.0 > SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES:
+                parsed = _parse_compact_datetime(hit_time)
+                secs = _kst_seconds_since(parsed)
+                if secs is not None and secs / 60.0 > SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES:
                     return False
             except Exception as e:
                 _swallow_exception(e)
@@ -24073,7 +24074,7 @@ def _extract_alert_sector_theme(alert: dict) -> str:
         sec = str(alert.get("sector_theme", "") or "").strip()
         if not sec:
             sec = str((alert.get("sector_info") or {}).get("theme", "") or "").strip()
-        if sec in ("", "기타업종", "unknown", "미분류"):
+        if sec in ("", "기타업종", "동일업종", "업종미상", "unknown", "미분류"):
             return "기타"
         return sec
     except Exception as e:
@@ -24082,7 +24083,7 @@ def _extract_alert_sector_theme(alert: dict) -> str:
 def _is_generic_sector_theme(theme_name: str) -> bool:
     try:
         theme = str(theme_name or "").strip()
-        return theme in ("", "기타", "기타업종", "unknown", "미분류")
+        return theme in ("", "기타", "기타업종", "동일업종", "업종미상", "unknown", "미분류")
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return True
@@ -30902,8 +30903,105 @@ def _normalize_scan_signal_code(payload: dict | None = None, fallback_code: str 
         return code
     return normalize_stock_code(fallback_code or "")
 
-def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
+def _needs_run_scan_payload_repair(payload: dict | None = None) -> bool:
+    item = payload if isinstance(payload, dict) else {}
+    code = _normalize_scan_signal_code(item)
+    if not code:
+        return False
+    signal_type = str(item.get("signal_type") or "").strip().upper()
+    score = safe_int(item.get("score", 0), 0)
+    change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    return signal_type in ("", "UNKNOWN") or score <= 0 or (abs(change_rate) < 0.01 and volume_ratio <= 0.0)
+
+def _build_fallback_scan_signal_type(item: dict) -> str:
+    signal_type = str(item.get("signal_type") or "").strip().upper()
+    if signal_type not in ("", "UNKNOWN"):
+        return signal_type
+    change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    if change_rate >= UPPER_LIMIT_THRESHOLD:
+        return "NEAR_UPPER"
+    if change_rate >= max(PRICE_SURGE_MIN, 4.0) or volume_ratio >= max(3.0, COMMON_THRESHOLD_3P0):
+        return "SURGE"
+    if change_rate >= max(0.8, _early_price_min_dynamic) and volume_ratio >= max(1.2, _early_volume_min_dynamic * 0.7):
+        return "EARLY_DETECT"
+    return ""
+
+def _build_fallback_scan_score(item: dict, signal_type: str = "") -> int:
+    score = safe_int(item.get("score", 0), 0)
+    if score > 0:
+        return score
+    change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    sig = str(signal_type or item.get("signal_type") or "").upper()
+    base = 0
+    if sig == "UPPER_LIMIT":
+        base = 90
+    elif sig == "NEAR_UPPER":
+        base = 82
+    elif sig == "SURGE":
+        base = 62
+    elif sig == "EARLY_DETECT":
+        base = 54
+    base += min(18, max(0, int(abs(change_rate) * 1.4)))
+    base += min(14, max(0, int(volume_ratio * 2.5)))
+    return max(0, min(99, base))
+
+def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | None = None) -> dict:
     item = dict(payload or {})
+    code = _normalize_scan_signal_code(item, fallback_code=fallback_code)
+    if not code:
+        return item
+    item["code"] = code
+    market = "NXT" if str(item.get("market", "") or "").upper() == "NXT" else "KRX"
+    if _needs_run_scan_payload_repair(item):
+        try:
+            quote = get_nxt_stock_price(code) if market == "NXT" else get_stock_price(code)
+        except Exception as e:
+            _swallow_exception(e)
+            quote = {}
+        if isinstance(quote, dict) and quote.get("price"):
+            for key in ("name", "price", "change_rate", "volume_ratio", "today_vol", "market", "open", "prev_close", "ask_qty", "bid_qty", "ask_price", "bid_price", "bstp_code"):
+                if quote.get(key) not in (None, "", 0):
+                    item[key] = quote.get(key)
+        item["change_rate"] = _get_effective_change_rate(item, safe_int(item.get("price", 0), 0))
+        try:
+            analyzed = analyze(item)
+        except Exception as e:
+            _swallow_exception(e)
+            analyzed = {}
+        if isinstance(analyzed, dict) and _normalize_scan_signal_code(analyzed, fallback_code=code) == code:
+            merged = dict(item)
+            merged.update(analyzed)
+            if item.get("market") and not merged.get("market"):
+                merged["market"] = item.get("market")
+            merged_reasons = list(item.get("reasons") or []) + list(analyzed.get("reasons") or [])
+            if merged_reasons:
+                uniq = []
+                seen_reason = set()
+                for reason in merged_reasons:
+                    key = str(reason)
+                    if key in seen_reason:
+                        continue
+                    seen_reason.add(key)
+                    uniq.append(reason)
+                merged["reasons"] = uniq
+            item = merged
+    signal_type = _build_fallback_scan_signal_type(item)
+    if signal_type and str(item.get("signal_type") or "").strip().upper() in ("", "UNKNOWN"):
+        item["signal_type"] = signal_type
+    if safe_int(item.get("score", 0), 0) <= 0:
+        item["score"] = _build_fallback_scan_score(item, signal_type=str(item.get("signal_type") or signal_type or ""))
+    if not str(item.get("grade") or item.get("execution_grade") or "").strip():
+        score = safe_int(item.get("score", 0), 0)
+        grade = "A" if score >= 80 else "B" if score >= 60 else "C"
+        item["grade"] = grade
+        item["execution_grade"] = grade
+    return item
+
+def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
+    item = _repair_run_scan_payload(payload, fallback_code=fallback_code)
     code = _normalize_scan_signal_code(item, fallback_code=fallback_code)
     if code:
         item["code"] = code
@@ -30927,7 +31025,7 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
     if "reasons" not in item or not isinstance(item.get("reasons"), list):
         item["reasons"] = list(item.get("reasons") or []) if item.get("reasons") else []
     if "detected_at" not in item or item.get("detected_at") in (None, ""):
-        item["detected_at"] = datetime.now()
+        item["detected_at"] = _now_kst()
     return item
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     cleaned = []
