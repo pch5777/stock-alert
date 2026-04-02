@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.12
+버전: v160.13
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.13 (2026-04-02): 종목명 강제 복구 + 예상 체결가 선계산/원인추적 + 일반 포착 알람 폭탄 억제 — 사용자 메인 알림 전에 종목명을 다중 캐시/KIS/NXT/public fallback으로 강제 복구하고, 끝까지 이름을 못 찾으면 외부 발송 대신 코드수정 요청 알림을 남기도록 정리했다. 또한 일반 포착은 예상 체결가(대표/계획/체결기반)가 비면 현재 호가·현재가 기반으로 즉시 보정하고, 그래도 계산이 안 되면 원인을 기록한 뒤 자동보정 실패 코드수정 알림으로 넘긴다. 마지막으로 동일 종목 일반 포착은 의미 있는 강화가 없으면 재알림 쿨다운으로 외부 폭탄을 막고, 외부알림 지연/내부감시 유지 로그도 별도 쿨다운을 둬 내부감시 로그와 사용자 체감 알림이 섞여 쏟아지지 않게 보강했다.
 - v160.12 (2026-04-02): 비정상 상위 잠금 자동 복구 + 잠금 로그 숫자 노출 최소화 — `runtime_version_lock.json`에 `lock_kind=authoritative` 메타를 기록하고, 이 메타 없이 남은 구형 정수형 상위 잠금은 비정상 잠금으로 보고 자동 복구하도록 정리했다. 이로써 오류본에서 남은 특정 잠금 버전 숫자 노출과 잘못된 상위 잠금 차단을 줄인다. 문서/스모크도 최근 오류본 표기를 일반화해 다음 정상 버전 체계(`v160.x`)와 혼선이 생기지 않게 맞췄다.
 - v160.11 (2026-04-02): v160.10 안정화 유지 + 눌림목 3종 재적용 + token 재발급 쿨다운/섹터 재보정/run_scan 결측 정리 — 직전 정상본 v160.10 위에 오류본에서 유효했던 눌림목 3종 포착 보강(갭상승 후 시가 회복, 박스권 상단 돌파·하단 지지, higher low + 거래대금 재유입)을 다시 얹었다. 동시에 KIS tokenP 403 `EGW00133`가 뜨면 1분 내 재발급 재시도를 중단하고 쿨다운을 기록해 같은 분 연속 발급을 막는다. run_scan은 섹터 gate 직전에 종목의 업종/테마를 한 번 더 재보정해 `기타` 쏠림을 줄이고, 시세·신호 결측 payload는 재복구 후에도 불완전하면 일반 포착에서 제거해 `+0.0% [] 0점 [C]` 로그가 반복되지 않게 했다. 또한 눌림목 결과 dict는 provisional grade를 먼저 채워 `눌림목 오류 (...): 'grade'`를 막는다.
 - v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
@@ -4866,6 +4867,9 @@ FULL_SESSION_CAPTURE_PROFILES = {
     "other": {"label": "전시간대", "early_min_change": 2.0, "early_min_vol": 1.6, "surge_min_change": 4.5, "surge_min_vol": 2.3, "near_upper_min_change": 22.0, "near_upper_min_vol": COMMON_THRESHOLD_3P0, "required_vol_mult": {"EARLY_DETECT": 1.0, "SURGE": 1.0, "NEAR_UPPER": 1.0, "UPPER_LIMIT": 1.0}, "surge_cap": 6.0, "surge_strong_cap": 5.2, "near_upper_cap": 4.5, "upper_limit_cap": 3.2, "a_relax_bonus": 0, "confirm_count": 3, "promo_bonus": {"EARLY_DETECT": 0, "SURGE": 0, "NEAR_UPPER": 0}},
 }
 INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "900") or "900")
+GENERAL_CAPTURE_REALERT_COOLDOWN_SEC = int(os.getenv("GENERAL_CAPTURE_REALERT_COOLDOWN_SEC", "2700") or "2700")
+INTERNAL_MONITOR_LOG_COOLDOWN_SEC = int(os.getenv("INTERNAL_MONITOR_LOG_COOLDOWN_SEC", "1800") or "1800")
+STOCK_NAME_CACHE_FILE = _state_path("stock_name_cache.json")
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
 MA20_DISCOUNT_MAX  = -30.0  # 20일선 아래 최대 (%)
@@ -5469,6 +5473,9 @@ def _log_error(func_name: str, e: Exception, critical: bool = False):
             _swallow_exception(e)
 _alert_history      = {}
 _internal_only_alert_history = {}
+_capture_user_alert_state = {}
+_capture_monitor_log_state = {}
+_stock_name_cache_runtime = {}
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
@@ -10902,21 +10909,81 @@ def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
     if compact.isdigit() and len(compact) >= 5:
         return True
     return False
+def _load_stock_name_cache() -> dict:
+    try:
+        data = _read_json_safe(STOCK_NAME_CACHE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+def _remember_stock_name(code: str, name: str = "") -> None:
+    code = normalize_stock_code(code)
+    nm = str(name or "").strip()
+    if not code or _looks_like_placeholder_stock_name(code, nm):
+        return
+    try:
+        if str(_stock_name_cache_runtime.get(code, "") or "").strip() == nm:
+            return
+        _stock_name_cache_runtime[code] = nm
+        cache = _load_stock_name_cache()
+        if str(cache.get(code, "") or "").strip() != nm:
+            cache[code] = nm
+            _write_json_atomic(STOCK_NAME_CACHE_FILE, cache, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+def _get_cached_stock_name(code: str) -> str:
+    code = normalize_stock_code(code)
+    if not code:
+        return ""
+    try:
+        nm = str(_stock_name_cache_runtime.get(code, "") or "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            return nm
+        cache = _load_stock_name_cache()
+        nm = str(cache.get(code, "") or "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            _stock_name_cache_runtime[code] = nm
+            return nm
+    except Exception as e:
+        _swallow_exception(e)
+    return ""
+def _fetch_public_stock_name_by_code(code: str) -> str:
+    code = normalize_stock_code(code)
+    if not code:
+        return ""
+    try:
+        resp = _session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=6, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        html = resp.text or ""
+        m = _re.search(r'<title>\s*([^:<\|]+?)\s*[:\|]', html, _re.I)
+        nm = str(m.group(1) if m else "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            _remember_stock_name(code, nm)
+            return nm
+    except Exception as e:
+        _swallow_exception(e)
+    return ""
 def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None) -> str:
-    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태로 복구."""
+    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태/캐시/public fallback으로 복구."""
     code = normalize_stock_code(code) or str(code or "").strip()
     try:
         nm = str(name_hint or "").strip()
         if not _looks_like_placeholder_stock_name(code, nm):
+            _remember_stock_name(code, nm)
             return nm
         if isinstance(cur, dict):
             nm = str(cur.get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_stock_name(code, nm)
                 return nm
+        nm = _get_cached_stock_name(code)
+        if not _looks_like_placeholder_stock_name(code, nm):
+            return nm
         try:
             info = get_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_stock_name(code, nm)
                 return nm
         except Exception as e:
             _swallow_exception(e)
@@ -10924,18 +10991,21 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
             info = get_nxt_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_stock_name(code, nm)
                 return nm
         except Exception as e:
             _swallow_exception(e)
         try:
-            for pool in (_entry_watch, _execution_setup_watch):
-                for rec in list((pool or {}).values()):
+            for pool in (_entry_watch, _execution_setup_watch, _detected_stocks):
+                values = list((pool or {}).values()) if isinstance(pool, dict) else []
+                for rec in values:
                     if not isinstance(rec, dict):
                         continue
                     if normalize_stock_code(rec.get("code")) != code:
                         continue
                     nm = str(rec.get("name", "") or "").strip()
                     if not _looks_like_placeholder_stock_name(code, nm):
+                        _remember_stock_name(code, nm)
                         return nm
         except Exception as e:
             _swallow_exception(e)
@@ -10949,9 +11019,13 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
                         continue
                     nm = str(rec.get("name", "") or "").strip()
                     if not _looks_like_placeholder_stock_name(code, nm):
+                        _remember_stock_name(code, nm)
                         return nm
         except Exception as e:
             _swallow_exception(e)
+        nm = _fetch_public_stock_name_by_code(code)
+        if not _looks_like_placeholder_stock_name(code, nm):
+            return nm
     except Exception as e:
         _swallow_exception(e)
     return code or str(name_hint or "").strip()
@@ -11479,7 +11553,8 @@ def _handle_mid_pullback_internal_paths(signal: dict) -> bool:
         if not promoted:
             save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
+        if _should_emit_internal_monitor_log(signal.get("code", ""), f"mid_pullback_c:{signal.get('grade','C')}"):
+            _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'실알림 억제/내부감시 자동승격' if promoted else '실알림 억제/내부기록 유지'}")
         return True
     if not _should_send_external_grade_alert(signal):
         grade = str(signal.get('grade', 'C')).upper()
@@ -11488,13 +11563,15 @@ def _handle_mid_pullback_internal_paths(signal: dict) -> bool:
         if logged and not promoted:
             save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
+        if _should_emit_internal_monitor_log(signal.get("code", ""), f"mid_pullback_grade:{signal.get('grade','C')}"):
+            _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점 — {'외부억제/내부감시 자동승격' if promoted else '외부알림 억제/내부기록 유지'}")
         return True
     _, existing_hit_watch = _find_existing_entry_hit_watch(signal.get("code", ""))
     if existing_hit_watch is not None:
         save_signal_log(signal)
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} — 기존 entry_hit 유지, 외부알림 생략")
+        if _should_emit_internal_monitor_log(signal.get("code", ""), "mid_pullback_entry_hit"):
+            _log_info_msg(f"  ⏭ 눌림목 {tag}: {signal.get('name','')} — 기존 entry_hit 유지, 외부알림 생략")
         return True
     return False
 def _dispatch_mid_pullback_signal(signal: dict) -> None:
@@ -11546,6 +11623,9 @@ def run_mid_pullback_scan():
     for signal in _prepare_mid_pullback_signals(signals):
         _dispatch_mid_pullback_signal(signal)
 def send_mid_pullback_alert(s: dict):
+    ok_actionable, _ = _ensure_signal_actionability(s, live=s, source_label="눌림목")
+    if not ok_actionable:
+        return
     stock_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = stock_name
     entry_price = safe_int(s.get("entry_price", 0), 0)
@@ -11599,6 +11679,7 @@ def get_stock_price(code: str) -> dict:
                       else "small"),
     }
     try:
+        _remember_stock_name(code, payload.get("name", ""))
         _record_execution_snapshot(code, payload, market="KRX")
     except Exception as e:
         _swallow_exception(e)
@@ -12385,6 +12466,7 @@ def get_nxt_stock_price(code: str) -> dict:
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
     }
     try:
+        _remember_stock_name(code, payload.get("name", ""))
         _record_execution_snapshot(code, payload, market="NXT")
     except Exception as e:
         _swallow_exception(e)
@@ -21233,6 +21315,9 @@ def _build_send_alert_compact_text(signal: dict, visuals: dict) -> str:
     return f"{visuals['lvl_icon']}{visuals['emoji']} {visuals['name_dot']}<b>{signal['name']}</b>  {signal['change_rate']:+.1f}%  {signal['score']}점 ({_signal_total_score_label(signal['score'])}){visuals['nxt_badge']}\n현재가 {price:,}원"
 def send_alert(signal: dict):
     global _last_external_alert_ts
+    ok_actionable, _ = _ensure_signal_actionability(signal, live=signal, source_label="일반 포착")
+    if not ok_actionable:
+        return
     signal["name"] = _resolve_stock_name(signal.get("code", ""), signal.get("name", ""))
     _last_external_alert_ts = time.time()
     if _should_throttle_send_alert_signal(signal):
@@ -21407,6 +21492,123 @@ def _format_capture_secondary_price_line(price: int, secondary_price: int, label
     return f"🎯 {label} <b>{secondary_price:,}원</b>  (현재가 대비 {gap_pct:+.1f}%{source_tail})"
 def _format_capture_expected_entry_line(price: int, expected_entry: int, source_label: str = "") -> str:
     return _format_capture_secondary_price_line(price, expected_entry, "예상진입가", source_label)
+def _capture_user_alert_key(signal: dict | None = None) -> str:
+    signal = signal if isinstance(signal, dict) else {}
+    code = normalize_stock_code(signal.get("code", ""))
+    market = "NXT" if str(signal.get("market") or "").upper() == "NXT" else "KRX"
+    return f"{market}:{code}" if code else ""
+def _capture_signal_strength_rank(signal: dict | None = None) -> int:
+    signal = signal if isinstance(signal, dict) else {}
+    return {"MID_PULLBACK": 1, "ENTRY_POINT": 1, "EARLY_DETECT": 2, "SURGE": 3, "NEAR_UPPER": 4, "UPPER_LIMIT": 5, "STRONG_BUY": 5}.get(str(signal.get("signal_type") or "").upper(), 0)
+def _is_meaningful_capture_realert(prev: dict, signal: dict) -> bool:
+    prev = prev if isinstance(prev, dict) else {}
+    signal = signal if isinstance(signal, dict) else {}
+    if _capture_signal_strength_rank(signal) > int(prev.get("rank", 0) or 0):
+        return True
+    if _grade_rank(str(signal.get("execution_grade") or signal.get("grade") or "C").upper()) > _grade_rank(str(prev.get("grade", "C") or "C").upper()):
+        return True
+    if safe_int(signal.get("score", 0), 0) >= safe_int(prev.get("score", 0), 0) + 8:
+        return True
+    prev_entry = safe_int(prev.get("entry_price", 0), 0)
+    new_entry = safe_int(signal.get("entry_price", signal.get("planned_entry_price", signal.get("execution_hint_entry_price", 0))), 0)
+    if prev_entry > 0 and new_entry > 0 and abs(new_entry - prev_entry) / max(prev_entry, 1) >= 0.02:
+        return True
+    return False
+def _should_skip_general_capture_realert(signal: dict | None = None) -> bool:
+    signal = signal if isinstance(signal, dict) else {}
+    key = _capture_user_alert_key(signal)
+    if not key:
+        return False
+    prev = _capture_user_alert_state.get(key) or {}
+    prev_ts = float(prev.get("ts", 0) or 0)
+    if prev_ts <= 0 or (time.time() - prev_ts) >= GENERAL_CAPTURE_REALERT_COOLDOWN_SEC:
+        return False
+    return not _is_meaningful_capture_realert(prev, signal)
+def _remember_general_capture_realert(signal: dict | None = None) -> None:
+    signal = signal if isinstance(signal, dict) else {}
+    key = _capture_user_alert_key(signal)
+    if not key:
+        return
+    _capture_user_alert_state[key] = {
+        "ts": time.time(),
+        "rank": _capture_signal_strength_rank(signal),
+        "score": safe_int(signal.get("score", 0), 0),
+        "grade": str(signal.get("execution_grade") or signal.get("grade") or "C").upper(),
+        "entry_price": safe_int(signal.get("entry_price", signal.get("planned_entry_price", signal.get("execution_hint_entry_price", 0))), 0),
+    }
+def _should_emit_internal_monitor_log(code: str, reason: str = "") -> bool:
+    key = f"{normalize_stock_code(code)}:{str(reason or '').strip()}"
+    if not key or key == ':':
+        return True
+    return _throttle_ok(_capture_monitor_log_state, key, INTERNAL_MONITOR_LOG_COOLDOWN_SEC)
+def _derive_fallback_expected_entry_price(signal: dict | None = None, live: dict | None = None) -> tuple[int, str]:
+    signal = signal if isinstance(signal, dict) else {}
+    live = live if isinstance(live, dict) else {}
+    price = safe_int(live.get("price", signal.get("price", 0)), 0)
+    ask_price = safe_int(live.get("ask_price", signal.get("ask_price", 0)), 0)
+    sig_type = str(signal.get("signal_type") or "").upper()
+    if price <= 0 and ask_price <= 0:
+        return 0, ""
+    if sig_type in ("SURGE", "EARLY_DETECT", "NEAR_UPPER", "UPPER_LIMIT", "STRONG_BUY", "PRECLOSE_GAP_ENTRY"):
+        return (ask_price or price), "실시간 체결기반"
+    return (ask_price or price), "실시간 재계산"
+def _build_actionability_issue_lines(signal: dict, source_label: str, reason: str) -> list[str]:
+    code = normalize_stock_code(signal.get("code", ""))
+    name = str(signal.get("name", code) or code)
+    sig_type = str(signal.get("signal_type", "") or "")
+    score = safe_int(signal.get("score", 0), 0)
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "C").upper()
+    return [
+        "🛠 [코드수정 요청]",
+        f"증상: {source_label} 사용자 알림 직전 실행형 정보 미완성",
+        f"종목: {name} ({code})",
+        f"신호: {sig_type} / 점수 {score} / 등급 {grade}",
+        f"원인: {reason}",
+        "자동조치: 이름 복구/실시간 시세/호가/예상 체결가 재계산까지 시도했지만 해결 실패",
+        "점검 대상: _resolve_stock_name / _ensure_signal_actionability / _select_capture_expected_entry_price / analyze entry plan builders",
+    ]
+def _ensure_signal_actionability(signal: dict | None = None, live: dict | None = None, source_label: str = "일반 포착") -> tuple[bool, str]:
+    signal = signal if isinstance(signal, dict) else {}
+    live = live if isinstance(live, dict) else {}
+    code = normalize_stock_code(signal.get("code", ""))
+    if not code:
+        return False, "code_missing"
+    signal["code"] = code
+    signal["name"] = _resolve_stock_name(code, signal.get("name", ""), cur=live or signal)
+    if _looks_like_placeholder_stock_name(code, signal.get("name", "")):
+        reason = "종목명 강제 복구 실패"
+        _send_code_change_request_alert(f"display_name_missing:{code}", _build_actionability_issue_lines(signal, source_label, reason), cooldown_min=120)
+        signal["_user_alert_block_reason"] = reason
+        return False, reason
+    price = safe_int(signal.get("price", 0), 0) or safe_int(live.get("price", 0), 0)
+    if price > 0:
+        signal["price"] = price
+    expected_entry, _ = _select_capture_expected_entry_price(signal)
+    if expected_entry <= 0:
+        derived_entry, derived_label = _derive_fallback_expected_entry_price(signal, live=live)
+        if derived_entry > 0:
+            signal["entry_price"] = safe_int(signal.get("entry_price", 0), 0) or derived_entry
+            signal["planned_entry_price"] = safe_int(signal.get("planned_entry_price", 0), 0) or derived_entry
+            signal["execution_hint_entry_price"] = safe_int(signal.get("execution_hint_entry_price", 0), 0) or derived_entry
+            signal["execution_setup_required"] = False
+            signal.setdefault("reasons", []).append(f"🎯 예상 체결가 자동보정 — {derived_label}")
+            expected_entry, _ = _select_capture_expected_entry_price(signal)
+            if code and expected_entry > 0 and (safe_int(signal.get("stop_loss", 0), 0) <= 0 or safe_int(signal.get("target_price", 0), 0) <= expected_entry):
+                try:
+                    stop_price, target_price, _, _, _ = calc_stop_target(code, expected_entry, signal_type=str(signal.get("signal_type") or ""))
+                    if stop_price > 0 and target_price > expected_entry:
+                        signal["stop_loss"] = safe_int(signal.get("stop_loss", 0), 0) or stop_price
+                        signal["target_price"] = safe_int(signal.get("target_price", 0), 0) or target_price
+                except Exception as e:
+                    _swallow_exception(e)
+        else:
+            reason = "실시간 현재가/호가 부재로 예상 체결가 계산 실패" if price <= 0 else "진입가 산출 경로 부재로 예상 체결가 계산 실패"
+            signal.setdefault("reasons", []).append(f"⚠️ 예상 체결가 미산출 — {reason}")
+            signal["_expected_entry_missing_reason"] = reason
+            _send_code_change_request_alert(f"expected_entry_missing:{str(signal.get('signal_type') or 'UNKNOWN').upper()}", _build_actionability_issue_lines(signal, source_label, reason), cooldown_min=120)
+            signal["_user_alert_block_reason"] = reason
+            return False, reason
+    return True, "ok"
 def _build_capture_focus_price_line(s: dict) -> str:
     price = int(s.get('price', 0) or 0)
     if not price:
@@ -21426,11 +21628,12 @@ def _build_capture_focus_price_line(s: dict) -> str:
 def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, name_dot: str = '') -> str:
     display_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = display_name
+    title_line = f"{name_dot} <b>{display_name}</b>  <code>{s['code']}</code>" if display_name != str(s.get("code", "")) else f"{name_dot} <code>{s['code']}</code>"
     parts = [
         header_line,
         f"🕐 {capture_label}",
         '━━━━━━━━━━━━━━━',
-        f"{name_dot} <b>{display_name}</b>  <code>{s['code']}</code>",
+        title_line,
     ]
     price_line = _build_capture_focus_price_line(s)
     focus_reasons = _build_capture_focus_reasons(s)
@@ -23805,7 +24008,8 @@ def _persist_general_capture_without_external(s: dict, hist_key: str, source_lab
             "entry_price": s.get("entry_price", 0),
         },
     )
-    _log_info_msg(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
+    if _should_emit_internal_monitor_log(code, f"delay:{delay_reason}"):
+        _log_info_msg(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
     return True
 def _should_keep_internal_watch_on_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
@@ -23871,6 +24075,8 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
     s = _coerce_run_scan_signal_defaults(s, fallback_code=s.get("code"))
     live = _get_live_quote_for_signal(s)
     live_price = safe_int((live or {}).get("price", s.get("price", 0)), 0)
+    _ensure_signal_actionability(s, live=live, source_label="일반 포착")
+    s["name"] = _resolve_stock_name(s.get("code", ""), s.get("name", ""), cur=live or s)
     entry = safe_int(s.get("entry_price", 0), 0)
     blocked_reason = ""
     if entry and live_price and live_price >= entry:
@@ -23957,6 +24163,13 @@ def _handle_general_alert_external_policy(ctx: dict, source_label: str) -> bool:
     s = ctx["signal"]
     hist_key = ctx["hist_key"]
     grade_upper = ctx["grade_upper"]
+    block_reason = str(s.get("_user_alert_block_reason") or "").strip()
+    if block_reason:
+        _record_internal_only_alert(hist_key, s, f"{source_label} 실행형 정보 미완성 ({block_reason})")
+        save_signal_log(s)
+        if _should_emit_internal_monitor_log(s.get("code", ""), f"actionability:{block_reason}"):
+            _log_info_msg(f"  ⏭ {s.get('name', s.get('code',''))} {safe_float(s.get('change_rate',0.0),0.0):+.1f}% [{s.get('signal_type','')}] {safe_int(s.get('score',0),0)}점 [{grade_upper}] — 사용자 알림 차단/원인추적 ({block_reason})")
+        return False
     delay_reason = _should_delay_external_general_capture(s)
     if delay_reason:
         return _persist_general_capture_without_external(s, hist_key, source_label, delay_reason)
@@ -24098,8 +24311,15 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     signal_type = s.get("signal_type", "")
     grade_upper = str(ctx.get("grade_upper") or s.get("execution_grade") or s.get("grade") or "C").upper()
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
-    send_alert(s)
-    _alert_history[ctx["hist_key"]] = time.time()
+    skipped_realert = _should_skip_general_capture_realert(s)
+    if skipped_realert:
+        _record_internal_only_alert(ctx["hist_key"], s, "동일 종목 재포착 쿨다운")
+        if _should_emit_internal_monitor_log(code, f"realert:{signal_type}"):
+            _log_info_msg(f"  ⏭ 동일 종목 재포착 쿨다운: {name}{ctx.get('mkt_tag','')} [{signal_type}] — 외부알림 생략/내부감시 유지")
+    else:
+        send_alert(s)
+        _alert_history[ctx["hist_key"]] = time.time()
+        _remember_general_capture_realert(s)
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
