@@ -3,21 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.2
+버전: v160.1
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v162.2 (2026-04-02): v151 기준 재적용 최종본 — v151 기준으로 이후 요청사항을 다시 얹어 `stats cohort` 분리, `/reset_stats 확인`, 전 신호 공통 1차 진입가 도달, `/list`/`/watch` 도달 보정, NXT 거래량 급감 guard 완화, 강한 뉴스테마/이슈 종목 direct 승격, `trailing_active` 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시를 한 세트로 정리했다.
-- v160.1 (2026-04-02): 전 신호 공통 1차 진입가 도달 동기화 — `현재가<=진입가`면 SURGE/EARLY_DETECT/일반 급등/뉴스테마 직승격 포함 전 신호 공통으로 즉시 1차 진입가 도달 처리하고, 목록/알림 표현에도 `+ 1차 진입가 도달`을 반영했다.
-- v160 (2026-04-02): 구조 변경/비구조 변경 버전 체계 + stats cohort + `/reset_stats` — 정수 버전은 새 구조 cohort로, 소수점 버전은 같은 cohort로 유지하도록 하고 `/stats`가 현재 cohort만 집계하도록 보강했으며 `/reset_stats 확인`으로 현재 cohort만 백업 후 초기화할 수 있게 했다.
-- v159 (2026-04-02): NXT 거래량 급감 종료 완화 — `_get_entry_watch_volume_guard_profile()`를 추가해 정규장과 NXT 장전/장후의 거래량 급감 종료 기준을 분리하고, NXT에서는 더 긴 유예시간·재확인·완화된 폭락 컷을 적용하도록 조정했다.
-- v158 (2026-04-02): 유실 변경 복구 통합 — 테마체인 승격, 즉시 1차도달, tracking MFE/trailing 예외, timezone hotfix를 다시 현재 코드 위에 합쳐 기준을 복구했다.
-- v157 (2026-04-02): `send_market_leading_sector_update` timezone 혼합 계산 hotfix — `_parse_compact_datetime()`를 날짜/시간 분리 입력과 timezone-aware datetime으로 보강하고 최근 actionable tracking 상태 계산이 KST aware datetime 기준으로 동작하도록 바로잡았다.
-- v156 (2026-04-02): 강한 뉴스테마/이슈 종목 direct 승격 + sector update 인자 오류 수정 — `뉴스+주가 연동`/`이슈 선감지` 상위 반응 종목은 direct 승격 후보로 만들고 `_parse_compact_datetime()`가 2인자 입력도 처리하도록 보강해 `send_market_leading_sector_update` 인자 오류를 해소했다.
-- v155 (2026-04-01): 테마 알림만 오고 종목 알림이 안 뜨는 마지막 게이트 해제 — 테마체인 강한 종목에 `theme_chain_force_hit`, `force_external_capture_alert`를 부여하고 실행형 진입가를 보완해 실제 종목 알림까지 이어지게 조정했다.
-- v154 (2026-04-01): 강한 뉴스테마/이슈 종목 승격 게이트 완화 — `뉴스+주가 연동`/`이슈 선감지`의 매우강함·강함 종목을 near-A 승격 대상으로 올리고 `기타업종` 섹터 제한과 `no_ask_liquidity` soft allow를 강한 재료형 종목에 보수적으로 완화했다.
-- v153 (2026-04-01): 뉴스테마/이슈 선감지 near-A 승격 강화 + MFE/트레일링 정합성 보강 — `뉴스테마 A급 미달`로 내부기록만 남던 종목을 실행형 near-A 후보로 끌어올리고, 결과 라벨과 `최대수익(MFE)` 표시를 보강했다.
-- v152 (2026-04-01): `EARLY_DETECT` 즉시 1차 도달 + 목표가 도달 후 5일 강제종료 제외 — `현재가<=진입가`면 즉시 1차 진입가 도달로 넘기고 `trailing_active` 상태에서는 `TRACK_MAX_DAYS` 시간초과를 적용하지 않도록 정리했다.
+- v160.1 (2026-04-02): v151 기준 누락 기능 재적용 — `현재가<=진입가` 전 신호 공통 1차 진입가 도달 helper와 `/list`·`/watch` 도달 분류 보정, `+ 1차 진입가 도달` 표시를 복구했다. 또한 `EARLY_DETECT`/일반 포착 즉시 도달 연계, `trailing_active` 5일 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시, `send_market_leading_sector_update`용 `_parse_compact_datetime(value, time_value=None)` 및 KST aware 계산을 보강했다. 마지막으로 강한 뉴스테마/이슈 종목 direct 승격과 NXT 거래량 급감 guard 완화를 다시 연결했다.
+- v160 (2026-04-02): 구조 버전별 성과 cohort 분리 + /reset_stats 명령 추가 — 큰 구조 변경은 정수 버전(v160, v161 …)으로 올리고 해당 버전이 곧 새로운 성과 cohort가 되도록 버전 체계를 정리했다. 같은 구조 안의 버그/경미 수정은 소수점 버전(v160.1, v160.2 …)을 쓰도록 helpers를 추가했고, signal_log 신규 레코드에 `bot_version`·`stats_cohort`를 저장한다. `/stats`는 이제 현재 cohort 기준으로만 승률을 계산하며, `/reset_stats 확인`은 signal_log를 백업한 뒤 현재 cohort의 통계 시작 시각만 초기화해 과거 기록은 보존하고 현재 구조 성과만 새로 측정한다.
+- v159 (2026-04-02): NXT 거래량 급감 종료 완화 — `_get_entry_watch_volume_guard_profile()`를 추가해 장전/장후 NXT는 정규장과 다른 유예시간·재확인 횟수·거래량폭락 컷을 사용하도록 분리했다. `theme_chain`/`direct_news` 계열은 NXT에서 추가 유예를 주어 `거래량 급감` 즉시 종료를 완화했다.
+- v158 (2026-04-02): 유실된 v152~v156 핵심 변경 복구 — 테마체인 direct 승격/실행형 진입가 보완, `현재가<=진입가` 즉시 1차도달 helper, `trailing_active` 5일 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시와 종료 경로 공통 `_apply_result_labels()` 호출을 다시 합쳐 넣었다.
+- v157 (2026-04-02): `send_market_leading_sector_update` timezone hotfix — `_parse_compact_datetime(value, time_value=None)`와 `_has_recent_actionable_tracking_state()`를 KST aware 기준으로 정리해 `can't subtract offset-naive and offset-aware datetimes` 오류를 제거했다.
+- v156 (2026-04-02): 강한 뉴스테마/이슈 종목 direct 승격 + compact datetime 파싱 보강 — 매우강함/강함 뉴스테마와 이슈 선감지 상위 반응 종목을 `_build_theme_chain_direct_candidate()` 기반 direct 실행형 후보로 승격하고, `entry_price/stop_loss/target_price`를 현재가 기준으로 보완했다. 동시에 `_parse_compact_datetime(value, time_value)` 경로를 확장해 `send_market_leading_sector_update`의 인자 불일치를 해결했다.
+- v155 (2026-04-02): 테마 알림만 오고 종목 알림이 안 뜨던 마지막 게이트 완화 — `send_news_theme_alert()`와 `_dispatch_issue_prewatch_reacted()`에 테마체인 direct 승격을 연결하고, `theme_chain_force_hit`/`force_external_capture_alert` 후보는 `no_ask_liquidity` soft allow와 섹터 게이트에서 추가 여유를 받도록 정리했다.
+- v154 (2026-04-02): 강한 뉴스테마/이슈 종목 승격 + 기타업종/no_ask 완화 — `_apply_theme_chain_capture_adjustment()`와 실행형 진입가 보완을 연결해 매우강함/강함 테마 종목이 near-A여도 종목 포착으로 더 잘 이어지게 보강했다. 동시에 `theme_chain_priority`가 붙은 종목은 `기타업종` 섹터 제한과 `no_ask_liquidity` soft gate에서 완화 혜택을 받게 조정했다.
+- v153 (2026-04-02): 뉴스테마/이슈 선감지 near-A 승격 강화 + 추적 결과 MFE 표시 — 강한 뉴스테마/이슈 선감지 종목은 `_apply_theme_chain_capture_adjustment()`를 통해 점수·등급·실행형 진입가를 보강하고, 추적 결과 메시지에는 `최대수익(MFE)`를 함께 표시하도록 정리했다. 종료 경로 전반에 `_apply_result_labels()`를 연결해 학습 라벨을 일관되게 남기도록 보강했다.
+- v152 (2026-04-02): `EARLY_DETECT` 즉시 1차 진입가 도달 + `trailing_active` 5일 강제종료 제외 — `현재가<=진입가`인 `EARLY_DETECT`는 포착 직후 바로 `1차 진입가 도달`로 이어지게 하고, 제목에 해당 상태를 반영했다. 목표가 도달 후 `trailing_active` 상태인 종목은 5일 `시간초과` 강제종료에서 제외하고, 결과 메시지와 학습 라벨에 `최대수익(MFE)`를 남기도록 정리했다.
 - v151 (2026-04-01): 24시간 시나리오 수집 + 장후/장전 액션보드 연결 — 미국장·미국 이슈·환율·금리·유가·지정학·뉴스/옵션형 유튜브를 공통 시나리오 객체로 묶는 `collect_market_scenarios_24h()`와 `run_market_scenario_collection_cycle()`를 추가했다. 각 재료는 이벤트명·방향·원인·한국 상방/하방 섹터·한국 종목 후보까지 내려와 `premarket_action_board`와 `overnight_watchlist`를 동시에 갱신하고, 재료-first headline 입력에도 같은 시나리오 행을 주입한다. 또한 15:45/20:10 장후 알림은 하방 차단 요약에 더해 상·하방 핵심 시나리오와 한국 후보를 함께 보내고, 07:30/08:50 장전 알림은 기존 단순 워치리스트 대신 액션형 시나리오 보드 중심으로 재구성했으며, 본스캔에도 상방 시나리오 후보를 직접 우선 편입한다.
 - v150 (2026-03-31): 상방/하방 재료 시나리오 강화 + 하방 재료 전구간 차단/알림 — 재료 엔진이 직접뉴스·테마동조·섹터확산·market flow·material-first 선감지가 겹칠수록 추가 가점을 더 크게 주도록 `재료 시나리오 결속` 보너스를 도입했다. 동시에 감사보고서 제출기한 연장신고/지연·감사의견·관리/상장폐지/거래정지·횡령/배임·회생류 하방 재료를 DART/뉴스/옵션형 유튜브 최근성 감시에서 시나리오로 묶어 후보 부트스트랩과 최종 진입 필터 양쪽에서 즉시 차단하고, 이미 걸린 entry/reentry/execution/preclose 감시도 `하방재료차단`으로 정리하며 즉시 알림과 장마감 묶음 요약을 함께 남기도록 확장했다.
 - v149 (2026-03-31): run_scan `change_rate` 결측/requests GET reset hotfix — run_scan 후보/신호 중 일부가 `change_rate` 없이 흘러들어와 일반 포착 발송 단계에서 KeyError가 나던 문제를 바로잡았다. `run_scan` 정리 helper가 `change_rate`·`volume_ratio`·`score`·`price` 기본값을 강제하고, `_append_scan_alert()`도 동일 기본값을 채운 뒤 alert pipeline에 태우도록 보강해 결측 payload가 와도 스캔 전체가 중단되지 않는다. 또한 공통 `requests.get` 래퍼가 `ConnectionResetError` 계열 연결 재설정을 감지하면 전역 ERROR 누적 전에 1회 재시도하고, 재시도 실패 시 throttled warning으로만 남기도록 보강했다.
@@ -1597,9 +1596,27 @@ _ver_match = _re.search(r"버전:\s*(v[0-9][0-9A-Za-z._-]*)", __doc__ or "")
 BOT_VERSION = _ver_match.group(1) if _ver_match else "unknown"
 _date_match = _re.search(r"날짜:\s*([\d-]+)", __doc__ or "")
 BOT_DATE    = _date_match.group(1) if _date_match else "unknown"
-BOT_VERSION_SERIES = "162"
-BOT_STATS_COHORT = "v162"
-BOT_STRUCTURE_VERSION = "v162"
+_BOT_VER_FULLMATCH = _re.fullmatch(r"v(\d+)(?:\.(\d+))?", BOT_VERSION or "")
+if _BOT_VER_FULLMATCH:
+    _BOT_VER_MAJOR = int(_BOT_VER_FULLMATCH.group(1))
+    _BOT_VER_MINOR = int(_BOT_VER_FULLMATCH.group(2) or 0)
+    BOT_VERSION_SERIES = f"v{_BOT_VER_MAJOR}"
+else:
+    _BOT_VER_MAJOR = None
+    _BOT_VER_MINOR = 0
+    BOT_VERSION_SERIES = (BOT_VERSION.split(".", 1)[0] or BOT_VERSION or "legacy")
+BOT_STATS_COHORT = BOT_VERSION_SERIES
+BOT_VERSION_IS_MINOR = _BOT_VER_MINOR > 0
+
+def _derive_stats_cohort(version: str | None) -> str:
+    ver = str(version or "").strip()
+    if not ver:
+        return "legacy"
+    m = _re.fullmatch(r"v(\d+)(?:\.(\d+))?", ver)
+    if m:
+        return f"v{int(m.group(1))}"
+    return ver.split(".", 1)[0] or ver
+
 import os, requests, time, schedule, json, random, threading, math
 from collections import deque, defaultdict
 import xml.etree.ElementTree as ET
@@ -2404,6 +2421,154 @@ def _read_json_locked(file_path: str, default=None):
     """v38.3-P1-6: Lock 보호 JSON 읽기 (스레드 안전)"""
     with _file_lock:
         return _read_json_unlocked(file_path, default=default)
+def _backup_runtime_json_file(file_path: str, tag: str = "manual") -> str:
+    _ensure_dir(_BACKUP_DIR)
+    stamp = _now_kst().strftime("%Y%m%d_%H%M%S")
+    base = os.path.basename(file_path)
+    backup = os.path.join(_BACKUP_DIR, f"{tag}_{stamp}_{base}")
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as rf, open(backup, "wb") as wf:
+                wf.write(rf.read())
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 백업 실패: {base} ({e})")
+        return ""
+    return backup
+
+def _parse_stats_scope_datetime(value: str | None) -> datetime | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d %H:%M:%S", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=_KST)
+        except Exception:
+            pass
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+    except Exception:
+        return None
+
+def _record_detected_datetime(rec: dict) -> datetime | None:
+    if not isinstance(rec, dict):
+        return None
+    d = str(rec.get("detect_date") or rec.get("first_detect_date") or rec.get("exit_date") or "").strip()
+    t = str(rec.get("detect_time") or rec.get("first_detect_time") or rec.get("exit_time") or "00:00:00").strip()
+    if not d:
+        return None
+    if len(d) == 8 and d.isdigit():
+        try:
+            return datetime.strptime(f"{d} {t[:8]}", "%Y%m%d %H:%M:%S").replace(tzinfo=_KST)
+        except Exception:
+            return None
+    try:
+        dt = datetime.fromisoformat(f"{d} {t[:8]}")
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+    except Exception:
+        return None
+
+def _ensure_record_stats_meta(rec: dict) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    changed = False
+    bot_version = str(rec.get("bot_version") or rec.get("version") or rec.get("signal_version") or "").strip()
+    if not bot_version:
+        rec["bot_version"] = "legacy"
+        bot_version = "legacy"
+        changed = True
+    stats_cohort = str(rec.get("stats_cohort") or rec.get("structure_cohort") or "").strip()
+    if not stats_cohort:
+        rec["stats_cohort"] = _derive_stats_cohort(bot_version)
+        stats_cohort = rec["stats_cohort"]
+        changed = True
+    if not str(rec.get("structure_cohort") or "").strip():
+        rec["structure_cohort"] = stats_cohort
+        changed = True
+    return changed
+
+def _normalize_signal_log_meta_fields(data: dict) -> int:
+    if not isinstance(data, dict):
+        return 0
+    changed = 0
+    for rec in data.values():
+        if _ensure_record_stats_meta(rec):
+            changed += 1
+    return changed
+
+def _load_stats_scope_state() -> dict:
+    state = _read_json_locked(STATS_SCOPE_FILE, default={})
+    if not isinstance(state, dict):
+        state = {}
+    cohorts = state.get("cohorts")
+    if not isinstance(cohorts, dict):
+        cohorts = {}
+    state["cohorts"] = cohorts
+    if not state.get("active_cohort"):
+        state["active_cohort"] = BOT_STATS_COHORT
+    if BOT_STATS_COHORT not in cohorts:
+        cohorts[BOT_STATS_COHORT] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json_atomic(STATS_SCOPE_FILE, state, indent=2)
+    return state
+
+def _get_stats_scope_start(cohort: str | None = None) -> datetime | None:
+    state = _load_stats_scope_state()
+    target = str(cohort or BOT_STATS_COHORT or "").strip() or BOT_STATS_COHORT
+    return _parse_stats_scope_datetime((state.get("cohorts") or {}).get(target))
+
+def _record_matches_stats_scope(rec: dict, cohort: str | None = None) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    target = str(cohort or BOT_STATS_COHORT or "").strip() or BOT_STATS_COHORT
+    rec_cohort = str(rec.get("stats_cohort") or rec.get("structure_cohort") or _derive_stats_cohort(rec.get("bot_version"))).strip()
+    if rec_cohort != target:
+        return False
+    anchor = _get_stats_scope_start(target)
+    if anchor is None:
+        return True
+    rec_dt = _record_detected_datetime(rec)
+    if rec_dt is None:
+        return False
+    return rec_dt >= anchor
+
+def _filter_records_by_stats_scope(records, cohort: str | None = None) -> list:
+    return [rec for rec in (records or []) if _record_matches_stats_scope(rec, cohort=cohort)]
+
+def _handle_reset_stats_command(raw: str):
+    parts = raw.strip().split()
+    if len(parts) < 2 or parts[1] not in ("확인", "confirm"):
+        data = _load_signal_log_data()
+        cohort_count = sum(1 for rec in data.values() if _record_matches_stats_scope(rec))
+        send(
+            f"⚠️ 현재 구조 cohort <b>{BOT_STATS_COHORT}</b> 승률을 초기화합니다.\n"
+            f"대상 기록: {cohort_count}건\n"
+            f"signal_log는 백업하고, 현재 cohort의 통계 시작 시각만 지금으로 재설정합니다.\n"
+            f"실행: <code>/reset_stats 확인</code>"
+        )
+        return
+    backup = _backup_runtime_json_file(SIGNAL_LOG_FILE, tag="reset_stats")
+    state = _load_stats_scope_state()
+    stamp = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    state["active_cohort"] = BOT_STATS_COHORT
+    state.setdefault("cohorts", {})[BOT_STATS_COHORT] = stamp
+    state.setdefault("last_reset", {})[BOT_STATS_COHORT] = stamp
+    _write_json_atomic(STATS_SCOPE_FILE, state, indent=2)
+    try:
+        _history_cache["data"] = {}
+        _history_cache["ts"] = 0
+    except Exception:
+        pass
+    send(
+        f"♻️ <b>승률 초기화 완료</b>\n"
+        f"cohort: <b>{BOT_STATS_COHORT}</b>\n"
+        f"시작 시각: {stamp}\n"
+        f"백업: {os.path.basename(backup) if backup else '생략'}"
+    )
+
 def _migrate_legacy_files():
     """기존(현재 작업 디렉토리)에 있던 JSON이 있으면 DATA_DIR로 1회 복사"""
     try:
@@ -4170,7 +4335,7 @@ def run_intraday_watchdog() -> None:
 # ============================================================
 # v40.0-#9: 이벤트 유형별 승률 분리
 # ============================================================
-def get_signal_type_stats(signal_log_data: dict = None) -> dict:
+def get_signal_type_stats(signal_log_data: dict = None, cohort: str | None = BOT_STATS_COHORT) -> dict:
     """신호 유형별 승률·수익률 통계 반환.
     반환: {signal_type: {count, wins, win_rate, avg_pnl}}
     """
@@ -4185,6 +4350,8 @@ def get_signal_type_stats(signal_log_data: dict = None) -> dict:
             if not isinstance(rec, dict):
                 continue
             st = rec.get("status", "")
+            if cohort is not None and not _record_matches_stats_scope(rec, cohort=cohort):
+                continue
             if st not in ("수익", "손실", "본전"):
                 continue
             sig = rec.get("signal_type", "UNKNOWN")
@@ -5839,7 +6006,7 @@ def _get_similar_pattern_stats(code: str, signal_type: str, change_rate: float, 
     """유사패턴 통계 공통 계산 (상세 표시 / 요약 표시 / 내부 점수화 공용)."""
     try:
         data = _load_signal_history()
-        completed = _get_completed_signals(data)
+        completed = _get_completed_signals(data, cohort=BOT_STATS_COHORT)
         if len(completed) < 3:
             return {}
         out = {"same_stock": {}, "similar": {}, "primary": {}}
@@ -5967,13 +6134,15 @@ def _load_signal_history() -> dict:
         _swallow_exception(e)  # v105 structured silent-exception log
         _history_cache["data"] = {}
     return _history_cache["data"]
-def _get_completed_signals(data: dict = None) -> list:
-    """완료된 신호만 추출 (net_pnl_pct 우선)"""
+def _get_completed_signals(data: dict = None, cohort: str | None = BOT_STATS_COHORT) -> list:
+    """완료된 신호만 추출 (현재 구조 cohort 기준, net_pnl_pct 우선)"""
     if data is None:
         data = _load_signal_history()
     completed = []
     for v in data.values():
         if not isinstance(v, dict):
+            continue
+        if cohort is not None and not _record_matches_stats_scope(v, cohort=cohort):
             continue
         if v.get("status") not in ("수익", "손실", "본전"):
             continue
@@ -13750,6 +13919,7 @@ def calc_sector_momentum(code: str, name: str) -> dict:
 # 📋 신호 로그 저장 (모든 신호 유형 공통)
 # ============================================================
 SIGNAL_LOG_FILE = _state_path("signal_log.json")   # 모든 신호 추적 (신규)
+STATS_SCOPE_FILE = _state_path("stats_scope.json")
 CAPTURE_FUNNEL_FILE = _state_path("capture_funnel.json")  # saved/watch/reached 전환율 집계
 # ============================================================
 # 🎯 최적조건 만들기용 데이터/튜닝 설정
@@ -13908,6 +14078,8 @@ def _normalize_signal_log_pnl_fields(data: dict) -> int:
     changed = 0
     for rec in data.values():
         if _sync_record_pnl_fields(rec):
+            changed += 1
+        if _ensure_record_stats_meta(rec):
             changed += 1
     return changed
 def migrate_signal_log_pnl_fields() -> None:
@@ -14459,7 +14631,10 @@ def _merge_tracking_episode_records(data: dict | None, code: str, representative
     return changed
 def _load_signal_log_data() -> dict:
     try:
-        return _read_json_locked(SIGNAL_LOG_FILE)
+        data = _read_json_locked(SIGNAL_LOG_FILE)
+        if isinstance(data, dict):
+            _normalize_signal_log_pnl_fields(data)
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         _swallow_exception(e)
         return {}
@@ -14579,10 +14754,6 @@ def _update_representative_signal_log_record(data: dict, stock: dict, ctx: dict)
     rec["latest_signal_grade"] = stock.get("grade", rec.get("grade", "B"))
     rec["episode_representative"] = True
     rec["log_key"] = representative_key
-    rec["bot_version"] = BOT_VERSION
-    rec["bot_version_series"] = BOT_VERSION_SERIES
-    rec["stats_cohort"] = BOT_STATS_COHORT
-    rec["structure_cohort"] = BOT_STRUCTURE_VERSION
     stock["signal_log_key"] = representative_key
     if not rec.get("entry_hit"):
         prev_entry = safe_int(rec.get("entry_price", 0), 0)
@@ -14654,6 +14825,9 @@ def _build_new_signal_log_record(stock: dict, ctx: dict) -> dict:
         "code": ctx["code"],
         "name": ctx["stock_name"],
         "signal_type": ctx["sig_type"],
+        "bot_version": BOT_VERSION,
+        "stats_cohort": BOT_STATS_COHORT,
+        "structure_cohort": BOT_STATS_COHORT,
         "signal_type_history": [ctx["sig_type"]] if ctx["sig_type"] else [],
         "score": stock.get("score", 0),
         "grade": stock.get("grade", "B"),
@@ -14724,10 +14898,6 @@ def _build_new_signal_log_record(stock: dict, ctx: dict) -> dict:
         "entry_reference_date": "",
         "entry_reference_clock": "",
         "entry_reference_price": 0,
-        "bot_version": BOT_VERSION,
-        "bot_version_series": BOT_VERSION_SERIES,
-        "stats_cohort": BOT_STATS_COHORT,
-        "structure_cohort": BOT_STRUCTURE_VERSION,
     }
 def save_signal_log(stock: dict):
     """
@@ -15614,7 +15784,6 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
     rec["round_trip_cost_pct"] = round(ROUND_TRIP_COST_PCT, 4)
     rec["pnl_pct"] = net_pnl_pct
     rec["exit_reason"] = exit_reason
-    _apply_result_labels(rec)
     if ACTUAL_ENTRY_CONFIRM_ENABLED and rec.get("actual_entry") is None and exit_reason != TRACK_TIMEOUT_RESULT:
         _request_actual_entry_confirm(rec)
     _tracking_notified.add(log_key)
@@ -18693,6 +18862,10 @@ def _sync_watch_entry_hit_from_price(watch: dict | None, price: int) -> bool:
         watch["entry_hit"] = True
         watch.setdefault("entry_hit_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         watch.setdefault("entry_hit_price", int(price))
+        try:
+            _save_entry_watch_active()
+        except Exception as e:
+            _swallow_exception(e)
         return True
     return False
 
@@ -23098,8 +23271,6 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     code = s.get("code", "")
     signal_type = s.get("signal_type", "")
     grade_upper = str(ctx.get("grade_upper") or s.get("execution_grade") or s.get("grade") or "C").upper()
-    if ctx.get("entry") and ctx.get("live_price") and safe_int(ctx.get("live_price"), 0) <= safe_int(ctx.get("entry"), 0):
-        s["first_entry_reached"] = True
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = time.time()
@@ -26618,6 +26789,7 @@ def _send_menu(title: str = ""):
                 {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
                 {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
                 {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
+                {"text": "♻️ 승률 초기화",     "callback_data": "cmd_reset_stats"},
             ],
             [
                 {"text": "🟡 NXT 현황",        "callback_data": "cmd_nxt"},
@@ -26649,6 +26821,7 @@ def _handle_callback(callback_id: str, data: str):
         "cmd_nxt":     "/nxt",
         "cmd_week":    "/week",
         "cmd_stats":   "/stats",
+        "cmd_reset_stats": "/reset_stats",
         "cmd_stop":    "/stop",
         "cmd_resume":  "/resume",
         "cmd_compact": "/compact",
@@ -26739,6 +26912,8 @@ def _collect_watch_list_lines(*, include_detected: bool = True) -> tuple[list[st
                     details.append(f"🛡 손절가 {stop:,}원")
                 if details:
                     line += "\n  " + "  |  ".join(details)
+                if hit:
+                    line += "\n  ✅ + 1차 진입가 도달"
                 if detect_time:
                     line += f"\n  ⏰ 포착시각 {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=detect_time)}"
                 if hit:
@@ -27064,29 +27239,11 @@ def _handle_telegram_test_command():
         f"/us — 미국 시장 현황\n"
         f"/geo — 지정학 뉴스 분석\n"
         f"/overnight — 오버나이트 위험도\n"
-        f"/stats — 신호 통계\n"
+        f"/stats — 현재 구조 승률 통계\n"
+        f"/reset_stats — 현재 구조 승률 초기화\n"
         f"/top — 오늘 TOP 5\n"
         f"/nxt — NXT 동향"
     )
-def _handle_reset_stats_command(raw: str = "") -> None:
-    confirm = str(raw or "").strip().endswith("확인")
-    if not confirm:
-        send("🧹 <b>현재 구조 cohort 승률 초기화</b>\n형식: <code>/reset_stats 확인</code>\n현재 cohort만 백업 후 초기화합니다.")
-        return
-    try:
-        data = _load_signal_log_data()
-        backup_name = f"signal_log_{BOT_STATS_COHORT}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        backup_path = os.path.join(_BACKUP_DIR, backup_name)
-        _ensure_dir(_BACKUP_DIR)
-        _write_json_atomic(backup_path, data, indent=2)
-        new_data = {k: v for k, v in data.items() if not _matches_current_stats_cohort(v)}
-        _write_json_atomic(SIGNAL_LOG_FILE, new_data, indent=2)
-        _history_cache["data"] = {}
-        _history_cache["ts"] = 0
-        send(f"✅ <b>승률 초기화 완료</b>\ncohort: <code>{BOT_STATS_COHORT}</code>\n백업: <code>{os.path.basename(backup_path)}</code>")
-    except Exception as e:
-        send(f"⚠️ 승률 초기화 오류: {e}")
-
 def _dispatch_telegram_command(raw: str, text: str):
     global _bot_paused
     exact_handlers = {
@@ -27101,7 +27258,7 @@ def _dispatch_telegram_command(raw: str, text: str):
         "/오늘": _handle_telegram_daily_command,
         "/stats": _send_stats,
         "/reset_stats": lambda: _handle_reset_stats_command("/reset_stats"),
-        "/승률초기화": lambda: _handle_reset_stats_command("/승률초기화"),
+        "/승률초기화": lambda: _handle_reset_stats_command("/reset_stats"),
         "/menu": _send_menu,
         "/도움": _send_menu,
         "/help": _send_menu,
@@ -27349,6 +27506,7 @@ def _maybe_warn_result_pnl_gap(rec: dict, pnl: float) -> None:
         _swallow_exception(e)
 def _apply_result_signal_update(sig_data: dict, sig_matched_key: str, pnl: float, status_bundle: dict) -> None:
     rec = sig_data[sig_matched_key]
+    _ensure_record_stats_meta(rec)
     if not rec.get("pnl_pct"):
         rec["gross_pnl_pct"] = pnl
         rec["net_pnl_pct"] = pnl
@@ -27382,6 +27540,9 @@ def _build_manual_result_record(name_input: str, pnl: float, status_bundle: dict
         "code": new_key,
         "name": name_input,
         "signal_type": "MANUAL",
+        "bot_version": BOT_VERSION,
+        "stats_cohort": BOT_STATS_COHORT,
+        "structure_cohort": BOT_STATS_COHORT,
         "detect_date": status_bundle["today"],
         "detect_time": status_bundle["exit_time"],
         "detect_price": 0,
@@ -27575,7 +27736,8 @@ def get_missed_profit_summary() -> dict:
         except Exception as e:
             _swallow_exception(e)
         missed = [v for v in data.values()
-                  if v.get("actual_entry") in (False, None)
+                  if _record_matches_stats_scope(v)
+                  and v.get("actual_entry") in (False, None)
                   and v.get("status") in ("수익", "손실", "본전")
                   and v.get("pnl_pct") is not None]
         if not missed:
@@ -27592,29 +27754,22 @@ def get_missed_profit_summary() -> dict:
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return {"count": 0, "avg_pnl": 0.0, "total_pnl": 0.0, "best": None}
-def _normalize_stats_cohort(value: str | None) -> str:
-    raw = str(value or "").strip()
-    return raw or BOT_STATS_COHORT
-
-def _matches_current_stats_cohort(rec: dict | None) -> bool:
-    rec = rec if isinstance(rec, dict) else {}
-    cohort = _normalize_stats_cohort(rec.get("stats_cohort") or rec.get("structure_cohort"))
-    return cohort == BOT_STATS_COHORT
-
 def _build_signal_stats_context(data: dict) -> dict:
-    cohort_data = {k: v for k, v in (data or {}).items() if _matches_current_stats_cohort(v)}
-    completed = [v for v in cohort_data.values() if v.get("status") in ["수익", "손실", "본전"]]
-    tracking = _get_valid_tracking(cohort_data)
-    actual_entered = [v for v in cohort_data.values() if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
-    skipped = [v for v in cohort_data.values() if v.get("actual_entry") is False]
+    scoped = _filter_records_by_stats_scope(list(data.values()), cohort=BOT_STATS_COHORT)
+    completed = [v for v in scoped if v.get("status") in ["수익", "손실", "본전"]]
+    tracking = _filter_records_by_stats_scope(_get_valid_tracking(data), cohort=BOT_STATS_COHORT)
+    actual_entered = [v for v in scoped if v.get("actual_entry") is True and v.get("actual_pnl") is not None]
+    skipped = [v for v in scoped if v.get("actual_entry") is False]
     unconfirmed = [v for v in completed if v.get("actual_entry") is None]
     return {
-        "cohort_data": cohort_data,
+        "scoped": scoped,
         "completed": completed,
         "tracking": tracking,
         "actual_entered": actual_entered,
         "skipped": skipped,
         "unconfirmed": unconfirmed,
+        "stats_cohort": BOT_STATS_COHORT,
+        "version_label": BOT_VERSION,
         "type_labels": {
             "UPPER_LIMIT": "🚨 상한가",
             "NEAR_UPPER": "🔥 상한가근접",
@@ -27656,8 +27811,7 @@ def _build_signal_stats_header(data: dict, ctx: dict) -> str:
         skip_pnls = [v.get("pnl_pct", 0) for v in skipped if v.get("pnl_pct")]
         opp_cost = sum(skip_pnls) / len(skip_pnls) if skip_pnls else 0
         skip_msg = f"⏭ <b>스킵</b>  {len(skipped)}건  (이론 평균 {opp_cost:+.1f}%)\n  이유: {skip_str}\n"
-    cohort_data = ctx.get("cohort_data") or {}
-    miss_all = [v for v in cohort_data.values() if v.get("status") in ["진입미달", "진입가변경"]]
+    miss_all = [v for v in data.values() if _record_matches_stats_scope(v) and v.get("status") in ["진입미달", "진입가변경"]]
     miss_surge = sum(1 for v in miss_all if "상승이탈" in str(v.get("exit_reason", "")))
     miss_expire = sum(1 for v in miss_all if "기간만료" in str(v.get("exit_reason", "")))
     miss_reentry = sum(1 for v in miss_all if "진입가변경" in str(v.get("exit_reason", "")))
@@ -27668,7 +27822,8 @@ def _build_signal_stats_header(data: dict, ctx: dict) -> str:
     return (
         f"📊 <b>신호 성과 통계</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>이론 수익률</b> (봇 학습 기준)  {len(completed)}건\n"
+        f"🧬 <b>현재 구조 cohort</b>  {ctx['stats_cohort']}  (실행 버전 {ctx['version_label']})\n"
+        f"🤖 <b>이론 수익률</b> (현재 구조 기준)  {len(completed)}건\n"
         f"  승률 <b>{total_rate:.0f}%</b>  평균 <b>{avg_pnl:+.1f}%</b>  추적중 {len(tracking)}건\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{actual_msg}{skip_msg}{miss_msg}━━━━━━━━━━━━━━━\n"
