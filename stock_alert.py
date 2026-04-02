@@ -3,11 +3,12 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.13
+버전: v160.14
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v160.13 (2026-04-02): 종목명 강제 복구 + 예상 체결가 선계산/원인추적 + 일반 포착 알람 폭탄 억제 + 지연경로 중복발송 차단 — 사용자 메인 알림 전에 종목명을 다중 캐시/KIS/NXT/public fallback으로 강제 복구하고, 끝까지 이름을 못 찾으면 외부 발송 대신 코드수정 요청 알림을 남기도록 정리했다. 또한 일반 포착은 예상 체결가(대표/계획/체결기반)가 비면 현재 호가·현재가 기반으로 즉시 보정하고, 그래도 계산이 안 되면 원인을 기록한 뒤 자동보정 실패 코드수정 알림으로 넘긴다. 마지막으로 동일 종목 일반 포착은 의미 있는 강화가 없으면 재알림 쿨다운으로 외부 폭탄을 막고, 외부알림 지연/내부감시 유지 로그도 별도 쿨다운을 둬 내부감시 로그와 사용자 체감 알림이 섞여 쏟아지지 않게 보강했다. 특히 `_persist_general_capture_without_external()`는 내부감시 유지 후 반드시 `False`를 반환해 같은 평가 사이클에서 `⏭ 지연` 뒤 `✓ 발송`이 다시 붙지 않게 고쳤다.
+- v160.14 (2026-04-03): 종목명 공용 메타 fallback + 공용 업종 fallback으로 기타 섹터 대량탈락 완화 — `public_stock_meta.json` 캐시를 추가해 KRX 공개 종목 기본정보(종목명/업종)를 주기적으로 내려받아 코드→종목명/업종 fallback의 공용 소스로 사용하도록 정리했다. `_resolve_stock_name()`은 기존 KIS/NXT/runtime/cache 경로에 공용 메타 fallback을 더해 `459510`, `092790` 같은 코드형 노출을 줄이고, `get_theme_sector_stocks()`/`_hydrate_alert_sector_theme()`는 KIS `bstp_name`이 비거나 generic일 때 공용 업종과 동일업종 peer를 사용해 `기타` 섹터 잔류를 줄인다. 이로써 KIS 업종 404·빈 응답 구간에도 섹터 gate가 공용 업종 fallback을 먼저 시도하고, 이름/업종이 끝까지 안 채워진 경우만 마지막에 코드수정 알림 대상으로 남기도록 보강했다.
+- v160.13 (2026-04-02): 종목명 강제 복구 + 예상 체결가 선계산/원인추적 + 일반 포착 알람 폭탄 억제 — 사용자 메인 알림 전에 종목명을 다중 캐시/KIS/NXT/public fallback으로 강제 복구하고, 끝까지 이름을 못 찾으면 외부 발송 대신 코드수정 요청 알림을 남기도록 정리했다. 또한 일반 포착은 예상 체결가(대표/계획/체결기반)가 비면 현재 호가·현재가 기반으로 즉시 보정하고, 그래도 계산이 안 되면 원인을 기록한 뒤 자동보정 실패 코드수정 알림으로 넘긴다. 마지막으로 동일 종목 일반 포착은 의미 있는 강화가 없으면 재알림 쿨다운으로 외부 폭탄을 막고, 외부알림 지연/내부감시 유지 로그도 별도 쿨다운을 둬 내부감시 로그와 사용자 체감 알림이 섞여 쏟아지지 않게 보강했다.
 - v160.12 (2026-04-02): 비정상 상위 잠금 자동 복구 + 잠금 로그 숫자 노출 최소화 — `runtime_version_lock.json`에 `lock_kind=authoritative` 메타를 기록하고, 이 메타 없이 남은 구형 정수형 상위 잠금은 비정상 잠금으로 보고 자동 복구하도록 정리했다. 이로써 오류본에서 남은 특정 잠금 버전 숫자 노출과 잘못된 상위 잠금 차단을 줄인다. 문서/스모크도 최근 오류본 표기를 일반화해 다음 정상 버전 체계(`v160.x`)와 혼선이 생기지 않게 맞췄다.
 - v160.11 (2026-04-02): v160.10 안정화 유지 + 눌림목 3종 재적용 + token 재발급 쿨다운/섹터 재보정/run_scan 결측 정리 — 직전 정상본 v160.10 위에 오류본에서 유효했던 눌림목 3종 포착 보강(갭상승 후 시가 회복, 박스권 상단 돌파·하단 지지, higher low + 거래대금 재유입)을 다시 얹었다. 동시에 KIS tokenP 403 `EGW00133`가 뜨면 1분 내 재발급 재시도를 중단하고 쿨다운을 기록해 같은 분 연속 발급을 막는다. run_scan은 섹터 gate 직전에 종목의 업종/테마를 한 번 더 재보정해 `기타` 쏠림을 줄이고, 시세·신호 결측 payload는 재복구 후에도 불완전하면 일반 포착에서 제거해 `+0.0% [] 0점 [C]` 로그가 반복되지 않게 했다. 또한 눌림목 결과 dict는 provisional grade를 먼저 채워 `눌림목 오류 (...): 'grade'`를 막는다.
 - v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
@@ -4870,6 +4871,8 @@ INTERNAL_ONLY_ALERT_COOLDOWN = int(os.getenv("INTERNAL_ONLY_ALERT_COOLDOWN", "90
 GENERAL_CAPTURE_REALERT_COOLDOWN_SEC = int(os.getenv("GENERAL_CAPTURE_REALERT_COOLDOWN_SEC", "2700") or "2700")
 INTERNAL_MONITOR_LOG_COOLDOWN_SEC = int(os.getenv("INTERNAL_MONITOR_LOG_COOLDOWN_SEC", "1800") or "1800")
 STOCK_NAME_CACHE_FILE = _state_path("stock_name_cache.json")
+PUBLIC_STOCK_META_FILE = _state_path("public_stock_meta.json")
+PUBLIC_STOCK_META_CACHE_TTL_SEC = int(os.getenv("PUBLIC_STOCK_META_CACHE_TTL_SEC", "43200") or "43200")
 # ⑮ 이평 괴리율
 MA20_DISCOUNT_MIN  = -5.0   # 20일선 아래 최소 (%)
 MA20_DISCOUNT_MAX  = -30.0  # 20일선 아래 최대 (%)
@@ -5476,6 +5479,7 @@ _internal_only_alert_history = {}
 _capture_user_alert_state = {}
 _capture_monitor_log_state = {}
 _stock_name_cache_runtime = {}
+_public_stock_meta_runtime = {"ts": 0.0, "rows": {}}
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
@@ -10909,6 +10913,104 @@ def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
     if compact.isdigit() and len(compact) >= 5:
         return True
     return False
+def _normalize_public_sector_name(raw: str) -> str:
+    try:
+        sec = str(raw or "").strip()
+        if not sec:
+            return ""
+        sec = _re.sub(r"\s+", " ", sec)
+        return sec
+    except Exception as e:
+        _swallow_exception(e)
+        return ""
+def _load_public_stock_meta_map() -> dict:
+    try:
+        if _public_stock_meta_runtime.get("rows"):
+            if time.time() - float(_public_stock_meta_runtime.get("ts", 0.0) or 0.0) < max(900, PUBLIC_STOCK_META_CACHE_TTL_SEC):
+                rows = _public_stock_meta_runtime.get("rows") or {}
+                if isinstance(rows, dict):
+                    return rows
+        payload = _read_json_safe(PUBLIC_STOCK_META_FILE, {})
+        if isinstance(payload, dict):
+            rows = payload.get("rows") or {}
+            ts = float(payload.get("ts", 0.0) or 0.0)
+            if isinstance(rows, dict):
+                _public_stock_meta_runtime["ts"] = ts
+                _public_stock_meta_runtime["rows"] = rows
+                return rows
+    except Exception as e:
+        _swallow_exception(e)
+    return {}
+def _refresh_public_stock_meta_map(force: bool = False) -> dict:
+    try:
+        cached = _load_public_stock_meta_map()
+        cached_ts = float(_public_stock_meta_runtime.get("ts", 0.0) or 0.0)
+        if cached and not force and time.time() - cached_ts < max(900, PUBLIC_STOCK_META_CACHE_TTL_SEC):
+            return cached
+        try:
+            import pandas as _pd
+        except Exception:
+            _pd = None
+        if _pd is None:
+            return cached
+        url = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
+        resp = _session.get(url, timeout=12, headers={"User-Agent": USER_AGENT, "Referer": "https://kind.krx.co.kr/"})
+        resp.raise_for_status()
+        tables = _pd.read_html(resp.text)
+        rows = {}
+        for df in tables:
+            cols = [str(c).strip() for c in df.columns]
+            if "종목코드" not in cols or "회사명" not in cols:
+                continue
+            sector_col = "업종" if "업종" in cols else ("주요제품" if "주요제품" in cols else None)
+            for row in df.to_dict("records"):
+                code = str(row.get("종목코드", "") or "").strip().split(".")[0].zfill(6)
+                name = str(row.get("회사명", "") or "").strip()
+                sector = _normalize_public_sector_name(row.get(sector_col, "") if sector_col else "")
+                if not code or _looks_like_placeholder_stock_name(code, name):
+                    continue
+                rows[code] = {"name": name, "sector": sector}
+        if rows:
+            payload = {"ts": time.time(), "rows": rows}
+            _public_stock_meta_runtime["ts"] = payload["ts"]
+            _public_stock_meta_runtime["rows"] = rows
+            _write_json_atomic(PUBLIC_STOCK_META_FILE, payload, indent=2)
+            return rows
+    except Exception as e:
+        _swallow_exception(e)
+    return _load_public_stock_meta_map()
+def _get_public_stock_meta(code: str, refresh: bool = False) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    rows = _refresh_public_stock_meta_map(force=refresh) if refresh else _load_public_stock_meta_map()
+    if not isinstance(rows, dict):
+        return {}
+    meta = rows.get(code) or {}
+    return meta if isinstance(meta, dict) else {}
+def _collect_public_sector_peers(code: str, sector_name: str, limit: int = 12) -> list[tuple[str, str]]:
+    try:
+        code = normalize_stock_code(code)
+        sector_name = _normalize_public_sector_name(sector_name)
+        if not code or not sector_name:
+            return []
+        rows = _load_public_stock_meta_map()
+        peers = []
+        for peer_code, meta in rows.items():
+            if normalize_stock_code(peer_code) == code:
+                continue
+            if _normalize_public_sector_name((meta or {}).get("sector", "")) != sector_name:
+                continue
+            peer_name = str((meta or {}).get("name", "") or "").strip()
+            if _looks_like_placeholder_stock_name(peer_code, peer_name):
+                continue
+            peers.append((str(peer_code).zfill(6), peer_name))
+            if len(peers) >= max(1, int(limit or 12)):
+                break
+        return peers
+    except Exception as e:
+        _swallow_exception(e)
+        return []
 def _load_stock_name_cache() -> dict:
     try:
         data = _read_json_safe(STOCK_NAME_CACHE_FILE, {})
@@ -10952,11 +11054,36 @@ def _fetch_public_stock_name_by_code(code: str) -> str:
     if not code:
         return ""
     try:
-        resp = _session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=6, headers={"User-Agent": USER_AGENT})
-        resp.raise_for_status()
-        html = resp.text or ""
-        m = _re.search(r'<title>\s*([^:<\|]+?)\s*[:\|]', html, _re.I)
-        nm = str(m.group(1) if m else "").strip()
+        meta = _get_public_stock_meta(code)
+        nm = str((meta or {}).get("name", "") or "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            _remember_stock_name(code, nm)
+            return nm
+    except Exception as e:
+        _swallow_exception(e)
+    for url in (
+        f"https://finance.naver.com/item/main.naver?code={code}",
+        f"https://m.stock.naver.com/domestic/stock/{code}/total",
+    ):
+        try:
+            resp = _session.get(url, timeout=6, headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+            html = resp.text or ""
+            for pat in (
+                r'<meta[^>]+property="og:title"[^>]+content="([^"\:]+)',
+                r'<title>\s*([^:<\|]+?)\s*[:\|]',
+                r'"stockName"\s*:\s*"([^"]+)"',
+            ):
+                m = _re.search(pat, html, _re.I)
+                nm = str(m.group(1) if m else "").strip()
+                if not _looks_like_placeholder_stock_name(code, nm):
+                    _remember_stock_name(code, nm)
+                    return nm
+        except Exception as e:
+            _swallow_exception(e)
+    try:
+        meta = _get_public_stock_meta(code, refresh=True)
+        nm = str((meta or {}).get("name", "") or "").strip()
         if not _looks_like_placeholder_stock_name(code, nm):
             _remember_stock_name(code, nm)
             return nm
@@ -10964,7 +11091,7 @@ def _fetch_public_stock_name_by_code(code: str) -> str:
         _swallow_exception(e)
     return ""
 def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None) -> str:
-    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태/캐시/public fallback으로 복구."""
+    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태/캐시/public meta fallback으로 복구."""
     code = normalize_stock_code(code) or str(code or "").strip()
     try:
         nm = str(name_hint or "").strip()
@@ -10972,13 +11099,22 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
             _remember_stock_name(code, nm)
             return nm
         if isinstance(cur, dict):
-            nm = str(cur.get("name", "") or "").strip()
-            if not _looks_like_placeholder_stock_name(code, nm):
-                _remember_stock_name(code, nm)
-                return nm
+            for key in ("name", "hts_kor_isnm"):
+                nm = str(cur.get(key, "") or "").strip()
+                if not _looks_like_placeholder_stock_name(code, nm):
+                    _remember_stock_name(code, nm)
+                    return nm
         nm = _get_cached_stock_name(code)
         if not _looks_like_placeholder_stock_name(code, nm):
             return nm
+        try:
+            meta = _get_public_stock_meta(code)
+            nm = str((meta or {}).get("name", "") or "").strip()
+            if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_stock_name(code, nm)
+                return nm
+        except Exception as e:
+            _swallow_exception(e)
         try:
             info = get_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
@@ -14469,40 +14605,45 @@ def get_theme_sector_stocks(code: str) -> tuple:
       1. 하드코딩 THEME_MAP
       2. 동적 테마맵 (가격상관관계 + 뉴스 공동언급으로 자동 생성)
       3. KIS 업종코드 매칭
+      4. 공용 공개 업종 fallback
     각 소스를 병합해서 가장 풍부한 정보 제공
     """
-    peers_all = {}   # code → (name, source, reason)
-    # 1. THEME_MAP
+    peers_all = {}
+    code = normalize_stock_code(code)
     theme_name = "기타업종"
     for tk, ti in THEME_MAP.items():
-        if code in [c for c,_ in ti["stocks"]]:
+        if code in [c for c, _ in ti["stocks"]]:
             theme_name = tk
             for c, n in ti["stocks"]:
                 if c != code:
                     peers_all[c] = (n, "테마", tk)
             break
-    # 2. 동적 테마맵
-    dyn_reason = ""
     for tk, ti in _dynamic_theme_map.items():
-        if code in [c for c,_ in ti["stocks"]]:
-            if theme_name == "기타업종":
+        if code in [c for c, _ in ti["stocks"]]:
+            if _is_generic_sector_theme(theme_name):
                 theme_name = ti["desc"]
-            dyn_reason = ti.get("reason", "")
             for c, n in ti["stocks"]:
                 if c != code and c not in peers_all:
                     peers_all[c] = (n, "동적테마", ti["desc"])
             break
-    # 3. KIS 업종코드 매칭 (나머지 채우기용)
     base_ctx = _load_sector_stock_base_context(code) if code else {}
     kis_sector_name = str((base_ctx or {}).get("bstp_name", "") or "").strip()
-    if theme_name == "기타업종" and kis_sector_name not in ("", "동일업종", "업종미상", "미분류", "unknown"):
+    if _is_generic_sector_theme(theme_name) and kis_sector_name not in ("", "동일업종", "업종미상", "미분류", "unknown"):
         theme_name = kis_sector_name
     kis_peers = get_sector_stocks_from_kis(code)
     for c, n in kis_peers:
         if c not in peers_all:
             peers_all[c] = (n, "업종코드", kis_sector_name)
+    public_meta = _get_public_stock_meta(code)
+    public_sector_name = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
+    if _is_generic_sector_theme(theme_name) and not _is_generic_sector_theme(public_sector_name):
+        theme_name = public_sector_name
+    if not _is_generic_sector_theme(public_sector_name):
+        for peer_code, peer_name in _collect_public_sector_peers(code, public_sector_name, limit=12):
+            if peer_code not in peers_all:
+                peers_all[peer_code] = (peer_name, "공용업종", public_sector_name)
     peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
-    return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
+    return theme_name, peers, peers_all
 # ════════════════════════════════════════════════════════════
 # 🌍 J: 해외 선물→섹터 연동 (v39.0)
 # ════════════════════════════════════════════════════════════
@@ -24010,7 +24151,7 @@ def _persist_general_capture_without_external(s: dict, hist_key: str, source_lab
     )
     if _should_emit_internal_monitor_log(code, f"delay:{delay_reason}"):
         _log_info_msg(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
-    return False
+    return True
 def _should_keep_internal_watch_on_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     entry_price = safe_int(signal.get("entry_price", 0), 0)
@@ -24371,26 +24512,34 @@ def _hydrate_alert_sector_theme(alert: dict, *, force_lookup: bool = False) -> s
         if not isinstance(alert, dict):
             return "기타"
         sector_info = alert.get("sector_info") if isinstance(alert.get("sector_info"), dict) else {}
+        code = normalize_stock_code(alert.get("code", ""))
+        if code and _looks_like_placeholder_stock_name(code, str(alert.get("name", "") or "")):
+            public_name = str((_get_public_stock_meta(code) or {}).get("name", "") or "").strip()
+            if not _looks_like_placeholder_stock_name(code, public_name):
+                alert["name"] = public_name
         for candidate in (
             alert.get("sector_theme"),
             sector_info.get("theme"),
             alert.get("bstp_name"),
             sector_info.get("bstp_name"),
+            (_get_public_stock_meta(code) or {}).get("sector", "") if code else "",
             alert.get("adaptive_feedback_theme"),
             alert.get("theme_desc"),
         ):
-            sec = str(candidate or "").strip()
+            sec = _normalize_public_sector_name(candidate)
             if sec and not _is_generic_sector_theme(sec):
                 sector_info["theme"] = sec
+                if code:
+                    sector_info.setdefault("bstp_name", sec)
                 alert["sector_info"] = sector_info
                 alert["sector_theme"] = sec
                 return sec
-        code = normalize_stock_code(alert.get("code", ""))
         if code and force_lookup:
             theme_name, _, _ = get_theme_sector_stocks(code)
-            theme_name = str(theme_name or "").strip()
+            theme_name = _normalize_public_sector_name(theme_name)
             if theme_name and not _is_generic_sector_theme(theme_name):
                 sector_info["theme"] = theme_name
+                sector_info.setdefault("bstp_name", theme_name)
                 alert["sector_info"] = sector_info
                 alert["sector_theme"] = theme_name
                 return theme_name
