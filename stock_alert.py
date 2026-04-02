@@ -7,7 +7,7 @@
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v160.13 (2026-04-02): 종목명 강제 복구 + 예상 체결가 선계산/원인추적 + 일반 포착 알람 폭탄 억제 — 사용자 메인 알림 전에 종목명을 다중 캐시/KIS/NXT/public fallback으로 강제 복구하고, 끝까지 이름을 못 찾으면 외부 발송 대신 코드수정 요청 알림을 남기도록 정리했다. 또한 일반 포착은 예상 체결가(대표/계획/체결기반)가 비면 현재 호가·현재가 기반으로 즉시 보정하고, 그래도 계산이 안 되면 원인을 기록한 뒤 자동보정 실패 코드수정 알림으로 넘긴다. 마지막으로 동일 종목 일반 포착은 의미 있는 강화가 없으면 재알림 쿨다운으로 외부 폭탄을 막고, 외부알림 지연/내부감시 유지 로그도 별도 쿨다운을 둬 내부감시 로그와 사용자 체감 알림이 섞여 쏟아지지 않게 보강했다.
+- v160.13 (2026-04-02): 종목명 강제 복구 + 예상 체결가 선계산/원인추적 + 일반 포착 알람 폭탄 억제 + 지연경로 중복발송 차단 — 사용자 메인 알림 전에 종목명을 다중 캐시/KIS/NXT/public fallback으로 강제 복구하고, 끝까지 이름을 못 찾으면 외부 발송 대신 코드수정 요청 알림을 남기도록 정리했다. 또한 일반 포착은 예상 체결가(대표/계획/체결기반)가 비면 현재 호가·현재가 기반으로 즉시 보정하고, 그래도 계산이 안 되면 원인을 기록한 뒤 자동보정 실패 코드수정 알림으로 넘긴다. 마지막으로 동일 종목 일반 포착은 의미 있는 강화가 없으면 재알림 쿨다운으로 외부 폭탄을 막고, 외부알림 지연/내부감시 유지 로그도 별도 쿨다운을 둬 내부감시 로그와 사용자 체감 알림이 섞여 쏟아지지 않게 보강했다. 특히 `_persist_general_capture_without_external()`는 내부감시 유지 후 반드시 `False`를 반환해 같은 평가 사이클에서 `⏭ 지연` 뒤 `✓ 발송`이 다시 붙지 않게 고쳤다.
 - v160.12 (2026-04-02): 비정상 상위 잠금 자동 복구 + 잠금 로그 숫자 노출 최소화 — `runtime_version_lock.json`에 `lock_kind=authoritative` 메타를 기록하고, 이 메타 없이 남은 구형 정수형 상위 잠금은 비정상 잠금으로 보고 자동 복구하도록 정리했다. 이로써 오류본에서 남은 특정 잠금 버전 숫자 노출과 잘못된 상위 잠금 차단을 줄인다. 문서/스모크도 최근 오류본 표기를 일반화해 다음 정상 버전 체계(`v160.x`)와 혼선이 생기지 않게 맞췄다.
 - v160.11 (2026-04-02): v160.10 안정화 유지 + 눌림목 3종 재적용 + token 재발급 쿨다운/섹터 재보정/run_scan 결측 정리 — 직전 정상본 v160.10 위에 오류본에서 유효했던 눌림목 3종 포착 보강(갭상승 후 시가 회복, 박스권 상단 돌파·하단 지지, higher low + 거래대금 재유입)을 다시 얹었다. 동시에 KIS tokenP 403 `EGW00133`가 뜨면 1분 내 재발급 재시도를 중단하고 쿨다운을 기록해 같은 분 연속 발급을 막는다. run_scan은 섹터 gate 직전에 종목의 업종/테마를 한 번 더 재보정해 `기타` 쏠림을 줄이고, 시세·신호 결측 payload는 재복구 후에도 불완전하면 일반 포착에서 제거해 `+0.0% [] 0점 [C]` 로그가 반복되지 않게 했다. 또한 눌림목 결과 dict는 provisional grade를 먼저 채워 `눌림목 오류 (...): 'grade'`를 막는다.
 - v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
@@ -24010,7 +24010,7 @@ def _persist_general_capture_without_external(s: dict, hist_key: str, source_lab
     )
     if _should_emit_internal_monitor_log(code, f"delay:{delay_reason}"):
         _log_info_msg(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
-    return True
+    return False
 def _should_keep_internal_watch_on_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     entry_price = safe_int(signal.get("entry_price", 0), 0)
