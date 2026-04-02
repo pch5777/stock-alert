@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.4
+버전: v160.5
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.5 (2026-04-02): 네이버 코스닥 상승/거래량 순위 URL 404 복구 — `_fetch_naver_rank()`를 코스피/코스닥 분리 경로(`*_kosdaq.naver`) 대신 공통 `sise_rise.naver`/`sise_quant.naver`에 `sosok=0/1` 파라미터를 붙여 요청하도록 바꿨다. 코스닥 direct path 404를 제거하고, 응답 인코딩도 `apparent_encoding`/`euc-kr` 기준으로 보정해 외부 fallback 품질을 유지했다. 또한 smoke test에 구형 `*_kosdaq.naver` URL 금지와 `sosok` 파라미터 기반 요청 검증을 추가했다.
 - v160.4 (2026-04-02): v160.2 기능 보존 상태에서 startup 비동기 catch-up + datetime aware 정리 + 삭제방지 검증 강화 — `v160.2`의 stale runtime lock 복구/NXT·오픈 버스트/KPI cohort reset 보강을 그대로 유지한 채, `__main__` 시작부의 동기 `refresh_dynamic_candidates()` 호출과 즉시 스캔 실행을 제거하고 `_schedule_startup_scan_catchup()` 기반 비동기 catch-up으로 전환했다. 또한 carry/priority hint/minutes helper의 datetime 계산을 KST aware 기준으로 통일해 `can't subtract offset-naive and offset-aware datetimes` 잔여 오류를 줄였고, smoke test에는 직전 정상본 핵심 변경사항·변경이력 보존·삭제 금지 규칙 검증을 추가했다.
 - v160.2 (2026-04-02): stale 상위 버전 락 복구 + 장전/NXT·오픈 버스트 + cohort reset 보강 — `runtime_version_lock.json`에 lease/heartbeat 개념을 추가해 죽은 상위 버전 락은 자동 복구하고, 살아 있는 상위 버전만 구버전 런타임을 차단하도록 정리했다. 또한 08:00~09:00 NXT 장전 버스트와 09:00~09:03 KRX 오픈 버스트를 추가해 `refresh_dynamic_candidates(force_rank=True)`·`run_material_first_scan()`·`run_scan()`를 더 촘촘히 돌리도록 보강했다. `compute_signal_kpi()` 경로는 현재 cohort 필터를 강제하고, `/reset_stats 확인`은 signal_log 백업 뒤 통계 시작 시각뿐 아니라 동적 파라미터 baseline·emergency state·연속 손익 카운터까지 함께 초기화한다. 마지막으로 동적 후보군 로그를 `KRX_seed/KRX_rank/NXT_seed/NXT_rank/material_prewatch` 기준으로 분리해 운영 판단이 바로 되도록 정리했다.
 - v160.1 (2026-04-02): v151 기준 누락 기능 재적용 — `현재가<=진입가` 전 신호 공통 1차 진입가 도달 helper와 `/list`·`/watch` 도달 분류 보정, `+ 1차 진입가 도달` 표시를 복구했다. 또한 `EARLY_DETECT`/일반 포착 즉시 도달 연계, `trailing_active` 5일 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시, `send_market_leading_sector_update`용 `_parse_compact_datetime(value, time_value=None)` 및 KST aware 계산을 보강했다. 마지막으로 강한 뉴스테마/이슈 종목 direct 승격과 NXT 거래량 급감 guard 완화를 다시 연결했다.
@@ -3969,22 +3970,25 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
     category: rise(상승률) | volume(거래량) | amount(거래대금)
     KIS API 불통 시 보조 소스로 사용.
     v85: 코스피 + 코스닥 합산으로 확대.
+    v160.5: 코스닥 direct path 404를 피하기 위해 공통 URL + sosok 파라미터로 통일.
     """
-    # 코스피/코스닥 각각 URL
-    url_map_kospi = {
+    url_map = {
         "rise":   "https://finance.naver.com/sise/sise_rise.naver",
         "volume": "https://finance.naver.com/sise/sise_quant.naver",
         "amount": "https://finance.naver.com/sise/sise_etf.naver",
     }
-    url_map_kosdaq = {
-        "rise":   "https://finance.naver.com/sise/sise_rise_kosdaq.naver",
-        "volume": "https://finance.naver.com/sise/sise_quant_kosdaq.naver",
-        "amount": "https://finance.naver.com/sise/sise_etf.naver",
-    }
-    def _parse_naver_rank_url(url: str, market_label: str) -> list:
+    market_plan = [("KOSPI", "0"), ("KOSDAQ", "1")]
+
+    def _parse_naver_rank_url(url: str, market_label: str, sosok: str) -> list:
         try:
-            resp = requests.get(url, timeout=10, headers=_random_ua())
+            resp = requests.get(url, params={"sosok": sosok}, timeout=10, headers=_random_ua())
             resp.raise_for_status()
+            apparent = (resp.apparent_encoding or "").strip()
+            current = (resp.encoding or "").strip().lower()
+            if apparent:
+                resp.encoding = apparent
+            elif not current or current == "iso-8859-1":
+                resp.encoding = "euc-kr"
             soup = BeautifulSoup(resp.text, "html.parser")
             rows = soup.select("table.type_2 tr, table.type_5 tr")
             result = []
@@ -4017,7 +4021,8 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
                     "code": code, "name": name,
                     "change_rate": rate_td,
                     "source": f"naver_{category}",
-                    "market": market_label,
+                    "market": "KRX",
+                    "market_detail": market_label,
                 })
                 if len(result) >= top_n:
                     break
@@ -4025,21 +4030,19 @@ def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
         except Exception as e:
             _log_warn_msg(f"  ⚠️ 네이버 {market_label} {category} 순위 스크래핑 실패: {e}")
             return []
-    kospi_items = _parse_naver_rank_url(
-        url_map_kospi.get(category, url_map_kospi["rise"]), "KRX"
-    )
-    kosdaq_items = _parse_naver_rank_url(
-        url_map_kosdaq.get(category, url_map_kosdaq["rise"]), "KRX"
-    )
-    # 합산 (중복 제거)
+
+    base_url = url_map.get(category, url_map["rise"])
+    merged = []
+    for market_label, sosok in market_plan:
+        merged.extend(_parse_naver_rank_url(base_url, market_label, sosok))
+
     seen = set()
     result = []
-    for item in kospi_items + kosdaq_items:
+    for item in merged:
         code = item.get("code", "")
         if code and code not in seen:
             seen.add(code)
             result.append(item)
-    # 등락률 내림차순 정렬 후 top_n 반환
     result.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
     return result[:top_n]
 def _fetch_daum_rank(top_n: int = 30) -> list:
