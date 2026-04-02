@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.9
+버전: v161
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161 (2026-04-02): 눌림목 3종 실전 패턴 확장 — `MID_PULLBACK`/`intraday_reclaim` 경로에 (1) 갭상승 후 시가 회복 돌파, (2) 박스권 상단 돌파·하단 지지, (3) higher low + 거래대금 재유입 구조를 추가 반영했다. 일봉 눌림목은 박스 구조·전고 근접·저점 상승 가점을 받아 주도주 조정 재개형을 더 잘 살리고, 장중 재상승은 1분봉 기반 시가 회복/박스 돌파/저점 상승 구조가 확인되면 별도 가점과 final 이유로 승격된다. 실행등급 프로필에도 `시가회복/박스돌파/박스지지/저점상승/전고근접` 토큰을 연결해 좋은 재상승형 종목 누락을 줄이되 하향추세 차단과 A 외부알림 보수성은 유지한다.
 - v160.9 (2026-04-02): NXT/KRX 익일 오픈 평가 시각 분리 — `PRECLOSE_GAP_ENTRY`의 익일 오픈 체크를 시장별로 분리해 NXT는 08:05, KRX는 09:05에 각각 평가하도록 수정했다. `update_preclose_gap_open_outcomes(stage=...)`가 signal별 stage를 읽어 해당 시장만 기록하고, 고우선 정리 메모도 `08:05/09:05`를 시장별로 다르게 표기한다. 또한 startup catch-up도 NXT 08:05 / KRX 09:05 기준으로 다시 확인해, NXT 종가베팅 후보를 KRX와 같은 시각에 늦게 평가하던 문제를 막았다.
 - v160.8 (2026-04-02): NXT 19:20도 종가베팅 final confirm 동일 적용 — v160.7에서 KRX 15:18에만 붙였던 종가베팅 final confirm을 NXT 19:20에도 같은 기준으로 확장했다. 이제 NXT 선진입 후보도 `phase="final"`로 처리되어 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 외국인·기관 수급, 1분봉 20선 지지를 같은 축으로 다시 확인하고, 최종 점수 문턱과 안내 문구도 final 기준을 사용한다.
 - v160.7 (2026-04-02): 종가베팅 final confirm + 전고/윗꼬리/눌림/수급 필터 + 익일 09:05 청산우선도 — 기존 `PRECLOSE_GAP_ENTRY` 구조는 유지한 채 KRX 14:45 1차 선별 뒤 15:18 최종 확정 스캔을 추가했다. 종가선진입 점수화에는 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 1분봉 20선 지지, 외국인·기관 수급 우호를 반영해 종가베팅형 후보를 더 보수적으로 재평가한다. 또한 `update_preclose_gap_open_outcomes()`는 익일 09:05 기록 시 갭상승·시초 약세 기준의 청산 우선도와 메모를 함께 남기고, 우선 정리 필요 종목은 묶음 안내로 정리한다.
@@ -4701,6 +4702,13 @@ MID_PULLBACK_DAYS_MIN      = 3
 MID_PULLBACK_DAYS_MAX      = 9
 MID_PULLBACK_DISABLED_BUCKETS = {"daily_trend"}
 MID_PULLBACK_ALLOWED_BUCKETS = {"weekly_monthly_trend", "gap_first_pullback", "intraday_reclaim"}
+MID_PULLBACK_BOX_MAX_WIDTH_PCT = float(os.getenv("MID_PULLBACK_BOX_MAX_WIDTH_PCT", "12.0") or "12.0")
+MID_PULLBACK_NEAR_HIGH_MAX_DIST_PCT = float(os.getenv("MID_PULLBACK_NEAR_HIGH_MAX_DIST_PCT", "3.5") or "3.5")
+MID_PULLBACK_GAP_RECLAIM_MIN_GAP_PCT = float(os.getenv("MID_PULLBACK_GAP_RECLAIM_MIN_GAP_PCT", "2.2") or "2.2")
+MID_PULLBACK_GAP_RECLAIM_MIN_VOL_RATIO = float(os.getenv("MID_PULLBACK_GAP_RECLAIM_MIN_VOL_RATIO", "2.2") or "2.2")
+MID_PULLBACK_GAP_RECLAIM_OPEN_RECOVER_PCT = float(os.getenv("MID_PULLBACK_GAP_RECLAIM_OPEN_RECOVER_PCT", "0.15") or "0.15")
+MID_PULLBACK_GAP_RECLAIM_OPEN_DIP_PCT = float(os.getenv("MID_PULLBACK_GAP_RECLAIM_OPEN_DIP_PCT", "0.10") or "0.10")
+MID_PULLBACK_INTRADAY_BOX_LOOKBACK = int(os.getenv("MID_PULLBACK_INTRADAY_BOX_LOOKBACK", "12") or "12")
 MID_VOL_RECOVERY_MIN       = 1.3
 MID_ALERT_COOLDOWN         = 86400
 MID_RESURGE_MIN_PULLBACK_PCT = 15.0
@@ -6998,6 +7006,16 @@ def _get_mid_pullback_execution_profile(result: dict) -> dict:
         core_hits.append("장중돌파")
     if bool(result.get("turnaround_confirmed")):
         support_hits.append("수급전환")
+    if bool(result.get("gap_up_reclaim_hit")):
+        core_hits.append("시가회복")
+    if bool(result.get("box_breakout_hit")):
+        core_hits.append("박스돌파")
+    if bool(result.get("box_support_hit")):
+        support_hits.append("박스지지")
+    if bool(result.get("higher_low_active")):
+        support_hits.append("저점상승")
+    if bool(result.get("near_recent_high")):
+        support_hits.append("전고근접")
     if float(result.get("rs", 0) or 0) >= RS_MIN:
         support_hits.append("상대강도")
     if float(result.get("vol_zscore", 0) or 0) >= VOL_ZSCORE_MIN:
@@ -7035,6 +7053,8 @@ def _get_mid_pullback_execution_profile(result: dict) -> dict:
         or pattern_ctx.get("recent_high_breakout")
         or pattern_ctx.get("orb_breakout")
         or pattern_ctx.get("near_limit_lead")
+        or bool(result.get("gap_up_reclaim_hit"))
+        or bool(result.get("box_breakout_hit"))
     )
     return {
         "core_hits": core_hits,
@@ -7280,6 +7300,49 @@ def _build_mid_pullback_today_context(items: list[dict], today: dict, avg_pullba
         "current_pullback": current_pullback,
         "today_chg": today_chg,
     }
+
+
+def _build_mid_pullback_structure_context(after_peak: list[dict], today: dict, avg_pullback_vol: float) -> dict:
+    tail_rows = [row for row in (after_peak or []) if isinstance(row, dict)]
+    if not tail_rows:
+        return {}
+    hist_rows = tail_rows[:-1] if len(tail_rows) >= 2 else tail_rows
+    lows_tail = [safe_int(row.get("low", 0), 0) for row in tail_rows[-4:] if safe_int(row.get("low", 0), 0) > 0]
+    higher_low_active = bool(
+        len(lows_tail) >= 3
+        and lows_tail[-3] < lows_tail[-2]
+        and lows_tail[-2] <= lows_tail[-1]
+    )
+    box_rows = [row for row in hist_rows[-5:] if safe_int(row.get("high", 0), 0) > 0 and safe_int(row.get("low", 0), 0) > 0]
+    box_upper = max((safe_int(row.get("high", 0), 0) for row in box_rows), default=0)
+    box_lower = min((safe_int(row.get("low", 0), 0) for row in box_rows), default=0)
+    box_width_pct = round((box_upper - box_lower) / box_upper * 100.0, 2) if box_upper > 0 and box_lower > 0 else 0.0
+    in_box = bool(len(box_rows) >= 3 and box_upper > 0 and box_lower > 0 and box_width_pct <= MID_PULLBACK_BOX_MAX_WIDTH_PCT)
+    close_price = safe_int(today.get("close", 0), 0)
+    high_price = safe_int(today.get("high", close_price), close_price)
+    today_vol = safe_int(today.get("vol", 0), 0)
+    upper_half = box_lower + (box_upper - box_lower) * 0.55 if box_upper > box_lower else 0
+    box_support_hit = bool(in_box and close_price >= upper_half and close_price >= int(box_lower * 1.015))
+    box_breakout_hit = bool(
+        in_box
+        and high_price >= int(box_upper * 1.003)
+        and close_price >= int(box_upper * 0.997)
+        and (today_vol >= avg_pullback_vol * 1.15 if avg_pullback_vol > 0 else True)
+    )
+    recent_high = max((safe_int(row.get("high", 0), 0) for row in hist_rows[-10:] if safe_int(row.get("high", 0), 0) > 0), default=0)
+    recent_high_gap_pct = round((recent_high - close_price) / recent_high * 100.0, 2) if recent_high > 0 and close_price > 0 else 0.0
+    near_recent_high = bool(recent_high > 0 and recent_high_gap_pct <= MID_PULLBACK_NEAR_HIGH_MAX_DIST_PCT)
+    return {
+        "higher_low_active": higher_low_active,
+        "box_upper": box_upper,
+        "box_lower": box_lower,
+        "box_width_pct": box_width_pct,
+        "box_support_hit": box_support_hit,
+        "box_breakout_hit": box_breakout_hit,
+        "recent_high": recent_high,
+        "recent_high_gap_pct": recent_high_gap_pct,
+        "near_recent_high": near_recent_high,
+    }
 def _build_mid_pullback_base_context(code: str) -> dict:
     items = _load_mid_pullback_items(code)
     if not items:
@@ -7300,6 +7363,7 @@ def _build_mid_pullback_base_context(code: str) -> dict:
         return {}
     volume_ctx = _build_mid_pullback_volume_context(lookback, pullback_ctx["after_peak"], surge_ctx["surge_peak_idx"])
     today_ctx = _build_mid_pullback_today_context(items, today, volume_ctx["avg_pullback_vol"], surge_ctx["surge_peak_price"])
+    structure_ctx = _build_mid_pullback_structure_context(pullback_ctx["after_peak"], today, volume_ctx["avg_pullback_vol"])
     return {
         "items": items,
         "today": today,
@@ -7312,6 +7376,7 @@ def _build_mid_pullback_base_context(code: str) -> dict:
         **pullback_ctx,
         **volume_ctx,
         **today_ctx,
+        "structure_ctx": structure_ctx,
     }
 def _score_mid_pullback_primary_pattern(ctx: dict) -> tuple[int, list[str]]:
     score = 0
@@ -7346,6 +7411,19 @@ def _score_mid_pullback_recovery_signals(ctx: dict, score: int, reasons: list[st
         score += 10; reasons.append(f"📊 20일선 회복 중 (현재 {ctx['ma20_dev']:+.1f}%)")
     if MA20_DISCOUNT_MAX <= ctx["ma20_dev"] <= MA20_DISCOUNT_MIN:
         score += 5; reasons.append(f"📐 20일선 저점 근접 ({ctx['ma20_dev']:+.1f}%)")
+    return score, reasons
+
+
+def _score_mid_pullback_structure_signals(ctx: dict, score: int, reasons: list[str]) -> tuple[int, list[str]]:
+    structure_ctx = ctx.get("structure_ctx") or {}
+    if bool(structure_ctx.get("higher_low_active")):
+        score += 10; reasons.append("📐 조정 저점 상승 구조 +10")
+    if bool(structure_ctx.get("box_support_hit")):
+        score += 8; reasons.append(f"🧱 박스 지지 확인 ({structure_ctx.get('box_width_pct', 0):.1f}% 폭) +8")
+    if bool(structure_ctx.get("box_breakout_hit")):
+        score += 12; reasons.append(f"🧱 박스 상단 재돌파 ({structure_ctx.get('box_width_pct', 0):.1f}% 폭) +12")
+    if bool(structure_ctx.get("near_recent_high")):
+        score += 7; reasons.append(f"🏁 전고 {structure_ctx.get('recent_high_gap_pct', 0):.1f}% 이내 +7")
     return score, reasons
 def _score_mid_pullback_market_signals(code: str, ctx: dict, score: int, reasons: list[str]) -> tuple[int, list[str], float, float]:
     kospi_chg = get_kospi_change()
@@ -7386,10 +7464,17 @@ def _apply_mid_pullback_external_scores(code: str, name: str, ctx: dict, score: 
 def _score_mid_pullback_base_context(code: str, name: str, ctx: dict) -> dict:
     score, reasons = _score_mid_pullback_primary_pattern(ctx)
     score, reasons = _score_mid_pullback_recovery_signals(ctx, score, reasons)
+    score, reasons = _score_mid_pullback_structure_signals(ctx, score, reasons)
     score, reasons, rs, z = _score_mid_pullback_market_signals(code, ctx, score, reasons)
     score, reasons, sentiment = _apply_mid_pullback_external_scores(code, name, ctx, score, reasons)
+    structure_ctx = ctx.get("structure_ctx") or {}
     rebound_confirmed = bool(
-        ctx["is_bullish"] and ctx["vol_recovered"] and (ctx["ma20_recovering"] or bool(sentiment.get("foreign_turnaround") and sentiment.get("institution_buying")) or rs >= RS_MIN)
+        ctx["is_bullish"] and (
+            (ctx["vol_recovered"] and (ctx["ma20_recovering"] or bool(sentiment.get("foreign_turnaround") and sentiment.get("institution_buying")) or rs >= RS_MIN))
+            or bool(structure_ctx.get("box_breakout_hit"))
+            or bool(structure_ctx.get("higher_low_active") and ctx["vol_recovered"])
+            or bool(structure_ctx.get("box_support_hit") and (rs >= RS_MIN or ctx["ma20_recovering"]))
+        )
     )
     if not rebound_confirmed:
         return {}
@@ -7467,6 +7552,11 @@ def _build_mid_pullback_result(code: str, name: str, ctx: dict, execution: dict)
         "today_open": ctx["today_open"],
         "today_high": ctx["today_high"],
         "today_vol": ctx["today_vol"],
+        "higher_low_active": bool((ctx.get("structure_ctx") or {}).get("higher_low_active")),
+        "box_support_hit": bool((ctx.get("structure_ctx") or {}).get("box_support_hit")),
+        "box_breakout_hit": bool((ctx.get("structure_ctx") or {}).get("box_breakout_hit")),
+        "near_recent_high": bool((ctx.get("structure_ctx") or {}).get("near_recent_high")),
+        "box_width_pct": float((ctx.get("structure_ctx") or {}).get("box_width_pct", 0.0) or 0.0),
         "turnaround_confirmed": bool(ctx["sentiment"].get("foreign_turnaround") and ctx["sentiment"].get("institution_buying")),
         "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""),
         "sector_info": ctx["sector_info"],
@@ -11025,6 +11115,67 @@ def _find_intraday_pullback_surge(hist: list[dict]) -> dict:
             surge_pct = round(pct, 1)
             surge_peak_idx = i
     return {} if surge_peak_idx < 0 or surge_peak_price == 0 else {"surge_peak_price": surge_peak_price, "surge_pct": surge_pct, "surge_peak_idx": surge_peak_idx}
+
+
+def _build_intraday_reclaim_structure_context(ctx: dict) -> dict:
+    mins = _get_minute_data(ctx.get("code", ""), count=max(24, MID_PULLBACK_INTRADAY_BOX_LOOKBACK + 12))
+    if len(mins) < 12:
+        return {}
+    closes = [safe_int(item.get("close", 0), 0) for item in mins if safe_int(item.get("close", 0), 0) > 0]
+    highs = [safe_int(item.get("high", 0), 0) for item in mins if safe_int(item.get("high", 0), 0) > 0]
+    lows = [safe_int(item.get("low", 0), 0) for item in mins if safe_int(item.get("low", 0), 0) > 0]
+    if len(closes) < 12 or len(highs) < 12 or len(lows) < 12:
+        return {}
+    current_price = safe_int(ctx.get("today_price", 0), 0)
+    open_price = safe_int((ctx.get("cur") or {}).get("open", current_price), current_price)
+    prev_close = safe_int(ctx.get("prev_close", 0), 0)
+    ma20 = sum(closes[-20:]) / 20.0 if len(closes) >= 20 else 0.0
+    ma20_gap_pct = round((current_price - ma20) / max(ma20, 1) * 100.0, 2) if ma20 > 0 and current_price > 0 else 0.0
+    ma20_supported = bool(ma20 > 0 and ma20_gap_pct >= -0.6)
+    gap_pct = round((open_price - prev_close) / prev_close * 100.0, 2) if open_price > 0 and prev_close > 0 else 0.0
+    dipped_below_open = bool(open_price > 0 and any(low <= int(open_price * (1 - MID_PULLBACK_GAP_RECLAIM_OPEN_DIP_PCT / 100.0)) for low in lows[-12:]))
+    reclaimed_open = bool(open_price > 0 and current_price >= int(open_price * (1 + MID_PULLBACK_GAP_RECLAIM_OPEN_RECOVER_PCT / 100.0)))
+    tail = lows[-12:]
+    block = max(3, len(tail) // 3)
+    block_mins = []
+    for idx in range(3):
+        start = max(0, len(tail) - block * (3 - idx))
+        end = max(0, len(tail) - block * (2 - idx)) if idx < 2 else len(tail)
+        part = tail[start:end]
+        if part:
+            block_mins.append(min(part))
+    higher_low_active = bool(len(block_mins) >= 3 and block_mins[0] < block_mins[1] <= block_mins[2])
+    lookback_n = min(len(highs) - 1, max(6, MID_PULLBACK_INTRADAY_BOX_LOOKBACK))
+    box_highs = highs[-(lookback_n + 1):-1] if lookback_n > 0 else highs[:-1]
+    box_lows = lows[-(lookback_n + 1):-1] if lookback_n > 0 else lows[:-1]
+    box_upper = max(box_highs) if box_highs else 0
+    box_lower = min(box_lows) if box_lows else 0
+    box_width_pct = round((box_upper - box_lower) / max(box_upper, 1) * 100.0, 2) if box_upper > 0 and box_lower > 0 else 0.0
+    in_box = bool(box_upper > 0 and box_lower > 0 and box_width_pct <= MID_PULLBACK_BOX_MAX_WIDTH_PCT)
+    box_support_hit = bool(in_box and current_price >= box_lower + (box_upper - box_lower) * 0.55 and current_price >= int(box_lower * 1.01))
+    box_breakout_hit = bool(in_box and current_price >= int(box_upper * 1.001) and ma20_supported)
+    gap_up_reclaim_hit = bool(
+        gap_pct >= MID_PULLBACK_GAP_RECLAIM_MIN_GAP_PCT
+        and reclaimed_open
+        and dipped_below_open
+        and ma20_supported
+        and safe_float(ctx.get("vol_ratio", 0.0), 0.0) >= MID_PULLBACK_GAP_RECLAIM_MIN_VOL_RATIO
+    )
+    return {
+        "gap_pct": gap_pct,
+        "ma20": round(ma20, 1) if ma20 > 0 else 0.0,
+        "ma20_gap_pct": ma20_gap_pct,
+        "ma20_supported": ma20_supported,
+        "dipped_below_open": dipped_below_open,
+        "reclaimed_open": reclaimed_open,
+        "higher_low_active": higher_low_active,
+        "box_upper": box_upper,
+        "box_lower": box_lower,
+        "box_width_pct": box_width_pct,
+        "box_support_hit": box_support_hit,
+        "box_breakout_hit": box_breakout_hit,
+        "gap_up_reclaim_hit": gap_up_reclaim_hit,
+    }
 def _analyze_intraday_pullback_window(ctx: dict, surge_meta: dict) -> dict:
     hist = ctx["hist"]
     surge_peak_idx = surge_meta["surge_peak_idx"]
@@ -11044,12 +11195,15 @@ def _analyze_intraday_pullback_window(ctx: dict, surge_meta: dict) -> dict:
     avg_surge_vol = sum(surge_vols) / len(surge_vols) if surge_vols else 0
     avg_pb_vol = sum(pb_vols) / len(pb_vols) if pb_vols else 0
     vol_dried = avg_pb_vol < avg_surge_vol * 0.7 if avg_surge_vol else False
+    structure_ctx = _build_intraday_reclaim_structure_context(ctx)
     breakout_mode = ctx["today_price"] > ctx["prev_close"] and ctx["today_chg"] >= 5.0 and ctx["vol_ratio"] >= COMMON_THRESHOLD_3P0
     reclaim_ref_price = max(ctx["today_price"], ctx["intraday_high"])
     reclaim_ratio = _calc_pullback_reclaim_ratio(surge_peak_price, pullback_low, reclaim_ref_price)
     rebound_gain_pct = round((ctx["today_price"] - pullback_low) / pullback_low * 100, 1) if pullback_low else 0.0
     resurge_mode = pullback_pct >= MID_RESURGE_MIN_PULLBACK_PCT and ctx["today_chg"] >= MID_RESURGE_MIN_TODAY_CHG and ctx["vol_ratio"] >= MID_RESURGE_MIN_VOL_RATIO and reclaim_ratio >= MID_RESURGE_MIN_RECLAIM_RATIO and rebound_gain_pct >= MID_RESURGE_MIN_BOUNCE_PCT
-    return {} if not (breakout_mode or resurge_mode) else {"pullback_low": pullback_low, "pullback_days": pullback_days, "pullback_pct": pullback_pct, "vol_dried": vol_dried, "breakout_mode": breakout_mode, "reclaim_ratio": reclaim_ratio, "rebound_gain_pct": rebound_gain_pct, "resurge_mode": resurge_mode}
+    gap_up_reclaim_mode = bool(structure_ctx.get("gap_up_reclaim_hit") and reclaim_ratio >= 0.55)
+    box_breakout_mode = bool(structure_ctx.get("box_breakout_hit") and reclaim_ratio >= 0.45 and ctx["vol_ratio"] >= 2.2)
+    return {} if not (breakout_mode or resurge_mode or gap_up_reclaim_mode or box_breakout_mode) else {"pullback_low": pullback_low, "pullback_days": pullback_days, "pullback_pct": pullback_pct, "vol_dried": vol_dried, "breakout_mode": breakout_mode, "reclaim_ratio": reclaim_ratio, "rebound_gain_pct": rebound_gain_pct, "resurge_mode": resurge_mode, "gap_up_reclaim_mode": gap_up_reclaim_mode, "box_breakout_mode": box_breakout_mode, "structure_ctx": structure_ctx}
 def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: dict, name: str) -> dict:
     hist = ctx["hist"]
     today_price = ctx["today_price"]
@@ -11065,12 +11219,20 @@ def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: di
     reclaim_ratio = window_meta["reclaim_ratio"]
     rebound_gain_pct = window_meta["rebound_gain_pct"]
     resurge_mode = window_meta["resurge_mode"]
+    gap_up_reclaim_mode = bool(window_meta.get("gap_up_reclaim_mode"))
+    box_breakout_mode = bool(window_meta.get("box_breakout_mode"))
+    structure_ctx = window_meta.get("structure_ctx") or {}
     z = get_volume_zscore(ctx["code"], today_vol)
     rs = get_relative_strength(today_chg)
     ma20 = sum(day["close"] for day in hist[-20:]) / 20 if len(hist) >= 20 else 0
     ma20_dev = round((today_price - ma20) / ma20 * 100, 1) if ma20 else 0
     score = 0
-    reasons = ["⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)" if breakout_mode else "♻️ <b>재상승 감지!</b> (깊은 눌림 후 거래대금 재유입)"]
+    if gap_up_reclaim_mode:
+        reasons = ["🟦 <b>갭상승 후 시가 회복</b> (눌림 뒤 시가 재돌파)"]
+    elif box_breakout_mode:
+        reasons = ["🧱 <b>박스 상단 재돌파</b> (조정 후 압축 돌파)"]
+    else:
+        reasons = ["⚡️ <b>장중 돌파 감지!</b> (어제까지 눌림 완성 → 오늘 돌파)" if breakout_mode else "♻️ <b>재상승 감지!</b> (깊은 눌림 후 거래대금 재유입)"]
     if surge_pct >= 40:
         score += 25; reasons.append(f"🚀 1차 급등 {surge_pct:.0f}% (강력)")
     elif surge_pct >= 25:
@@ -11087,6 +11249,10 @@ def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: di
         score += 8; reasons.append(f"🟡 얕은 눌림 ({pullback_pct:.0f}%)")
     else:
         score += 5; reasons.append(f"🟡 깊은 눌림 ({pullback_pct:.0f}%)")
+    if gap_up_reclaim_mode:
+        score += 18; reasons.append(f"🟦 시가 회복 + 갭 유지 ({structure_ctx.get('gap_pct', 0):+.1f}%)")
+    if box_breakout_mode:
+        score += 12; reasons.append(f"🧱 분봉 박스 상단 돌파 ({structure_ctx.get('box_width_pct', 0):.1f}% 폭)")
     if breakout_mode:
         if today_chg >= 20:
             score += 30; reasons.append(f"🚨 오늘 +{today_chg:.0f}% 강력 돌파!")
@@ -11102,6 +11268,12 @@ def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: di
         else:
             score += 12; reasons.append(f"🟡 눌림 회복률 {reclaim_ratio * 100:.0f}% — 재상승 초입")
         reasons.append(f"📈 저점 대비 +{rebound_gain_pct:.1f}% 반등")
+    if bool(structure_ctx.get("higher_low_active")):
+        score += 8; reasons.append("📐 분봉 저점 상승 구조 +8")
+    if bool(structure_ctx.get("box_support_hit")) and not box_breakout_mode:
+        score += 5; reasons.append(f"🧱 박스 지지 유지 ({structure_ctx.get('box_width_pct', 0):.1f}% 폭) +5")
+    if bool(structure_ctx.get("ma20_supported")):
+        score += 5; reasons.append(f"⏱ 1분봉 20선 지지 {structure_ctx.get('ma20_gap_pct', 0):+.1f}% +5")
     if vol_ratio >= 10:
         score += 20; reasons.append(f"💥 거래량 {vol_ratio:.0f}배 폭발 (5일 평균 대비)")
     elif vol_ratio >= 5:
@@ -11122,7 +11294,7 @@ def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: di
     if resurge_mode and not breakout_mode:
         reasons.append(f"↘️ 재상승형 보수 진입가 {entry:,}원 (현재가 추격 방지)")
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(ctx["code"], entry, signal_type="MID_PULLBACK")
-    result = {"code": ctx["code"], "name": _resolve_stock_name(ctx["code"], name, ctx["cur"]), "price": today_price, "change_rate": today_chg, "volume_ratio": vol_ratio, "signal_type": "MID_PULLBACK", "is_intraday": True, "grade": grade, "score": score, "pattern_score_base": score, "surge_pct": surge_pct, "pullback_pct": pullback_pct, "pullback_days": pullback_days, "current_pullback": round((surge_peak_price - today_price) / surge_peak_price * 100, 1), "pullback_reclaim_ratio": reclaim_ratio, "resurge_mode": bool(resurge_mode and not breakout_mode), "entry_soft_block_allowed": bool(resurge_mode), "vol_dried": window_meta["vol_dried"], "vol_recovered": True, "is_bullish": True, "ma20_dev": ma20_dev, "rs": rs, "vol_zscore": z, "similar_pattern_stats": similar_pattern_stats, "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used, "gap_pct": round(((today_price - ctx['prev_close']) / ctx['prev_close']) * 100, 1) if ctx['prev_close'] else 0.0, "today_open": safe_int(ctx["cur"].get("open", today_price), today_price), "today_high": ctx["intraday_high"], "today_vol": ctx["today_vol"], "turnaround_confirmed": False, "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""), "reasons": reasons, "detected_at": datetime.now()}
+    result = {"code": ctx["code"], "name": _resolve_stock_name(ctx["code"], name, ctx["cur"]), "price": today_price, "change_rate": today_chg, "volume_ratio": vol_ratio, "signal_type": "MID_PULLBACK", "is_intraday": True, "grade": grade, "score": score, "pattern_score_base": score, "surge_pct": surge_pct, "pullback_pct": pullback_pct, "pullback_days": pullback_days, "current_pullback": round((surge_peak_price - today_price) / surge_peak_price * 100, 1), "pullback_reclaim_ratio": reclaim_ratio, "resurge_mode": bool(resurge_mode and not breakout_mode), "gap_up_reclaim_hit": gap_up_reclaim_mode, "box_breakout_hit": bool(structure_ctx.get("box_breakout_hit")), "box_support_hit": bool(structure_ctx.get("box_support_hit")), "higher_low_active": bool(structure_ctx.get("higher_low_active")), "near_recent_high": bool(structure_ctx.get("box_breakout_hit") or structure_ctx.get("box_support_hit")), "box_width_pct": float(structure_ctx.get("box_width_pct", 0.0) or 0.0), "entry_soft_block_allowed": bool(resurge_mode or gap_up_reclaim_mode), "vol_dried": window_meta["vol_dried"], "vol_recovered": True, "is_bullish": True, "ma20_dev": ma20_dev, "rs": rs, "vol_zscore": z, "similar_pattern_stats": similar_pattern_stats, "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used, "gap_pct": round(((today_price - ctx['prev_close']) / ctx['prev_close']) * 100, 1) if ctx['prev_close'] else 0.0, "today_open": safe_int(ctx["cur"].get("open", today_price), today_price), "today_high": ctx["intraday_high"], "today_vol": ctx["today_vol"], "turnaround_confirmed": False, "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""), "reasons": reasons, "detected_at": datetime.now()}
     return _finalize_mid_pullback_signal(result)
 def check_intraday_pullback_breakout(code: str, name: str) -> dict:
     ctx = _build_intraday_pullback_context(code)
