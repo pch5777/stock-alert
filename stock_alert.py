@@ -3,11 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162
+버전: v160.11
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v162 (2026-04-02): v160.10 기준에서 눌림목 3종 포착 보강 재적용 — 오류본 v161에서 유효했던 포착 보강만 직전 정상본 v160.10 위에 다시 얹었다. `MID_PULLBACK`/`intraday_reclaim` 경로에 (1) 갭상승 후 시가 회복 돌파, (2) 박스권 상단 돌파·하단 지지, (3) higher low + 거래대금 재유입 구조를 재반영해 좋은 재상승형 종목 누락을 줄였다. 일봉 눌림목은 박스 구조·전고 근접·저점 상승 가점을 받고, 장중 재상승은 1분봉 기반 시가 회복/박스 돌파/저점 상승 구조가 확인되면 별도 가점과 이유로 승격된다. 실행등급 프로필에도 `시가회복/박스돌파/박스지지/저점상승/전고근접` 토큰을 다시 연결하되, v160.10의 timezone/업종 fallback/run_scan 결측 복구 수정은 그대로 유지한다.
+- v160.11 (2026-04-02): v160.10 안정화 유지 + 눌림목 3종 재적용 + token 재발급 쿨다운/섹터 재보정/run_scan 결측 정리 — 직전 정상본 v160.10 위에 오류본에서 유효했던 눌림목 3종 포착 보강(갭상승 후 시가 회복, 박스권 상단 돌파·하단 지지, higher low + 거래대금 재유입)을 다시 얹었다. 동시에 KIS tokenP 403 `EGW00133`가 뜨면 1분 내 재발급 재시도를 중단하고 쿨다운을 기록해 같은 분 연속 발급을 막는다. run_scan은 섹터 gate 직전에 종목의 업종/테마를 한 번 더 재보정해 `기타` 쏠림을 줄이고, 시세·신호 결측 payload는 재복구 후에도 불완전하면 일반 포착에서 제거해 `+0.0% [] 0점 [C]` 로그가 반복되지 않게 했다. 또한 눌림목 결과 dict는 provisional grade를 먼저 채워 `눌림목 오류 (...): 'grade'`를 막는다.
 - v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
 - v160.9 (2026-04-02): NXT/KRX 익일 오픈 평가 시각 분리 — `PRECLOSE_GAP_ENTRY`의 익일 오픈 체크를 시장별로 분리해 NXT는 08:05, KRX는 09:05에 각각 평가하도록 수정했다. `update_preclose_gap_open_outcomes(stage=...)`가 signal별 stage를 읽어 해당 시장만 기록하고, 고우선 정리 메모도 `08:05/09:05`를 시장별로 다르게 표기한다. 또한 startup catch-up도 NXT 08:05 / KRX 09:05 기준으로 다시 확인해, NXT 종가베팅 후보를 KRX와 같은 시각에 늦게 평가하던 문제를 막았다.
 - v160.8 (2026-04-02): NXT 19:20도 종가베팅 final confirm 동일 적용 — v160.7에서 KRX 15:18에만 붙였던 종가베팅 final confirm을 NXT 19:20에도 같은 기준으로 확장했다. 이제 NXT 선진입 후보도 `phase="final"`로 처리되어 전고/신고가 근접, 윗꼬리 부담, 거래대금 강도, higher low 조정, 외국인·기관 수급, 1분봉 20선 지지를 같은 축으로 다시 확인하고, 최종 점수 문턱과 안내 문구도 final 기준을 사용한다.
@@ -5420,6 +5420,8 @@ _token_expires      = 0
 _session            = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
 KIS_TOKEN_STATE_FILE = _state_path("kis_token_state.json")
+KIS_TOKEN_RETRY_BLOCK_SEC = int(os.getenv("KIS_TOKEN_RETRY_BLOCK_SEC", "65") or "65")
+_kis_token_retry_block_until = 0.0
 # 디버그: 어떤 KIS 서버로 붙는지 1회 출력(환경 혼동 방지)
 try:
     _log_info_msg(f"🔗 KIS_BASE_URL: {KIS_BASE_URL}")
@@ -5779,19 +5781,47 @@ def _wait_for_kis_rest_slot(kind: str = "rest") -> None:
 def _load_kis_token_state() -> dict:
     state = _read_json_locked(KIS_TOKEN_STATE_FILE, default={})
     return state if isinstance(state, dict) else {}
-def _save_kis_token_state(token: str, expires_at: float) -> None:
+def _save_kis_token_state(token: str, expires_at: float, *, retry_block_until: float = 0.0, retry_block_reason: str = "") -> None:
     payload = {
         "access_token": str(token or "").strip(),
         "expires_at": int(float(expires_at or 0)),
         "base_url": KIS_BASE_URL,
         "saved_at": int(time.time()),
+        "retry_block_until": int(float(retry_block_until or 0)),
+        "retry_block_reason": str(retry_block_reason or "").strip(),
     }
     _write_json_atomic(KIS_TOKEN_STATE_FILE, payload, indent=2)
+def _set_kis_token_retry_block_until(block_until: float, reason: str = "") -> None:
+    global _kis_token_retry_block_until
+    _kis_token_retry_block_until = max(_kis_token_retry_block_until, float(block_until or 0.0))
+    state = _load_kis_token_state()
+    payload = {
+        "access_token": str(state.get("access_token") or "").strip(),
+        "expires_at": int(float(state.get("expires_at") or 0)),
+        "base_url": KIS_BASE_URL,
+        "saved_at": int(time.time()),
+        "retry_block_until": int(float(_kis_token_retry_block_until or 0)),
+        "retry_block_reason": str(reason or state.get("retry_block_reason") or "").strip(),
+    }
+    _write_json_atomic(KIS_TOKEN_STATE_FILE, payload, indent=2)
+def _get_kis_token_retry_block_until() -> float:
+    global _kis_token_retry_block_until
+    if _kis_token_retry_block_until > time.time():
+        return _kis_token_retry_block_until
+    state = _load_kis_token_state()
+    block_until = float(state.get("retry_block_until") or 0.0)
+    if block_until > time.time():
+        _kis_token_retry_block_until = block_until
+        return block_until
+    return 0.0
 def _clear_kis_token_state() -> None:
+    global _kis_token_retry_block_until
+    _kis_token_retry_block_until = 0.0
     _write_json_atomic(KIS_TOKEN_STATE_FILE, {}, indent=2)
 def _restore_kis_token_from_state() -> str:
-    global _access_token, _token_expires
+    global _access_token, _token_expires, _kis_token_retry_block_until
     state = _load_kis_token_state()
+    _kis_token_retry_block_until = float(state.get("retry_block_until") or 0.0)
     token = str(state.get("access_token") or "").strip()
     expires_at = int(float(state.get("expires_at") or 0))
     base_url = str(state.get("base_url") or "").strip().rstrip("/")
@@ -5815,6 +5845,9 @@ def _kis_http_error_body_snippet(resp) -> str:
     except Exception as e:
         _swallow_exception(e)
         return ""
+def _is_kis_token_retry_block_error(err: Exception | str | None) -> bool:
+    msg = str(err or "")
+    return "EGW00133" in msg or "토큰 재발급 대기" in msg or "token retry cooldown" in msg
 def get_token(retry: int = 3) -> str:
     global _access_token, _token_expires
     _validate_kis_oauth_config()
@@ -5823,6 +5856,10 @@ def get_token(retry: int = 3) -> str:
     cached = _restore_kis_token_from_state()
     if cached:
         return cached
+    block_until = _get_kis_token_retry_block_until()
+    if block_until > time.time():
+        remain = max(1, int(block_until - time.time()))
+        raise RuntimeError(f"KIS token retry cooldown active | wait={remain}s | cause=EGW00133")
     last_error: Exception | None = None
     for attempt in range(retry):
         resp = None
@@ -5843,15 +5880,27 @@ def get_token(retry: int = 3) -> str:
         except requests.HTTPError as e:
             status = getattr(resp, "status_code", None)
             body_snip = _kis_http_error_body_snippet(resp)
+            body_txt = str(body_snip or "")
             if status == 403:
+                _access_token = None
+                _token_expires = 0
+                if "EGW00133" in body_txt or "1분당 1회" in body_txt:
+                    block_until = time.time() + max(61, int(KIS_TOKEN_RETRY_BLOCK_SEC or 65))
+                    _set_kis_token_retry_block_until(block_until, reason=body_txt)
+                    remain = max(1, int(block_until - time.time()))
+                    last_error = RuntimeError(f"KIS tokenP 403 Forbidden | EGW00133 | token retry cooldown {remain}s | body={body_txt or '없음'}")
+                    _log_error(f"get_token(attempt={attempt+1})", last_error, critical=True)
+                    break
                 _clear_kis_token_state()
                 hint = "실전/모의 URL-키 조합, API신청/권한 상태, 동일일 재발급 여부 점검 필요"
-                last_error = RuntimeError(f"KIS tokenP 403 Forbidden | {hint} | body={body_snip or '없음'}")
+                last_error = RuntimeError(f"KIS tokenP 403 Forbidden | {hint} | body={body_txt or '없음'}")
             else:
-                last_error = RuntimeError(f"KIS tokenP HTTP {status} | body={body_snip or '없음'}")
+                last_error = RuntimeError(f"KIS tokenP HTTP {status} | body={body_txt or '없음'}")
         except Exception as e:
             last_error = e
         _log_error(f"get_token(attempt={attempt+1})", last_error, critical=attempt==retry-1)
+        if _is_kis_token_retry_block_error(last_error):
+            break
         time.sleep(5 * (attempt + 1))
     raise RuntimeError(f"❌ KIS 토큰 최종 실패: {last_error}")
 def _headers(tr_id: str) -> dict:
@@ -5902,6 +5951,8 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
                 last_exc = None
         except Exception as e:
             last_exc = e
+        if _is_kis_token_retry_block_error(last_exc):
+            break
         try:
             time.sleep(0.8 * (2 ** attempt))
         except Exception as e:
@@ -7529,7 +7580,7 @@ def _build_mid_pullback_result(code: str, name: str, ctx: dict, execution: dict)
         "change_rate": ctx["today_chg"],
         "volume_ratio": execution["vol_ratio"],
         "signal_type": "MID_PULLBACK",
-        "grade": ctx["grade"],
+        "grade": str(ctx.get("grade") or ("A" if int(ctx.get("score", 0) or 0) >= 80 else "B" if int(ctx.get("score", 0) or 0) >= 60 else "C")),
         "score": ctx["score"],
         "surge_pct": ctx["surge_pct"],
         "pullback_pct": ctx["pullback_pct"],
@@ -11515,6 +11566,7 @@ def get_stock_price(code: str) -> dict:
         "bid_price": int(o.get("bidp1",0) or 0),
         "prev_close": int(o.get("stck_sdpr",0)),
         "bstp_code": o.get("bstp_cls_code",""),
+        "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
         "mktcap":    mktcap_raw,       # 억원 단위
@@ -12304,6 +12356,7 @@ def get_nxt_stock_price(code: str) -> dict:
         "bid_price": int(o.get("bidp1",0) or 0),
         "open": int(o.get("stck_oprc",0) or 0),
         "market": "NXT",
+        "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
     }
@@ -24069,14 +24122,41 @@ def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_
     if existing_hit_result is not None:
         return existing_hit_result
     return _finalize_general_alert_dispatch(ctx)
+def _hydrate_alert_sector_theme(alert: dict, *, force_lookup: bool = False) -> str:
+    try:
+        if not isinstance(alert, dict):
+            return "기타"
+        sector_info = alert.get("sector_info") if isinstance(alert.get("sector_info"), dict) else {}
+        for candidate in (
+            alert.get("sector_theme"),
+            sector_info.get("theme"),
+            alert.get("bstp_name"),
+            sector_info.get("bstp_name"),
+            alert.get("adaptive_feedback_theme"),
+            alert.get("theme_desc"),
+        ):
+            sec = str(candidate or "").strip()
+            if sec and not _is_generic_sector_theme(sec):
+                sector_info["theme"] = sec
+                alert["sector_info"] = sector_info
+                alert["sector_theme"] = sec
+                return sec
+        code = normalize_stock_code(alert.get("code", ""))
+        if code and force_lookup:
+            theme_name, _, _ = get_theme_sector_stocks(code)
+            theme_name = str(theme_name or "").strip()
+            if theme_name and not _is_generic_sector_theme(theme_name):
+                sector_info["theme"] = theme_name
+                alert["sector_info"] = sector_info
+                alert["sector_theme"] = theme_name
+                return theme_name
+        return "기타"
+    except Exception as e:
+        _swallow_exception(e)
+        return "기타"
 def _extract_alert_sector_theme(alert: dict) -> str:
     try:
-        sec = str(alert.get("sector_theme", "") or "").strip()
-        if not sec:
-            sec = str((alert.get("sector_info") or {}).get("theme", "") or "").strip()
-        if sec in ("", "기타업종", "동일업종", "업종미상", "unknown", "미분류"):
-            return "기타"
-        return sec
+        return _hydrate_alert_sector_theme(alert, force_lookup=False)
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         return "기타"
@@ -30920,11 +31000,19 @@ def _build_fallback_scan_signal_type(item: dict) -> str:
         return signal_type
     change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
     volume_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
+    joined = " ".join([str(item.get("desc") or ""), str(item.get("theme_desc") or ""), " ".join(map(str, item.get("reasons") or []))]).upper()
+    has_live = safe_int(item.get("price", 0), 0) > 0 and bool(str(item.get("name", "") or "").strip())
     if change_rate >= UPPER_LIMIT_THRESHOLD:
         return "NEAR_UPPER"
     if change_rate >= max(PRICE_SURGE_MIN, 4.0) or volume_ratio >= max(3.0, COMMON_THRESHOLD_3P0):
         return "SURGE"
     if change_rate >= max(0.8, _early_price_min_dynamic) and volume_ratio >= max(1.2, _early_volume_min_dynamic * 0.7):
+        return "EARLY_DETECT"
+    if any(token in joined for token in ("MID_PULLBACK", "재상승", "시가회복", "박스돌파", "박스지지")):
+        return "MID_PULLBACK"
+    if has_live and any(token in joined for token in ("랭킹후보", "자동편입", "NXT장후리더", "THEME_FEEDBACK", "ADAPTIVE_FEEDBACK", "PREWATCH", "리더")):
+        return "EARLY_DETECT"
+    if has_live and (bool(item.get("direct_news_hit")) or bool(item.get("theme_chain_force_hit")) or bool(item.get("material_first_priority_hit"))):
         return "EARLY_DETECT"
     return ""
 
@@ -30935,6 +31023,8 @@ def _build_fallback_scan_score(item: dict, signal_type: str = "") -> int:
     change_rate = safe_float(item.get("change_rate", 0.0), 0.0)
     volume_ratio = safe_float(item.get("volume_ratio", 0.0), 0.0)
     sig = str(signal_type or item.get("signal_type") or "").upper()
+    has_live = safe_int(item.get("price", 0), 0) > 0 and bool(str(item.get("name", "") or "").strip())
+    meaningful_theme = not _is_generic_sector_theme(str(item.get("sector_theme") or (item.get("sector_info") or {}).get("theme") or ""))
     base = 0
     if sig == "UPPER_LIMIT":
         base = 90
@@ -30942,10 +31032,16 @@ def _build_fallback_scan_score(item: dict, signal_type: str = "") -> int:
         base = 82
     elif sig == "SURGE":
         base = 62
+    elif sig == "MID_PULLBACK":
+        base = 58
     elif sig == "EARLY_DETECT":
         base = 54
+    elif has_live and (meaningful_theme or bool(item.get("direct_news_hit")) or bool(item.get("material_first_priority_hit"))):
+        base = 46
     base += min(18, max(0, int(abs(change_rate) * 1.4)))
     base += min(14, max(0, int(volume_ratio * 2.5)))
+    if has_live and str(item.get("market", "") or "").upper() == "NXT":
+        base += 2
     return max(0, min(99, base))
 
 def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | None = None) -> dict:
@@ -30962,7 +31058,7 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
             _swallow_exception(e)
             quote = {}
         if isinstance(quote, dict) and quote.get("price"):
-            for key in ("name", "price", "change_rate", "volume_ratio", "today_vol", "market", "open", "prev_close", "ask_qty", "bid_qty", "ask_price", "bid_price", "bstp_code"):
+            for key in ("name", "price", "change_rate", "volume_ratio", "today_vol", "market", "open", "prev_close", "ask_qty", "bid_qty", "ask_price", "bid_price", "bstp_code", "bstp_name"):
                 if quote.get(key) not in (None, "", 0):
                     item[key] = quote.get(key)
         item["change_rate"] = _get_effective_change_rate(item, safe_int(item.get("price", 0), 0))
@@ -30988,6 +31084,18 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
                     uniq.append(reason)
                 merged["reasons"] = uniq
             item = merged
+    if not str(item.get("name") or "").strip():
+        item["name"] = _resolve_stock_name(code, item.get("name", ""))
+    if safe_int(item.get("price", 0), 0) <= 0 and safe_int(item.get("entry_price", 0), 0) > 0:
+        item["price"] = safe_int(item.get("entry_price", 0), 0)
+    bstp_name = str(item.get("bstp_name") or (item.get("sector_info") or {}).get("bstp_name") or "").strip()
+    if bstp_name and not _is_generic_sector_theme(bstp_name):
+        sector_info = item.get("sector_info") if isinstance(item.get("sector_info"), dict) else {}
+        sector_info["theme"] = str(sector_info.get("theme") or bstp_name) if _is_generic_sector_theme(str(sector_info.get("theme") or "")) else str(sector_info.get("theme") or "")
+        sector_info["bstp_name"] = bstp_name
+        item["sector_info"] = sector_info
+        if _is_generic_sector_theme(str(item.get("sector_theme") or "")):
+            item["sector_theme"] = sector_info.get("theme", bstp_name)
     signal_type = _build_fallback_scan_signal_type(item)
     if signal_type and str(item.get("signal_type") or "").strip().upper() in ("", "UNKNOWN"):
         item["signal_type"] = signal_type
@@ -30998,6 +31106,15 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
         grade = "A" if score >= 80 else "B" if score >= 60 else "C"
         item["grade"] = grade
         item["execution_grade"] = grade
+    incomplete = (
+        not str(item.get("signal_type") or "").strip()
+        or safe_int(item.get("score", 0), 0) <= 0
+        or safe_int(item.get("price", 0), 0) <= 0
+        or not str(item.get("name") or "").strip()
+    )
+    item["_scan_payload_incomplete"] = bool(incomplete)
+    if incomplete:
+        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 일반 포착 제외")
     return item
 
 def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
@@ -31040,6 +31157,10 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
+        if bool(item.get("_scan_payload_incomplete")):
+            dropped += 1
+            _log_warn_msg(f"⚠️ run_scan 결측 payload 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code}")
+            continue
         cleaned.append(item)
     if dropped > 0:
         _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}")
@@ -31054,6 +31175,9 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
         return
     result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
+    if bool(result.get("_scan_payload_incomplete")):
+        _log_warn_msg(f"⚠️ run_scan alert 결측 스킵: {result.get('name', result_code) or result_code}")
+        return
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
     if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
         return
@@ -31343,7 +31467,9 @@ def _apply_scan_sector_gate(alerts: list) -> list:
     sector_counts = {}
     filtered_alerts = []
     for s in alerts:
-        sec = _extract_alert_sector_theme(s)
+        sec = _hydrate_alert_sector_theme(s, force_lookup=True)
+        if not str(s.get("name") or "").strip() and s.get("code"):
+            s["name"] = _resolve_stock_name(s.get("code"), s.get("name", ""))
         sec_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
         if s.get("theme_chain_force_hit") or s.get("force_external_capture_alert") or s.get("material_first_priority_hit") or s.get("direct_news_hit"):
             sec_limit += 2
