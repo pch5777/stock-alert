@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.5
+버전: v160.6
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.6 (2026-04-02): 정규장 재료 prewatch 반응 완화 + 오전 NXT 저품질 후보 축소 — 하향추세 차단은 유지한 채 정규장에서는 강한 재료 seed의 prewatch 반응 기준을 `quality_score/headline_count` 기반으로 완화해 `뉴스 있지만 주가 반응 없음`으로 오래 묻히는 종목이 더 빨리 본스캔에 합류하도록 조정했다. 동시에 오전 NXT는 `_get_nxt_premarket_quality_gate()`를 추가해 0점/C급/진입가 미확정으로 반복 쌓이던 저품질 후보를 사전 제거하고, 장전 NXT 본스캔도 같은 gate를 통과한 후보만 돌도록 정리했다. 이로써 현대로템 같은 주봉·일봉 하향 추세 차단은 그대로 유지하면서도 정규장 진짜 재료 반응형과 오전 NXT 실행형 후보의 품질을 더 보수적으로 맞췄다.
 - v160.5 (2026-04-02): 네이버 코스닥 상승/거래량 순위 URL 404 복구 — `_fetch_naver_rank()`를 코스피/코스닥 분리 경로(`*_kosdaq.naver`) 대신 공통 `sise_rise.naver`/`sise_quant.naver`에 `sosok=0/1` 파라미터를 붙여 요청하도록 바꿨다. 코스닥 direct path 404를 제거하고, 응답 인코딩도 `apparent_encoding`/`euc-kr` 기준으로 보정해 외부 fallback 품질을 유지했다. 또한 smoke test에 구형 `*_kosdaq.naver` URL 금지와 `sosok` 파라미터 기반 요청 검증을 추가했다.
 - v160.4 (2026-04-02): v160.2 기능 보존 상태에서 startup 비동기 catch-up + datetime aware 정리 + 삭제방지 검증 강화 — `v160.2`의 stale runtime lock 복구/NXT·오픈 버스트/KPI cohort reset 보강을 그대로 유지한 채, `__main__` 시작부의 동기 `refresh_dynamic_candidates()` 호출과 즉시 스캔 실행을 제거하고 `_schedule_startup_scan_catchup()` 기반 비동기 catch-up으로 전환했다. 또한 carry/priority hint/minutes helper의 datetime 계산을 KST aware 기준으로 통일해 `can't subtract offset-naive and offset-aware datetimes` 잔여 오류를 줄였고, smoke test에는 직전 정상본 핵심 변경사항·변경이력 보존·삭제 금지 규칙 검증을 추가했다.
 - v160.2 (2026-04-02): stale 상위 버전 락 복구 + 장전/NXT·오픈 버스트 + cohort reset 보강 — `runtime_version_lock.json`에 lease/heartbeat 개념을 추가해 죽은 상위 버전 락은 자동 복구하고, 살아 있는 상위 버전만 구버전 런타임을 차단하도록 정리했다. 또한 08:00~09:00 NXT 장전 버스트와 09:00~09:03 KRX 오픈 버스트를 추가해 `refresh_dynamic_candidates(force_rank=True)`·`run_material_first_scan()`·`run_scan()`를 더 촘촘히 돌리도록 보강했다. `compute_signal_kpi()` 경로는 현재 cohort 필터를 강제하고, `/reset_stats 확인`은 signal_log 백업 뒤 통계 시작 시각뿐 아니라 동적 파라미터 baseline·emergency state·연속 손익 카운터까지 함께 초기화한다. 마지막으로 동적 후보군 로그를 `KRX_seed/KRX_rank/NXT_seed/NXT_rank/material_prewatch` 기준으로 분리해 운영 판단이 바로 되도록 정리했다.
@@ -4746,6 +4747,13 @@ ISSUE_PREWATCH_REACTION_MIN_CHANGE = float(os.getenv("ISSUE_PREWATCH_REACTION_MI
 ISSUE_PREWATCH_REACTION_MIN_VOLUME = float(os.getenv("ISSUE_PREWATCH_REACTION_MIN_VOLUME", "1.5") or "1.5")
 ISSUE_PREWATCH_REACT_LIMIT = int(os.getenv("ISSUE_PREWATCH_REACT_LIMIT", "5") or "5")
 ISSUE_PREWATCH_FIRED_TTL_SEC = int(os.getenv("ISSUE_PREWATCH_FIRED_TTL_SEC", "28800") or "28800")
+ISSUE_PREWATCH_STRONG_SEED_SCORE = int(os.getenv("ISSUE_PREWATCH_STRONG_SEED_SCORE", "4") or "4")
+ISSUE_PREWATCH_STRONG_HEADLINE_COUNT = int(os.getenv("ISSUE_PREWATCH_STRONG_HEADLINE_COUNT", "3") or "3")
+ISSUE_PREWATCH_STRONG_REACTION_MIN_CHANGE = float(os.getenv("ISSUE_PREWATCH_STRONG_REACTION_MIN_CHANGE", "1.0") or "1.0")
+ISSUE_PREWATCH_STRONG_REACTION_MIN_VOLUME = float(os.getenv("ISSUE_PREWATCH_STRONG_REACTION_MIN_VOLUME", "1.1") or "1.1")
+NXT_PREMARKET_QUALITY_MIN_CHANGE = float(os.getenv("NXT_PREMARKET_QUALITY_MIN_CHANGE", "1.2") or "1.2")
+NXT_PREMARKET_QUALITY_MIN_VOLUME = float(os.getenv("NXT_PREMARKET_QUALITY_MIN_VOLUME", "1.8") or "1.8")
+NXT_PREMARKET_QUALITY_MIN_SUPPORT_HITS = int(os.getenv("NXT_PREMARKET_QUALITY_MIN_SUPPORT_HITS", "2") or "2")
 MATERIAL_FIRST_OFFHOURS_MIN_SEC = int(os.getenv("MATERIAL_FIRST_OFFHOURS_MIN_SEC", "300") or "300")
 MATERIAL_FIRST_OFFHOURS_START = dtime(6, 0)
 MATERIAL_FIRST_OFFHOURS_END = dtime(23, 30)
@@ -22010,6 +22018,52 @@ def analyze(stock: dict) -> dict:
 # ============================================================
 # 조기 포착
 # ============================================================
+def _get_nxt_premarket_quality_gate(stock: dict) -> dict:
+    stock = dict(stock or {})
+    code = normalize_stock_code(stock.get("code", ""))
+    name = _resolve_stock_name(code, stock.get("name", code))
+    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
+    out = {"allow": False, "reason": "", "support_hits": 0, "nxt": {}, "sector_info": {}, "has_theme_support": False}
+    if not code:
+        out["reason"] = "code_missing"
+        return out
+    nxt = get_nxt_info(code) or {}
+    sector_info = calc_sector_momentum(code, name) or {}
+    support_hits = 0
+    theme_support = False
+    if change_rate >= NXT_PREMARKET_QUALITY_MIN_CHANGE:
+        support_hits += 1
+    if volume_ratio >= NXT_PREMARKET_QUALITY_MIN_VOLUME:
+        support_hits += 1
+    if bool(nxt.get("inv_bullish")):
+        support_hits += 1
+    if safe_float(nxt.get("vs_krx_pct", 0.0), 0.0) >= 0.8:
+        support_hits += 1
+    if int(sector_info.get("bonus", 0) or 0) >= 4 and not _is_generic_sector_theme(sector_info.get("theme", "")):
+        support_hits += 1
+        theme_support = True
+    try:
+        direct_theme = _infer_direct_news_theme(code, name)
+    except Exception as e:
+        _swallow_exception(e)
+        direct_theme = {}
+    try:
+        emergent_theme = _infer_emergent_issue_theme(code, name) if not direct_theme.get("theme") else {}
+    except Exception as e:
+        _swallow_exception(e)
+        emergent_theme = {}
+    if direct_theme.get("theme") or emergent_theme.get("theme"):
+        support_hits += 2
+        theme_support = True
+    weak_flat = change_rate <= 0.3 and volume_ratio < max(2.2, NXT_PREMARKET_QUALITY_MIN_VOLUME + 0.2)
+    allow = support_hits >= max(1, NXT_PREMARKET_QUALITY_MIN_SUPPORT_HITS) and not weak_flat
+    reason = ""
+    if not allow:
+        reason = f"장전 저품질 후보 제외 (support={support_hits}, chg={change_rate:+.1f}%, vol={volume_ratio:.1f}x)"
+    out.update({"allow": allow, "reason": reason, "support_hits": support_hits, "nxt": nxt, "sector_info": sector_info, "has_theme_support": theme_support})
+    return out
+
 def _iter_nxt_preopen_stock_candidates(existing_codes) -> list[dict]:
     existing = set(existing_codes or [])
     now_t = datetime.now().time()
@@ -22025,6 +22079,11 @@ def _iter_nxt_preopen_stock_candidates(existing_codes) -> list[dict]:
             continue
         if change_rate < NXT_PREOPEN_MIN_CHANGE or volume_ratio < NXT_PREOPEN_MIN_VOLUME:
             continue
+        gate = _get_nxt_premarket_quality_gate(stock)
+        if not gate.get("allow"):
+            continue
+        stock = dict(stock)
+        stock["_nxt_premarket_gate"] = gate
         candidates.append(stock)
     return candidates
 def _build_nxt_preopen_context(stock: dict) -> dict:
@@ -22033,7 +22092,8 @@ def _build_nxt_preopen_context(stock: dict) -> dict:
     volume_ratio = stock.get("volume_ratio", 0)
     stock = dict(stock or {})
     stock["market"] = "NXT"
-    return {"stock": stock, "code": code, "price": stock.get("price", 0), "change_rate": change_rate, "volume_ratio": volume_ratio, "nxt": get_nxt_info(code), "pre_score": NXT_PREOPEN_BASE_SCORE, "pre_reasons": ["🌅 장 전 NXT 선포착!", f"📈 NXT 현재 +{change_rate:.1f}%  (KRX 개장 전)", f"💥 NXT 거래량 {volume_ratio:.1f}배"], "sector_info": calc_sector_momentum(code, stock.get("name", code)) or {}, "direct_news_hit": False}
+    gate = stock.get("_nxt_premarket_gate") if isinstance(stock.get("_nxt_premarket_gate"), dict) else _get_nxt_premarket_quality_gate(stock)
+    return {"stock": stock, "code": code, "price": stock.get("price", 0), "change_rate": change_rate, "volume_ratio": volume_ratio, "nxt": gate.get("nxt") or get_nxt_info(code), "pre_score": NXT_PREOPEN_BASE_SCORE, "pre_reasons": ["🌅 장 전 NXT 선포착!", f"📈 NXT 현재 +{change_rate:.1f}%  (KRX 개장 전)", f"💥 NXT 거래량 {volume_ratio:.1f}배"], "sector_info": gate.get("sector_info") or calc_sector_momentum(code, stock.get("name", code)) or {}, "direct_news_hit": False, "premarket_quality_gate": gate}
 def _apply_nxt_preopen_sector_context(ctx: dict) -> None:
     nxt = ctx["nxt"]
     sector_info = ctx["sector_info"]
@@ -22095,6 +22155,10 @@ def _apply_nxt_preopen_theme_context(ctx: dict) -> None:
     except Exception as e:
         _swallow_exception(e)
 def _finalize_nxt_preopen_signal(ctx: dict) -> dict:
+    gate = ctx.get("premarket_quality_gate") if isinstance(ctx.get("premarket_quality_gate"), dict) else {}
+    if gate and not gate.get("allow"):
+        _log_suppressed_alert(ctx["code"], ctx["stock"].get("name", ctx["code"]), gate.get("reason", "장전 저품질 후보 제외"), "EARLY_DETECT", {"market": "NXT", "change_rate": ctx["change_rate"], "score": ctx.get("pre_score", 0)})
+        return {}
     if ctx["pre_score"] < NXT_PREOPEN_ALERT_MIN_SCORE:
         return {}
     hoga = _passes_early_detection_hoga_gate(ctx["code"], market="NXT")
@@ -26205,8 +26269,24 @@ def _should_expire_issue_prewatch(theme_key: str, pw: dict, now: float) -> bool:
         return True
     stocks = pw.get("stocks", [])
     return not stocks
-def _collect_issue_prewatch_reacted(stocks: list[dict]) -> list[dict]:
+def _get_issue_prewatch_reaction_thresholds(stock: dict, pw: dict | None = None) -> dict:
+    pw = pw if isinstance(pw, dict) else {}
+    min_change = float(ISSUE_PREWATCH_REACTION_MIN_CHANGE)
+    min_volume = float(ISSUE_PREWATCH_REACTION_MIN_VOLUME)
+    quality_score = safe_int(pw.get("quality_score", 0), 0)
+    headline_count = safe_int(pw.get("headline_count", 0), 0)
+    strong_seed = bool(quality_score >= ISSUE_PREWATCH_STRONG_SEED_SCORE or headline_count >= ISSUE_PREWATCH_STRONG_HEADLINE_COUNT)
+    if strong_seed and is_market_open():
+        min_change = min(min_change, float(ISSUE_PREWATCH_STRONG_REACTION_MIN_CHANGE))
+        min_volume = min(min_volume, float(ISSUE_PREWATCH_STRONG_REACTION_MIN_VOLUME))
+    return {"min_change": round(min_change, 2), "min_volume": round(min_volume, 2), "strong_seed": strong_seed}
+
+def _collect_issue_prewatch_reacted(stocks: list[dict], pw: dict | None = None) -> list[dict]:
     reacted = []
+    thresholds = _get_issue_prewatch_reaction_thresholds({}, pw)
+    min_change = safe_float(thresholds.get("min_change", ISSUE_PREWATCH_REACTION_MIN_CHANGE), ISSUE_PREWATCH_REACTION_MIN_CHANGE)
+    min_volume = safe_float(thresholds.get("min_volume", ISSUE_PREWATCH_REACTION_MIN_VOLUME), ISSUE_PREWATCH_REACTION_MIN_VOLUME)
+    strong_seed = bool(thresholds.get("strong_seed"))
     for stock in stocks:
         try:
             cur = get_stock_price(stock["code"])
@@ -26214,7 +26294,8 @@ def _collect_issue_prewatch_reacted(stocks: list[dict]) -> list[dict]:
                 continue
             cr = cur.get("change_rate", 0)
             vr = cur.get("volume_ratio", 0)
-            if cr >= ISSUE_PREWATCH_REACTION_MIN_CHANGE and vr >= ISSUE_PREWATCH_REACTION_MIN_VOLUME:
+            reacts = bool(cr >= min_change and (vr >= min_volume or (strong_seed and cr >= min_change + 1.0)))
+            if reacts:
                 reacted.append({
                     "code": stock["code"],
                     "name": stock["name"],
@@ -26229,6 +26310,9 @@ def _collect_issue_prewatch_reacted(stocks: list[dict]) -> list[dict]:
                     "open": cur.get("open", 0),
                     "cap_size": cur.get("cap_size", "small"),
                     "mktcap": cur.get("mktcap", 0),
+                    "issue_prewatch_min_change": min_change,
+                    "issue_prewatch_min_volume": min_volume,
+                    "issue_prewatch_strong_seed": strong_seed,
                 })
             time.sleep(GEO_PREWATCH_POLL_DELAY_SEC)
         except Exception as e:
@@ -26274,7 +26358,7 @@ def check_issue_prewatch() -> None:
         try:
             pw = dict(pw)
             pw.setdefault("theme_key", theme_key)
-            reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []))
+            reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []), pw)
             if not reacted:
                 continue
             _news_prewatch_fired[theme_key] = now
@@ -30470,7 +30554,7 @@ def _scan_issue_prewatch_candidates(alerts: list, seen: set) -> None:
         try:
             pw = dict(pw)
             pw.setdefault("theme_key", theme_key)
-            reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []))
+            reacted = _collect_issue_prewatch_reacted(pw.get("stocks", []), pw)
             if not reacted:
                 continue
             summary = _summarize_material_reaction(reacted, pw)
@@ -30552,6 +30636,11 @@ def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
         _register_sector_leader_follow_seed(stock)
         if code in seen:
             continue
+        if _is_nxt_premarket_window():
+            gate = stock.get("_nxt_premarket_gate") if isinstance(stock.get("_nxt_premarket_gate"), dict) else _get_nxt_premarket_quality_gate(stock)
+            if not gate.get("allow"):
+                continue
+            stock["_nxt_premarket_gate"] = gate
         r = analyze(stock)
         if isinstance(r, dict):
             r["market"] = "NXT"
