@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.11
+버전: v160.12
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.12 (2026-04-02): 비정상 상위 잠금 자동 복구 + 잠금 로그 숫자 노출 최소화 — `runtime_version_lock.json`에 `lock_kind=authoritative` 메타를 기록하고, 이 메타 없이 남은 구형 정수형 상위 잠금은 비정상 잠금으로 보고 자동 복구하도록 정리했다. 이로써 오류본에서 남은 특정 잠금 버전 숫자 노출과 잘못된 상위 잠금 차단을 줄인다. 문서/스모크도 최근 오류본 표기를 일반화해 다음 정상 버전 체계(`v160.x`)와 혼선이 생기지 않게 맞췄다.
 - v160.11 (2026-04-02): v160.10 안정화 유지 + 눌림목 3종 재적용 + token 재발급 쿨다운/섹터 재보정/run_scan 결측 정리 — 직전 정상본 v160.10 위에 오류본에서 유효했던 눌림목 3종 포착 보강(갭상승 후 시가 회복, 박스권 상단 돌파·하단 지지, higher low + 거래대금 재유입)을 다시 얹었다. 동시에 KIS tokenP 403 `EGW00133`가 뜨면 1분 내 재발급 재시도를 중단하고 쿨다운을 기록해 같은 분 연속 발급을 막는다. run_scan은 섹터 gate 직전에 종목의 업종/테마를 한 번 더 재보정해 `기타` 쏠림을 줄이고, 시세·신호 결측 payload는 재복구 후에도 불완전하면 일반 포착에서 제거해 `+0.0% [] 0점 [C]` 로그가 반복되지 않게 했다. 또한 눌림목 결과 dict는 provisional grade를 먼저 채워 `눌림목 오류 (...): 'grade'`를 막는다.
 - v160.10 (2026-04-02): timezone 잔여 naive/aware 정리 + 업종 fallback을 섹터명에 직접 반영 + run_scan 결측 payload 자동 복구 — `_signal_age_minutes_for_retry()`/`_sector_resend_relevance_ok()`/`confirm_bottom_and_signal()`의 문자열 시각 비교를 KST aware helper 기반으로 통일해 잔여 `offset-naive/aware` 오류를 더 줄였다. 또한 `get_theme_sector_stocks()`가 KIS 업종 fallback의 `bstp_name`을 그대로 `theme_name`으로 승격하도록 바꿔, `chgrate-pcls-100` 404나 테마맵 부재 시에도 반도체·건설 같은 업종명이 `기타업종`으로 뭉개져 섹터 제한에 무더기 탈락하던 문제를 줄였다. 마지막으로 run_scan 결측 payload는 live quote 병합과 `analyze()` 재평가를 한 번 더 시도해 `change_rate 0 / 빈 signal_type / 0점 C급`으로 흘러가던 포착 후보를 자동 복구한다.
 - v160.9 (2026-04-02): NXT/KRX 익일 오픈 평가 시각 분리 — `PRECLOSE_GAP_ENTRY`의 익일 오픈 체크를 시장별로 분리해 NXT는 08:05, KRX는 09:05에 각각 평가하도록 수정했다. `update_preclose_gap_open_outcomes(stage=...)`가 signal별 stage를 읽어 해당 시장만 기록하고, 고우선 정리 메모도 `08:05/09:05`를 시장별로 다르게 표기한다. 또한 startup catch-up도 NXT 08:05 / KRX 09:05 기준으로 다시 확인해, NXT 종가베팅 후보를 KRX와 같은 시각에 늦게 평가하던 문제를 막았다.
@@ -2333,6 +2334,19 @@ def _runtime_version_lock_is_live(payload: dict | None, now_ts: float | None = N
     return (ref_ts - ts) <= RUNTIME_VERSION_LOCK_LEASE_SEC
 
 
+def _is_non_authoritative_higher_runtime_lock(saved_ver: str, payload: dict | None) -> bool:
+    payload = payload if isinstance(payload, dict) else {}
+    saved_ver = str(saved_ver or "").strip()
+    if not saved_ver:
+        return False
+    if _version_sort_key(saved_ver) <= _version_sort_key(BOT_VERSION):
+        return False
+    current_has_patch = "." in str(BOT_VERSION or "")
+    saved_has_patch = "." in saved_ver
+    lock_kind = str(payload.get("lock_kind", "") or "").strip().lower()
+    return current_has_patch and (not saved_has_patch) and lock_kind != "authoritative"
+
+
 def _enforce_runtime_version_lock(notify: bool = True) -> bool:
     """공유 볼륨에 살아 있는 더 최신 버전 잠금이 있으면 현재 구버전 런타임을 정지한다."""
     global _runtime_version_blocked
@@ -2347,11 +2361,21 @@ def _enforce_runtime_version_lock(notify: bool = True) -> bool:
             "pid": os.getpid(),
             "host": os.getenv("HOSTNAME") or "",
             "railway_replica": os.getenv("RAILWAY_REPLICA_ID") or "",
+            "lock_kind": "authoritative",
         }
         saved = _read_json_safe(RUNTIME_VERSION_LOCK_FILE, {}) or {}
         saved_ver = str(saved.get("version", "") or "")
         saved_live = _runtime_version_lock_is_live(saved, now_ts=now_ts)
         saved_instance = str(saved.get("instance_id", "") or "")
+        non_authoritative_high_lock = _is_non_authoritative_higher_runtime_lock(saved_ver, saved)
+        if non_authoritative_high_lock:
+            stale_age = int(max(0, now_ts - safe_float(saved.get("ts", 0.0), 0.0)))
+            _log_warn_msg(
+                f"⚠️ 비정상 상위 잠금 자동 복구: instance={saved_instance or '-'} age={stale_age}s"
+            )
+            saved_ver = ""
+            saved_live = False
+            saved_instance = ""
         higher_live_lock = bool(
             saved_ver
             and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION)
@@ -2362,7 +2386,7 @@ def _enforce_runtime_version_lock(notify: bool = True) -> bool:
             _runtime_version_blocked = True
             msg = (
                 f"⛔ <b>구버전 런타임 자동 정지</b>\n"
-                f"현재 실행: <b>{BOT_VERSION}</b> / 잠금 버전: <b>{saved_ver}</b>\n"
+                f"현재 실행: <b>{BOT_VERSION}</b> / 상위 잠금 감지\n"
                 f"인스턴스: <code>{_INSTANCE_ID}</code>\n"
                 f"최신 버전이 이미 운영 중이므로 이 런타임은 스캔/알림을 중단합니다."
             )
@@ -2376,7 +2400,7 @@ def _enforce_runtime_version_lock(notify: bool = True) -> bool:
         if saved_ver and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION) and not saved_live:
             stale_age = int(max(0, now_ts - safe_float(saved.get("ts", 0.0), 0.0)))
             _log_warn_msg(
-                f"⚠️ stale 상위 버전 락 자동 복구: saved={saved_ver} instance={saved_instance or '-'} age={stale_age}s"
+                f"⚠️ stale 상위 잠금 자동 복구: instance={saved_instance or '-'} age={stale_age}s"
             )
         should_write = False
         if not saved_ver:
