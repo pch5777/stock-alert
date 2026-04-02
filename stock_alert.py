@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.1
+버전: v160.2
 날짜: 2026-04-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.2 (2026-04-02): stale 상위 버전 락 복구 + 장전/NXT·오픈 버스트 + cohort reset 보강 — `runtime_version_lock.json`에 lease/heartbeat 개념을 추가해 죽은 상위 버전 락은 자동 복구하고, 살아 있는 상위 버전만 구버전 런타임을 차단하도록 정리했다. 또한 08:00~09:00 NXT 장전 버스트와 09:00~09:03 KRX 오픈 버스트를 추가해 `refresh_dynamic_candidates(force_rank=True)`·`run_material_first_scan()`·`run_scan()`를 더 촘촘히 돌리도록 보강했다. `compute_signal_kpi()` 경로는 현재 cohort 필터를 강제하고, `/reset_stats 확인`은 signal_log 백업 뒤 통계 시작 시각뿐 아니라 동적 파라미터 baseline·emergency state·연속 손익 카운터까지 함께 초기화한다. 마지막으로 동적 후보군 로그를 `KRX_seed/KRX_rank/NXT_seed/NXT_rank/material_prewatch` 기준으로 분리해 운영 판단이 바로 되도록 정리했다.
 - v160.1 (2026-04-02): v151 기준 누락 기능 재적용 — `현재가<=진입가` 전 신호 공통 1차 진입가 도달 helper와 `/list`·`/watch` 도달 분류 보정, `+ 1차 진입가 도달` 표시를 복구했다. 또한 `EARLY_DETECT`/일반 포착 즉시 도달 연계, `trailing_active` 5일 시간초과 제외, 자동 추적 결과 `최대수익(MFE)` 표시, `send_market_leading_sector_update`용 `_parse_compact_datetime(value, time_value=None)` 및 KST aware 계산을 보강했다. 마지막으로 강한 뉴스테마/이슈 종목 direct 승격과 NXT 거래량 급감 guard 완화를 다시 연결했다.
 - v160 (2026-04-02): 구조 버전별 성과 cohort 분리 + /reset_stats 명령 추가 — 큰 구조 변경은 정수 버전(v160, v161 …)으로 올리고 해당 버전이 곧 새로운 성과 cohort가 되도록 버전 체계를 정리했다. 같은 구조 안의 버그/경미 수정은 소수점 버전(v160.1, v160.2 …)을 쓰도록 helpers를 추가했고, signal_log 신규 레코드에 `bot_version`·`stats_cohort`를 저장한다. `/stats`는 이제 현재 cohort 기준으로만 승률을 계산하며, `/reset_stats 확인`은 signal_log를 백업한 뒤 현재 cohort의 통계 시작 시각만 초기화해 과거 기록은 보존하고 현재 구조 성과만 새로 측정한다.
 - v159 (2026-04-02): NXT 거래량 급감 종료 완화 — `_get_entry_watch_volume_guard_profile()`를 추가해 장전/장후 NXT는 정규장과 다른 유예시간·재확인 횟수·거래량폭락 컷을 사용하도록 분리했다. `theme_chain`/`direct_news` 계열은 NXT에서 추가 유예를 주어 `거래량 급감` 즉시 종료를 완화했다.
@@ -1905,6 +1906,7 @@ _INSTANCE_ID = f"{os.getenv('RAILWAY_REPLICA_ID') or os.getenv('HOSTNAME') or 'l
 _RUNTIME_IS_LEADER = False
 _STARTUP_BANNER_SENT = False
 RUNTIME_VERSION_LOCK_FILE = _state_path("runtime_version_lock.json")
+RUNTIME_VERSION_LOCK_LEASE_SEC = int(os.getenv("RUNTIME_VERSION_LOCK_LEASE_SEC", "300") or "300")
 SHADOW_CAPTURE_FILE = _state_path("shadow_captures.json")
 SELF_AUDIT_FILE = _state_path("daily_self_audit.json")
 ADAPTIVE_CAPTURE_FEEDBACK_FILE = _state_path("adaptive_capture_feedback.json")
@@ -2207,11 +2209,13 @@ def _get_dynamic_relaxable_no_chase_signal_types() -> set[str]:
     return sigs
 def _clear_emergency_tune_state(reason: str = ""):
     st = _get_auto_tune_state()
-    if st.get("emergency_active") or int(st.get("emergency_stage", 0) or 0) > 0:
+    if st.get("emergency_active") or int(st.get("emergency_stage", 0) or 0) > 0 or reason:
         st["emergency_active"] = False
         st["emergency_stage"] = 0
         st["last_emergency_reason"] = reason or "recovered"
         st["last_emergency_ts"] = time.time()
+        st["last_emergency_alert_stage"] = 0
+        st["last_emergency_alert_hash"] = ""
         _save_auto_tune_state(st)
 def _emergency_stage(loss_streak: int) -> int:
     if loss_streak >= 7:
@@ -2312,19 +2316,41 @@ def _version_sort_key(ver: str) -> tuple:
         else:
             parts.append((1, token))
     return tuple(parts)
+def _runtime_version_lock_is_live(payload: dict | None, now_ts: float | None = None) -> bool:
+    payload = payload if isinstance(payload, dict) else {}
+    ref_ts = float(now_ts if now_ts is not None else time.time())
+    ts = safe_float(payload.get("ts", 0.0), 0.0)
+    if ts <= 0:
+        return False
+    return (ref_ts - ts) <= RUNTIME_VERSION_LOCK_LEASE_SEC
+
+
 def _enforce_runtime_version_lock(notify: bool = True) -> bool:
-    """공유 볼륨에 더 최신 버전 잠금이 있으면 현재 구버전 런타임을 정지한다."""
+    """공유 볼륨에 살아 있는 더 최신 버전 잠금이 있으면 현재 구버전 런타임을 정지한다."""
     global _runtime_version_blocked
     try:
+        now_ts = time.time()
         current = {
             "version": BOT_VERSION,
             "code_hash": _get_code_hash(),
             "updated_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
             "instance_id": _INSTANCE_ID,
+            "ts": now_ts,
+            "pid": os.getpid(),
+            "host": os.getenv("HOSTNAME") or "",
+            "railway_replica": os.getenv("RAILWAY_REPLICA_ID") or "",
         }
         saved = _read_json_safe(RUNTIME_VERSION_LOCK_FILE, {}) or {}
         saved_ver = str(saved.get("version", "") or "")
-        if saved_ver and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION):
+        saved_live = _runtime_version_lock_is_live(saved, now_ts=now_ts)
+        saved_instance = str(saved.get("instance_id", "") or "")
+        higher_live_lock = bool(
+            saved_ver
+            and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION)
+            and saved_live
+            and saved_instance != _INSTANCE_ID
+        )
+        if higher_live_lock:
             _runtime_version_blocked = True
             msg = (
                 f"⛔ <b>구버전 런타임 자동 정지</b>\n"
@@ -2339,14 +2365,30 @@ def _enforce_runtime_version_lock(notify: bool = True) -> bool:
                 except Exception as e:
                     _swallow_exception(e)
             return False
-        if (not saved_ver) or _version_sort_key(BOT_VERSION) >= _version_sort_key(saved_ver):
-            if saved_ver != BOT_VERSION or str(saved.get("code_hash", "")) != current["code_hash"]:
-                _write_json_atomic(RUNTIME_VERSION_LOCK_FILE, current, indent=2)
+        if saved_ver and _version_sort_key(saved_ver) > _version_sort_key(BOT_VERSION) and not saved_live:
+            stale_age = int(max(0, now_ts - safe_float(saved.get("ts", 0.0), 0.0)))
+            _log_warn_msg(
+                f"⚠️ stale 상위 버전 락 자동 복구: saved={saved_ver} instance={saved_instance or '-'} age={stale_age}s"
+            )
+        should_write = False
+        if not saved_ver:
+            should_write = True
+        elif saved_instance == _INSTANCE_ID:
+            should_write = True
+        elif not saved_live:
+            should_write = True
+        elif _version_sort_key(BOT_VERSION) >= _version_sort_key(saved_ver):
+            should_write = True
+        elif str(saved.get("code_hash", "")) != current["code_hash"] and saved_ver == BOT_VERSION:
+            should_write = True
+        if should_write:
+            _write_json_atomic(RUNTIME_VERSION_LOCK_FILE, current, indent=2)
         _runtime_version_blocked = False
         return True
     except Exception as e:
         _log_warn_msg(f"⚠️ 운영 버전 잠금 확인 실패: {e}")
         return True
+
 def _leader_job(fn):
     def _wrapped(*args, **kwargs):
         if _runtime_version_blocked:
@@ -2546,7 +2588,7 @@ def _handle_reset_stats_command(raw: str):
         send(
             f"⚠️ 현재 구조 cohort <b>{BOT_STATS_COHORT}</b> 승률을 초기화합니다.\n"
             f"대상 기록: {cohort_count}건\n"
-            f"signal_log는 백업하고, 현재 cohort의 통계 시작 시각만 지금으로 재설정합니다.\n"
+            f"signal_log는 백업하고, 현재 cohort의 통계 시작 시각과 동적 기준을 baseline으로 복원합니다.\n"
             f"실행: <code>/reset_stats 확인</code>"
         )
         return
@@ -2562,10 +2604,13 @@ def _handle_reset_stats_command(raw: str):
         _history_cache["ts"] = 0
     except Exception:
         pass
+    runtime_reset = _reset_stats_runtime_controls()
     send(
         f"♻️ <b>승률 초기화 완료</b>\n"
         f"cohort: <b>{BOT_STATS_COHORT}</b>\n"
         f"시작 시각: {stamp}\n"
+        f"동적 기준: baseline 복원 (min_score/emergency/streak reset)\n"
+        f"최소점수(일반/엄격): {runtime_reset['min_score_normal']}/{runtime_reset['min_score_strict']}점\n"
         f"백업: {os.path.basename(backup) if backup else '생략'}"
     )
 
@@ -10398,7 +10443,7 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
 def _lookup_name_by_code(code: str, name_hint: str = "") -> str:
     """v40.1: 레거시 호출 호환용. 내부적으로 _resolve_stock_name을 사용."""
     return _resolve_stock_name(code, name_hint=name_hint)
-def refresh_dynamic_candidates():
+def refresh_dynamic_candidates(force_rank: bool = False):
     """
     거래량/상한가/NXT 급등 + 실시간 랭킹 상위 종목을 자동 후보군에 편입
     → THEME_MAP에 없는 종목도 포착 가능
@@ -10415,8 +10460,8 @@ def refresh_dynamic_candidates():
         vol_stocks = get_volume_surge_stocks() if krx_open else []
         upper_stocks = get_upper_limit_stocks() if krx_open else []
         nxt_stocks = get_nxt_surge_stocks() if nxt_open else []
-        krx_rank_stocks = _collect_market_rank_candidates("KRX", scan_limit=None, force=False) if krx_open else []
-        nxt_rank_stocks = _collect_market_rank_candidates("NXT", scan_limit=None, force=False) if nxt_open else []
+        krx_rank_stocks = _collect_market_rank_candidates("KRX", scan_limit=None, force=force_rank) if krx_open else []
+        nxt_rank_stocks = _collect_market_rank_candidates("NXT", scan_limit=None, force=force_rank) if nxt_open else []
         candidates = {}
         excluded_cnt = 0
         early_rank_cnt = 0
@@ -10468,13 +10513,83 @@ def refresh_dynamic_candidates():
                 _dynamic_candidates[code]["desc"] = info["desc"]
                 _dynamic_candidates[code]["added_ts"] = time.time()
         krx_rank_source = "fallback" if _rank_api_disabled_today() else "api"
+        material_prewatch_cnt = len(_news_issue_prewatch) if isinstance(_news_issue_prewatch, dict) else 0
         _log_info_msg(
             f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 "
-            f"(제외 {excluded_cnt}개, KRX={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
-            f"NXT={len(nxt_stocks)}, 랭킹후보={early_rank_cnt} [{rank_mode}], 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt}, 장후NXT={nxt_post_cnt})"
+            f"(제외 {excluded_cnt}개, KRX_seed={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
+            f"KRX_rank={len(krx_rank_stocks)} [{rank_mode}], NXT_seed={len(nxt_stocks)}, NXT_rank={len(nxt_rank_stocks)}, "
+            f"랭킹후보={early_rank_cnt}, material_prewatch={material_prewatch_cnt}, 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt}, 장후NXT={nxt_post_cnt}, force_rank={int(bool(force_rank))})"
         )
     except Exception as e:
         _log_warn_msg(f"⚠️ 동적 후보군 갱신 오류: {e}")
+
+NXT_PREMARKET_BURST_INTERVAL_SEC = int(os.getenv("NXT_PREMARKET_BURST_INTERVAL_SEC", "15") or "15")
+KRX_OPEN_BURST_INTERVAL_SEC = int(os.getenv("KRX_OPEN_BURST_INTERVAL_SEC", "15") or "15")
+_BURST_SCAN_STATE = {
+    "nxt_premarket_last_ts": 0.0,
+    "krx_open_last_ts": 0.0,
+    "startup_catchup_done": "",
+}
+
+
+def _is_nxt_premarket_burst_window(now: datetime | None = None) -> bool:
+    now = now or _now_kst()
+    if not is_nxt_open() or is_market_open():
+        return False
+    cur = now.timetz().replace(tzinfo=None)
+    return dtime(8, 0, 0) <= cur <= dtime(8, 59, 59)
+
+
+def _is_krx_open_burst_window(now: datetime | None = None) -> bool:
+    now = now or _now_kst()
+    if not is_market_open():
+        return False
+    cur = now.timetz().replace(tzinfo=None)
+    return dtime(9, 0, 0) <= cur <= dtime(9, 3, 30)
+
+
+def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
+    state_key = "nxt_premarket_last_ts" if tag == "nxt_premarket" else "krx_open_last_ts"
+    last_ts = safe_float(_BURST_SCAN_STATE.get(state_key, 0.0), 0.0)
+    if (time.time() - last_ts) < max(interval_sec - 1, 1):
+        return
+    _BURST_SCAN_STATE[state_key] = time.time()
+    label = "NXT장전" if tag == "nxt_premarket" else "KRX오픈"
+    _log_info_msg(f"🚀 버스트 스캔 [{label}] 시작")
+    refresh_dynamic_candidates(force_rank=True)
+    run_material_first_scan()
+    run_scan()
+
+
+def _run_nxt_premarket_burst_scan() -> None:
+    if not _is_nxt_premarket_burst_window():
+        return
+    _run_scan_burst_window("nxt_premarket", NXT_PREMARKET_BURST_INTERVAL_SEC)
+
+
+def _run_krx_open_burst_scan() -> None:
+    if not _is_krx_open_burst_window():
+        return
+    _run_scan_burst_window("krx_open", KRX_OPEN_BURST_INTERVAL_SEC)
+
+
+def _run_startup_scan_catchup() -> None:
+    now = _now_kst()
+    if not is_any_market_open():
+        return
+    window_key = now.strftime("%Y%m%d")
+    if _BURST_SCAN_STATE.get("startup_catchup_done") == window_key:
+        return
+    cur = now.timetz().replace(tzinfo=None)
+    should_run = _is_nxt_premarket_burst_window(now) or _is_krx_open_burst_window(now) or (is_market_open() and dtime(9, 0, 0) <= cur <= dtime(9, 15, 0))
+    if not should_run:
+        return
+    _BURST_SCAN_STATE["startup_catchup_done"] = window_key
+    _log_info_msg("🚀 재시작 catch-up 스캔 시작")
+    refresh_dynamic_candidates(force_rank=True)
+    run_material_first_scan()
+    run_scan()
+
 def get_all_scan_candidates() -> list:
     """
     THEME_MAP + 동적 후보군 합산 → 중복 제거
@@ -16308,6 +16423,7 @@ _dynamic = {
     },
     "geo_sector_weights": {},
 }
+_DEFAULT_DYNAMIC_PARAMS = json.loads(json.dumps(_dynamic, ensure_ascii=False))
 # 긴급 튜닝: 연속 손절/수익 카운터
 _consecutive_loss_count: int = 0
 _consecutive_win_count:  int = 0   # ③ 연속 수익 카운터
@@ -16362,6 +16478,29 @@ def _load_dynamic_params():
             _log_warn_msg(f"dynamic_params 기본값 저장 실패: {se}")
     except Exception as e:
         _log_warn_msg(f"dynamic_params 복원 실패: {e}")
+def _reset_stats_runtime_controls():
+    global _dynamic, _early_price_min_dynamic, _early_volume_min_dynamic
+    global _consecutive_loss_count, _consecutive_win_count
+    _dynamic.clear()
+    _dynamic.update(json.loads(json.dumps(_DEFAULT_DYNAMIC_PARAMS, ensure_ascii=False)))
+    _early_price_min_dynamic = _dynamic["early_price_min"]
+    _early_volume_min_dynamic = _dynamic["early_volume_min"]
+    _consecutive_loss_count = 0
+    _consecutive_win_count = 0
+    state = _default_auto_tune_state()
+    state["last_emergency_reason"] = "reset_stats"
+    state["last_emergency_ts"] = time.time()
+    _save_auto_tune_state(state)
+    _clear_emergency_tune_state("reset_stats")
+    _save_dynamic_params()
+    return {
+        "min_score_normal": _dynamic.get("min_score_normal", 0),
+        "min_score_strict": _dynamic.get("min_score_strict", 0),
+        "consecutive_loss_count": _consecutive_loss_count,
+        "consecutive_win_count": _consecutive_win_count,
+    }
+
+
 def load_tracker_feedback():
     """기존 함수 — 하위 호환용. auto_tune()을 호출"""
     auto_tune(notify=False)
@@ -16478,13 +16617,13 @@ def analyze_loss_pattern(completed: list) -> str:
 KPI_MIN_SAMPLES = int(os.getenv("KPI_MIN_SAMPLES", "10") or "10")
 def _load_completed_signal_kpi_records(completed: list | None) -> list:
     if completed is not None:
-        return completed
+        return [row for row in completed if row.get("status") in ["수익", "손실", "본전"] and _record_matches_stats_scope(row)]
     try:
         data = _read_json_locked(SIGNAL_LOG_FILE)
     except Exception as e:
         _swallow_exception(e)
         data = {}
-    return [v for v in data.values() if v.get("status") in ["수익", "손실", "본전"]]
+    return [v for v in data.values() if v.get("status") in ["수익", "손실", "본전"] and _record_matches_stats_scope(v)]
 def _empty_signal_kpi() -> dict:
     return {
         "win_rate": 0,
@@ -30631,9 +30770,12 @@ if __name__ == "__main__":
     if _try_acquire_leader_lock():
         if _enforce_runtime_version_lock(notify=True):
             _send_startup_banner_once()
+            _run_startup_scan_catchup()
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
     schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
+    schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_premarket_burst_scan))
+    schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_krx_open_burst_scan))
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_material_first_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
