@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.19
+버전: v160.20
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.20 (2026-04-03): run_scan 섹터 게이트 비활성화 — `v160.19` 기준에서 `_apply_scan_sector_gate()`를 후보 통과 함수로 바꿔 섹터별 제한/`기타` 버킷 제한으로 포착이 잘리는 경로를 끄고, 이름 복구만 수행한 뒤 후보를 그대로 다음 단계로 넘기도록 조정했다.
 - v160.19 (2026-04-03): run_scan 결측 차단 전면 비활성화 — `v160.17` 기준에서 `_scan_payload_incomplete`는 기록용 메타로만 남기고 후보 차단/재복구 큐/대기 스킵으로 이어지지 않게 전역 비활성화했다. 즉 `_sanitize_run_scan_alerts()`와 `_append_scan_alert()`, 재복구 큐 drain 경로에서 결측 후보도 그대로 통과시키도록 바꿨다.
 - v160.17 (2026-04-03): 감시종료 재등록 쿨다운 + run_scan 재복구 큐 실반영 + 공용 종목명/업종 fallback 보강 — 근거약화로 감시 종료된 종목은 일정 시간 재등록과 종료 알림을 억제해 같은 종목의 감시종료 반복 알림을 줄인다. `run_scan` 결측 후보는 즉시 폐기하지 않고 결측 사유별 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패한 종목만 코드수정 요청 알림으로 승격한다. 또한 종목명은 공용 공개 메타와 다중 public fallback으로 끝까지 복구하고, 업종/섹터도 공용 업종 fallback을 사용해 `기타` 섹터 잔류를 줄인다.
 - v160.16 (2026-04-03): calc_position_size 0나눗셈/compact datetime 파싱/JSON 경고 정리 — `calc_position_size()`는 승률 표본에서 평균 이익폭이 0이거나 손익비 `b`가 0 이하로 내려가는 경우 기본 손익비로 안전하게 대체해 `ZeroDivisionError`를 막는다. `_parse_compact_datetime()`는 `2026040219:51:47`처럼 날짜+콜론시간이 붙은 문자열과 `YYYYMMDD HH:MM:SS` 형태를 조용히 정규화해 반복 `ValueError` 경고를 없앤다. 또한 `safe_json_response()`는 응답 본문을 문자열 기준으로 직접 파싱하고 빈 응답/HTML/비JSON은 조용히 `{}`로 반환하도록 정리했으며, `get_korea_etf_signals()`/`check_earnings_risk()`/`analyze_news_deep()`도 같은 안전 경로를 사용해 `JSONDecodeError` 로그를 줄인다.
@@ -31901,27 +31902,15 @@ def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt
             if code not in seen:
                 _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
 def _apply_scan_sector_gate(alerts: list) -> list:
-    alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
-    max_signals_per_sector = 3
-    max_signals_misc = 4
-    sector_counts = {}
-    filtered_alerts = []
+    passed_alerts = []
     for s in alerts:
         sec = _hydrate_alert_sector_theme(s, force_lookup=True)
         if not str(s.get("name") or "").strip() and s.get("code"):
             s["name"] = _resolve_stock_name(s.get("code"), s.get("name", ""))
-        sec_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
-        if s.get("theme_chain_force_hit") or s.get("force_external_capture_alert") or s.get("material_first_priority_hit") or s.get("direct_news_hit"):
-            sec_limit += 2
-        sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        if sector_counts[sec] <= sec_limit:
-            if not s.get("sector_theme") and sec != "기타":
-                s["sector_theme"] = sec
-            filtered_alerts.append(s)
-        else:
-            _record_shadow_capture(s.get("code", ""), s.get("name", s.get("code", "")), "sector_limit", s.get("signal_type", ""), stage="sector_gate", extra={"sector": sec, "score": s.get("score", 0), "change_rate": s.get("change_rate", 0)})
-            _log_info_msg(f"  ⏭ 섹터 제한({sec} {sector_counts[sec]}번째): {s.get('name','')} 생략")
-    return filtered_alerts
+        if not s.get("sector_theme") and sec and sec != "기타":
+            s["sector_theme"] = sec
+        passed_alerts.append(s)
+    return passed_alerts
 def _dispatch_scan_alerts(alerts: list) -> None:
     if not alerts:
         _log_info_msg("  → 조건 충족 없음")
