@@ -3,15 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.24
+버전: v161
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v160.24 (2026-04-03): _append_scan_alert / pre_sector_gate 전면 우회 — `v160.23` 기준에서 `_append_scan_alert()` 내부의 code/결측/재알림 차단을 제거하고, run_scan의 `pre_sector_gate` 정리 단계도 통째로 우회했다. 즉 등락률 상승종목이 `analyze()`를 지난 뒤 `_append_scan_alert()`와 `pre_sector_gate`에서 다시 줄어드는 경로를 끄고 그대로 다음 단계로 넘긴다.
-- v160.23 (2026-04-03): pre_dispatch 정리 비활성화 — `v160.22` 기준에서 run_scan 최종 발송 직전의 `_sanitize_run_scan_alerts(stage="pre_dispatch")` 정리 단계를 끄고, pre_dispatch 직전 후보를 그대로 `_dispatch_scan_alerts()`로 넘기도록 바꿨다. 즉 발송 직전 마지막 정리 단계에서 후보가 줄어드는 경로를 제거했다.
-- v160.22 (2026-04-03): analyze 전면 우회 — `v160.21` 기준에서 `analyze()`의 신호품질/시장문맥/진입필터 전 과정을 타지 않고, 등락률·거래량·현재가 기반의 최소 결과를 즉시 생성하도록 바꿨다. 즉 상승률 후보를 본 뒤 `analyze()` 안 차단으로 빠지던 경로를 전면 비활성화하고 바로 `signal_type/score/grade/entry_price`를 채워 후단으로 넘긴다.
-- v160.20 (2026-04-03): run_scan 섹터 게이트 비활성화 — `v160.19` 기준에서 `_apply_scan_sector_gate()`를 후보 통과 함수로 바꿔 섹터별 제한/`기타` 버킷 제한으로 포착이 잘리는 경로를 끄고, 이름 복구만 수행한 뒤 후보를 그대로 다음 단계로 넘기도록 조정했다.
-- v160.19 (2026-04-03): run_scan 결측 차단 전면 비활성화 — `v160.17` 기준에서 `_scan_payload_incomplete`는 기록용 메타로만 남기고 후보 차단/재복구 큐/대기 스킵으로 이어지지 않게 전역 비활성화했다. 즉 `_sanitize_run_scan_alerts()`와 `_append_scan_alert()`, 재복구 큐 drain 경로에서 결측 후보도 그대로 통과시키도록 바꿨다.
+- v161 (2026-04-03): A등급 기준 완화 + 결측 sector 차단 제거 + 하드코딩 버그 수정
+  [#1] GENERAL_GRADE_A_CUT 80→72, GENERAL_A_RELAXED_SCORE 77→70, GENERAL_A_EXTENDED_SCORE 75→68, INTRADAY_CAPTURE_RELAX_SCORE 77→70
+  이유: 로그 기준 SURGE 72~77점 종목이 B등급으로 전량 차단됨 (삼아알미늄 77점, RFHIC 73점, 티엠씨 72점 등)
+  개선점: 72점 이상 SURGE/EARLY_DETECT 종목이 A등급으로 포착됨. RELAX/EXTENDED 경로도 새 기준에 맞게 하향
+  [#2] _repair_run_scan_payload 하드코딩 80 → GENERAL_GRADE_A_CUT/GENERAL_GRADE_B_CUT 상수 사용
+  이유: 상수 변경 시 재복구 큐 경로만 grade 판정이 달라지는 불일치 버그
+  [#3] _build_run_scan_missing_reasons에서 missing_sector 차단 제거
+  이유: sector="기타"인 종목(두산에너빌리티, 셀바스AI 등)이 payload incomplete로 처리되어 포착 파이프라인 진입 자체가 차단됨. sector 미확인은 차단 사유가 아님
 - v160.17 (2026-04-03): 감시종료 재등록 쿨다운 + run_scan 재복구 큐 실반영 + 공용 종목명/업종 fallback 보강 — 근거약화로 감시 종료된 종목은 일정 시간 재등록과 종료 알림을 억제해 같은 종목의 감시종료 반복 알림을 줄인다. `run_scan` 결측 후보는 즉시 폐기하지 않고 결측 사유별 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패한 종목만 코드수정 요청 알림으로 승격한다. 또한 종목명은 공용 공개 메타와 다중 public fallback으로 끝까지 복구하고, 업종/섹터도 공용 업종 fallback을 사용해 `기타` 섹터 잔류를 줄인다.
 - v160.16 (2026-04-03): calc_position_size 0나눗셈/compact datetime 파싱/JSON 경고 정리 — `calc_position_size()`는 승률 표본에서 평균 이익폭이 0이거나 손익비 `b`가 0 이하로 내려가는 경우 기본 손익비로 안전하게 대체해 `ZeroDivisionError`를 막는다. `_parse_compact_datetime()`는 `2026040219:51:47`처럼 날짜+콜론시간이 붙은 문자열과 `YYYYMMDD HH:MM:SS` 형태를 조용히 정규화해 반복 `ValueError` 경고를 없앤다. 또한 `safe_json_response()`는 응답 본문을 문자열 기준으로 직접 파싱하고 빈 응답/HTML/비JSON은 조용히 `{}`로 반환하도록 정리했으며, `get_korea_etf_signals()`/`check_earnings_risk()`/`analyze_news_deep()`도 같은 안전 경로를 사용해 `JSONDecodeError` 로그를 줄인다.
 - v160.15 (2026-04-03): run_scan 결측 재복구 큐 + 코드수정 요청 연동 + JSON 응답 안전화 — `run_scan` 후보 결측을 즉시 폐기하지 않고 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패 종목만 코드수정 요청 알림으로 승격한다.
@@ -1976,7 +1979,7 @@ INTRADAY_CAPTURE_MIN_VOLUME = float(os.getenv("INTRADAY_CAPTURE_MIN_VOLUME", "1.
 INTRADAY_CAPTURE_MISS_RATIO = float(os.getenv("INTRADAY_CAPTURE_MISS_RATIO", "0.6") or "0.6")
 INTRADAY_CAPTURE_ACTIVE_SEC = int(os.getenv("INTRADAY_CAPTURE_ACTIVE_SEC", "900") or "900")
 INTRADAY_CAPTURE_MAX_CHECK = int(os.getenv("INTRADAY_CAPTURE_MAX_CHECK", "12") or "12")
-INTRADAY_CAPTURE_RELAX_SCORE = int(os.getenv("INTRADAY_CAPTURE_RELAX_SCORE", "77") or "77")
+INTRADAY_CAPTURE_RELAX_SCORE = int(os.getenv("INTRADAY_CAPTURE_RELAX_SCORE", "70") or "70")
 _intraday_capture_mode_cache: dict = {"ts": 0.0, "state": {}}
 def _normalize_for_hash(obj):
     if isinstance(obj, dict):
@@ -4174,7 +4177,6 @@ PUBLIC_STOCK_META_CACHE_TTL_SEC = int(os.getenv("PUBLIC_STOCK_META_CACHE_TTL_SEC
 RUN_SCAN_REPAIR_RETRY_SEC = int(os.getenv("RUN_SCAN_REPAIR_RETRY_SEC", "30") or "30")
 RUN_SCAN_REPAIR_MAX_ATTEMPTS = int(os.getenv("RUN_SCAN_REPAIR_MAX_ATTEMPTS", "2") or "2")
 RUN_SCAN_REPAIR_ALERT_AFTER = int(os.getenv("RUN_SCAN_REPAIR_ALERT_AFTER", "2") or "2")
-RUN_SCAN_INCOMPLETE_GATE_ENABLED = False
 ENTRY_TERMINATION_STATE_FILE = _state_path("entry_termination_state.json")
 ENTRY_TERMINATION_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_ALERT_COOLDOWN_SEC", "1800") or "1800")
 ENTRY_TERMINATION_REARM_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_REARM_COOLDOWN_SEC", "2400") or "2400")
@@ -4792,10 +4794,10 @@ NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLB
 RELAXABLE_NO_CHASE_ENTRY_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 GENERAL_A_RELAX_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER"}
 GENERAL_A_EXTENDED_SIGNAL_TYPES = {"SURGE", "EARLY_DETECT", "NEAR_UPPER", "STRONG_BUY"}
-GENERAL_A_RELAXED_SCORE = int(os.getenv("GENERAL_A_RELAXED_SCORE", "77") or "77")
-GENERAL_A_EXTENDED_SCORE = int(os.getenv("GENERAL_A_EXTENDED_SCORE", "75") or "75")
+GENERAL_A_RELAXED_SCORE = int(os.getenv("GENERAL_A_RELAXED_SCORE", "70") or "70")
+GENERAL_A_EXTENDED_SCORE = int(os.getenv("GENERAL_A_EXTENDED_SCORE", "68") or "68")
 GENERAL_A_EXTENDED_SUPPORT_MIN = int(os.getenv("GENERAL_A_EXTENDED_SUPPORT_MIN", "2") or "2")
-GENERAL_GRADE_A_CUT = int(os.getenv("GENERAL_GRADE_A_CUT", "80") or "80")
+GENERAL_GRADE_A_CUT = int(os.getenv("GENERAL_GRADE_A_CUT", "72") or "72")
 GENERAL_GRADE_B_CUT = int(os.getenv("GENERAL_GRADE_B_CUT", "60") or "60")
 MIN_TRADABLE_SIGNAL_PRICE = int(os.getenv("MIN_TRADABLE_SIGNAL_PRICE", "500") or "500")
 NXT_PREOPEN_MIN_CHANGE = float(os.getenv("NXT_PREOPEN_MIN_CHANGE", "5.0") or "5.0")
@@ -11551,7 +11553,7 @@ def _score_intraday_pullback_signal(ctx: dict, surge_meta: dict, window_meta: di
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(score, reasons, ctx["code"], "MID_PULLBACK", today_chg, vol_ratio, weight_mode="weak")
     if score < 45:
         return {}
-    grade = "A" if score >= 80 else "B" if score >= 60 else "C"
+    grade = "A" if score >= GENERAL_GRADE_A_CUT else "B" if score >= GENERAL_GRADE_B_CUT else "C"
     entry = _calc_resurge_entry_price(today_price, pullback_low, reclaim_ratio) if (resurge_mode and not breakout_mode) else today_price
     if resurge_mode and not breakout_mode:
         reasons.append(f"↘️ 재상승형 보수 진입가 {entry:,}원 (현재가 추격 방지)")
@@ -22907,48 +22909,18 @@ def _build_analyze_result(ctx: dict) -> dict:
         "crossday_episode_confirmed": bool(crossday_ctx.get("confirmed")), "crossday_episode_reason": str(crossday_ctx.get("reason", "") or ""),
         "crossday_episode_reclaim_ratio": float(crossday_ctx.get("reclaim_ratio", 0.0) or 0.0),
     }
-def _build_analyze_bypass_result(stock: dict) -> dict:
-    stock = dict(stock or {})
-    code = normalize_stock_code(stock.get("code", ""))
-    price = safe_int(stock.get("price", 0), 0)
-    if not code or price < MIN_TRADABLE_SIGNAL_PRICE:
-        return {}
-    name = _resolve_stock_name(code, stock.get("name", code)) or code
-    stock["code"] = code
-    stock["name"] = name
-    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
-    vol_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
-    signal_type = "UPPER_LIMIT" if change_rate >= 29.0 else "NEAR_UPPER" if change_rate >= UPPER_LIMIT_THRESHOLD else "SURGE" if change_rate >= max(PRICE_SURGE_MIN, 3.0) else "EARLY_DETECT"
-    score = max(65, min(95, 65 + int(abs(change_rate) * 2.0) + int(max(0.0, vol_ratio) * 2.0)))
-    sector_info = calc_sector_momentum(code, name) or {}
-    entry = price
-    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type=signal_type)
-    reasons = ["🟢 analyze 전면 우회", f"📈 등락률 {change_rate:+.1f}%", f"📊 거래량 {vol_ratio:.1f}배"]
-    grade = _derive_general_signal_grade(signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio, sector_info=sector_info, direct_news_hit=False, nxt_delta=0, market=str(stock.get("market", "") or ""), reasons=reasons)
-    position = calc_position_size(signal_type, score, grade)
-    return {
-        "code": code, "name": name, "price": price,
-        "change_rate": change_rate, "volume_ratio": vol_ratio, "signal_type": signal_type,
-        "score": score, "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
-        "direct_news_hit": False, "emergent_theme_hit": False, "theme_drive_hit": False, "adaptive_feedback_hit": False,
-        "market_flow_hit": False, "market_flow_bonus": 0, "sector_leader_follow_hit": False, "sector_leader_follow_bonus": 0,
-        "material_scenario_hit": False, "material_scenario_bonus": 0, "adaptive_feedback_bonus": 0, "miss_theme_leader_hit": False,
-        "miss_theme_leader_bonus": 0, "nxt_post_leader_hit": False, "nxt_post_leader_bonus": 0, "theme_expansion_hit": False,
-        "theme_expansion_bonus": 0, "theme_breadth_ratio": 0.0,
-        "global_pattern_value_ratio": 0.0, "global_pattern_high_hold_ratio": 0.0, "global_pattern_orb_breakout": False,
-        "global_pattern_recent_high_breakout": False, "global_pattern_near_limit_lead": False,
-        "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
-        "prev_upper": False, "reasons": reasons, "detected_at": datetime.now(),
-        "nxt_delta": 0, "regime": "bypass", "us_regime": "neutral", "gap_signal": "flat",
-        "foreign_days": 0, "institution_days": 0, "short_ratio": 0.0, "earnings_risk": None, "position": position,
-        "indic": {}, "grade": grade, "news_analysis": {}, "news_articles": [], "similar_pattern_stats": {},
-        "dart_risk": False, "countertrend_warning": False, "countertrend_ctx": {},
-        "execution_setup_required": False, "entry_execution_focus": False,
-        "crossday_episode_active": False, "crossday_episode_prep": False, "crossday_episode_confirmed": False,
-        "crossday_episode_reason": "", "crossday_episode_reclaim_ratio": 0.0,
-    }
 def analyze(stock: dict) -> dict:
-    return _build_analyze_bypass_result(stock)
+    ctx = _bootstrap_analyze_context(stock)
+    if not ctx:
+        return {}
+    if not _apply_analyze_signal_quality(ctx):
+        return {}
+    _apply_analyze_theme_context(ctx)
+    if not _apply_analyze_market_context(ctx):
+        return {}
+    if not _apply_analyze_entry_and_filters(ctx):
+        return {}
+    return _build_analyze_result(ctx)
 # ============================================================
 # 조기 포착
 # ============================================================
@@ -27501,7 +27473,7 @@ def _score_dart_execution_signal(change_rate: float, vol_ratio: float, rs: float
     elif sector_bonus >= 10:
         score += 2
     score = max(55, min(95, int(score)))
-    grade = "A" if score >= 80 else "B"
+    grade = "A" if score >= GENERAL_GRADE_A_CUT else "B"
     return score, grade
 def _build_dart_execution_stock(code: str, company: str, title: str, *, price: int,
                                 change_rate: float, today_vol: int, vol_ratio: float,
@@ -31283,9 +31255,77 @@ def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[s
     # v82: 동시보유 제한 완전 제거 — v62~v80 9회 수정에도 오카운트 반복, 실진입은 사용자 수동 결정이므로 봇 단계에서 차단 불필요.
     return sorted_alerts if sorted_alerts else []
 def filter_portfolio_signals(alerts: list) -> list:
-    """v160.21: 포트폴리오 필터 비활성화 — 입력 후보를 그대로 통과시킨다."""
-    return alerts or []
-
+    """
+    동시 다발 신호에서 실질 섹터 스코어 기반 중복 제거.
+    - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
+    - 점수 높은 것 1개만 통과 (나머지 제외)
+    - 국면별 총 신호 수 제한
+    - v53: 신규/기존 신호를 먼저 평가한 뒤 동시 보유 제한을 마지막 행동 단계에 적용
+    """
+    if not alerts:
+        return alerts
+    regime_info = get_market_regime()
+    regime    = regime_info.get("mode", "normal")
+    rp        = REGIME_PARAMS.get(regime, REGIME_PARAMS["normal"])
+    max_positions = rp.get("max_positions", 1)
+    max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
+    carry_count, carry_codes = _get_carry_position_context()
+    alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
+    # 신규 리더 우선 + stale 눌림목 후순위 정렬
+    sorted_alerts = sorted(
+        alerts,
+        key=lambda x: (
+            1 if x.get("leader_priority_hit") else 0,
+            0 if x.get("stale_pullback_hit") else 1,
+            0 if x.get("stale_replay_penalty_hit") else 1,
+            int(x.get("score", 0) or 0),
+            float(x.get("change_rate", 0) or 0),
+            float(x.get("volume_ratio", 0) or 0),
+        ),
+        reverse=True,
+    )
+    sorted_alerts = _apply_position_limit_after_priority(
+        sorted_alerts,
+        carry_codes=carry_codes,
+        carry_count=carry_count,
+        max_positions=max_positions,
+        stage="filter_portfolio_signals",
+    )
+    if not sorted_alerts:
+        return []
+    passed   = []
+    excluded = set()
+    for i, s in enumerate(sorted_alerts):
+        if len(passed) >= max_total:
+            break
+        if s["code"] in excluded:
+            continue
+        passed.append(s)
+        # 아직 통과 안 된 뒤 신호들과 실질 섹터 비교
+        for j in range(i + 1, len(sorted_alerts)):
+            peer = sorted_alerts[j]
+            if peer["code"] in excluded:
+                continue
+            try:
+                rs = calc_real_sector_score(s["code"], peer["code"],
+                                            s["name"], peer["name"])
+                if rs["score"] >= 50:
+                    # 같은 섹터 내 max_same_sector 개수까지는 허용
+                    same_sector_passed = sum(
+                        1 for p in passed
+                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
+                    )
+                    _max_same = _dynamic.get("max_same_sector", 2)
+                    if same_sector_passed >= _max_same:
+                        excluded.add(peer["code"])
+                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
+            except Exception as e:
+                _swallow_exception(e)
+    if len(passed) < len(sorted_alerts):
+        skipped = len(sorted_alerts) - len(passed)
+        _log_info_msg(f"  🗂️ 포트폴리오 필터: {skipped}개 제외 ({regime}장, 최대 {max_total}개)")
+    return passed
+# v37.0: schedule lambda → 명명 함수 (에러 추적 가능)
 def _on_market_open():
     """장 시작 시 초기화 — schedule에서 호출"""
     if is_holiday(): return
@@ -31389,9 +31429,6 @@ def _build_run_scan_missing_reasons(item: dict) -> list[str]:
         reasons.append("missing_signal_type")
     if safe_int(item.get("score", 0), 0) <= 0:
         reasons.append("missing_score")
-    sector_theme = str(item.get("sector_theme") or (item.get("sector_info") or {}).get("theme") or "")
-    if _is_generic_sector_theme(sector_theme):
-        reasons.append("missing_sector")
     return reasons
 
 def _queue_run_scan_repair(item: dict, stage: str = "") -> None:
@@ -31426,7 +31463,7 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
         item = dict(row.get("payload") or {})
         item["code"] = code
         repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(repaired.get("_scan_payload_incomplete")):
+        if bool(repaired.get("_scan_payload_incomplete")):
             attempts = int(row.get("attempts", 0) or 0) + 1
             if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
                 _emit_run_scan_code_change_request(repaired)
@@ -31510,15 +31547,15 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
         item["score"] = _build_fallback_scan_score(item, signal_type=str(item.get("signal_type") or signal_type or ""))
     if not str(item.get("grade") or item.get("execution_grade") or "").strip():
         score = safe_int(item.get("score", 0), 0)
-        grade = "A" if score >= 80 else "B" if score >= 60 else "C"
+        grade = "A" if score >= GENERAL_GRADE_A_CUT else "B" if score >= GENERAL_GRADE_B_CUT else "C"
         item["grade"] = grade
         item["execution_grade"] = grade
     missing_reasons = _build_run_scan_missing_reasons(item)
     incomplete = bool(missing_reasons)
-    item["_scan_payload_incomplete"] = bool(incomplete and RUN_SCAN_INCOMPLETE_GATE_ENABLED)
+    item["_scan_payload_incomplete"] = bool(incomplete)
     item["_scan_payload_missing_reasons"] = list(missing_reasons)
     if incomplete:
-        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 참고용 메타")
+        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 일반 포착 재복구 대기")
     return item
 
 def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
@@ -31561,7 +31598,7 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(item.get("_scan_payload_incomplete")):
+        if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
             _queue_run_scan_repair(item, stage=stage)
             _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(item.get('_scan_payload_missing_reasons', []))}")
@@ -31572,16 +31609,23 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     return cleaned
 
 def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str | None = None, seen_code: str | None = None) -> None:
-    """v160.24: _append_scan_alert 전면 우회 — code/결측/재알림 차단 없이 후보를 그대로 누적한다."""
     if not isinstance(result, dict):
         return
     normalized_seen_code = normalize_stock_code(seen_code or "")
-    fallback_code = normalized_seen_code or _normalize_scan_signal_code(result)
-    result = _coerce_run_scan_signal_defaults(result, fallback_code=fallback_code)
+    result_code = _normalize_scan_signal_code(result, fallback_code=normalized_seen_code)
+    if not result_code:
+        _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
+        return
+    result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
+    if bool(result.get("_scan_payload_incomplete")):
+        _queue_run_scan_repair(result, stage="append")
+        _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
+        return
+    resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
+    if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
+        return
     alerts.append(result)
-    if fallback_code:
-        seen.add(fallback_code)
-
+    seen.add(normalized_seen_code or result_code)
 def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool) -> None:
     try:
         if not (_overnight_watchlist and krx_open):
@@ -31860,15 +31904,27 @@ def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt
             if code not in seen:
                 _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
 def _apply_scan_sector_gate(alerts: list) -> list:
-    passed_alerts = []
+    alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
+    max_signals_per_sector = 3
+    max_signals_misc = 4
+    sector_counts = {}
+    filtered_alerts = []
     for s in alerts:
         sec = _hydrate_alert_sector_theme(s, force_lookup=True)
         if not str(s.get("name") or "").strip() and s.get("code"):
             s["name"] = _resolve_stock_name(s.get("code"), s.get("name", ""))
-        if not s.get("sector_theme") and sec and sec != "기타":
-            s["sector_theme"] = sec
-        passed_alerts.append(s)
-    return passed_alerts
+        sec_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
+        if s.get("theme_chain_force_hit") or s.get("force_external_capture_alert") or s.get("material_first_priority_hit") or s.get("direct_news_hit"):
+            sec_limit += 2
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        if sector_counts[sec] <= sec_limit:
+            if not s.get("sector_theme") and sec != "기타":
+                s["sector_theme"] = sec
+            filtered_alerts.append(s)
+        else:
+            _record_shadow_capture(s.get("code", ""), s.get("name", s.get("code", "")), "sector_limit", s.get("signal_type", ""), stage="sector_gate", extra={"sector": sec, "score": s.get("score", 0), "change_rate": s.get("change_rate", 0)})
+            _log_info_msg(f"  ⏭ 섹터 제한({sec} {sector_counts[sec]}번째): {s.get('name','')} 생략")
+    return filtered_alerts
 def _dispatch_scan_alerts(alerts: list) -> None:
     if not alerts:
         _log_info_msg("  → 조건 충족 없음")
@@ -31914,11 +31970,11 @@ def run_scan():
         _scan_rank_and_theme_candidates(alerts, seen)
         _scan_sector_leader_follow_candidates(alerts, seen)
         _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
-        alerts = alerts or []  # v160.24: pre_sector_gate 정리 비활성화
+        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_sector_gate")
         alerts = _apply_scan_sector_gate(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
         alerts = filter_portfolio_signals(alerts)
-        alerts = alerts or []  # v160.23: pre_dispatch 정리 비활성화
+        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
         _dispatch_scan_alerts(alerts)
         _run_scan_followup_hooks()
     except Exception as e:
