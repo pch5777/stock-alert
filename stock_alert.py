@@ -3,11 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.18
+버전: v160.19
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v160.18 (2026-04-03): 종목포착 후 차단 기능 전면 비활성화 — `v160.17`을 기준으로 포착 이후 후보를 막던 섹터 게이트, 포트폴리오 필터, 진입불가/외부지연/기존 entry_hit 보호, 감시종료 재등록 쿨다운, 일반 포착 actionability 차단, run_scan 결측 하드 차단을 모두 끄고 후보를 그대로 통과시키도록 정리했다. 즉 포착된 종목은 후단 차단 없이 외부 알림·감시 등록까지 이어지며, 결측 후보도 기본값 보정 후 일단 통과시켜 기회 손실을 줄이는 공격형 모드다.
+- v160.19 (2026-04-03): run_scan 결측 차단 전면 비활성화 — `v160.17` 기준에서 `_scan_payload_incomplete`는 기록용 메타로만 남기고 후보 차단/재복구 큐/대기 스킵으로 이어지지 않게 전역 비활성화했다. 즉 `_sanitize_run_scan_alerts()`와 `_append_scan_alert()`, 재복구 큐 drain 경로에서 결측 후보도 그대로 통과시키도록 바꿨다.
 - v160.17 (2026-04-03): 감시종료 재등록 쿨다운 + run_scan 재복구 큐 실반영 + 공용 종목명/업종 fallback 보강 — 근거약화로 감시 종료된 종목은 일정 시간 재등록과 종료 알림을 억제해 같은 종목의 감시종료 반복 알림을 줄인다. `run_scan` 결측 후보는 즉시 폐기하지 않고 결측 사유별 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패한 종목만 코드수정 요청 알림으로 승격한다. 또한 종목명은 공용 공개 메타와 다중 public fallback으로 끝까지 복구하고, 업종/섹터도 공용 업종 fallback을 사용해 `기타` 섹터 잔류를 줄인다.
 - v160.16 (2026-04-03): calc_position_size 0나눗셈/compact datetime 파싱/JSON 경고 정리 — `calc_position_size()`는 승률 표본에서 평균 이익폭이 0이거나 손익비 `b`가 0 이하로 내려가는 경우 기본 손익비로 안전하게 대체해 `ZeroDivisionError`를 막는다. `_parse_compact_datetime()`는 `2026040219:51:47`처럼 날짜+콜론시간이 붙은 문자열과 `YYYYMMDD HH:MM:SS` 형태를 조용히 정규화해 반복 `ValueError` 경고를 없앤다. 또한 `safe_json_response()`는 응답 본문을 문자열 기준으로 직접 파싱하고 빈 응답/HTML/비JSON은 조용히 `{}`로 반환하도록 정리했으며, `get_korea_etf_signals()`/`check_earnings_risk()`/`analyze_news_deep()`도 같은 안전 경로를 사용해 `JSONDecodeError` 로그를 줄인다.
 - v160.15 (2026-04-03): run_scan 결측 재복구 큐 + 코드수정 요청 연동 + JSON 응답 안전화 — `run_scan` 후보 결측을 즉시 폐기하지 않고 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패 종목만 코드수정 요청 알림으로 승격한다.
@@ -4167,10 +4167,10 @@ CODE_CHANGE_REQUEST_STATE_FILE = _state_path("code_change_request_state.json")
 _CODE_CHANGE_REQUEST_CD_MIN = int(os.getenv("CODE_CHANGE_REQUEST_CD_MIN", "180"))
 PUBLIC_STOCK_META_FILE = _state_path("public_stock_meta.json")
 PUBLIC_STOCK_META_CACHE_TTL_SEC = int(os.getenv("PUBLIC_STOCK_META_CACHE_TTL_SEC", "21600") or "21600")
-DISABLE_POST_CAPTURE_BLOCKS = str(os.getenv("DISABLE_POST_CAPTURE_BLOCKS", "1") or "1").strip().lower() not in ("0","false","no","off")
 RUN_SCAN_REPAIR_RETRY_SEC = int(os.getenv("RUN_SCAN_REPAIR_RETRY_SEC", "30") or "30")
 RUN_SCAN_REPAIR_MAX_ATTEMPTS = int(os.getenv("RUN_SCAN_REPAIR_MAX_ATTEMPTS", "2") or "2")
 RUN_SCAN_REPAIR_ALERT_AFTER = int(os.getenv("RUN_SCAN_REPAIR_ALERT_AFTER", "2") or "2")
+RUN_SCAN_INCOMPLETE_GATE_ENABLED = False
 ENTRY_TERMINATION_STATE_FILE = _state_path("entry_termination_state.json")
 ENTRY_TERMINATION_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_ALERT_COOLDOWN_SEC", "1800") or "1800")
 ENTRY_TERMINATION_REARM_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_REARM_COOLDOWN_SEC", "2400") or "2400")
@@ -11755,17 +11755,6 @@ def _build_actionability_issue_lines(signal: dict, reasons: list[str]) -> list[s
     return lines
 
 def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        if not isinstance(signal, dict):
-            return False
-        code = normalize_stock_code(signal.get("code", ""))
-        signal["name"] = _resolve_stock_name(code, signal.get("name", ""), cur=signal)
-        expected_entry = _derive_fallback_expected_entry_price(signal)
-        if expected_entry > 0:
-            signal.setdefault("planned_entry_price", expected_entry)
-            if safe_int(signal.get("entry_price", 0), 0) <= 0:
-                signal["entry_price"] = expected_entry
-        return True
     if not isinstance(signal, dict):
         return False
     code = normalize_stock_code(signal.get("code", ""))
@@ -19272,8 +19261,6 @@ def _get_entry_termination_state(code: str) -> dict:
     return row
 
 def _should_skip_entry_termination_notice(watch: dict, reason: str) -> bool:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return False
     code = normalize_stock_code((watch or {}).get("code", ""))
     if not code:
         return False
@@ -19296,8 +19283,6 @@ def _mark_entry_termination_notice(code: str, reason: str) -> None:
     _save_entry_termination_state(state)
 
 def _should_skip_terminated_rearm(signal: dict) -> bool:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return False
     sig = dict(signal or {})
     code = normalize_stock_code(sig.get("code", ""))
     if not code:
@@ -20034,8 +20019,6 @@ def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
     return calc_rate if abs(calc_rate) > abs(api_rate) else api_rate
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
     """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return ""
     change_rate = _get_effective_change_rate(cur, price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
@@ -24104,8 +24087,6 @@ def _signal_bid_ask_ratio_hint(signal: dict | None = None) -> float:
     ]
     return round(max(candidates + [0.0]), 3)
 def _should_delay_external_general_capture(signal: dict) -> str:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return ""
     if not isinstance(signal, dict):
         return ""
     if signal.get("force_external_capture_alert"):
@@ -24417,8 +24398,6 @@ def _trigger_general_alert_phase2_upgrade(s: dict, existing_hit_watch: dict, old
         _log_warn_msg(f"  ⚠️ phase2 트리거 오류: {e}")
     return True
 def _handle_general_alert_existing_entry_hit(ctx: dict) -> bool | None:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return None
     s = ctx["signal"]
     live_for_halt = ctx["live"] if isinstance(ctx["live"], dict) else {}
     code = normalize_stock_code(s.get("code", ""))
@@ -31267,13 +31246,9 @@ def _should_allow_conditional_second_position(alert: dict | None = None, carry_c
         active_themes.add(active_theme)
     return candidate_theme not in active_themes
 def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[str], carry_count: int, max_positions: int, stage: str = "") -> list:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return list(sorted_alerts or [])
     # v82: 동시보유 제한 완전 제거 — v62~v80 9회 수정에도 오카운트 반복, 실진입은 사용자 수동 결정이므로 봇 단계에서 차단 불필요.
     return sorted_alerts if sorted_alerts else []
 def filter_portfolio_signals(alerts: list) -> list:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return list(alerts or [])
     """
     동시 다발 신호에서 실질 섹터 스코어 기반 중복 제거.
     - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
@@ -31485,7 +31460,7 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
         item = dict(row.get("payload") or {})
         item["code"] = code
         repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        if bool(repaired.get("_scan_payload_incomplete")):
+        if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(repaired.get("_scan_payload_incomplete")):
             attempts = int(row.get("attempts", 0) or 0) + 1
             if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
                 _emit_run_scan_code_change_request(repaired)
@@ -31574,10 +31549,10 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
         item["execution_grade"] = grade
     missing_reasons = _build_run_scan_missing_reasons(item)
     incomplete = bool(missing_reasons)
-    item["_scan_payload_incomplete"] = bool(incomplete)
+    item["_scan_payload_incomplete"] = bool(incomplete and RUN_SCAN_INCOMPLETE_GATE_ENABLED)
     item["_scan_payload_missing_reasons"] = list(missing_reasons)
     if incomplete:
-        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 일반 포착 재복구 대기")
+        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 참고용 메타")
     return item
 
 def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
@@ -31620,12 +31595,7 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        if bool(item.get("_scan_payload_incomplete")) and DISABLE_POST_CAPTURE_BLOCKS:
-            item.setdefault("reasons", []).append("⚠️ 결측 후보 차단 해제")
-            item["_capture_block_bypassed"] = True
-            cleaned.append(item)
-            continue
-        if bool(item.get("_scan_payload_incomplete")):
+        if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(item.get("_scan_payload_incomplete")):
             dropped += 1
             _queue_run_scan_repair(item, stage=stage)
             _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(item.get('_scan_payload_missing_reasons', []))}")
@@ -31644,15 +31614,12 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
         return
     result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
-    if bool(result.get("_scan_payload_incomplete")) and not DISABLE_POST_CAPTURE_BLOCKS:
+    if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(result.get("_scan_payload_incomplete")):
         _queue_run_scan_repair(result, stage="append")
         _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
         return
-    if bool(result.get("_scan_payload_incomplete")) and DISABLE_POST_CAPTURE_BLOCKS:
-        result.setdefault("reasons", []).append("⚠️ 결측 후보 차단 해제")
-        result["_capture_block_bypassed"] = True
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
-    if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown() and not DISABLE_POST_CAPTURE_BLOCKS:
+    if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
         return
     alerts.append(result)
     seen.add(normalized_seen_code or result_code)
@@ -31934,8 +31901,6 @@ def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt
             if code not in seen:
                 _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
 def _apply_scan_sector_gate(alerts: list) -> list:
-    if DISABLE_POST_CAPTURE_BLOCKS:
-        return list(alerts or [])
     alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
     max_signals_per_sector = 3
     max_signals_misc = 4
