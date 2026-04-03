@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161
+버전: v161.1
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.1 (2026-04-03): repair queue 3종 버그 수정
+  [#1] _queue_run_scan_repair: ETF/ETN(is_scoring_only_instrument) 큐 진입 차단
+  이유: KODEX 200/인버스/레버리지 ETN 등이 missing_signal_type으로 큐에 반복 쌓임
+  [#2] _drain_run_scan_repair_queue: threading.Lock으로 동시 실행 차단
+  이유: catch-up 스캔과 정규 스캔이 동시에 드레인 → 같은 종목 두 번씩 처리
+  [#3] _emit_run_scan_code_change_request: ETF/ETN 텔레그램 코드수정 요청 알림 차단
+  이유: ETF가 큐 최대 재시도 초과 시 노이즈 텔레그램 알림 발송됨
 - v161 (2026-04-03): A등급 기준 완화 + 결측 sector 차단 제거 + 하드코딩 버그 수정
   [#1] GENERAL_GRADE_A_CUT 80→72, GENERAL_A_RELAXED_SCORE 77→70, GENERAL_A_EXTENDED_SCORE 75→68, INTRADAY_CAPTURE_RELAX_SCORE 77→70
   이유: 로그 기준 SURGE 72~77점 종목이 B등급으로 전량 차단됨 (삼아알미늄 77점, RFHIC 73점, 티엠씨 72점 등)
@@ -1665,6 +1672,7 @@ _file_lock  = threading.Lock()   # signal_log/carry/dynamic JSON 읽기/쓰기
 _state_lock = threading.Lock()   # _detected_stocks/_alert_history 등 공유 dict
 _cache_lock = threading.Lock()   # 캐시 dict 일괄 관리
 _kis_rate_lock = threading.Lock()  # KIS REST 전역 호출 burst 제어
+_repair_drain_lock = threading.Lock()  # v161.1: repair queue 동시 드레인 방지
 _kis_rest_call_times = deque()
 _kis_token_call_times = deque()
 _kis_rate_stats = {"rest_wait_events": 0, "rest_wait_sec": 0.0, "token_wait_events": 0, "token_wait_sec": 0.0}
@@ -31435,6 +31443,8 @@ def _queue_run_scan_repair(item: dict, stage: str = "") -> None:
     code = _normalize_scan_signal_code(item)
     if not code:
         return
+    if is_scoring_only_instrument(code, str(item.get("name") or "")):
+        return
     row = dict(_run_scan_repair_queue.get(code) or {})
     row["payload"] = dict(item)
     row["stage"] = str(stage or row.get("stage", ""))
@@ -31447,6 +31457,8 @@ def _emit_run_scan_code_change_request(item: dict) -> None:
     code = _normalize_scan_signal_code(item)
     if not code:
         return
+    if is_scoring_only_instrument(code, str(item.get("name") or "")):
+        return
     reasons = list(item.get("_scan_payload_missing_reasons") or [])
     lines = [f"종목: {str(item.get('name', '') or code)} ({code})", f"market: {str(item.get('market','') or '')}"]
     for r in reasons:
@@ -31455,29 +31467,34 @@ def _emit_run_scan_code_change_request(item: dict) -> None:
 
 
 def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
-    now = time.time()
-    remove_codes = []
-    for code, row in list(_run_scan_repair_queue.items()):
-        if now < float(row.get("next_ts", 0.0) or 0.0):
-            continue
-        item = dict(row.get("payload") or {})
-        item["code"] = code
-        repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        if bool(repaired.get("_scan_payload_incomplete")):
-            attempts = int(row.get("attempts", 0) or 0) + 1
-            if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
-                _emit_run_scan_code_change_request(repaired)
-                remove_codes.append(code)
-            else:
-                row["payload"] = dict(repaired)
-                row["attempts"] = attempts
-                row["next_ts"] = now + RUN_SCAN_REPAIR_RETRY_SEC
-                _run_scan_repair_queue[code] = row
-            continue
-        remove_codes.append(code)
-        _append_scan_alert(alerts, seen, repaired, hist_key=code, seen_code=code)
-    for code in remove_codes:
-        _run_scan_repair_queue.pop(code, None)
+    if not _repair_drain_lock.acquire(blocking=False):
+        return
+    try:
+        now = time.time()
+        remove_codes = []
+        for code, row in list(_run_scan_repair_queue.items()):
+            if now < float(row.get("next_ts", 0.0) or 0.0):
+                continue
+            item = dict(row.get("payload") or {})
+            item["code"] = code
+            repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
+            if bool(repaired.get("_scan_payload_incomplete")):
+                attempts = int(row.get("attempts", 0) or 0) + 1
+                if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
+                    _emit_run_scan_code_change_request(repaired)
+                    remove_codes.append(code)
+                else:
+                    row["payload"] = dict(repaired)
+                    row["attempts"] = attempts
+                    row["next_ts"] = now + RUN_SCAN_REPAIR_RETRY_SEC
+                    _run_scan_repair_queue[code] = row
+                continue
+            remove_codes.append(code)
+            _append_scan_alert(alerts, seen, repaired, hist_key=code, seen_code=code)
+        for code in remove_codes:
+            _run_scan_repair_queue.pop(code, None)
+    finally:
+        _repair_drain_lock.release()
 
 def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | None = None) -> dict:
     item = dict(payload or {})
