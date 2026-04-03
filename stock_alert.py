@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.3
-날짜: 2026-04-03
+버전: v161.4
+날짜: 2026-04-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.4 (2026-04-04): 주말/공휴일 장전 알람 발송 버그 수정
+  [#1] _send_preopen_watchlist_once / _send_premarket_risk_assessment_once / _send_premarket_risk_update_once 에 is_holiday() 가드 추가
+  이유: 07:30 스케줄이 주말에도 실행되어 🌅 장전 액션보드 알람이 토요일에 발송됨
+  개선점: is_holiday() True이면 즉시 반환, 발송 없음
+  주의점: send_premarket_briefing()은 기존에 이미 is_holiday() 체크 있으므로 수정 불필요
 - v161.3 (2026-04-03): 로그 분석 10개 문제 일괄 수정
   [#1] _dispatch_scan_alerts Lock — 스캔 동시 실행 중복 알람 제거
   이유: catch-up·정규 스캔 동시 실행 시 같은 종목 2회 dispatch
@@ -29697,16 +29702,22 @@ def _try_mark_preopen_dispatch(kind: str, now_dt: datetime | None = None) -> boo
         _log_warn_msg(f"⚠️ 장전 디스패치 상태 기록 실패({kind}): {e}")
         return True
 def _send_preopen_watchlist_once():
+    if is_holiday():
+        return
     if not _try_mark_preopen_dispatch("watchlist_0730"):
         _log_info_msg("ℹ️ 07:30 워치리스트 이미 처리됨")
         return
     send_preopen_watchlist()
 def _send_premarket_risk_assessment_once():
+    if is_holiday():
+        return
     if not _try_mark_preopen_dispatch("risk_full_0730"):
         _log_info_msg("ℹ️ 07:30 장전 리스크 평가 이미 처리됨")
         return
     send_premarket_risk_assessment()
 def _send_premarket_risk_update_once():
+    if is_holiday():
+        return
     if not _try_mark_preopen_dispatch("risk_update_0830"):
         _log_info_msg("ℹ️ 08:30 장전 리스크 업데이트 이미 처리됨")
         return
