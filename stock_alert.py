@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.22
+버전: v160.23
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.23 (2026-04-03): pre_dispatch 정리 비활성화 — `v160.22` 기준에서 run_scan 최종 발송 직전의 `_sanitize_run_scan_alerts(stage="pre_dispatch")` 정리 단계를 끄고, pre_dispatch 직전 후보를 그대로 `_dispatch_scan_alerts()`로 넘기도록 바꿨다. 즉 발송 직전 마지막 정리 단계에서 후보가 줄어드는 경로를 제거했다.
 - v160.22 (2026-04-03): analyze 전면 우회 — `v160.21` 기준에서 `analyze()`의 신호품질/시장문맥/진입필터 전 과정을 타지 않고, 등락률·거래량·현재가 기반의 최소 결과를 즉시 생성하도록 바꿨다. 즉 상승률 후보를 본 뒤 `analyze()` 안 차단으로 빠지던 경로를 전면 비활성화하고 바로 `signal_type/score/grade/entry_price`를 채워 후단으로 넘긴다.
 - v160.20 (2026-04-03): run_scan 섹터 게이트 비활성화 — `v160.19` 기준에서 `_apply_scan_sector_gate()`를 후보 통과 함수로 바꿔 섹터별 제한/`기타` 버킷 제한으로 포착이 잘리는 경로를 끄고, 이름 복구만 수행한 뒤 후보를 그대로 다음 단계로 넘기도록 조정했다.
 - v160.19 (2026-04-03): run_scan 결측 차단 전면 비활성화 — `v160.17` 기준에서 `_scan_payload_incomplete`는 기록용 메타로만 남기고 후보 차단/재복구 큐/대기 스킵으로 이어지지 않게 전역 비활성화했다. 즉 `_sanitize_run_scan_alerts()`와 `_append_scan_alert()`, 재복구 큐 drain 경로에서 결측 후보도 그대로 통과시키도록 바꿨다.
@@ -31923,7 +31924,7 @@ def run_scan():
         alerts = _apply_scan_sector_gate(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
         alerts = filter_portfolio_signals(alerts)
-        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
+        alerts = alerts or []  # v160.23: pre_dispatch 정리 비활성화
         _dispatch_scan_alerts(alerts)
         _run_scan_followup_hooks()
     except Exception as e:
