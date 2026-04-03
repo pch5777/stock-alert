@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.16
+버전: v160.17
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.17 (2026-04-03): 감시종료 재등록 쿨다운 + run_scan 재복구 큐 실반영 + 공용 종목명/업종 fallback 보강 — 근거약화로 감시 종료된 종목은 일정 시간 재등록과 종료 알림을 억제해 같은 종목의 감시종료 반복 알림을 줄인다. `run_scan` 결측 후보는 즉시 폐기하지 않고 결측 사유별 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패한 종목만 코드수정 요청 알림으로 승격한다. 또한 종목명은 공용 공개 메타와 다중 public fallback으로 끝까지 복구하고, 업종/섹터도 공용 업종 fallback을 사용해 `기타` 섹터 잔류를 줄인다.
 - v160.16 (2026-04-03): calc_position_size 0나눗셈/compact datetime 파싱/JSON 경고 정리 — `calc_position_size()`는 승률 표본에서 평균 이익폭이 0이거나 손익비 `b`가 0 이하로 내려가는 경우 기본 손익비로 안전하게 대체해 `ZeroDivisionError`를 막는다. `_parse_compact_datetime()`는 `2026040219:51:47`처럼 날짜+콜론시간이 붙은 문자열과 `YYYYMMDD HH:MM:SS` 형태를 조용히 정규화해 반복 `ValueError` 경고를 없앤다. 또한 `safe_json_response()`는 응답 본문을 문자열 기준으로 직접 파싱하고 빈 응답/HTML/비JSON은 조용히 `{}`로 반환하도록 정리했으며, `get_korea_etf_signals()`/`check_earnings_risk()`/`analyze_news_deep()`도 같은 안전 경로를 사용해 `JSONDecodeError` 로그를 줄인다.
 - v160.15 (2026-04-03): run_scan 결측 재복구 큐 + 코드수정 요청 연동 + JSON 응답 안전화 — `run_scan` 후보 결측을 즉시 폐기하지 않고 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패 종목만 코드수정 요청 알림으로 승격한다.
 - v160.14 (2026-04-03): 종목명 공용 메타 fallback + 공용 업종 fallback — KRX 공개 종목 기본정보를 공용 fallback으로 사용해 코드형 종목명 노출과 `기타` 업종 잔류를 줄이도록 보강했다.
@@ -4163,6 +4164,17 @@ _WATCHDOG_NOTIFY_CD_MIN = int(os.getenv("WATCHDOG_NOTIFY_CD_MIN", "20"))  # 텔�
 _watchdog_last_notify_ts: float = 0.0
 CODE_CHANGE_REQUEST_STATE_FILE = _state_path("code_change_request_state.json")
 _CODE_CHANGE_REQUEST_CD_MIN = int(os.getenv("CODE_CHANGE_REQUEST_CD_MIN", "180"))
+PUBLIC_STOCK_META_FILE = _state_path("public_stock_meta.json")
+PUBLIC_STOCK_META_CACHE_TTL_SEC = int(os.getenv("PUBLIC_STOCK_META_CACHE_TTL_SEC", "21600") or "21600")
+RUN_SCAN_REPAIR_RETRY_SEC = int(os.getenv("RUN_SCAN_REPAIR_RETRY_SEC", "30") or "30")
+RUN_SCAN_REPAIR_MAX_ATTEMPTS = int(os.getenv("RUN_SCAN_REPAIR_MAX_ATTEMPTS", "2") or "2")
+RUN_SCAN_REPAIR_ALERT_AFTER = int(os.getenv("RUN_SCAN_REPAIR_ALERT_AFTER", "2") or "2")
+ENTRY_TERMINATION_STATE_FILE = _state_path("entry_termination_state.json")
+ENTRY_TERMINATION_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_ALERT_COOLDOWN_SEC", "1800") or "1800")
+ENTRY_TERMINATION_REARM_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_REARM_COOLDOWN_SEC", "2400") or "2400")
+_entry_termination_state_runtime = {}
+_PUBLIC_STOCK_META_MEM = {"ts": 0.0, "items": {}}
+_run_scan_repair_queue = {}
 def _send_code_change_request_alert(issue_key: str, lines: list[str], cooldown_min: int | None = None) -> bool:
     """자동조정 불가 구조 문제를 별도 텔레그램 요청 알림으로 보낸다."""
     try:
@@ -10928,21 +10940,162 @@ def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
     if compact.isdigit() and len(compact) >= 5:
         return True
     return False
+
+def _load_public_stock_meta_cache() -> dict:
+    state = _read_json_safe(PUBLIC_STOCK_META_FILE, {}) or {}
+    if not isinstance(state, dict):
+        return {"ts": 0.0, "items": {}}
+    items = state.get("items", {})
+    if not isinstance(items, dict):
+        items = {}
+    return {"ts": float(state.get("ts", 0.0) or 0.0), "items": items}
+
+def _save_public_stock_meta_cache(items: dict, ts: float | None = None) -> None:
+    payload = {"ts": float(ts if ts is not None else time.time()), "items": items if isinstance(items, dict) else {}}
+    _write_json_atomic(PUBLIC_STOCK_META_FILE, payload, indent=2)
+
+def _normalize_public_sector_name(value: str | None) -> str:
+    sec = str(value or "").strip()
+    sec = re.sub(r"\s+", " ", sec)
+    sec = sec.replace("업종", "").strip()
+    sec = sec.replace("코스피", "").replace("코스닥", "").strip()
+    return sec or "기타업종"
+
+def _remember_public_stock_meta(code: str, name: str = "", sector: str = "") -> None:
+    code = normalize_stock_code(code)
+    if not code:
+        return
+    name = str(name or "").strip()
+    sector = _normalize_public_sector_name(sector)
+    items = dict((_PUBLIC_STOCK_META_MEM.get("items") or {}))
+    row = dict(items.get(code) or {})
+    if name and not _looks_like_placeholder_stock_name(code, name):
+        row["name"] = name
+    if sector and sector not in ("기타업종", "기타"):
+        row["sector"] = sector
+    if not row:
+        return
+    items[code] = row
+    _PUBLIC_STOCK_META_MEM["items"] = items
+    _PUBLIC_STOCK_META_MEM["ts"] = time.time()
+    try:
+        _save_public_stock_meta_cache(items, _PUBLIC_STOCK_META_MEM["ts"])
+    except Exception as e:
+        _swallow_exception(e)
+
+def _fetch_public_stock_meta_by_code(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    candidates = [
+        f"https://finance.naver.com/item/main.naver?code={code}",
+        f"https://finance.daum.net/quotes/A{code}",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    found_name = ""
+    found_sector = ""
+    for url in candidates:
+        try:
+            resp = requests.get(url, headers=headers, timeout=(3.5, 6.0))
+            txt = str(getattr(resp, "text", "") or "")
+            if not txt:
+                continue
+            if not found_name:
+                m = re.search(r'<title>\s*([^<\|\-]+)', txt, re.I)
+                if m:
+                    cand = html.unescape(m.group(1)).strip()
+                    if not _looks_like_placeholder_stock_name(code, cand):
+                        found_name = cand
+                if not found_name:
+                    m = re.search(r'종목명[^가-힣A-Za-z0-9]{0,20}([가-힣A-Za-z0-9\(\)\-\s]{2,40})', txt)
+                    if m:
+                        cand = html.unescape(m.group(1)).strip()
+                        if not _looks_like_placeholder_stock_name(code, cand):
+                            found_name = cand
+            if not found_sector:
+                patterns = [
+                    r'업종[^가-힣A-Za-z0-9]{0,20}([가-힣A-Za-z0-9\s/&·-]{2,40})',
+                    r'섹터[^가-힣A-Za-z0-9]{0,20}([가-힣A-Za-z0-9\s/&·-]{2,40})',
+                ]
+                for pat in patterns:
+                    m = re.search(pat, txt)
+                    if m:
+                        found_sector = _normalize_public_sector_name(html.unescape(m.group(1)))
+                        if found_sector and found_sector not in ("기타업종", "기타"):
+                            break
+            if found_name and found_sector:
+                break
+        except Exception as e:
+            _swallow_exception(e)
+            continue
+    if found_name or found_sector:
+        _remember_public_stock_meta(code, found_name, found_sector)
+    return {"name": found_name, "sector": found_sector}
+
+def _get_public_stock_meta(code: str, refresh: bool = False) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    now = time.time()
+    try:
+        if refresh or not _PUBLIC_STOCK_META_MEM.get("items") or (now - float(_PUBLIC_STOCK_META_MEM.get("ts", 0.0) or 0.0) > PUBLIC_STOCK_META_CACHE_TTL_SEC):
+            _PUBLIC_STOCK_META_MEM.update(_load_public_stock_meta_cache())
+    except Exception as e:
+        _swallow_exception(e)
+    row = dict((_PUBLIC_STOCK_META_MEM.get("items") or {}).get(code) or {})
+    if row and not refresh:
+        return row
+    fetched = _fetch_public_stock_meta_by_code(code)
+    return dict(fetched or row or {})
+
+def _collect_public_sector_peers(code: str, sector_name: str = "", max_peers: int = 12) -> list[tuple[str, str]]:
+    code = normalize_stock_code(code)
+    sector = _normalize_public_sector_name(sector_name)
+    if not code or sector in ("", "기타업종", "기타"):
+        return []
+    try:
+        state = _load_public_stock_meta_cache()
+        items = state.get("items", {}) if isinstance(state, dict) else {}
+        peers = []
+        for peer_code, meta in list((items or {}).items()):
+            peer_code = normalize_stock_code(peer_code)
+            if not peer_code or peer_code == code:
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            peer_sector = _normalize_public_sector_name(meta.get("sector", ""))
+            if peer_sector != sector:
+                continue
+            peer_name = str(meta.get("name", "") or "").strip() or peer_code
+            peers.append((peer_code, peer_name))
+            if len(peers) >= max_peers:
+                break
+        return peers
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
 def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None) -> str:
-    """종목명이 비어 있거나 코드 placeholder일 때 KRX/NXT 응답 및 runtime 상태로 복구."""
+    """종목명이 비어 있거나 코드 placeholder일 때 최대한 끝까지 복구."""
     code = normalize_stock_code(code) or str(code or "").strip()
     try:
         nm = str(name_hint or "").strip()
         if not _looks_like_placeholder_stock_name(code, nm):
+            _remember_public_stock_meta(code, nm, "")
             return nm
         if isinstance(cur, dict):
             nm = str(cur.get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_public_stock_meta(code, nm, str(cur.get("bstp_name", "") or cur.get("sector_theme", "") or ""))
                 return nm
+        public_meta = _get_public_stock_meta(code)
+        nm = str((public_meta or {}).get("name", "") or "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            return nm
         try:
             info = get_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_public_stock_meta(code, nm, str((info or {}).get("bstp_name", "") or ""))
                 return nm
         except Exception as e:
             _swallow_exception(e)
@@ -10950,6 +11103,7 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
             info = get_nxt_stock_price(code)
             nm = str((info or {}).get("name", "") or "").strip()
             if not _looks_like_placeholder_stock_name(code, nm):
+                _remember_public_stock_meta(code, nm, str((info or {}).get("bstp_name", "") or ""))
                 return nm
         except Exception as e:
             _swallow_exception(e)
@@ -10962,6 +11116,7 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
                         continue
                     nm = str(rec.get("name", "") or "").strip()
                     if not _looks_like_placeholder_stock_name(code, nm):
+                        _remember_public_stock_meta(code, nm, str(rec.get("sector_theme", "") or ""))
                         return nm
         except Exception as e:
             _swallow_exception(e)
@@ -10975,14 +11130,19 @@ def _resolve_stock_name(code: str, name_hint: str = "", cur: dict | None = None)
                         continue
                     nm = str(rec.get("name", "") or "").strip()
                     if not _looks_like_placeholder_stock_name(code, nm):
+                        _remember_public_stock_meta(code, nm, str((rec.get("sector_info") or {}).get("theme", "") or rec.get("sector_theme", "") or ""))
                         return nm
         except Exception as e:
             _swallow_exception(e)
+        public_meta = _get_public_stock_meta(code, refresh=True)
+        nm = str((public_meta or {}).get("name", "") or "").strip()
+        if not _looks_like_placeholder_stock_name(code, nm):
+            return nm
     except Exception as e:
         _swallow_exception(e)
     return code or str(name_hint or "").strip()
+
 def _lookup_name_by_code(code: str, name_hint: str = "") -> str:
-    """v40.1: 레거시 호출 호환용. 내부적으로 _resolve_stock_name을 사용."""
     return _resolve_stock_name(code, name_hint=name_hint)
 def refresh_dynamic_candidates(force_rank: bool = False):
     """
@@ -11571,7 +11731,53 @@ def run_mid_pullback_scan():
         return
     for signal in _prepare_mid_pullback_signals(signals):
         _dispatch_mid_pullback_signal(signal)
+def _derive_fallback_expected_entry_price(signal: dict) -> int:
+    s = dict(signal or {})
+    for key in ("entry_price", "planned_entry_price", "execution_hint_entry_price"):
+        val = safe_int(s.get(key, 0), 0)
+        if val > 0:
+            return val
+    for key in ("ask_price", "bid_price", "price", "open", "prev_close"):
+        val = safe_int(s.get(key, 0), 0)
+        if val > 0:
+            return val
+    return 0
+
+def _build_actionability_issue_lines(signal: dict, reasons: list[str]) -> list[str]:
+    s = dict(signal or {})
+    code = normalize_stock_code(s.get("code", ""))
+    name = str(s.get("name", "") or code).strip() or code
+    lines = [f"종목: {name} ({code})", f"signal_type: {str(s.get('signal_type','') or '')}"]
+    for reason in reasons:
+        lines.append(f"- {reason}")
+    return lines
+
+def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
+    if not isinstance(signal, dict):
+        return False
+    code = normalize_stock_code(signal.get("code", ""))
+    signal["name"] = _resolve_stock_name(code, signal.get("name", ""), cur=signal)
+    issues = []
+    if _looks_like_placeholder_stock_name(code, signal.get("name", "")):
+        issues.append("종목명 복구 실패")
+    expected_entry = _derive_fallback_expected_entry_price(signal)
+    if expected_entry > 0:
+        signal.setdefault("planned_entry_price", expected_entry)
+        if safe_int(signal.get("entry_price", 0), 0) <= 0:
+            signal["entry_price"] = expected_entry
+    else:
+        issues.append("예상 체결가 미산출")
+    if issues:
+        try:
+            _send_code_change_request_alert(f"actionability:{code}:{source_label}", _build_actionability_issue_lines(signal, issues), cooldown_min=60)
+        except Exception as e:
+            _swallow_exception(e)
+        return False
+    return True
+
 def send_mid_pullback_alert(s: dict):
+    if not _ensure_signal_actionability(s, source_label="눌림목"):
+        return
     stock_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = stock_name
     entry_price = safe_int(s.get("entry_price", 0), 0)
@@ -11626,6 +11832,10 @@ def get_stock_price(code: str) -> dict:
     }
     try:
         _record_execution_snapshot(code, payload, market="KRX")
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        _remember_public_stock_meta(code, payload.get("name", ""), payload.get("bstp_name", ""))
     except Exception as e:
         _swallow_exception(e)
     return payload
@@ -12412,6 +12622,10 @@ def get_nxt_stock_price(code: str) -> dict:
     }
     try:
         _record_execution_snapshot(code, payload, market="NXT")
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        _remember_public_stock_meta(code, payload.get("name", ""), payload.get("bstp_name", ""))
     except Exception as e:
         _swallow_exception(e)
     return payload
@@ -14411,42 +14625,44 @@ def get_theme_sector_stocks(code: str) -> tuple:
     종목 코드 → (테마명, [(peer_code, peer_name)]) 반환
     우선순위:
       1. 하드코딩 THEME_MAP
-      2. 동적 테마맵 (가격상관관계 + 뉴스 공동언급으로 자동 생성)
-      3. KIS 업종코드 매칭
-    각 소스를 병합해서 가장 풍부한 정보 제공
+      2. 동적 테마맵
+      3. KIS 업종코드 / 공용 업종 fallback
     """
-    peers_all = {}   # code → (name, source, reason)
-    # 1. THEME_MAP
+    peers_all = {}
     theme_name = "기타업종"
     for tk, ti in THEME_MAP.items():
-        if code in [c for c,_ in ti["stocks"]]:
+        if code in [c for c, _ in ti["stocks"]]:
             theme_name = tk
             for c, n in ti["stocks"]:
                 if c != code:
                     peers_all[c] = (n, "테마", tk)
             break
-    # 2. 동적 테마맵
-    dyn_reason = ""
     for tk, ti in _dynamic_theme_map.items():
-        if code in [c for c,_ in ti["stocks"]]:
+        if code in [c for c, _ in ti["stocks"]]:
             if theme_name == "기타업종":
-                theme_name = ti["desc"]
-            dyn_reason = ti.get("reason", "")
+                theme_name = ti.get("desc", tk)
             for c, n in ti["stocks"]:
                 if c != code and c not in peers_all:
-                    peers_all[c] = (n, "동적테마", ti["desc"])
+                    peers_all[c] = (n, "동적테마", ti.get("desc", tk))
             break
-    # 3. KIS 업종코드 매칭 (나머지 채우기용)
     base_ctx = _load_sector_stock_base_context(code) if code else {}
     kis_sector_name = str((base_ctx or {}).get("bstp_name", "") or "").strip()
+    public_meta = _get_public_stock_meta(code)
+    public_sector = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
     if theme_name == "기타업종" and kis_sector_name not in ("", "동일업종", "업종미상", "미분류", "unknown"):
         theme_name = kis_sector_name
+    if _is_generic_sector_theme(theme_name) and public_sector not in ("", "기타업종", "기타"):
+        theme_name = public_sector
     kis_peers = get_sector_stocks_from_kis(code)
     for c, n in kis_peers:
         if c not in peers_all:
-            peers_all[c] = (n, "업종코드", kis_sector_name)
-    peers = [(c, n) for c, (n, src, rsn) in peers_all.items()]
-    return theme_name, peers, peers_all   # peers_all은 소스 정보 포함
+            peers_all[c] = (n, "업종코드", kis_sector_name or theme_name)
+    if public_sector not in ("", "기타업종", "기타"):
+        for c, n in _collect_public_sector_peers(code, public_sector):
+            if c not in peers_all:
+                peers_all[c] = (n, "공용업종", public_sector)
+    peers = [(c, n) for c, (n, _src, _rsn) in peers_all.items()]
+    return theme_name, peers, peers_all
 # ════════════════════════════════════════════════════════════
 # 🌍 J: 해외 선물→섹터 연동 (v39.0)
 # ════════════════════════════════════════════════════════════
@@ -18999,6 +19215,90 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
         "entry_execution_focus": bool(s.get("entry_execution_focus")),
         "entry_watch_state": "active",
     }
+def _load_entry_termination_state() -> dict:
+    state = _read_json_safe(ENTRY_TERMINATION_STATE_FILE, {}) or {}
+    return state if isinstance(state, dict) else {}
+
+def _save_entry_termination_state(state: dict) -> None:
+    _write_json_atomic(ENTRY_TERMINATION_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
+
+def _entry_signal_rank(signal_type: str) -> int:
+    sig = str(signal_type or "").upper()
+    ranks = {"MID_PULLBACK": 1, "ENTRY_POINT": 1, "EARLY_DETECT": 2, "SURGE": 3, "NEAR_UPPER": 4, "UPPER_LIMIT": 5, "STRONG_BUY": 5}
+    return int(ranks.get(sig, 0))
+
+def _entry_grade_rank(grade: str) -> int:
+    return {"C": 1, "B": 2, "A": 3}.get(str(grade or "").upper(), 0)
+
+def _mark_entry_termination_state(code: str, reason: str, signal_type: str = "", grade: str = "", score: int = 0) -> None:
+    code = normalize_stock_code(code)
+    if not code:
+        return
+    state = _load_entry_termination_state()
+    state[code] = {
+        "ts": time.time(),
+        "reason": str(reason or ""),
+        "signal_type": str(signal_type or ""),
+        "grade": str(grade or ""),
+        "score": int(score or 0),
+    }
+    _entry_termination_state_runtime[code] = dict(state[code])
+    _save_entry_termination_state(state)
+
+def _get_entry_termination_state(code: str) -> dict:
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    row = dict((_entry_termination_state_runtime or {}).get(code) or {})
+    if row:
+        return row
+    state = _load_entry_termination_state()
+    row = dict((state or {}).get(code) or {})
+    if row:
+        _entry_termination_state_runtime[code] = dict(row)
+    return row
+
+def _should_skip_entry_termination_notice(watch: dict, reason: str) -> bool:
+    code = normalize_stock_code((watch or {}).get("code", ""))
+    if not code:
+        return False
+    row = _get_entry_termination_state(code)
+    last_ts = float(row.get("notice_ts", 0.0) or 0.0)
+    if time.time() - last_ts < ENTRY_TERMINATION_ALERT_COOLDOWN_SEC and str(row.get("notice_reason", "")) == str(reason or ""):
+        return True
+    return False
+
+def _mark_entry_termination_notice(code: str, reason: str) -> None:
+    code = normalize_stock_code(code)
+    if not code:
+        return
+    state = _load_entry_termination_state()
+    row = dict((state or {}).get(code) or {})
+    row["notice_ts"] = time.time()
+    row["notice_reason"] = str(reason or "")
+    state[code] = row
+    _entry_termination_state_runtime[code] = dict(row)
+    _save_entry_termination_state(state)
+
+def _should_skip_terminated_rearm(signal: dict) -> bool:
+    sig = dict(signal or {})
+    code = normalize_stock_code(sig.get("code", ""))
+    if not code:
+        return False
+    row = _get_entry_termination_state(code)
+    if not row:
+        return False
+    if time.time() - float(row.get("ts", 0.0) or 0.0) >= ENTRY_TERMINATION_REARM_COOLDOWN_SEC:
+        return False
+    prev_sig_rank = _entry_signal_rank(row.get("signal_type", ""))
+    new_sig_rank = _entry_signal_rank(sig.get("signal_type", ""))
+    prev_grade_rank = _entry_grade_rank(row.get("grade", ""))
+    new_grade_rank = _entry_grade_rank(sig.get("execution_grade") or sig.get("grade") or "")
+    prev_score = int(row.get("score", 0) or 0)
+    new_score = safe_int(sig.get("score", 0), 0)
+    meaningful_upgrade = new_sig_rank > prev_sig_rank or new_grade_rank > prev_grade_rank or new_score >= prev_score + 8
+    return not meaningful_upgrade
+
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry:
@@ -19007,6 +19307,9 @@ def register_entry_watch(s: dict):
         _register_execution_setup_watch(s)
         return
     code = normalize_stock_code(s["code"])
+    if _should_skip_terminated_rearm(s):
+        _log_info_msg(f"  ⏭ 감시종료 재등록 쿨다운: {_resolve_stock_name(code, s.get('name',''))}")
+        return
     stock_name = _resolve_stock_name(code, s.get("name", ""))
     if is_scoring_only_instrument(code, stock_name):
         return
@@ -19116,6 +19419,7 @@ def _record_entry_dropped(watch: dict, reason: str, current_price: int):
             break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+        _mark_entry_termination_state(watch.get("code", ""), reason, watch.get("signal_type", ""), watch.get("execution_grade") or watch.get("grade") or "", watch.get("score", 0))
         _log_info_msg(f"  🗑 근거약화 탈락 기록: {watch.get('name','')} {reason} @ {int(current_price or 0):,}")
     except Exception as e:
         _log_warn_msg(f"⚠️ 근거약화 탈락 기록 오류: {e}")
@@ -19181,6 +19485,8 @@ def _notify_entry_watch_terminated(watch: dict, reason: str, current_price: int 
         notice_key = f"{str(watch.get('signal_log_key') or '')}|{str(reason or '')}"
         if watch.get("termination_notice_key") == notice_key:
             return False
+        if _should_skip_entry_termination_notice(watch, reason):
+            return False
         label, default_detail = _entry_watch_termination_summary(reason)
         code = normalize_stock_code(watch.get("code"))
         if not code:
@@ -19220,6 +19526,7 @@ def _notify_entry_watch_terminated(watch: dict, reason: str, current_price: int 
         watch["termination_notice_key"] = notice_key
         watch["termination_notice_reason"] = str(reason or "")
         watch["termination_notice_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _mark_entry_termination_notice(code, reason)
         return True
     except Exception as e:
         _swallow_exception(e)
@@ -21259,6 +21566,8 @@ def _build_send_alert_compact_text(signal: dict, visuals: dict) -> str:
     return f"{visuals['lvl_icon']}{visuals['emoji']} {visuals['name_dot']}<b>{signal['name']}</b>  {signal['change_rate']:+.1f}%  {signal['score']}점 ({_signal_total_score_label(signal['score'])}){visuals['nxt_badge']}\n현재가 {price:,}원"
 def send_alert(signal: dict):
     global _last_external_alert_ts
+    if not _ensure_signal_actionability(signal, source_label="일반 포착"):
+        return
     signal["name"] = _resolve_stock_name(signal.get("code", ""), signal.get("name", ""))
     _last_external_alert_ts = time.time()
     if _should_throttle_send_alert_signal(signal):
@@ -23832,7 +24141,7 @@ def _persist_general_capture_without_external(s: dict, hist_key: str, source_lab
         },
     )
     _log_info_msg(f"  ⏭ {s['name']}{' 🟡NXT' if str(s.get('market') or '') == 'NXT' else ''} {s.get('change_rate',0):+.1f}% [{s.get('signal_type','')}] {s.get('score',0)}점 [{grade_upper}] — 외부알림 지연/내부감시 유지 ({delay_reason})")
-    return True
+    return False
 def _should_keep_internal_watch_on_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     entry_price = safe_int(signal.get("entry_price", 0), 0)
@@ -24177,6 +24486,7 @@ def _hydrate_alert_sector_theme(alert: dict, *, force_lookup: bool = False) -> s
         if not isinstance(alert, dict):
             return "기타"
         sector_info = alert.get("sector_info") if isinstance(alert.get("sector_info"), dict) else {}
+        public_meta = _get_public_stock_meta(alert.get("code", "")) if alert.get("code") else {}
         for candidate in (
             alert.get("sector_theme"),
             sector_info.get("theme"),
@@ -24184,17 +24494,20 @@ def _hydrate_alert_sector_theme(alert: dict, *, force_lookup: bool = False) -> s
             sector_info.get("bstp_name"),
             alert.get("adaptive_feedback_theme"),
             alert.get("theme_desc"),
+            (public_meta or {}).get("sector", ""),
         ):
-            sec = str(candidate or "").strip()
+            sec = _normalize_public_sector_name(candidate)
             if sec and not _is_generic_sector_theme(sec):
                 sector_info["theme"] = sec
+                if (public_meta or {}).get("sector"):
+                    sector_info["public_sector"] = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
                 alert["sector_info"] = sector_info
                 alert["sector_theme"] = sec
                 return sec
         code = normalize_stock_code(alert.get("code", ""))
         if code and force_lookup:
             theme_name, _, _ = get_theme_sector_stocks(code)
-            theme_name = str(theme_name or "").strip()
+            theme_name = _normalize_public_sector_name(theme_name)
             if theme_name and not _is_generic_sector_theme(theme_name):
                 sector_info["theme"] = theme_name
                 alert["sector_info"] = sector_info
@@ -31098,6 +31411,69 @@ def _build_fallback_scan_score(item: dict, signal_type: str = "") -> int:
         base += 2
     return max(0, min(99, base))
 
+def _build_run_scan_missing_reasons(item: dict) -> list[str]:
+    reasons = []
+    if not str(item.get("name") or "").strip():
+        reasons.append("missing_name")
+    if safe_int(item.get("price", 0), 0) <= 0:
+        reasons.append("missing_price")
+    if not str(item.get("signal_type") or "").strip():
+        reasons.append("missing_signal_type")
+    if safe_int(item.get("score", 0), 0) <= 0:
+        reasons.append("missing_score")
+    sector_theme = str(item.get("sector_theme") or (item.get("sector_info") or {}).get("theme") or "")
+    if _is_generic_sector_theme(sector_theme):
+        reasons.append("missing_sector")
+    return reasons
+
+def _queue_run_scan_repair(item: dict, stage: str = "") -> None:
+    code = _normalize_scan_signal_code(item)
+    if not code:
+        return
+    row = dict(_run_scan_repair_queue.get(code) or {})
+    row["payload"] = dict(item)
+    row["stage"] = str(stage or row.get("stage", ""))
+    row["attempts"] = int(row.get("attempts", 0) or 0)
+    row["next_ts"] = min(float(row.get("next_ts", time.time()) or time.time()), time.time() + RUN_SCAN_REPAIR_RETRY_SEC)
+    _run_scan_repair_queue[code] = row
+
+
+def _emit_run_scan_code_change_request(item: dict) -> None:
+    code = _normalize_scan_signal_code(item)
+    if not code:
+        return
+    reasons = list(item.get("_scan_payload_missing_reasons") or [])
+    lines = [f"종목: {str(item.get('name', '') or code)} ({code})", f"market: {str(item.get('market','') or '')}"]
+    for r in reasons:
+        lines.append(f"- {r}")
+    _send_code_change_request_alert(f"run_scan_payload:{code}", lines, cooldown_min=120)
+
+
+def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
+    now = time.time()
+    remove_codes = []
+    for code, row in list(_run_scan_repair_queue.items()):
+        if now < float(row.get("next_ts", 0.0) or 0.0):
+            continue
+        item = dict(row.get("payload") or {})
+        item["code"] = code
+        repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
+        if bool(repaired.get("_scan_payload_incomplete")):
+            attempts = int(row.get("attempts", 0) or 0) + 1
+            if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
+                _emit_run_scan_code_change_request(repaired)
+                remove_codes.append(code)
+            else:
+                row["payload"] = dict(repaired)
+                row["attempts"] = attempts
+                row["next_ts"] = now + RUN_SCAN_REPAIR_RETRY_SEC
+                _run_scan_repair_queue[code] = row
+            continue
+        remove_codes.append(code)
+        _append_scan_alert(alerts, seen, repaired, hist_key=code, seen_code=code)
+    for code in remove_codes:
+        _run_scan_repair_queue.pop(code, None)
+
 def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | None = None) -> dict:
     item = dict(payload or {})
     code = _normalize_scan_signal_code(item, fallback_code=fallback_code)
@@ -31139,17 +31515,26 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
                 merged["reasons"] = uniq
             item = merged
     if not str(item.get("name") or "").strip():
-        item["name"] = _resolve_stock_name(code, item.get("name", ""))
-    if safe_int(item.get("price", 0), 0) <= 0 and safe_int(item.get("entry_price", 0), 0) > 0:
-        item["price"] = safe_int(item.get("entry_price", 0), 0)
+        item["name"] = _resolve_stock_name(code, item.get("name", ""), cur=item)
+    if safe_int(item.get("price", 0), 0) <= 0:
+        for key in ("ask_price", "bid_price", "entry_price", "planned_entry_price", "execution_hint_entry_price", "open", "prev_close"):
+            val = safe_int(item.get(key, 0), 0)
+            if val > 0:
+                item["price"] = val
+                break
     bstp_name = str(item.get("bstp_name") or (item.get("sector_info") or {}).get("bstp_name") or "").strip()
-    if bstp_name and not _is_generic_sector_theme(bstp_name):
+    public_meta = _get_public_stock_meta(code)
+    public_sector = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
+    if (bstp_name and not _is_generic_sector_theme(bstp_name)) or public_sector not in ("", "기타업종", "기타"):
         sector_info = item.get("sector_info") if isinstance(item.get("sector_info"), dict) else {}
-        sector_info["theme"] = str(sector_info.get("theme") or bstp_name) if _is_generic_sector_theme(str(sector_info.get("theme") or "")) else str(sector_info.get("theme") or "")
-        sector_info["bstp_name"] = bstp_name
+        resolved_sector = bstp_name if bstp_name and not _is_generic_sector_theme(bstp_name) else public_sector
+        sector_info["theme"] = str(sector_info.get("theme") or resolved_sector) if _is_generic_sector_theme(str(sector_info.get("theme") or "")) else str(sector_info.get("theme") or "")
+        sector_info["bstp_name"] = bstp_name or resolved_sector
+        if public_sector not in ("", "기타업종", "기타"):
+            sector_info["public_sector"] = public_sector
         item["sector_info"] = sector_info
         if _is_generic_sector_theme(str(item.get("sector_theme") or "")):
-            item["sector_theme"] = sector_info.get("theme", bstp_name)
+            item["sector_theme"] = sector_info.get("theme", resolved_sector)
     signal_type = _build_fallback_scan_signal_type(item)
     if signal_type and str(item.get("signal_type") or "").strip().upper() in ("", "UNKNOWN"):
         item["signal_type"] = signal_type
@@ -31160,15 +31545,12 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
         grade = "A" if score >= 80 else "B" if score >= 60 else "C"
         item["grade"] = grade
         item["execution_grade"] = grade
-    incomplete = (
-        not str(item.get("signal_type") or "").strip()
-        or safe_int(item.get("score", 0), 0) <= 0
-        or safe_int(item.get("price", 0), 0) <= 0
-        or not str(item.get("name") or "").strip()
-    )
+    missing_reasons = _build_run_scan_missing_reasons(item)
+    incomplete = bool(missing_reasons)
     item["_scan_payload_incomplete"] = bool(incomplete)
+    item["_scan_payload_missing_reasons"] = list(missing_reasons)
     if incomplete:
-        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 일반 포착 제외")
+        item.setdefault("reasons", []).append("⚠️ 시세/신호 결측 — 일반 포착 재복구 대기")
     return item
 
 def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code: str | None = None) -> dict:
@@ -31213,7 +31595,8 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
         if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
-            _log_warn_msg(f"⚠️ run_scan 결측 payload 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code}")
+            _queue_run_scan_repair(item, stage=stage)
+            _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(item.get('_scan_payload_missing_reasons', []))}")
             continue
         cleaned.append(item)
     if dropped > 0:
@@ -31230,7 +31613,8 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         return
     result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
     if bool(result.get("_scan_payload_incomplete")):
-        _log_warn_msg(f"⚠️ run_scan alert 결측 스킵: {result.get('name', result_code) or result_code}")
+        _queue_run_scan_repair(result, stage="append")
+        _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
         return
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
     if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
@@ -31569,6 +31953,7 @@ def run_scan():
     try:
         _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
+        _drain_run_scan_repair_queue(alerts, seen)
         _scan_overnight_watchlist_candidates(alerts, seen, ctx["krx_open"])
         _scan_scenario_action_board_candidates(alerts, seen, ctx["krx_open"])
         _scan_issue_prewatch_candidates(alerts, seen)
