@@ -3,10 +3,41 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.2
+버전: v161.3
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.3 (2026-04-03): 로그 분석 10개 문제 일괄 수정
+  [#1] _dispatch_scan_alerts Lock — 스캔 동시 실행 중복 알람 제거
+  이유: catch-up·정규 스캔 동시 실행 시 같은 종목 2회 dispatch
+  개선점: _dispatch_scan_lock acquire 실패 시 즉시 반환
+  [#2] 진입가 미확정 해제 — entry_price=0이면 현재가로 대체 후 발송
+  이유: CS(+30%), 후성(+28%), 신성이엔지(+25%) 등 강한 종목 알람 전혀 안 감
+  개선점: price로 entry_price 대체, 알람 메시지에 현재가 기준 표시
+  [#3] run_mid_pullback_scan Lock — 눌림목 중복 알람 제거
+  이유: 삼성E&A·대명에너지 눌림목 2회씩 발송
+  개선점: _mid_pullback_scan_lock acquire 실패 시 즉시 반환
+  [#4] 코드수정 요청 알람 차단 — analyze 정상 차단 종목 발송 안 함
+  이유: 미래에셋증권·펄어비스 등 analyze 내부 필터 차단 종목이 사용자 텔레그램 노이즈 발송
+  개선점: missing_signal_type 종목은 조용히 폐기
+  [#5] 섹터 분류 오류 — public_meta sector 우선 적용
+  이유: LIG넥스원·SK오션플랜트 등이 금속으로 오분류되어 섹터 제한 탈락
+  개선점: _hydrate_alert_sector_theme에서 public_sector를 bstp_name보다 우선
+  [#6] run_material_first_scan Lock — 뉴스테마 중복 처리 제거
+  이유: 같은 종목 뉴스테마 A급 미달 로그 2회씩 출력
+  개선점: _material_first_scan_lock acquire 실패 시 즉시 반환
+  [#7] 재포착 억제 — 동일 점수·등락률이면 쿨다운 내 재발송 억제
+  이유: GS글로벌 18:00, 19:04 동일 내용 재알람
+  개선점: _finalize_general_alert_dispatch에서 직전 알람과 비교 후 동일하면 스킵
+  [#8] 종목명 소실 복구 — _coerce_run_scan_signal_defaults name 재시도
+  이유: 캐시 만료 후 001250 같이 코드로 노출
+  개선점: name 없을 때 _resolve_stock_name 재시도
+  [#9] 진입불가 중복 경고 — 종목별 30초 쿨다운
+  이유: 나우로보틱스·한국철강 진입불가 경고 5초 간격 2회씩
+  개선점: _entry_blocked_log_cooldown dict로 중복 로그 억제
+  [#10] 미국시장 API 경고 — 이미 _warn_throttled_once로 처리됨 (추가 수정 불필요 확인)
+  이유: 30분 쿨다운 already 적용 중
+  주의점: #1/#3/#6 Lock은 blocking=False, 스캔 자체를 막지 않음
 - v161.2 (2026-04-03): KIS 500+EGW00123 토큰만료 자동 복구
   [#1] _safe_get에서 500 응답 body에 EGW00123 포함 시 토큰 초기화 후 재시도 추가
   이유: KIS가 토큰만료를 403이 아닌 500으로 내려보내는 경우 토큰 재발급 없이 경고 로그만 찍고 이후 모든 API 호출이 연쇄 실패
@@ -1678,6 +1709,10 @@ _state_lock = threading.Lock()   # _detected_stocks/_alert_history 등 공유 di
 _cache_lock = threading.Lock()   # 캐시 dict 일괄 관리
 _kis_rate_lock = threading.Lock()  # KIS REST 전역 호출 burst 제어
 _repair_drain_lock = threading.Lock()  # v161.1: repair queue 동시 드레인 방지
+_dispatch_scan_lock = threading.Lock()  # v161.3: scan dispatch 동시 실행 방지
+_mid_pullback_scan_lock = threading.Lock()  # v161.3: 눌림목 스캔 동시 실행 방지
+_material_first_scan_lock = threading.Lock()  # v161.3: 뉴스테마 스캔 동시 실행 방지
+_entry_blocked_log_cooldown: dict = {}  # v161.3: 진입불가 로그 중복 억제 (code → last_ts)
 _kis_rest_call_times = deque()
 _kis_token_call_times = deque()
 _kis_rate_stats = {"rest_wait_events": 0, "rest_wait_sec": 0.0, "token_wait_events": 0, "token_wait_sec": 0.0}
@@ -11752,21 +11787,26 @@ def run_mid_pullback_scan():
     nxt_open = is_nxt_open()
     if (not krx_open and not nxt_open) or _bot_paused:
         return
-    _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...")
-    _ensure_dynamic_candidates_fresh()
-    signals = []
-    for code, name, theme_desc in get_all_scan_candidates():
-        name = _resolve_stock_name(code, name)
-        if not _passes_mid_pullback_cooldown_gate(code, name):
-            continue
-        result = _build_mid_pullback_scan_result(code, name, theme_desc)
-        if result:
-            signals.append(result)
-    if not signals:
-        _log_info_msg("  → 눌림목 조건 충족 종목 없음")
+    if not _mid_pullback_scan_lock.acquire(blocking=False):
         return
-    for signal in _prepare_mid_pullback_signals(signals):
-        _dispatch_mid_pullback_signal(signal)
+    try:
+        _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...")
+        _ensure_dynamic_candidates_fresh()
+        signals = []
+        for code, name, theme_desc in get_all_scan_candidates():
+            name = _resolve_stock_name(code, name)
+            if not _passes_mid_pullback_cooldown_gate(code, name):
+                continue
+            result = _build_mid_pullback_scan_result(code, name, theme_desc)
+            if result:
+                signals.append(result)
+        if not signals:
+            _log_info_msg("  → 눌림목 조건 충족 종목 없음")
+            return
+        for signal in _prepare_mid_pullback_signals(signals):
+            _dispatch_mid_pullback_signal(signal)
+    finally:
+        _mid_pullback_scan_lock.release()
 def _derive_fallback_expected_entry_price(signal: dict) -> int:
     s = dict(signal or {})
     for key in ("entry_price", "planned_entry_price", "execution_hint_entry_price"):
@@ -19396,7 +19436,13 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
                 break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        _log_warn_msg(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
+        # v161.3 #9: 종목별 30초 쿨다운으로 중복 경고 억제
+        blocked_code = str(watch.get("code") or "")
+        _cooldown_key = f"{blocked_code}_{reason}"
+        _now_ts = time.time()
+        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= 30:
+            _entry_blocked_log_cooldown[_cooldown_key] = _now_ts
+            _log_warn_msg(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
     except Exception as e:
         _log_warn_msg(f"⚠️ 진입불가 기록 오류: {e}")
 def _record_entry_policy_filtered(watch: dict, reason: str, filtered_price: int):
@@ -24152,7 +24198,12 @@ def _should_delay_external_general_capture(signal: dict) -> str:
     if bool(signal.get("execution_setup_required")):
         return "체결확인 전 외부알림 지연"
     if entry_price <= 0:
-        return "진입가 미확정 외부알림 지연"
+        price = safe_int(signal.get("price", 0), 0)
+        if price > 0:
+            signal["entry_price"] = price
+            signal.setdefault("reasons", []).append("⚠️ 진입가 미산출 — 현재가 기준 발송")
+        else:
+            return "진입가 미확정 외부알림 지연"
     return ""
 def _persist_general_capture_without_external(s: dict, hist_key: str, source_label: str, delay_reason: str) -> bool:
     code = normalize_stock_code(s.get("code"))
@@ -24468,9 +24519,21 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     code = s.get("code", "")
     signal_type = s.get("signal_type", "")
     grade_upper = str(ctx.get("grade_upper") or s.get("execution_grade") or s.get("grade") or "C").upper()
+    # v161.3 #7: 쿨다운 내 동일 score·change_rate면 재발송 억제
+    hist_key = ctx.get("hist_key", code)
+    prev = _alert_history.get(hist_key)
+    if isinstance(prev, dict):
+        if (prev.get("score") == safe_int(s.get("score", 0), 0)
+                and abs(prev.get("change_rate", 0) - safe_float(s.get("change_rate", 0), 0.0)) < 0.1):
+            _log_info_msg(f"  ⏭ {name} — 동일 신호 재발송 억제 (score={prev.get('score')} change_rate={prev.get('change_rate'):+.1f}%)")
+            return False
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     send_alert(s)
-    _alert_history[ctx["hist_key"]] = time.time()
+    _alert_history[ctx["hist_key"]] = {
+        "ts": time.time(),
+        "score": safe_int(s.get("score", 0), 0),
+        "change_rate": safe_float(s.get("change_rate", 0), 0.0),
+    }
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
@@ -24523,20 +24586,21 @@ def _hydrate_alert_sector_theme(alert: dict, *, force_lookup: bool = False) -> s
             return "기타"
         sector_info = alert.get("sector_info") if isinstance(alert.get("sector_info"), dict) else {}
         public_meta = _get_public_stock_meta(alert.get("code", "")) if alert.get("code") else {}
+        public_sector = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
         for candidate in (
             alert.get("sector_theme"),
             sector_info.get("theme"),
+            public_sector,  # v161.3: public_meta sector를 bstp_name보다 우선 적용 (#5 섹터 오분류 수정)
             alert.get("bstp_name"),
             sector_info.get("bstp_name"),
             alert.get("adaptive_feedback_theme"),
             alert.get("theme_desc"),
-            (public_meta or {}).get("sector", ""),
         ):
             sec = _normalize_public_sector_name(candidate)
             if sec and not _is_generic_sector_theme(sec):
                 sector_info["theme"] = sec
-                if (public_meta or {}).get("sector"):
-                    sector_info["public_sector"] = _normalize_public_sector_name((public_meta or {}).get("sector", ""))
+                if public_sector:
+                    sector_info["public_sector"] = public_sector
                 alert["sector_info"] = sector_info
                 alert["sector_theme"] = sec
                 return sec
@@ -26992,8 +27056,10 @@ def run_material_first_scan() -> None:
     now_ts = time.time()
     if not live_market and now_ts - float(_material_first_state.get("last_offhours_ts", 0) or 0) < MATERIAL_FIRST_OFFHOURS_MIN_SEC:
         return
-    _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 재료-first 스캔{' [실시간]' if live_market else ' [장외/장전]'}...")
+    if not _material_first_scan_lock.acquire(blocking=False):
+        return
     try:
+        _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 재료-first 스캔{' [실시간]' if live_market else ' [장외/장전]'}...")
         collect_market_scenarios_24h(force=not live_market)
         headlines = _get_material_signal_headlines(force=not live_market)
         if not headlines:
@@ -27014,6 +27080,8 @@ def run_material_first_scan() -> None:
                 _log_info_msg(f"  👁 장외 재료-first prewatch seed 등록: {added}개")
     except Exception as e:
         _log_warn_msg(f"⚠️ 재료-first 스캔 오류: {e}")
+    finally:
+        _material_first_scan_lock.release()
 
 
 def analyze_news_theme(headlines: list = None) -> list:
@@ -31480,6 +31548,11 @@ def _emit_run_scan_code_change_request(item: dict) -> None:
     if is_scoring_only_instrument(code, str(item.get("name") or "")):
         return
     reasons = list(item.get("_scan_payload_missing_reasons") or [])
+    # missing_signal_type 단독이면 analyze() 정상 차단 — 사용자 알람 불필요
+    if reasons == ["missing_signal_type"] or (len(reasons) == 1 and "missing_signal_type" in reasons):
+        _log_info_msg(f"  ⏭ run_scan 결측(signal_type) 조용히 폐기: {item.get('name', code) or code}")
+        return
+    reasons = list(item.get("_scan_payload_missing_reasons") or [])
     lines = [f"종목: {str(item.get('name', '') or code)} ({code})", f"market: {str(item.get('market','') or '')}"]
     for r in reasons:
         lines.append(f"- {r}")
@@ -31600,6 +31673,11 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
     code = _normalize_scan_signal_code(item, fallback_code=fallback_code)
     if code:
         item["code"] = code
+    # v161.3 #8: name이 비어있거나 코드와 동일하면 재시도
+    if code and (not str(item.get("name") or "").strip() or str(item.get("name") or "").strip() == code):
+        resolved = _resolve_stock_name(code, "")
+        if resolved and resolved != code:
+            item["name"] = resolved
     item["change_rate"] = safe_float(item.get("change_rate", 0.0), 0.0)
     item["volume_ratio"] = safe_float(item.get("volume_ratio", 0.0), 0.0)
     item["score"] = safe_int(item.get("score", 0), 0)
@@ -31659,7 +31737,9 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
         return
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
-    if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
+    prev_hist = _alert_history.get(resolved_hist_key, 0)
+    prev_ts = prev_hist.get("ts", 0) if isinstance(prev_hist, dict) else float(prev_hist or 0)
+    if time.time() - prev_ts <= get_regime_cooldown():
         return
     alerts.append(result)
     seen.add(normalized_seen_code or result_code)
@@ -31966,14 +32046,19 @@ def _dispatch_scan_alerts(alerts: list) -> None:
     if not alerts:
         _log_info_msg("  → 조건 충족 없음")
         return
-    _log_info_msg(f"  → {len(alerts)}개 감지! [{regime_label()}]")
-    for s in alerts:
-        if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
-            _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
-            continue
-        is_nxt = s.get("market") == "NXT"
-        hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
-        _dispatch_general_alert_signal(s, hist_key=hist_key, source_label="일반 포착")
+    if not _dispatch_scan_lock.acquire(blocking=False):
+        return
+    try:
+        _log_info_msg(f"  → {len(alerts)}개 감지! [{regime_label()}]")
+        for s in alerts:
+            if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
+                _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
+                continue
+            is_nxt = s.get("market") == "NXT"
+            hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
+            _dispatch_general_alert_signal(s, hist_key=hist_key, source_label="일반 포착")
+    finally:
+        _dispatch_scan_lock.release()
 def _run_scan_followup_hooks() -> None:
     check_execution_setup_watch()
     _tick_exec_speed_prewarm()
