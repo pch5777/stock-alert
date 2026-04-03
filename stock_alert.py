@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.21
+버전: v160.22
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.22 (2026-04-03): analyze 전면 우회 — `v160.21` 기준에서 `analyze()`의 신호품질/시장문맥/진입필터 전 과정을 타지 않고, 등락률·거래량·현재가 기반의 최소 결과를 즉시 생성하도록 바꿨다. 즉 상승률 후보를 본 뒤 `analyze()` 안 차단으로 빠지던 경로를 전면 비활성화하고 바로 `signal_type/score/grade/entry_price`를 채워 후단으로 넘긴다.
 - v160.20 (2026-04-03): run_scan 섹터 게이트 비활성화 — `v160.19` 기준에서 `_apply_scan_sector_gate()`를 후보 통과 함수로 바꿔 섹터별 제한/`기타` 버킷 제한으로 포착이 잘리는 경로를 끄고, 이름 복구만 수행한 뒤 후보를 그대로 다음 단계로 넘기도록 조정했다.
 - v160.19 (2026-04-03): run_scan 결측 차단 전면 비활성화 — `v160.17` 기준에서 `_scan_payload_incomplete`는 기록용 메타로만 남기고 후보 차단/재복구 큐/대기 스킵으로 이어지지 않게 전역 비활성화했다. 즉 `_sanitize_run_scan_alerts()`와 `_append_scan_alert()`, 재복구 큐 drain 경로에서 결측 후보도 그대로 통과시키도록 바꿨다.
 - v160.17 (2026-04-03): 감시종료 재등록 쿨다운 + run_scan 재복구 큐 실반영 + 공용 종목명/업종 fallback 보강 — 근거약화로 감시 종료된 종목은 일정 시간 재등록과 종료 알림을 억제해 같은 종목의 감시종료 반복 알림을 줄인다. `run_scan` 결측 후보는 즉시 폐기하지 않고 결측 사유별 재복구 큐로 넘겨 다음 사이클에서 다시 복구를 시도하며, 반복 실패한 종목만 코드수정 요청 알림으로 승격한다. 또한 종목명은 공용 공개 메타와 다중 public fallback으로 끝까지 복구하고, 업종/섹터도 공용 업종 fallback을 사용해 `기타` 섹터 잔류를 줄인다.
@@ -22904,18 +22905,48 @@ def _build_analyze_result(ctx: dict) -> dict:
         "crossday_episode_confirmed": bool(crossday_ctx.get("confirmed")), "crossday_episode_reason": str(crossday_ctx.get("reason", "") or ""),
         "crossday_episode_reclaim_ratio": float(crossday_ctx.get("reclaim_ratio", 0.0) or 0.0),
     }
+def _build_analyze_bypass_result(stock: dict) -> dict:
+    stock = dict(stock or {})
+    code = normalize_stock_code(stock.get("code", ""))
+    price = safe_int(stock.get("price", 0), 0)
+    if not code or price < MIN_TRADABLE_SIGNAL_PRICE:
+        return {}
+    name = _resolve_stock_name(code, stock.get("name", code)) or code
+    stock["code"] = code
+    stock["name"] = name
+    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+    vol_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
+    signal_type = "UPPER_LIMIT" if change_rate >= 29.0 else "NEAR_UPPER" if change_rate >= UPPER_LIMIT_THRESHOLD else "SURGE" if change_rate >= max(PRICE_SURGE_MIN, 3.0) else "EARLY_DETECT"
+    score = max(65, min(95, 65 + int(abs(change_rate) * 2.0) + int(max(0.0, vol_ratio) * 2.0)))
+    sector_info = calc_sector_momentum(code, name) or {}
+    entry = price
+    stop, target, stop_pct, target_pct, atr_used = calc_stop_target(code, entry, signal_type=signal_type)
+    reasons = ["🟢 analyze 전면 우회", f"📈 등락률 {change_rate:+.1f}%", f"📊 거래량 {vol_ratio:.1f}배"]
+    grade = _derive_general_signal_grade(signal_type, score, change_rate=change_rate, vol_ratio=vol_ratio, sector_info=sector_info, direct_news_hit=False, nxt_delta=0, market=str(stock.get("market", "") or ""), reasons=reasons)
+    position = calc_position_size(signal_type, score, grade)
+    return {
+        "code": code, "name": name, "price": price,
+        "change_rate": change_rate, "volume_ratio": vol_ratio, "signal_type": signal_type,
+        "score": score, "sector_info": sector_info, "sector_theme": sector_info.get("theme", ""),
+        "direct_news_hit": False, "emergent_theme_hit": False, "theme_drive_hit": False, "adaptive_feedback_hit": False,
+        "market_flow_hit": False, "market_flow_bonus": 0, "sector_leader_follow_hit": False, "sector_leader_follow_bonus": 0,
+        "material_scenario_hit": False, "material_scenario_bonus": 0, "adaptive_feedback_bonus": 0, "miss_theme_leader_hit": False,
+        "miss_theme_leader_bonus": 0, "nxt_post_leader_hit": False, "nxt_post_leader_bonus": 0, "theme_expansion_hit": False,
+        "theme_expansion_bonus": 0, "theme_breadth_ratio": 0.0,
+        "global_pattern_value_ratio": 0.0, "global_pattern_high_hold_ratio": 0.0, "global_pattern_orb_breakout": False,
+        "global_pattern_recent_high_breakout": False, "global_pattern_near_limit_lead": False,
+        "entry_price": entry, "stop_loss": stop, "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct, "atr_used": atr_used,
+        "prev_upper": False, "reasons": reasons, "detected_at": datetime.now(),
+        "nxt_delta": 0, "regime": "bypass", "us_regime": "neutral", "gap_signal": "flat",
+        "foreign_days": 0, "institution_days": 0, "short_ratio": 0.0, "earnings_risk": None, "position": position,
+        "indic": {}, "grade": grade, "news_analysis": {}, "news_articles": [], "similar_pattern_stats": {},
+        "dart_risk": False, "countertrend_warning": False, "countertrend_ctx": {},
+        "execution_setup_required": False, "entry_execution_focus": False,
+        "crossday_episode_active": False, "crossday_episode_prep": False, "crossday_episode_confirmed": False,
+        "crossday_episode_reason": "", "crossday_episode_reclaim_ratio": 0.0,
+    }
 def analyze(stock: dict) -> dict:
-    ctx = _bootstrap_analyze_context(stock)
-    if not ctx:
-        return {}
-    if not _apply_analyze_signal_quality(ctx):
-        return {}
-    _apply_analyze_theme_context(ctx)
-    if not _apply_analyze_market_context(ctx):
-        return {}
-    if not _apply_analyze_entry_and_filters(ctx):
-        return {}
-    return _build_analyze_result(ctx)
+    return _build_analyze_bypass_result(stock)
 # ============================================================
 # 조기 포착
 # ============================================================
