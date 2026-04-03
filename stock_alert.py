@@ -3,10 +3,11 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.23
+버전: v160.24
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v160.24 (2026-04-03): _append_scan_alert / pre_sector_gate 전면 우회 — `v160.23` 기준에서 `_append_scan_alert()` 내부의 code/결측/재알림 차단을 제거하고, run_scan의 `pre_sector_gate` 정리 단계도 통째로 우회했다. 즉 등락률 상승종목이 `analyze()`를 지난 뒤 `_append_scan_alert()`와 `pre_sector_gate`에서 다시 줄어드는 경로를 끄고 그대로 다음 단계로 넘긴다.
 - v160.23 (2026-04-03): pre_dispatch 정리 비활성화 — `v160.22` 기준에서 run_scan 최종 발송 직전의 `_sanitize_run_scan_alerts(stage="pre_dispatch")` 정리 단계를 끄고, pre_dispatch 직전 후보를 그대로 `_dispatch_scan_alerts()`로 넘기도록 바꿨다. 즉 발송 직전 마지막 정리 단계에서 후보가 줄어드는 경로를 제거했다.
 - v160.22 (2026-04-03): analyze 전면 우회 — `v160.21` 기준에서 `analyze()`의 신호품질/시장문맥/진입필터 전 과정을 타지 않고, 등락률·거래량·현재가 기반의 최소 결과를 즉시 생성하도록 바꿨다. 즉 상승률 후보를 본 뒤 `analyze()` 안 차단으로 빠지던 경로를 전면 비활성화하고 바로 `signal_type/score/grade/entry_price`를 채워 후단으로 넘긴다.
 - v160.20 (2026-04-03): run_scan 섹터 게이트 비활성화 — `v160.19` 기준에서 `_apply_scan_sector_gate()`를 후보 통과 함수로 바꿔 섹터별 제한/`기타` 버킷 제한으로 포착이 잘리는 경로를 끄고, 이름 복구만 수행한 뒤 후보를 그대로 다음 단계로 넘기도록 조정했다.
@@ -31571,23 +31572,16 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     return cleaned
 
 def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str | None = None, seen_code: str | None = None) -> None:
+    """v160.24: _append_scan_alert 전면 우회 — code/결측/재알림 차단 없이 후보를 그대로 누적한다."""
     if not isinstance(result, dict):
         return
     normalized_seen_code = normalize_stock_code(seen_code or "")
-    result_code = _normalize_scan_signal_code(result, fallback_code=normalized_seen_code)
-    if not result_code:
-        _log_warn_msg(f"⚠️ run_scan alert code 누락 스킵: {result.get('name', '') or result.get('signal_type', '') or 'unknown'}")
-        return
-    result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
-    if RUN_SCAN_INCOMPLETE_GATE_ENABLED and bool(result.get("_scan_payload_incomplete")):
-        _queue_run_scan_repair(result, stage="append")
-        _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
-        return
-    resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
-    if time.time() - _alert_history.get(resolved_hist_key, 0) <= get_regime_cooldown():
-        return
+    fallback_code = normalized_seen_code or _normalize_scan_signal_code(result)
+    result = _coerce_run_scan_signal_defaults(result, fallback_code=fallback_code)
     alerts.append(result)
-    seen.add(normalized_seen_code or result_code)
+    if fallback_code:
+        seen.add(fallback_code)
+
 def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool) -> None:
     try:
         if not (_overnight_watchlist and krx_open):
@@ -31920,7 +31914,7 @@ def run_scan():
         _scan_rank_and_theme_candidates(alerts, seen)
         _scan_sector_leader_follow_candidates(alerts, seen)
         _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
-        alerts = _sanitize_run_scan_alerts(alerts, stage="pre_sector_gate")
+        alerts = alerts or []  # v160.24: pre_sector_gate 정리 비활성화
         alerts = _apply_scan_sector_gate(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
         alerts = filter_portfolio_signals(alerts)
