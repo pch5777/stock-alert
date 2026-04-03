@@ -3,7 +3,7 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v160.20
+버전: v160.21
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -31250,77 +31250,9 @@ def _apply_position_limit_after_priority(sorted_alerts: list, carry_codes: set[s
     # v82: 동시보유 제한 완전 제거 — v62~v80 9회 수정에도 오카운트 반복, 실진입은 사용자 수동 결정이므로 봇 단계에서 차단 불필요.
     return sorted_alerts if sorted_alerts else []
 def filter_portfolio_signals(alerts: list) -> list:
-    """
-    동시 다발 신호에서 실질 섹터 스코어 기반 중복 제거.
-    - 두 신호 간 real_sector_score >= 50 이면 같은 실질섹터로 판단
-    - 점수 높은 것 1개만 통과 (나머지 제외)
-    - 국면별 총 신호 수 제한
-    - v53: 신규/기존 신호를 먼저 평가한 뒤 동시 보유 제한을 마지막 행동 단계에 적용
-    """
-    if not alerts:
-        return alerts
-    regime_info = get_market_regime()
-    regime    = regime_info.get("mode", "normal")
-    rp        = REGIME_PARAMS.get(regime, REGIME_PARAMS["normal"])
-    max_positions = rp.get("max_positions", 1)
-    max_total = {"bull": 8, "normal": 6, "bear": 3, "crash": 1}.get(regime, 6)
-    carry_count, carry_codes = _get_carry_position_context()
-    alerts = _apply_stale_pullback_quota(alerts, stage="filter_portfolio_signals")
-    # 신규 리더 우선 + stale 눌림목 후순위 정렬
-    sorted_alerts = sorted(
-        alerts,
-        key=lambda x: (
-            1 if x.get("leader_priority_hit") else 0,
-            0 if x.get("stale_pullback_hit") else 1,
-            0 if x.get("stale_replay_penalty_hit") else 1,
-            int(x.get("score", 0) or 0),
-            float(x.get("change_rate", 0) or 0),
-            float(x.get("volume_ratio", 0) or 0),
-        ),
-        reverse=True,
-    )
-    sorted_alerts = _apply_position_limit_after_priority(
-        sorted_alerts,
-        carry_codes=carry_codes,
-        carry_count=carry_count,
-        max_positions=max_positions,
-        stage="filter_portfolio_signals",
-    )
-    if not sorted_alerts:
-        return []
-    passed   = []
-    excluded = set()
-    for i, s in enumerate(sorted_alerts):
-        if len(passed) >= max_total:
-            break
-        if s["code"] in excluded:
-            continue
-        passed.append(s)
-        # 아직 통과 안 된 뒤 신호들과 실질 섹터 비교
-        for j in range(i + 1, len(sorted_alerts)):
-            peer = sorted_alerts[j]
-            if peer["code"] in excluded:
-                continue
-            try:
-                rs = calc_real_sector_score(s["code"], peer["code"],
-                                            s["name"], peer["name"])
-                if rs["score"] >= 50:
-                    # 같은 섹터 내 max_same_sector 개수까지는 허용
-                    same_sector_passed = sum(
-                        1 for p in passed
-                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
-                    )
-                    _max_same = _dynamic.get("max_same_sector", 2)
-                    if same_sector_passed >= _max_same:
-                        excluded.add(peer["code"])
-                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
-            except Exception as e:
-                _swallow_exception(e)
-    if len(passed) < len(sorted_alerts):
-        skipped = len(sorted_alerts) - len(passed)
-        _log_info_msg(f"  🗂️ 포트폴리오 필터: {skipped}개 제외 ({regime}장, 최대 {max_total}개)")
-    return passed
-# v37.0: schedule lambda → 명명 함수 (에러 추적 가능)
+    """v160.21: 포트폴리오 필터 비활성화 — 입력 후보를 그대로 통과시킨다."""
+    return alerts or []
+
 def _on_market_open():
     """장 시작 시 초기화 — schedule에서 호출"""
     if is_holiday(): return
