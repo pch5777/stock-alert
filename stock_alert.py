@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.1
+버전: v161.2
 날짜: 2026-04-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.2 (2026-04-03): KIS 500+EGW00123 토큰만료 자동 복구
+  [#1] _safe_get에서 500 응답 body에 EGW00123 포함 시 토큰 초기화 후 재시도 추가
+  이유: KIS가 토큰만료를 403이 아닌 500으로 내려보내는 경우 토큰 재발급 없이 경고 로그만 찍고 이후 모든 API 호출이 연쇄 실패
+  개선점: 500+EGW00123 감지 시 403과 동일하게 토큰 초기화·재발급 후 즉시 재시도
+  주의점: EGW00123 체크는 body 파싱 후에만 수행, 500이라도 토큰 무관 오류는 기존대로 처리
 - v161.1 (2026-04-03): repair queue 3종 버그 수정
   [#1] _queue_run_scan_repair: ETF/ETN(is_scoring_only_instrument) 큐 진입 차단
   이유: KODEX 200/인버스/레버리지 ETN 등이 missing_signal_type으로 큐에 반복 쌓임
@@ -5995,6 +6000,21 @@ def _safe_get(url: str, tr_id: str, params: dict, *, return_meta: bool = False):
                 last_status = getattr(resp, "status_code", None)
                 last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
                 last_url = getattr(resp, "url", url) or url
+            if last_status == 500:
+                try:
+                    body_500 = (getattr(resp, "text", "") or "")
+                    if "EGW00123" in body_500:
+                        _access_token = None
+                        _token_expires = 0
+                        _clear_kis_token_state()
+                        _log_warn_msg(f"⚠️ KIS 토큰만료(EGW00123) 감지 — 재발급 후 재시도")
+                        _wait_for_kis_rest_slot("rest")
+                        resp = _session.get(url, headers=_headers(tr_id), params=params, timeout=15)
+                        last_status = getattr(resp, "status_code", None)
+                        last_ct = ((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "")
+                        last_url = getattr(resp, "url", url) or url
+                except Exception as e:
+                    _swallow_exception(e)
             if last_status == 200:
                 data = safe_json_response(resp)
                 return (data, last_status, last_ct, "") if return_meta else data
