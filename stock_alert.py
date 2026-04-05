@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.4
-날짜: 2026-04-04
+버전: v161.5
+날짜: 2026-04-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.5 (2026-04-05): /재료 명령어 + 메뉴 버튼 추가
+  [#1] _handle_telegram_material_command() 신규 함수 추가
+  이유: 주말/장외에 축적된 재료(야간 시나리오·이슈 테마·prewatch seed)를 언제든 확인하고 싶음
+  개선점: /재료 또는 메뉴 '📡 재료 현황' 버튼으로 ①야간 시나리오 ②이슈 테마 ③prewatch seed 전부 표시
+  주의점: 장중/장외 구분 없이 언제나 호출 가능, 데이터 없으면 "수집된 재료 없음" 표시
+  진입 체인: analyze() 미사용 — 재료 조회 전용, 포착 알람 아님
 - v161.4 (2026-04-04): 주말/공휴일 장전 알람 발송 버그 수정
   [#1] _send_preopen_watchlist_once / _send_premarket_risk_assessment_once / _send_premarket_risk_update_once 에 is_holiday() 가드 추가
   이유: 07:30 스케줄이 주말에도 실행되어 🌅 장전 액션보드 알람이 토요일에 발송됨
@@ -28106,15 +28112,16 @@ def _send_menu(title: str = ""):
                 {"text": "🏆 오늘 TOP 5",      "callback_data": "cmd_top"},
             ],
             [
+                {"text": "📡 재료 현황",       "callback_data": "cmd_material"},
                 {"text": "📊 일일 성과",       "callback_data": "cmd_daily"},
                 {"text": "📅 이번 주 성과",    "callback_data": "cmd_week"},
                 {"text": "📈 승률 통계",       "callback_data": "cmd_stats"},
-                {"text": "♻️ 승률 초기화",     "callback_data": "cmd_reset_stats"},
             ],
             [
                 {"text": "🟡 NXT 현황",        "callback_data": "cmd_nxt"},
                 {"text": "⏸ 알림 정지",        "callback_data": "cmd_stop"},
                 {"text": "▶️ 알림 재개",        "callback_data": "cmd_resume"},
+                {"text": "♻️ 승률 초기화",     "callback_data": "cmd_reset_stats"},
             ],
             [
                 {"text": "🗜 컴팩트 전환",      "callback_data": "cmd_compact"},
@@ -28136,6 +28143,7 @@ def _handle_callback(callback_id: str, data: str):
         "cmd_status":  "/status",
         "cmd_list":    "/list",
         "cmd_watch":   "/watch",
+        "cmd_material": "/재료",
         "cmd_top":     "/top",
         "cmd_daily":   "/daily",
         "cmd_nxt":     "/nxt",
@@ -28294,6 +28302,92 @@ def _handle_telegram_watch_command():
         pending_title="\n🟡 <b>진입가 대기/감시 중</b>",
         active_title="\n🏆 <b>진입가 도달 후 추적 중</b>",
     )
+
+
+def _handle_telegram_material_command():
+    """v161.5: 축적된 재료·이슈 현황 — 야간 시나리오·이슈 테마·prewatch seed 전부 표시"""
+    try:
+        now_str = _now_kst().strftime("%Y-%m-%d %H:%M")
+        parts = [f"📡 <b>축적 재료 현황</b>  {now_str}\n━━━━━━━━━━━━━━━"]
+
+        # ① 야간 시나리오 액션보드
+        try:
+            board_block = _format_premarket_action_board_block(max_events=8, max_stocks=5)
+            if board_block:
+                parts.append("\n" + board_block)
+            else:
+                parts.append("\n🧭 <b>핵심 시나리오</b>\n  - 수집된 시나리오 없음")
+        except Exception as e:
+            _swallow_exception(e)
+            parts.append("\n🧭 <b>핵심 시나리오</b>\n  - 조회 실패")
+
+        # ② 야간 워치리스트 (상방 후보)
+        try:
+            wl_block = _format_overnight_watchlist_block()
+            if wl_block:
+                parts.append("\n" + wl_block)
+            else:
+                parts.append("\n🌙 <b>야간 상방 후보</b>\n  - 없음")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ③ 이슈 테마 (동적 테마 + news_issue_prewatch)
+        try:
+            issue_lines = ["📌 <b>이슈 테마</b>"]
+            now_ts = time.time()
+            # 동적 테마 (24시간 이내)
+            recent_themes = [
+                (tk, ti) for tk, ti in (_dynamic_theme_map or {}).items()
+                if now_ts - float(ti.get("ts", 0) or 0) < 86400
+            ]
+            recent_themes.sort(key=lambda x: float(x[1].get("ts", 0) or 0), reverse=True)
+            if recent_themes:
+                for tk, ti in recent_themes[:8]:
+                    age_h = int((now_ts - float(ti.get("ts", 0) or 0)) / 3600)
+                    age_str = f"{age_h}시간 전" if age_h > 0 else "방금"
+                    stocks = list(ti.get("stocks", []) or [])[:4]
+                    stock_str = "/".join([s[1] if isinstance(s, (list, tuple)) and len(s) > 1 else str(s) for s in stocks])
+                    issue_lines.append(f"  • {ti.get('desc', tk)} ({age_str})")
+                    if stock_str:
+                        issue_lines.append(f"    {stock_str}")
+            else:
+                issue_lines.append("  - 없음")
+            parts.append("\n" + "\n".join(issue_lines))
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ④ prewatch seed (내일 우선 스캔 후보)
+        try:
+            seed_lines = ["👁 <b>prewatch seed (장 시작 시 우선 스캔)</b>"]
+            if _news_issue_prewatch:
+                now_ts = time.time()
+                seeds = sorted(
+                    _news_issue_prewatch.items(),
+                    key=lambda x: float(x[1].get("ts", 0) or 0),
+                    reverse=True,
+                )
+                for theme_key, info in seeds[:8]:
+                    stocks = list(info.get("stocks", []) or [])
+                    reacted = [s for s in stocks if safe_float(s.get("change_rate", 0), 0.0) >= 1.0]
+                    stock_names = "/".join([s.get("name", "") for s in reacted[:4]]) or "/".join([s.get("name", "") for s in stocks[:4]])
+                    age_h = int((now_ts - float(info.get("ts", 0) or 0)) / 3600)
+                    age_str = f"{age_h}시간 전" if age_h > 0 else "방금"
+                    headline = str(info.get("headline") or info.get("theme_desc") or theme_key)[:36]
+                    q_score = int(info.get("quality_score", 0) or 0)
+                    seed_lines.append(f"  • {headline} ({age_str}, 품질{q_score}점)")
+                    if stock_names:
+                        seed_lines.append(f"    → {stock_names}")
+            else:
+                seed_lines.append("  - 수집된 seed 없음")
+            parts.append("\n" + "\n".join(seed_lines))
+        except Exception as e:
+            _swallow_exception(e)
+            parts.append("\n👁 <b>prewatch seed</b>\n  - 조회 실패")
+
+        send("\n".join(parts))
+    except Exception as e:
+        _log_error("_handle_telegram_material_command", e)
+        send("⚠️ 재료 현황 조회 중 오류가 발생했습니다.")
 
 
 def _handle_telegram_list_command():
@@ -28571,6 +28665,8 @@ def _dispatch_telegram_command(raw: str, text: str):
         "/list": _handle_telegram_list_command,
         "/watch": _handle_telegram_watch_command,
         "/포착감시": _handle_telegram_watch_command,
+        "/재료": _handle_telegram_material_command,
+        "/material": _handle_telegram_material_command,
         "/top": _handle_telegram_top_command,
         "/nxt": _handle_telegram_nxt_command,
         "/week": _handle_telegram_week_command,
