@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.7
+버전: v161.8
 날짜: 2026-04-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.8 (2026-04-05): /재료 명령어에 유튜브 Gemini 분석 섹션 추가
+  [#1] _handle_telegram_material_command()에 ⑤ 유튜브 AI 분석 재료 섹션 추가
+  이유: Gemini가 유튜브 영상을 분석해도 /재료 현황에 별도 표시가 없어 결과 확인 불가
+  개선점: _youtube_gemini_analyzed_cache에서 24시간 이내 분석 결과를 꺼내 종목·방향(🔴🔵🟡)·경과시간 표시. 오늘 Gemini 호출 횟수/한도도 함께 표시
+  주의점: 캐시가 비어있으면 "분석된 영상 없음" 표시 — 첫 사이클(20분) 이후부터 데이터 채워짐
 - v161.7 (2026-04-05): Gemini 유튜브 영상 재료 분석 엔진 추가
   [#1] GEMINI_API_KEY 환경변수 + Gemini 관련 상수 추가
   이유: 유튜브 영상 제목만 수집하던 기존 방식에서 영상 내용을 AI로 분석해 종목·테마·방향을 직접 추출하도록 업그레이드
@@ -28697,6 +28702,58 @@ def _handle_telegram_material_command():
         except Exception as e:
             _swallow_exception(e)
             parts.append("\n👁 <b>prewatch seed</b>\n  - 조회 실패")
+
+        # ⑤ 유튜브 Gemini 분석 재료 (v161.8)
+        try:
+            yt_lines = ["📺 <b>유튜브 AI 분석 재료</b>"]
+            now_ts = time.time()
+            yt_cache = _youtube_gemini_analyzed_cache or {}
+            # 24시간 이내 분석 결과만, 최신순 정렬
+            recent = sorted(
+                [(vid, data) for vid, data in yt_cache.items()
+                 if now_ts - float(data.get("ts", 0) or 0) < 86400],
+                key=lambda x: float(x[1].get("ts", 0) or 0),
+                reverse=True,
+            )
+            if not recent:
+                yt_lines.append("  - 분석된 영상 없음 (GEMINI_API_KEY 확인)")
+            else:
+                shown = 0
+                for vid, data in recent[:10]:
+                    rows = list(data.get("rows", []) or [])
+                    for row in rows:
+                        title = str(row.get("title", "") or "").strip()
+                        if not title or shown >= 8:
+                            break
+                        stocks = list(row.get("gemini_stocks", []) or [])
+                        age_m = int((now_ts - float(data.get("ts", 0) or 0)) / 60)
+                        age_str = f"{age_m}분 전" if age_m < 60 else f"{age_m // 60}시간 전"
+                        # 방향 아이콘
+                        directions = [str(s.get("direction", "") or "") for s in stocks]
+                        if "up" in directions:
+                            dir_icon = "🔴"
+                        elif "down" in directions:
+                            dir_icon = "🔵"
+                        else:
+                            dir_icon = "🟡"
+                        # 표시 (제목에서 [YT재료]/[YT종목] 접두어 제거)
+                        clean_title = title.replace("[YT재료] ", "").replace("[YT종목] ", "")[:48]
+                        yt_lines.append(f"  {dir_icon} {clean_title} ({age_str})")
+                        # 종목 목록
+                        names = [str(s.get("name", "") or "") for s in stocks if s.get("name")]
+                        if names:
+                            yt_lines.append(f"    → {'/'.join(names[:4])}")
+                        shown += 1
+                if shown == 0:
+                    yt_lines.append("  - 분석 결과 없음")
+                # 오늘 호출 횟수 표시
+                today = _now_kst().strftime("%Y-%m-%d")
+                cnt = _youtube_gemini_daily_counter.get("count", 0) if _youtube_gemini_daily_counter.get("date") == today else 0
+                yt_lines.append(f"\n  💡 오늘 Gemini 분석 {cnt}회 / {GEMINI_YOUTUBE_DAILY_LIMIT}회 한도")
+            parts.append("\n" + "\n".join(yt_lines))
+        except Exception as e:
+            _swallow_exception(e)
+            parts.append("\n📺 <b>유튜브 AI 분석 재료</b>\n  - 조회 실패")
 
         send("\n".join(parts))
     except Exception as e:
