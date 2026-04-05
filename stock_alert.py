@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.5
+버전: v161.6
 날짜: 2026-04-05
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.6 (2026-04-05): 재료 현황 시나리오·이슈테마 표시 개선
+  [#1] 시나리오 중복 이벤트 통합: event_name 기준으로 up/down 양쪽 있으면 priority_score 더 높은 쪽을 주방향으로 표시, 반대 방향 내용(섹터·종목)을 경고로 함께 표시
+  이유: 같은 이벤트가 상방·하방 양쪽에 나열되어 행동 방향을 판단하기 어려움
+  개선점: 강한 쪽 방향으로 정리되고 반대 방향 주의사항이 한 블록에 포함됨
+  [#2] 이슈 테마 방향 표시: change_rate·source·reason 기반으로 🔴상승/🔵하락/🟡중립 아이콘+글씨 추가
+  이유: 각 테마가 상승 재료인지 하락 재료인지 표시 없어 판단 불가
+  개선점: 테마마다 방향 명시, 지정학 테마는 heuristic으로 방향 추론
+  주의점: 방향 추론이 불확실한 경우 🟡중립으로 표시
 - v161.5 (2026-04-05): /재료 명령어 + 메뉴 버튼 추가
   [#1] _handle_telegram_material_command() 신규 함수 추가
   이유: 주말/장외에 축적된 재료(야간 시나리오·이슈 테마·prewatch seed)를 언제든 확인하고 싶음
@@ -28305,23 +28313,97 @@ def _handle_telegram_watch_command():
 
 
 def _handle_telegram_material_command():
-    """v161.5: 축적된 재료·이슈 현황 — 야간 시나리오·이슈 테마·prewatch seed 전부 표시"""
+    """v161.6: 축적된 재료·이슈 현황 — 시나리오 중복 통합 + 이슈테마 방향 표시"""
     try:
         now_str = _now_kst().strftime("%Y-%m-%d %H:%M")
         parts = [f"📡 <b>축적 재료 현황</b>  {now_str}\n━━━━━━━━━━━━━━━"]
 
-        # ① 야간 시나리오 액션보드
+        # ① 시나리오 액션보드 — 중복 이벤트 통합
         try:
-            board_block = _format_premarket_action_board_block(max_events=8, max_stocks=5)
-            if board_block:
-                parts.append("\n" + board_block)
-            else:
+            board = _load_premarket_action_board()
+            items = list((board or {}).get("items", []) or [])
+            if not items:
                 parts.append("\n🧭 <b>핵심 시나리오</b>\n  - 수집된 시나리오 없음")
+            else:
+                # event_name 기준으로 그룹핑
+                event_groups: dict = {}
+                for item in items:
+                    en = str(item.get("event_name") or "기타").strip()
+                    if en not in event_groups:
+                        event_groups[en] = []
+                    event_groups[en].append(item)
+
+                scenario_lines = ["🧭 <b>핵심 시나리오</b>"]
+                for en, group in list(event_groups.items())[:8]:
+                    ups   = [i for i in group if i.get("direction") == "up"]
+                    downs = [i for i in group if i.get("direction") == "down"]
+                    up_score   = max((int(i.get("priority_score", 0) or 0) for i in ups),   default=0)
+                    down_score = max((int(i.get("priority_score", 0) or 0) for i in downs), default=0)
+
+                    if ups and downs:
+                        # 양방향 존재 → 강한 쪽 주방향, 약한 쪽 경고
+                        if up_score >= down_score:
+                            main, sub = ups[0], downs[0]
+                            main_dir = "up"
+                        else:
+                            main, sub = downs[0], ups[0]
+                            main_dir = "down"
+                    elif ups:
+                        main, sub, main_dir = ups[0], None, "up"
+                    elif downs:
+                        main, sub, main_dir = downs[0], None, "down"
+                    else:
+                        continue
+
+                    dir_emoji = "🔴" if main_dir == "up" else "🔵"
+                    dir_label = "상승" if main_dir == "up" else "하락"
+                    cause = str(main.get("cause") or "")[:44]
+                    scenario_lines.append(f"\n{dir_emoji} <b>{en}</b> | {dir_label}")
+                    scenario_lines.append(f"  원인: {cause}")
+
+                    if main_dir == "up":
+                        sectors = list(main.get("kr_sector_bull") or [])[:3]
+                        cands   = [v.get("name","") for v in list(main.get("kr_stock_candidates_long") or [])[:4]]
+                        if sectors:
+                            scenario_lines.append(f"  🔴 수혜섹터: {', '.join(sectors)}")
+                        if cands:
+                            scenario_lines.append(f"  🔴 매수후보: {'/'.join(cands)}")
+                        if sub:
+                            sub_sectors = list(sub.get("kr_sector_bear") or [])[:2]
+                            sub_cands   = [v.get("name","") for v in list(sub.get("kr_stock_candidates_short") or [])[:3]]
+                            sub_cause   = str(sub.get("cause") or "")[:36]
+                            scenario_lines.append(f"  ⚠️ 하방 주의: {sub_cause}")
+                            if sub_sectors:
+                                scenario_lines.append(f"     약세섹터: {', '.join(sub_sectors)}")
+                            if sub_cands:
+                                scenario_lines.append(f"     경계종목: {'/'.join(sub_cands)}")
+                    else:
+                        sectors = list(main.get("kr_sector_bear") or [])[:3]
+                        cands   = [v.get("name","") for v in list(main.get("kr_stock_candidates_short") or [])[:4]]
+                        if sectors:
+                            scenario_lines.append(f"  🔵 약세섹터: {', '.join(sectors)}")
+                        if cands:
+                            scenario_lines.append(f"  🔵 회피종목: {'/'.join(cands)}")
+                        if sub:
+                            sub_sectors = list(sub.get("kr_sector_bull") or [])[:2]
+                            sub_cands   = [v.get("name","") for v in list(sub.get("kr_stock_candidates_long") or [])[:3]]
+                            sub_cause   = str(sub.get("cause") or "")[:36]
+                            scenario_lines.append(f"  ⚠️ 상방 반전 주의: {sub_cause}")
+                            if sub_sectors:
+                                scenario_lines.append(f"     반전 시 수혜: {', '.join(sub_sectors)}")
+                            if sub_cands:
+                                scenario_lines.append(f"     반전 후보: {'/'.join(sub_cands)}")
+
+                    confirm = str(main.get("confirm_signal") or "")
+                    if confirm:
+                        scenario_lines.append(f"  ✔ 확인: {confirm}")
+
+                parts.append("\n" + "\n".join(scenario_lines))
         except Exception as e:
             _swallow_exception(e)
             parts.append("\n🧭 <b>핵심 시나리오</b>\n  - 조회 실패")
 
-        # ② 야간 워치리스트 (상방 후보)
+        # ② 야간 워치리스트
         try:
             wl_block = _format_overnight_watchlist_block()
             if wl_block:
@@ -28331,11 +28413,10 @@ def _handle_telegram_material_command():
         except Exception as e:
             _swallow_exception(e)
 
-        # ③ 이슈 테마 (동적 테마 + news_issue_prewatch)
+        # ③ 이슈 테마 — 방향 아이콘+글씨 표시
         try:
             issue_lines = ["📌 <b>이슈 테마</b>"]
             now_ts = time.time()
-            # 동적 테마 (24시간 이내)
             recent_themes = [
                 (tk, ti) for tk, ti in (_dynamic_theme_map or {}).items()
                 if now_ts - float(ti.get("ts", 0) or 0) < 86400
@@ -28347,33 +28428,51 @@ def _handle_telegram_material_command():
                     age_str = f"{age_h}시간 전" if age_h > 0 else "방금"
                     stocks = list(ti.get("stocks", []) or [])[:4]
                     stock_str = "/".join([s[1] if isinstance(s, (list, tuple)) and len(s) > 1 else str(s) for s in stocks])
-                    issue_lines.append(f"  • {ti.get('desc', tk)} ({age_str})")
+                    # 방향 추론
+                    cr = safe_float(ti.get("change_rate", 0.0), 0.0)
+                    source = str(ti.get("source") or "")
+                    reason = str(ti.get("reason") or ti.get("desc") or "").lower()
+                    if cr >= 2.0 or "surge" in source or "auto_discover" in source:
+                        dir_icon, dir_label = "🔴", "상승"
+                    elif cr <= -2.0 or any(kw in reason for kw in ("하락", "약세", "하방", "위험", "차단", "규제")):
+                        dir_icon, dir_label = "🔵", "하락"
+                    elif "geo_sector" in source:
+                        # 지정학 테마: reason에서 방향 추론
+                        if any(kw in reason for kw in ("방산", "수혜", "상승", "강세", "수주", "전쟁", "긴장")):
+                            dir_icon, dir_label = "🔴", "상승"
+                        elif any(kw in reason for kw in ("하락", "약세", "수출규제", "관세", "충격")):
+                            dir_icon, dir_label = "🔵", "하락"
+                        else:
+                            dir_icon, dir_label = "🟡", "중립"
+                    else:
+                        dir_icon, dir_label = "🟡", "중립"
+                    issue_lines.append(f"  {dir_icon} <b>{dir_label}</b> | {ti.get('desc', tk)} ({age_str})")
                     if stock_str:
-                        issue_lines.append(f"    {stock_str}")
+                        issue_lines.append(f"    → {stock_str}")
             else:
                 issue_lines.append("  - 없음")
             parts.append("\n" + "\n".join(issue_lines))
         except Exception as e:
             _swallow_exception(e)
 
-        # ④ prewatch seed (내일 우선 스캔 후보)
+        # ④ prewatch seed
         try:
             seed_lines = ["👁 <b>prewatch seed (장 시작 시 우선 스캔)</b>"]
             if _news_issue_prewatch:
-                now_ts = time.time()
                 seeds = sorted(
                     _news_issue_prewatch.items(),
                     key=lambda x: float(x[1].get("ts", 0) or 0),
                     reverse=True,
                 )
+                now_ts = time.time()
                 for theme_key, info in seeds[:8]:
-                    stocks = list(info.get("stocks", []) or [])
+                    stocks  = list(info.get("stocks", []) or [])
                     reacted = [s for s in stocks if safe_float(s.get("change_rate", 0), 0.0) >= 1.0]
                     stock_names = "/".join([s.get("name", "") for s in reacted[:4]]) or "/".join([s.get("name", "") for s in stocks[:4]])
-                    age_h = int((now_ts - float(info.get("ts", 0) or 0)) / 3600)
+                    age_h   = int((now_ts - float(info.get("ts", 0) or 0)) / 3600)
                     age_str = f"{age_h}시간 전" if age_h > 0 else "방금"
                     headline = str(info.get("headline") or info.get("theme_desc") or theme_key)[:36]
-                    q_score = int(info.get("quality_score", 0) or 0)
+                    q_score  = int(info.get("quality_score", 0) or 0)
                     seed_lines.append(f"  • {headline} ({age_str}, 품질{q_score}점)")
                     if stock_names:
                         seed_lines.append(f"    → {stock_names}")
