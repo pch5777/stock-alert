@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.18
+버전: v161.19
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.19 (2026-04-06): missing_signal_type 무한 재시도 차단 — NXT 전용 시간대 KRX 종목 repair 큐 제외
+  [#1] _queue_run_scan_repair(): NXT 전용 시간대(KRX 닫힘+NXT 열림)에 market!="NXT" 종목은 큐 등록 자체 차단
+  [#2] _drain_run_scan_repair_queue(): 이미 큐에 있는 KRX 종목도 NXT 전용 시간대 진입 시 즉시 폐기
+  이유: SK하이닉스·삼성SDI·두산에너빌리티 등 27개 KRX 종목이 NXT 시간대 스캔 → analyze() 빈 결과 → missing_signal_type → 큐 등록 → 3회×120초 재시도 → 폐기 → 다음 스캔에서 또 등록 무한 반복. 258건/세션 발생하며 정규 스캔 사이클 부하 유발
+  개선점: 큐 등록 단계와 drain 단계 양쪽에서 차단 → NXT 전용 시간대엔 KRX 종목 repair 큐 완전 차단. 장중(KRX+NXT 동시)엔 영향 없음
+  주의점: market 필드가 ""(빈 문자열)인 KRX 종목도 차단 대상 — NXT 종목은 반드시 market="NXT" 명시 필요
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.18 (2026-04-06): 선진입(PRECLOSE_GAP_ENTRY) 경로 상한가·KRX 장마감 차단 추가
   [#1] _load_next_open_gap_candidate_context(): 상한가 잠김(change_rate>=29%+ask_qty=0) 종목 선진입 후보 제외
   [#2] _load_next_open_gap_candidate_context(): NXT 전용 시간대(KRX 닫힘+NXT 열림)에 NXT 미상장 KRX 종목 제외
@@ -32226,6 +32233,9 @@ def _queue_run_scan_repair(item: dict, stage: str = "") -> None:
         return
     if is_scoring_only_instrument(code, str(item.get("name") or "")):
         return
+    # v161.19: NXT 전용 시간대에 KRX 종목은 repair 큐 등록 자체 차단 — 무한 재시도 방지
+    if not is_market_open() and is_nxt_open() and str(item.get("market") or "") != "NXT":
+        return
     row = dict(_run_scan_repair_queue.get(code) or {})
     row["payload"] = dict(item)
     row["stage"] = str(stage or row.get("stage", ""))
@@ -32263,6 +32273,10 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
                 continue
             item = dict(row.get("payload") or {})
             item["code"] = code
+            # v161.19: NXT 전용 시간대에 KRX 종목은 재시도 없이 즉시 폐기 — missing_signal_type 무한반복 방지
+            if not is_market_open() and is_nxt_open() and str(item.get("market") or "") != "NXT":
+                remove_codes.append(code)
+                continue
             repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
             if bool(repaired.get("_scan_payload_incomplete")):
                 attempts = int(row.get("attempts", 0) or 0) + 1
