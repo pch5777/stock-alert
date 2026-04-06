@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.19
-날짜: 2026-04-06
+버전: v161.20
+날짜: 2026-04-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.20 (2026-04-07): Gemini SDK 신버전 교체 + 429 대응 + 분석 딜레이
+  [#1] _analyze_youtube_video_with_gemini(): google.generativeai(deprecated) → google.genai 신 SDK 교체
+  [#2] _analyze_youtube_video_with_gemini(): 429/ResourceExhausted 발생 시 30초 대기 후 1회 재시도
+  [#3] _fetch_youtube_material_headline_rows(): 영상 분석 사이 7초 딜레이 추가 — 분당 250,000 토큰 한도 분산
+  [#4] GEMINI_YOUTUBE_MAX_PER_CYCLE 기본값 5→2 — 사이클당 분석 수 축소로 429 예방
+  이유: google.generativeai 패키지가 2025-11 deprecated → 로그에 deprecation 경고 출력. gemini-2.5-flash 분석 5개 동시 실행 시 분당 250,000 토큰 초과 → 429 ResourceExhausted 반복 발생
+  개선점: 신 SDK(google.genai)로 교체해 최신 모델/기능 지원. 영상 사이 7초 딜레이로 토큰 소모 분산. GEMINI_YOUTUBE_MAX_PER_CYCLE 환경변수로 조정 가능
+  주의점: requirements.txt에 google-genai>=1.0.0 추가 필요 (google-generativeai 제거). 사이클당 2개×7초=최소 7초 추가 소요
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.19 (2026-04-06): missing_signal_type 무한 재시도 차단 — NXT 전용 시간대 KRX 종목 repair 큐 제외
   [#1] _queue_run_scan_repair(): NXT 전용 시간대(KRX 닫힘+NXT 열림)에 market!="NXT" 종목은 큐 등록 자체 차단
   [#2] _drain_run_scan_repair_queue(): 이미 큐에 있는 KRX 종목도 NXT 전용 시간대 진입 시 즉시 폐기
@@ -5185,7 +5194,7 @@ YOUTUBE_MAX_RESULTS_PER_CHANNEL = int(os.getenv("YOUTUBE_MAX_RESULTS_PER_CHANNEL
 # ── Gemini 유튜브 영상 재료 분석 ──
 GEMINI_API_KEY = str(os.getenv("GEMINI_API_KEY", "") or "").strip()
 GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") or "gemini-2.5-flash-preview-04-17").strip()
-GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "5") or "5")   # 사이클당 최대 분석 영상 수
+GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "한국주식 급등재료,주식 테마 상승,공시 호재 종목,반도체 방산 바이오 주식") or "").split(",") if x.strip()]
@@ -5297,67 +5306,81 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
     if not _gemini_daily_count_ok():
         _warn_throttled_once("gemini_daily_limit", "⚠️ Gemini 일일 한도 도달 — 오늘은 더 분석 안 함", cooldown_sec=3600.0)
         return []
-    try:
-        import google.generativeai as genai  # noqa
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        prompt = (
-            "다음 유튜브 영상을 분석해서 한국 주식시장에 영향을 줄 수 있는 재료(호재/악재)와 관련 종목을 추출해줘.\n"
-            "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
-            '{"stocks": [{"name": "종목명", "theme": "테마", "direction": "up/down/neutral", "reason": "근거 1줄"}], '
-            '"summary": "영상 핵심 재료 1~2줄 요약"}\n'
-            "종목이 없으면 stocks는 빈 배열. 영상이 재료와 무관하면 stocks 빈 배열 + summary에 무관 표시."
-        )
-        resp = model.generate_content([{"file_data": {"file_uri": video_url}}, prompt])
-        raw = str(resp.text or "").strip()
-        # JSON 파싱
-        import json as _json
-        raw_clean = raw.replace("```json", "").replace("```", "").strip()
-        parsed = _json.loads(raw_clean)
-        stocks = parsed.get("stocks") or []
-        summary = str(parsed.get("summary", "") or "").strip()
-        rows = []
-        # summary를 headline row로 — 파이프라인이 제목으로 인식
-        if summary:
-            rows.append({
-                "title": f"[YT재료] {summary}",
-                "source": "YOUTUBE_GEMINI",
-                "published_at": "",
-                "channel_id": video_id,
-                "live": "",
-                "gemini_stocks": stocks,
-            })
-        # 종목별 개별 row — 재료 파이프라인이 종목명 키워드로 매칭
-        for s in stocks[:6]:
-            name = str(s.get("name", "") or "").strip()
-            theme = str(s.get("theme", "") or "").strip()
-            reason = str(s.get("reason", "") or "").strip()
-            direction = str(s.get("direction", "neutral") or "neutral").strip()
-            if not name:
-                continue
-            dir_label = "📈상승재료" if direction == "up" else ("📉하락재료" if direction == "down" else "")
-            rows.append({
-                "title": f"[YT종목] {name} {theme} {dir_label} {reason}".strip(),
-                "source": "YOUTUBE_GEMINI",
-                "published_at": "",
-                "channel_id": video_id,
-                "live": "",
-                "gemini_stocks": [s],
-            })
-        _gemini_daily_count_inc()
-        _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": rows}
-        return rows
-    except Exception as e:
-        _warn_throttled_once(
-            f"gemini_video_analyze:{video_id}",
-            f"⚠️ Gemini 영상 분석 실패 [{video_id}]: {type(e).__name__}: {e}",
-            cooldown_sec=1800.0,
-        )
-        # fallback: 제목만 반환
-        fallback = [{"title": title, "source": "YOUTUBE", "published_at": "", "channel_id": video_id, "live": "", "gemini_stocks": []}]
-        _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": fallback}
-        return fallback
+    # v161.20: google.genai 신 SDK 사용 + 429 재시도(최대 2회, 30초 대기)
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            from google import genai as _genai  # noqa
+            client = _genai.Client(api_key=GEMINI_API_KEY)
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            prompt = (
+                "다음 유튜브 영상을 분석해서 한국 주식시장에 영향을 줄 수 있는 재료(호재/악재)와 관련 종목을 추출해줘.\n"
+                "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
+                '{"stocks": [{"name": "종목명", "theme": "테마", "direction": "up/down/neutral", "reason": "근거 1줄"}], '
+                '"summary": "영상 핵심 재료 1~2줄 요약"}\n'
+                "종목이 없으면 stocks는 빈 배열. 영상이 재료와 무관하면 stocks 빈 배열 + summary에 무관 표시."
+            )
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[{"file_data": {"file_uri": video_url}}, prompt],
+            )
+            raw = str(resp.text or "").strip()
+            import json as _json
+            raw_clean = raw.replace("```json", "").replace("```", "").strip()
+            parsed = _json.loads(raw_clean)
+            stocks = parsed.get("stocks") or []
+            summary = str(parsed.get("summary", "") or "").strip()
+            rows = []
+            if summary:
+                rows.append({
+                    "title": f"[YT재료] {summary}",
+                    "source": "YOUTUBE_GEMINI",
+                    "published_at": "",
+                    "channel_id": video_id,
+                    "live": "",
+                    "gemini_stocks": stocks,
+                })
+            for s in stocks[:6]:
+                name = str(s.get("name", "") or "").strip()
+                theme = str(s.get("theme", "") or "").strip()
+                reason = str(s.get("reason", "") or "").strip()
+                direction = str(s.get("direction", "neutral") or "neutral").strip()
+                if not name:
+                    continue
+                dir_label = "📈상승재료" if direction == "up" else ("📉하락재료" if direction == "down" else "")
+                rows.append({
+                    "title": f"[YT종목] {name} {theme} {dir_label} {reason}".strip(),
+                    "source": "YOUTUBE_GEMINI",
+                    "published_at": "",
+                    "channel_id": video_id,
+                    "live": "",
+                    "gemini_stocks": [s],
+                })
+            _gemini_daily_count_inc()
+            _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": rows}
+            return rows
+        except Exception as e:
+            err_str = str(e)
+            # 429 토큰 한도 초과 → 재시도 대기
+            if "429" in err_str or "ResourceExhausted" in err_str or "quota" in err_str.lower():
+                if attempt < max_attempts - 1:
+                    _warn_throttled_once(
+                        f"gemini_429:{video_id}",
+                        f"⚠️ Gemini 429 토큰 한도 — {30}초 후 재시도 ({attempt+1}/{max_attempts})",
+                        cooldown_sec=60.0,
+                    )
+                    time.sleep(30)
+                    continue
+            _warn_throttled_once(
+                f"gemini_video_analyze:{video_id}",
+                f"⚠️ Gemini 영상 분석 실패 [{video_id}]: {type(e).__name__}: {err_str[:120]}",
+                cooldown_sec=1800.0,
+            )
+            break
+    # fallback: 제목만 반환
+    fallback = [{"title": title, "source": "YOUTUBE", "published_at": "", "channel_id": video_id, "live": "", "gemini_stocks": []}]
+    _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": fallback}
+    return fallback
 
 
 def _fetch_youtube_keyword_search_rows() -> list[dict]:
@@ -5482,6 +5505,9 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
         if not video_id or not title:
             continue
         if GEMINI_API_KEY and gemini_done < GEMINI_YOUTUBE_MAX_PER_CYCLE and _gemini_daily_count_ok():
+            # v161.20: 영상 사이 7초 딜레이 — 분당 토큰 한도(250,000) 분산
+            if gemini_done > 0:
+                time.sleep(7)
             analyzed = _analyze_youtube_video_with_gemini(video_id, title)
             if analyzed:
                 rows.extend(analyzed)
