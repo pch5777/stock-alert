@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.9
+버전: v161.10
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.10 (2026-04-06): candidate_miss 원인 2종 수정 — 랭킹 캡 확대 + 재복구 큐 과부하 완화
+  [#1] RANK_SESSION_TOP_N 30→50, RANK_SESSION_EXPANDED_TOP_N 50→80
+  이유: 워치독 주 차단사유=candidate_miss — 롯데쇼핑·케스피온·일진홀딩스 등 외부 상승 30개 중 후보군 편입 자체가 안 됨. 네이버 fallback이 57건 수집해도 top_n=30 캡에서 30~57위 종목 전부 탈락
+  개선점: session 모드 기준 상위 50개 → 80개까지 후보군 편입 가능. 오늘 같은 전시장 급등장에서 롯데쇼핑·일진홀딩스급 종목 편입 확률 대폭 상승
+  주의점: 후보군 확대로 스캔 부하 소폭 증가. RANK_SESSION_TOP_N 환경변수로 조정 가능
+  [#2] RUN_SCAN_REPAIR_RETRY_SEC 30→120, RUN_SCAN_REPAIR_MAX_ATTEMPTS 2→3
+  이유: missing_signal_type 재복구 큐가 30초마다 30개 이상 동시 돌면서 정규 스캔 사이클을 잡아먹어 신규 급등 종목 처리 지연
+  개선점: 재시도 간격 4배 확대(30→120초)로 큐 과부하 완화. 최대 시도 횟수 3회로 늘려 복구 기회는 유지
+  주의점: 재복구 큐 종목은 최대 6분(120s×3) 후 폐기 — 기존 1분(30s×2)보다 늦어지나 정규 스캔 우선순위 보장
 - v161.9 (2026-04-06): 섹터 제한 완화 — 급등장 자동 감지 + 환경변수화
   [#1] SCAN_SECTOR_LIMIT 환경변수 추가 (기본값 3) — 기존 하드코딩 3을 환경변수로 교체
   이유: 섹터 제한이 하드코딩 3으로 고정되어 전기·전자 14번째 RF머트리얼즈(+29%), 7번째 티엠씨(+28%) 등 강한 종목이 섹터 제한에 무더기 탈락
@@ -4276,8 +4285,8 @@ CODE_CHANGE_REQUEST_STATE_FILE = _state_path("code_change_request_state.json")
 _CODE_CHANGE_REQUEST_CD_MIN = int(os.getenv("CODE_CHANGE_REQUEST_CD_MIN", "180"))
 PUBLIC_STOCK_META_FILE = _state_path("public_stock_meta.json")
 PUBLIC_STOCK_META_CACHE_TTL_SEC = int(os.getenv("PUBLIC_STOCK_META_CACHE_TTL_SEC", "21600") or "21600")
-RUN_SCAN_REPAIR_RETRY_SEC = int(os.getenv("RUN_SCAN_REPAIR_RETRY_SEC", "30") or "30")
-RUN_SCAN_REPAIR_MAX_ATTEMPTS = int(os.getenv("RUN_SCAN_REPAIR_MAX_ATTEMPTS", "2") or "2")
+RUN_SCAN_REPAIR_RETRY_SEC = int(os.getenv("RUN_SCAN_REPAIR_RETRY_SEC", "120") or "120")
+RUN_SCAN_REPAIR_MAX_ATTEMPTS = int(os.getenv("RUN_SCAN_REPAIR_MAX_ATTEMPTS", "3") or "3")
 RUN_SCAN_REPAIR_ALERT_AFTER = int(os.getenv("RUN_SCAN_REPAIR_ALERT_AFTER", "2") or "2")
 ENTRY_TERMINATION_STATE_FILE = _state_path("entry_termination_state.json")
 ENTRY_TERMINATION_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_TERMINATION_ALERT_COOLDOWN_SEC", "1800") or "1800")
@@ -12194,8 +12203,8 @@ UNIVERSE_MIN_VOL = int(os.getenv("UNIVERSE_MIN_VOL", "100000") or "100000")
 UNIVERSE_MIN_RSFL = float(os.getenv("UNIVERSE_MIN_RSFL", "5") or "5")
 RANK_FOCUS_TOP_N = int(os.getenv("RANK_FOCUS_TOP_N", "50") or "50")
 RANK_FOCUS_EXPANDED_TOP_N = int(os.getenv("RANK_FOCUS_EXPANDED_TOP_N", "100") or "100")
-RANK_SESSION_TOP_N = int(os.getenv("RANK_SESSION_TOP_N", "30") or "30")
-RANK_SESSION_EXPANDED_TOP_N = int(os.getenv("RANK_SESSION_EXPANDED_TOP_N", "50") or "50")
+RANK_SESSION_TOP_N = int(os.getenv("RANK_SESSION_TOP_N", "50") or "50")
+RANK_SESSION_EXPANDED_TOP_N = int(os.getenv("RANK_SESSION_EXPANDED_TOP_N", "80") or "80")
 RANK_FOCUS_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_FOCUS_SCAN_LIMIT_PER_MARKET", "30") or "30")
 RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "18") or "18")
 RANK_FOCUS_REFRESH_SEC = int(os.getenv("RANK_FOCUS_REFRESH_SEC", "300") or "300")
