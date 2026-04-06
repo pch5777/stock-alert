@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.17
+버전: v161.18
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.18 (2026-04-06): 선진입(PRECLOSE_GAP_ENTRY) 경로 상한가·KRX 장마감 차단 추가
+  [#1] _load_next_open_gap_candidate_context(): 상한가 잠김(change_rate>=29%+ask_qty=0) 종목 선진입 후보 제외
+  [#2] _load_next_open_gap_candidate_context(): NXT 전용 시간대(KRX 닫힘+NXT 열림)에 NXT 미상장 KRX 종목 제외
+  이유: 선진입(PRECLOSE_GAP_ENTRY) 경로는 _dispatch_general_alert_signal을 우회 → v161.17 패치가 전혀 적용 안 됨. 이노인스트루먼트(상한가 잠김, KRX 종목)가 19:33 선진입 알람에 포함됨. _load_next_open_gap_candidate_context()에 진입가능성 체크가 전혀 없었음
+  개선점: 후보 수집 최초 단계(_load_next_open_gap_candidate_context)에서 차단 → 이후 스코어링/발송 전체 단계 낭비 없음
+  주의점: 상한가 판단은 change_rate>=29%+ask_qty=0 기준. use_nxt=False이더라도 KRX 장 열림 시간(09:00~15:30)엔 정상 수집됨
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.17 (2026-04-06): NXT전용 시간대 비NXT 종목 알람 완전 차단 — market 필드 오판 근본 수정
   [#1] _build_analyze_result(): market 필드 명시적 보존 추가 — analyze() 결과가 원본 stock.market을 잃지 않도록
   [#2] _build_general_alert_dispatch_context(): market!="NXT" 판단을 is_market_open()+is_nxt_open() 기반으로 재작성 — is_nxt_listed()가 _nxt_unavailable 기준이라 KRX 종목도 NXT로 오판 가능한 문제 차단
@@ -10313,6 +10320,17 @@ def _load_next_open_gap_candidate_context(code: str, stage: str) -> dict | None:
         return None
     price = int(cur.get("price", 0) or 0)
     if price <= 0:
+        return None
+    # v161.18: 상한가 잠김 종목 선진입 후보 제외 — 매도호가 없으면 진입 불가
+    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+    change_rate = float(cur.get("change_rate", 0.0) or 0.0)
+    upper_like = change_rate >= 29.0
+    if upper_like and ask_qty <= 0:
+        _log_info_msg(f"  ⏭ 선진입 제외: {name} — 상한가 잠김(ask=0), 진입 불가")
+        return None
+    # v161.18: NXT 전용 시간대에 NXT 미상장(use_nxt=False) KRX 종목 제외
+    if not is_market_open() and is_nxt_open() and not use_nxt:
+        _log_info_msg(f"  ⏭ 선진입 제외: {name} — NXT 전용 시간대 KRX 전용 종목")
         return None
     return {
         "code": code,
