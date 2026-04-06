@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.15
+버전: v161.16
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.16 (2026-04-06): KRX 장마감 후 진입 불가 종목 알람 전면 차단
+  [#1] _build_general_alert_dispatch_context(): KRX 종목이고 is_market_open()=False면 즉시 None 반환 → 외부 알람 차단
+  [#2] _should_soft_allow_no_ask_liquidity_general(): KRX 종목 장마감 후 soft allow 완전 차단
+  [#3] _scan_rank_and_theme_candidates(): NXT전용 시간대(장후/장전)에 market!=NXT 종목 스킵 — 스캔 낭비 방지
+  이유: KRX 장마감(15:30) 이후 KRX 종목(GS글로벌 등)이 NXT 시간대 스캔에서 A급 통과 → 18:24 알람 발송. KRX는 15:30 이후 매수 자체 불가 → 행동 불가 알람. no_ask_liquidity soft allow도 KRX 장마감 후엔 무의미
+  개선점: 세 게이트 중층 차단 — ①스캔 단계 KRX 스킵 ②soft allow 단계 KRX 차단 ③dispatch context 단계 최종 차단. NXT 종목(삼성E&A 등)은 영향 없음
+  주의점: KRX+NXT 동시 운영 시간대(09:00~15:30)엔 is_market_open()=True이므로 정상 작동. 장전 NXT(08:00~08:59)·장후 NXT(15:40~20:00) 시간대에만 KRX 차단 적용
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.15 (2026-04-06): _alert_history 쿨다운 상태파일 저장/복원 — 재시작 후 알람 몰아치기 방지
   [#1] ALERT_HISTORY_FILE 상수 추가 + _save_alert_history() / _load_alert_history() 함수 신규
   [#2] _dispatch_general_alert_signal() 발송 직후 _save_alert_history() 호출 → 발송 즉시 저장
@@ -24350,6 +24358,10 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     sig_type = str(signal.get("signal_type") or "")
     if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT"):
         return False
+    # v161.16: KRX 종목은 장마감 후 soft allow 불허 — 호가 없어도 발송되는 문제 차단
+    is_nxt = str(signal.get("market") or "") == "NXT"
+    if not is_nxt and not is_market_open():
+        return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
@@ -24677,6 +24689,10 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
         _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
         return None
     is_nxt = str(s.get("market") or "") == "NXT"
+    # v161.16: KRX 종목은 KRX 장마감(15:30) 이후 진입 불가 → 외부 알람 차단
+    if not is_nxt and not is_market_open():
+        _log_info_msg(f"  ⏭ KRX 장마감 후 진입불가 차단: {s.get('name', s.get('code',''))} (KRX 종목, 현재 장외 시간)")
+        return None
     resolved_hist_key = hist_key or (f"NXT_{s['code']}" if is_nxt else s["code"])
     mkt_tag = " 🟡NXT" if is_nxt else ""
     s = _apply_execution_speed_to_signal(s)
@@ -32603,14 +32619,21 @@ def _scan_quiet_absorption_candidates(alerts: list, seen: set) -> None:
         _log_info_msg(f"  ⏭ quiet scan budget 절약: snapshot 생략 {skipped}건")
 def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
     _rank_scan_limit = NXT_POSTMARKET_EXTRA_RANK_LIMIT if _is_nxt_postmarket_only_window() else None
+    nxt_only_window = _is_nxt_postmarket_only_window() or _is_nxt_premarket_window()
     for stock in get_market_rank_focus_stocks(scan_limit_per_market=_rank_scan_limit):
         code = stock.get("code")
         if not code or code in seen:
+            continue
+        # v161.16: NXT전용 시간대에 KRX 종목 스킵 — 진입 불가 종목 스캔 낭비 방지
+        if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
     for stock in _collect_theme_peer_follow_candidates(existing_codes=seen):
         code = stock.get("code")
         if not code or code in seen:
+            continue
+        # v161.16: NXT전용 시간대에 KRX 종목 스킵
+        if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
 def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
