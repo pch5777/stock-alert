@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.10
+버전: v161.11
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.11 (2026-04-06): 최우선 TOP 리스트에서 손절 완료 종목 제외
+  [#1] send_top_signals()에서 _reentry_watch에 있는 종목 필터링
+  이유: 손절 완료 후 재진입 감시로 등록된 종목이 _today_top_signals에 그대로 남아 TOP 1위로 표시되는 버그 — 탑머티리얼 -16.6% 손절 후에도 TOP 1위로 노출
+  개선점: TOP 리스트 발송 시 _reentry_watch 코드 목록과 교차 확인 → 재진입 감시 중인 종목은 자동 제외
+  주의점: _today_top_signals에서 삭제하지 않고 발송 시점에만 필터링 — 재진입 포착 시 다시 등록될 수 있도록 유지
+  [#2] _register_tracking_reentry_watch_from_result() 호출 시 _today_top_signals에서 해당 종목 즉시 제거
+  이유: 손절 직후 TOP 리스트에서 빠져나가야 다음 발송 시점까지 노출 안 됨
+  개선점: 재진입 감시 등록과 동시에 top_signals 풀에서 제거 → 이후 재포착 시에만 재등록
+  주의점: 이론 추적(actual_entry=False) 종목도 동일 적용
 - v161.10 (2026-04-06): candidate_miss 원인 2종 수정 — 랭킹 캡 확대 + 재복구 큐 과부하 완화
   [#1] RANK_SESSION_TOP_N 30→50, RANK_SESSION_EXPANDED_TOP_N 50→80
   이유: 워치독 주 차단사유=candidate_miss — 롯데쇼핑·케스피온·일진홀딩스 등 외부 상승 30개 중 후보군 편입 자체가 안 됨. 네이버 fallback이 57건 수집해도 top_n=30 캡에서 30~57위 종목 전부 탈락
@@ -17361,6 +17370,10 @@ def _register_tracking_reentry_watch_from_result(rec: dict) -> None:
         }
         _save_reentry_watch()
         _log_info_msg(f"  🔄 재진입 감시 등록: {name} ({code}) 손절가 {cur_price:,}")
+        # v161.11: 손절 완료 종목은 TOP 리스트에서 즉시 제거
+        if code in _today_top_signals:
+            _today_top_signals.pop(code, None)
+            _log_info_msg(f"  ⏭ TOP 리스트 제거: {name} (손절 완료)")
     except Exception as e:
         _swallow_exception(e)
 def _send_tracking_result(rec: dict, log_key: str | None = None):
@@ -19305,7 +19318,14 @@ def send_top_signals():
         "EARLY_DETECT":"조기포착","MID_PULLBACK":"눌림목",
         "ENTRY_POINT":"눌림목","STRONG_BUY":"강력매수",
     }
-    top5  = sorted(_today_top_signals.values(), key=lambda x: x["score"], reverse=True)[:5]
+    # v161.11: 손절 완료 후 재진입 감시 중인 종목 제외
+    reentry_codes = set(str(c) for c in (_reentry_watch or {}).keys())
+    candidates = {
+        code: val for code, val in _today_top_signals.items()
+        if str(code) not in reentry_codes
+    }
+    if not candidates: return
+    top5  = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:5]
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
     msg   = f"🏆 <b>최우선 종목 TOP 5</b>  {datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━━\n"
     for i, t in enumerate(top5, 1):
