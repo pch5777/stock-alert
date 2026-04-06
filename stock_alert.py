@@ -3,10 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.12
+버전: v161.14
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.14 (2026-04-06): 봇 시작 시 _load_upper_limit_alerted_today() 호출 연결
+  [#1] 정규 시작 블록 + 대기모드 블록 양쪽에 _load_upper_limit_alerted_today() 추가
+  이유: v161.13에서 함수는 만들었으나 봇 시작 시 호출 연결이 누락 → 재시작 후 상한가 차단 목록이 복원되지 않아 당일 재알람 차단 무효화
+  개선점: 두 블록 모두 _load_preclose_gap_entry_watch() 직후, _load_reentry_watch() 직전에 삽입 → 재시작 시 즉시 복원
+  주의점: 대기모드(휴장일) 블록과 정규 시작 블록 양쪽 모두 적용 필수
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.13 (2026-04-06): upper_limit_reached 당일 차단 상태파일 저장/복원
+  [#1] UPPER_LIMIT_ALERTED_FILE 상태파일 추가 + _save/_load_upper_limit_alerted_today() 함수 신규
+  이유: v161.12에서 _upper_limit_alerted_today를 메모리 캐시로만 관리 → 재배포/재시작 시 초기화되어 광전자가 재시작 후 16:55에 또 알람 발송
+  개선점: upper_limit_reached 차단 시 즉시 상태파일 저장 → 재시작 시 복원 → 당일 날짜 기준이므로 익일 자동 무효화
+  주의점: 상태파일은 BOT_STATE_DIR에 저장. 재시작 시 _load_upper_limit_alerted_today() 호출 필요
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.12 (2026-04-06): upper_limit_reached 종목 당일 재알람 차단
   [#1] _upper_limit_alerted_today 전역 캐시 추가 — {code: date} 형태로 당일 상한가 차단 기록
   이유: _alert_history 쿨다운이 hist_key(코드+날짜+시간) 기준이라 stale entry_hit 정리 후 새 hist_key로 재포착되면 쿨다운 우회 — 광전자가 11:10, 12:26, 15:59 세 번 알람 발송됨
@@ -5828,6 +5840,7 @@ _alert_history      = {}
 _internal_only_alert_history = {}
 # v161.12: upper_limit_reached 당일 알람 차단 캐시 {code: "YYYYMMDD"}
 _upper_limit_alerted_today: dict = {}
+UPPER_LIMIT_ALERTED_FILE = _state_path("upper_limit_alerted_today.json")
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
@@ -8162,6 +8175,27 @@ def _load_preclose_gap_entry_watch() -> None:
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         _preclose_gap_entry_watch = {}
+def _save_upper_limit_alerted_today() -> None:
+    """v161.13: upper_limit_reached 당일 차단 목록 상태파일 저장."""
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        clean = {k: v for k, v in (_upper_limit_alerted_today or {}).items() if v == today}
+        _write_json_atomic(UPPER_LIMIT_ALERTED_FILE, clean, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+def _load_upper_limit_alerted_today() -> None:
+    """v161.13: 재시작 시 upper_limit_reached 당일 차단 목록 복원."""
+    global _upper_limit_alerted_today
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        data = _read_json_safe(UPPER_LIMIT_ALERTED_FILE, {})
+        if isinstance(data, dict):
+            _upper_limit_alerted_today = {k: v for k, v in data.items() if v == today}
+        else:
+            _upper_limit_alerted_today = {}
+    except Exception as e:
+        _swallow_exception(e)
+        _upper_limit_alerted_today = {}
 def _save_reentry_watch() -> None:
     try:
         _write_json_atomic(REENTRY_WATCH_FILE, _reentry_watch if isinstance(_reentry_watch, dict) else {}, indent=2)
@@ -20362,17 +20396,34 @@ def _maybe_send_immediate_entry_hit_from_signal(signal: dict, watch_key: str | N
     watch = _entry_watch.get(watch_key) or {}
     if not isinstance(watch, dict) or watch.get("entry_hit_locked"):
         return False
-    price = safe_int(signal.get("price", 0), 0)
+    # v161.13: 포착 시점 저장 가격 대신 실시간 현재가 재조회
+    code = str(signal.get("code", "") or "").strip()
+    live_cur = {}
+    live_price = 0
+    try:
+        if str(signal.get("market", "") or "").upper() == "NXT" and is_nxt_open():
+            live_cur = get_nxt_stock_price(code) or {}
+        else:
+            live_cur = get_stock_price(code) or {}
+        live_price = safe_int(live_cur.get("price", 0), 0)
+    except Exception as e:
+        _swallow_exception(e)
+    price = live_price if live_price > 0 else safe_int(signal.get("price", 0), 0)
+    # 실시간 현재가로 signal 업데이트
+    merged_signal = dict(signal)
+    if live_price > 0:
+        merged_signal["price"] = live_price
+        merged_signal.update({k: v for k, v in live_cur.items() if k not in ("code", "name")})
     entry = safe_int(watch.get("entry_price", 0), 0)
-    if not _should_immediate_first_entry_hit_from_signal(signal, watch):
+    if not _should_immediate_first_entry_hit_from_signal(merged_signal, watch):
         return False
-    blocked_reason = _detect_entry_block_reason(signal, watch, price, entry)
+    blocked_reason = _detect_entry_block_reason(merged_signal, watch, price, entry)
     if blocked_reason:
         return False
     watch["entry_hit"] = True
     watch["entry_hit_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     watch["entry_hit_price"] = int(price)
-    return _send_entry_phase_alert(watch, dict(signal), price, entry, use_nxt=bool(signal.get("use_nxt") or str(signal.get("market") or "").upper()=="NXT"), reach_via_recovery=False, merge_capture_phase1=merge_capture_phase1)
+    return _send_entry_phase_alert(watch, merged_signal, price, entry, use_nxt=bool(merged_signal.get("use_nxt") or str(merged_signal.get("market") or "").upper()=="NXT"), reach_via_recovery=False, merge_capture_phase1=merge_capture_phase1)
 def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
     """KIS change_rate와 전일종가 대비 실계산 등락률 중 절대값이 큰 값을 사용."""
     try:
@@ -24642,6 +24693,7 @@ def _handle_general_alert_entry_block(ctx: dict, source_label: str) -> bool:
         code = s.get("code", "")
         today = _now_kst().strftime("%Y%m%d")
         _upper_limit_alerted_today[code] = today
+        _save_upper_limit_alerted_today()
     _log_suppressed_alert(
         s["code"],
         s["name"],
@@ -32729,6 +32781,7 @@ if __name__ == "__main__":
         except Exception as _pe:
             _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
         _load_preclose_gap_entry_watch()
+        _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
         _load_reentry_watch()
         _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
@@ -32750,6 +32803,7 @@ if __name__ == "__main__":
     except Exception as _pe:
         _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
     _load_preclose_gap_entry_watch()
+    _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
     _load_reentry_watch()
     _load_execution_setup_watch()
     migrate_signal_log_pnl_fields()
