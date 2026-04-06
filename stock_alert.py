@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.11
+버전: v161.12
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.12 (2026-04-06): upper_limit_reached 종목 당일 재알람 차단
+  [#1] _upper_limit_alerted_today 전역 캐시 추가 — {code: date} 형태로 당일 상한가 차단 기록
+  이유: _alert_history 쿨다운이 hist_key(코드+날짜+시간) 기준이라 stale entry_hit 정리 후 새 hist_key로 재포착되면 쿨다운 우회 — 광전자가 11:10, 12:26, 15:59 세 번 알람 발송됨
+  개선점: upper_limit_reached 차단 시 코드 기준으로 당일 날짜를 캐시에 기록 → 이후 재포착 시 동일 코드+당일이면 외부알람 억제
+  주의점: 당일 날짜 기준이므로 다음 거래일에는 자동 해제됨. 상한가 풀림 후 재진입 가능 알람은 check_reentry_watch()가 별도 담당
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.11 (2026-04-06): 최우선 TOP 리스트에서 손절 완료 종목 제외
   [#1] send_top_signals()에서 _reentry_watch에 있는 종목 필터링
   이유: 손절 완료 후 재진입 감시로 등록된 종목이 _today_top_signals에 그대로 남아 TOP 1위로 표시되는 버그 — 탑머티리얼 -16.6% 손절 후에도 TOP 1위로 노출
@@ -5820,6 +5826,8 @@ def _log_error(func_name: str, e: Exception, critical: bool = False):
             _swallow_exception(e)
 _alert_history      = {}
 _internal_only_alert_history = {}
+# v161.12: upper_limit_reached 당일 알람 차단 캐시 {code: "YYYYMMDD"}
+_upper_limit_alerted_today: dict = {}
 _detected_stocks    = {}
 _pullback_history   = {}
 _news_alert_history = {}
@@ -24629,6 +24637,11 @@ def _handle_general_alert_entry_block(ctx: dict, source_label: str) -> bool:
     kept_internal = False
     if blocked_reason == "no_ask_liquidity" and _should_keep_internal_watch_on_no_ask_liquidity(live, s):
         kept_internal = _persist_blocked_capture_watch(s, source_label=source_label, blocked_reason=blocked_reason)
+    # v161.12: upper_limit_reached 시 당일 코드 기준으로 재알람 차단 기록
+    if blocked_reason == "upper_limit_reached":
+        code = s.get("code", "")
+        today = _now_kst().strftime("%Y%m%d")
+        _upper_limit_alerted_today[code] = today
     _log_suppressed_alert(
         s["code"],
         s["name"],
@@ -24812,6 +24825,12 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
                 and abs(prev.get("change_rate", 0) - safe_float(s.get("change_rate", 0), 0.0)) < 0.1):
             _log_info_msg(f"  ⏭ {name} — 동일 신호 재발송 억제 (score={prev.get('score')} change_rate={prev.get('change_rate'):+.1f}%)")
             return False
+    # v161.12: upper_limit_reached 당일 차단 확인
+    today = _now_kst().strftime("%Y%m%d")
+    if _upper_limit_alerted_today.get(code) == today:
+        _log_info_msg(f"  ⏭ {name} — upper_limit_reached 당일 재알람 차단")
+        save_signal_log(s)
+        return False
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     send_alert(s)
     _alert_history[ctx["hist_key"]] = {
