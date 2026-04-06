@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.16
+버전: v161.17
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.17 (2026-04-06): NXT전용 시간대 비NXT 종목 알람 완전 차단 — market 필드 오판 근본 수정
+  [#1] _build_analyze_result(): market 필드 명시적 보존 추가 — analyze() 결과가 원본 stock.market을 잃지 않도록
+  [#2] _build_general_alert_dispatch_context(): market!="NXT" 판단을 is_market_open()+is_nxt_open() 기반으로 재작성 — is_nxt_listed()가 _nxt_unavailable 기준이라 KRX 종목도 NXT로 오판 가능한 문제 차단
+  [#3] _should_soft_allow_no_ask_liquidity_general(): 동일 기준으로 soft allow 차단 재작성
+  [#4] _scan_rank_and_theme_candidates(): nxt_only_window 판단을 not is_market_open()+is_nxt_open() 직접 체크로 교체
+  이유: v161.16 패치1~3이 market 필드에 의존했으나, is_nxt_listed()가 _nxt_unavailable에 없는 종목을 NXT로 간주 → 조일알미늄(KRX) market="NXT" 오판 → 패치 우회 → 19:07 알람 발송. v161.16 배포(18:52) 후에도 문제 재현됨
+  개선점: market 필드 값 대신 실제 시장 상태(is_market_open/is_nxt_open) 기준으로 판단 → 오판 불가. KRX+NXT 동시 시간(09:00~15:30)엔 영향 없음
+  주의점: NXT 종목은 market="NXT" 명시 필수 — 누락 시 NXT전용 시간대에 차단됨. _build_analyze_result에 market 보존 추가로 analyze() 결과도 market 유지
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.16 (2026-04-06): KRX 장마감 후 진입 불가 종목 알람 전면 차단
   [#1] _build_general_alert_dispatch_context(): KRX 종목이고 is_market_open()=False면 즉시 None 반환 → 외부 알람 차단
   [#2] _should_soft_allow_no_ask_liquidity_general(): KRX 종목 장마감 후 soft allow 완전 차단
@@ -23380,6 +23389,8 @@ def _build_analyze_result(ctx: dict) -> dict:
         "crossday_episode_active": bool(crossday_ctx.get("episode_active")), "crossday_episode_prep": bool(crossday_ctx.get("prep")),
         "crossday_episode_confirmed": bool(crossday_ctx.get("confirmed")), "crossday_episode_reason": str(crossday_ctx.get("reason", "") or ""),
         "crossday_episode_reclaim_ratio": float(crossday_ctx.get("reclaim_ratio", 0.0) or 0.0),
+        # v161.17: market 필드 명시적 보존 — analyze() 결과가 원본 stock market을 잃지 않도록
+        "market": str(stock.get("market", "") or ""),
     }
 def analyze(stock: dict) -> dict:
     ctx = _bootstrap_analyze_context(stock)
@@ -24358,9 +24369,10 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     sig_type = str(signal.get("signal_type") or "")
     if sig_type not in ("SURGE", "STRONG_BUY", "EARLY_DETECT"):
         return False
-    # v161.16: KRX 종목은 장마감 후 soft allow 불허 — 호가 없어도 발송되는 문제 차단
-    is_nxt = str(signal.get("market") or "") == "NXT"
-    if not is_nxt and not is_market_open():
+    # v161.17: NXT전용 시간대엔 market=="NXT"인 종목만 soft allow — market 오판 방지
+    if not is_market_open() and is_nxt_open() and str(signal.get("market") or "") != "NXT":
+        return False
+    if not is_market_open() and not is_nxt_open():
         return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
@@ -24689,9 +24701,14 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
         _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
         return None
     is_nxt = str(s.get("market") or "") == "NXT"
-    # v161.16: KRX 종목은 KRX 장마감(15:30) 이후 진입 불가 → 외부 알람 차단
-    if not is_nxt and not is_market_open():
-        _log_info_msg(f"  ⏭ KRX 장마감 후 진입불가 차단: {s.get('name', s.get('code',''))} (KRX 종목, 현재 장외 시간)")
+    # v161.17: KRX 장마감 후 NXT 종목만 허용 — market 필드 오판 방지 위해 is_nxt_open()+not is_market_open() 기준 사용
+    # is_nxt_listed()가 _nxt_unavailable 기준이라 KRX 종목도 NXT로 오판 가능 → market!="NXT"이면 모두 차단
+    if not is_market_open() and is_nxt_open() and not is_nxt:
+        _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단: {s.get('name', s.get('code',''))} (market={s.get('market','')})")
+        return None
+    # KRX·NXT 모두 닫힌 시간대도 차단
+    if not is_market_open() and not is_nxt_open():
+        _log_info_msg(f"  ⏭ 전 시장 마감 후 차단: {s.get('name', s.get('code',''))}")
         return None
     resolved_hist_key = hist_key or (f"NXT_{s['code']}" if is_nxt else s["code"])
     mkt_tag = " 🟡NXT" if is_nxt else ""
@@ -32619,12 +32636,13 @@ def _scan_quiet_absorption_candidates(alerts: list, seen: set) -> None:
         _log_info_msg(f"  ⏭ quiet scan budget 절약: snapshot 생략 {skipped}건")
 def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
     _rank_scan_limit = NXT_POSTMARKET_EXTRA_RANK_LIMIT if _is_nxt_postmarket_only_window() else None
-    nxt_only_window = _is_nxt_postmarket_only_window() or _is_nxt_premarket_window()
+    # v161.17: NXT전용 시간대(KRX 닫힘+NXT 열림) 판단 — market 필드 오판 방지 위해 시장 상태 직접 체크
+    nxt_only_window = not is_market_open() and is_nxt_open()
     for stock in get_market_rank_focus_stocks(scan_limit_per_market=_rank_scan_limit):
         code = stock.get("code")
         if not code or code in seen:
             continue
-        # v161.16: NXT전용 시간대에 KRX 종목 스킵 — 진입 불가 종목 스캔 낭비 방지
+        # NXT전용 시간대엔 market=="NXT" 명시된 종목만 스캔
         if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
@@ -32632,7 +32650,7 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
         code = stock.get("code")
         if not code or code in seen:
             continue
-        # v161.16: NXT전용 시간대에 KRX 종목 스킵
+        # NXT전용 시간대엔 market=="NXT" 명시된 종목만 스캔
         if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
