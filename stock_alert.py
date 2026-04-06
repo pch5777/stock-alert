@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.14
+버전: v161.15
 날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.15 (2026-04-06): _alert_history 쿨다운 상태파일 저장/복원 — 재시작 후 알람 몰아치기 방지
+  [#1] ALERT_HISTORY_FILE 상수 추가 + _save_alert_history() / _load_alert_history() 함수 신규
+  [#2] _dispatch_general_alert_signal() 발송 직후 _save_alert_history() 호출 → 발송 즉시 저장
+  [#3] 정규 시작 블록 + 대기모드 블록 양쪽에 _load_alert_history() 호출 추가
+  이유: 재배포/재시작 시 _alert_history 메모리 초기화 → 당일 이미 발송한 종목(광전자·GS글로벌·남선알미늄 등)이 쿨다운 없이 재발송 — 로그에서 재시작 후 17:52~17:53에 진입가 감시 재등록 + 알람 몰아치기 확인
+  개선점: 발송 즉시 상태파일 저장 → 재시작 시 복원 → get_regime_cooldown() 체크가 정상 작동해 catch-up 스캔에서도 중복 발송 자동 차단. 당일 날짜 기준이므로 익일 자동 무효화. 4시간 이내 항목만 저장해 파일 비대화 방지
+  주의점: _load_alert_history()는 _load_upper_limit_alerted_today() 직후 호출. get_regime_cooldown() 호출 시점에 regime이 초기화되어 있어야 하므로 _load_dynamic_params() 이전에 위치해야 함
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.14 (2026-04-06): 봇 시작 시 _load_upper_limit_alerted_today() 호출 연결
   [#1] 정규 시작 블록 + 대기모드 블록 양쪽에 _load_upper_limit_alerted_today() 추가
   이유: v161.13에서 함수는 만들었으나 봇 시작 시 호출 연결이 누락 → 재시작 후 상한가 차단 목록이 복원되지 않아 당일 재알람 차단 무효화
@@ -5838,6 +5846,8 @@ def _log_error(func_name: str, e: Exception, critical: bool = False):
             _swallow_exception(e)
 _alert_history      = {}
 _internal_only_alert_history = {}
+# v161.15: _alert_history 쿨다운 상태파일 (재시작 후 당일 알람 중복 차단 유지)
+ALERT_HISTORY_FILE = _state_path("alert_history.json")
 # v161.12: upper_limit_reached 당일 알람 차단 캐시 {code: "YYYYMMDD"}
 _upper_limit_alerted_today: dict = {}
 UPPER_LIMIT_ALERTED_FILE = _state_path("upper_limit_alerted_today.json")
@@ -8175,6 +8185,42 @@ def _load_preclose_gap_entry_watch() -> None:
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         _preclose_gap_entry_watch = {}
+def _save_alert_history() -> None:
+    """v161.15: _alert_history 쿨다운 상태파일 저장 — 재시작 후 당일 알람 중복 차단 유지."""
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        now_ts = time.time()
+        max_cooldown = 4 * 3600  # 최대 4시간치만 저장 (당일 범위)
+        clean = {
+            k: v for k, v in (_alert_history or {}).items()
+            if isinstance(v, dict) and (now_ts - float(v.get("ts", 0) or 0)) < max_cooldown
+        }
+        _write_json_atomic(ALERT_HISTORY_FILE, {"date": today, "history": clean}, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _load_alert_history() -> None:
+    """v161.15: 재시작 시 _alert_history 쿨다운 복원 — 당일 날짜 기준, 익일 자동 무효화."""
+    global _alert_history
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        data = _read_json_safe(ALERT_HISTORY_FILE, {})
+        if isinstance(data, dict) and data.get("date") == today:
+            raw = data.get("history", {})
+            if isinstance(raw, dict):
+                now_ts = time.time()
+                # 쿨다운 아직 유효한 항목만 복원
+                _alert_history = {
+                    k: v for k, v in raw.items()
+                    if isinstance(v, dict) and (now_ts - float(v.get("ts", 0) or 0)) < get_regime_cooldown()
+                }
+                _log_info_msg(f"📂 알람 이력 복원 {len(_alert_history)}건 (쿨다운 유효)")
+                return
+        _alert_history = {}
+    except Exception as e:
+        _swallow_exception(e)
+        _alert_history = {}
+
 def _save_upper_limit_alerted_today() -> None:
     """v161.13: upper_limit_reached 당일 차단 목록 상태파일 저장."""
     try:
@@ -24890,6 +24936,7 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         "score": safe_int(s.get("score", 0), 0),
         "change_rate": safe_float(s.get("change_rate", 0), 0.0),
     }
+    _save_alert_history()   # v161.15: 발송 즉시 상태파일 저장 → 재시작 후 쿨다운 유지
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
@@ -32782,6 +32829,7 @@ if __name__ == "__main__":
             _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
         _load_preclose_gap_entry_watch()
         _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
+        _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
         _load_reentry_watch()
         _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
@@ -32804,6 +32852,7 @@ if __name__ == "__main__":
         _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
     _load_preclose_gap_entry_watch()
     _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
+    _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
     _load_reentry_watch()
     _load_execution_setup_watch()
     migrate_signal_log_pnl_fields()
