@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.8
-날짜: 2026-04-05
+버전: v161.9
+날짜: 2026-04-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.9 (2026-04-06): 섹터 제한 완화 — 급등장 자동 감지 + 환경변수화
+  [#1] SCAN_SECTOR_LIMIT 환경변수 추가 (기본값 3) — 기존 하드코딩 3을 환경변수로 교체
+  이유: 섹터 제한이 하드코딩 3으로 고정되어 전기·전자 14번째 RF머트리얼즈(+29%), 7번째 티엠씨(+28%) 등 강한 종목이 섹터 제한에 무더기 탈락
+  개선점: Railway에서 SCAN_SECTOR_LIMIT 값 조정 가능
+  주의점: 기본값 3 유지 — 평상시 노이즈 억제 기준 동일
+  [#2] _apply_scan_sector_gate() 급등장 자동 감지 — 동일 섹터 후보 7개 이상이면 limit 자동 +3 확대
+  이유: 오늘처럼 미국 관세 이슈로 전 섹터 동반 급등 시 섹터 내 상위 3개만 통과하면 핵심 종목 누락
+  개선점: 한 섹터에 후보가 몰리는 급등장에서 자동으로 제한 완화 → 신세계·RF머트리얼즈급 종목 포착
+  주의점: 급등장 판단은 sector_counts 기준 — API 추가 호출 없음
+  [#3] change_rate >= 15% 이상 종목은 섹터 제한 면제
+  이유: +29% 신세계, +29% RF머트리얼즈, +28% 티엠씨 같은 극강 종목이 섹터 순서 때문에 탈락하는 것은 수익 기회 직접 손실
+  개선점: 등락률 15% 이상이면 섹터 카운트 증가 없이 무조건 통과
+  주의점: 15% 임계값은 SCAN_SECTOR_EXEMPT_RATE 환경변수로 조정 가능
 - v161.8 (2026-04-05): /재료 명령어에 유튜브 Gemini 분석 섹션 추가
   [#1] _handle_telegram_material_command()에 ⑤ 유튜브 AI 분석 재료 섹션 추가
   이유: Gemini가 유튜브 영상을 분석해도 /재료 현황에 별도 표시가 없어 결과 확인 불가
@@ -5102,6 +5115,10 @@ GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "한국주식 급등재료,주식 테마 상승,공시 호재 종목,반도체 방산 바이오 주식") or "").split(",") if x.strip()]
 YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") or "5")      # 키워드당 최대 영상 수
+# ── 섹터 제한 (v161.9) ──
+SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
+SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "15.0") or "15.0")  # 이 등락률 이상이면 섹터 제한 면제
+SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "7") or "7")  # 섹터 후보 이 수 이상이면 급등장 판단 → limit +3
 MATERIAL_DOWNSIDE_SCENARIOS = [
     {
         "id": "audit_report_delay",
@@ -32500,24 +32517,51 @@ def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt
                 _append_scan_alert(alerts, seen, s, hist_key=f"NXT_{code}", seen_code=code)
 def _apply_scan_sector_gate(alerts: list) -> list:
     alerts = sorted(alerts, key=_sector_gate_sort_key, reverse=True)
-    max_signals_per_sector = 3
-    max_signals_misc = 4
-    sector_counts = {}
+    max_signals_per_sector = int(SCAN_SECTOR_LIMIT or 3)
+    max_signals_misc = max_signals_per_sector + 1  # 기타 섹터는 1개 더 허용
+    exempt_rate = float(SCAN_SECTOR_EXEMPT_RATE or 15.0)
+    burst_threshold = int(SCAN_SECTOR_BURST_THRESHOLD or 7)
+
+    # 섹터별 후보 수 사전 집계 → 급등장 판단용
+    sector_total: dict = {}
+    for s in alerts:
+        sec = str(s.get("sector_theme") or s.get("sector") or "기타").strip() or "기타"
+        sector_total[sec] = sector_total.get(sec, 0) + 1
+
+    sector_counts: dict = {}
     filtered_alerts = []
     for s in alerts:
         sec = _hydrate_alert_sector_theme(s, force_lookup=True)
         if not str(s.get("name") or "").strip() and s.get("code"):
             s["name"] = _resolve_stock_name(s.get("code"), s.get("name", ""))
-        sec_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
+
+        change_rate = float(s.get("change_rate") or 0.0)
+
+        # ── 규칙1: 등락률 15% 이상 → 섹터 제한 면제 (카운트도 증가 안 함)
+        if change_rate >= exempt_rate:
+            if not s.get("sector_theme") and sec != "기타":
+                s["sector_theme"] = sec
+            filtered_alerts.append(s)
+            continue  # sector_counts 증가 없이 통과
+
+        # ── 규칙2: 섹터별 한도 계산
+        base_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
+
+        # 테마·재료 우선 종목 +2
         if s.get("theme_chain_force_hit") or s.get("force_external_capture_alert") or s.get("material_first_priority_hit") or s.get("direct_news_hit"):
-            sec_limit += 2
+            base_limit += 2
+
+        # 급등장 감지: 이 섹터 전체 후보가 burst_threshold 이상이면 +3
+        if sector_total.get(sec, 0) >= burst_threshold:
+            base_limit += 3
+
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        if sector_counts[sec] <= sec_limit:
+        if sector_counts[sec] <= base_limit:
             if not s.get("sector_theme") and sec != "기타":
                 s["sector_theme"] = sec
             filtered_alerts.append(s)
         else:
-            _record_shadow_capture(s.get("code", ""), s.get("name", s.get("code", "")), "sector_limit", s.get("signal_type", ""), stage="sector_gate", extra={"sector": sec, "score": s.get("score", 0), "change_rate": s.get("change_rate", 0)})
+            _record_shadow_capture(s.get("code", ""), s.get("name", s.get("code", "")), "sector_limit", s.get("signal_type", ""), stage="sector_gate", extra={"sector": sec, "score": s.get("score", 0), "change_rate": change_rate})
             _log_info_msg(f"  ⏭ 섹터 제한({sec} {sector_counts[sec]}번째): {s.get('name','')} 생략")
     return filtered_alerts
 def _dispatch_scan_alerts(alerts: list) -> None:
