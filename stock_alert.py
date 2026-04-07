@@ -3,10 +3,47 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.22
+버전: v161.27
 날짜: 2026-04-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.27 (2026-04-07): candidate_miss 워치독 실질 완화 — 후보군 확대 자동 적용
+  [#1] _watchdog_apply_relax(): candidate_miss 시 알림만 하던 것 → rank_session_top_n_override(+50, 최대150) + universe_max_per_theme_override(+4, 최대15) _dynamic에 즉시 반영, 30분 후 복원
+  [#2] _get_rank_topn(): _dynamic["rank_session_top_n_override"] 존재 시 상한 확대 적용
+  [#3] _rank_from_universe(): _dynamic["universe_max_per_theme_override"] 우선 참조, 기본값 6→8 상향
+  이유: 텔레그램 "코드수정 요청 — candidate_miss" 알람에서 워치독이 완화 불가라고 판단하고 알림만 보냄. 실제로는 rank_top_n·테마캡 확대로 후보군 증원 가능. 코리아써키트 +29%·한일철강 +28%가 테마 캡(6종목) 또는 TOP_N(50) 초과로 편입 실패한 것이 원인
+  개선점: candidate_miss 발동 즉시 후보군 50종목 추가 편입 + 테마당 허용 종목 4개 추가 → 침묵 상황 자동 해소. 30분 후 자동 복원
+  주의점: 완화 중에는 스캔 부하 증가 가능. 구조적 fallback 체인 문제(KIS API 불통)는 여전히 코드 수정 필요
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.26 (2026-04-07): 섹터 거래대금 집계 기능 추가 — /재료 명령어 상단 표시
+  [#1] _fetch_sector_volume_rank() 신규 — 네이버 업종 시세 스크래핑, 섹터별 거래대금(억/조 단위) 순위 집계, 3분 캐시
+  [#2] _handle_telegram_material_command(): /재료 상단에 "섹터 거래대금 Top8" 블록 추가 (등락률·거래대금·방향 이모지 포함)
+  [#3] _sector_volume_cache 전역 캐시 추가
+  이유: 한투 "지금 섹터는?" 대비 섹터별 실제 자금 흐름(거래대금) 정보가 없었음. 봇은 등락률·거래량비율 기반이라 "어느 섹터에 돈이 얼마나 들어왔는지" 금액 기준 파악 불가
+  개선점: /재료 입력 시 섹터 거래대금 Top8을 조/억 단위로 즉시 확인 가능. 3분 캐시로 API 부하 최소화
+  주의점: 네이버 업종 시세 페이지 HTML 구조 변경 시 파싱 실패 가능 — 실패 시 해당 블록 생략(예외 swallow). 업종명은 네이버 기준
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.25 (2026-04-07): 손절가·목표가 0 문제 수정 — ATR 과대 시 entry 기반 하한 보장
+  [#1] calc_dynamic_stop_target(): stop≤0 또는 stop≥entry이면 entry×0.93(−7%) 하한 적용, target≤entry이면 entry×1.10(+10%) 하한 적용
+  이유: ATR이 entry보다 클 경우(저가주·급등 직후) stop=음수 또는 0이 계산되어 신호저장 로그에 "손절0 목표0" 표시. 이노인스트루먼트 +29.9% [NEAR_UPPER] 진입2,045 손절0 목표0 사례 확인
+  개선점: ATR 기반 계산이 유효하면 그대로 사용, 음수/0/역전 시에만 고정비율 fallback 적용
+  주의점: 하한값(−7%/+10%)은 하드코딩. 추후 signal_type별 차등 적용 가능
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.24 (2026-04-07): 상한가 풀림 감지 알람 추가
+  [#1] _check_upper_limit_release() 신규 — _upper_limit_alerted_today 등록 종목의 ask_qty 복원(상한가 풀림) 매 스캔 사이클 감지
+  [#2] _run_scan_followup_hooks()에 _check_upper_limit_release() 호출 추가
+  이유: 상한가 종목이 매도호가 복원(풀림) 시 즉시 매수 가능해지지만 알람 기능이 없었음 — 이노인스트루먼트처럼 오전에 상한가 후 장중 풀리면 재진입 기회를 놓침
+  개선점: ask_qty > 0 복원 + change_rate >= 10% 조건 충족 시 즉시 "🔓 상한가 풀림" 알람 발송. 발송 후 _upper_limit_alerted_today에서 제거 → 일반 스캔 포착 재개
+  주의점: 매 스캔 사이클(20초)마다 체크. 풀림 직후 변동성 주의 문구 포함. KRX 장중엔 KRX 가격, 장후엔 NXT 가격 기준
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.23 (2026-04-07): 상한가 재알람 차단 강화 + 섹터 면제 기준 개선 + candidate_miss 완화
+  [#1] _finalize_general_alert_dispatch(): NEAR_UPPER/UPPER_LIMIT 또는 change_rate>=29% 발송 즉시 _upper_limit_alerted_today 등록 + 파일 저장
+  [#2] _apply_scan_sector_gate(): change_rate 스냅샷 지연 보정 — prev_close 기반 실계산 change_rate와 max() 비교로 면제 오작동 방지
+  [#3] SCAN_SECTOR_EXEMPT_RATE 기본값 15→10% 완화 — candidate_miss 완화 (코리아써키트 +29% 같은 종목이 섹터 제한에 걸리는 문제)
+  이유: ①이노인스트루먼트가 오전에 상한가가 됐지만 봇 미포착 → _upper_limit_alerted_today에 기록 없음 → 10:37 섹터대장 감시에서 재포착 시 알람 발송. NEAR_UPPER 발송 후 차단 등록이 누락됨 ②코리아써키트 +29%가 스캔 당시 change_rate 스냅샷이 낮아 섹터 면제 미적용 → 섹터 9번째 제한에 걸림 ③워치독 candidate_miss: 외부 상승 30개 중 후보군 미포함
+  개선점: 상한가류 발송 즉시 차단 등록 → 섹터대장/재포착 경로에서도 당일 재알람 불가. change_rate max() 비교로 스냅샷 오차 보정. 면제 기준 10%로 완화해 강한 상승 종목 섹터 제한 통과
+  주의점: SCAN_SECTOR_EXEMPT_RATE 환경변수로 재조정 가능. 10% 완화로 섹터 내 알람 수 소폭 증가 가능 — 품질 모니터링 필요
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.22 (2026-04-07): 알람 현재가 실시간 교정 근본 수정 — _build_general_alert_dispatch_context 내부로 이동
   [#1] _build_general_alert_dispatch_context(): live_price 확정 직후 s["price"]/s["change_rate"] 즉시 갱신
   [#2] _finalize_general_alert_dispatch(): v161.21의 send_alert 직전 중복 패치 제거 — 근본 위치에서 처리하므로 불필요
@@ -4214,6 +4251,90 @@ def run_daily_self_audit(stage: str = "krx") -> dict:
 # ============================================================
 # v83: 외부 순위 소스 스크래핑 (KIS fallback 다변화)
 # ============================================================
+# v161.26: 섹터별 거래대금 집계 캐시
+_sector_volume_cache: dict = {"ts": 0, "data": []}
+
+def _fetch_sector_volume_rank(top_n: int = 10) -> list:
+    """v161.26: 네이버 증권 업종별 시세에서 거래대금 순위 집계.
+    반환: [{"sector": str, "amount_bn": float, "change_rate": float}, ...]
+    amount_bn: 거래대금 (억원 단위)
+    캐시 TTL: 3분
+    """
+    global _sector_volume_cache
+    now = time.time()
+    if now - _sector_volume_cache.get("ts", 0) < 180:
+        return list(_sector_volume_cache.get("data", []))
+    try:
+        # 네이버 업종 시세 (kospi=0, kosdaq=1)
+        results = {}
+        for sosok, mkt in [("0", "코스피"), ("1", "코스닥")]:
+            try:
+                url = "https://finance.naver.com/sise/sise_group.naver"
+                resp = requests.get(url, params={"type": "업종", "sosok": sosok},
+                                    timeout=10, headers=_random_ua())
+                resp.raise_for_status()
+                apparent = (resp.apparent_encoding or "").strip()
+                if apparent:
+                    resp.encoding = apparent
+                else:
+                    resp.encoding = "euc-kr"
+                soup = BeautifulSoup(resp.text, "html.parser")
+                rows = soup.select("table.type_1 tr, table.group_list tr")
+                if not rows:
+                    rows = soup.select("tr")
+                for row in rows:
+                    tds = row.find_all("td")
+                    if len(tds) < 5:
+                        continue
+                    a_tag = row.find("a")
+                    if not a_tag:
+                        continue
+                    sector_name = a_tag.get_text(strip=True)
+                    if not sector_name or len(sector_name) < 2:
+                        continue
+                    # 각 td에서 거래대금(억원) 추출 — 숫자가 큰 값이 거래대금
+                    amounts = []
+                    for td in tds:
+                        txt = td.get_text(strip=True).replace(",", "")
+                        try:
+                            val = float(txt)
+                            if val > 100:  # 100억 이상만 거래대금으로 간주
+                                amounts.append(val)
+                        except ValueError:
+                            continue
+                    if not amounts:
+                        continue
+                    amount = max(amounts)
+                    # 등락률 추출
+                    rate = 0.0
+                    for td in tds:
+                        txt = td.get_text(strip=True).replace(",", "").replace("+", "")
+                        try:
+                            val = float(txt)
+                            if -15.0 < val < 15.0 and val != 0.0:
+                                rate = val
+                                break
+                        except ValueError:
+                            continue
+                    key = sector_name
+                    if key not in results or results[key]["amount_bn"] < amount:
+                        results[key] = {
+                            "sector": sector_name,
+                            "amount_bn": amount,
+                            "change_rate": rate,
+                            "market": mkt,
+                        }
+            except Exception as e:
+                _log_warn_msg(f"  ⚠️ 섹터 거래대금 {mkt} 스크래핑 실패: {e}")
+                continue
+
+        ranked = sorted(results.values(), key=lambda x: x["amount_bn"], reverse=True)[:top_n]
+        _sector_volume_cache["ts"] = now
+        _sector_volume_cache["data"] = ranked
+        return ranked
+    except Exception as e:
+        _swallow_exception(e)
+        return []
 def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
     """
     네이버 증권 순위 스크래핑.
@@ -4514,9 +4635,18 @@ def _watchdog_apply_relax(main_reason: str) -> list:
             _watchdog_relaxed_until = time.time() + relax_sec
             changes.append(f"min_score_normal {old_n} → {new_n} (호가차단 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
     elif main_reason == "candidate_miss":
-        # 🔧 코드 구조 문제: 후보군 자체가 비어있음 → 파라미터로 해결 불가
-        # KIS fallback 체인 or 유니버스 로딩 문제 → 운영자에게 알림만
-        changes.append("🔴 코드 구조 문제: 외부소스 상승 종목이 후보군에 미포함 — fallback 체인 점검 필요 (코드 수정 요망)")
+        # v161.27: 파라미터로 부분 완화 가능한 항목 즉시 적용
+        # ① RANK_SESSION_TOP_N 일시 확대 → 더 많은 종목이 랭킹후보로 편입
+        old_top_n = int(_dynamic.get("rank_session_top_n_override", 0) or RANK_SESSION_TOP_N)
+        new_top_n = min(old_top_n + 50, 150)
+        _dynamic["rank_session_top_n_override"] = new_top_n
+        # ② UNIVERSE_MAX_PER_THEME 일시 완화 → 테마 내 후순위 종목도 편입
+        old_theme_cap = int(_dynamic.get("universe_max_per_theme_override", 0) or 8)
+        new_theme_cap = min(old_theme_cap + 4, 15)
+        _dynamic["universe_max_per_theme_override"] = new_theme_cap
+        _watchdog_relaxed_until = time.time() + relax_sec
+        changes.append(f"🔧 candidate_miss 완화: rank_top_n {old_top_n}→{new_top_n}, theme_cap {old_theme_cap}→{new_theme_cap} ({_WATCHDOG_RELAX_MIN}분 후 복원)")
+        changes.append("🔴 구조 문제 병존: fallback 체인 점검 필요 (코드 수정 요망)")
     elif main_reason == "기타":
         # 원인 불명 — min_score만 소폭 완화
         old_n = int(_dynamic.get("min_score_normal", 56))
@@ -5214,7 +5344,7 @@ YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUE
 YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") or "5")      # 키워드당 최대 영상 수
 # ── 섹터 제한 (v161.9) ──
 SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
-SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "15.0") or "15.0")  # 이 등락률 이상이면 섹터 제한 면제
+SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "10.0") or "10.0")  # v161.23: 15→10% — candidate_miss 완화, 이 등락률 이상이면 섹터 제한 면제
 SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "7") or "7")  # 섹터 후보 이 수 이상이면 급등장 판단 → limit +3
 MATERIAL_DOWNSIDE_SCENARIOS = [
     {
@@ -12413,11 +12543,16 @@ def _get_rank_market_mode() -> str:
     return "focus" if dtime(8, 0) <= now_t <= dtime(10, 0) else "session"
 def _get_rank_topn(mode: str = "") -> tuple[int, int]:
     mode = mode or _get_rank_market_mode()
+    # v161.27: candidate_miss 워치독 완화 시 _dynamic 오버라이드 적용
+    override = int(_dynamic.get("rank_session_top_n_override", 0) or 0)
     if mode == "focus":
-        return RANK_FOCUS_TOP_N, max(RANK_FOCUS_TOP_N, RANK_FOCUS_EXPANDED_TOP_N)
+        base = max(RANK_FOCUS_TOP_N, override) if override else RANK_FOCUS_TOP_N
+        return base, max(base, RANK_FOCUS_EXPANDED_TOP_N)
     if mode == "session":
-        return RANK_SESSION_TOP_N, max(RANK_SESSION_TOP_N, RANK_SESSION_EXPANDED_TOP_N)
-    return RANK_SESSION_TOP_N, max(RANK_SESSION_TOP_N, RANK_SESSION_EXPANDED_TOP_N)
+        base = max(RANK_SESSION_TOP_N, override) if override else RANK_SESSION_TOP_N
+        return base, max(base, RANK_SESSION_EXPANDED_TOP_N)
+    base = max(RANK_SESSION_TOP_N, override) if override else RANK_SESSION_TOP_N
+    return base, max(base, RANK_SESSION_EXPANDED_TOP_N)
 def _get_rank_scan_limit(mode: str = "") -> int:
     mode = mode or _get_rank_market_mode()
     return RANK_FOCUS_SCAN_LIMIT_PER_MARKET if mode == "focus" else RANK_SESSION_SCAN_LIMIT_PER_MARKET
@@ -12706,7 +12841,7 @@ def _rank_from_universe(market: str = "KRX") -> list:
     top_n, expanded_top_n = _get_rank_topn(mode)
     snapshot = _get_universe_rank_snapshot(market, force=False)
     items = _build_rank_candidate_union(snapshot, market, top_n=top_n, expanded_top_n=expanded_top_n, scan_limit=top_n)
-    max_per_theme = int(os.getenv("UNIVERSE_MAX_PER_THEME", "6") or "6")
+    max_per_theme = int(_dynamic.get("universe_max_per_theme_override", 0) or os.getenv("UNIVERSE_MAX_PER_THEME", "8") or "8")  # v161.27: 6→8 기본값, candidate_miss 시 _dynamic 오버라이드
     if max_per_theme > 0:
         bucket = {}
         diversified = []
@@ -25041,6 +25176,13 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         "change_rate": safe_float(s.get("change_rate", 0), 0.0),
     }
     _save_alert_history()   # v161.15: 발송 즉시 상태파일 저장 → 재시작 후 쿨다운 유지
+    # v161.23: NEAR_UPPER/UPPER_LIMIT 발송 즉시 당일 차단 등록 — 오전 상한가 종목이 봇 미포착 상태면
+    # _upper_limit_alerted_today에 기록이 없어 나중에 재포착 시 알람이 나가는 문제 방지
+    if signal_type in ("UPPER_LIMIT", "NEAR_UPPER") or safe_float(s.get("change_rate", 0), 0.0) >= 29.0:
+        today = _now_kst().strftime("%Y%m%d")
+        _upper_limit_alerted_today[code] = today
+        _save_upper_limit_alerted_today()
+        _log_info_msg(f"  🔒 {name} — 상한가류 발송 완료, 당일 재알람 차단 등록")
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
@@ -28806,6 +28948,27 @@ def _handle_telegram_material_command():
         now_str = _now_kst().strftime("%Y-%m-%d %H:%M")
         parts = [f"📡 <b>축적 재료 현황</b>  {now_str}\n━━━━━━━━━━━━━━━"]
 
+        # ⓪ 섹터 거래대금 순위 — v161.26 신규
+        try:
+            sv_rank = _fetch_sector_volume_rank(top_n=8)
+            if sv_rank:
+                sv_lines = ["💰 <b>섹터 거래대금 Top8</b>"]
+                for i, sv in enumerate(sv_rank, 1):
+                    amt = sv.get("amount_bn", 0)
+                    rate = sv.get("change_rate", 0.0)
+                    sector = sv.get("sector", "")
+                    # 억→조 변환 (1조=10000억)
+                    if amt >= 10000:
+                        amt_str = f"{amt/10000:.1f}조"
+                    else:
+                        amt_str = f"{int(amt):,}억"
+                    rate_emoji = "🔴" if rate >= 1.0 else ("🔵" if rate <= -1.0 else "⬜")
+                    rate_str = f"{rate:+.1f}%" if rate != 0.0 else "0.0%"
+                    sv_lines.append(f"  {i}. {sector}  <b>{amt_str}</b>  {rate_emoji}{rate_str}")
+                parts.append("\n" + "\n".join(sv_lines))
+        except Exception as e:
+            _swallow_exception(e)
+
         # ① 시나리오 액션보드 — 중복 이벤트 통합
         try:
             board = _load_premarket_action_board()
@@ -31963,8 +32126,15 @@ def calc_dynamic_stop_target(code: str, entry: int, signal_type: str | None = No
             tgt_m   = max(tgt_m   * 0.80, 1.5)
     stop      = int((entry - atr * stop_m)  / 10) * 10
     target    = int((entry + atr * tgt_m)   / 10) * 10
-    stop_pct  = round((entry - stop)   / entry * 100, 1)
-    tgt_pct   = round((target - entry) / entry * 100, 1)
+    # v161.25: ATR 과대 시 음수/0 결과 방지 — entry 기반 고정비율 하한 보장
+    min_stop   = int(entry * 0.93 / 10) * 10   # 최대 -7% 손절
+    min_target = int(entry * 1.10 / 10) * 10   # 최소 +10% 목표
+    if stop <= 0 or stop >= entry:
+        stop = min_stop
+    if target <= entry:
+        target = min_target
+    stop_pct  = round((entry - stop)   / entry * 100, 1) if entry > 0 else 7.0
+    tgt_pct   = round((target - entry) / entry * 100, 1) if entry > 0 else 10.0
     return stop, target, stop_pct, tgt_pct, True
 # ============================================================
 # 📅 ④ 실적 발표 전후 필터
@@ -32802,6 +32972,12 @@ def _apply_scan_sector_gate(alerts: list) -> list:
             s["name"] = _resolve_stock_name(s.get("code"), s.get("name", ""))
 
         change_rate = float(s.get("change_rate") or 0.0)
+        # v161.23: 섹터 면제 판단 시 prev_close 기반 실계산 change_rate도 고려 — 스냅샷 지연 보정
+        prev_close = safe_int(s.get("prev_close", 0), 0)
+        price_now = safe_int(s.get("price", 0), 0)
+        if prev_close > 0 and price_now > 0:
+            calc_rate = ((price_now - prev_close) / prev_close) * 100.0
+            change_rate = max(change_rate, calc_rate)  # 더 높은 값 사용
 
         # ── 규칙1: 등락률 15% 이상 → 섹터 제한 면제 (카운트도 증가 안 함)
         if change_rate >= exempt_rate:
@@ -32847,6 +33023,54 @@ def _dispatch_scan_alerts(alerts: list) -> None:
             _dispatch_general_alert_signal(s, hist_key=hist_key, source_label="일반 포착")
     finally:
         _dispatch_scan_lock.release()
+def _check_upper_limit_release() -> None:
+    """v161.24: 당일 상한가 차단 종목의 매도호가 복원(상한가 풀림) 감지 → 즉시 알람.
+    _upper_limit_alerted_today에 등록된 종목을 매 스캔 사이클마다 체크.
+    ask_qty > 0 복원 확인 시 → 상한가 풀림 알람 발송 + 차단 목록에서 제거.
+    """
+    if not _upper_limit_alerted_today or not is_any_market_open():
+        return
+    today = _now_kst().strftime("%Y%m%d")
+    released = []
+    for code, date_str in list(_upper_limit_alerted_today.items()):
+        if date_str != today:
+            continue
+        try:
+            if is_market_open():
+                cur = get_stock_price(code)
+            elif is_nxt_open() and is_nxt_listed(code):
+                cur = get_nxt_stock_price(code) or get_stock_price(code)
+            else:
+                cur = get_stock_price(code)
+            if not cur:
+                continue
+            ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+            price = safe_int(cur.get("price", 0), 0)
+            change_rate = safe_float(cur.get("change_rate", 0), 0.0)
+            if not price:
+                continue
+            # 매도호가 복원 + 등락률이 여전히 강함(10% 이상) 확인
+            if ask_qty > 0 and change_rate >= 10.0:
+                name = _resolve_stock_name(code, cur.get("name", code))
+                _log_info_msg(f"  🔓 상한가 풀림 감지: {name} ask={ask_qty:,} price={price:,} ({change_rate:+.1f}%)")
+                send_with_chart_buttons(
+                    f"🔓 <b>[상한가 풀림 — 매수 가능]</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🔴 <b>{name}</b>  <code>{code}</code>\n"
+                    f"📍 현재가: <b>{price:,}원</b>  ({change_rate:+.1f}%)\n"
+                    f"✅ 매도호가 복원 ({ask_qty:,}주) — 즉시 매수 가능\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"⚠️ 상한가 풀림 직후 변동성 주의 — 호가·거래량 확인 후 진입",
+                    code, name
+                )
+                released.append(code)
+        except Exception as e:
+            _swallow_exception(e)
+    for code in released:
+        _upper_limit_alerted_today.pop(code, None)
+    if released:
+        _save_upper_limit_alerted_today()
+        _log_info_msg(f"  🔓 상한가 풀림 차단 해제: {len(released)}종목")
 def _run_scan_followup_hooks() -> None:
     check_execution_setup_watch()
     _tick_exec_speed_prewarm()
@@ -32854,6 +33078,7 @@ def _run_scan_followup_hooks() -> None:
     check_preclose_gap_entry_watch()
     run_entry_defense_monitor()
     check_reentry_watch()
+    _check_upper_limit_release()   # v161.24: 상한가 풀림 감지
     track_signal_results()
 def run_price_first_scan() -> None:
     run_scan()
