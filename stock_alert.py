@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.20
+버전: v161.22
 날짜: 2026-04-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.22 (2026-04-07): 알람 현재가 실시간 교정 근본 수정 — _build_general_alert_dispatch_context 내부로 이동
+  [#1] _build_general_alert_dispatch_context(): live_price 확정 직후 s["price"]/s["change_rate"] 즉시 갱신
+  [#2] _finalize_general_alert_dispatch(): v161.21의 send_alert 직전 중복 패치 제거 — 근본 위치에서 처리하므로 불필요
+  이유: v161.21은 send_alert 직전에만 price를 교정했으나, 그 이전에 호출되는 _handle_general_alert_entry_block·_handle_general_alert_external_policy·save_signal_log 등 모든 하위 로직도 스냅샷 가격 기반으로 동작 중. live_price 확정 즉시 s["price"]를 갱신하면 이후 모든 로직이 실시간 가격 기준으로 통일됨
+  개선점: entry_block 판단, soft_allow, 내부기록, 알람 메시지 표시 전부 실시간 가격 기준. live_price=0(API 실패)이면 스냅샷 유지
+  주의점: change_rate=0.0이면 갱신 안 함 (API가 0을 반환할 수 있으므로 스냅샷 유지)
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
+- v161.21 (2026-04-07): 알람 현재가 실시간 재조회 가격으로 교정
+  [#1] _finalize_general_alert_dispatch(): send_alert(s) 직전 ctx["live_price"]로 s["price"] 갱신, live change_rate도 반영
+  이유: 스캔 포착 시점 스냅샷 가격이 알람 메시지에 그대로 표시됨 — 서울반도체 08:41 알람에서 실제 시장가 10,500원인데 포착가 10,530원이 "현재가"로 표시. _build_general_alert_dispatch_context에서 live_price를 재조회하지만 ctx에만 저장하고 s["price"]에 반영 안 함
+  개선점: dispatch 직전 live_price > 0이면 s["price"] 덮어쓰기 → 알람 메시지 현재가가 발송 시점 실제 가격과 일치
+  주의점: live_price=0이면 기존 스냅샷 가격 유지 (API 조회 실패 대비). change_rate도 live 값으로 교정
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.20 (2026-04-07): Gemini SDK 신버전 교체 + 429 대응 + 분석 딜레이
   [#1] _analyze_youtube_video_with_gemini(): google.generativeai(deprecated) → google.genai 신 SDK 교체
   [#2] _analyze_youtube_video_with_gemini(): 429/ResourceExhausted 발생 시 30초 대기 후 1회 재시도
@@ -24767,6 +24780,13 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
     s = _coerce_run_scan_signal_defaults(s, fallback_code=s.get("code"))
     live = _get_live_quote_for_signal(s)
     live_price = safe_int((live or {}).get("price", s.get("price", 0)), 0)
+    # v161.22: live_price 확정 즉시 s["price"] 갱신 — 이후 모든 하위 로직이 실시간 가격 기준으로 동작
+    # (entry_block 판단, soft_allow, save_signal_log, send_alert 등 전부 live_price 기반)
+    if live_price > 0:
+        s["price"] = live_price
+        live_change_rate = safe_float((live or {}).get("change_rate", 0), 0.0)
+        if live_change_rate != 0.0:
+            s["change_rate"] = live_change_rate
     entry = safe_int(s.get("entry_price", 0), 0)
     blocked_reason = ""
     if entry and live_price and live_price >= entry:
