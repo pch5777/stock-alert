@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.28
+버전: v161.29
 날짜: 2026-04-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.29 (2026-04-07): KIS API 미활용 데이터 전면 활용 + 3가지 버그 수정
+  [#1] get_stock_price(): low(저가)/upper_price(상한가)/lower_price(하한가)/acml_tr_pbmn(누적거래대금)/prdy_vrss_sign(전일대비부호) 필드 추가
+  [#2] _detect_entry_block_reason(): upper_price 직접 비교(price>=upper_price) + prdy_vrss_sign=="1" 조건으로 상한가 정확 판단 — change_rate>=29% 단순 계산보다 정확
+  [#3] _build_general_alert_dispatch_context(): upper_price 기반 NEAR_UPPER 강제변환 강화 — 상한가급 종목이 SURGE로 알람 나가는 문제 차단
+  [#4] _notify_material_downside_block(analyze_bootstrap): stock_name==code이면 _resolve_stock_name()으로 보완 — 035290처럼 종목명 없이 코드만 표시되던 문제 수정
+  [#5] _notify_material_downside_block(analyze_filters): 동일 보완 적용
+  [#6] _apply_analyze_market_context(): 저가 대비 반등폭·당일 고가 갱신·거래대금 기준·갭업 유지·상한가 도달 시 차단 점수화 추가
+  이유: ①KIS API가 반환하는 상한가(stck_mxpr)/저가(stck_lwpr)/거래대금(acml_tr_pbmn) 등을 활용 안 해 정확도 저하 ②캡스톤파트너스 29.9% SURGE 알람(상한가 상태) ③035290 종목명 코드로 표시
+  개선점: 상한가 판단 정확도 향상. 소형주 거래대금 미달 -5점/강세 +3점. 저가 반등 +4점. 고가 갱신 +3점. 갭업 유지 +2점
+  주의점: _apply_analyze_market_context의 상한가 차단은 analyze 단계 — dispatch 단계 NEAR_UPPER 변환과 이중 방어
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.28 (2026-04-07): 손절가·목표가 0 이중 방어 완전 수정
   [#1] calc_dynamic_stop_target(): atr=0 early-return 분기에 entry=0 방어 + 클램핑 추가 — v161.25는 atr>0 분기에만 적용됐고 atr=0 분기(early return)에는 누락됐음
   [#2] save_signal_log(): 저장 직전 stop_loss<=0 또는 stop_loss>=entry이면 entry×0.93(-7%) 강제 적용, target_price<=entry이면 entry×1.10(+10%) 강제 적용
@@ -12472,7 +12483,12 @@ def get_stock_price(code: str) -> dict:
         "volume_ratio": get_real_volume_ratio(code, today_vol),
         "today_vol": today_vol,
         "high": int(o.get("stck_hgpr",0)),
+        "low":  int(o.get("stck_lwpr",0)),   # v161.29: 당일 저가 추가
         "open": int(o.get("stck_oprc",0)),
+        "upper_price": int(o.get("stck_mxpr",0)),   # v161.29: 상한가 가격 추가
+        "lower_price": int(o.get("stck_llam",0)),   # v161.29: 하한가 가격 추가
+        "acml_tr_pbmn": int(o.get("acml_tr_pbmn",0)),  # v161.29: 누적 거래대금(원) 추가
+        "prdy_vrss_sign": str(o.get("prdy_vrss_sign","3")),  # v161.29: 전일대비부호(1=상한) 추가
         "ask_qty": int(o.get("askp_rsqn1",0)),
         "bid_qty": int(o.get("bidp_rsqn1",0)),
         "ask_price": int(o.get("askp1",0) or 0),
@@ -20728,7 +20744,11 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     sig_type = str(watch.get("signal_type") or "").upper()
-    upper_like = change_rate >= 29.0 or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
+    # v161.29: upper_price(상한가 가격) 직접 비교 — change_rate>=29% 보다 정확
+    upper_price = safe_int(cur.get("upper_price", 0), 0)
+    prdy_vrss_sign = str(cur.get("prdy_vrss_sign", "") or "")
+    is_upper_price_hit = (upper_price > 0 and price >= upper_price) or prdy_vrss_sign == "1"
+    upper_like = is_upper_price_hit or change_rate >= 29.0 or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
@@ -22835,6 +22855,9 @@ def _bootstrap_analyze_context(stock: dict) -> dict:
         return {}
     code = normalize_stock_code(ctx.get("code", ""))
     stock_name = str((ctx.get("stock") or {}).get("name", code) or code)
+    # v161.29: stock_name이 code와 동일하면(이름 미조회) _resolve_stock_name으로 보완
+    if stock_name == code or not stock_name.strip():
+        stock_name = _resolve_stock_name(code, stock_name) or code
     pre_dart_risk_meta = check_dart_risk(code) if code else {"is_risk": False, "title": ""}
     material_downside_meta = _check_material_downside_risk(code, stock_name, dart_meta=pre_dart_risk_meta) if code else {"block": False}
     ctx["pre_dart_risk_meta"] = pre_dart_risk_meta
@@ -23283,6 +23306,55 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
     ok, score, earnings = _apply_earnings_risk_context(ctx, score, reasons)
     if not ok:
         return False
+
+    # v161.29: 저가·고점·거래대금·상한가 데이터 활용 점수화
+    try:
+        _s_price    = safe_int(stock.get("price", 0) or ctx.get("price", 0), 0)
+        _s_low      = safe_int(stock.get("low", 0), 0)
+        _s_high     = safe_int(stock.get("high", 0), 0)
+        _s_open     = safe_int(stock.get("open", 0), 0)
+        _s_upper    = safe_int(stock.get("upper_price", 0), 0)
+        _s_pbmn     = safe_int(stock.get("acml_tr_pbmn", 0), 0)   # 누적 거래대금(원)
+        _s_sign     = str(stock.get("prdy_vrss_sign", "") or "")
+        _s_prev     = safe_int(stock.get("prev_close", 0), 0)
+
+        # ① 상한가 도달 시 analyze 단계 차단 (UPPER_LIMIT/NEAR_UPPER 제외)
+        _is_upper = (_s_upper > 0 and _s_price >= _s_upper) or _s_sign == "1"
+        if _is_upper and signal_type not in ("UPPER_LIMIT", "NEAR_UPPER", "STRONG_BUY"):
+            reasons.append("🚫 상한가 도달 — 신규 진입 불가")
+            return False
+
+        # ② 거래대금 최소 기준 — 1억 미만 소형주 노이즈 차단
+        if _s_pbmn > 0 and _s_pbmn < 100_000_000:  # 1억원 미만
+            score -= 5
+            reasons.append(f"⚠️ 거래대금 {_s_pbmn//10000:,}만원 미달 -5점")
+        elif _s_pbmn >= 10_000_000_000:  # 100억 이상 = 강한 수급
+            score += 3
+            reasons.append(f"💵 거래대금 {_s_pbmn//100000000:,}억원 강세 +3점")
+
+        # ③ 당일 저가 대비 반등폭 — 낙폭 후 강한 반등은 추가 점수
+        if _s_low > 0 and _s_price > 0 and _s_open > 0:
+            _low_to_now = (_s_price - _s_low) / _s_low * 100 if _s_low > 0 else 0
+            _open_to_low = (_s_open - _s_low) / _s_open * 100 if _s_open > 0 else 0
+            # 저가 대비 5% 이상 반등 + 시가 대비 저가 낙폭 3% 이상 = 눌림 반등
+            if _low_to_now >= 5.0 and _open_to_low >= 3.0:
+                score += 4
+                reasons.append(f"📈 저가 대비 반등 {_low_to_now:.1f}% (낙폭 {_open_to_low:.1f}% 후 회복) +4점")
+
+        # ④ 당일 고가 == 현재가 → 고점 지속 돌파 (강세 신호)
+        if _s_high > 0 and _s_price > 0 and _s_price >= _s_high:
+            score += 3
+            reasons.append(f"🔝 당일 고가 갱신 중 ({_s_high:,}원) +3점")
+
+        # ⑤ 시가 대비 하락 후 현재가 시가 회복 = 역V 반전 아님, 강세 지속
+        if _s_open > 0 and _s_prev > 0 and _s_price >= _s_open and _s_open > _s_prev:
+            _open_gap = (_s_open - _s_prev) / _s_prev * 100
+            if _open_gap >= 3.0:
+                score += 2
+                reasons.append(f"↗️ 갭업({_open_gap:.1f}%) 후 시가 유지 +2점")
+    except Exception as _e:
+        _swallow_exception(_e)
+
     ctx.update({
         "score": score, "reasons": reasons, "sector_info": sector_info, "us": us,
         "short_ratio": short_ratio, "f_days": f_days, "i_days": i_days,
@@ -23307,8 +23379,12 @@ def _apply_analyze_entry_and_filters(ctx: dict) -> bool:
     _dart_r = ctx.get("pre_dart_risk_meta") if isinstance(ctx.get("pre_dart_risk_meta"), dict) else check_dart_risk(code)
     _material_downside = ctx.get("material_downside_meta") if isinstance(ctx.get("material_downside_meta"), dict) else _check_material_downside_risk(code, stock.get("name", code), dart_meta=_dart_r)
     if _material_downside.get("block") and signal_type not in ("UPPER_LIMIT",):
-        _log_info_msg(f"  🚫 하방재료차단 [{stock.get('name', code)}]: {_material_downside.get('title','') or _material_downside.get('label','하방 재료')}")
-        _notify_material_downside_block(code, stock.get("name", code), _material_downside, stage="analyze_filters")
+        # v161.29: name이 code와 동일하면 _resolve_stock_name으로 보완
+        _block_name = stock.get("name", code)
+        if not _block_name or _block_name == code:
+            _block_name = _resolve_stock_name(code, _block_name) or code
+        _log_info_msg(f"  🚫 하방재료차단 [{_block_name}]: {_material_downside.get('title','') or _material_downside.get('label','하방 재료')}")
+        _notify_material_downside_block(code, _block_name, _material_downside, stage="analyze_filters")
         _purge_code_from_runtime_watches(
             code,
             reason="하방재료차단",
@@ -24952,6 +25028,15 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
         live_change_rate = safe_float((live or {}).get("change_rate", 0), 0.0)
         if live_change_rate != 0.0:
             s["change_rate"] = live_change_rate
+    # v161.29: change_rate>=29% 또는 price>=upper_price 종목이 SURGE로 알람 나가는 문제 차단
+    # ask_qty>0이어도 상한가급은 NEAR_UPPER로 강제 변환 → 이후 entry_block에서 차단됨
+    _live_cr = safe_float(s.get("change_rate", 0), 0.0)
+    _live_upper = safe_int((live or {}).get("upper_price", 0), 0)
+    _live_sign  = str((live or {}).get("prdy_vrss_sign", "") or "")
+    _is_upper_hit = (_live_upper > 0 and live_price >= _live_upper) or _live_sign == "1" or _live_cr >= 29.0
+    if _is_upper_hit and s.get("signal_type") not in ("UPPER_LIMIT", "NEAR_UPPER"):
+        s["signal_type"] = "NEAR_UPPER"
+        _log_info_msg(f"  ⏭ {s.get('name', s.get('code',''))} 상한가급({_live_cr:.1f}%) → NEAR_UPPER 강제 변환")
     entry = safe_int(s.get("entry_price", 0), 0)
     blocked_reason = ""
     if entry and live_price and live_price >= entry:
