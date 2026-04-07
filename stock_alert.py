@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.27
+버전: v161.28
 날짜: 2026-04-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.28 (2026-04-07): 손절가·목표가 0 이중 방어 완전 수정
+  [#1] calc_dynamic_stop_target(): atr=0 early-return 분기에 entry=0 방어 + 클램핑 추가 — v161.25는 atr>0 분기에만 적용됐고 atr=0 분기(early return)에는 누락됐음
+  [#2] save_signal_log(): 저장 직전 stop_loss<=0 또는 stop_loss>=entry이면 entry×0.93(-7%) 강제 적용, target_price<=entry이면 entry×1.10(+10%) 강제 적용
+  [#3] send_alert(): 알람 메시지 발송 직전 동일 조건 방어 — 알람 텍스트에 "손절0 목표0" 표시 완전 차단
+  이유: 진영(285800) [SURGE] 진입2,710 손절0 목표0 — calc_dynamic_stop_target의 atr=0 분기가 entry=0일 때 stop=0 반환, 클램핑도 entry×0.93=0이 됨. v161.25 클램핑은 atr>0 분기에만 있어 atr=0 케이스 미처리
+  개선점: 3중 방어(함수 내부 + 저장 직전 + 발송 직전)로 어떤 경로에서도 손절0·목표0 알람 불가
+  주의점: entry=0인 경우(가격 미확정)는 방어 적용 안 함 — entry>0인 경우에만 강제 보정
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.27 (2026-04-07): candidate_miss 워치독 실질 완화 — 후보군 확대 자동 적용
   [#1] _watchdog_apply_relax(): candidate_miss 시 알림만 하던 것 → rank_session_top_n_override(+50, 최대150) + universe_max_per_theme_override(+4, 최대15) _dynamic에 즉시 반영, 30분 후 복원
   [#2] _get_rank_topn(): _dynamic["rank_session_top_n_override"] 존재 시 상한 확대 적용
@@ -16546,6 +16554,17 @@ def save_signal_log(stock: dict):
     - 이후 track_signal_results()가 목표가·손절가 도달 여부를 자동 체크
     """
     try:
+        # v161.28: 최후 방어 — stop_loss=0 또는 target_price=0이면 entry 기반 재계산
+        _entry = safe_int(stock.get("entry_price", 0), 0)
+        if _entry > 0:
+            _stop = safe_int(stock.get("stop_loss", 0), 0)
+            _tgt  = safe_int(stock.get("target_price", 0), 0)
+            if _stop <= 0 or _stop >= _entry:
+                stock["stop_loss"]    = int(_entry * 0.93 / 10) * 10
+                stock["stop_pct"]     = 7.0
+            if _tgt <= _entry:
+                stock["target_price"] = int(_entry * 1.10 / 10) * 10
+                stock["target_pct"]   = 10.0
         data = _load_signal_log_data()
         ctx = _build_signal_log_context(stock)
         if _update_representative_signal_log_record(data, stock, ctx):
@@ -22257,6 +22276,17 @@ def send_alert(signal: dict):
     if not _ensure_signal_actionability(signal, source_label="일반 포착"):
         return
     signal["name"] = _resolve_stock_name(signal.get("code", ""), signal.get("name", ""))
+    # v161.28: 알람 메시지에 손절0·목표0 표시 방지 — 최후 방어선
+    _ea = safe_int(signal.get("entry_price", 0), 0)
+    if _ea > 0:
+        _es = safe_int(signal.get("stop_loss", 0), 0)
+        _et = safe_int(signal.get("target_price", 0), 0)
+        if _es <= 0 or _es >= _ea:
+            signal["stop_loss"] = int(_ea * 0.93 / 10) * 10
+            signal["stop_pct"]  = 7.0
+        if _et <= _ea:
+            signal["target_price"] = int(_ea * 1.10 / 10) * 10
+            signal["target_pct"]   = 10.0
     _last_external_alert_ts = time.time()
     if _should_throttle_send_alert_signal(signal):
         return
@@ -32082,8 +32112,18 @@ def calc_dynamic_stop_target(code: str, entry: int, signal_type: str | None = No
         _rm   = get_atr_regime_mult()
         _stop_pct   = max(0.05, 0.07 * _rm)
         _target_pct = max(0.08, 0.15 / _rm)
+        # v161.28: entry=0 방어 — entry가 0이면 stop/target 모두 0이 되므로 즉시 (0,0) 반환 방지
+        if entry <= 0:
+            return 0, 0, 7.0, 10.0, False
         stop   = int(entry * (1 - _stop_pct)   / 10) * 10
         target = int(entry * (1 + _target_pct) / 10) * 10
+        # v161.28: atr=0 fallback에도 클램핑 적용 (v161.25는 atr>0 분기에만 있었음)
+        min_stop   = int(entry * 0.93 / 10) * 10
+        min_target = int(entry * 1.10 / 10) * 10
+        if stop <= 0 or stop >= entry:
+            stop = min_stop
+        if target <= entry:
+            target = min_target
         return stop, target, round(_stop_pct*100,1), round(_target_pct*100,1), False
     regime_info = get_market_regime()
     regime  = regime_info.get("mode", "normal")
