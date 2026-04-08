@@ -3,10 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.34
+버전: v161.36
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.36 (2026-04-08): /yt_exclude 재시작 후에도 영구 유지
+  [#1] YT_EXCLUDE_KEYWORDS_FILE 상태파일 추가 + _save/_load_yt_exclude_keywords() 신규
+  이유: v161.35에서 /yt_exclude로 추가한 키워드가 재시작 시 초기화됨
+  개선점: 추가/삭제 즉시 상태파일에 저장 → 재시작 후 자동 복원. 환경변수 기본값과 병합
+  주의점: 환경변수 YOUTUBE_EXCLUDE_KEYWORDS는 초기 기본값으로만 사용됨. 이후 변경은 상태파일 우선
+  [#2] 시작 블록 두 군데에 _load_yt_exclude_keywords() 추가
+  이유: 정규 시작·대기모드 양쪽 복원 필요
+  개선점: 없음
+  주의점: 없음
+- v161.35 (2026-04-08): /yt_exclude 텔레그램 명령어 구현
+  [#1] _handle_telegram_yt_exclude_command() 신규 + 라우터 등록
+  이유: v161.34에서 "명령어 준비"만 했고 실제 함수·라우터 미구현 → "알 수 없는 명령어" 오류
+  개선점: /yt_exclude 추가|삭제|목록 으로 런타임 즉시 반영. 재시작 없이 키워드 관리 가능
+  주의점: 재시작 시 환경변수 YOUTUBE_EXCLUDE_KEYWORDS 값으로 초기화됨 (영구 저장 필요시 Railway 환경변수에도 추가)
 - v161.34 (2026-04-08): Gemini YouTube URL 방식 폐기 → 텍스트 분석 전환 + description 수집 + /yt_exclude 명령어 준비
   [#1] _analyze_youtube_video_with_gemini(): file_data URL 방식 폐기 → 제목+설명 텍스트 분석으로 전환
   이유: URL 방식은 Gemini 서버가 영상 직접 다운로드·처리 → 수분 hang, timeout 없음 → "Gemini 분석 시작" 후 결과 로그 0건의 원인
@@ -2252,6 +2266,7 @@ SHADOW_CAPTURE_FILE = _state_path("shadow_captures.json")
 SELF_AUDIT_FILE = _state_path("daily_self_audit.json")
 ADAPTIVE_CAPTURE_FEEDBACK_FILE = _state_path("adaptive_capture_feedback.json")
 STALE_REPLAY_PENALTY_FILE = _state_path("stale_replay_penalty.json")
+YT_EXCLUDE_KEYWORDS_FILE = _state_path("yt_exclude_keywords.json")  # v161.36: 유튜브 제외 키워드 영구 저장
 ADAPTIVE_FEEDBACK_LOOKBACK_DAYS = int(os.getenv("ADAPTIVE_FEEDBACK_LOOKBACK_DAYS", "5") or "5")
 ADAPTIVE_FEEDBACK_MAX_CODES = int(os.getenv("ADAPTIVE_FEEDBACK_MAX_CODES", "12") or "12")
 ADAPTIVE_FEEDBACK_CODE_MIN_WEIGHT = float(os.getenv("ADAPTIVE_FEEDBACK_CODE_MIN_WEIGHT", "2.5") or "2.5")
@@ -8526,6 +8541,28 @@ def _load_alert_history() -> None:
     except Exception as e:
         _swallow_exception(e)
         _alert_history = {}
+
+def _save_yt_exclude_keywords() -> None:
+    """v161.36: YouTube 제외 키워드 상태파일 저장 — 재시작 후에도 유지."""
+    try:
+        _write_json_atomic(YT_EXCLUDE_KEYWORDS_FILE, {"keywords": list(YOUTUBE_EXCLUDE_KEYWORDS)}, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _load_yt_exclude_keywords() -> None:
+    """v161.36: 시작 시 YouTube 제외 키워드 복원."""
+    global YOUTUBE_EXCLUDE_KEYWORDS
+    try:
+        data = _read_json_safe(YT_EXCLUDE_KEYWORDS_FILE, {})
+        if isinstance(data, dict) and "keywords" in data:
+            saved = [str(k).strip() for k in (data.get("keywords") or []) if str(k).strip()]
+            if saved:
+                # 환경변수 기본값과 병합 (중복 제거)
+                merged = list(dict.fromkeys(list(YOUTUBE_EXCLUDE_KEYWORDS) + saved))
+                YOUTUBE_EXCLUDE_KEYWORDS = merged
+                _log_info_msg(f"📂 YouTube 제외 키워드 {len(YOUTUBE_EXCLUDE_KEYWORDS)}개 복원")
+    except Exception as e:
+        _swallow_exception(e)
 
 def _save_upper_limit_alerted_today() -> None:
     """v161.13: upper_limit_reached 당일 차단 목록 상태파일 저장."""
@@ -29726,6 +29763,49 @@ def _handle_telegram_us_command():
         send(msg)
     except Exception as e:
         send(f"❌ 미국 시장 조회 오류: {e}")
+def _handle_telegram_yt_exclude_command(raw: str) -> None:
+    """
+    /yt_exclude 추가 키워드  — 제외 키워드 추가
+    /yt_exclude 삭제 키워드  — 제외 키워드 삭제
+    /yt_exclude 목록         — 현재 목록 확인
+    런타임 즉시 반영. 재시작 시 환경변수 YOUTUBE_EXCLUDE_KEYWORDS로 초기화됨.
+    """
+    global YOUTUBE_EXCLUDE_KEYWORDS
+    parts = raw.strip().split(None, 2)  # ['/yt_exclude', '추가|삭제|목록', '키워드']
+    sub = parts[1].strip() if len(parts) > 1 else "목록"
+    keyword = parts[2].strip() if len(parts) > 2 else ""
+
+    if sub == "목록":
+        kws = YOUTUBE_EXCLUDE_KEYWORDS or []
+        if kws:
+            lines = "\n".join(f"  • {k}" for k in kws)
+            send(f"📋 <b>YouTube 제외 키워드 ({len(kws)}개)</b>\n{lines}\n\n💡 /yt_exclude 추가 키워드\n💡 /yt_exclude 삭제 키워드")
+        else:
+            send("📋 YouTube 제외 키워드 없음\n\n💡 /yt_exclude 추가 키워드")
+    elif sub == "추가":
+        if not keyword:
+            send("❌ 키워드를 입력해주세요\n예) /yt_exclude 추가 리딩방")
+            return
+        if keyword in YOUTUBE_EXCLUDE_KEYWORDS:
+            send(f"⚠️ 이미 있는 키워드: <b>{keyword}</b>")
+            return
+        YOUTUBE_EXCLUDE_KEYWORDS = list(YOUTUBE_EXCLUDE_KEYWORDS) + [keyword]
+        _save_yt_exclude_keywords()
+        send(f"✅ 추가됨: <b>{keyword}</b>\n현재 {len(YOUTUBE_EXCLUDE_KEYWORDS)}개 — 즉시 적용 + 영구 저장")
+    elif sub == "삭제":
+        if not keyword:
+            send("❌ 키워드를 입력해주세요\n예) /yt_exclude 삭제 리딩방")
+            return
+        if keyword not in YOUTUBE_EXCLUDE_KEYWORDS:
+            send(f"⚠️ 없는 키워드: <b>{keyword}</b>")
+            return
+        YOUTUBE_EXCLUDE_KEYWORDS = [k for k in YOUTUBE_EXCLUDE_KEYWORDS if k != keyword]
+        _save_yt_exclude_keywords()
+        send(f"✅ 삭제됨: <b>{keyword}</b>\n현재 {len(YOUTUBE_EXCLUDE_KEYWORDS)}개 — 즉시 적용 + 영구 저장")
+    else:
+        send("❓ 사용법:\n/yt_exclude 목록\n/yt_exclude 추가 키워드\n/yt_exclude 삭제 키워드")
+
+
 def _handle_telegram_overnight_command():
     send("🌙 오버나이트 모니터 수동 실행 중...")
     def _run_overnight():
@@ -29798,6 +29878,9 @@ def _dispatch_telegram_command(raw: str, text: str):
         return
     if text.startswith("/reset_stats") or text.startswith("/승률초기화"):
         _handle_reset_stats_command(raw)
+        return
+    if text.startswith("/yt_exclude"):
+        _handle_telegram_yt_exclude_command(raw)
         return
     if text.startswith("/test"):
         _handle_telegram_test_command()
@@ -33471,6 +33554,7 @@ if __name__ == "__main__":
         _load_preclose_gap_entry_watch()
         _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
         _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
+        _load_yt_exclude_keywords()         # v161.36: 재시작 시 YouTube 제외 키워드 복원
         _load_reentry_watch()
         _load_execution_setup_watch()
         migrate_signal_log_pnl_fields()
@@ -33494,6 +33578,7 @@ if __name__ == "__main__":
     _load_preclose_gap_entry_watch()
     _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
     _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
+    _load_yt_exclude_keywords()         # v161.36: 재시작 시 YouTube 제외 키워드 복원
     _load_reentry_watch()
     _load_execution_setup_watch()
     migrate_signal_log_pnl_fields()
