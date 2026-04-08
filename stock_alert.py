@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.31
+버전: v161.32
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.32 (2026-04-08): Gemini YouTube URL 전달 방식 수정 + 키워드 개선
+  [#1] _analyze_youtube_video_with_gemini(): {"file_data": dict} → types.Part(file_data=types.FileData()) 객체로 교체
+  이유: file_data를 raw dict로 넘기면 400 INVALID_ARGUMENT (Unknown name "fileData") 발생 → 로그에도 안 찍히는 침묵 실패
+  개선점: google.genai types 객체 사용으로 SDK가 올바른 payload 형식 보장. YouTube URL 분석 정상 작동 예상
+  주의점: google-genai 패키지 최신 버전 필요 (types.FileData 포함 버전)
+  [#2] YOUTUBE_MATERIAL_QUERY: 공시·분석 중심 키워드로 교체 + -리딩방/-단톡방 등 제외어 추가
+  이유: 기존 "급등 OR 재료" 키워드는 유료유도 방송 다수 포함
+  개선점: 공시해석/기업리스크/상장사이슈 등 실질 분석 채널 우선 수집
+  주의점: YouTube Data API는 -제외어 연산자를 지원하나 완전 필터는 아님
+  [#3] YOUTUBE_KEYWORD_QUERIES: 공시/지분변동/담보권/반대매매 등 팩트체크형 키워드로 교체
+  이유: 테마/급등 키워드는 유료서비스 유도 영상 비율 높음
+  개선점: 실질 재료 분석 영상 수집 품질 향상
+  주의점: 없음
+  [#4] YOUTUBE_EXCLUDE_KEYWORDS 신규 상수 + _fetch_youtube_keyword_search_rows() 필터 적용
+  이유: 제목에 리딩방/단톡방/무료추천주 포함 영상은 투자 정보 가치 없음
+  개선점: Gemini 분석 쿼터를 실질 분석 영상에만 소모
+  주의점: 환경변수 YOUTUBE_EXCLUDE_KEYWORDS로 커스텀 가능
 - v161.31 (2026-04-08): 섹터대장 연관 포착 강화 + RuntimeError 수정 + 중복 도달 알람 차단
   [#1] _collect_sector_leader_follow_candidates(): active dict 직접참조→스냅샷 순회 분리, ts_updates 일괄반영 — RuntimeError: dictionary changed size during iteration 원천 차단
   [#2] _collect_sector_leader_follow_candidates(): 후보에 _force_news_recheck=True 플래그 심기 — 섹터대장 연관 종목 analyze() 진입 시 emergent_theme 즉시 재평가
@@ -5367,7 +5384,7 @@ MATERIAL_BLOCK_ALERT_BURST_LIMIT = int(os.getenv("MATERIAL_BLOCK_ALERT_BURST_LIM
 MATERIAL_BLOCK_DIGEST_LIMIT = int(os.getenv("MATERIAL_BLOCK_DIGEST_LIMIT", "12") or "12")
 YOUTUBE_API_KEY = str(os.getenv("YOUTUBE_API_KEY", "") or "").strip()
 YOUTUBE_WATCH_CHANNEL_IDS = [x.strip() for x in str(os.getenv("YOUTUBE_WATCH_CHANNEL_IDS", "") or "").split(",") if x.strip()]
-YOUTUBE_MATERIAL_QUERY = str(os.getenv("YOUTUBE_MATERIAL_QUERY", "주식 재료 OR 급등 OR 공시 OR 감사보고서") or "").strip()
+YOUTUBE_MATERIAL_QUERY = str(os.getenv("YOUTUBE_MATERIAL_QUERY", "공시 해석 OR 주식 분석 OR 기업 리스크 OR 상장사 이슈 OR 공시 뜯어보기 OR 감사보고서 -리딩방 -단톡방 -무료추천주 -급등주 -조건검색식") or "").strip()
 YOUTUBE_LOOKBACK_HOURS = int(os.getenv("YOUTUBE_LOOKBACK_HOURS", "48") or "48")
 YOUTUBE_MAX_RESULTS_PER_CHANNEL = int(os.getenv("YOUTUBE_MAX_RESULTS_PER_CHANNEL", "5") or "5")
 # ── Gemini 유튜브 영상 재료 분석 ──
@@ -5376,7 +5393,9 @@ GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") o
 GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
-YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "한국주식 급등재료,주식 테마 상승,공시 호재 종목,반도체 방산 바이오 주식") or "").split(",") if x.strip()]
+YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
+# 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
+YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
 YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") or "5")      # 키워드당 최대 영상 수
 # ── 섹터 제한 (v161.9) ──
 SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
@@ -5499,9 +5518,18 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
                 '"summary": "영상 핵심 재료 1~2줄 요약"}\n'
                 "종목이 없으면 stocks는 빈 배열. 영상이 재료와 무관하면 stocks 빈 배열 + summary에 무관 표시."
             )
+            from google.genai import types as _genai_types  # noqa
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=[{"file_data": {"file_uri": video_url}}, prompt],
+                contents=[
+                    _genai_types.Part(
+                        file_data=_genai_types.FileData(
+                            file_uri=video_url,
+                            mime_type="video/*",
+                        )
+                    ),
+                    prompt,
+                ],
             )
             raw = str(resp.text or "").strip()
             import json as _json
@@ -5591,6 +5619,10 @@ def _fetch_youtube_keyword_search_rows() -> list[dict]:
                 video_id = str((item.get("id") or {}).get("videoId", "") or "").strip()
                 title = str(snippet.get("title", "") or "").strip()
                 if not title or not video_id or video_id in seen_ids:
+                    continue
+                # 유료유도 키워드 포함 영상 제외 (v161.32)
+                title_lower = title.lower()
+                if any(ex.lower() in title_lower for ex in YOUTUBE_EXCLUDE_KEYWORDS if ex):
                     continue
                 seen_ids.add(video_id)
                 rows.append({
