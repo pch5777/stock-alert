@@ -3,10 +3,40 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.36
+버전: v161.38
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.38 (2026-04-08): Gemini grounding 15분 주기 + 전용 카운터 분리
+  [#1] GEMINI_GROUNDING_CACHE_TTL_SEC 기본값 3600→900초 (15분)
+  이유: 1시간은 너무 드물고, Gemini RPD 500 여유분 내에서 최대 빈도 산정 — 15분×96회=여유 확보
+  개선점: 장중 15분마다 실시간 재료 갱신. 환경변수로 조정 가능
+  주의점: GEMINI_GROUNDING_DAILY_LIMIT=96이 기본값. RPD 500에서 YouTube분석~200 + grounding 96 = 296회로 여유
+  [#2] GEMINI_GROUNDING_DAILY_LIMIT 상수 추가 + _gemini_grounding_daily_counter 전용 카운터 분리
+  이유: grounding이 _gemini_daily_count_ok() 공유 카운터를 소모 → YouTube 영상 분석 한도 침범
+  개선점: grounding 전용 카운터로 분리해 두 기능이 서로 한도를 침범하지 않음
+  주의점: 없음
+  [#3] /재료 grounding 섹션에 오늘 호출 횟수 + 갱신 주기 표시
+  이유: 몇 번 호출됐는지 확인 불가했음
+  개선점: "오늘 N/96회", "매 15분 갱신" 표시
+  주의점: 없음
+- v161.37 (2026-04-08): YouTube API KST 07:30·20:30 2회 고정 + Gemini grounding 재료 수집 통합
+  [#1] _fetch_youtube_keyword_search_rows(): 카운터 방식 → KST 07:30·20:30 시각 기반 허용 윈도우(±10분)로 교체
+  이유: 3분마다 호출 시 하루 10,000유닛 반나절 만에 소진. 하루 2회 고정 시각 호출로 유닛 절약
+  개선점: 슬롯 키(날짜+시각)로 중복 호출 방지. 07:30=장 시작 전 재료, 20:30=야간 재료 수집
+  주의점: 허용 윈도우(10분) 안에 사이클이 돌아야 호출됨. 사이클 주기가 10분 초과면 미호출 가능
+  [#2] _fetch_gemini_grounding_rows() 신규 — Gemini google_search grounding으로 한국 주식 재료 직접 수집
+  이유: YouTube API 소모 없이 Gemini가 실시간 웹 검색으로 재료 수집. 1시간 캐시로 빈도 조절
+  개선점: YouTube와 무관하게 매 1시간 재료 갱신. 섹터·종목까지 구조화 반환
+  주의점: GEMINI_GROUNDING_CACHE_TTL_SEC 환경변수로 캐시 TTL 조정 가능 (기본 3600초)
+  [#3] _get_material_signal_headline_rows(): _fetch_gemini_grounding_rows() 통합
+  이유: grounding 재료를 기존 뉴스·시나리오 파이프라인과 동일하게 처리
+  개선점: 없음
+  주의점: 없음
+  [#4] _handle_telegram_material_command(): ⑥ Gemini 실시간 재료 섹션 추가 + YouTube API 호출 횟수 표시
+  이유: /재료에서 grounding 결과 확인 불가했음
+  개선점: 🔍 Gemini 실시간 재료 섹션으로 grounding 결과 즉시 확인 가능
+  주의점: 없음
 - v161.36 (2026-04-08): /yt_exclude 재시작 후에도 영구 유지
   [#1] YT_EXCLUDE_KEYWORDS_FILE 상태파일 추가 + _save/_load_yt_exclude_keywords() 신규
   이유: v161.35에서 /yt_exclude로 추가한 키워드가 재시작 시 초기화됨
@@ -5430,10 +5460,13 @@ GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") o
 GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
+GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "900") or "900")   # v161.38: 15분 캐시 (3600→900)
+GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "96") or "96")         # v161.38: 15분×24h=96회, RPD 500 여유분 내
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
 # 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
 YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
 YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") or "5")      # 키워드당 최대 영상 수
+YOUTUBE_FETCH_DAILY_LIMIT = int(os.getenv("YOUTUBE_FETCH_DAILY_LIMIT", "2") or "2")         # v161.37: 하루 최대 YouTube API fetch 횟수 (기본 2회)
 # ── 섹터 제한 (v161.9) ──
 SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
 SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "10.0") or "10.0")  # v161.23: 15→10% — candidate_miss 완화, 이 등락률 이상이면 섹터 제한 면제
@@ -5627,8 +5660,29 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: s
 
 def _fetch_youtube_keyword_search_rows() -> list[dict]:
     """키워드 검색으로 최신 유튜브 영상 탐색 (채널 지정 불필요)."""
+    global _youtube_fetch_daily
     if not YOUTUBE_API_KEY or not YOUTUBE_KEYWORD_QUERIES:
         return []
+    # v161.37: KST 07:30·20:30 두 번만 호출 — 허용 윈도우(±10분) 이외에는 차단
+    now_kst = _now_kst()
+    today_str = now_kst.strftime("%Y-%m-%d")
+    h, m = now_kst.hour, now_kst.minute
+    now_hm = h * 60 + m  # 분 단위
+    # 허용 윈도우: 07:30~07:39 / 20:30~20:39
+    windows = [(7 * 60 + 30, "07:30"), (20 * 60 + 30, "20:30")]
+    slot = None
+    for wstart, wlabel in windows:
+        if wstart <= now_hm < wstart + 10:
+            slot = wlabel
+            break
+    if slot is None:
+        return []  # 허용 시각 외 — 차단
+    # 같은 슬롯에서 이미 호출했으면 재호출 방지
+    slot_key = f"{today_str}_{slot}"
+    if _youtube_fetch_daily.get("last_slot") == slot_key:
+        return []  # 이 슬롯에서 이미 호출 완료
+    _youtube_fetch_daily["last_slot"] = slot_key
+    print(f"[YT] YouTube API fetch 실행 (KST {slot} 슬롯, 오늘 {slot_key})")
     rows = []
     published_after = _build_youtube_published_after_iso(YOUTUBE_LOOKBACK_HOURS)
     seen_ids: set = set()
@@ -5686,6 +5740,85 @@ def _fetch_youtube_keyword_search_rows() -> list[dict]:
                 cooldown_sec=1800.0,
             )
     return rows
+
+
+def _fetch_gemini_grounding_rows() -> list[dict]:
+    """
+    v161.37: Gemini google_search grounding으로 한국 주식 재료 직접 수집.
+    YouTube API 소모 없이 Gemini가 실시간 웹 검색 후 재료 구조화.
+    캐시 TTL: GEMINI_GROUNDING_CACHE_TTL_SEC (기본 900초=15분). 전용 카운터로 YouTube 분석 한도와 분리.
+    """
+    global _gemini_grounding_cache, _gemini_grounding_daily_counter
+    if not GEMINI_API_KEY:
+        return []
+    now = time.time()
+    # 캐시 유효 시 즉시 반환
+    if _gemini_grounding_cache.get("rows") and now - float(_gemini_grounding_cache.get("ts", 0) or 0) < GEMINI_GROUNDING_CACHE_TTL_SEC:
+        return list(_gemini_grounding_cache.get("rows", []))
+    # 전용 일별 한도 체크 (YouTube 분석 카운터와 분리)
+    today = _now_kst().strftime("%Y-%m-%d")
+    if _gemini_grounding_daily_counter.get("date") != today:
+        _gemini_grounding_daily_counter = {"date": today, "count": 0}
+    if _gemini_grounding_daily_counter.get("count", 0) >= GEMINI_GROUNDING_DAILY_LIMIT:
+        _warn_throttled_once("gemini_grounding_limit", f"⚠️ Gemini grounding 일일 한도 도달 ({GEMINI_GROUNDING_DAILY_LIMIT}회)", cooldown_sec=3600.0)
+        return list(_gemini_grounding_cache.get("rows", []))  # 한도 초과 시 마지막 캐시 반환
+    try:
+        from google import genai as _genai  # noqa
+        from google.genai import types as _gt  # noqa
+        client = _genai.Client(api_key=GEMINI_API_KEY)
+        today_str = _now_kst().strftime("%Y년 %m월 %d일")
+        prompt = (
+            f"오늘({today_str}) 한국 주식시장에 영향을 줄 수 있는 주요 재료(호재/악재)를 최신 뉴스에서 찾아서 분석해줘.\n"
+            "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
+            '{"items": [{"theme": "테마명", "direction": "up/down/neutral", "summary": "재료 1~2줄 요약", '
+            '"sectors": ["수혜섹터1", "수혜섹터2"], "stocks": ["종목명1", "종목명2"]}]}\n'
+            "최소 3개, 최대 8개 항목. 리딩방/투자 유도 내용은 제외. 실제 시장 재료만."
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=_gt.GenerateContentConfig(
+                tools=[_gt.Tool(google_search=_gt.GoogleSearch())],
+                temperature=0.3,
+            ),
+        )
+        import json as _json
+        raw = str(resp.text or "").strip()
+        raw_clean = raw.replace("```json", "").replace("```", "").strip()
+        parsed = _json.loads(raw_clean)
+        items = parsed.get("items") or []
+        rows = []
+        for item in items[:8]:
+            theme = str(item.get("theme", "") or "").strip()
+            direction = str(item.get("direction", "neutral") or "neutral").strip()
+            summary = str(item.get("summary", "") or "").strip()
+            sectors = [str(s) for s in (item.get("sectors") or []) if s]
+            stocks = [str(s) for s in (item.get("stocks") or []) if s]
+            if not theme or not summary:
+                continue
+            dir_label = "📈상승재료" if direction == "up" else ("📉하락재료" if direction == "down" else "")
+            title = f"[Gemini재료] {theme} {dir_label} {summary}".strip()
+            rows.append({
+                "title": title,
+                "source": "GEMINI_GROUNDING",
+                "published_at": "",
+                "channel_id": "",
+                "live": "",
+                "gemini_stocks": [{"name": s, "theme": theme, "direction": direction, "reason": summary} for s in stocks[:4]],
+                "_sectors": sectors,
+            })
+        # 전용 카운터 증가 (YouTube 분석 카운터와 분리)
+        _gemini_grounding_daily_counter["count"] = _gemini_grounding_daily_counter.get("count", 0) + 1
+        _gemini_grounding_cache = {"ts": now, "rows": rows}
+        print(f"[Gemini] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_gemini_grounding_daily_counter['count']}/{GEMINI_GROUNDING_DAILY_LIMIT}회)")
+        return rows
+    except Exception as e:
+        _warn_throttled_once(
+            "gemini_grounding_fetch",
+            f"⚠️ Gemini grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
+            cooldown_sec=300.0,
+        )
+        return []
 
 
 def _fetch_youtube_material_headline_rows() -> list[dict]:
@@ -5804,6 +5937,10 @@ def _get_material_signal_headline_rows(force: bool = False) -> list[dict]:
         _swallow_exception(e)
     try:
         rows.extend(_fetch_youtube_material_headline_rows())
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        rows.extend(_fetch_gemini_grounding_rows())  # v161.37: Gemini grounding 재료 통합
     except Exception as e:
         _swallow_exception(e)
     try:
@@ -6185,6 +6322,9 @@ _material_signal_headline_cache: dict = {"ts": 0.0, "rows": []}
 # v161.7: Gemini 유튜브 영상 분석 캐시 {video_id: {ts, rows}}
 _youtube_gemini_analyzed_cache: dict = {}
 _youtube_gemini_daily_counter: dict = {"date": "", "count": 0}  # 하루 호출 카운터
+_youtube_fetch_daily: dict = {"date": "", "count": 0}  # v161.37: YouTube API 하루 fetch 횟수 제한용
+_gemini_grounding_cache: dict = {"ts": 0.0, "rows": []}  # v161.37: Gemini grounding 결과 캐시
+_gemini_grounding_daily_counter: dict = {"date": "", "count": 0}  # v161.38: grounding 전용 일별 카운터
 _material_downside_cache: dict = {}
 _material_block_runtime: dict = {
     "alert_history": {},
@@ -29504,11 +29644,38 @@ def _handle_telegram_material_command():
                 # 오늘 호출 횟수 표시
                 today = _now_kst().strftime("%Y-%m-%d")
                 cnt = _youtube_gemini_daily_counter.get("count", 0) if _youtube_gemini_daily_counter.get("date") == today else 0
-                yt_lines.append(f"\n  💡 오늘 Gemini 분석 {cnt}회 / {GEMINI_YOUTUBE_DAILY_LIMIT}회 한도")
+                yt_fetch = _youtube_fetch_daily.get("count", 0) if _youtube_fetch_daily.get("date") == today else 0
+                yt_lines.append(f"\n  💡 오늘 Gemini 분석 {cnt}회 / {GEMINI_YOUTUBE_DAILY_LIMIT}회 한도  |  YouTube API {yt_fetch}/{YOUTUBE_FETCH_DAILY_LIMIT}회")
             parts.append("\n" + "\n".join(yt_lines))
         except Exception as e:
             _swallow_exception(e)
             parts.append("\n📺 <b>유튜브 AI 분석 재료</b>\n  - 조회 실패")
+
+        # ⑥ Gemini grounding 재료 (v161.37)
+        try:
+            gr_cache = _gemini_grounding_cache or {}
+            gr_rows = list(gr_cache.get("rows", []) or [])
+            gr_ts = float(gr_cache.get("ts", 0) or 0)
+            now_ts = time.time()
+            age_m = int((now_ts - gr_ts) / 60) if gr_ts else -1
+            age_str = f"{age_m}분 전" if 0 <= age_m < 60 else (f"{age_m//60}시간 전" if age_m >= 60 else "없음")
+            today = _now_kst().strftime("%Y-%m-%d")
+            gr_cnt = _gemini_grounding_daily_counter.get("count", 0) if _gemini_grounding_daily_counter.get("date") == today else 0
+            gr_lines = [f"🔍 <b>Gemini 실시간 재료</b> ({age_str}) — 오늘 {gr_cnt}/{GEMINI_GROUNDING_DAILY_LIMIT}회"]
+            if not gr_rows:
+                gr_lines.append(f"  - 수집된 재료 없음 (매 {GEMINI_GROUNDING_CACHE_TTL_SEC//60}분 갱신)")
+            else:
+                for row in gr_rows[:6]:
+                    title = str(row.get("title", "") or "").replace("[Gemini재료] ", "").strip()[:60]
+                    stocks = [str(s.get("name", "") or "") for s in (row.get("gemini_stocks") or []) if s.get("name")]
+                    directions = [str(s.get("direction", "") or "") for s in (row.get("gemini_stocks") or [])]
+                    dir_icon = "🔴" if "up" in directions else ("🔵" if "down" in directions else "🟡")
+                    gr_lines.append(f"  {dir_icon} {title}")
+                    if stocks:
+                        gr_lines.append(f"    → {'/'.join(stocks[:4])}")
+            parts.append("\n" + "\n".join(gr_lines))
+        except Exception as e:
+            _swallow_exception(e)
 
         send("\n".join(parts))
     except Exception as e:
