@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.38
+버전: v161.39
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.39 (2026-04-08): 시장 주도 섹터 중복 발송 수정
+  [#1] _render_market_leading_sector_payload(): digest에서 등락률 제거, 섹터 구성(테마+종목코드)만으로 중복 판단
+  이유: digest에 change_rate가 포함되어 등락률만 바뀌어도 새 digest → 동일 섹터 구성인데 매 사이클 재발송
+  개선점: 테마명+종목코드가 바뀔 때만 재발송. 등락률 변화는 발송 조건에서 제외
+  주의점: 섹터 구성이 완전히 동일하면 max(interval_sec, 1800) 경과 후 자동 재발송 (기존 로직 유지)
 - v161.38 (2026-04-08): Gemini grounding 15분 주기 + 전용 카운터 분리
   [#1] GEMINI_GROUNDING_CACHE_TTL_SEC 기본값 3600→900초 (15분)
   이유: 1시간은 너무 드물고, Gemini RPD 500 여유분 내에서 최대 빈도 산정 — 15분×96회=여유 확보
@@ -31371,8 +31376,8 @@ def _render_market_leading_sector_payload(top: list, now_dt, market_heat: int, i
             lines.append(f"📈 {followers}")
         lines.append("")
         digest_parts.append(sec["theme"])
-        digest_parts.append(f"{leader['code']}:{leader['change_rate']:.1f}")
-        digest_parts.extend(f"{q['code']}:{q['change_rate']:.1f}" for q in sec.get("followers", [])[:4])
+        digest_parts.append(leader['code'])  # v161.39: 등락률 제외 → 섹터 구성 변화 시에만 재발송
+        digest_parts.extend(q['code'] for q in sec.get("followers", [])[:4])
     lines.append("━━━━━━━━━━━━━━━")
     lines.append(f"💥 시장 활력 {market_heat}점  |  다음 재평가 {interval_min}분")
     return "\n".join(lines).strip(), hashlib.sha256("|".join(digest_parts).encode("utf-8")).hexdigest()
