@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.31
+버전: v161.32
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.32 (2026-04-08): _collect_sector_leader_follow_candidates RuntimeError 수정
+  [#1] _collect_sector_leader_follow_candidates(): active dict 직접 참조 → 얕은 복사본(active_snapshot)으로 순회. last_seen_ts 수정은 ts_updates dict에 모아 순회 완료 후 일괄 반영 — 순회 중 외부에서 새 키 추가돼도 RuntimeError 불가
+  이유: v161.31 배포 후 run_scan에서 RuntimeError: dictionary changed size during iteration 발생. _collect_sector_leader_follow_candidates가 active 원본을 순회하면서 active[code]["last_seen_ts"] 수정, 동시에 _register_sector_leader_follow_seed가 같은 active dict에 새 키를 추가하면서 size 변경 충돌
+  개선점: 순회용 스냅샷(dict 복사)과 실제 원본을 분리 → 멀티스레드/동일사이클 내 동시 수정에도 안전. 기존 touched 플래그 제거, ts_updates 일괄 반영으로 저장 호출 1회로 통합
+  주의점: active_snapshot은 순회 시작 시점 스냅샷이므로 순회 중 새로 등록된 종목은 다음 스캔 사이클에서 처리됨 — 정상 동작
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.31 (2026-04-08): 섹터 대장 연관 종목 analyze() 직결 + 상승 중 재료 즉시 달라붙기
   [#1] _collect_sector_leader_follow_candidates(): 수집 후보에 _force_news_recheck=True 플래그 심기 — 섹터 대장 감시 등록 종목이 analyze()에 들어올 때 emergent_theme 재평가 강제
   [#2] _analyze_news_context(): _force_news_recheck 플래그 있으면 change_rate/signal_type 조건 우회하고 _infer_emergent_issue_theme() 즉시 호출 — 상승 전 재료 미파악이어도 상승 중 재료 달라붙기 가능. 로그에 "[섹터연관 재료확인]" 태그 명시
@@ -15206,14 +15212,16 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
         _log_info_msg(f"🧭 섹터 대장 후속 강제감시 등록: {seed_name} [{theme_name}] → {added}개")
     return added
 def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, limit_total: int | None = None) -> list:
+    # v161.32: active 원본 대신 얕은 복사본으로 순회 — 순회 중 외부에서 키 추가돼도 RuntimeError 방지
     active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
     if not active:
         return []
+    active_snapshot = dict(active)  # 순회용 스냅샷 (원본과 분리)
     existing = {normalize_stock_code(c) for c in (existing_codes or set()) if c}
     limit_total = max(1, int(limit_total or SECTOR_LEADER_FOLLOW_SCAN_LIMIT or 1))
     rows = []
-    touched = False
-    ordered = sorted(active.values(), key=lambda rec: (float((rec or {}).get("leader_change", 0.0) or 0.0), float((rec or {}).get("registered_ts", 0.0) or 0.0)), reverse=True)
+    ts_updates: dict = {}  # 순회 완료 후 일괄 반영
+    ordered = sorted(active_snapshot.values(), key=lambda rec: (float((rec or {}).get("leader_change", 0.0) or 0.0), float((rec or {}).get("registered_ts", 0.0) or 0.0)), reverse=True)
     for rec in ordered:
         if len(rows) >= limit_total:
             break
@@ -15243,14 +15251,18 @@ def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, 
             cand["market"] = "NXT"
         rows.append(cand)
         existing.add(code)
+        ts_updates[code] = time.time()  # 순회 완료 후 일괄 반영
+        time.sleep(0.03)
+    # 순회 완료 후 last_seen_ts 일괄 반영 (순회 중 dict 수정 방지)
+    if ts_updates:
         try:
-            active[code]["last_seen_ts"] = time.time()
-            touched = True
+            live_active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+            for code, ts in ts_updates.items():
+                if code in live_active and isinstance(live_active[code], dict):
+                    live_active[code]["last_seen_ts"] = ts
+            _save_sector_leader_follow_state()
         except Exception as e:
             _swallow_exception(e)
-        time.sleep(0.03)
-    if touched:
-        _save_sector_leader_follow_state()
     return rows
 # ============================================================
 # 🏗️ 실질 섹터 분류 (4레이어 가중 스코어)
