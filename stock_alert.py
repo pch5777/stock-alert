@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.32
+버전: v161.33
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.33 (2026-04-08): YouTube 수집 진단 로그 강화 + API 오류 명시적 처리
+  [#1] _fetch_youtube_material_headline_rows(): 수집 시작 시 GEMINI_API_KEY/YOUTUBE_API_KEY 상태 로그 추가
+  이유: YouTube/Gemini 관련 로그가 전혀 없어 환경변수 누락인지 API 오류인지 구분 불가
+  개선점: 배포 후 Railway 로그에서 "[YT]" 키워드로 즉시 수집 시작 여부 확인 가능
+  주의점: 진단 후 불필요하면 제거 가능
+  [#2] _fetch_youtube_keyword_search_rows(): YouTube API 응답 status_code != 200 또는 error 필드 시 명시적 경고 로그
+  이유: 잘못된 YOUTUBE_API_KEY, 할당량 초과(403), 비활성화 등의 경우 resp.json().get("items", [])가 빈 배열 반환 → 오류 무음 처리
+  개선점: "YouTube API 오류 [403]" 형태로 Railway 로그에 찍혀 키/할당량 문제 즉시 진단 가능
+  주의점: 쿨다운 300초(5분)로 잦은 반복 억제
 - v161.32 (2026-04-08): Gemini YouTube URL 전달 방식 수정 + 키워드 개선
   [#1] _analyze_youtube_video_with_gemini(): {"file_data": dict} → types.Part(file_data=types.FileData()) 객체로 교체
   이유: file_data를 raw dict로 넘기면 400 INVALID_ARGUMENT (Unknown name "fileData") 발생 → 로그에도 안 찍히는 침묵 실패
@@ -5614,7 +5623,17 @@ def _fetch_youtube_keyword_search_rows() -> list[dict]:
                 },
                 timeout=10,
             )
-            for item in resp.json().get("items", []):
+            # v161.33: API 오류 명시적 로그 (키 오류/할당량 초과 진단용)
+            resp_json = resp.json()
+            if resp.status_code != 200 or "error" in resp_json:
+                err_msg = str((resp_json.get("error") or {}).get("message", resp.status_code))
+                _warn_throttled_once(
+                    f"youtube_api_error:{query[:15]}",
+                    f"⚠️ YouTube API 오류 [{resp.status_code}] {err_msg[:80]}",
+                    cooldown_sec=300.0,
+                )
+                continue
+            for item in resp_json.get("items", []):
                 snippet = item.get("snippet", {}) if isinstance(item, dict) else {}
                 video_id = str((item.get("id") or {}).get("videoId", "") or "").strip()
                 title = str(snippet.get("title", "") or "").strip()
@@ -5651,8 +5670,11 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
     채널 없어도 키워드 검색만으로 작동.
     """
     if not YOUTUBE_API_KEY:
+        _warn_throttled_once("youtube_api_key_missing", "⚠️ YOUTUBE_API_KEY 환경변수 미설정 — 유튜브 재료 수집 불가", cooldown_sec=3600.0)
         return []
-    raw_items: list[dict] = []   # (title, video_id) 목록
+    # v161.33: 수집 시작 로그 (진단용)
+    print(f"[YT] 유튜브 재료 수집 시작 — GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'} YOUTUBE_API_KEY=SET")
+    raw_items: list[dict] = []
     seen_ids: set = set()
     published_after = _build_youtube_published_after_iso(YOUTUBE_LOOKBACK_HOURS)
 
@@ -5708,6 +5730,7 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
         })
 
     # ③ Gemini 분석 — 사이클당 최대 GEMINI_YOUTUBE_MAX_PER_CYCLE개
+    print(f"[YT] 수집된 영상 {len(raw_items)}개 — Gemini 분석 시작 (max={GEMINI_YOUTUBE_MAX_PER_CYCLE})")
     rows: list[dict] = []
     gemini_done = 0
     for item in raw_items:
@@ -11603,7 +11626,7 @@ def send_preopen_watchlist():
                 risk_score = 0
                 points = []
                 try:
-                    dr = check_dart_risk(_code, _name)
+                    dr = check_dart_risk(_code)
                     if isinstance(dr, dict) and dr.get("is_risk"):
                         risk_score += 60
                         points.append(f"DART:{str(dr.get('title',''))[:24]}")
@@ -21819,7 +21842,7 @@ def _detect_defense_issues(code: str, name: str, entry: int, stop_loss: int) -> 
     try:
         # 1) DART 리스크
         try:
-            dr = check_dart_risk(code, name)
+            dr = check_dart_risk(code)
             if isinstance(dr, dict) and dr.get("is_risk"):
                 score += 60
                 reasons.append(f"⚠️ DART 리스크: {dr.get('title','')}".strip())
