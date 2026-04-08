@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.33
+버전: v161.34
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.34 (2026-04-08): Gemini YouTube URL 방식 폐기 → 텍스트 분석 전환 + description 수집 + /yt_exclude 명령어 준비
+  [#1] _analyze_youtube_video_with_gemini(): file_data URL 방식 폐기 → 제목+설명 텍스트 분석으로 전환
+  이유: URL 방식은 Gemini 서버가 영상 직접 다운로드·처리 → 수분 hang, timeout 없음 → "Gemini 분석 시작" 후 결과 로그 0건의 원인
+  개선점: 텍스트 분석은 즉시 응답·안정적. description 포함으로 내용 기반 유료유도 필터링 가능
+  주의점: 영상 전체 내용이 아닌 제목+설명(300자) 기반이므로 분석 깊이 다소 제한
+  [#2] description 인자 추가 및 raw_items 전달 경로 전체 반영
+  이유: 제목만으로는 유료유도 방송 판단 불가
+  개선점: 유료유도 2차 필터 실효성 향상
+  주의점: YouTube search API snippet의 description은 요약본 (전체는 videos.list 별도 호출 필요)
+  [#3] Gemini 성공 로그 추가 + 실패 쿨다운 1800→120초
+  이유: 침묵 실패 진단용
+  개선점: "[YT] Gemini 분석 완료" 로그로 정상 동작 즉시 확인 가능
+  주의점: 안정화 후 쿨다운 복구 예정
 - v161.33 (2026-04-08): YouTube 수집 진단 로그 강화 + API 오류 명시적 처리
   [#1] _fetch_youtube_material_headline_rows(): 수집 시작 시 GEMINI_API_KEY/YOUTUBE_API_KEY 상태 로그 추가
   이유: YouTube/Gemini 관련 로그가 전혀 없어 환경변수 누락인지 API 오류인지 구분 불가
@@ -5498,9 +5511,10 @@ def _gemini_daily_count_inc() -> None:
     _youtube_gemini_daily_counter["count"] = _youtube_gemini_daily_counter.get("count", 0) + 1
 
 
-def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
+def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: str = "") -> list[dict]:
     """
     Gemini로 유튜브 영상 분석 → 주식 재료 rows 반환.
+    v161.34: YouTube URL 직접 처리(불안정/hang) → 제목+설명 텍스트 분석으로 전환.
     캐시 TTL 내 재분석 방지. 실패 시 제목만 반환(fallback).
     반환 row 형식: {title, source, published_at, channel_id, live, gemini_stocks}
     """
@@ -5519,26 +5533,21 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
         try:
             from google import genai as _genai  # noqa
             client = _genai.Client(api_key=GEMINI_API_KEY)
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            # v161.34: URL 직접 처리 폐기 → 제목+설명 텍스트 분석 (안정적, 빠름)
+            desc_block = f"\n영상 설명:\n{description}" if description else ""
             prompt = (
-                "다음 유튜브 영상을 분석해서 한국 주식시장에 영향을 줄 수 있는 재료(호재/악재)와 관련 종목을 추출해줘.\n"
+                f"다음 유튜브 영상 정보를 분석해서 한국 주식시장에 영향을 줄 수 있는 재료(호재/악재)와 관련 종목을 추출해줘.\n"
+                f"영상 제목: {title}{desc_block}\n\n"
+                "⚠️ 중요: 영상이 리딩방, 단톡방, 유료 추천, 종목 추천 서비스, 조건검색식 판매, 구독 유도, 수익 인증 등 유료 서비스 홍보 목적이면 "
+                "반드시 stocks=빈배열, summary='유료유도영상'으로만 답해.\n"
                 "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
                 '{"stocks": [{"name": "종목명", "theme": "테마", "direction": "up/down/neutral", "reason": "근거 1줄"}], '
                 '"summary": "영상 핵심 재료 1~2줄 요약"}\n'
                 "종목이 없으면 stocks는 빈 배열. 영상이 재료와 무관하면 stocks 빈 배열 + summary에 무관 표시."
             )
-            from google.genai import types as _genai_types  # noqa
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=[
-                    _genai_types.Part(
-                        file_data=_genai_types.FileData(
-                            file_uri=video_url,
-                            mime_type="video/*",
-                        )
-                    ),
-                    prompt,
-                ],
+                contents=[prompt],
             )
             raw = str(resp.text or "").strip()
             import json as _json
@@ -5574,6 +5583,8 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
                 })
             _gemini_daily_count_inc()
             _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": rows}
+            # v161.34: 성공 로그
+            print(f"[YT] Gemini 분석 완료 [{video_id}]: stocks={len(stocks)}개 summary={summary[:40]!r}")
             return rows
         except Exception as e:
             err_str = str(e)
@@ -5590,7 +5601,7 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str) -> list[dict]:
             _warn_throttled_once(
                 f"gemini_video_analyze:{video_id}",
                 f"⚠️ Gemini 영상 분석 실패 [{video_id}]: {type(e).__name__}: {err_str[:120]}",
-                cooldown_sec=1800.0,
+                cooldown_sec=120.0,  # v161.34: 1800→120초, 진단 후 복구 예정
             )
             break
     # fallback: 제목만 반환
@@ -5651,6 +5662,7 @@ def _fetch_youtube_keyword_search_rows() -> list[dict]:
                     "channel_id": video_id,   # video_id를 channel_id 슬롯에 저장 (Gemini 분석용)
                     "live": str(snippet.get("liveBroadcastContent", "") or ""),
                     "_video_id": video_id,
+                    "_description": str(snippet.get("description", "") or "")[:300],  # v161.34: Gemini 텍스트 분석용
                 })
         except Exception as e:
             _warn_throttled_once(
@@ -5707,6 +5719,7 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
                     "video_id": video_id,
                     "published_at": str(snippet.get("publishedAt", "") or ""),
                     "live": str(snippet.get("liveBroadcastContent", "") or ""),
+                    "_description": str(snippet.get("description", "") or "")[:300],  # v161.34
                 })
         except Exception as e:
             _warn_throttled_once(
@@ -5727,6 +5740,7 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
             "video_id": video_id,
             "published_at": str(kw_row.get("published_at", "") or ""),
             "live": str(kw_row.get("live", "") or ""),
+            "_description": str(kw_row.get("_description", "") or ""),  # v161.34
         })
 
     # ③ Gemini 분석 — 사이클당 최대 GEMINI_YOUTUBE_MAX_PER_CYCLE개
@@ -5742,7 +5756,8 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
             # v161.20: 영상 사이 7초 딜레이 — 분당 토큰 한도(250,000) 분산
             if gemini_done > 0:
                 time.sleep(7)
-            analyzed = _analyze_youtube_video_with_gemini(video_id, title)
+            desc = str(item.get("_description", "") or "")
+            analyzed = _analyze_youtube_video_with_gemini(video_id, title, desc)
             if analyzed:
                 rows.extend(analyzed)
                 gemini_done += 1
