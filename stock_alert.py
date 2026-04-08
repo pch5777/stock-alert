@@ -3,22 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.32
+버전: v161.31
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v161.32 (2026-04-08): _collect_sector_leader_follow_candidates RuntimeError 수정
-  [#1] _collect_sector_leader_follow_candidates(): active dict 직접 참조 → 얕은 복사본(active_snapshot)으로 순회. last_seen_ts 수정은 ts_updates dict에 모아 순회 완료 후 일괄 반영 — 순회 중 외부에서 새 키 추가돼도 RuntimeError 불가
-  이유: v161.31 배포 후 run_scan에서 RuntimeError: dictionary changed size during iteration 발생. _collect_sector_leader_follow_candidates가 active 원본을 순회하면서 active[code]["last_seen_ts"] 수정, 동시에 _register_sector_leader_follow_seed가 같은 active dict에 새 키를 추가하면서 size 변경 충돌
-  개선점: 순회용 스냅샷(dict 복사)과 실제 원본을 분리 → 멀티스레드/동일사이클 내 동시 수정에도 안전. 기존 touched 플래그 제거, ts_updates 일괄 반영으로 저장 호출 1회로 통합
-  주의점: active_snapshot은 순회 시작 시점 스냅샷이므로 순회 중 새로 등록된 종목은 다음 스캔 사이클에서 처리됨 — 정상 동작
-  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
-- v161.31 (2026-04-08): 섹터 대장 연관 종목 analyze() 직결 + 상승 중 재료 즉시 달라붙기
-  [#1] _collect_sector_leader_follow_candidates(): 수집 후보에 _force_news_recheck=True 플래그 심기 — 섹터 대장 감시 등록 종목이 analyze()에 들어올 때 emergent_theme 재평가 강제
-  [#2] _analyze_news_context(): _force_news_recheck 플래그 있으면 change_rate/signal_type 조건 우회하고 _infer_emergent_issue_theme() 즉시 호출 — 상승 전 재료 미파악이어도 상승 중 재료 달라붙기 가능. 로그에 "[섹터연관 재료확인]" 태그 명시
-  이유: 대우건설 사례 — GS건설(A급) 알람 후 대우건설이 "GS건설 연관 테마" 후속감시에 등록됐으나 analyze() 체인이 즉시 연결되지 않고 재료도 emergent_theme 조건(change_rate/signal_type 미충족)에 막혀 미포착. 중동 종전·재건 수주 재료가 있었음에도 봇이 못 잡음
-  개선점: 섹터 대장 연관 후보는 _force_news_recheck=True로 recheck 경로 강제 진입 → 상승 중이면 재료가 즉시 달라붙어 emergent_theme_hit=True → 점수 상승 → A컷 진입 가능성 대폭 향상
-  주의점: _force_news_recheck는 emergent_theme 탐지 조건만 완화. direct_news_hit 판단(signal_type 조건)은 기존 유지. _infer_emergent_issue_theme 자체가 뉴스 없으면 hit=False 반환하므로 재료 없는 종목에 오탐 없음
+- v161.31 (2026-04-08): 섹터대장 연관 포착 강화 + RuntimeError 수정 + 중복 도달 알람 차단
+  [#1] _collect_sector_leader_follow_candidates(): active dict 직접참조→스냅샷 순회 분리, ts_updates 일괄반영 — RuntimeError: dictionary changed size during iteration 원천 차단
+  [#2] _collect_sector_leader_follow_candidates(): 후보에 _force_news_recheck=True 플래그 심기 — 섹터대장 연관 종목 analyze() 진입 시 emergent_theme 즉시 재평가
+  [#3] _analyze_news_context(): _force_news_recheck=True 시 change_rate/signal_type 조건 우회하고 _infer_emergent_issue_theme() 강제 호출 — 상승 중 재료 즉시 달라붙기. 로그에 [섹터연관 재료확인] 태그 명시
+  [#4] _prepare_entry_watch_registration_context(): old_items에서 prior_last_notified_ts·prior_notify_count 수집해 ctx에 추가
+  [#5] _build_entry_watch_active_record(): last_notified_ts=0 초기화 → prior_last_notified_ts 승계, notify_count=0 → prior_notify_count 승계 — 대표갱신 재등록 시 이미 발송한 도달 알람이 쿨다운 초기화로 재발송되는 버그 차단
+  이유: ①v161.31(오류본) RuntimeError: dictionary changed size during iteration — active dict 순회 중 _register_sector_leader_follow_seed가 동일 dict에 새 키 추가 ②대우건설 사례 — 섹터대장 연관 감시 등록 후 analyze() 체인 미연결·재료 미달라붙음 ③모헨즈/빛샘전자 — 대표갱신 재등록 시 last_notified_ts=0 초기화로 쿨다운 우회, 1차 진입가 도달 알람 2회 발송
+  개선점: ①dict 복사본 순회로 멀티스레드 안전 ②섹터대장 연관 종목 재료 즉시 달라붙기 → A컷 진입 가능 ③재등록 시 notify 이력 승계 → 동일 진입가 구간 중복 도달 알람 불가
+  주의점: prior_last_notified_ts 승계로 진입가가 동일한 대표갱신 재등록은 쿨다운이 유지됨. 진입가가 크게 변경된 경우(entry_guard_mode 변경)에도 동일하게 적용 — 진입가 변경 시 새 알람이 필요하면 별도 검토 필요
   진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.30 (2026-04-08): NXT SURGE 재료없음 페널티 + KIS 기관·외국인 가집계 신규 함수
   [#1] _apply_analyze_market_context(): NXT 시장 + SURGE/EARLY_DETECT 신호 + 직접재료·테마·시나리오 전부 없을 때 -10점 페널티 추가
@@ -15212,7 +15209,7 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
         _log_info_msg(f"🧭 섹터 대장 후속 강제감시 등록: {seed_name} [{theme_name}] → {added}개")
     return added
 def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, limit_total: int | None = None) -> list:
-    # v161.32: active 원본 대신 얕은 복사본으로 순회 — 순회 중 외부에서 키 추가돼도 RuntimeError 방지
+    # v161.31: active 원본 대신 얕은 복사본으로 순회 — 순회 중 외부에서 키 추가돼도 RuntimeError 방지
     active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
     if not active:
         return []
@@ -15245,8 +15242,7 @@ def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, 
         cand["name"] = _resolve_stock_name(code, rec.get("name", ""), q)
         cand["desc"] = f"sector_leader_follow[{rec.get('theme', '기타')}]"
         cand["_sector_leader_follow"] = dict(rec)
-        # v161.31 패치A: 섹터 대장 연관 종목은 상승 중 재료 즉시 재평가 강제
-        cand["_force_news_recheck"] = True
+        cand["_force_news_recheck"] = True  # v161.31: 상승 중 재료 즉시 재평가 강제
         if market == "NXT":
             cand["market"] = "NXT"
         rows.append(cand)
@@ -19822,6 +19818,9 @@ def _prepare_entry_watch_registration_context(s: dict, code: str, stock_name: st
     previous_entry = safe_int((latest_old_watch or {}).get("entry_price", 0), 0)
     previous_miss_count = safe_int((latest_old_watch or {}).get("miss_count", 0), 0)
     previous_first_detect_date = str((latest_old_watch or {}).get("first_detect_date", (latest_old_watch or {}).get("detect_date", "")) or "")
+    # v161.31: 대표갱신 시 notify 이력 승계용 — 중복 도달 알람 방지
+    prior_last_notified_ts = max((safe_int((w or {}).get("last_notified_ts", 0), 0) for _, w in old_items), default=0)
+    prior_notify_count = max((safe_int((w or {}).get("notify_count", 0), 0) for _, w in old_items), default=0)
     entry, entry_guard_mode = _apply_entry_price_guard(
         s,
         previous_entry,
@@ -19848,6 +19847,8 @@ def _prepare_entry_watch_registration_context(s: dict, code: str, stock_name: st
         "current_price": current_price,
         "stock_name": stock_name,
         "code": code,
+        "prior_last_notified_ts": prior_last_notified_ts,  # v161.31
+        "prior_notify_count": prior_notify_count,          # v161.31
     }
 def _should_skip_entry_watch_registration(ctx: dict, regime_mode: str) -> bool:
     current_price = ctx["current_price"]
@@ -19933,6 +19934,9 @@ def _archive_prior_entry_watches(old_items: list[tuple[str, dict]], ctx: dict) -
 def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
     signal_log_key = ctx["signal_log_key"] or ctx["log_key"]
     entry = ctx["entry"]
+    # v161.31: 대표갱신 재등록 시 기존 notify 이력 승계 — last_notified_ts=0 초기화로 중복 도달 알람 방지
+    _prior_last_notified_ts = ctx.get("prior_last_notified_ts", 0)
+    _prior_notify_count = ctx.get("prior_notify_count", 0)
     return {
         "code": ctx["code"],
         "name": ctx["stock_name"],
@@ -19944,8 +19948,8 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
         "detect_date": ctx["detect_date"],
         "detect_time": ctx["detect_time"],
         "first_detect_date": ctx["previous_first_detect_date"] or ctx["detect_date"],
-        "last_notified_ts": 0,
-        "notify_count": 0,
+        "last_notified_ts": _prior_last_notified_ts,  # v161.31: 기존 notify 시각 승계
+        "notify_count": _prior_notify_count,           # v161.31: 기존 notify 횟수 승계
         "miss_count": ctx["previous_miss_count"] + len(ctx["old_items"]),
         "registered_ts": time.time(),
         "expire_ts": time.time() + 86400 * ctx["expire_days"],
@@ -23202,7 +23206,7 @@ def _analyze_news_context(ctx: dict, score: int, reasons: list, sector_info: dic
                 _matched = ", ".join(direct_theme.get("matched", [])[:3])
                 reasons.append(f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — {direct_theme.get('reason','')}" + (f" ({_matched})" if _matched else ""))
             elif (signal_type in EMERGENT_THEME_SIGNAL_TYPES or change_rate >= EMERGENT_THEME_MIN_CHANGE or vol_ratio >= EMERGENT_THEME_MIN_VOLUME
-                  or bool(stock.get("_force_news_recheck"))):  # v161.31 패치B: 섹터대장 연관 종목 recheck 강제
+                  or bool(stock.get("_force_news_recheck"))):  # v161.31: 섹터대장 연관 종목 recheck 강제
                 emergent_theme = _infer_emergent_issue_theme(code, stock.get("name", code), news_articles)
                 if emergent_theme.get("theme"):
                     if sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
@@ -23213,7 +23217,6 @@ def _analyze_news_context(ctx: dict, score: int, reasons: list, sector_info: dic
                         score += emergent_bonus
                     emergent_theme_hit = True
                     _matched = ", ".join(emergent_theme.get("matched", [])[:3])
-                    # v161.31: recheck 경로 명시
                     _recheck_tag = " [섹터연관 재료확인]" if bool(stock.get("_force_news_recheck")) else ""
                     reasons.append(f"🧠 신규이슈 자동감지{_recheck_tag} [{emergent_theme['theme']}] {emergent_bonus:+d}점 — {emergent_theme.get('reason','')}" + (f" ({_matched})" if _matched else ""))
                     _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="analyze")
