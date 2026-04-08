@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.30
+버전: v161.31
 날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.31 (2026-04-08): 섹터 대장 연관 종목 analyze() 직결 + 상승 중 재료 즉시 달라붙기
+  [#1] _collect_sector_leader_follow_candidates(): 수집 후보에 _force_news_recheck=True 플래그 심기 — 섹터 대장 감시 등록 종목이 analyze()에 들어올 때 emergent_theme 재평가 강제
+  [#2] _analyze_news_context(): _force_news_recheck 플래그 있으면 change_rate/signal_type 조건 우회하고 _infer_emergent_issue_theme() 즉시 호출 — 상승 전 재료 미파악이어도 상승 중 재료 달라붙기 가능. 로그에 "[섹터연관 재료확인]" 태그 명시
+  이유: 대우건설 사례 — GS건설(A급) 알람 후 대우건설이 "GS건설 연관 테마" 후속감시에 등록됐으나 analyze() 체인이 즉시 연결되지 않고 재료도 emergent_theme 조건(change_rate/signal_type 미충족)에 막혀 미포착. 중동 종전·재건 수주 재료가 있었음에도 봇이 못 잡음
+  개선점: 섹터 대장 연관 후보는 _force_news_recheck=True로 recheck 경로 강제 진입 → 상승 중이면 재료가 즉시 달라붙어 emergent_theme_hit=True → 점수 상승 → A컷 진입 가능성 대폭 향상
+  주의점: _force_news_recheck는 emergent_theme 탐지 조건만 완화. direct_news_hit 판단(signal_type 조건)은 기존 유지. _infer_emergent_issue_theme 자체가 뉴스 없으면 hit=False 반환하므로 재료 없는 종목에 오탐 없음
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.30 (2026-04-08): NXT SURGE 재료없음 페널티 + KIS 기관·외국인 가집계 신규 함수
   [#1] _apply_analyze_market_context(): NXT 시장 + SURGE/EARLY_DETECT 신호 + 직접재료·테마·시나리오 전부 없을 때 -10점 페널티 추가
   [#2] get_investor_provisional_trend(code, market) 신규 함수 추가 — KIS FHKST01010900 기반 당일 가집계(기관·외국인·개인 순매수 수량+거래대금) 반환, KRX/NXT 양쪽 지원
@@ -15230,6 +15237,8 @@ def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, 
         cand["name"] = _resolve_stock_name(code, rec.get("name", ""), q)
         cand["desc"] = f"sector_leader_follow[{rec.get('theme', '기타')}]"
         cand["_sector_leader_follow"] = dict(rec)
+        # v161.31 패치A: 섹터 대장 연관 종목은 상승 중 재료 즉시 재평가 강제
+        cand["_force_news_recheck"] = True
         if market == "NXT":
             cand["market"] = "NXT"
         rows.append(cand)
@@ -23180,7 +23189,8 @@ def _analyze_news_context(ctx: dict, score: int, reasons: list, sector_info: dic
                 direct_news_hit = True
                 _matched = ", ".join(direct_theme.get("matched", [])[:3])
                 reasons.append(f"📰 직접뉴스 테마 [{direct_theme['theme']}] {direct_bonus:+d}점 — {direct_theme.get('reason','')}" + (f" ({_matched})" if _matched else ""))
-            elif signal_type in EMERGENT_THEME_SIGNAL_TYPES or change_rate >= EMERGENT_THEME_MIN_CHANGE or vol_ratio >= EMERGENT_THEME_MIN_VOLUME:
+            elif (signal_type in EMERGENT_THEME_SIGNAL_TYPES or change_rate >= EMERGENT_THEME_MIN_CHANGE or vol_ratio >= EMERGENT_THEME_MIN_VOLUME
+                  or bool(stock.get("_force_news_recheck"))):  # v161.31 패치B: 섹터대장 연관 종목 recheck 강제
                 emergent_theme = _infer_emergent_issue_theme(code, stock.get("name", code), news_articles)
                 if emergent_theme.get("theme"):
                     if sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
@@ -23191,7 +23201,9 @@ def _analyze_news_context(ctx: dict, score: int, reasons: list, sector_info: dic
                         score += emergent_bonus
                     emergent_theme_hit = True
                     _matched = ", ".join(emergent_theme.get("matched", [])[:3])
-                    reasons.append(f"🧠 신규이슈 자동감지 [{emergent_theme['theme']}] {emergent_bonus:+d}점 — {emergent_theme.get('reason','')}" + (f" ({_matched})" if _matched else ""))
+                    # v161.31: recheck 경로 명시
+                    _recheck_tag = " [섹터연관 재료확인]" if bool(stock.get("_force_news_recheck")) else ""
+                    reasons.append(f"🧠 신규이슈 자동감지{_recheck_tag} [{emergent_theme['theme']}] {emergent_bonus:+d}점 — {emergent_theme.get('reason','')}" + (f" ({_matched})" if _matched else ""))
                     _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="analyze")
     except Exception as _e:
         _log_error(f"analyze_news({code})", _e)
