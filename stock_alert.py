@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.29
-날짜: 2026-04-07
+버전: v161.30
+날짜: 2026-04-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.30 (2026-04-08): NXT SURGE 재료없음 페널티 + KIS 기관·외국인 가집계 신규 함수
+  [#1] _apply_analyze_market_context(): NXT 시장 + SURGE/EARLY_DETECT 신호 + 직접재료·테마·시나리오 전부 없을 때 -10점 페널티 추가
+  [#2] get_investor_provisional_trend(code, market) 신규 함수 추가 — KIS FHKST01010900 기반 당일 가집계(기관·외국인·개인 순매수 수량+거래대금) 반환, KRX/NXT 양쪽 지원
+  이유: ④NXT 장외시간대 재료 없는 SURGE가 A등급으로 올라와 실행 가능성 낮은 알람 발송 사례 발생 ⑤기관·외국인 당일 실시간 가집계를 별도 함수 없이 get_investor_trend()만으로 처리해 호출부에서 수량/거래대금 구분이 불가
+  개선점: ④재료 없는 NXT SURGE는 최소 -10점 → A컷(75점) 미달 가능성 상승, 실행형 알람 품질 향상 ⑤get_investor_provisional_trend()로 수량·거래대금 모두 반환, is_provisional=True 플래그로 가집계 여부 명시, NXT(FID_COND_MRKT_DIV_CODE=NX) 분기 지원
+  주의점: ④direct_news_hit/emergent_theme_hit/material_scenario_hit/theme_drive_hit/force_external_capture_alert 중 하나라도 있으면 페널티 면제 — 실제 재료형 NXT SURGE는 영향 없음 ⑤FHKST01010900은 장 중 실시간 집계이므로 장 마감 후 최종값과 소폭 다를 수 있음. 오류 시 빈 dict 반환(봇 중단 없음)
+  진입 체인: analyze() → _dispatch_general_alert_signal() 연결 확인 (변경 없음)
 - v161.29 (2026-04-07): KIS API 미활용 데이터 전면 활용 + 3가지 버그 수정
   [#1] get_stock_price(): low(저가)/upper_price(상한가)/lower_price(하한가)/acml_tr_pbmn(누적거래대금)/prdy_vrss_sign(전일대비부호) 필드 추가
   [#2] _detect_entry_block_reason(): upper_price 직접 비교(price>=upper_price) + prdy_vrss_sign=="1" 조건으로 상한가 정확 판단 — change_rate>=29% 단순 계산보다 정확
@@ -13551,6 +13558,54 @@ def get_investor_trend(code: str) -> dict:
         "institution_net": safe_int(output[0].get('orgn_ntby_qty', 0)),
         "retail_net":      safe_int(output[0].get('prsn_ntby_qty', 0)),  # 개인 순매수
     }
+def get_investor_provisional_trend(code: str, market: str = "KRX") -> dict:
+    """v161.30 ⑤: KIS 기관·외국인 당일 가집계 조회 신규 함수.
+    get_investor_trend()가 일별 누계를 반환하는 것과 달리,
+    이 함수는 당일 장 중 실시간 잠정 집계(가집계)를 반환한다.
+    - KRX: FHKST01010900 (FID_COND_MRKT_DIV_CODE=J), 당일 포함
+    - NXT: FHKST01010900 (FID_COND_MRKT_DIV_CODE=NX)
+    반환: {
+        "foreign_net": 외국인 순매수(주),
+        "institution_net": 기관 순매수(주),
+        "retail_net": 개인 순매수(주),
+        "foreign_net_amount": 외국인 순매수(원),
+        "institution_net_amount": 기관 순매수(원),
+        "is_provisional": True,   ← 가집계 플래그
+        "market": "KRX" or "NXT",
+    }
+    """
+    try:
+        _mkt_div = "NX" if str(market or "").upper() == "NXT" else "J"
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
+            "FHKST01010900",
+            {"FID_COND_MRKT_DIV_CODE": _mkt_div, "FID_INPUT_ISCD": code},
+        )
+        output = data.get("output", [])
+        if not output:
+            return {"foreign_net": 0, "institution_net": 0, "retail_net": 0,
+                    "foreign_net_amount": 0, "institution_net_amount": 0,
+                    "is_provisional": True, "market": market}
+        row = output[0] if isinstance(output, list) else output
+        f_qty  = safe_int(row.get("frgn_ntby_qty",  0))
+        i_qty  = safe_int(row.get("orgn_ntby_qty",  0))
+        r_qty  = safe_int(row.get("prsn_ntby_qty",  0))
+        f_amt  = safe_int(row.get("frgn_ntby_tr_pbmn", 0))  # 외국인 순매수 거래대금(원)
+        i_amt  = safe_int(row.get("orgn_ntby_tr_pbmn", 0))  # 기관 순매수 거래대금(원)
+        return {
+            "foreign_net":             f_qty,
+            "institution_net":         i_qty,
+            "retail_net":              r_qty,
+            "foreign_net_amount":      f_amt,
+            "institution_net_amount":  i_amt,
+            "is_provisional":          True,
+            "market":                  market,
+        }
+    except Exception as e:
+        _swallow_exception(e)
+        return {"foreign_net": 0, "institution_net": 0, "retail_net": 0,
+                "foreign_net_amount": 0, "institution_net_amount": 0,
+                "is_provisional": True, "market": market}
 # ============================================================
 # 섹터 모멘텀
 # ============================================================
@@ -23352,6 +23407,26 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
             if _open_gap >= 3.0:
                 score += 2
                 reasons.append(f"↗️ 갭업({_open_gap:.1f}%) 후 시가 유지 +2점")
+    except Exception as _e:
+        _swallow_exception(_e)
+
+    # v161.30 ④: NXT SURGE 재료없음 -10점 페널티
+    # NXT 전용 시간대(KRX 닫힘)에서 SURGE 신호인데 직접재료/테마/시나리오 없으면 페널티
+    try:
+        _mkt_str = str((stock.get("market", "") or "")).upper()
+        _is_nxt_market = (_mkt_str == "NXT")
+        _is_surge_type = (signal_type in ("SURGE", "EARLY_DETECT"))
+        _has_any_material = bool(
+            direct_news_hit
+            or emergent_theme_hit
+            or material_scenario_hit
+            or bool(ctx.get("theme_drive_hit"))
+            or bool(ctx.get("force_external_capture_alert"))
+        )
+        if _is_nxt_market and _is_surge_type and not _has_any_material:
+            _NXT_SURGE_NO_MATERIAL_PENALTY = -10
+            score += _NXT_SURGE_NO_MATERIAL_PENALTY
+            reasons.append(f"⚠️ NXT SURGE 재료 없음 {_NXT_SURGE_NO_MATERIAL_PENALTY}점")
     except Exception as _e:
         _swallow_exception(_e)
 
