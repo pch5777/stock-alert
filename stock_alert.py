@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.39
-날짜: 2026-04-08
+버전: v161.41
+날짜: 2026-04-09
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.41 (2026-04-09): grounding 429 루프 차단 + JSONDecodeError 처리
+  [#1] _fetch_gemini_grounding_rows(): 실패 시 캐시 ts 갱신 → TTL 동안 재시도 차단
+  이유: 429/503 실패 후 캐시 ts 미갱신 → 다음 사이클(20분)에서 재시도 → 429 연쇄 발생
+  개선점: 실패해도 ts 갱신으로 TTL(1시간) 동안 재호출 없음. 마지막 성공 캐시 반환
+  주의점: 없음
+  [#2] 빈 응답(JSONDecodeError) 처리: raw가 빈 문자열이면 캐시 ts만 갱신 후 반환
+  이유: Gemini가 빈 응답 반환 시 _json.loads("") → JSONDecodeError → 캐시 미갱신 → 루프
+  개선점: 없음
+  주의점: 없음
+  [#3] grounding 경고 쿨다운 300→3600초
+  이유: 429 루프로 5분마다 경고 로그 폭발
+  개선점: 없음
+  주의점: 없음
+- v161.40 (2026-04-09): Gemini grounding TTL 1시간 복구 + YouTube 403 쿨다운 연장
+  [#1] GEMINI_GROUNDING_CACHE_TTL_SEC 900→3600초, GEMINI_GROUNDING_DAILY_LIMIT 96→20회
+  이유: 무료 Gemini Flash RPD가 2025-12 이후 실질적으로 20~250회 수준. 15분마다 96회 목표는 당연히 429 유발
+  개선점: 1시간마다 호출 → 하루 24회 이하. 무료 RPD 내에서 안정 운영
+  주의점: GEMINI_GROUNDING_CACHE_TTL_SEC/GEMINI_GROUNDING_DAILY_LIMIT 환경변수로 조정 가능
+  [#2] YouTube API 403 경고 쿨다운 300→3600초
+  이유: 할당량 소진 시 5분마다 403 경고 로그 폭발 (매 쿼리마다 별도 키로 300초 쿨다운)
+  개선점: 1시간 쿨다운으로 로그 노이즈 제거. 할당량은 자정 리셋됨
+  주의점: 없음
 - v161.39 (2026-04-08): 시장 주도 섹터 중복 발송 수정
   [#1] _render_market_leading_sector_payload(): digest에서 등락률 제거, 섹터 구성(테마+종목코드)만으로 중복 판단
   이유: digest에 change_rate가 포함되어 등락률만 바뀌어도 새 digest → 동일 섹터 구성인데 매 사이클 재발송
@@ -5465,8 +5487,8 @@ GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") o
 GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
-GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "900") or "900")   # v161.38: 15분 캐시 (3600→900)
-GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "96") or "96")         # v161.38: 15분×24h=96회, RPD 500 여유분 내
+GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "3600") or "3600")   # v161.40: 900→3600초(1시간), 무료 RPD 절약
+GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "20") or "20")         # v161.40: 96→20회, 무료 RPD 실제 한도 고려
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
 # 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
 YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
@@ -5715,7 +5737,7 @@ def _fetch_youtube_keyword_search_rows() -> list[dict]:
                 _warn_throttled_once(
                     f"youtube_api_error:{query[:15]}",
                     f"⚠️ YouTube API 오류 [{resp.status_code}] {err_msg[:80]}",
-                    cooldown_sec=300.0,
+                    cooldown_sec=3600.0,  # v161.40: 300→3600초, 할당량 소진 시 로그 폭발 방지
                 )
                 continue
             for item in resp_json.get("items", []):
@@ -5789,6 +5811,10 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         )
         import json as _json
         raw = str(resp.text or "").strip()
+        if not raw:
+            # v161.40: 빈 응답 처리 — 캐시 ts 갱신으로 TTL 동안 재시도 차단
+            _gemini_grounding_cache["ts"] = now
+            return list(_gemini_grounding_cache.get("rows", []))
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
         parsed = _json.loads(raw_clean)
         items = parsed.get("items") or []
@@ -5821,9 +5847,11 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         _warn_throttled_once(
             "gemini_grounding_fetch",
             f"⚠️ Gemini grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
-            cooldown_sec=300.0,
+            cooldown_sec=3600.0,  # v161.40: 300→3600초
         )
-        return []
+        # v161.40: 실패해도 캐시 ts 갱신 → TTL 동안 재시도 차단 (429 루프 방지)
+        _gemini_grounding_cache["ts"] = now
+        return list(_gemini_grounding_cache.get("rows", []))
 
 
 def _fetch_youtube_material_headline_rows() -> list[dict]:
