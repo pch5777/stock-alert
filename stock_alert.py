@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.41
+버전: v161.42
 날짜: 2026-04-09
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.42 (2026-04-09): 섹터 재안내 상한가 종목 차단
+  [#1] _sector_resend_relevance_ok(): _upper_limit_alerted_today 체크 + prdy_vrss_sign/upper_price 이중 체크
+  이유: 상한가 도달(NEAR_UPPER 발송 완료) 후에도 섹터 재안내가 발송됨. upper_limit_reached 차단 후에도 entry_watch가 살아있어 진입가 도달 재알람 경로로 섹터 재안내가 나감
+  개선점: ① _upper_limit_alerted_today[code]==today → 재안내 즉시 차단 ② 실시간 quote에서 prdy_vrss_sign=="1" 또는 현재가>=상한가 → 추가 차단. KIS API stck_mxpr/prdy_vrss_sign 필드 직접 활용
+  주의점: 상한가 풀린 후 재매수 기회는 새 포착 신호로만 처리됨
 - v161.41 (2026-04-09): grounding 429 루프 차단 + JSONDecodeError 처리
   [#1] _fetch_gemini_grounding_rows(): 실패 시 캐시 ts 갱신 → TTL 동안 재시도 차단
   이유: 429/503 실패 후 캐시 ts 미갱신 → 다음 사이클(20분)에서 재시도 → 429 연쇄 발생
@@ -19710,7 +19715,19 @@ def _sector_resend_relevance_ok(alert_snapshot: dict, si_retry: dict) -> bool:
         return False
     if _signal_age_minutes_for_retry(alert_snapshot) > SECTOR_RESEND_MAX_MINUTES:
         return False
+    code = str(alert_snapshot.get("code", "") or "").strip()
+    # v161.42: 상한가 도달 종목 재안내 차단 — _upper_limit_alerted_today 체크
+    today = _now_kst().strftime("%Y%m%d")
+    if code and _upper_limit_alerted_today.get(code) == today:
+        return False
     quote = _get_live_quote_for_signal(alert_snapshot)
+    # v161.42: 실시간 상한가 상태 이중 체크 (prdy_vrss_sign=="1" 또는 현재가>=상한가)
+    if quote:
+        _sign = str(quote.get("prdy_vrss_sign", "") or "")
+        _upper_price = safe_int(quote.get("upper_price", 0), 0)
+        _cur_price = safe_int(quote.get("price", 0), 0)
+        if _sign == "1" or (_upper_price > 0 and _cur_price >= _upper_price):
+            return False
     price = safe_int((quote or {}).get("price", 0) or alert_snapshot.get("price", 0))
     entry = safe_int(alert_snapshot.get("entry_price", 0))
     stop = safe_int(alert_snapshot.get("stop_loss", 0))
