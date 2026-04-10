@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.44
+버전: v161.45
 날짜: 2026-04-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.45 (2026-04-10): KRX 장마감 후 KRX 전용 종목 알람 발송 구멍 4곳 차단
+  [#1] run_mid_pullback_scan(): NXT 전용 시간대 KRX 미상장 종목 스캔 skip
+  이유: 지앤비에스 에코(382800) KRX 전용 종목이 17:08 눌림목 A등급 발송됨. NXT 열린 동안 run_mid_pullback_scan이 KRX 종목 필터링 없이 계속 스캔
+  개선점: nxt_only_window일 때 is_nxt_listed() 미상장 종목 즉시 skip
+  주의점: KRX+NXT 동시(09:00~15:30)엔 nxt_only_window=False라 기존 동작 유지
+  [#2] _scan_sector_leader_follow_candidates(): NXT 전용 시간대 KRX 전용 종목 차단
+  이유: _scan_rank_and_theme_candidates에만 nxt_only_window 게이팅 적용되고 섹터리더팔로우 경로는 누락
+  개선점: nxt_only_window + not is_nxt_listed() 조합 종목 skip
+  주의점: market=NXT 명시 종목은 통과
+  [#3] _scan_quiet_absorption_candidates(): NXT 전용 시간대 KRX 전용 종목 차단
+  이유: quiet absorption 풀에 KRX 전용 종목 포함 가능하나 게이팅 없음
+  개선점: nxt_only_window 체크 후 KRX 전용 종목 skip
+  주의점: 장중(09:00~15:30)엔 nxt_only_window=False라 기존 동작 유지
+  [#4] send_news_theme_alert(): NXT 전용 시간대 rising 종목 A급 진입 체인 KRX 전용 차단
+  이유: NXT 열린 15:30 이후 live_market=True → 뉴스 알람 rising 종목 진입 체인에서 KRX 전용 종목 dispatch 가능
+  개선점: rising 종목 진입 체인 직전 nxt_only_window+KRX 전용 조합 차단. 정보성 메시지 자체는 유지
+  주의점: 뉴스 알람(send_news_theme_alert 메시지) 차단 아님. _dispatch_general_alert_signal 경로만 차단
 - v161.44 (2026-04-10): 선진입 전면강화 (KRX/NXT) + 섹터대장주 풀직결 + 종가매매 스코어 보강
   [#1] 선진입 타이밍 10분 앞당김: KRX 14:45→14:35 / 15:18→15:08 / NXT 19:20→19:10
   이유: 동시호가(15:20) 직전 15:18은 여유 없음. 10분 앞당겨 실질 의사결정 시간 확보
@@ -12800,6 +12817,7 @@ def run_mid_pullback_scan():
     nxt_open = is_nxt_open()
     if (not krx_open and not nxt_open) or _bot_paused:
         return
+    nxt_only_window = not krx_open and nxt_open  # v161.45: KRX 닫힘+NXT 열림
     if not _mid_pullback_scan_lock.acquire(blocking=False):
         return
     try:
@@ -12807,6 +12825,10 @@ def run_mid_pullback_scan():
         _ensure_dynamic_candidates_fresh()
         signals = []
         for code, name, theme_desc in get_all_scan_candidates():
+            # v161.45: NXT 전용 시간대에 KRX 미상장 종목 스캔 제외
+            if nxt_only_window and not is_nxt_listed(code):
+                _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(눌림목): {name} ({code})")
+                continue
             name = _resolve_stock_name(code, name)
             if not _passes_mid_pullback_cooldown_gate(code, name):
                 continue
@@ -28568,8 +28590,13 @@ def send_news_theme_alert(signal: dict):
          +"━━━━━━━━━━━━━━━")
     # v81 #1: rising 종목 A급 진입 체인 연결
     # 정보 알람 발송 후 각 상승 종목에 대해 analyze() → A급이면 _dispatch_general_alert_signal()
+    _nxt_only = not is_market_open() and is_nxt_open()  # v161.45: KRX 장마감 후 NXT 전용 시간대 판단
     for r in signal.get("rising", []):
         try:
+            # v161.45: NXT 전용 시간대에 KRX 전용 종목 A급 진입 체인 차단 (정보성 메시지는 이미 발송됨)
+            if _nxt_only and not is_nxt_listed(r.get("code", "")):
+                _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 진입체인 차단(뉴스테마): {r.get('name', r.get('code', ''))}")
+                continue
             cur = get_stock_price(r["code"])
             if not cur:
                 continue
@@ -33613,6 +33640,7 @@ def _slice_quiet_absorption_scan_pool(pool: list[dict]) -> list[dict]:
     _quiet_scan_cursor["all"] = (cursor + deep_limit) % len(pool)
     return selected
 def _scan_quiet_absorption_candidates(alerts: list, seen: set) -> None:
+    nxt_only_window = not is_market_open() and is_nxt_open()  # v161.45
     pool = _slice_quiet_absorption_scan_pool(_collect_quiet_absorption_scan_pool(existing_codes=seen))
     if not pool:
         return
@@ -33620,6 +33648,10 @@ def _scan_quiet_absorption_candidates(alerts: list, seen: set) -> None:
     for stock in pool:
         code = normalize_stock_code(stock.get("code", ""))
         if not code:
+            continue
+        # v161.45: NXT 전용 시간대에 KRX 전용 종목 차단
+        if nxt_only_window and stock.get("market", "") != "NXT" and not is_nxt_listed(code):
+            _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(quiet): {stock.get('name', code)}")
             continue
         registered = _register_quiet_absorption_seed(stock, source="quiet_absorption_scan")
         if not registered or code in seen:
@@ -33652,9 +33684,14 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
 def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
+    nxt_only_window = not is_market_open() and is_nxt_open()  # v161.45
     for stock in _collect_sector_leader_follow_candidates(existing_codes=seen):
         code = stock.get("code")
         if not code or code in seen:
+            continue
+        # v161.45: NXT 전용 시간대에 KRX 전용 종목 차단
+        if nxt_only_window and stock.get("market", "") != "NXT" and not is_nxt_listed(code):
+            _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(섹터팔로우): {stock.get('name', code)}")
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
 def _scan_early_pullback_candidates(alerts: list, seen: set, krx_open: bool, nxt_open: bool) -> None:
