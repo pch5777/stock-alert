@@ -3,10 +3,31 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.43
+버전: v161.44
 날짜: 2026-04-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.44 (2026-04-10): 선진입 전면강화 (KRX/NXT) + 섹터대장주 풀직결 + 종가매매 스코어 보강
+  [#1] 선진입 타이밍 10분 앞당김: KRX 14:45→14:35 / 15:18→15:08 / NXT 19:20→19:10
+  이유: 동시호가(15:20) 직전 15:18은 여유 없음. 10분 앞당겨 실질 의사결정 시간 확보
+  개선점: KRX 14:35 1차·15:08 최종·NXT 19:10 발송으로 종가 체결 여유 확보
+  주의점: schedule 등록 시각 + PRECLOSE_GAP 상수 양쪽 모두 변경
+  [#2] _collect_next_open_gap_candidate_codes(): 섹터 대장주 발송 이력 → 선진입 풀 최우선 편입
+  이유: send_market_leading_sector_update 대장주가 _detected_stocks/_entry_watch에 없으면 선진입 후보 풀 미진입
+  개선점: market_leader_sector_state.json의 오늘 발송 대장주·follower 코드를 최우선 풀에 삽입
+  주의점: 당일 날짜 일치 여부 확인 후 삽입 (전날 캐시 혼입 방지)
+  [#3] _apply_next_open_gap_sector_history(): 섹터 대장주 발송 이력 종목 +10점 강화 (기존 +4)
+  이유: calc_sector_momentum leader 판정은 실시간이라 섹터알림 대장주와 다를 수 있음
+  개선점: market_leader_state 기반 오늘 대장주·follower 확인으로 직접 보너스 +10
+  주의점: 기존 calc_sector_momentum 대장주 +4는 유지 (별도 경로)
+  [#4] _apply_next_open_gap_sector_history(): 이평 정배열 +3점 / RSI 50~70 구간 +3점 추가 (KRX/NXT 공통)
+  이유: 종가매매 핵심 지표인 이평배열·RSI가 선진입 스코어에 미반영
+  개선점: calc_indicators() 기존 반환값 재활용 → API 추가호출 없음
+  주의점: RSI 데이터 없을 시 0점 처리 (skip)
+  [#5] _score_next_open_gap_price_volume(): 마감 직전 매수 체결 우위 +4점 / NXT 나스닥 선물 방향 +3점 추가
+  이유: "상승폭 끝까지 지키는 종목" 판별 — bid_qty>ask_qty 비율로 매수세 유지 확인
+  개선점: KRX=bid/ask비율, NXT=나스닥선물 방향(us.gap_signal/nasdaq_chg) 시장별 분기
+  주의점: NXT 지수방향은 _apply_next_open_gap_market_context와 중복 아님 (NXT 전용 추가가점)
 - v161.43 (2026-04-10): 상한가류 entry_watch 즉시만료 + 진입가 도달 헤더 보강
   [#1] _expire_entry_watch_for_upper_limit(): NEAR_UPPER/UPPER_LIMIT 발송 즉시 해당 종목 entry_watch 전부 만료
   이유: 상한가류 발송 후 entry_watch가 살아있어 매 사이클 upper_limit_reached 진입불가 기록이 반복됨
@@ -5331,12 +5352,12 @@ WATCHDOG_RANK_TOP_N = int(os.getenv("WATCHDOG_RANK_TOP_N", "30") or "30")
 TRACK_NEWS_WATCH_INTERVAL_SEC = int(os.getenv("TRACK_NEWS_WATCH_INTERVAL_SEC", "1800") or "1800")
 NXT_SURGE_REENTRY_RAISE_THRESHOLD = float(os.getenv("NXT_SURGE_REENTRY_RAISE_THRESHOLD", "1.03") or "1.03")
 NXT_SURGE_REENTRY_PULLBACK_FACTOR = float(os.getenv("NXT_SURGE_REENTRY_PULLBACK_FACTOR", "0.97") or "0.97")
-PRECLOSE_GAP_KRX_CATCHUP_START = dtime(14, 45)
-PRECLOSE_GAP_KRX_CATCHUP_END = dtime(15, 5)
-PRECLOSE_GAP_FINAL_CONFIRM_START = dtime(15, 18)
-PRECLOSE_GAP_FINAL_CONFIRM_END = dtime(15, 20)
-PRECLOSE_GAP_NXT_CATCHUP_START = dtime(19, 20)
-PRECLOSE_GAP_NXT_CATCHUP_END = dtime(19, 35)
+PRECLOSE_GAP_KRX_CATCHUP_START = dtime(14, 35)   # v161.44: 14:45→14:35 (10분 앞당김)
+PRECLOSE_GAP_KRX_CATCHUP_END = dtime(14, 55)      # v161.44: 15:05→14:55
+PRECLOSE_GAP_FINAL_CONFIRM_START = dtime(15, 8)   # v161.44: 15:18→15:08 (10분 앞당김)
+PRECLOSE_GAP_FINAL_CONFIRM_END = dtime(15, 12)    # v161.44: 15:20→15:12
+PRECLOSE_GAP_NXT_CATCHUP_START = dtime(19, 10)    # v161.44: 19:20→19:10 (10분 앞당김)
+PRECLOSE_GAP_NXT_CATCHUP_END = dtime(19, 25)      # v161.44: 19:35→19:25
 PRECLOSE_GAP_STAGE_LABEL_KRX = "KRX 14:45 1차"
 PRECLOSE_GAP_STAGE_LABEL_KRX_FINAL = "KRX 15:18 최종"
 PRECLOSE_GAP_STAGE_LABEL_NXT = "NXT 19:20"
@@ -10637,6 +10658,27 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
         if c and c not in seen:
             seen.add(c)
             codes.append(c)
+    # v161.44: 섹터 대장주 발송 이력 → 최우선 편입
+    try:
+        leader_state = _read_market_leader_state()
+        today_str = datetime.now().strftime("%Y%m%d")
+        sent_at = str(leader_state.get("sent_at", "") or "")
+        if sent_at[:8] == today_str:
+            themes_raw = leader_state.get("themes", [])
+            leader_code = normalize_stock_code(leader_state.get("leader_code", "") or "")
+            if leader_code:
+                _push_gap_code(leader_code)
+            # sectors 구조에서 leader/follower 코드 추출
+            for sec in (leader_state.get("sectors") or []):
+                if isinstance(sec, dict):
+                    ld = sec.get("leader") or {}
+                    if isinstance(ld, dict):
+                        _push_gap_code(ld.get("code", ""))
+                    for fol in (sec.get("followers") or []):
+                        if isinstance(fol, dict):
+                            _push_gap_code(fol.get("code", ""))
+    except Exception as e:
+        _swallow_exception(e)
     try:
         with _state_lock:
             for c in list((_detected_stocks or {}).keys()):
@@ -11089,6 +11131,31 @@ def _score_next_open_gap_price_volume(ctx: dict) -> tuple[int, list[str], list[s
         score += 8; reasons.append(f"💥 거래량 {volume_ratio:.1f}배 +8")
     elif volume_ratio >= 2:
         score += 4; reasons.append(f"📊 거래량 {volume_ratio:.1f}배 +4")
+    # v161.44: 마감 직전 매수잔량 우위 확인 (KRX/NXT 공통)
+    try:
+        cur = ctx.get("cur") if isinstance(ctx.get("cur"), dict) else {}
+        bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+        ask_qty = safe_int(cur.get("ask_qty", 0), 0)
+        if bid_qty > 0 and ask_qty > 0:
+            ba_ratio = bid_qty / ask_qty
+            if ba_ratio >= 1.5:
+                score += 4; reasons.append(f"💪 매수잔량 강세 {ba_ratio:.1f}배 +4")
+            elif ba_ratio >= 1.2:
+                score += 2; reasons.append(f"💪 매수잔량 우위 {ba_ratio:.1f}배 +2")
+    except Exception as e:
+        _swallow_exception(e)
+    # v161.44: NXT 전용 — 나스닥 프리마켓 방향 추가 가점 (19:10은 미국 프리마켓 활성 시간대)
+    try:
+        if ctx.get("use_nxt"):
+            us = get_us_market_signals()
+            nasdaq_chg = float(us.get("nasdaq_chg", 0.0) or 0.0)
+            gap_signal = str(us.get("gap_signal", "flat") or "flat")
+            if gap_signal == "gap_up" and nasdaq_chg >= 0.5:
+                score += 3; reasons.append(f"🌐 NXT 나스닥 프리마켓 강세 +3 ({nasdaq_chg:+.1f}%)")
+            elif gap_signal == "gap_down" and nasdaq_chg <= -0.5:
+                score -= 3; cautions.append(f"🌐 NXT 나스닥 프리마켓 약세 -3 ({nasdaq_chg:+.1f}%)")
+    except Exception as e:
+        _swallow_exception(e)
     return score, reasons, cautions
 def _apply_next_open_gap_sector_history(score: int, reasons: list[str], ctx: dict,
                                         latest_rec: dict | None) -> tuple[int, list[str], dict]:
@@ -11107,6 +11174,45 @@ def _apply_next_open_gap_sector_history(score: int, reasons: list[str], ctx: dic
     leader = sector_info.get("leader") or {}
     if leader and str(leader.get("code", "")) == str(ctx["code"]):
         score += 4; reasons.append("👑 섹터 대장주 +4")
+    # v161.44: 섹터알림 발송 이력 대장주/follower → +10점 강화
+    try:
+        leader_state = _read_market_leader_state()
+        today_str = datetime.now().strftime("%Y%m%d")
+        sent_at = str(leader_state.get("sent_at", "") or "")
+        if sent_at[:8] == today_str:
+            is_today_leader = False
+            for sec in (leader_state.get("sectors") or []):
+                if not isinstance(sec, dict):
+                    continue
+                ld = sec.get("leader") or {}
+                if isinstance(ld, dict) and normalize_stock_code(ld.get("code", "")) == ctx["code"]:
+                    is_today_leader = True
+                    break
+                for fol in (sec.get("followers") or []):
+                    if isinstance(fol, dict) and normalize_stock_code(fol.get("code", "")) == ctx["code"]:
+                        is_today_leader = True
+                        break
+                if is_today_leader:
+                    break
+            if is_today_leader:
+                score += 10; reasons.append("🏆 오늘 섹터알림 대장/추종주 +10")
+    except Exception as e:
+        _swallow_exception(e)
+    # v161.44: 이평 정배열 +3 / RSI 50~70 +3 (KRX/NXT 공통, API 추가호출 없음)
+    try:
+        ind = calc_indicators(ctx["code"])
+        ma = ind.get("ma") or {}
+        rsi = float(ind.get("rsi", 0) or 0)
+        if ma.get("aligned"):
+            score += 3; reasons.append("📐 이평 정배열 +3")
+        elif ma.get("partial"):
+            score += 1; reasons.append("📐 이평 부분정배열 +1")
+        if 50 <= rsi <= 70:
+            score += 3; reasons.append(f"📊 RSI {rsi:.0f} 상승추세구간 +3")
+        elif rsi > 70:
+            pass  # 과매수 — 별도 감점 없음(calc_indicators가 이미 처리)
+    except Exception as e:
+        _swallow_exception(e)
     if latest_rec:
         rec_score = int(latest_rec.get("score", 0) or 0)
         if latest_rec.get("detect_date") == datetime.now().strftime("%Y%m%d"):
@@ -31540,6 +31646,7 @@ def send_market_leading_sector_update(force: bool = False):
             "market_heat": payload.get("market_heat", 0),
             "sent_at": payload.get("ts", ""),
             "themes": [sec.get("theme", "") for sec in payload.get("sectors", [])],
+            "sectors": payload.get("sectors", []),  # v161.44: 선진입 풀 직결용
         })
         _log_info_msg(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 섹터, heat={payload.get('market_heat', 0)})")
     except Exception as e:
@@ -33877,13 +33984,13 @@ if __name__ == "__main__":
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
     ))
-    schedule.every().day.at("14:45").do(_leader_job(
+    schedule.every().day.at("14:35").do(_leader_job(  # v161.44: 14:45→14:35
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="initial")
     ))
-    schedule.every().day.at("15:18").do(_leader_job(
+    schedule.every().day.at("15:08").do(_leader_job(  # v161.44: 15:18→15:08
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="final")
     ))
-    schedule.every().day.at("19:20").do(_leader_job(
+    schedule.every().day.at("19:10").do(_leader_job(  # v161.44: 19:20→19:10
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt", phase="final")
     ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
