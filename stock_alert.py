@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.45
+버전: v161.46
 날짜: 2026-04-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.46 (2026-04-10): TOP5 진입가 실시간 동기화 + 재포착 시 entry_price 갱신 + geo 포착 체인 연결
+  [#1] send_top_signals(): 발송 시점에 _entry_watch에서 code별 최신 entry_price/stop_loss/target_price 동기화
+  이유: _today_top_signals는 포착 시점 snapshot 고정 → 이후 _select_representative_entry_price() 갱신 미반영 → TOP5에 구 진입가 표시 (티엠씨 사례: 포착 16:53 진입가 23,010 표시됐으나 entry_watch와 불일치 가능)
+  개선점: 발송 직전 _entry_watch에 살아있는 동일 code watch의 entry_price로 덮어씀 → 모든 알람 진입가 일치
+  주의점: _entry_watch에 없는 종목(이미 만료/손절)은 _today_top_signals 원본값 그대로 사용
+  [#2] register_top_signal(): 동일 종목 재포착 시 score만 아니라 entry_price/stop_loss/target_price도 함께 갱신
+  이유: score > existing.score 조건 충족 시 score만 갱신하고 진입가 3종은 갱신 안 함 → TOP5 진입가가 낮은 점수의 구 snapshot 유지
+  개선점: score 갱신 시 entry_price/stop_loss/target_price/signal_type/detected_at도 함께 갱신
+  주의점: score가 낮아도 entry_price만 갱신하는 경우(재포착 후 진입가 변경)는 별도 처리 불필요 - #1 패치로 커버
+  [#3] run_geo_news_scan(): 장중 지정학 이벤트 감지 시 analyze_news_theme() 직접 호출 → 포착 체인 연결
+  이유: geo scan은 geo_prewatch 등록 + check_issue_prewatch() 호출만 하고 analyze_news_theme() 미호출 → 지정학 수혜 섹터 종목이 뉴스테마 포착 체인(A급→dispatch)에 진입 못함
+  개선점: is_any_market_open() 시 headlines 기반 analyze_news_theme() 호출 → send_news_theme_alert() → A급 진입 체인
+  주의점: headlines 수집 실패 시 skip. geo_prewatch 경로(check_issue_prewatch)와 중복 아님 — 보완 관계
 - v161.45 (2026-04-10): KRX 장마감 후 KRX 전용 종목 알람 발송 구멍 4곳 차단
   [#1] run_mid_pullback_scan(): NXT 전용 시간대 KRX 미상장 종목 스캔 skip
   이유: 지앤비에스 에코(382800) KRX 전용 종목이 17:08 눌림목 A등급 발송됨. NXT 열린 동안 run_mid_pullback_scan이 KRX 종목 필터링 없이 계속 스캔
@@ -20147,18 +20160,27 @@ def register_top_signal(s: dict):
     if is_scoring_only_instrument(code, s.get("name", "")):
         return
     existing = _today_top_signals.get(code, {})
+    new_entry = s.get("entry_price", 0)
     if score > existing.get("score", 0):
+        # v161.46: score 갱신 시 진입가 3종 + signal_type + detected_at 함께 갱신
         _today_top_signals[code] = {
             "score":       score,
             "name":        s.get("name", code),
             "signal_type": s.get("signal_type",""),
-            "entry_price": s.get("entry_price", 0),
+            "entry_price": new_entry,
             "stop_loss":   s.get("stop_loss", 0),
             "target_price":s.get("target_price", 0),
             "reasons":     s.get("reasons", []),
             "detected_at": datetime.now().strftime("%H:%M"),
             "nxt_delta":   s.get("nxt_delta", 0),
         }
+    elif new_entry > 0 and code in _today_top_signals:
+        # v161.46: score가 낮아도 진입가가 바뀌었으면 진입가 3종 갱신
+        prev_entry = int(_today_top_signals[code].get("entry_price", 0) or 0)
+        if new_entry != prev_entry:
+            _today_top_signals[code]["entry_price"] = new_entry
+            _today_top_signals[code]["stop_loss"]   = s.get("stop_loss", _today_top_signals[code].get("stop_loss", 0))
+            _today_top_signals[code]["target_price"] = s.get("target_price", _today_top_signals[code].get("target_price", 0))
 def send_top_signals():
     """10:00~장마감까지 1시간마다 — 최우선 종목 TOP 5 발송"""
     if not _today_top_signals: return
@@ -20174,6 +20196,17 @@ def send_top_signals():
         if str(code) not in reentry_codes
     }
     if not candidates: return
+    # v161.46: 발송 시점에 _entry_watch 최신 진입가로 동기화
+    # _entry_watch key = signal_log_key, value에 code + entry_price/stop_loss/target_price
+    _watch_by_code: dict[str, dict] = {}
+    try:
+        for _w in list((_entry_watch or {}).values()):
+            if not isinstance(_w, dict): continue
+            _wc = normalize_stock_code(_w.get("code", ""))
+            if _wc and _wc not in _watch_by_code:
+                _watch_by_code[_wc] = _w
+    except Exception:
+        pass
     top5  = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)[:5]
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
     msg   = f"🏆 <b>최우선 종목 TOP 5</b>  {datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━━\n"
@@ -20181,9 +20214,12 @@ def send_top_signals():
         medal   = medals[i-1]
         sig     = sig_labels.get(t["signal_type"], t["signal_type"])
         nxt_tag = f"  🟡NXT +{t['nxt_delta']}pt" if t.get("nxt_delta",0) > 0 else ""
-        entry   = t.get("entry_price", 0)
-        stop    = t.get("stop_loss", 0)
-        target  = t.get("target_price", 0)
+        # v161.46: _entry_watch 최신값 우선 사용
+        _code = next((c for c, v in candidates.items() if v is t), "")
+        _live_w = _watch_by_code.get(normalize_stock_code(_code), {})
+        entry   = int(_live_w.get("entry_price", 0) or 0) or t.get("entry_price", 0)
+        stop    = int(_live_w.get("stop_loss",   0) or 0) or t.get("stop_loss",   0)
+        target  = int(_live_w.get("target_price",0) or 0) or t.get("target_price",0)
         rr      = round((target - entry) / (entry - stop), 1) if entry and stop and entry > stop else 0
         msg += (
             f"\n{medal} <b>{t['name']}</b>  {sig}  {t['score']}점{nxt_tag}\n"
@@ -27912,11 +27948,20 @@ def run_geo_news_scan():
         _maybe_send_geo_event_message(msg)
         _maybe_refresh_geo_overnight_watchlist(headlines_by_source)
         _maybe_register_geo_issue_prewatch(geo)
-        try:
-            if is_any_market_open():
+        if is_any_market_open():
+            # v161.46: 장중 지정학 이벤트 감지 시 뉴스테마 포착 체인 연결
+            # geo_prewatch(check_issue_prewatch)와 보완 관계 — 테마별 종목 A급 즉시 dispatch
+            try:
+                all_headlines = [h for lines in headlines_by_source.values() for h in lines]
+                if all_headlines:
+                    for signal in analyze_news_theme(headlines=all_headlines):
+                        send_news_theme_alert(signal)
+            except Exception as _e2:
+                _log_error("run_geo_news_scan/analyze_news_theme", _e2)
+            try:
                 check_issue_prewatch()
-        except Exception as _e3:
-            _log_error("run_geo_news_scan/check_issue_prewatch", _e3)
+            except Exception as _e3:
+                _log_error("run_geo_news_scan/check_issue_prewatch", _e3)
     except Exception as e:
         _log_error("run_geo_news_scan", e)
 def _build_retail_signal_result(score_adj: int, label: str, detail: str, confidence: str) -> dict:
