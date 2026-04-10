@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.46
-날짜: 2026-04-10
+버전: v161.47
+날짜: 2026-04-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.47 (2026-04-11): no_ask_liquidity 체결속도 soft allow 추가
+  [#1] _should_soft_allow_no_ask_liquidity_general(): A급 + score≥72 + change_rate≥5% 조건에서 get_execution_speed_metrics()로 체결속도를 확인해 exec_speed_score≥45 + flow_state 비둔화(둔화/정체 제외)이면 soft allow 통과
+  이유: 로그 분석 결과 A급 포착 후 no_ask_liquidity로 955건 차단, 78개 종목 진입 실패. 티엠씨(217590) 사례: 08:16 NXT +8.1% A급 75점 포착 → 08:17 no_ask_liquidity 즉시 차단 → 이후 25,850원(+27%) 도달했으나 진입 불가. no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 모두 소화한 상태로 오히려 강한 매수 신호인데 봇이 진입 위험으로 오판
+  개선점: 체결속도(exec_speed_score)가 보통(45점) 이상이고 흐름이 둔화되지 않은 경우 no_ask_liquidity여도 soft allow → A급 급등 종목 진입 기회 확대. KRX/NXT 양쪽 모두 적용. 이미 수집 중인 _execution_snapshots 데이터를 활용하므로 추가 API 호출 없음
+  주의점: exec_score<45 또는 flow_state==둔화/정체이면 기존대로 차단 유지. 상한가(change_rate≥29) 차단 및 시장외 시간대 차단 등 기존 선행 조건은 그대로 유지. 체결속도 샘플 부족(ready=False) 시 해당 분기 skip → 기존 로직으로 fallback
+  진입 체인: 기존 체인 유지 (_should_soft_allow_no_ask_liquidity_general → run_scan → _dispatch_general_alert_signal)
 - v161.46 (2026-04-10): TOP5 진입가 실시간 동기화 + 재포착 시 entry_price 갱신 + geo 포착 체인 연결
   [#1] send_top_signals(): 발송 시점에 _entry_watch에서 code별 최신 entry_price/stop_loss/target_price 동기화
   이유: _today_top_signals는 포착 시점 snapshot 고정 → 이후 _select_representative_entry_price() 갱신 미반영 → TOP5에 구 진입가 표시 (티엠씨 사례: 포착 16:53 진입가 23,010 표시됐으나 entry_watch와 불일치 가능)
@@ -25291,6 +25297,21 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
     if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
         return True
+    # v161.47: 체결속도 soft allow — A급 + score≥72 + change_rate≥5% + exec_speed 보통 이상 + 흐름 비둔화
+    # no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 소화한 상태 → 실제로는 강한 매수 신호
+    # 이미 수집 중인 _execution_snapshots 활용 (추가 API 호출 없음)
+    if grade == "A" and score >= 72 and change_rate >= 5.0:
+        _exec_code = str(signal.get("code") or "")
+        if _exec_code:
+            try:
+                _exec_metrics = get_execution_speed_metrics(_exec_code)
+                if _exec_metrics.get("ready"):
+                    _exec_score = int(_exec_metrics.get("execution_speed_score", 0) or 0)
+                    _flow_state = str(_exec_metrics.get("flow_state", "") or "")
+                    if _exec_score >= 45 and _flow_state not in ("둔화", "정체"):
+                        return True
+            except Exception as _e:
+                _swallow_exception(_e)
     strong_combo = score >= GENERAL_SOFT_ALLOW_MIN_SCORE and change_rate >= GENERAL_SOFT_ALLOW_MIN_CHANGE and (
         vol_ratio >= GENERAL_SOFT_ALLOW_MIN_VOLUME or sector_bonus >= 10 or sector_live or nxt_order_flow
     )
