@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.47
+버전: v161.48
 날짜: 2026-04-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.48 (2026-04-11): 섹터 제한 완화 + 장초반 모멘텀 가중
+  [#1] SCAN_SECTOR_EXEMPT_RATE 기본값 10%→8%: 8% 이상 급등 종목 섹터 제한 면제
+  [#2] SCAN_SECTOR_BURST_THRESHOLD 기본값 7→5: 섹터 후보 5개 이상이면 급등장 감지 → base_limit +3
+  [#3] _apply_scan_sector_gate(): A급 종목 base_limit +1 추가
+  [#4] _apply_analyze_market_context(): KRX 장초반(09:00~10:30) 코스피 모멘텀 방향 가중 ±2점
+  이유: 로그 분석 결과 섹터 제한으로 478건 생략(티엠씨 섹터 10~17번째 생략 반복). 면제 기준 10%는 +8~9% 급등 종목도 걸리게 해 기회 손실. 장초반 30분 방향이 당일 추세 예측에 유효함(KOSPI MIM 학술 검증)
+  개선점: 섹터 급등 동조 시 더 많은 종목 통과, A급 섹터 생존율 향상, 장초반 상승장에서 점수 가중으로 포착 확률 상승
+  주의점: 알람 수 소폭 증가 가능 — 품질 모니터링 병행. 장초반 모멘텀은 KRX 09:00~10:30에만 적용, NXT 미적용
 - v161.47 (2026-04-11): no_ask_liquidity 체결속도 soft allow 추가
   [#1] _should_soft_allow_no_ask_liquidity_general(): A급 + score≥72 + change_rate≥5% 조건에서 get_execution_speed_metrics()로 체결속도를 확인해 exec_speed_score≥45 + flow_state 비둔화(둔화/정체 제외)이면 soft allow 통과
   이유: 로그 분석 결과 A급 포착 후 no_ask_liquidity로 955건 차단, 78개 종목 진입 실패. 티엠씨(217590) 사례: 08:16 NXT +8.1% A급 75점 포착 → 08:17 no_ask_liquidity 즉시 차단 → 이후 25,850원(+27%) 도달했으나 진입 불가. no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 모두 소화한 상태로 오히려 강한 매수 신호인데 봇이 진입 위험으로 오판
@@ -5571,8 +5579,8 @@ YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") 
 YOUTUBE_FETCH_DAILY_LIMIT = int(os.getenv("YOUTUBE_FETCH_DAILY_LIMIT", "2") or "2")         # v161.37: 하루 최대 YouTube API fetch 횟수 (기본 2회)
 # ── 섹터 제한 (v161.9) ──
 SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
-SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "10.0") or "10.0")  # v161.23: 15→10% — candidate_miss 완화, 이 등락률 이상이면 섹터 제한 면제
-SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "7") or "7")  # 섹터 후보 이 수 이상이면 급등장 판단 → limit +3
+SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "8.0") or "8.0")    # v161.48: 10→8% — 8% 이상 급등 종목 섹터 제한 면제 (기존 10%는 +8~9% 급등 종목도 차단)
+SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "5") or "5")  # v161.48: 7→5 — 섹터 후보 5개 이상이면 급등장 판단 → limit +3 (기존 7은 감지 늦음)
 MATERIAL_DOWNSIDE_SCENARIOS = [
     {
         "id": "audit_report_delay",
@@ -23860,6 +23868,21 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
         return False
     if regime_mode != "normal":
         reasons.append(f"🌐 시장: {regime_label()} (코스피 {regime.get('chg_1d',0):+.1f}%)")
+    # v161.48: 장초반 KRX 모멘텀 가중 (09:00~10:30)
+    # KOSPI MIM(Market Intraday Momentum) 연구: 장초반 30분 방향이 당일 추세 예측에 유의미
+    try:
+        _now_h = _now_kst()
+        _hhmm = _now_h.hour * 100 + _now_h.minute
+        if is_market_open() and 900 <= _hhmm <= 1030:
+            _kospi_chg = float(regime.get("chg_1d", 0.0) or 0.0)
+            if _kospi_chg >= 1.0:
+                score += 2
+                reasons.append(f"📈 장초반 상승 모멘텀 +2점 (코스피 {_kospi_chg:+.1f}%)")
+            elif _kospi_chg <= -1.0:
+                score -= 2
+                reasons.append(f"📉 장초반 하락 모멘텀 -2점 (코스피 {_kospi_chg:+.1f}%)")
+    except Exception as _me:
+        _swallow_exception(_me)
     score, us = _analyze_us_market_adjustment(ctx, score, reasons)
     score = _analyze_korea_etf_adjustment(ctx, score, reasons, sector_info)
     score, short_ratio = _analyze_short_sell_context(code, score, reasons)
@@ -33844,6 +33867,11 @@ def _apply_scan_sector_gate(alerts: list) -> list:
         # 테마·재료 우선 종목 +2
         if s.get("theme_chain_force_hit") or s.get("force_external_capture_alert") or s.get("material_first_priority_hit") or s.get("direct_news_hit"):
             base_limit += 2
+
+        # v161.48: A급 종목 한도 +1 — A급이 섹터 제한에 B급보다 먼저 탈락하는 역전 방지
+        _gate_grade = str(s.get("execution_grade") or s.get("grade") or "").upper()
+        if _gate_grade == "A":
+            base_limit += 1
 
         # 급등장 감지: 이 섹터 전체 후보가 burst_threshold 이상이면 +3
         if sector_total.get(sec, 0) >= burst_threshold:
