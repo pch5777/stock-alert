@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.42
-날짜: 2026-04-09
+버전: v161.43
+날짜: 2026-04-10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v161.43 (2026-04-10): 상한가류 entry_watch 즉시만료 + 진입가 도달 헤더 보강
+  [#1] _expire_entry_watch_for_upper_limit(): NEAR_UPPER/UPPER_LIMIT 발송 즉시 해당 종목 entry_watch 전부 만료
+  이유: 상한가류 발송 후 entry_watch가 살아있어 매 사이클 upper_limit_reached 진입불가 기록이 반복됨
+  개선점: 상한가류 발송 즉시 entry_watch 만료 → 이후 진입불가 반복 차단
+  주의점: 상한가 풀린 후 재진입은 check_reentry_watch()가 별도 담당
+  [#2] _finalize_general_alert_dispatch(): NEAR_UPPER/UPPER_LIMIT/29%↑ 종목 register_entry_watch 차단
+  이유: 상한가류는 진입 불가이므로 entry_watch 등록 자체가 불필요 — 등록 후 계속 진입불가 기록만 쌓임
+  개선점: 상한가류 entry_watch 미등록 → candidate_miss 워치독 부하 감소
+  주의점: _maybe_send_immediate_entry_hit_from_signal에 watch_key=None 전달로 무해함
+  [#3] send_alert 전 _allow_existing_entry_hit_header=True 세팅 → 기존 entry_hit watch 존재 시 헤더에 "+ 1차 진입가 도달" 반영
+  이유: 포착 알람 제목에 "+ 1차 진입가 도달"이 붙어야 하는데 signal["first_entry_reached"]가 analyze() 시점과 달리 False인 케이스 존재
+  개선점: send_alert 직전 _allow_existing_entry_hit_header 세팅으로 entry_hit watch 존재 시 헤더 반영 보장
+  주의점: 진입 체인: analyze() → _dispatch_general_alert_signal() → send_alert() 연결 확인
 - v161.42 (2026-04-09): 섹터 재안내 상한가 종목 차단
   [#1] _sector_resend_relevance_ok(): _upper_limit_alerted_today 체크 + prdy_vrss_sign/upper_price 이중 체크
   이유: 상한가 도달(NEAR_UPPER 발송 완료) 후에도 섹터 재안내가 발송됨. upper_limit_reached 차단 후에도 entry_watch가 살아있어 진입가 도달 재알람 경로로 섹터 재안내가 나감
@@ -21155,9 +21168,15 @@ def _is_general_capture_first_entry_reached(signal: dict | None = None, live_pri
     if signal.get("first_entry_reached") is True:
         return True
     entry_price = safe_int(signal.get("entry_price", 0), 0)
-    price_now = safe_int(live_price or signal.get("price", 0), 0)
+    # v161.43: live_price 우선, 없으면 signal price 사용. 0이면 판단 포기하지 않고 entry_price만으로 체크
+    price_now = safe_int(live_price, 0) or safe_int(signal.get("price", 0), 0)
     if entry_price > 0 and price_now > 0 and price_now <= entry_price:
         return True
+    # v161.43: signal에 저장된 change_rate가 음수(-) 또는 0에 가까우면 진입가 도달 가능성 — 추가 체크
+    # analyze()에서 first_entry_reached 미세팅 케이스 보완: price가 entry 이하면 True
+    if entry_price > 0 and price_now <= 0:
+        # price 정보 없을 때는 False 유지 (잘못된 헤더 방지)
+        return False
     code = normalize_stock_code(signal.get("code", ""))
     if code and signal.get("_allow_existing_entry_hit_header"):
         try:
@@ -25683,6 +25702,8 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         save_signal_log(s)
         return False
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
+    # v161.43: 기존 entry_hit watch 존재 시 헤더에 "+ 1차 진입가 도달" 반영 허용
+    s["_allow_existing_entry_hit_header"] = True
     send_alert(s)
     _alert_history[ctx["hist_key"]] = {
         "ts": time.time(),
@@ -25700,7 +25721,12 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     save_signal_log(s)
     if signal_type == "EARLY_DETECT":
         save_early_detect(s)
-    watch_key = register_entry_watch(s)
+    # v161.43: 상한가류(NEAR_UPPER/UPPER_LIMIT/29%↑)는 entry_watch 신규 등록 차단
+    if signal_type in ("UPPER_LIMIT", "NEAR_UPPER") or safe_float(s.get("change_rate", 0), 0.0) >= 29.0:
+        _expire_entry_watch_for_upper_limit(code, name)
+        watch_key = None
+    else:
+        watch_key = register_entry_watch(s)
     _maybe_send_immediate_entry_hit_from_signal(s, watch_key=watch_key, merge_capture_phase1=False)
     register_top_signal(s)
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
@@ -25731,6 +25757,25 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         elif safe_int(s.get("price", 0), 0) > safe_int(_detected_stocks[code].get("high_price", 0), 0):
             _detected_stocks[code]["high_price"] = safe_int(s.get("price", 0), 0)
     return True
+def _expire_entry_watch_for_upper_limit(code: str, name: str) -> None:
+    """NEAR_UPPER/UPPER_LIMIT 발송 즉시 해당 종목 entry_watch 전부 만료 처리.
+    이후 check_entry_watch 사이클에서 upper_limit_reached 진입불가 반복 차단.
+    """
+    norm = normalize_stock_code(code)
+    if not norm:
+        return
+    to_expire = [k for k, w in list(_entry_watch.items())
+                 if isinstance(w, dict) and normalize_stock_code(w.get("code", "")) == norm]
+    for k in to_expire:
+        w = _entry_watch.pop(k, None)
+        if w:
+            _archive_entry_watch_record(k, w, consume_reason="상한가류발송만료",
+                                        final_status=_entry_watch_final_status(w, "상한가차단"))
+            _log_info_msg(f"  🔒 {name} — entry_watch 상한가류 발송 즉시 만료 ({k})")
+    if to_expire:
+        _save_entry_watch_active()
+
+
 def _dispatch_general_alert_signal(s: dict, hist_key: str | None = None, source_label: str = "일반 포착") -> bool:
     ctx = _build_general_alert_dispatch_context(s, hist_key)
     if ctx is None:
