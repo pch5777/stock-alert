@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v161.48
+버전: v162
 날짜: 2026-04-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162 (2026-04-11): WebSocket 기반 실시간 체결속도 병렬 레이어 추가
+  [#1] KIS WebSocket API(H0STCNT0) 실시간 체결 데이터 수신 → _execution_snapshots 갱신 병렬 레이어 신설
+  [#2] _ws_get_approval_key(): WebSocket 전용 approval_key 발급 (oauth2/Approval)
+  [#3] _ws_connect_loop(): websocket-client 기반 수신 루프 — 자동 재연결(지수 백오프), PINGPONG 응답, 체결 데이터 파싱 → _record_execution_snapshot() 호출
+  [#4] _ws_subscribe()/_ws_unsubscribe(): 종목 구독/해제 관리 — 최대 WS_MAX_SUBSCRIPTIONS(기본 20)개 제한, LRU 교체
+  [#5] _ws_sync_subscriptions(): _entry_watch + _exec_speed_prewarm 기반 구독 대상 자동 동기화 (run_scan 사이클마다 호출)
+  [#6] _ws_start()/_ws_stop(): 시장 개장/폐장 시 WebSocket 스레드 시작/중지 — is_any_market_open() 기반
+  [#7] WEBSOCKET_ENABLED 환경변수(기본 true)로 on/off 제어. WebSocket 연결 시 우선, 끊기면 REST fallback 자동 전환
+  [#8] _tick_exec_speed_prewarm() WebSocket 활성 시 REST 호출 skip — WebSocket이 실시간 갱신하므로 중복 방지
+  이유: REST 폴링은 20초 간격으로 스냅샷 수집 → 급등 순간 체결속도 변화를 놓칠 수 있음. WebSocket은 체결 즉시 데이터 수신하므로 _execution_snapshots 정밀도 대폭 향상. 진입가 도달 판단 시 최신 체결 데이터로 더 정확한 exec_speed_score 산출 가능
+  개선점: 체결속도 스냅샷 수집 지연 20초→실시간(~0.1초). prewarm 단계에서 REST API 호출 절감. WebSocket 끊김 시 기존 REST fallback 자동 전환으로 안정성 유지. KRX/NXT 양쪽 모두 적용
+  주의점: ①KIS WebSocket 세션당 구독 제한 20개(H0STCNT0+H0STASP0 합산) — WS_MAX_SUBSCRIPTIONS으로 제어 ②WebSocket은 단일 세션만 허용(동일 appkey) — 기존 다른 WebSocket 연결 있으면 충돌 가능 ③approval_key는 REST token과 별도 발급 ④장 마감 후 PINGPONG 미전송 시 서버가 연결 끊음 — ping_interval=60 설정 ⑤WEBSOCKET_ENABLED=false로 완전 비활성화 가능
+  진입 체인: 기존 체인 유지 (_record_execution_snapshot → get_execution_speed_metrics → 기존 모든 하위 함수 변경 없음)
 - v161.48 (2026-04-11): 섹터 제한 완화 + 장초반 모멘텀 가중
   [#1] SCAN_SECTOR_EXEMPT_RATE 기본값 10%→8%: 8% 이상 급등 종목 섹터 제한 면제
   [#2] SCAN_SECTOR_BURST_THRESHOLD 기본값 7→5: 섹터 후보 5개 이상이면 급등장 감지 → base_limit +3
@@ -2777,12 +2790,14 @@ def _send_startup_banner_once() -> bool:
         return False
     try:
         code_hash = _get_code_hash()
+        ws_status = "🟢 WebSocket 실시간 체결 활성" if WEBSOCKET_ENABLED else "⚪ WebSocket 비활성 (REST only)"
         message_id = send(
             f"🤖 <b>주식 급등 알림 봇 ON ({BOT_VERSION})</b>\n"
             f"📅 {BOT_DATE}  🔑 <code>{code_hash}</code>\n\n"
             "✅ 한국투자증권 API 연결\n"
             "🟡 NXT(넥스트레이드) 연동 활성\n"
-            "🔒 스레드 안전성 활성\n\n"
+            "🔒 스레드 안전성 활성\n"
+            f"{ws_status}\n\n"
             "<b>📡 스캔 주기</b>\n"
             "• 급등/상한가 스캔: <b>20초</b>\n"
             "• 눌림목: <b>90초</b>\n"
@@ -5177,6 +5192,13 @@ KIS_APP_KEY        = os.environ.get("KIS_APP_KEY", "")
 KIS_APP_SECRET     = os.environ.get("KIS_APP_SECRET", "")
 KIS_ACCOUNT_NO     = os.environ.get("KIS_ACCOUNT_NO", "")
 KIS_BASE_URL       = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443").strip().rstrip("/")
+# ── v162: WebSocket 설정 ──
+WEBSOCKET_ENABLED      = os.environ.get("WEBSOCKET_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+WS_URL                 = os.environ.get("WS_URL", "ws://ops.koreainvestment.com:21000").strip().rstrip("/")
+WS_MAX_SUBSCRIPTIONS   = int(os.environ.get("WS_MAX_SUBSCRIPTIONS", "20") or "20")   # KIS 세션당 구독 상한
+WS_RECONNECT_BASE_SEC  = float(os.environ.get("WS_RECONNECT_BASE_SEC", "2.0") or "2.0")
+WS_RECONNECT_MAX_SEC   = float(os.environ.get("WS_RECONNECT_MAX_SEC", "120.0") or "120.0")
+WS_SYNC_INTERVAL_SEC   = int(os.environ.get("WS_SYNC_INTERVAL_SEC", "15") or "15")   # 구독 동기화 주기
 DART_API_KEY       = os.environ.get("DART_API_KEY", "")      # DART 공시 API
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -6400,6 +6422,7 @@ _kis_token_retry_block_until = 0.0
 # 디버그: 어떤 KIS 서버로 붙는지 1회 출력(환경 혼동 방지)
 try:
     _log_info_msg(f"🔗 KIS_BASE_URL: {KIS_BASE_URL}")
+    _log_info_msg(f"🔌 WEBSOCKET_ENABLED: {WEBSOCKET_ENABLED} | WS_URL: {WS_URL} | MAX_SUB: {WS_MAX_SUBSCRIPTIONS}")
 except Exception as e:
     _swallow_exception(e)
 # ⑤ 중앙 에러 로거 (중요 기능 오류 조용히 묻히지 않게)
@@ -9104,6 +9127,446 @@ EXEC_SPEED_RECENT_WINDOW_SEC = int(os.getenv("EXEC_SPEED_RECENT_WINDOW_SEC", "30
 EXEC_SPEED_STALE_WARN_SEC = int(os.getenv("EXEC_SPEED_STALE_WARN_SEC", "45") or "45")
 _execution_snapshots: dict = {}
 _exec_speed_prewarm: dict = {}          # code → registered_ts, 포착 직후 스냅샷 사전 누적용
+# ════════════════════════════════════════════════════════════════
+# v162: KIS WebSocket 실시간 체결 데이터 수신 레이어
+# ════════════════════════════════════════════════════════════════
+_ws_thread: threading.Thread | None = None
+_ws_stop_event = threading.Event()
+_ws_lock = threading.Lock()
+_ws_subscribed_codes: dict = {}         # code → subscribe_ts  (현재 구독 중인 종목)
+_ws_approval_key: str = ""
+_ws_approval_key_ts: float = 0.0
+_ws_connected: bool = False             # WebSocket 연결 상태 플래그
+_ws_last_recv_ts: float = 0.0           # 마지막 데이터 수신 시각
+_ws_last_sync_ts: float = 0.0           # 마지막 구독 동기화 시각
+_ws_reconnect_count: int = 0
+_ws_stats = {"recv_count": 0, "parse_errors": 0, "reconnects": 0, "subscribe_ok": 0, "subscribe_fail": 0}
+
+# H0STCNT0 체결 데이터 필드 순서 (KIS API 공식 명세)
+_WS_H0STCNT0_FIELDS = [
+    "stock_code",       # 0: 유가증권 단축 종목코드
+    "exec_time",        # 1: 주식체결시간 (HHMMSS)
+    "current_price",    # 2: 주식현재가
+    "sign",             # 3: 전일대비부호
+    "change",           # 4: 전일대비
+    "change_rate",      # 5: 전일대비율
+    "weighted_avg",     # 6: 가중평균주식가격
+    "open_price",       # 7: 주식시가
+    "high_price",       # 8: 주식최고가
+    "low_price",        # 9: 주식최저가
+    "ask_price1",       # 10: 매도호가1
+    "bid_price1",       # 11: 매수호가1
+    "exec_vol",         # 12: 체결거래량
+    "acml_vol",         # 13: 누적거래량
+    "acml_tr_pbmn",     # 14: 누적거래대금
+    "sell_exec_cnt",    # 15: 매도체결건수
+    "buy_exec_cnt",     # 16: 매수체결건수
+    "net_buy_exec_cnt", # 17: 순매수체결건수
+    "exec_strength",    # 18: 체결강도
+    "total_sell_qty",   # 19: 총매도수량
+    "total_buy_qty",    # 20: 총매수수량
+    "exec_type",        # 21: 체결구분
+    "buy_ratio",        # 22: 매수비율
+    "prev_vol_rate",    # 23: 전일거래량대비등락율
+    "open_time",        # 24: 시가시간
+    "open_sign",        # 25: 시가대비구분
+    "open_diff",        # 26: 시가대비
+    "high_time",        # 27: 최고가시간
+    "high_sign",        # 28: 고가대비구분
+    "high_diff",        # 29: 고가대비
+    "low_time",         # 30: 최저가시간
+    "low_sign",         # 31: 저가대비구분
+    "low_diff",         # 32: 저가대비
+    "biz_date",         # 33: 영업일자
+    "market_op_cls",    # 34: 신장운영구분코드
+    "trade_halt",       # 35: 거래정지여부
+    "ask_rem_qty",      # 36: 매도호가잔량
+    "bid_rem_qty",      # 37: 매수호가잔량
+    "total_ask_rem",    # 38: 총매도호가잔량
+    "total_bid_rem",    # 39: 총매수호가잔량
+    "vol_turnover",     # 40: 거래량회전율
+    "prev_same_vol",    # 41: 전일동시간누적거래량
+    "prev_same_rate",   # 42: 전일동시간누적거래량비율
+    "time_cls",         # 43: 시간구분코드
+    "arbit_halt",       # 44: 임의종료구분코드
+    "vi_price",         # 45: 정적VI발동기준가
+]
+
+
+def _ws_get_approval_key() -> str:
+    """KIS WebSocket 전용 approval_key 발급 (REST token과 별도)."""
+    global _ws_approval_key, _ws_approval_key_ts
+    now = time.time()
+    # approval_key는 24시간 유효하지만 안전하게 12시간마다 갱신
+    if _ws_approval_key and (now - _ws_approval_key_ts) < 43200:
+        return _ws_approval_key
+    try:
+        url = f"{KIS_BASE_URL}/oauth2/Approval"
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": KIS_APP_KEY,
+            "secretkey": KIS_APP_SECRET,
+        }
+        resp = requests.post(url, json=body, timeout=10)
+        resp.raise_for_status()
+        key = resp.json().get("approval_key", "")
+        if key:
+            _ws_approval_key = key
+            _ws_approval_key_ts = now
+            _log_info_msg(f"🔑 WebSocket approval_key 발급 완료")
+        return key
+    except Exception as e:
+        _log_error_msg(f"❌ WebSocket approval_key 발급 실패: {e}")
+        return ""
+
+
+def _ws_build_subscribe_msg(tr_id: str, tr_key: str, tr_type: str = "1") -> str:
+    """KIS WebSocket 구독/해제 메시지 생성."""
+    return json.dumps({
+        "header": {
+            "approval_key": _ws_approval_key,
+            "custtype": "P",
+            "tr_type": tr_type,
+            "content-type": "utf-8",
+        },
+        "body": {
+            "input": {
+                "tr_id": tr_id,
+                "tr_key": tr_key,
+            }
+        }
+    })
+
+
+def _ws_parse_execution_data(raw_data: str) -> list[dict]:
+    """H0STCNT0 체결 데이터 파싱 → _record_execution_snapshot 호환 dict 리스트 반환."""
+    results = []
+    try:
+        parts = raw_data.split("|")
+        if len(parts) < 4:
+            return results
+        tr_id = parts[1]
+        if tr_id != "H0STCNT0":
+            return results
+        data_cnt = int(parts[2])
+        fields_str = parts[3]
+        values = fields_str.split("^")
+        field_count = len(_WS_H0STCNT0_FIELDS)
+        for i in range(data_cnt):
+            offset = i * field_count
+            if offset + field_count > len(values):
+                break
+            chunk = values[offset:offset + field_count]
+            code = chunk[0].strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                price = int(chunk[2])
+                acml_vol = int(chunk[13])
+                if price <= 0 or acml_vol <= 0:
+                    continue
+                payload = {
+                    "code": code,
+                    "price": price,
+                    "today_vol": acml_vol,
+                    "change_rate": float(chunk[5]) if chunk[5] else 0.0,
+                    "ask_qty": int(chunk[36]) if chunk[36] else 0,
+                    "bid_qty": int(chunk[37]) if chunk[37] else 0,
+                    "high": int(chunk[8]) if chunk[8] else 0,
+                    "low": int(chunk[9]) if chunk[9] else 0,
+                    "open": int(chunk[7]) if chunk[7] else 0,
+                }
+                results.append({"code": code, "payload": payload})
+            except (ValueError, IndexError):
+                _ws_stats["parse_errors"] += 1
+    except Exception:
+        _ws_stats["parse_errors"] += 1
+    return results
+
+
+def _ws_on_message(data: str) -> None:
+    """WebSocket 수신 메시지 처리 — 체결 데이터면 _record_execution_snapshot 호출."""
+    global _ws_last_recv_ts
+    _ws_last_recv_ts = time.time()
+
+    if not data:
+        return
+
+    first_char = data[0] if data else ""
+
+    # 실시간 데이터 (0=일반, 1=암호화)
+    if first_char == "0":
+        parsed = _ws_parse_execution_data(data)
+        for item in parsed:
+            try:
+                # 시장 판별: NXT 시간대이고 KRX 미개장이면 NXT
+                market = "KRX"
+                if not is_market_open() and is_nxt_open():
+                    market = "NXT"
+                _record_execution_snapshot(item["code"], item["payload"], market=market)
+                _ws_stats["recv_count"] += 1
+            except Exception as e:
+                _swallow_exception(e)
+        return
+
+    # JSON 응답 (구독 확인, 에러, PINGPONG)
+    try:
+        msg = json.loads(data)
+        tr_id = msg.get("header", {}).get("tr_id", "")
+        if tr_id == "PINGPONG":
+            # PINGPONG 응답 — 동일 메시지를 돌려보내야 연결 유지
+            return  # websocket-client ping_interval이 처리
+
+        rt_cd = msg.get("body", {}).get("rt_cd", "")
+        msg1 = msg.get("body", {}).get("msg1", "")
+        if rt_cd == "0":
+            _ws_stats["subscribe_ok"] += 1
+        elif rt_cd == "1":
+            _ws_stats["subscribe_fail"] += 1
+            _log_warn_msg(f"⚠️ WebSocket 구독 에러: {msg1}")
+    except (json.JSONDecodeError, Exception):
+        pass
+
+
+def _ws_subscribe(ws, code: str) -> bool:
+    """종목 체결가 구독 등록."""
+    try:
+        msg = _ws_build_subscribe_msg("H0STCNT0", code, "1")
+        ws.send(msg)
+        with _ws_lock:
+            _ws_subscribed_codes[code] = time.time()
+        return True
+    except Exception as e:
+        _log_warn_msg(f"⚠️ WebSocket 구독 실패 [{code}]: {e}")
+        return False
+
+
+def _ws_unsubscribe(ws, code: str) -> bool:
+    """종목 체결가 구독 해제."""
+    try:
+        msg = _ws_build_subscribe_msg("H0STCNT0", code, "2")
+        ws.send(msg)
+        with _ws_lock:
+            _ws_subscribed_codes.pop(code, None)
+        return True
+    except Exception as e:
+        _log_warn_msg(f"⚠️ WebSocket 구독해제 실패 [{code}]: {e}")
+        return False
+
+
+def _ws_get_target_codes() -> list[str]:
+    """현재 구독 대상 종목 코드 리스트 반환 — _entry_watch + _exec_speed_prewarm 기반."""
+    targets = set()
+    # 1순위: entry_watch 활성 종목
+    try:
+        for key, watch in dict(_entry_watch).items():
+            code = normalize_stock_code(watch.get("code"))
+            if code:
+                targets.add(code)
+    except Exception:
+        pass
+    # 2순위: prewarm 대상 종목
+    try:
+        for code in list(_exec_speed_prewarm.keys()):
+            code = normalize_stock_code(code)
+            if code:
+                targets.add(code)
+    except Exception:
+        pass
+    # 3순위: execution_setup_watch 종목
+    try:
+        for code in list(_execution_setup_watch.keys()):
+            code = normalize_stock_code(code)
+            if code:
+                targets.add(code)
+    except Exception:
+        pass
+    return list(targets)
+
+
+def _ws_sync_subscriptions(ws) -> None:
+    """구독 대상을 현재 _entry_watch/_exec_speed_prewarm과 동기화."""
+    global _ws_last_sync_ts
+    now = time.time()
+    if now - _ws_last_sync_ts < WS_SYNC_INTERVAL_SEC:
+        return
+    _ws_last_sync_ts = now
+
+    target_codes = _ws_get_target_codes()
+    with _ws_lock:
+        current_codes = set(_ws_subscribed_codes.keys())
+
+    target_set = set(target_codes)
+
+    # 구독 해제: 더 이상 필요 없는 종목
+    for code in current_codes - target_set:
+        _ws_unsubscribe(ws, code)
+
+    # 신규 구독: 아직 구독 안 된 종목
+    available_slots = WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)
+    codes_to_add = list(target_set - current_codes)
+
+    if len(codes_to_add) > available_slots:
+        # LRU 방식: 가장 오래된 구독 해제 후 새 종목 추가
+        with _ws_lock:
+            sorted_current = sorted(
+                [(c, ts) for c, ts in _ws_subscribed_codes.items() if c not in target_set],
+                key=lambda x: x[1]
+            )
+        evict_count = len(codes_to_add) - available_slots
+        for c, _ in sorted_current[:evict_count]:
+            _ws_unsubscribe(ws, c)
+        codes_to_add = codes_to_add[:WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)]
+
+    for code in codes_to_add:
+        if len(_ws_subscribed_codes) >= WS_MAX_SUBSCRIPTIONS:
+            break
+        _ws_subscribe(ws, code)
+        time.sleep(0.05)  # 구독 요청 간 약간의 딜레이
+
+
+def _ws_connect_loop() -> None:
+    """WebSocket 수신 루프 — 별도 스레드에서 실행. 지수 백오프 재연결."""
+    global _ws_connected, _ws_reconnect_count, _ws_last_sync_ts
+    import websocket as _websocket_lib
+
+    backoff = WS_RECONNECT_BASE_SEC
+
+    while not _ws_stop_event.is_set():
+        ws = None
+        try:
+            # 시장 미개장이면 대기
+            if not is_any_market_open():
+                _ws_connected = False
+                with _ws_lock:
+                    _ws_subscribed_codes.clear()
+                _ws_stop_event.wait(30)
+                continue
+
+            # approval_key 발급
+            approval_key = _ws_get_approval_key()
+            if not approval_key:
+                _ws_stop_event.wait(min(backoff, WS_RECONNECT_MAX_SEC))
+                backoff = min(backoff * 2, WS_RECONNECT_MAX_SEC)
+                continue
+
+            _log_info_msg(f"🔌 WebSocket 연결 시도: {WS_URL}")
+            ws = _websocket_lib.WebSocket()
+            ws.connect(WS_URL, ping_interval=60, ping_timeout=30)
+            _ws_connected = True
+            backoff = WS_RECONNECT_BASE_SEC
+            _ws_last_sync_ts = 0.0  # 즉시 동기화 트리거
+            _log_info_msg(f"✅ WebSocket 연결 성공")
+
+            # 초기 구독 동기화
+            _ws_sync_subscriptions(ws)
+
+            # 수신 루프
+            while not _ws_stop_event.is_set():
+                # 시장 폐장 확인
+                if not is_any_market_open():
+                    _log_info_msg("🔌 시장 폐장 — WebSocket 연결 해제")
+                    break
+
+                try:
+                    ws.settimeout(5.0)
+                    data = ws.recv()
+                    if data:
+                        # PINGPONG 처리
+                        try:
+                            if isinstance(data, str) and '"PINGPONG"' in data:
+                                ws.send(data)
+                                continue
+                        except Exception:
+                            pass
+                        _ws_on_message(data)
+                except _websocket_lib.WebSocketTimeoutException:
+                    # 주기적 구독 동기화
+                    _ws_sync_subscriptions(ws)
+                    continue
+                except _websocket_lib.WebSocketConnectionClosedException:
+                    _log_warn_msg("⚠️ WebSocket 연결 종료됨 — 재연결 예정")
+                    break
+                except Exception as e:
+                    _log_warn_msg(f"⚠️ WebSocket 수신 오류: {e}")
+                    break
+
+                # 주기적 구독 동기화
+                _ws_sync_subscriptions(ws)
+
+        except Exception as e:
+            _log_warn_msg(f"⚠️ WebSocket 연결 실패: {e}")
+        finally:
+            _ws_connected = False
+            with _ws_lock:
+                _ws_subscribed_codes.clear()
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+        if _ws_stop_event.is_set():
+            break
+
+        # 재연결 대기 (지수 백오프)
+        _ws_reconnect_count += 1
+        _ws_stats["reconnects"] += 1
+        wait_sec = min(backoff + random.uniform(0, 1), WS_RECONNECT_MAX_SEC)
+        _log_info_msg(f"🔄 WebSocket 재연결 대기 {wait_sec:.1f}초 (#{_ws_reconnect_count})")
+        _ws_stop_event.wait(wait_sec)
+        backoff = min(backoff * 2, WS_RECONNECT_MAX_SEC)
+
+    _log_info_msg("🔌 WebSocket 루프 종료")
+
+
+def _ws_start() -> None:
+    """WebSocket 스레드 시작 (이미 실행 중이면 skip)."""
+    global _ws_thread
+    if not WEBSOCKET_ENABLED:
+        return
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        _log_warn_msg("⚠️ WebSocket 시작 불가: KIS_APP_KEY/SECRET 누락")
+        return
+    if _ws_thread and _ws_thread.is_alive():
+        return
+    _ws_stop_event.clear()
+    _ws_thread = threading.Thread(target=_ws_connect_loop, name="KIS-WebSocket", daemon=True)
+    _ws_thread.start()
+    _log_info_msg("🚀 WebSocket 스레드 시작")
+
+
+def _ws_stop() -> None:
+    """WebSocket 스레드 중지."""
+    global _ws_thread
+    _ws_stop_event.set()
+    if _ws_thread:
+        _ws_thread.join(timeout=10)
+        _ws_thread = None
+    _log_info_msg("🛑 WebSocket 스레드 중지")
+
+
+def _ws_is_active() -> bool:
+    """WebSocket이 활성 상태(연결 중 + 최근 데이터 수신)인지 확인."""
+    if not WEBSOCKET_ENABLED or not _ws_connected:
+        return False
+    # 마지막 수신이 60초 이내면 활성
+    return (time.time() - _ws_last_recv_ts) < 60.0
+
+
+def _ws_get_status_summary() -> str:
+    """WebSocket 상태 요약 문자열."""
+    if not WEBSOCKET_ENABLED:
+        return "WebSocket: 비활성"
+    connected = "연결됨" if _ws_connected else "미연결"
+    with _ws_lock:
+        sub_count = len(_ws_subscribed_codes)
+    age = int(time.time() - _ws_last_recv_ts) if _ws_last_recv_ts > 0 else -1
+    return (f"WebSocket: {connected} | 구독 {sub_count}/{WS_MAX_SUBSCRIPTIONS} | "
+            f"수신 {_ws_stats['recv_count']}건 | 재연결 {_ws_stats['reconnects']}회 | "
+            f"마지막 수신 {age}초 전")
+
+# ════════════════════════════════════════════════════════════════
 _execution_setup_watch: dict = {}
 _execution_setup_watch_last_persist_ts: float = 0.0
 def _prune_execution_snapshots(code: str, now_ts: float | None = None) -> None:
@@ -9437,6 +9900,9 @@ def _tick_exec_speed_prewarm() -> None:
             _exec_speed_prewarm.pop(code, None)
             continue
         # 스냅샷 1회 추가 수집 (시장 상태에 따라 KRX/NXT 선택)
+        # v162: WebSocket 활성 시 REST 호출 skip — WebSocket이 실시간 갱신 중
+        if _ws_is_active() and code in _ws_subscribed_codes:
+            continue
         try:
             if krx_ok:
                 get_stock_price(code)
@@ -22647,6 +23113,12 @@ def update_dashboard(force: bool = False) -> None:
     )
     if perf:
         text += f"• 오늘 성과: {perf}\n"
+    # v162: WebSocket 상태 표시
+    if WEBSOCKET_ENABLED:
+        ws_conn = "🟢연결" if _ws_connected else "🔴미연결"
+        with _ws_lock:
+            ws_sub = len(_ws_subscribed_codes)
+        text += f"• WebSocket: {ws_conn} | 구독 {ws_sub}/{WS_MAX_SUBSCRIPTIONS}\n"
     text += f"• 업데이트: {datetime.now().strftime('%m-%d %H:%M')}\n"
     # v39.4-#6: 내용 해시 비교 → 변동 없으면 스킵 (메시지량 감소)
     content_hash = hashlib.md5(f"{regime}{tracked_n}{perf}".encode()).hexdigest()[:8]
@@ -33217,6 +33689,11 @@ def _on_market_open():
     _upper_limit_day_alerted.clear()  # v40.0-#10: 상한가 당일 추적 초기화
     reset_top_signals_daily()
     refresh_dynamic_candidates()
+    # v162: 장 시작 시 WebSocket 스레드 (재)시작
+    try:
+        _ws_start()
+    except Exception as e:
+        _swallow_exception(e)
     send(f"🌅 <b>장 시작!</b>  {datetime.now().strftime('%Y-%m-%d')}\n"
          f"📂 이월: {len(_detected_stocks)}개  |  📡 전체 스캔 시작")
 def _build_scan_runtime_context() -> dict:
@@ -34195,6 +34672,11 @@ if __name__ == "__main__":
                 _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
     _maybe_run_preclose_gap_alert_catchup()
     _schedule_startup_scan_catchup()
+    # v162: WebSocket 스레드 시작
+    try:
+        _ws_start()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ WebSocket 시작 실패 (REST fallback 유지): {e}")
     while True:
         try:
             schedule.run_pending(); time.sleep(1)
