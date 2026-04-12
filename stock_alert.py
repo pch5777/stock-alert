@@ -3,10 +3,40 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162
-날짜: 2026-04-11
+버전: v162.1
+날짜: 2026-04-12
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162.1 (2026-04-12): YouTube 캐시 복원 완성 + KIS 해외주식 API + 심볼 확장 + 섹터 교차분류 강화
+  [#1] main 진입점 _load_youtube_gemini_cache() 호출 삽입 (일반 경로 + 공휴일 대기 경로)
+  이유: _load/_save_youtube_gemini_cache() 함수는 추가됐으나 봇 재시작 시 로드 호출이 누락 → 캐시 영속화 미작동
+  개선점: 재시작 후에도 YouTube Gemini 분석 캐시가 복원되어 중복 API 호출 감소
+  주의점: 공휴일 대기 모드 경로도 동일하게 처리 (두 경로 모두 삽입)
+  [#2] _fetch_kis_overseas_price() 신규 — KIS HHDFS00000300 TR 해외주식 현재가 조회
+  이유: Yahoo Finance 단일 의존 → 간헐적 차단/지연 시 NVDA·TSM 데이터 누락
+  개선점: KIS API 우선 조회, 실패 시 Yahoo 보조로 자동 fallback
+  주의점: KIS 해외주식 조회는 장 운영시간 외 응답 없을 수 있음 — 실패 시 기존 Yahoo 경로 유지
+  [#3] get_us_market_signals() symbols에 SOX·NVDA·TSM·닛케이·상하이 추가
+  이유: 반도체 섹터 영향이 큰 SOX·NVDA·TSM, 아시아 시장 상관관계가 높은 닛케이·상하이 누락
+  개선점: 재료현황(/material) 메시지에 🌐 미국 수치지표 섹션으로 한 눈에 확인 가능
+  주의점: sox_chg·nvda_chg·tsm_chg·nikkei_chg·shanghai_chg 기본값 0.0 → Yahoo 수집 실패 시 flat 유지
+  [#4] _build_macro_signal_scenarios() SOX 급등(≥+2.5%)/급락(≤-2.5%) 시나리오 신설
+  이유: 나스닥 전체 지수보다 SOX가 국내 반도체 섹터 당일 방향을 더 직접적으로 선행
+  개선점: SOX 급등 시 반도체/HBM/AI인프라 kr_sector_bull 자동 연결, 급락 시 bear 경보
+  주의점: 나스닥 기반 기존 시나리오와 중복 발생 가능 — priority_base=8로 SOX 우선
+  [#5] OVERNIGHT_EVENT_SECTOR_MAP에 유가/이란/호르무즈/OPEC/중동 키워드 추가
+  이유: 야간 지정학 이슈 중 에너지·중동 관련 이벤트가 정유·방산 섹터와 자동 연결 안 됨
+  개선점: 유가/이란/호르무즈/OPEC/중동 키워드 → 정유·에너지·방산·조선 자동 매핑
+  주의점: 기존 GTC/FOMC 등 이벤트 매핑 유지
+  [#6] _GEO_SECTOR_MAP 이란·중동 항목에 호르무즈·홍해·수에즈·방산 교차 추가
+  이유: 해협 봉쇄 관련 뉴스에서 정유만 매핑되고 방산·해운 누락
+  개선점: 이란|호르무즈 키워드 → 정유+에너지+화학+방산 / 중동|홍해|수에즈 → 방산+정유+해운
+  주의점: 기존 _GEO_SECTOR_MAP 패턴 구조 유지 (정규식 | 구분자)
+  [#7] 유가 급등 시나리오 kr_sector_bull에 "방산" 교차 추가
+  이유: 유가 급등은 중동 긴장과 동반되는 경우가 많아 방산 수혜 교차 필요
+  개선점: 유가 급등 → 정유/에너지/LNG/조선/방산 5개 섹터 동시 매핑
+  주의점: 유가 안정(하락) 시나리오에는 방산 추가 없음
+  진입 체인: 기존 체인 유지 (신규 함수 _fetch_kis_overseas_price는 데이터 조회 전용)
 - v162 (2026-04-11): WebSocket 기반 실시간 체결속도 병렬 레이어 추가
   [#1] KIS WebSocket API(H0STCNT0) 실시간 체결 데이터 수신 → _execution_snapshots 갱신 병렬 레이어 신설
   [#2] _ws_get_approval_key(): WebSocket 전용 approval_key 발급 (oauth2/Approval)
@@ -5599,6 +5629,8 @@ YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUE
 YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
 YOUTUBE_KEYWORD_MAX_RESULTS = int(os.getenv("YOUTUBE_KEYWORD_MAX_RESULTS", "5") or "5")      # 키워드당 최대 영상 수
 YOUTUBE_FETCH_DAILY_LIMIT = int(os.getenv("YOUTUBE_FETCH_DAILY_LIMIT", "2") or "2")         # v161.37: 하루 최대 YouTube API fetch 횟수 (기본 2회)
+# v162.1: YouTube Gemini 분석 캐시 영속화 파일
+YOUTUBE_GEMINI_CACHE_FILE = _state_path("youtube_gemini_cache.json")
 # ── 섹터 제한 (v161.9) ──
 SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
 SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "8.0") or "8.0")    # v161.48: 10→8% — 8% 이상 급등 종목 섹터 제한 면제 (기존 10%는 +8~9% 급등 종목도 차단)
@@ -5691,6 +5723,31 @@ def _gemini_daily_count_inc() -> None:
     _youtube_gemini_daily_counter["count"] = _youtube_gemini_daily_counter.get("count", 0) + 1
 
 
+def _load_youtube_gemini_cache() -> None:
+    """v162.1: 재시작 후 youtube_gemini_cache.json에서 캐시 복원."""
+    global _youtube_gemini_analyzed_cache
+    try:
+        data = _read_json_locked(YOUTUBE_GEMINI_CACHE_FILE)
+        if isinstance(data, dict) and data:
+            now_ts = time.time()
+            # 24시간 초과 항목은 복원하지 않음
+            valid = {vid: v for vid, v in data.items()
+                     if now_ts - float(v.get("ts", 0) or 0) < GEMINI_YOUTUBE_CACHE_TTL_SEC}
+            _youtube_gemini_analyzed_cache.update(valid)
+            if valid:
+                print(f"[YT] 캐시 복원: {len(valid)}개 영상")
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _save_youtube_gemini_cache() -> None:
+    """v162.1: _youtube_gemini_analyzed_cache를 youtube_gemini_cache.json에 저장."""
+    try:
+        _write_json_atomic(YOUTUBE_GEMINI_CACHE_FILE, dict(_youtube_gemini_analyzed_cache))
+    except Exception as e:
+        _swallow_exception(e)
+
+
 def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: str = "") -> list[dict]:
     """
     Gemini로 유튜브 영상 분석 → 주식 재료 rows 반환.
@@ -5763,6 +5820,7 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: s
                 })
             _gemini_daily_count_inc()
             _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": rows}
+            _save_youtube_gemini_cache()  # v162.1: 영속화
             # v161.34: 성공 로그
             print(f"[YT] Gemini 분석 완료 [{video_id}]: stocks={len(stocks)}개 summary={summary[:40]!r}")
             return rows
@@ -5787,6 +5845,7 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: s
     # fallback: 제목만 반환
     fallback = [{"title": title, "source": "YOUTUBE", "published_at": "", "channel_id": video_id, "live": "", "gemini_stocks": []}]
     _youtube_gemini_analyzed_cache[video_id] = {"ts": now, "rows": fallback}
+    _save_youtube_gemini_cache()  # v162.1: 영속화
     return fallback
 
 
@@ -6549,6 +6608,11 @@ OVERNIGHT_EVENT_SECTOR_MAP = {
     "밸류업": ["증권","보험","금융","지주"],
     "바이오": ["바이오","제약","헬스케어"],
     "조선":   ["조선","기자재","LNG"],
+    "유가":   ["정유","에너지","화학","조선","방산"],
+    "이란":   ["정유","에너지","방산","조선"],
+    "호르무즈": ["정유","에너지","해운","방산"],
+    "OPEC":   ["정유","에너지","화학"],
+    "중동":   ["방산","정유","에너지","조선"],
 }
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -15249,7 +15313,7 @@ def _build_macro_signal_scenarios(us: dict) -> list[dict]:
             cause=f"WTI {safe_float(us.get('oil_chg', 0.0), 0.0):+.1f}%",
             source="OIL",
             matched_keywords=["유가", "에너지"],
-            kr_sector_bull=["정유", "에너지", "LNG", "조선"],
+            kr_sector_bull=["정유", "에너지", "LNG", "조선", "방산"],
             kr_sector_bear=["항공", "운송", "화학"],
             priority_base=7,
             confidence="mid",
@@ -15265,6 +15329,30 @@ def _build_macro_signal_scenarios(us: dict) -> list[dict]:
             kr_sector_bear=["정유", "에너지"],
             priority_base=6,
             confidence="mid",
+        ))
+    # v162.1: SOX 반도체 지수 급등/급락 시나리오
+    if safe_float(us.get("sox_chg", 0.0), 0.0) >= 2.5:
+        scenarios.append(_build_market_scenario_item(
+            event_name="필라델피아 반도체지수(SOX) 급등",
+            direction="up",
+            cause=f"SOX {safe_float(us.get('sox_chg', 0.0), 0.0):+.1f}% / NVDA {safe_float(us.get('nvda_chg', 0.0), 0.0):+.1f}%",
+            source="SOX",
+            matched_keywords=["SOX", "반도체", "NVDA", "엔비디아", "AI반도체"],
+            us_leaders=["엔비디아", "TSMC", "브로드컴"],
+            kr_sector_bull=["반도체", "AI반도체", "HBM", "AI인프라", "전력반도체"],
+            priority_base=8,
+            confidence="high",
+        ))
+    elif safe_float(us.get("sox_chg", 0.0), 0.0) <= -2.5:
+        scenarios.append(_build_market_scenario_item(
+            event_name="필라델피아 반도체지수(SOX) 급락",
+            direction="down",
+            cause=f"SOX {safe_float(us.get('sox_chg', 0.0), 0.0):+.1f}% / NVDA {safe_float(us.get('nvda_chg', 0.0), 0.0):+.1f}%",
+            source="SOX",
+            matched_keywords=["SOX", "반도체", "NVDA", "엔비디아"],
+            kr_sector_bear=["반도체", "AI반도체", "HBM", "디스플레이"],
+            priority_base=8,
+            confidence="high",
         ))
     return scenarios
 
@@ -27953,11 +28041,11 @@ def _render_geo_sector_block(sec_dirs: list) -> str:
     return "\n".join(lines) + "\n"
 _GEO_SECTOR_MAP = {
     "전쟁|전투|공습|미사일|폭격|침공|교전|충돌|군사": ["방산", "항공우주"],
-    "이란|OPEC|유가|원유|석유|천연가스|LNG|감산|증산": ["정유", "에너지", "화학"],
+    "이란|OPEC|유가|원유|석유|천연가스|LNG|감산|증산|호르무즈": ["정유", "에너지", "화학", "방산"],
     "러시아|우크라이나": ["방산", "에너지", "곡물"],
     "중국|대만|반도체|수출통제": ["반도체", "IT", "전자"],
     "제재|봉쇄|관세|무역전쟁|금수": ["수출주", "화학", "철강"],
-    "이스라엘|팔레스타인|가자|중동": ["방산", "정유"],
+    "이스라엘|팔레스타인|가자|중동|홍해|수에즈": ["방산", "정유", "해운"],
     "북한": ["방산", "건설"],
 }
 _geo_cache: dict = {}  # keyword_hash → {result, ts}
@@ -30463,6 +30551,23 @@ def _handle_telegram_material_command():
                     if stocks:
                         gr_lines.append(f"    → {'/'.join(stocks[:4])}")
             parts.append("\n" + "\n".join(gr_lines))
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑦ 미국 수치지표 (v162.1)
+        try:
+            us = get_us_market_signals()
+            us_lines = ["🌐 <b>미국 수치지표</b>"]
+            def _fmt(val: float, unit: str = "%", prec: int = 1) -> str:
+                return f"{val:+.{prec}f}{unit}" if val != 0.0 else f"0.0{unit}"
+            us_lines.append(f"  나스닥선물 {_fmt(us.get('nasdaq_chg', 0.0))}  S&P500 {_fmt(us.get('sp500_chg', 0.0))}")
+            us_lines.append(f"  SOX(반도체) {_fmt(us.get('sox_chg', 0.0))}  NVDA {_fmt(us.get('nvda_chg', 0.0))}  TSM {_fmt(us.get('tsm_chg', 0.0))}")
+            us_lines.append(f"  닛케이 {_fmt(us.get('nikkei_chg', 0.0))}  상하이 {_fmt(us.get('shanghai_chg', 0.0))}")
+            us_lines.append(f"  VIX {us.get('vix', 0.0):.1f}  DXY {us.get('dxy', 0.0):.2f}  WTI {_fmt(us.get('oil_chg', 0.0))}  금 {_fmt(us.get('gold_chg', 0.0))}")
+            us_lines.append(f"  원/달러 {us.get('krw_usd', 0.0):.0f}원 ({_fmt(us.get('krw_usd_chg', 0.0))})")
+            if us.get("summary"):
+                us_lines.append(f"  → {us['summary']}")
+            parts.append("\n" + "\n".join(us_lines))
         except Exception as e:
             _swallow_exception(e)
 
@@ -33178,7 +33283,39 @@ def _build_us_market_signal_default() -> dict:
         "gap_signal": "flat", "score_adj": 0, "summary": "",
         "sp500_chg": 0.0, "gold_chg": 0.0, "oil_chg": 0.0, "tnx": 0.0,
         "krw_usd": 0.0, "krw_usd_chg": 0.0,
+        "sox_chg": 0.0, "nvda_chg": 0.0, "tsm_chg": 0.0,
+        "nikkei_chg": 0.0, "shanghai_chg": 0.0,
     }
+def _fetch_kis_overseas_price(symbol: str, excd: str = "NAS") -> float | None:
+    """v162.1: KIS HHDFS00000300 TR로 해외주식 현재가 조회.
+    symbol: 종목코드 (예: NVDA, TSM, QQQ)
+    excd: 거래소코드 (NAS=나스닥, NYS=NYSE, TSE=도쿄, SHS=상해)
+    반환: 현재가(float) 또는 None(실패 시)
+    """
+    try:
+        url = f"{KIS_BASE_URL}/uapi/overseas-price/v1/quotations/price"
+        params = {
+            "AUTH": "",
+            "EXCD": excd,
+            "SYMB": symbol,
+        }
+        data = _safe_get(url, "HHDFS00000300", params)
+        if not isinstance(data, dict):
+            return None
+        output = data.get("output") or {}
+        last_str = str(output.get("last", "") or "")
+        if last_str:
+            return float(last_str)
+        return None
+    except Exception as e:
+        _warn_throttled_once(
+            f"kis_overseas:{symbol}",
+            f"🌐 KIS 해외주식 {symbol} 조회 실패 ({type(e).__name__})",
+            cooldown_sec=1800.0,
+        )
+        return None
+
+
 def _fetch_us_market_signal_values(symbols: dict) -> dict:
     values = {}
     for sym, key in symbols.items():
@@ -33294,6 +33431,8 @@ def get_us_market_signals() -> dict:
     """
     나스닥 선물(NQ=F), VIX(^VIX), 달러인덱스(DX-Y.NYB) 조회.
     Yahoo Finance JSON API 사용 (무료, pip 설치 불필요).
+    v162.1: SOX(^SOX)·NVDA·TSM·닛케이(^N225)·상하이(000001.SS) 추가.
+            NVDA·TSM은 KIS HHDFS00000300 TR 우선, 실패 시 Yahoo 보조.
     """
     if time.time() - _us_cache.get("ts", 0) < 3600:
         return _us_cache
@@ -33303,8 +33442,16 @@ def get_us_market_signals() -> dict:
             "NQ=F": "nasdaq", "^VIX": "vix", "DX-Y.NYB": "dxy",
             "ES=F": "sp500", "GC=F": "gold", "CL=F": "oil",
             "^TNX": "tnx", "KRW=X": "krw",
+            "^SOX": "sox", "NVDA": "nvda", "TSM": "tsm",
+            "^N225": "nikkei", "000001.SS": "shanghai",
         }
         values = _fetch_us_market_signal_values(symbols)
+        # v162.1: NVDA·TSM KIS 우선 조회 (Yahoo 실패 시 보완)
+        for sym, key, excd in [("NVDA", "nvda", "NAS"), ("TSM", "tsm", "NAS")]:
+            if not values.get(f"{key}_chg"):
+                kis_price = _fetch_kis_overseas_price(sym, excd)
+                if kis_price and kis_price > 0:
+                    values[f"{key}_last"] = kis_price
         result.update(_evaluate_us_market_signal_result(values))
         result["ts"] = time.time()
         result["summary"] = _compose_us_market_signal_summary(result)
@@ -34538,6 +34685,7 @@ if __name__ == "__main__":
         _load_sector_leader_follow_state()
         _load_market_flow_state()
         _load_dynamic_params()
+        _load_youtube_gemini_cache()    # v162.1: 재시작 후 YouTube Gemini 캐시 복원
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
         _run_holiday_standby_until_trading_day()
@@ -34566,6 +34714,7 @@ if __name__ == "__main__":
     load_adaptive_capture_feedback()
     load_stale_replay_penalty_profile()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
+    _load_youtube_gemini_cache()    # v162.1: 재시작 후 YouTube Gemini 캐시 복원
     if _try_acquire_leader_lock():
         if _enforce_runtime_version_lock(notify=True):
             _send_startup_banner_once()
