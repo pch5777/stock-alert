@@ -3,10 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.1
+버전: v162.2
 날짜: 2026-04-12
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162.2 (2026-04-12): SOX score_adj 파이프라인 연결 + NXT 액션보드 스캔 구멍 수정
+  [#1] _evaluate_us_market_signal_result(): sox_chg score_adj 반영(±2~4점) + sox/nvda/tsm/nikkei/shanghai 필드 반환
+  이유: sox_chg가 _build_us_market_signal_default()에만 있고 _evaluate_us_market_signal_result() 반환에 없어 result.update() 후 덮어씌워짐 → _us_cache에서 0으로 리셋, score_adj에도 미반영
+  개선점: SOX ≥+2.5% → score_adj +4, ≥+1.2% → +2 / SOX ≤-2.5% → -4, ≤-1.2% → -2 — 반도체 섹터 종목 점수에 직접 반영
+  주의점: score_adj는 전 종목 공통 보정 — 반도체 섹터 외 종목에도 적용됨. 과도한 가중 방지를 위해 ±4점 캡
+  [#2] _analyze_us_market_adjustment(): SOX 급등/급락 시 반도체 섹터 종목에 멘트 추가
+  이유: score_adj는 반영되나 reasons에 SOX 근거가 없어 알람 메시지에서 왜 점수가 높은지 추적 불가
+  개선점: stock_theme에 반도체/HBM/AI반도체 포함 종목에만 SOX 멘트 출력
+  주의점: 이중 점수 적용 없음 — 멘트만 추가, score 변경 없음
+  [#3] _scan_scenario_action_board_candidates(): NXT 전용 시간대(KRX 마감 후) 동작 허용
+  이유: if not krx_open: return → 15:30~20:00 NXT 시간대에 SOX/유가/지정학 시나리오 기반 종목 스캔 완전 skip
+  개선점: nxt_open이면 스캔 허용, nxt_only_window 시 KRX 전용 종목(is_nxt_listed() False)만 skip
+  주의점: KRX+NXT 동시(09:00~15:30)엔 기존 동작 유지. SCENARIO_SCAN_LIMIT 한도 동일 적용
+  [#4] _compose_us_market_signal_summary(): SOX/NVDA/닛케이 summary 표시 추가
+  이유: /us 명령어 및 재료현황 summary 줄에 SOX 미표시
+  개선점: extra_parts에 SOX/NVDA/닛케이 추가 — 장중 빠른 맥락 파악 가능
+  주의점: extra_parts 길이 증가로 summary 문자열 길어질 수 있음 — Telegram 메시지 길이 허용 범위 내
+  진입 체인: 기존 체인 유지 (_evaluate_us_market_signal_result → _analyze_us_market_adjustment → analyze() score 반영)
 - v162.1 (2026-04-12): YouTube 캐시 복원 완성 + KIS 해외주식 API + 심볼 확장 + 섹터 교차분류 강화
   [#1] main 진입점 _load_youtube_gemini_cache() 호출 삽입 (일반 경로 + 공휴일 대기 경로)
   이유: _load/_save_youtube_gemini_cache() 함수는 추가됐으나 봇 재시작 시 로드 호출이 누락 → 캐시 영속화 미작동
@@ -24155,6 +24173,15 @@ def _analyze_us_market_adjustment(ctx: dict, score: int, reasons: list) -> tuple
             reasons.append("⬇️ 내일 갭하락 가능성 (미국 약세)")
         elif us.get("gap_signal") == "gap_up":
             reasons.append("⬆️ 내일 갭상승 기대 (미국 강세)")
+        # v162.2: SOX 급등/급락 멘트 (score_adj는 _evaluate_us_market_signal_result에서 이미 반영)
+        sox_chg = float(us.get("sox_chg", 0.0) or 0.0)
+        si = (stock.get("sector_info") or ctx.get("sector_info") or {})
+        stock_theme = str(si.get("theme", "") or si.get("sector", "") or "")
+        _is_semicon = any(k in stock_theme for k in ("반도체", "AI반도체", "HBM", "AI인프라", "전력반도체"))
+        if sox_chg >= 2.5 and _is_semicon:
+            reasons.append(f"🔴 SOX 반도체지수 {sox_chg:+.1f}% 급등 — 반도체 섹터 강세 가중")
+        elif sox_chg <= -2.5 and _is_semicon:
+            reasons.append(f"🔵 SOX 반도체지수 {sox_chg:+.1f}% 급락 — 반도체 섹터 주의")
     except Exception as _e:
         _log_error(f"analyze_us({code})", _e)
     return score, us
@@ -33391,6 +33418,20 @@ def _evaluate_us_market_signal_result(values: dict) -> dict:
         score_adj -= 3
     elif tnx >= 4.5:
         score_adj -= 1
+    # v162.2: SOX 반도체지수 score_adj 반영
+    sox_chg = values.get("sox_chg", 0.0)
+    nvda_chg = values.get("nvda_chg", 0.0)
+    tsm_chg  = values.get("tsm_chg",  0.0)
+    nikkei_chg   = values.get("nikkei_chg",   0.0)
+    shanghai_chg = values.get("shanghai_chg", 0.0)
+    if sox_chg >= 2.5:
+        score_adj += 4   # SOX 급등 → 반도체 섹터 강세 가중
+    elif sox_chg >= 1.2:
+        score_adj += 2
+    elif sox_chg <= -2.5:
+        score_adj -= 4   # SOX 급락 → 반도체 섹터 약세 차감
+    elif sox_chg <= -1.2:
+        score_adj -= 2
     return {
         "nasdaq_chg": nasdaq_chg,
         "vix": vix,
@@ -33404,11 +33445,22 @@ def _evaluate_us_market_signal_result(values: dict) -> dict:
         "tnx": tnx,
         "krw_usd": krw_usd,
         "krw_usd_chg": krw_usd_chg,
+        "sox_chg": sox_chg,
+        "nvda_chg": nvda_chg,
+        "tsm_chg": tsm_chg,
+        "nikkei_chg": nikkei_chg,
+        "shanghai_chg": shanghai_chg,
     }
 def _compose_us_market_signal_summary(result: dict) -> str:
     regime_emoji = {"panic": "🔵", "risk_off": "🟡", "neutral": "🟡", "risk_on": "🔴"}
     gap_emoji = {"gap_up": "⬆️", "flat": "➡️", "gap_down": "⬇️"}
     extra_parts = []
+    if result.get("sox_chg"):
+        extra_parts.append(f"SOX{result['sox_chg']:+.1f}%")
+    if result.get("nvda_chg"):
+        extra_parts.append(f"NVDA{result['nvda_chg']:+.1f}%")
+    if result.get("nikkei_chg"):
+        extra_parts.append(f"닛케이{result['nikkei_chg']:+.1f}%")
     if result.get("krw_usd"):
         extra_parts.append(f"원/달러{result['krw_usd']:.0f}원({result.get('krw_usd_chg', 0):+.1f}%)")
     if result.get("gold_chg"):
@@ -34183,11 +34235,14 @@ def _scan_overnight_watchlist_candidates(alerts: list, seen: set, krx_open: bool
         _log_warn_msg(f"  ⚠️ 야간 워치리스트 우선 스캔 오류: {_e}")
 def _scan_scenario_action_board_candidates(alerts: list, seen: set, krx_open: bool) -> None:
     try:
-        if not krx_open:
+        # v162.2: NXT 전용 시간대(KRX 마감 후)에도 시나리오 액션보드 스캔 허용
+        nxt_open = is_nxt_open()
+        if not krx_open and not nxt_open:
             return
         board = _load_premarket_action_board()
         if not board.get("items"):
             return
+        nxt_only_window = nxt_open and not krx_open
         scanned = 0
         for item in list(board.get("items", []) or []):
             if str(item.get("direction", "")) != "up":
@@ -34195,6 +34250,9 @@ def _scan_scenario_action_board_candidates(alerts: list, seen: set, krx_open: bo
             for cand in list(item.get("kr_stock_candidates_long", []) or [])[:3]:
                 code = normalize_stock_code(cand.get("code"))
                 if not code or code in seen:
+                    continue
+                # v162.2: NXT 전용 시간대에는 KRX 전용 종목 skip
+                if nxt_only_window and not is_nxt_listed(code):
                     continue
                 cur = get_stock_price(code)
                 if not cur or not cur.get("price", 0):
