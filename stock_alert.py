@@ -3,10 +3,40 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.8
+버전: v163
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163 (2026-04-13): 주도주 4대 판정 엔진 신설 — VI발동순서·테마최초반응·지수버팀회복력 스코어 통합
+  [#1] 전역 상태 3개 추가: _sector_first_react_ts / _vi_sector_tracker / _index_dip_snapshots
+       — 각각 섹터 최초반응 타임스탬프, VI 발동 순서, 코스피 시계열 스냅샷 추적
+  [#2] 신규 함수 8개:
+       _normalize_sector_key() — 섹터 키 정규화
+       _update_sector_first_react() — 임계(%+5) 최초 돌파 종목 기록
+       _get_sector_react_rank() — 섹터 내 반응 순위 반환 (1=대장, 2=유력, 3+=후발)
+       _update_vi_sector_tracker() — VI 발동 종목 섹터별 순서 기록
+       _get_vi_rank_in_sector() — 섹터 내 VI 발동 순위 반환
+       record_index_snapshot() — 코스피 등락 2분 간격 스냅샷 저장
+       _calc_stock_resilience_score() — 지수 하락 중 종목 버팀·회복력 점수 계산
+  [#3] _ws_parse_execution_data(): vi_price(정적VI발동기준가) payload 파싱 추가 (chunk[45])
+  [#4] _record_execution_snapshot(): vi_price > 0 감지 시 _update_vi_sector_tracker() 자동 호출
+  [#5] get_volume_surge_stocks() / get_nxt_surge_stocks():
+       등락률 임계 초과 종목 → _update_sector_first_react() 호출 (KRX/NXT 양쪽 모두)
+  [#6] _apply_signal_quality_relative_strength(): code/sector 인자 추가,
+       기존 RS +10점 외에 VI순위·최초반응 보너스/후발주 페널티·회복력 점수 통합 적용
+       — VI 1위: +8 / VI 2위: +4 / 최초반응: +8 / 2번째: +3 / 4번째+: -5 / 회복력: +6
+  [#7] 스케줄러: record_index_snapshot() 2분 간격 등록
+  [#8] reset_daily_caches(): 주도주 추적 상태 일별 초기화 추가
+  이유: 기존 봇은 등락률 크기만으로 대장주를 판별 — 테마 내 VI 발동 순서와 최초 반응 타임스탬프,
+       지수 역행 강세(회복력)를 전혀 추적하지 않아 후발주를 대장주로 오인할 수 있었음.
+       주도주 2대 기준(이슈 최초 반응, 지수 역행 버팀)을 코드 레벨에서 직접 구현해 A급 진입 정확도 향상.
+  개선점: 같은 섹터 내 먼저 VI 진입한 종목 우선 포착 / 후발주 자동 페널티로 불필요한 추종 진입 차단 /
+          지수 하락 중 버티는 종목에 회복력 가점 → 주도 자금 유입 종목 조기 선별
+  주의점: _sector_first_react_ts·_vi_sector_tracker는 당일 기준으로만 유효 (reset_daily_caches 초기화).
+          vi_price는 WS 실시간 체결 데이터(H0STCNT0)에서만 수신 — REST 폴링 경로에서는 vi_price 미수신.
+          get_nxt_surge_stocks 내 get_stock_info 호출 추가 → NXT 스캔 시 API 호출 소폭 증가(최대 20회/스캔).
+          후발주 페널티(-5)는 4번째 이후 반응 종목에만 적용, 2~3번째는 보너스 없음(패널티도 없음).
+  진입불가 게이트 연결: _ensure_signal_actionability() → _pre_send_upper_block() 경유 확인 ✅
 - v162.8 (2026-04-13): _ensure_signal_actionability() 단일 게이트 강화 — 상한가·동시호가 영구 차단
   [#1] _ensure_signal_actionability(): _pre_send_upper_block() 호출 추가
        — send_alert() 진입 즉시 ①상한가 캐시 ②실시간 가격 ③KRX 동시호가(15:20+) NEAR_UPPER/UPPER_LIMIT 차단
@@ -5360,8 +5390,13 @@ def clean_expired_cache():
     _purge_stale_entry_watch_hits()
 def reset_daily_caches():
     global _daily_cache, _exec_speed_cache
+    global _sector_first_react_ts, _vi_sector_tracker, _index_dip_snapshots
     _daily_cache = {}
     _exec_speed_cache = {}
+    # v163: 주도주 추적 상태 일별 초기화 (당일 기준으로 재수집)
+    _sector_first_react_ts = {}
+    _vi_sector_tracker = {}
+    _index_dip_snapshots = []
 # [v41.84] NXT/KRX 명확화
 def get_active_market_type() -> str:
     h, m = _now_kst().hour, _now_kst().minute
@@ -6760,6 +6795,17 @@ SECTOR_LEADER_FOLLOW_MIN_VOLUME = float(os.getenv("SECTOR_LEADER_FOLLOW_MIN_VOLU
 SECTOR_LEADER_FOLLOW_BONUS = int(os.getenv("SECTOR_LEADER_FOLLOW_BONUS", "5") or "5")
 _sector_leader_follow_watch: dict = {"active": {}}
 _sector_leader_follow_seed_touched: dict = {}
+# ── v163: 주도주 추적 전역 상태 ──────────────────────────────────────────
+# 섹터별 최초 반응 종목 (sector_key → {code, name, ts, change_rate})
+# 같은 섹터 내 등락률 임계 최초 돌파 종목 = 주도주 후보
+_sector_first_react_ts: dict = {}
+# 섹터별 VI 발동 순서 (sector_key → [{code, name, vi_price, ts}])
+# vi_price > 0 이 기록될 때마다 순서대로 쌓음
+_vi_sector_tracker: dict = {}
+# 코스피 등락 스냅샷 — 장중 시간별 기록 [(ts, kospi_chg), ...]
+# 회복력(Recovery) 계산용: 지수 하락 구간에서 개별 종목 등락을 비교
+_index_dip_snapshots: list = []
+INDEX_DIP_SNAPSHOT_MAX = 120   # 최대 120개 (2분 간격 × 4시간)
 MARKET_FLOW_STATE_FILE = _state_path("market_flow_state.json")
 MARKET_FLOW_KEEP_HOURS = int(os.getenv("MARKET_FLOW_KEEP_HOURS", "72") or "72")
 MARKET_FLOW_MAX_MEMBERS = int(os.getenv("MARKET_FLOW_MAX_MEMBERS", "6") or "6")
@@ -8146,6 +8192,143 @@ def get_relative_strength(stock_change: float) -> float:
 # ============================================================
 # ⑰ 거래량 표준편차 Z-score (통계적 이상 탐지)
 # ============================================================
+# ============================================================
+# v163: 주도주 추적 함수군
+# ① 섹터 내 최초 반응 추적  ② VI 발동 순서 추적
+# ③ 지수 하락 시 회복력(Resilience) 계산
+# ============================================================
+
+# 최초 반응 임계값: 이 등락률을 최초로 돌파한 종목 = 섹터 주도주 후보
+SECTOR_FIRST_REACT_THRESHOLD = float(os.getenv("SECTOR_FIRST_REACT_THRESHOLD", "5.0") or "5.0")
+# VI 1번째 포착 스코어 보너스
+VI_FIRST_BONUS   = int(os.getenv("VI_FIRST_BONUS",  "8") or "8")
+VI_SECOND_BONUS  = int(os.getenv("VI_SECOND_BONUS", "4") or "4")
+# 테마 최초 반응 스코어 보너스
+FIRST_REACT_BONUS   = int(os.getenv("FIRST_REACT_BONUS",  "8") or "8")
+SECOND_REACT_BONUS  = int(os.getenv("SECOND_REACT_BONUS", "3") or "3")
+LAGGARD_PENALTY     = int(os.getenv("LAGGARD_PENALTY",   "-5") or "-5")
+# 회복력 기준: 지수가 -N% 하락할 때 종목이 이보다 덜 하락 or 상승하면 resilience로 판정
+INDEX_DIP_THRESHOLD = float(os.getenv("INDEX_DIP_THRESHOLD", "-0.3") or "-0.3")
+RESILIENCE_BONUS    = int(os.getenv("RESILIENCE_BONUS", "6") or "6")
+
+
+def _normalize_sector_key(sector: str) -> str:
+    """섹터 문자열 정규화 — 빈 문자열·'기타' 등은 공통 버킷으로 처리"""
+    s = (sector or "").strip()
+    if not s or s in ("기타", "기타업종", "unknown"):
+        return "기타"
+    return s
+
+
+def _update_sector_first_react(code: str, name: str, sector: str, change_rate: float) -> None:
+    """섹터 내 최초로 임계 등락률을 돌파한 종목을 기록한다.
+    당일 섹터별로 1회만 기록 (최초 도달 시각 고정).
+    임계값: SECTOR_FIRST_REACT_THRESHOLD (기본 +5%)."""
+    global _sector_first_react_ts
+    if change_rate < SECTOR_FIRST_REACT_THRESHOLD:
+        return
+    key = _normalize_sector_key(sector)
+    today = _now_kst().strftime("%Y%m%d")
+    entry = _sector_first_react_ts.get(key)
+    # 이미 오늘 기록된 종목이 있으면 추가 기록만 (순서 추적용)
+    if not entry or entry.get("date") != today:
+        _sector_first_react_ts[key] = {
+            "date": today,
+            "first": {"code": code, "name": name, "change_rate": change_rate,
+                      "ts": time.time()},
+            "members": [],
+        }
+    rec = _sector_first_react_ts[key]
+    # 이미 등록된 코드는 중복 추가 금지
+    existing = [m["code"] for m in rec.get("members", [])]
+    if code not in existing and code != rec.get("first", {}).get("code"):
+        rec.setdefault("members", []).append(
+            {"code": code, "name": name, "change_rate": change_rate, "ts": time.time()}
+        )
+
+
+def _get_sector_react_rank(code: str, sector: str) -> int:
+    """섹터 내 반응 순위 반환 (1=최초 대장, 2=2번째, 3+=후발주, 0=미기록)."""
+    key = _normalize_sector_key(sector)
+    today = _now_kst().strftime("%Y%m%d")
+    rec = _sector_first_react_ts.get(key)
+    if not rec or rec.get("date") != today:
+        return 0
+    if rec.get("first", {}).get("code") == code:
+        return 1
+    for i, m in enumerate(rec.get("members", []), start=2):
+        if m["code"] == code:
+            return i
+    return 0
+
+
+def _update_vi_sector_tracker(code: str, name: str, sector: str, vi_price: int) -> None:
+    """VI 발동 종목을 섹터별 순서대로 기록한다.
+    vi_price > 0 일 때만 호출된다. 당일 기준 중복 코드는 무시."""
+    global _vi_sector_tracker
+    if vi_price <= 0:
+        return
+    key = _normalize_sector_key(sector)
+    today = _now_kst().strftime("%Y%m%d")
+    bucket = _vi_sector_tracker.setdefault(key, {"date": today, "members": []})
+    if bucket.get("date") != today:
+        _vi_sector_tracker[key] = {"date": today, "members": []}
+        bucket = _vi_sector_tracker[key]
+    existing = [m["code"] for m in bucket["members"]]
+    if code not in existing:
+        bucket["members"].append({
+            "code": code, "name": name, "vi_price": vi_price, "ts": time.time()
+        })
+
+
+def _get_vi_rank_in_sector(code: str, sector: str) -> int:
+    """섹터 내 VI 발동 순위 반환 (1=최초, 0=미기록)."""
+    key = _normalize_sector_key(sector)
+    today = _now_kst().strftime("%Y%m%d")
+    bucket = _vi_sector_tracker.get(key)
+    if not bucket or bucket.get("date") != today:
+        return 0
+    for i, m in enumerate(bucket["members"], start=1):
+        if m["code"] == code:
+            return i
+    return 0
+
+
+def record_index_snapshot() -> None:
+    """코스피 현재 등락률을 스냅샷 리스트에 추가 (스케줄러에서 2분 간격 호출)."""
+    global _index_dip_snapshots
+    try:
+        chg = get_kospi_change()
+        _index_dip_snapshots.append({"ts": time.time(), "kospi_chg": chg})
+        if len(_index_dip_snapshots) > INDEX_DIP_SNAPSHOT_MAX:
+            _index_dip_snapshots = _index_dip_snapshots[-INDEX_DIP_SNAPSHOT_MAX:]
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _calc_stock_resilience_score(change_rate: float) -> tuple[int, str]:
+    """지수 하락 구간에서 종목의 버팀·회복력을 점수로 반환한다.
+    코스피가 INDEX_DIP_THRESHOLD(기본 -0.3%) 이하일 때
+    종목이 코스피보다 덜 하락하거나 상승하면 회복력 가점 부여.
+    Returns: (score_bonus, description)"""
+    if not _index_dip_snapshots:
+        return 0, ""
+    # 최근 10개 스냅샷에서 지수 하락 구간만 필터
+    recent = _index_dip_snapshots[-10:]
+    dip_moments = [s for s in recent if float(s.get("kospi_chg", 0) or 0) <= INDEX_DIP_THRESHOLD]
+    if not dip_moments:
+        return 0, ""
+    # 대표 지수 하락폭 (평균)
+    avg_index_dip = sum(float(s["kospi_chg"]) for s in dip_moments) / len(dip_moments)
+    # 종목이 지수보다 얼마나 버텼는지
+    outperformance = change_rate - avg_index_dip
+    if outperformance >= 2.0:
+        return RESILIENCE_BONUS, f"지수 하락 중 강세 버팀 +{RESILIENCE_BONUS}점 (코스피 {avg_index_dip:+.1f}% vs 종목 {change_rate:+.1f}%)"
+    elif outperformance >= 0.5:
+        return RESILIENCE_BONUS // 2, f"지수 하락 대비 상대강세 +{RESILIENCE_BONUS // 2}점 (코스피 {avg_index_dip:+.1f}%)"
+    return 0, ""
+
+
 def get_volume_zscore(code: str, today_vol: int) -> float:
     """오늘 거래량의 Z-score (과거 20일 기준)"""
     items = get_daily_data(code, 30)
@@ -9546,6 +9729,8 @@ def _ws_parse_execution_data(raw_data: str) -> list[dict]:
                     "exec_vol": int(chunk[12]) if chunk[12] else 0,
                     "exec_strength": float(chunk[18]) if chunk[18] else 0.0,
                     "acml_tr_pbmn": int(chunk[14]) if chunk[14] else 0,
+                    # v163: VI 발동 기준가 (정적VI, 0이면 미발동)
+                    "vi_price": int(float(chunk[45])) if len(chunk) > 45 and chunk[45] else 0,
                 }
                 results.append({"code": code, "payload": payload})
             except (ValueError, IndexError):
@@ -9901,11 +10086,23 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
         "acml_tr_pbmn": safe_int(payload.get("acml_tr_pbmn", 0)),
         "high": safe_int(payload.get("high", 0)),
         "low": safe_int(payload.get("low", 0)),
+        # v163: VI 발동 기준가 저장
+        "vi_price": safe_int(payload.get("vi_price", 0)),
     }
     if prev and prev.get("price") == price and prev.get("today_vol") == today_vol:
         return
     buf.append(sample)
     _prune_execution_snapshots(code, now_ts)
+    # v163: VI 발동 감지 → 섹터별 VI 순서 기록
+    _vi_price_val = safe_int(payload.get("vi_price", 0))
+    if _vi_price_val > 0:
+        try:
+            _stock_info = get_stock_info(code) or {}
+            _vi_sector  = str(_stock_info.get("sector", "") or "")
+            _vi_name    = str(_stock_info.get("name", code) or code)
+            _update_vi_sector_tracker(code, _vi_name, _vi_sector, _vi_price_val)
+        except Exception as _ve:
+            _swallow_exception(_ve)
 def _build_execution_speed_metrics_base(current_price: int | None = None) -> dict:
     base_price = safe_int(current_price, 0)
     return {
@@ -14376,6 +14573,17 @@ def get_volume_surge_stocks() -> list:
     items = [item for item in items if item.get("code")]
     if target_count > request_count:
         items = _extend_krx_volume_rank_items(items, target_count)
+    # v163: 등락률 임계 초과 종목 → 섹터 최초 반응 tracker 업데이트
+    try:
+        for _it in items:
+            _it_code = str(_it.get("code", "") or "")
+            _it_chg  = float(_it.get("change_rate", 0.0) or 0.0)
+            _it_sec  = str(_it.get("sector", "") or _it.get("theme", "") or "")
+            _it_name = str(_it.get("name", _it_code) or _it_code)
+            if _it_code and _it_chg >= SECTOR_FIRST_REACT_THRESHOLD:
+                _update_sector_first_react(_it_code, _it_name, _it_sec, _it_chg)
+    except Exception as _fre:
+        _swallow_exception(_fre)
     return items
 # ── NXT (넥스트레이드) 조회 ──
 # NXT는 KRX와 동일 종목이 복수 시장에서 거래됨
@@ -14551,6 +14759,18 @@ def get_nxt_surge_stocks() -> list:
         if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
             _log_warn_msg("⚠️ [NXT] volume-rank 응답 비어있음 → NXT 유니버스 후보군으로 대체")
             return _rank_from_universe("NXT")
+        # v163: NXT 종목도 최초 반응 tracker 업데이트
+        try:
+            for _ni in items:
+                _ni_code = str(_ni.get("code", "") or "")
+                _ni_chg  = float(_ni.get("change_rate", 0.0) or 0.0)
+                _ni_name = str(_ni.get("name", _ni_code) or _ni_code)
+                if _ni_code and _ni_chg >= SECTOR_FIRST_REACT_THRESHOLD:
+                    _si = get_stock_info(_ni_code) or {}
+                    _ni_sec = str(_si.get("sector", "") or "")
+                    _update_sector_first_react(_ni_code, _ni_name, _ni_sec, _ni_chg)
+        except Exception as _nfre:
+            _swallow_exception(_nfre)
         return items
     except Exception as e:
         _log_warn_msg(f"⚠️ NXT 조회 오류: {e}")
@@ -24390,11 +24610,51 @@ def _bootstrap_analyze_context(stock: dict) -> dict:
         return {}
     _apply_bootstrap_context_bonuses(ctx)
     return _finalize_bootstrap_analyze_context(ctx)
-def _apply_signal_quality_relative_strength(change_rate: float, score: int, reasons: list) -> tuple[int, float]:
+def _apply_signal_quality_relative_strength(change_rate: float, score: int, reasons: list,
+                                             code: str = "", sector: str = "") -> tuple[int, float]:
+    """v163: 코스피 상대강도 + 주도주 4대 판정 (VI순위·최초반응·회복력) 통합 점수화.
+    기존 RS 점수(+10)는 유지하고 주도주 특성에 따라 추가 보너스/페널티를 부여한다."""
     rs = get_relative_strength(change_rate)
     if rs >= RS_MIN:
         score += 10
         reasons.append(f"💪 코스피 상대강도 {rs:.1f}배")
+
+    # ── v163 주도주 판정 블록 ────────────────────────────────────────────
+    if code and sector:
+        try:
+            # ① VI 발동 순위: 섹터 내 VI 1번째 = 대장, 2번째 = 유력
+            _vi_rank = _get_vi_rank_in_sector(code, sector)
+            if _vi_rank == 1:
+                score += VI_FIRST_BONUS
+                reasons.append(f"⚡ 섹터 VI 1번째 발동 — 대장주 판정 +{VI_FIRST_BONUS}점")
+            elif _vi_rank == 2:
+                score += VI_SECOND_BONUS
+                reasons.append(f"⚡ 섹터 VI 2번째 발동 +{VI_SECOND_BONUS}점")
+
+            # ② 테마 내 최초 반응 순위
+            _react_rank = _get_sector_react_rank(code, sector)
+            if _react_rank == 1:
+                score += FIRST_REACT_BONUS
+                reasons.append(f"🥇 섹터 내 최초 반응 대장주 +{FIRST_REACT_BONUS}점")
+            elif _react_rank == 2:
+                score += SECOND_REACT_BONUS
+                reasons.append(f"🥈 섹터 내 2번째 반응 +{SECOND_REACT_BONUS}점")
+            elif _react_rank >= 4:
+                # 4번째 이후 = 후발주 경고
+                score += LAGGARD_PENALTY
+                reasons.append(f"⚠️ 섹터 내 {_react_rank}번째 반응 — 후발주 주의 {LAGGARD_PENALTY}점")
+        except Exception as _jde:
+            _swallow_exception(_jde)
+
+        # ③ 지수 하락 중 회복력
+        try:
+            _res_bonus, _res_msg = _calc_stock_resilience_score(change_rate)
+            if _res_bonus > 0:
+                score += _res_bonus
+                reasons.append(f"🛡️ {_res_msg}")
+        except Exception as _rse:
+            _swallow_exception(_rse)
+
     return score, rs
 def _apply_signal_quality_investor_context(ctx: dict, score: int, reasons: list, signal_type: str) -> tuple[int, list, str]:
     if score < 25:
@@ -24488,7 +24748,12 @@ def _apply_analyze_signal_quality(ctx: dict) -> bool:
     reasons = ctx["reasons"]
     signal_type = ctx["signal_type"]
     min_score = ctx["min_score"]
-    score, rs = _apply_signal_quality_relative_strength(change_rate, score, reasons)
+    score, rs = _apply_signal_quality_relative_strength(
+        change_rate, score, reasons,
+        code=code,
+        sector=str((ctx.get("stock") or {}).get("sector", "") or
+                   (ctx.get("sector_info") or {}).get("theme", "") or ""),
+    )
     score, reasons, signal_type = _apply_signal_quality_investor_context(ctx, score, reasons, signal_type)
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(score, reasons, code, signal_type, change_rate, vol_ratio, weight_mode="strong")
     score = _apply_signal_quality_execution_speed(code, price, score, reasons)
@@ -35343,6 +35608,8 @@ if __name__ == "__main__":
     schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
     schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
+    # v163: 코스피 지수 스냅샷 2분 간격 — 회복력(Resilience) 계산용
+    schedule.every(2).minutes.do(record_index_snapshot)
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
