@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.4
+버전: v162.5
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162.5 (2026-04-13): _dynamic_candidates 순회 중 변경 RuntimeError 수정
+  [#1] _dynamic_candidates.items() 직접 순회 3곳 → dict(_dynamic_candidates).items() 스냅샷으로 교체
+  이유: WS 스레드(_record_execution_snapshot)가 동시에 _dynamic_candidates 수정 가능 → RuntimeError: dictionary changed size during iteration 발생 (09:47:42 로그 확인)
+  개선점: dict()로 순회 시작 전 스냅샷 복사 → 순회 중 원본 변경되어도 안전
+  주의점: 이번 오류는 v162.4 이전(deployment 26bb8b81) 코드에서 발생 — v162.4도 동일 패턴 존재하므로 선제 수정
+  진입 체인: 기존 체인 변경 없음 (dict 스냅샷 교체는 순회 안전성만 개선)
 - v162.4 (2026-04-13): F구간 VWAP 눌림반등 당일 단타 진입 신호 + 학습 루프 완성
   [#1] _ws_parse_execution_data(): weighted_avg(VWAP)/exec_vol/exec_strength/acml_tr_pbmn payload 추가
   이유: H0STCNT0 필드 6(VWAP)/12(틱체결량)/18(체결강도)/14(누적거래대금) 파싱에 누락 — FZONE 눌림감지 불가
@@ -13171,7 +13177,7 @@ def get_all_scan_candidates() -> list:
                 if is_trade_candidate_name(resolved_name):
                     seen.add(c); result.append((c, resolved_name, theme_info["desc"]))
     # 동적 후보군 추가 (THEME_MAP에 없는 종목만)
-    for code, info in _dynamic_candidates.items():
+    for code, info in dict(_dynamic_candidates).items():
         if code not in seen:
             resolved_name = _resolve_stock_name(code, info.get("name", ""))
             if is_trade_candidate_name(resolved_name):
@@ -14988,7 +14994,7 @@ def update_news_cooccur(headlines: list):
     for ti in THEME_MAP.values():
         for c, n in ti["stocks"]:
             known[c] = n
-    for c, info in _dynamic_candidates.items():
+    for c, info in dict(_dynamic_candidates).items():
         known[c] = info["name"]
     new_pairs = extract_stock_mentions(headlines, known)
     for code, peers in new_pairs.items():
@@ -15012,7 +15018,7 @@ def get_news_cooccur_peers(code: str) -> list:
     name_map = {}
     for ti in THEME_MAP.values():
         for c, n in ti["stocks"]: name_map[c] = n
-    for c, info in _dynamic_candidates.items():
+    for c, info in dict(_dynamic_candidates).items():
         name_map[c] = info["name"]
     result = sorted(
         [(c, name_map.get(c, c), cnt) for c, cnt in peers_raw.items() if cnt >= 2],
