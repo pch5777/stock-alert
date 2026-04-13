@@ -3,10 +3,48 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163
+버전: v163.2
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.2 (2026-04-13): 진입불가 종목 전면 차단 — 시간대+종목상태 통합 게이트
+  [#1] _dispatch_mid_pullback_signal(): 진입불가 시간대 save_signal_log 제거
+       KRX 마감후·전시장 마감후 시간대에 진입 자체가 불가하므로 결과 추적 학습 데이터도 저장 안 함
+  [#2] _pre_send_upper_block(): ⑥ 종목상태 체크 추가
+       raw_status_code(iscd_stat_cls_code) 기반 진입불가 종목 차단:
+       51=관리종목, 52=투자주의, 53=투자경고, 54=투자위험, 57=단기과열
+       mrkt_alrm_cls_code 기반 추가 차단: 01=투자주의, 02=투자경고, 03=투자위험
+  [#3] get_stock_price() + get_nxt_stock_price(): mrkt_alrm_cls_code 필드 추가 수신
+  [#4] verify.py: '종목상태 차단', 'mrkt_alrm_cls_code' 패턴 검증 추가
+  [#5] SKILL.md verify.py 코드블록 최신화
+  이유: 진입 자체가 불가한 시간대 save_signal_log로 잘못된 학습 데이터 생성;
+       iscd_stat_cls_code 기반 관리종목·투자경고·단기과열 종목이 포착/알람 가능;
+       mrkt_alrm_cls_code 필드 미수신으로 투자주의/경고/위험 상태 감지 불가
+  개선점: 진입불가 시간대 학습 데이터 미생성; 관리종목/투자경고/단기과열 종목 알람 차단;
+          verify.py 패턴으로 차단 로직 삭제 즉시 감지
+  주의점: 투자주의(52/01)는 매수 가능하나 고위험 경고 의미이므로 차단 포함.
+          iscd_stat_cls_code가 항상 수신되지 않을 수 있으므로 빈값이면 통과(보수적).
+          야간 DART/지정학·거래정지 취소 알람(send_with_chart_buttons 직접)은 게이트 미경유.
+  진입불가 게이트 연결: _pre_send_upper_block() ⑥ 종목상태 체크 추가 ✅
+- v163.1 (2026-04-13): 진입불가 시간대 알람+진입감시 동시 차단 — KRX마감후/전시장마감후 영구 차단
+  [#1] _pre_send_upper_block(): ④⑤ 체크 추가
+       ④ KRX 마감(15:30) 후 NXT 시간대 — market!="NXT" + is_nxt_listed()=False 종목 차단
+       ⑤ 전 시장 마감(20:00) 후 — 포착 알람 전면 차단
+  [#2] _dispatch_mid_pullback_signal(): register_entry_watch 호출 전 시간대 체크 추가
+       KRX 마감 후 NXT 시간대 KRX 전용 종목 → save_signal_log만 실행, 진입감시 등록 스킵
+       전 시장 마감 후 → 동일하게 진입감시 등록 스킵
+  [#3] _finalize_general_alert_dispatch(): send_alert 전 _pre_send_upper_block 선차단 확인
+       게이트 차단 시 register_entry_watch도 스킵 → 알람+진입감시 동시 차단 완전 보장
+  [#4] verify.py + SKILL.md verify.py 코드블록 최신화
+  이유: 기존 게이트(_pre_send_upper_block)가 send_alert만 차단하고 register_entry_watch는
+       차단하지 않아 KRX 마감 후에도 진입가 감시가 내부적으로 등록되는 문제.
+       _dispatch_mid_pullback_signal은 register_entry_watch를 send 전에 호출하는 구조.
+  개선점: 알람 차단 시 진입감시 등록도 동시에 차단; 어떤 경로로도 KRX 마감 후 KRX전용
+          종목은 알람+감시 모두 불가; verify.py 패턴으로 삭제 즉시 감지
+  주의점: save_signal_log(내부 기록)는 유지 — 학습/분석 데이터 보존.
+          send_with_chart_buttons 직접 호출(진입가 도달·거래정지 등)은 게이트 미경유.
+          야간 DART/지정학 알람은 포착알람 아니므로 영향 없음.
+  진입불가 게이트 연결: _dispatch_mid_pullback_signal + _finalize_general_alert_dispatch 동시 차단 ✅
 - v163 (2026-04-13): 주도주 4대 판정 엔진 신설 — VI발동순서·테마최초반응·지수버팀회복력 스코어 통합
   [#1] 전역 상태 3개 추가: _sector_first_react_ts / _vi_sector_tracker / _index_dip_snapshots
        — 각각 섹터 최초반응 타임스탬프, VI 발동 순서, 코스피 시계열 스냅샷 추적
@@ -13777,6 +13815,21 @@ def _dispatch_mid_pullback_signal(signal: dict) -> None:
         return
     if _handle_mid_pullback_internal_paths(signal):
         return
+    # v163.1: KRX 마감 후 NXT 시간대·전시장 마감 후 → KRX 전용 종목 진입가 감시 등록 및 알람 차단
+    # v163.2: 진입불가 시간대 — register_entry_watch·send·save_signal_log 전부 스킵
+    # 진입 자체가 불가한 상황이므로 결과 추적 학습 데이터도 저장하지 않음
+    _code = normalize_stock_code(signal.get("code", ""))
+    _krx_open = is_market_open()
+    _nxt_open = is_nxt_open()
+    _is_nxt_sig = str(signal.get("market", "") or "").upper() == "NXT"
+    if not _krx_open and _nxt_open and not _is_nxt_sig and not is_nxt_listed(_code):
+        _record_mid_pullback_alert_state(signal)
+        _log_info_msg(f"  ⏭ KRX 마감·NXT 시간대 KRX 전용 종목 — 진입감시·알람·학습 전부 차단: {signal.get('name', _code)}")
+        return
+    if not _krx_open and not _nxt_open:
+        _record_mid_pullback_alert_state(signal)
+        _log_info_msg(f"  ⏭ 전 시장 마감 후 — 진입감시·알람·학습 전부 차단: {signal.get('name', _code)}")
+        return
     save_signal_log(signal)
     watch_key = register_entry_watch(signal)
     merged_phase1 = _maybe_send_immediate_entry_hit_from_signal(signal, watch_key, merge_capture_phase1=True)
@@ -13850,6 +13903,8 @@ def _pre_send_upper_block(signal: dict) -> str:
       ① 당일 상한가 캐시(_upper_limit_alerted_today) 등록 종목
       ② 실시간 가격 기준 상한가급(change_rate>=29% 또는 price>=upper_price)
       ③ KRX 동시호가(15:20~15:30) + NEAR_UPPER/UPPER_LIMIT 조합 → 진입 불가 시간대
+      ④ KRX 마감(15:30) 후 NXT 시간대 — market!="NXT" 이고 is_nxt_listed()=False인 KRX 전용 종목
+      ⑤ 전 시장 마감(20:00) 후 — 포착 알람 전면 차단
     FZONE_VWAP_BOUNCE·거래정지 취소 등 비포착 알람은 이 게이트를 거치지 않음.
     """
     if not isinstance(signal, dict):
@@ -13858,7 +13913,7 @@ def _pre_send_upper_block(signal: dict) -> str:
     if not code:
         return ""
     sig_type = str(signal.get("signal_type", "") or "").upper()
-    # 비포착 신호(FZONE_VWAP_BOUNCE 등)는 상한가 게이트 제외
+    # 비포착 신호(FZONE_VWAP_BOUNCE 등)는 시간대 게이트 제외
     if sig_type in ("FZONE_VWAP_BOUNCE",):
         return ""
 
@@ -13878,7 +13933,6 @@ def _pre_send_upper_block(signal: dict) -> str:
         or change_rate >= 29.0
     )
     if is_upper_hit:
-        # 상한가급 → 캐시 등록 후 차단
         _upper_limit_alerted_today[code] = today
         _save_upper_limit_alerted_today()
         return f"실시간 상한가급 차단 ({change_rate:.1f}%)"
@@ -13888,6 +13942,39 @@ def _pre_send_upper_block(signal: dict) -> str:
         now_t = _now_kst().time()
         if now_t >= dtime(15, 20):
             return "KRX 동시호가 시간대 NEAR_UPPER/UPPER_LIMIT 진입불가"
+
+    krx_open = is_market_open()
+    nxt_open = is_nxt_open()
+
+    # ④ KRX 마감(15:30) 후 NXT 시간대 — KRX 전용 종목 포착 알람 차단
+    # market 필드가 명시적으로 "NXT"이거나 NXT 상장 종목이면 통과
+    # scan-level NXT 차단이 race condition 등으로 실패해도 이 게이트가 최종 방어
+    if not krx_open and nxt_open:
+        is_nxt_signal = str(signal.get("market", "") or "").upper() == "NXT"
+        if not is_nxt_signal and not is_nxt_listed(code):
+            return "KRX 마감 후 NXT 시간대 KRX 전용 종목 포착 알람 차단"
+
+    # ⑤ 전 시장 마감(20:00) 후 — 포착 알람 전면 차단
+    if not krx_open and not nxt_open:
+        return "전 시장 마감 후 포착 알람 차단"
+
+    # ⑥ 종목상태 차단 — KIS API iscd_stat_cls_code / mrkt_alrm_cls_code 기반
+    # raw_status_code: 51=관리종목, 52=투자주의, 53=투자경고, 54=투자위험, 57=단기과열
+    # mrkt_alrm_cls_code: 01=투자주의, 02=투자경고, 03=투자위험
+    # 빈값이면 알 수 없으므로 통과 (보수적 처리)
+    _raw_stat = str(signal.get("raw_status_code", "") or "").strip()
+    _mrkt_alrm = str(signal.get("mrkt_alrm_cls_code", "") or "").strip()
+    _BLOCKED_STAT_CODES = {"51", "52", "53", "54", "57"}  # 관리/투자주의/경고/위험/단기과열
+    _BLOCKED_ALRM_CODES = {"01", "02", "03"}              # 투자주의/경고/위험
+    if _raw_stat in _BLOCKED_STAT_CODES:
+        _stat_labels = {
+            "51": "관리종목", "52": "투자주의", "53": "투자경고",
+            "54": "투자위험", "57": "단기과열"
+        }
+        return f"종목상태 차단 ({_stat_labels.get(_raw_stat, _raw_stat)})"
+    if _mrkt_alrm in _BLOCKED_ALRM_CODES:
+        _alrm_labels = {"01": "투자주의", "02": "투자경고", "03": "투자위험"}
+        return f"종목상태 차단 ({_alrm_labels.get(_mrkt_alrm, _mrkt_alrm)})"
 
     return ""
 
@@ -13975,7 +14062,7 @@ def get_stock_price(code: str) -> dict:
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
-        "mktcap":    mktcap_raw,       # 억원 단위
+        "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
         "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
                       else "mid" if mktcap_raw >= 1000  # 1000억 이상
                       else "small"),
@@ -14797,6 +14884,7 @@ def get_nxt_stock_price(code: str) -> dict:
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
+        "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
     }
     try:
         _record_execution_snapshot(code, payload, market="NXT")
@@ -27141,6 +27229,12 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     _, _existing_watch_nc = _find_existing_entry_hit_watch(code)
     if _existing_watch_nc is not None and safe_int(_existing_watch_nc.get("notify_count", 0), 0) >= 1:
         s["_allow_existing_entry_hit_header"] = True
+    # v163.1: send_alert 전 게이트 선차단 확인 — 차단 시 register_entry_watch도 스킵
+    _gate_block = _pre_send_upper_block(s)
+    if _gate_block:
+        _log_info_msg(f"  🚫 [게이트 선차단] {name} — {_gate_block} (진입감시 등록 스킵)")
+        save_signal_log(s)
+        return False
     send_alert(s)
     _alert_history[ctx["hist_key"]] = {
         "ts": time.time(),
