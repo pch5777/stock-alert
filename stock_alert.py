@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.5
+버전: v162.7
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162.7 (2026-04-13): 상한가 재포착 근본차단·조기포착 섹터중복면제·거래정지 오발송 수정
+  [#1] _save/_load_upper_limit_alerted_today(): _upper_limit_day_alerted 동기화 추가 —
+       두 캐시 불일치로 재시작 후 상한가 종목 재포착 발생하던 문제 근본 차단
+  [#2] _scan_krx_market_candidates(): get_volume_surge_stocks 루프 진입 전
+       _upper_limit_alerted_today 기준 실시간 하드블록 추가 (상태파일 복원 실패 보험)
+  [#3] filter_portfolio_signals(): 실질섹터 중복제외 시 _sector_leader_follow 플래그 종목은
+       same_sector 카운트 대상에서 제외 → 섹터대장 강제감시 종목이 조기에 알람 도달 가능
+  [#4] _maybe_clear_false_trading_halt(): source 필터 제거 — dispatch_block 등 포함 실시간 해제
+  [#5] _notify_trading_halt_cancel(): 전날 등록 halt 오늘 정상 거래 시 무음 해제
+  [#6] _finalize_general_alert_dispatch(): _allow_existing_entry_hit_header notify_count≥1 조건
+  이유: ①두 캐시 미동기화로 재시작마다 상한가 종목 재알람; ②섹터리더 강제감시 종목이 실질섹터
+       중복제외에 걸려 조기 포착 기회 소실; ③dispatch_block 소스 halt 미해제로 오발송
+  개선점: 상한가 재포착 재시작 후에도 차단; 섹터대장 후속 종목 조기 알람 경로 확보;
+          전날 halt 다음날 무음 해제
+  주의점: #3 면제 조건은 _sector_leader_follow 플래그 종목만, 일반 종목 동작 무변경.
+          _upper_limit_day_alerted·_upper_limit_alerted_today 양쪽 모두 동기화 유지 필요.
+- v162.6 (2026-04-13): 상한가 재포착 방지 강화·거래정지 취소 오발송 수정·1차 진입가 도달 헤더 조건
 - v162.5 (2026-04-13): _dynamic_candidates 순회 중 변경 RuntimeError 수정
   [#1] _dynamic_candidates.items() 직접 순회 3곳 → dict(_dynamic_candidates).items() 스냅샷으로 교체
   이유: WS 스레드(_record_execution_snapshot)가 동시에 _dynamic_candidates 수정 가능 → RuntimeError: dictionary changed size during iteration 발생 (09:47:42 로그 확인)
@@ -9069,16 +9086,23 @@ def _load_yt_exclude_keywords() -> None:
         _swallow_exception(e)
 
 def _save_upper_limit_alerted_today() -> None:
-    """v161.13: upper_limit_reached 당일 차단 목록 상태파일 저장."""
+    """v161.13: upper_limit_reached 당일 차단 목록 상태파일 저장.
+    v162.7: _upper_limit_day_alerted 동기화 추가 — 두 캐시 불일치 방지"""
+    global _upper_limit_day_alerted
     try:
         today = _now_kst().strftime("%Y%m%d")
         clean = {k: v for k, v in (_upper_limit_alerted_today or {}).items() if v == today}
         _write_json_atomic(UPPER_LIMIT_ALERTED_FILE, clean, indent=2)
+        # v162.7: _upper_limit_day_alerted 동기화 — 두 캐시를 항상 일치시킴
+        for code in clean:
+            if code not in _upper_limit_day_alerted:
+                _upper_limit_day_alerted[code] = {"date": today, "alerted": True}
     except Exception as e:
         _swallow_exception(e)
 def _load_upper_limit_alerted_today() -> None:
-    """v161.13: 재시작 시 upper_limit_reached 당일 차단 목록 복원."""
-    global _upper_limit_alerted_today
+    """v161.13: 재시작 시 upper_limit_reached 당일 차단 목록 복원.
+    v162.7: _upper_limit_day_alerted 동기화 추가 — 복원 즉시 두 캐시 일치"""
+    global _upper_limit_alerted_today, _upper_limit_day_alerted
     try:
         today = _now_kst().strftime("%Y%m%d")
         data = _read_json_safe(UPPER_LIMIT_ALERTED_FILE, {})
@@ -9086,6 +9110,10 @@ def _load_upper_limit_alerted_today() -> None:
             _upper_limit_alerted_today = {k: v for k, v in data.items() if v == today}
         else:
             _upper_limit_alerted_today = {}
+        # v162.7: _upper_limit_day_alerted 동기화 — 재시작 후 두 캐시 불일치 방지
+        for code in _upper_limit_alerted_today:
+            if code not in _upper_limit_day_alerted:
+                _upper_limit_day_alerted[code] = {"date": today, "alerted": True}
     except Exception as e:
         _swallow_exception(e)
         _upper_limit_alerted_today = {}
@@ -21674,10 +21702,25 @@ def _get_trading_halt_reason_label(code: str) -> str:
         _swallow_exception(e)
     return _fallback
 def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | None = None) -> None:
-    """v76/v87/v88: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림."""
+    """v76/v87/v88: 거래정지 감지 시 entry_watch 즉시 만료 + 사용자 취소 알림.
+    v162.6: 전날 등록 halt가 오늘 정상 거래 시 무음 해제 — 사용자 알람 없음."""
     code = watch.get("code", "")
     name = _resolve_stock_name(code, watch.get("name", code), cur if isinstance(cur, dict) else None)
     halt_reason = _get_trading_halt_reason_label(code)
+    # v162.6: 전날 등록 halt → 오늘 정상 거래 확인 시 무음 해제 (사용자 알람 없음)
+    _persisted_for_ts = _get_persisted_trading_halt(code)
+    if isinstance(_persisted_for_ts, dict):
+        _halt_ts = float(_persisted_for_ts.get("ts", 0) or 0)
+        if _halt_ts > 0:
+            _today_start = time.mktime(
+                datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timetuple()
+            )
+            if _halt_ts < _today_start:
+                # 전날 등록된 halt — 오늘 정상 거래 중이면 무음 해제만
+                _clear_trading_halt_state(code, resume_title="전날 halt 오늘 정상 거래 확인 — 무음 해제", source="LIVE_MARKET")
+                _clear_dart_halt_cache(code, "전날 halt 오늘 정상 거래 무음 해제")
+                _log_info_msg(f"  ℹ️ {name}({code}) 전날 거래정지 기록 무음 해제 (ts={_halt_ts:.0f})")
+                return
     _mark_trading_halt_state(code, title=halt_reason, name=name, source="entry_watch_cancel")
     if watch.get("halt_cancel_notified"):
         return
@@ -22281,11 +22324,11 @@ def _maybe_clear_false_trading_halt(code: str, persisted: dict | None = None, cu
     if not isinstance(rec, dict) or not rec:
         return False
     source = str(rec.get("source") or "")
-    title = str(rec.get("title") or "")
     if source == "KIS_FLAG":
         return False
-    if not (_is_trade_halt_title(title) or source in ("DART", "DART_CACHE", "run_dart_intraday")):
-        return False
+    # v162.6: source/title 필터 제거 — 실시간 정상 거래 확인 시 KIS_FLAG 제외 전 소스 해제
+    # 기존: DART/DART_CACHE/run_dart_intraday 소스만 해제 → dispatch_block·entry_watch_cancel 소스는
+    #       정상 거래 중에도 해제 안 돼 [포착 취소—거래정지] 오발송 발생
     _clear_trading_halt_state(code, resume_title=reason or "실시간 정상 거래 확인", source="LIVE_MARKET")
     _clear_dart_halt_cache(code, reason or "실시간 정상 거래 확인")
     return True
@@ -26761,7 +26804,11 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         return False
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     # v161.43: 기존 entry_hit watch 존재 시 헤더에 "+ 1차 진입가 도달" 반영 허용
-    s["_allow_existing_entry_hit_header"] = True
+    # v162.6: notify_count>=1 조건 추가 — 사용자가 실제 1차 알람 받은 경우에만 헤더 반영
+    #         1차 알람 미수령(notify_count=0) 상태에서 NEAR_UPPER에 '1차 진입가 도달' 표시 시 혼란
+    _, _existing_watch_nc = _find_existing_entry_hit_watch(code)
+    if _existing_watch_nc is not None and safe_int(_existing_watch_nc.get("notify_count", 0), 0) >= 1:
+        s["_allow_existing_entry_hit_header"] = True
     send_alert(s)
     _alert_history[ctx["hist_key"]] = {
         "ts": time.time(),
@@ -34117,6 +34164,10 @@ def filter_portfolio_signals(alerts: list) -> list:
             peer = sorted_alerts[j]
             if peer["code"] in excluded:
                 continue
+            # v162.7: 섹터대장 강제감시 종목(_sector_leader_follow)은 실질섹터 중복 카운트에서 면제
+            # — 대장 종목이 상한가에 가기 전 후속 종목 조기포착 경로 확보
+            if peer.get("_sector_leader_follow") or peer.get("_force_news_recheck"):
+                continue
             try:
                 rs = calc_real_sector_score(s["code"], peer["code"],
                                             s["name"], peer["name"])
@@ -34623,6 +34674,12 @@ def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
         stock["code"] = code
         _register_sector_leader_follow_seed(stock)
         if code in seen:
+            continue
+        # v162.7: _upper_limit_alerted_today 기준 실시간 하드블록 — 상태파일 복원 실패 보험
+        # get_upper_limit_stocks 루프에서 _upper_limit_day_alerted로 걸리더라도
+        # volume_surge 경로에서 재진입되는 케이스 차단
+        _ul_today = _upper_limit_alerted_today.get(code)
+        if _ul_today and _ul_today == today_date:
             continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
 def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
