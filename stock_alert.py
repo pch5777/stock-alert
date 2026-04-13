@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v162.7
+버전: v162.8
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v162.8 (2026-04-13): _ensure_signal_actionability() 단일 게이트 강화 — 상한가·동시호가 영구 차단
+  [#1] _ensure_signal_actionability(): _pre_send_upper_block() 호출 추가
+       — send_alert() 진입 즉시 ①상한가 캐시 ②실시간 가격 ③KRX 동시호가(15:20+) NEAR_UPPER/UPPER_LIMIT 차단
+  [#2] _pre_send_upper_block() 신규 함수 — 3중 진입불가 게이트 (모든 경로 공통 적용)
+  [#3] verify.py 패턴 검증 추가: '동시호가', '_pre_send_upper_block', '_ensure_signal_actionability'
+  이유: send_alert()는 모든 경로(sector_leader_follow 포함)가 통과하는 유일한 공통 지점.
+       여기에 게이트를 심으면 새 경로가 추가돼도 차단 누락 불가. 우리로 케이스(14:45 상한가 →
+       15:22 알람)처럼 경로 분산으로 인한 상한가 종목 알람 영구 방지.
+  개선점: 버전 변경 시 새 경로 추가해도 _ensure_signal_actionability 제거하지 않는 한 차단 보장;
+          verify.py가 게이트 패턴 부재를 검출해 제출 전 강제 복원
+  주의점: _pre_send_upper_block은 FZONE_VWAP_BOUNCE·거래정지 취소 등 비포착 알람에는 미적용.
+          동시호가 차단은 NEAR_UPPER/UPPER_LIMIT 신호에만 — 눌림목·급등은 정상 발송 유지.
+  진입불가 게이트 연결: _ensure_signal_actionability() → _pre_send_upper_block() 경유 확인 ✅
 - v162.7 (2026-04-13): 상한가 재포착 근본차단·조기포착 섹터중복면제·거래정지 오발송 수정
   [#1] _save/_load_upper_limit_alerted_today(): _upper_limit_day_alerted 동기화 추가 —
        두 캐시 불일치로 재시작 후 상한가 종목 재포착 발생하던 문제 근본 차단
@@ -13633,6 +13646,55 @@ def _build_actionability_issue_lines(signal: dict, reasons: list[str]) -> list[s
         lines.append(f"- {reason}")
     return lines
 
+def _pre_send_upper_block(signal: dict) -> str:
+    """v162.8: send_alert() 진입 직전 단일 게이트 — 모든 경로 공통 적용.
+    반환값: 차단 사유 문자열 (빈 문자열이면 통과)
+    체크 순서:
+      ① 당일 상한가 캐시(_upper_limit_alerted_today) 등록 종목
+      ② 실시간 가격 기준 상한가급(change_rate>=29% 또는 price>=upper_price)
+      ③ KRX 동시호가(15:20~15:30) + NEAR_UPPER/UPPER_LIMIT 조합 → 진입 불가 시간대
+    FZONE_VWAP_BOUNCE·거래정지 취소 등 비포착 알람은 이 게이트를 거치지 않음.
+    """
+    if not isinstance(signal, dict):
+        return ""
+    code = normalize_stock_code(signal.get("code", ""))
+    if not code:
+        return ""
+    sig_type = str(signal.get("signal_type", "") or "").upper()
+    # 비포착 신호(FZONE_VWAP_BOUNCE 등)는 상한가 게이트 제외
+    if sig_type in ("FZONE_VWAP_BOUNCE",):
+        return ""
+
+    # ① 당일 상한가 캐시 체크
+    today = _now_kst().strftime("%Y%m%d")
+    if _upper_limit_alerted_today.get(code) == today:
+        return "upper_limit_reached 당일 재알람 차단"
+
+    # ② 실시간 가격 기준 상한가급 체크
+    change_rate = safe_float(signal.get("change_rate", 0), 0.0)
+    price = safe_int(signal.get("price", 0), 0)
+    upper_price = safe_int(signal.get("upper_price", 0), 0)
+    prdy_sign = str(signal.get("prdy_vrss_sign", "") or "")
+    is_upper_hit = (
+        (upper_price > 0 and price >= upper_price)
+        or prdy_sign == "1"
+        or change_rate >= 29.0
+    )
+    if is_upper_hit:
+        # 상한가급 → 캐시 등록 후 차단
+        _upper_limit_alerted_today[code] = today
+        _save_upper_limit_alerted_today()
+        return f"실시간 상한가급 차단 ({change_rate:.1f}%)"
+
+    # ③ KRX 동시호가 시간대(15:20~15:30) + NEAR_UPPER/UPPER_LIMIT → 진입 불가
+    if sig_type in ("NEAR_UPPER", "UPPER_LIMIT") and is_market_open():
+        now_t = _now_kst().time()
+        if now_t >= dtime(15, 20):
+            return "KRX 동시호가 시간대 NEAR_UPPER/UPPER_LIMIT 진입불가"
+
+    return ""
+
+
 def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
     if not isinstance(signal, dict):
         return False
@@ -13653,6 +13715,11 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
             _send_code_change_request_alert(f"actionability:{code}:{source_label}", _build_actionability_issue_lines(signal, issues), cooldown_min=60)
         except Exception as e:
             _swallow_exception(e)
+        return False
+    # v162.8: 단일 게이트 — 상한가·동시호가 진입불가 체크
+    block_reason = _pre_send_upper_block(signal)
+    if block_reason:
+        _log_info_msg(f"  🚫 [게이트 차단] {signal.get('name', code)} — {block_reason}")
         return False
     return True
 
