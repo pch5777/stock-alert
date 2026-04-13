@@ -3,10 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.2
+버전: v163.3
 날짜: 2026-04-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.3 (2026-04-13): is_nxt_listed() 불안정 근본 해결 — market="NXT" 직접 마킹 방식으로 전환
+  [#1] run_mid_pullback_scan(): nxt_only_window 시 is_nxt_listed() 통과 종목에 market="NXT" 직접 마킹
+       → _pre_send_upper_block·_dispatch_mid_pullback_signal이 market 필드로만 판단
+  [#2] _pre_send_upper_block() ④: is_nxt_listed() 제거, market="NXT" 체크만 유지
+       → is_nxt_listed()가 True를 잘못 반환해도 game="NXT" 없으면 차단
+  [#3] _dispatch_mid_pullback_signal(): is_nxt_listed() 제거, _is_nxt_sig 체크만 유지
+  이유: is_nxt_listed()는 _nxt_unavailable 블랙리스트 부재 시 모든 종목을 NXT 상장으로 간주.
+       _nxt_unavailable에 등록되기 전 KRX 전용 종목이 NXT 시간대 게이트를 통과 → 알람 발송.
+       쏘닉스(088280)·프로이천 등이 17:41, 19:43에 반복 알람된 근본 원인.
+  개선점: market="NXT" 마킹은 run_mid_pullback_scan의 nxt_only_window 필터를 실제로 통과한
+          종목에만 설정 → 게이트는 API 신뢰도 무관하게 signal 필드만 참조
+  주의점: run_mid_pullback_scan 외 경로(sector_leader_follow 등)는 기존 market 필드 그대로 사용.
+          NXT 정상 상장 종목도 mid-pullback 스캔 결과에 market="NXT" 마킹돼야 게이트 통과.
+  진입불가 게이트 연결: is_nxt_listed() 의존성 제거 → market 필드 단일 기준 ✅
 - v163.2 (2026-04-13): 진입불가 종목 전면 차단 — 시간대+종목상태 통합 게이트
   [#1] _dispatch_mid_pullback_signal(): 진입불가 시간대 save_signal_log 제거
        KRX 마감후·전시장 마감후 시간대에 진입 자체가 불가하므로 결과 추적 학습 데이터도 저장 안 함
@@ -13817,14 +13831,14 @@ def _dispatch_mid_pullback_signal(signal: dict) -> None:
         return
     # v163.1: KRX 마감 후 NXT 시간대·전시장 마감 후 → KRX 전용 종목 진입가 감시 등록 및 알람 차단
     # v163.2: 진입불가 시간대 — register_entry_watch·send·save_signal_log 전부 스킵
-    # 진입 자체가 불가한 상황이므로 결과 추적 학습 데이터도 저장하지 않음
+    # v163.3: is_nxt_listed() 제거 — market="NXT" 체크만 사용 (run_mid_pullback_scan에서 마킹)
     _code = normalize_stock_code(signal.get("code", ""))
     _krx_open = is_market_open()
     _nxt_open = is_nxt_open()
     _is_nxt_sig = str(signal.get("market", "") or "").upper() == "NXT"
-    if not _krx_open and _nxt_open and not _is_nxt_sig and not is_nxt_listed(_code):
+    if not _krx_open and _nxt_open and not _is_nxt_sig:
         _record_mid_pullback_alert_state(signal)
-        _log_info_msg(f"  ⏭ KRX 마감·NXT 시간대 KRX 전용 종목 — 진입감시·알람·학습 전부 차단: {signal.get('name', _code)}")
+        _log_info_msg(f"  ⏭ KRX 마감·NXT 시간대 market=NXT 미확인 — 진입감시·알람·학습 전부 차단: {signal.get('name', _code)}")
         return
     if not _krx_open and not _nxt_open:
         _record_mid_pullback_alert_state(signal)
@@ -13859,6 +13873,7 @@ def run_mid_pullback_scan():
         signals = []
         for code, name, theme_desc in get_all_scan_candidates():
             # v161.45: NXT 전용 시간대에 KRX 미상장 종목 스캔 제외
+            # v163.3: is_nxt_listed() 불안정 → nxt_only_window 필터 통과 종목에 market="NXT" 직접 마킹
             if nxt_only_window and not is_nxt_listed(code):
                 _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(눌림목): {name} ({code})")
                 continue
@@ -13867,6 +13882,10 @@ def run_mid_pullback_scan():
                 continue
             result = _build_mid_pullback_scan_result(code, name, theme_desc)
             if result:
+                # v163.3: nxt_only_window 필터 통과 = NXT 상장 종목으로 확정 → market="NXT" 마킹
+                # 이후 _pre_send_upper_block·_dispatch_mid_pullback_signal이 market 필드만 참조
+                if nxt_only_window:
+                    result["market"] = "NXT"
                 signals.append(result)
         if not signals:
             _log_info_msg("  → 눌림목 조건 충족 종목 없음")
@@ -13947,12 +13966,12 @@ def _pre_send_upper_block(signal: dict) -> str:
     nxt_open = is_nxt_open()
 
     # ④ KRX 마감(15:30) 후 NXT 시간대 — KRX 전용 종목 포착 알람 차단
-    # market 필드가 명시적으로 "NXT"이거나 NXT 상장 종목이면 통과
-    # scan-level NXT 차단이 race condition 등으로 실패해도 이 게이트가 최종 방어
+    # v163.3: is_nxt_listed() 제거 — 불안정(블랙리스트 부재 시 모든 종목 NXT 상장으로 간주)
+    # market="NXT"가 명시된 경우만 통과 — run_mid_pullback_scan에서 NXT 필터 통과 시 마킹됨
     if not krx_open and nxt_open:
         is_nxt_signal = str(signal.get("market", "") or "").upper() == "NXT"
-        if not is_nxt_signal and not is_nxt_listed(code):
-            return "KRX 마감 후 NXT 시간대 KRX 전용 종목 포착 알람 차단"
+        if not is_nxt_signal:
+            return "KRX 마감 후 NXT 시간대 — market=NXT 미확인 종목 포착 알람 차단"
 
     # ⑤ 전 시장 마감(20:00) 후 — 포착 알람 전면 차단
     if not krx_open and not nxt_open:
