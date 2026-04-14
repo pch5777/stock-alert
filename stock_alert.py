@@ -3,10 +3,42 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.3
-날짜: 2026-04-13
+버전: v163.4
+날짜: 2026-04-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.4 (2026-04-14): F구간 활용 확장 — 무재료 급등 종목 자동 추적 + 재료 확인 시 후속 알람
+  [#1] analyze() F구간 마킹 조건 절충 확장
+       기존 v162.3: 거래대금비율 8배↑ AND 등락률 +10%↑ (너무 엄격 → 신규상장·재부각 누락)
+       변경: SURGE/EARLY_DETECT + 등락률 +7%↑ + 거래대금비율 3배↑ (MID_PULLBACK 제외)
+       MID_PULLBACK 제외 이유: 눌림목은 이미 F구간 통과 후 눌리는 것 → 재마킹 무의미
+       KRX/NXT 구분 없이 전체 시장 적용
+  [#2] _mark_f_zone() 필드 추가
+       no_material_alert_sent: 최초 마킹 시 재료 없음 여부 기록
+       material_confirmed_pending: 재료 확인 시 True → 후속 알람 트리거
+  [#3] _get_fzone_no_material_codes() 신규 추가
+       당일 F구간 마킹 중 has_material=False 종목 목록 반환
+       run_material_first_scan()에서 우선 검색 대상으로 활용
+  [#4] _check_fzone_material_confirmed_and_alert() 신규 추가
+       material_confirmed_pending=True 종목에 "⚡ [재료 확인됨]" 후속 알람 발송
+       발송 후 pending 플래그 해제 + f_zone_state.json 즉시 저장
+  [#5] run_material_first_scan() 확장
+       F구간 무재료 종목 목록 추출 → 헤드라인 매칭으로 재료 확인 여부 판단
+       재료 확인 시 _mark_f_zone(has_material=True) → material_confirmed_pending=True
+       → _check_fzone_material_confirmed_and_alert() 호출 → 후속 알람 발송
+  [#6] refresh_dynamic_candidates() F구간 이력 종목 자동 편입
+       당일 + 최근 3거래일 F구간 마킹 종목을 동적 후보군에 자동 추가
+       재료있음/추적중 구분 desc 태그로 운영 가시성 확보
+  이유: NXT+KRX 모두에서 재료 없는 급등 종목이 포착되지만 재료 탐색 성공 여부가
+        로그에 표시되지 않아 추적 불가. F구간 무재료 마킹 → 재료 확인 후 알람까지
+        전체 파이프라인 완성.
+  개선점: 재료 없이 포착된 종목의 재료 확인 속도가 텔레그램으로 직접 확인 가능해짐.
+          급등 이력 종목의 재부각 시 사전 watchlist 보유로 알람 품질 향상.
+  주의점: 헤드라인 매칭은 종목명 기준이므로 약칭/영문명 종목은 누락 가능.
+          _check_fzone_material_confirmed_and_alert()는 장중/장외 모두 호출되므로
+          발송 쿨다운 없음 — material_confirmed_pending 플래그가 1회 발송 보장.
+  진입불가 게이트 연결: 후속 알람은 send_with_chart_buttons() 직접 호출
+                        (진입 권유 아닌 재료 확인 알림이므로 _pre_send_upper_block 미경유 ✅)
 - v163.3 (2026-04-13): is_nxt_listed() 불안정 근본 해결 — market="NXT" 직접 마킹 방식으로 전환
   [#1] run_mid_pullback_scan(): nxt_only_window 시 is_nxt_listed() 통과 종목에 market="NXT" 직접 마킹
        → _pre_send_upper_block·_dispatch_mid_pullback_signal이 market 필드로만 판단
@@ -4293,25 +4325,35 @@ def _load_f_zone_codes() -> None:
         _swallow_exception(e)
 
 def _mark_f_zone(code: str, has_material: bool = False) -> None:
-    """F구간 종목으로 마킹. has_material=True이면 재료 있음으로 기록 (페널티 면제 대상)."""
+    """F구간 종목으로 마킹. has_material=True이면 재료 있음으로 기록 (페널티 면제 대상).
+    v163.4: no_material_alert_sent 플래그 추가
+      - 최초 마킹 시 has_material=False → no_material_alert_sent=False 세팅
+      - 이후 재료-first 스캔에서 재료 발견 시 has_material=True 업데이트 + 후속 알람 트리거
+    """
     global _f_zone_codes
     code = normalize_stock_code(code)
     if not code:
         return
     today_str = _now_kst().strftime("%Y%m%d")
     existing = _f_zone_codes.get(code, {})
-    # 이미 오늘 마킹된 경우 has_material만 업데이트
+    # 이미 오늘 마킹된 경우 has_material만 업데이트 (재료 새로 확인된 경우)
     if existing.get("date") == today_str:
         if has_material and not existing.get("has_material"):
             _f_zone_codes[code]["has_material"] = True
-            _save_f_zone_codes()  # v162.3: 재료 확인 시 즉시 저장
+            # v163.4: 재료 새로 확인 → 후속 알람 트리거 플래그 세팅
+            _f_zone_codes[code]["material_confirmed_pending"] = True
+            _save_f_zone_codes()
+            _log_info_msg(f"[F구간] {code} 재료 확인 → 후속 알람 트리거 예약")
         return
     _f_zone_codes[code] = {
         "date": today_str,
         "has_material": has_material,
+        # v163.4: 무재료 포착 시 재료-first 스캔 우선 대상 플래그
+        "no_material_alert_sent": not has_material,
+        "material_confirmed_pending": False,
     }
-    _save_f_zone_codes()  # v162.3: 마킹 즉시 파일에 영속화
-    print(f"[F구간] {code} 마킹 — date={today_str} has_material={has_material}")
+    _save_f_zone_codes()
+    _log_info_msg(f"[F구간] {code} 마킹 — date={today_str} has_material={has_material}")
 
 def _is_f_zone_penalty(code: str, has_new_material: bool = False) -> tuple[bool, str]:
     """선진입 스코어링 시 F구간 페널티 적용 여부 반환.
@@ -4336,6 +4378,64 @@ def _is_f_zone_penalty(code: str, has_new_material: bool = False) -> tuple[bool,
         return False, ""
     reason = f"🚨 F구간 소진 종목 -15 (D+{elapsed}, {mark_date})"
     return True, reason
+
+
+def _get_fzone_no_material_codes() -> list[str]:
+    """v163.4: F구간 마킹 중 재료 미확인(has_material=False) 종목 코드 목록 반환.
+    재료-first 스캔에서 이 종목들을 우선 뉴스/DART 검색 대상으로 활용.
+    """
+    today_str = _now_kst().strftime("%Y%m%d")
+    result = []
+    for code, info in dict(_f_zone_codes).items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("date") != today_str:
+            continue
+        if not info.get("has_material", False):
+            result.append(code)
+    return result
+
+
+def _check_fzone_material_confirmed_and_alert() -> None:
+    """v163.4: F구간 재료 확인 대기(material_confirmed_pending=True) 종목에 후속 알람 발송.
+    run_material_first_scan() 내 또는 재료 발견 즉시 호출.
+    흐름: F존 무재료 마킹 → 재료-first 스캔에서 뉴스/DART 확인
+          → _mark_f_zone(code, has_material=True) → material_confirmed_pending=True
+          → 이 함수가 후속 알람 발송 → pending 플래그 해제
+    """
+    if not _f_zone_codes:
+        return
+    today_str = _now_kst().strftime("%Y%m%d")
+    for code, info in dict(_f_zone_codes).items():
+        try:
+            if not isinstance(info, dict):
+                continue
+            if info.get("date") != today_str:
+                continue
+            if not info.get("material_confirmed_pending", False):
+                continue
+            # 후속 알람 발송
+            name = _resolve_stock_name(code, code)
+            cur = get_stock_price(code)
+            if not cur:
+                continue
+            price = safe_int(cur.get("price", 0), 0)
+            chg = float(cur.get("change_rate", 0.0) or 0.0)
+            chg_str = f"+{chg:.1f}%" if chg >= 0 else f"{chg:.1f}%"
+            chart_url = f"https://m.stock.naver.com/domestic/stock/{code}/total"
+            msg = (
+                f"⚡ [재료 확인됨] {name} ({code})\n"
+                f"현재 {price:,}원 {chg_str}\n"
+                f"F구간 포착 후 재료가 확인되었습니다.\n"
+                f"📊 차트: {chart_url}"
+            )
+            send_with_chart_buttons(msg, code, name)
+            _log_info_msg(f"[F구간] {name}({code}) 재료 확인 후속 알람 발송 완료")
+            # pending 플래그 해제
+            _f_zone_codes[code]["material_confirmed_pending"] = False
+            _save_f_zone_codes()
+        except Exception as e:
+            _swallow_exception(e)
 
 def _get_recent_avg_trade_amount(code: str, days: int | None = None) -> int:
     code = normalize_stock_code(code)
@@ -13339,6 +13439,25 @@ def refresh_dynamic_candidates(force_rank: bool = False):
             _put_candidate(item, item.get("desc", "theme_feedback"))
         for item in _collect_nxt_postmarket_candidates(existing_codes=candidates.keys()):
             _put_candidate(item, item.get("desc", "NXT장후리더"))
+
+        # v163.4: F구간 마킹 종목 자동 편입 (당일 + 최근 3거래일 이내)
+        # 급등 후 재부각 가능성 있는 종목을 watchlist에 유지
+        try:
+            today_str = _now_kst().strftime("%Y%m%d")
+            _fz_added = 0
+            for _fz_code, _fz_info in dict(_f_zone_codes).items():
+                if not isinstance(_fz_info, dict):
+                    continue
+                _fz_name = _resolve_stock_name(_fz_code, _fz_code)
+                _fz_mat = _fz_info.get("has_material", False)
+                _fz_desc = "F구간이력(재료있음)" if _fz_mat else "F구간이력(재료추적중)"
+                _put_candidate({"code": _fz_code, "name": _fz_name}, _fz_desc)
+                _fz_added += 1
+            if _fz_added > 0:
+                _log_info_msg(f"  📌 F구간 이력 자동편입: {_fz_added}종목")
+        except Exception as _fz_e:
+            _swallow_exception(_fz_e)
+
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": info["name"], "desc": info["desc"], "added_ts": time.time()}
@@ -25279,13 +25398,18 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
     except Exception as _e:
         _swallow_exception(_e)
 
-    # v162.3: F구간 마킹 — 거래대금비율 8배↑ AND 등락률 +10%↑ 동시 충족 시
-    # 마킹된 종목은 이후 3 거래일간 선진입(PRECLOSE_GAP_ENTRY) 스코어 -15점
-    # 재료 확인 시 has_material=True → 페널티 면제
+    # v163.4: F구간 마킹 — SURGE/EARLY_DETECT + 등락률 +7%↑ + 거래대금비율 3배↑
+    # MID_PULLBACK 제외: 눌림목은 이미 F구간 통과 후 눌리는 것이므로 재마킹 무의미
+    # 조건 근거: "의미있는 급등"(7%↑) + "거래대금 폭발 동반"(3배↑) 동시 충족 종목만
+    #   - 기존 v162.3 (8배+10%): 너무 엄격 → 신규상장·재부각 종목 누락
+    #   - 이전 패치 (5%↑만): 너무 완화 → F구간 의미 희석
+    #   - 현재 절충 (7%↑+3배): 진짜 급등 피날레급만 마킹
+    # 마킹 후: 선진입 -15점 페널티 + 재료-first 스캔 우선 추적 + 재료 확인 시 후속 알람
     try:
-        _fz_vol_ratio = float(ctx.get("vol_ratio", 0.0) or 0.0)
         _fz_chg = float(ctx.get("change_rate", 0.0) or 0.0)
+        _fz_vol = float(ctx.get("vol_ratio", 0.0) or 0.0)
         _fz_code = str(ctx.get("code", "") or "")
+        _fz_sig_type = str(signal_type or "")
         _fz_has_material = bool(
             direct_news_hit
             or emergent_theme_hit
@@ -25293,7 +25417,8 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
             or bool(ctx.get("theme_drive_hit"))
             or bool(ctx.get("force_external_capture_alert"))
         )
-        if _fz_vol_ratio >= 8.0 and _fz_chg >= 10.0 and _fz_code:
+        _fz_is_surge = _fz_sig_type in ("SURGE", "EARLY_DETECT")
+        if _fz_is_surge and _fz_chg >= 7.0 and _fz_vol >= 3.0 and _fz_code:
             _mark_f_zone(_fz_code, has_material=_fz_has_material)
     except Exception as _e:
         _swallow_exception(_e)
@@ -29832,6 +29957,36 @@ def run_material_first_scan() -> None:
         if not headlines:
             return
         threading.Thread(target=update_news_cooccur, args=(headlines,), daemon=True).start()
+
+        # v163.4: F구간 무재료 종목 우선 뉴스 검색
+        # F존에 마킹됐지만 재료가 없는 종목들을 헤드라인과 대조하여 재료 확인 시 마킹 업데이트
+        try:
+            _fz_no_mat = _get_fzone_no_material_codes()
+            if _fz_no_mat:
+                _log_info_msg(f"  🔍 F구간 무재료 종목 재료 추적 중: {len(_fz_no_mat)}종목")
+                _headlines_lower = [h.lower() for h in headlines]
+                for _fz_code in _fz_no_mat:
+                    _fz_name = _resolve_stock_name(_fz_code, _fz_code)
+                    _fz_name_lower = _fz_name.lower()
+                    # 종목명 또는 코드가 헤드라인에 포함되면 재료 확인으로 간주
+                    _hit = any(
+                        _fz_name_lower in h or _fz_code in h
+                        for h in _headlines_lower
+                    )
+                    if _hit:
+                        _log_info_msg(f"  ✅ F구간 재료 확인: {_fz_name}({_fz_code}) — 헤드라인 매칭")
+                        _mark_f_zone(_fz_code, has_material=True)
+                    else:
+                        _log_info_msg(f"  ⏳ F구간 재료 미확인: {_fz_name}({_fz_code})")
+        except Exception as _fz_e:
+            _swallow_exception(_fz_e)
+
+        # v163.4: F구간 재료 확인 후속 알람 처리 (material_confirmed_pending 종목)
+        try:
+            _check_fzone_material_confirmed_and_alert()
+        except Exception as _fa_e:
+            _swallow_exception(_fa_e)
+
         if live_market:
             for signal in analyze_news_theme(headlines=headlines):
                 send_news_theme_alert(signal)
