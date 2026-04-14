@@ -7,30 +7,55 @@
 날짜: 2026-04-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v163.6 (2026-04-14): no_ask_liquidity 과도 차단 긴급 패치
-  [#1] _detect_entry_block_reason() 주석 보강
-       급등 중(+5%↑) ask_qty=0은 매수소화 강세 신호임을 명시
-       bid_qty=0 동시 + change_rate<5%일 때만 완전 유동성 부재로 처리
-       실제 차단 판단은 soft allow 함수로 위임하는 구조 명확화
-  [#2] _should_soft_allow_no_ask_liquidity_general() 완화
-       기존: exec_score≥45 AND flow_state 비둔화 → WebSocket 스냅샷 불안정 시 전량 차단
-       변경: A급 + score≥72 + change_rate≥5% → exec_score 무관 즉시 soft allow 통과
-       이유: v163.5 이후에도 알에프텍·아이티엠반도체·티엠씨·서울반도체 등 A급 전량
-             no_ask_liquidity 차단 지속 — exec_score 의존이 근본 원인
-       개선점: 급등 중 A급 종목 알람 복원, KRX·NXT 모두 적용
-  [#3] _should_soft_allow_no_ask_liquidity() entry_watch 확장
-       기존: MID_PULLBACK 전용 soft allow
-       변경: A급 + score≥72 + change_rate≥5% 이면 신호 타입 무관 통과
-       이유: entry_watch 추적 중 종목도 no_ask로 계속 차단되던 문제
-  [#4] _record_entry_blocked() no_ask 쿨다운 30초 → 300초
-       no_ask_liquidity 반복 차단 기록이 매 스캔마다 로그 수천 줄 오염
-       300초(5분) 쿨다운으로 로그 가독성 복원, 실제 차단 동작은 유지
-  이유: 로그 분석 결과 알에프텍·티엠씨·삼화콘덴서·서울반도체·엑스게이트·
-        LS ELECTRIC 등 실제 거래 중인 A급 종목이 no_ask로 전량 차단
-        (10:14 스캔 기준 20+종목 반복 차단)
-  개선점: 급등 중 A급 종목 즉시 알람, 블랙리스트 반복 로그 억제
-  주의점: 상한가(29%↑)/limit_up_locked 차단은 유지 — soft allow 미적용
-  진입불가 게이트 연결: _should_soft_allow_no_ask_liquidity_general → soft allow 통과 ✅
+- v163.6 (2026-04-14): 스케줄러 중복·루프 버그·포착 누락 8개 항목 일괄 패치
+  [#1] _leader_job() 재진입 방지 — 동일 함수 동시 2회 실행 차단
+       _leader_job_running dict + _leader_job_lock 추가
+       이유: 4/13 하루에만 81개 시간대 YT 수집이 2~4회 동시 호출 → Gemini API 쿼터 2배 소모 →
+             429 에러 17회·503 에러 10회 → 아주IB투자·미래에셋벤처투자·빛과전자·엑스게이트 등
+             주요 종목 스캔 풀 미포함 → 조기 포착 완전 실패
+       개선점: 동일 함수 중복 실행 원천 차단으로 API 쿼터 절반 절감
+       주의점: lambda 함수는 fn_key가 "<lambda>"로 통일되므로 람다 중복 실행도 차단됨
+  [#2] _queue_run_scan_repair(): missing_signal_type 단독 결측 큐 등록 차단 + 큐 크기 80개 제한
+       이유: 4/14 하루 1,519건 발생 — v161.19는 NXT전용시간대 KRX종목만 차단했으나
+             장중(KRX+NXT 동시) 구간은 미차단. 동일 종목이 같은 분 안에 2회씩 반복
+       개선점: 장중 포함 전 시간대 missing_signal_type 단독 루프 완전 차단
+       주의점: missing_signal_type + 다른 결측(missing_price 등) 복합은 기존대로 큐 등록
+  [#3] _ws_unsubscribe(): 구독해제 실패 3회 초과 시 조용히 목록에서 제거
+       _ws_unsubscribe_fail_count dict 추가
+       이유: 남선알미늄(008350) 거래정지 취소 후 Broken pipe 에러 152회 무한 반복
+       개선점: 3회 이내 경고 후 자동 포기 → 로그 스팸 완전 차단
+       주의점: 3회 초과 시 구독 목록에서 강제 제거 — 실제 구독 해제 실패해도 내부 상태는 정리됨
+  [#4] Gemini grounding 캐시 파일 영속화 — GEMINI_GROUNDING_CACHE_FILE 추가
+       _save_gemini_grounding_cache() / _load_gemini_grounding_cache() 신규
+       성공 시 저장, 실패 시 파일에서 rows 복원, main 양쪽 경로에 로드 호출 추가
+       이유: Gemini 429/503 실패 시 메모리 캐시가 비어 스캔 풀 종목 누락 → 주요 종목 포착 실패
+       개선점: 재시작 또는 API 실패 후에도 이전 성공 재료로 스캔 풀 유지
+       주의점: 캐시 TTL은 기존 GEMINI_GROUNDING_CACHE_TTL_SEC 그대로 적용
+  [#5] _register_prev_upper_limit_prewatch(): 전날 상한가 종목 07:30 자동 prewatch 등록
+       _send_preopen_watchlist_once() 내에서 호출
+       이유: 빛과전자·엑스게이트 등 전날 상한가 종목이 4/14 당일 로그 자체가 없음
+             → 재료 수집 실패와 무관하게 가격 감시조차 안 됨
+       개선점: 전날 상한가 이력 종목은 재료 수집 실패와 무관하게 당일 prewatch 보장
+       주의점: UPPER_LIMIT_ALERTED_FILE 기준 전날 날짜 종목만 등록 (당일 중복 등록 방지)
+  [#6] NXT SURGE 동일 종목 텔레그램 2시간 쿨다운
+       _finalize_general_alert_dispatch() 내 nxt_surge_cd:{code} 키로 관리
+       이유: 에스투더블유 4/14 하루 7회 A급 포착·발송 — NXT 지속 급등 종목 중복 발송
+       개선점: 2시간 쿨다운으로 텔레그램 발송 억제, 진입가 갱신(register_entry_watch)은 유지
+       주의점: _entry_hit_alert(진입가 도달) 플래그 있으면 쿨다운 예외 — 진입 알람은 항상 발송
+  [#7] _looks_like_placeholder_stock_name(): latin-1 깨진 종목명 감지 추가
+       깨진 문자(0xC0~0xFF) 2개 이상이면 placeholder 처리 → _resolve_stock_name 재조회
+       이유: 종목코드 368770 종목명이 'óáâä¿—úêñö'로 깨져 로그 64건 + 텔레그램 오출력
+       개선점: 깨진 이름 자동 감지 후 API 재조회로 정상 종목명 복원
+       주의점: 단순 외래어 종목명(알파벳 포함)은 해당 범위 미포함이므로 오탐 없음
+  [#8] 이론적 추적완료 로그 환경변수 조건부 출력
+       STOCK_ALERT_DEBUG_TRACKING 환경변수 설정 시에만 출력
+       이유: 재시작 직후 29건 일괄 출력 + 하루 종일 반복으로 Railway 로그 폭증
+       개선점: 기본값 비활성화로 로그 노이즈 제거, 디버깅 필요 시 환경변수로 활성화
+       주의점: Railway 환경변수에 STOCK_ALERT_DEBUG_TRACKING=1 추가 시 기존처럼 출력
+  이유: 4/13 Gemini 쿼터 소진으로 주요 상한가 종목 전체 미포착 + 루프 버그로 Railway 로그 한도 위협
+  개선점: YT 중복 실행 차단으로 API 쿼터 절감 + 전날 상한가 자동 prewatch로 포착 안전망 추가
+  주의점: NXT SURGE 쿨다운으로 에스투더블유류 알람 빈도 줄어듦 — 진입가 갱신은 계속 작동
+  진입불가 게이트 연결: _finalize_general_alert_dispatch() NXT 쿨다운 후 register_entry_watch 경유 ✅
 - v163.5 (2026-04-14): 정규장 포착 전무 3중 버그 긴급 패치
   [#1] get_stock_info NameError 수만 번 발생 → get_stock_price 폴백 수정
        위치①: _record_execution_snapshot() VI 발동 감지 로직
@@ -3211,6 +3236,9 @@ def _enforce_runtime_version_lock(notify: bool = True) -> bool:
         _log_warn_msg(f"⚠️ 운영 버전 잠금 확인 실패: {e}")
         return True
 
+_leader_job_running: dict = {}  # v163.6: 동일 함수 동시 실행 방지
+_leader_job_lock = threading.Lock()
+
 def _leader_job(fn):
     def _wrapped(*args, **kwargs):
         if _runtime_version_blocked:
@@ -3220,9 +3248,19 @@ def _leader_job(fn):
             return None
         if not _enforce_runtime_version_lock(notify=False):
             return None
-        if not was_leader:
-            _send_startup_banner_once()
-        return fn(*args, **kwargs)
+        # v163.6: 동일 함수 중복 실행 방지 (YT 스케줄러 2중 호출 차단)
+        fn_key = getattr(fn, "__name__", str(fn))
+        with _leader_job_lock:
+            if _leader_job_running.get(fn_key):
+                return None
+            _leader_job_running[fn_key] = True
+        try:
+            if not was_leader:
+                _send_startup_banner_once()
+            return fn(*args, **kwargs)
+        finally:
+            with _leader_job_lock:
+                _leader_job_running.pop(fn_key, None)
     return _wrapped
 def _ensure_dir(path: str):
     try:
@@ -6433,6 +6471,7 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         # 전용 카운터 증가 (YouTube 분석 카운터와 분리)
         _gemini_grounding_daily_counter["count"] = _gemini_grounding_daily_counter.get("count", 0) + 1
         _gemini_grounding_cache = {"ts": now, "rows": rows}
+        _save_gemini_grounding_cache()  # v163.6: 성공 시 파일 저장
         print(f"[Gemini] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_gemini_grounding_daily_counter['count']}/{GEMINI_GROUNDING_DAILY_LIMIT}회)")
         return rows
     except Exception as e:
@@ -6441,6 +6480,9 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
             f"⚠️ Gemini grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
             cooldown_sec=3600.0,  # v161.40: 300→3600초
         )
+        # v163.6: 실패 시 파일 캐시에서 rows 복원 — API 오류로 스캔 풀 빈 상태 방지
+        if not _gemini_grounding_cache.get("rows"):
+            _load_gemini_grounding_cache()
         # v161.40: 실패해도 캐시 ts 갱신 → TTL 동안 재시도 차단 (429 루프 방지)
         _gemini_grounding_cache["ts"] = now
         return list(_gemini_grounding_cache.get("rows", []))
@@ -6950,6 +6992,24 @@ _youtube_gemini_analyzed_cache: dict = {}
 _youtube_gemini_daily_counter: dict = {"date": "", "count": 0}  # 하루 호출 카운터
 _youtube_fetch_daily: dict = {"date": "", "count": 0}  # v161.37: YouTube API 하루 fetch 횟수 제한용
 _gemini_grounding_cache: dict = {"ts": 0.0, "rows": []}  # v161.37: Gemini grounding 결과 캐시
+GEMINI_GROUNDING_CACHE_FILE = _state_path("gemini_grounding_cache.json")  # v163.6: 재시작/실패 복원용
+
+def _save_gemini_grounding_cache() -> None:
+    """v163.6: grounding 재료 캐시를 파일로 영속화 — 재시작 또는 API 실패 시 복원용."""
+    try:
+        _write_json_atomic(GEMINI_GROUNDING_CACHE_FILE, _gemini_grounding_cache, indent=2)
+    except Exception:
+        pass
+
+def _load_gemini_grounding_cache() -> None:
+    """v163.6: 시작 시 grounding 캐시 복원."""
+    global _gemini_grounding_cache
+    try:
+        data = _read_json_safe(GEMINI_GROUNDING_CACHE_FILE, {})
+        if isinstance(data, dict) and data.get("rows"):
+            _gemini_grounding_cache = data
+    except Exception:
+        pass
 _gemini_grounding_daily_counter: dict = {"date": "", "count": 0}  # v161.38: grounding 전용 일별 카운터
 _material_downside_cache: dict = {}
 _material_block_runtime: dict = {
@@ -9999,6 +10059,8 @@ def _ws_subscribe(ws, code: str) -> bool:
         return False
 
 
+_ws_unsubscribe_fail_count: dict = {}  # v163.6: 구독해제 실패 횟수 추적
+
 def _ws_unsubscribe(ws, code: str) -> bool:
     """종목 체결가 구독 해제."""
     try:
@@ -10006,9 +10068,19 @@ def _ws_unsubscribe(ws, code: str) -> bool:
         ws.send(msg)
         with _ws_lock:
             _ws_subscribed_codes.pop(code, None)
+            _ws_unsubscribe_fail_count.pop(code, None)
         return True
     except Exception as e:
-        _log_warn_msg(f"⚠️ WebSocket 구독해제 실패 [{code}]: {e}")
+        # v163.6: 실패 횟수 카운트 — 3회 초과 시 경고 없이 구독 목록에서 강제 제거
+        with _ws_lock:
+            fail_cnt = _ws_unsubscribe_fail_count.get(code, 0) + 1
+            _ws_unsubscribe_fail_count[code] = fail_cnt
+            if fail_cnt <= 3:
+                _log_warn_msg(f"⚠️ WebSocket 구독해제 실패 [{code}]: {e}")
+            else:
+                # 3회 초과: 조용히 목록에서 제거하고 포기
+                _ws_subscribed_codes.pop(code, None)
+                _ws_unsubscribe_fail_count.pop(code, None)
         return False
 
 
@@ -13222,6 +13294,10 @@ def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
     if code and compact == code:
         return True
     if compact.isdigit() and len(compact) >= 5:
+        return True
+    # v163.6: 인코딩 깨진 종목명 감지 — latin-1 대체 문자(ó á â ä 등) 포함 시 placeholder 처리
+    broken_chars = sum(1 for c in nm if ord(c) in range(0xC0, 0x100))
+    if broken_chars >= 2:
         return True
     return False
 
@@ -18040,27 +18116,15 @@ def _get_dynamic_entry_reach_slack_pct(watch: dict | None = None) -> float:
         return 0.006
     return 0.0
 def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
-    """entry_watch 진입 시 no_ask_liquidity soft allow 판단.
-    v163.6: SURGE/EARLY_DETECT A급도 soft allow 대상으로 확장
-    - 기존: MID_PULLBACK 전용
-    - 변경: A급 + score≥72 + change_rate≥5% 이면 신호 타입 무관 통과
-    """
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
+    if sig_type != "MID_PULLBACK":
+        return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
         return False
     if bid_qty > 0 and float(cur.get("change_rate", 0.0) or 0.0) >= 29.0:
-        return False
-    # v163.6: A급 SURGE/EARLY_DETECT도 soft allow 확장
-    grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
-    score = int(signal.get("score", 0) or 0)
-    change_rate = float(cur.get("change_rate", 0.0) or signal.get("change_rate", 0.0) or 0.0)
-    if grade == "A" and score >= 72 and change_rate >= 5.0:
-        return True
-    # 기존 MID_PULLBACK 조건 유지
-    if sig_type != "MID_PULLBACK":
         return False
     if signal.get("entry_soft_block_allowed"):
         return True
@@ -18068,7 +18132,7 @@ def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -
         return True
     if signal.get("direct_news_theme"):
         return True
-    return score >= MID_SOFT_ALLOW_MIN_SCORE
+    return int(signal.get("score", 0) or 0) >= MID_SOFT_ALLOW_MIN_SCORE
 def _enrich_mid_pullback_direct_news(signal: dict | None) -> dict:
     signal = signal if isinstance(signal, dict) else {}
     if str(signal.get("signal_type") or "") != "MID_PULLBACK":
@@ -19337,7 +19401,8 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
         if _dup_key not in _tracking_notified:
             _tracking_notified.add(_dup_key)
             _send_tracking_result(rec, log_key=log_key)
-            _log_info_msg(f"  📊 추적 완료: {rec['name']} {net_pnl_pct:+.1f}% ({exit_reason}) [이론]")
+            if os.getenv("STOCK_ALERT_DEBUG_TRACKING"):
+                _log_info_msg(f"  📊 추적 완료: {rec['name']} {net_pnl_pct:+.1f}% ({exit_reason}) [이론]")
         else:
             _log_info_msg(f"  📊 추적 완료(중복생략): {rec['name']} {net_pnl_pct:+.1f}%")
     global _consecutive_loss_count, _consecutive_win_count
@@ -22016,13 +22081,11 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
                 break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        # v161.3 #9: 종목별 쿨다운으로 중복 경고 억제
-        # v163.6: no_ask_liquidity는 5분(300s)으로 늘림 — 반복 차단 로그 오염 방지
+        # v161.3 #9: 종목별 30초 쿨다운으로 중복 경고 억제
         blocked_code = str(watch.get("code") or "")
         _cooldown_key = f"{blocked_code}_{reason}"
         _now_ts = time.time()
-        _cooldown_sec = 300 if reason == "no_ask_liquidity" else 30
-        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= _cooldown_sec:
+        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= 30:
             _entry_blocked_log_cooldown[_cooldown_key] = _now_ts
             _log_warn_msg(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
     except Exception as e:
@@ -22712,10 +22775,7 @@ def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
             calc_rate = 0.0
     return calc_rate if abs(calc_rate) > abs(api_rate) else api_rate
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
-    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별.
-    v163.6: 급등 중 ask_qty=0은 매수세가 매도물량을 전부 소화한 강세 신호로 판단
-    → change_rate >= 5% 이상이면 no_ask_liquidity 차단 완화 (soft allow로 넘김)
-    """
+    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
     change_rate = _get_effective_change_rate(cur, price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
@@ -22735,11 +22795,6 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     if fake_breakout.get("block"):
         return "fake_breakout_risk"
     if ask_qty <= 0:
-        # v163.6: 급등 중(+5%↑) ask_qty=0은 매수소화 강세 신호 → no_ask 반환하되
-        # soft allow 함수에서 통과시킴 (하드 차단 아님)
-        # 단, bid_qty도 0이면 완전 유동성 부재 → 하드 차단 유지
-        if bid_qty <= 0 and change_rate < 5.0:
-            return "no_ask_liquidity"
         return "no_ask_liquidity"
     return ""
 def _find_existing_entry_hit_watch(code: str):
@@ -26846,15 +26901,13 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     nxt_post_leader = bool(signal.get("nxt_post_leader_hit"))
     leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader or nxt_post_leader
     # v71: A급 85점↑ NXT 종목은 호가 얇아도 soft allow 통과
+    # 셀바스AI 06:01 SURGE A급 85점이 no_ask_liquidity로 전량 차단되던 문제 해소
     grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
     if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
         return True
-    # v163.6: KRX/NXT 공통 — A급 + score≥72 + change_rate≥5% 이면 exec_score 무관 soft allow
-    # 이유: WebSocket 스냅샷 불안정 시 exec_score=0 고착 → A급 전량 차단되는 문제 방어
-    # 급등 중 ask_qty=0은 오히려 강한 매수 신호 → 외부알림 허용
-    if grade == "A" and score >= 72 and change_rate >= 5.0:
-        return True
     # v161.47: 체결속도 soft allow — A급 + score≥72 + change_rate≥5% + exec_speed 보통 이상 + 흐름 비둔화
+    # no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 소화한 상태 → 실제로는 강한 매수 신호
+    # 이미 수집 중인 _execution_snapshots 활용 (추가 API 호출 없음)
     if grade == "A" and score >= 72 and change_rate >= 5.0:
         _exec_code = str(signal.get("code") or "")
         if _exec_code:
@@ -27444,6 +27497,20 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         save_signal_log(s)
         return False
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
+    # v163.6: NXT SURGE 동일 종목 2시간 텔레그램 쿨다운 — 에스투더블유류 7회 중복 발송 방지
+    # 진입가 도달 알람은 예외(쿨다운 미적용)
+    if (signal_type == "SURGE"
+            and str(s.get("market") or s.get("_market") or "").upper() == "NXT"
+            and not s.get("_entry_hit_alert")):
+        nxt_surge_cooldown_key = f"nxt_surge_cd:{code}"
+        prev_nxt = _alert_history.get(nxt_surge_cooldown_key)
+        if isinstance(prev_nxt, dict):
+            elapsed = time.time() - float(prev_nxt.get("ts", 0) or 0)
+            if elapsed < 7200:  # 2시간
+                _log_info_msg(f"  ⏭ {name} — NXT SURGE 2시간 쿨다운 ({int(elapsed//60)}분 경과, 대표갱신만)")
+                save_signal_log(s)
+                register_entry_watch(s)  # 진입가 갱신은 유지
+                return False
     # v161.43: 기존 entry_hit watch 존재 시 헤더에 "+ 1차 진입가 도달" 반영 허용
     # v162.6: notify_count>=1 조건 추가 — 사용자가 실제 1차 알람 받은 경우에만 헤더 반영
     #         1차 알람 미수령(notify_count=0) 상태에서 NEAR_UPPER에 '1차 진입가 도달' 표시 시 혼란
@@ -27462,6 +27529,9 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         "score": safe_int(s.get("score", 0), 0),
         "change_rate": safe_float(s.get("change_rate", 0), 0.0),
     }
+    # v163.6: NXT SURGE 발송 성공 시 쿨다운 키 기록
+    if signal_type == "SURGE" and str(s.get("market") or s.get("_market") or "").upper() == "NXT":
+        _alert_history[f"nxt_surge_cd:{code}"] = {"ts": time.time()}
     _save_alert_history()   # v161.15: 발송 즉시 상태파일 저장 → 재시작 후 쿨다운 유지
     # v161.23: NEAR_UPPER/UPPER_LIMIT 발송 즉시 당일 차단 등록 — 오전 상한가 종목이 봇 미포착 상태면
     # _upper_limit_alerted_today에 기록이 없어 나중에 재포착 시 알람이 나가는 문제 방지
@@ -33044,12 +33114,59 @@ def _try_mark_preopen_dispatch(kind: str, now_dt: datetime | None = None) -> boo
     except Exception as e:
         _log_warn_msg(f"⚠️ 장전 디스패치 상태 기록 실패({kind}): {e}")
         return True
+def _register_prev_upper_limit_prewatch() -> None:
+    """v163.6: 전날 상한가 도달 종목을 당일 07:30 prewatch 목록에 자동 등록.
+    재료 수집 실패(Gemini 429/503)로 스캔 풀에서 누락되는 것을 방지.
+    """
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        yesterday = (_now_kst() - timedelta(days=1)).strftime("%Y%m%d")
+        data = _read_json_safe(UPPER_LIMIT_ALERTED_FILE, {})
+        if not isinstance(data, dict):
+            return
+        # 전날 상한가 기록 종목 추출
+        prev_codes = [c for c, d in data.items() if d == yesterday]
+        if not prev_codes:
+            return
+        registered = 0
+        for code in prev_codes[:20]:
+            try:
+                name = _resolve_stock_name(code, "") or code
+                theme_key = f"prev_upper_{code}"
+                if theme_key in _news_issue_prewatch:
+                    continue
+                cur = get_stock_price(code) or {}
+                price = int(cur.get("price", 0) or 0)
+                if price <= 0:
+                    continue
+                _news_issue_prewatch[theme_key] = {
+                    "stocks": [{"code": code, "name": name, "price": price,
+                                "change_rate": float(cur.get("change_rate", 0) or 0),
+                                "volume_ratio": float(cur.get("volume_ratio", 0) or 0),
+                                "source": "prev_upper_limit"}],
+                    "headline": f"전날 상한가 → 당일 자동 감시",
+                    "theme_desc": f"{name} 전날상한가",
+                    "ts": time.time(),
+                    "source": "prev_upper_limit",
+                    "strong": True,
+                }
+                registered += 1
+                time.sleep(0.05)
+            except Exception:
+                continue
+        if registered > 0:
+            _log_info_msg(f"  👁 전날 상한가 → 당일 prewatch 자동 등록: {registered}개")
+    except Exception as e:
+        _swallow_exception(e)
+
+
 def _send_preopen_watchlist_once():
     if is_holiday():
         return
     if not _try_mark_preopen_dispatch("watchlist_0730"):
         _log_info_msg("ℹ️ 07:30 워치리스트 이미 처리됨")
         return
+    _register_prev_upper_limit_prewatch()  # v163.6: 전날 상한가 종목 자동 prewatch
     send_preopen_watchlist()
 def _send_premarket_risk_assessment_once():
     if is_holiday():
@@ -34981,6 +35098,16 @@ def _queue_run_scan_repair(item: dict, stage: str = "") -> None:
         return
     if is_scoring_only_instrument(code, str(item.get("name") or "")):
         return
+    # v163.6: missing_signal_type 단독 결측은 큐 등록 자체 차단 (장중 포함) — 1,519건 루프 방지
+    reasons = _build_run_scan_missing_reasons(item)
+    if reasons == ["missing_signal_type"]:
+        return
+    # v163.6: 큐 크기 제한 — 최대 80개 초과 시 오래된 항목 제거
+    if len(_run_scan_repair_queue) >= 80:
+        oldest = sorted(_run_scan_repair_queue.keys(),
+                        key=lambda c: float(_run_scan_repair_queue[c].get("next_ts", 0) or 0))
+        for c in oldest[:20]:
+            _run_scan_repair_queue.pop(c, None)
     # v161.19: NXT 전용 시간대에 KRX 종목은 repair 큐 등록 자체 차단 — 무한 재시도 방지
     if not is_market_open() and is_nxt_open() and str(item.get("market") or "") != "NXT":
         return
@@ -35904,6 +36031,7 @@ if __name__ == "__main__":
         _load_market_flow_state()
         _load_dynamic_params()
         _load_youtube_gemini_cache()    # v162.1: 재시작 후 YouTube Gemini 캐시 복원
+        _load_gemini_grounding_cache()  # v163.6: 재시작 후 grounding 재료 캐시 복원
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
         _run_holiday_standby_until_trading_day()
@@ -35934,6 +36062,7 @@ if __name__ == "__main__":
     load_stale_replay_penalty_profile()
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
     _load_youtube_gemini_cache()    # v162.1: 재시작 후 YouTube Gemini 캐시 복원
+    _load_gemini_grounding_cache()  # v163.6: 재시작 후 grounding 재료 캐시 복원
     if _try_acquire_leader_lock():
         if _enforce_runtime_version_lock(notify=True):
             _send_startup_banner_once()
