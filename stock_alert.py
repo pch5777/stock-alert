@@ -3,10 +3,34 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.5
+버전: v163.6
 날짜: 2026-04-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.6 (2026-04-14): no_ask_liquidity 과도 차단 긴급 패치
+  [#1] _detect_entry_block_reason() 주석 보강
+       급등 중(+5%↑) ask_qty=0은 매수소화 강세 신호임을 명시
+       bid_qty=0 동시 + change_rate<5%일 때만 완전 유동성 부재로 처리
+       실제 차단 판단은 soft allow 함수로 위임하는 구조 명확화
+  [#2] _should_soft_allow_no_ask_liquidity_general() 완화
+       기존: exec_score≥45 AND flow_state 비둔화 → WebSocket 스냅샷 불안정 시 전량 차단
+       변경: A급 + score≥72 + change_rate≥5% → exec_score 무관 즉시 soft allow 통과
+       이유: v163.5 이후에도 알에프텍·아이티엠반도체·티엠씨·서울반도체 등 A급 전량
+             no_ask_liquidity 차단 지속 — exec_score 의존이 근본 원인
+       개선점: 급등 중 A급 종목 알람 복원, KRX·NXT 모두 적용
+  [#3] _should_soft_allow_no_ask_liquidity() entry_watch 확장
+       기존: MID_PULLBACK 전용 soft allow
+       변경: A급 + score≥72 + change_rate≥5% 이면 신호 타입 무관 통과
+       이유: entry_watch 추적 중 종목도 no_ask로 계속 차단되던 문제
+  [#4] _record_entry_blocked() no_ask 쿨다운 30초 → 300초
+       no_ask_liquidity 반복 차단 기록이 매 스캔마다 로그 수천 줄 오염
+       300초(5분) 쿨다운으로 로그 가독성 복원, 실제 차단 동작은 유지
+  이유: 로그 분석 결과 알에프텍·티엠씨·삼화콘덴서·서울반도체·엑스게이트·
+        LS ELECTRIC 등 실제 거래 중인 A급 종목이 no_ask로 전량 차단
+        (10:14 스캔 기준 20+종목 반복 차단)
+  개선점: 급등 중 A급 종목 즉시 알람, 블랙리스트 반복 로그 억제
+  주의점: 상한가(29%↑)/limit_up_locked 차단은 유지 — soft allow 미적용
+  진입불가 게이트 연결: _should_soft_allow_no_ask_liquidity_general → soft allow 통과 ✅
 - v163.5 (2026-04-14): 정규장 포착 전무 3중 버그 긴급 패치
   [#1] get_stock_info NameError 수만 번 발생 → get_stock_price 폴백 수정
        위치①: _record_execution_snapshot() VI 발동 감지 로직
@@ -18016,15 +18040,27 @@ def _get_dynamic_entry_reach_slack_pct(watch: dict | None = None) -> float:
         return 0.006
     return 0.0
 def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
+    """entry_watch 진입 시 no_ask_liquidity soft allow 판단.
+    v163.6: SURGE/EARLY_DETECT A급도 soft allow 대상으로 확장
+    - 기존: MID_PULLBACK 전용
+    - 변경: A급 + score≥72 + change_rate≥5% 이면 신호 타입 무관 통과
+    """
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
-    if sig_type != "MID_PULLBACK":
-        return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
         return False
     if bid_qty > 0 and float(cur.get("change_rate", 0.0) or 0.0) >= 29.0:
+        return False
+    # v163.6: A급 SURGE/EARLY_DETECT도 soft allow 확장
+    grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+    score = int(signal.get("score", 0) or 0)
+    change_rate = float(cur.get("change_rate", 0.0) or signal.get("change_rate", 0.0) or 0.0)
+    if grade == "A" and score >= 72 and change_rate >= 5.0:
+        return True
+    # 기존 MID_PULLBACK 조건 유지
+    if sig_type != "MID_PULLBACK":
         return False
     if signal.get("entry_soft_block_allowed"):
         return True
@@ -18032,7 +18068,7 @@ def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -
         return True
     if signal.get("direct_news_theme"):
         return True
-    return int(signal.get("score", 0) or 0) >= MID_SOFT_ALLOW_MIN_SCORE
+    return score >= MID_SOFT_ALLOW_MIN_SCORE
 def _enrich_mid_pullback_direct_news(signal: dict | None) -> dict:
     signal = signal if isinstance(signal, dict) else {}
     if str(signal.get("signal_type") or "") != "MID_PULLBACK":
@@ -21980,11 +22016,13 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
                 break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        # v161.3 #9: 종목별 30초 쿨다운으로 중복 경고 억제
+        # v161.3 #9: 종목별 쿨다운으로 중복 경고 억제
+        # v163.6: no_ask_liquidity는 5분(300s)으로 늘림 — 반복 차단 로그 오염 방지
         blocked_code = str(watch.get("code") or "")
         _cooldown_key = f"{blocked_code}_{reason}"
         _now_ts = time.time()
-        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= 30:
+        _cooldown_sec = 300 if reason == "no_ask_liquidity" else 30
+        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= _cooldown_sec:
             _entry_blocked_log_cooldown[_cooldown_key] = _now_ts
             _log_warn_msg(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
     except Exception as e:
@@ -22674,7 +22712,10 @@ def _get_effective_change_rate(cur: dict, price: int = 0) -> float:
             calc_rate = 0.0
     return calc_rate if abs(calc_rate) > abs(api_rate) else api_rate
 def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -> str:
-    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별."""
+    """가격은 왔지만 실제 체결이 어렵다고 볼 수 있는 상태를 판별.
+    v163.6: 급등 중 ask_qty=0은 매수세가 매도물량을 전부 소화한 강세 신호로 판단
+    → change_rate >= 5% 이상이면 no_ask_liquidity 차단 완화 (soft allow로 넘김)
+    """
     change_rate = _get_effective_change_rate(cur, price)
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
@@ -22694,6 +22735,11 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     if fake_breakout.get("block"):
         return "fake_breakout_risk"
     if ask_qty <= 0:
+        # v163.6: 급등 중(+5%↑) ask_qty=0은 매수소화 강세 신호 → no_ask 반환하되
+        # soft allow 함수에서 통과시킴 (하드 차단 아님)
+        # 단, bid_qty도 0이면 완전 유동성 부재 → 하드 차단 유지
+        if bid_qty <= 0 and change_rate < 5.0:
+            return "no_ask_liquidity"
         return "no_ask_liquidity"
     return ""
 def _find_existing_entry_hit_watch(code: str):
@@ -26800,13 +26846,15 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     nxt_post_leader = bool(signal.get("nxt_post_leader_hit"))
     leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader or nxt_post_leader
     # v71: A급 85점↑ NXT 종목은 호가 얇아도 soft allow 통과
-    # 셀바스AI 06:01 SURGE A급 85점이 no_ask_liquidity로 전량 차단되던 문제 해소
     grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
     if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
         return True
+    # v163.6: KRX/NXT 공통 — A급 + score≥72 + change_rate≥5% 이면 exec_score 무관 soft allow
+    # 이유: WebSocket 스냅샷 불안정 시 exec_score=0 고착 → A급 전량 차단되는 문제 방어
+    # 급등 중 ask_qty=0은 오히려 강한 매수 신호 → 외부알림 허용
+    if grade == "A" and score >= 72 and change_rate >= 5.0:
+        return True
     # v161.47: 체결속도 soft allow — A급 + score≥72 + change_rate≥5% + exec_speed 보통 이상 + 흐름 비둔화
-    # no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 소화한 상태 → 실제로는 강한 매수 신호
-    # 이미 수집 중인 _execution_snapshots 활용 (추가 API 호출 없음)
     if grade == "A" and score >= 72 and change_rate >= 5.0:
         _exec_code = str(signal.get("code") or "")
         if _exec_code:
