@@ -3,10 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.4
+버전: v163.5
 날짜: 2026-04-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.5 (2026-04-14): 정규장 포착 전무 3중 버그 긴급 패치
+  [#1] get_stock_info NameError 수만 번 발생 → get_stock_price 폴백 수정
+       위치①: _record_execution_snapshot() VI 발동 감지 로직
+       위치②: get_nxt_surge_stocks() 최초반응 tracker 업데이트 로직
+       이유: get_stock_info 함수가 코드 어디에도 정의되지 않음 → WebSocket 스냅샷
+             기록 전체 실패(count=161,859) → exec_score=0 고착 → EARLY_DETECT 외부알림 차단
+       개선점: get_stock_price()/items 내장값으로 대체해 스냅샷 정상 기록
+       주의점: bstp_name 필드로 섹터 추출 (sector 필드는 get_stock_price 미포함)
+  [#2] EARLY_DETECT KRX 외부알림 지연 조건 완화
+       기존: exec_score >= 52 OR bid_ask_ratio >= 1.2 필수
+             → #1 버그로 exec_score=0 고착 시 bid_ask_ratio 미달이면 전량 차단
+       변경: A급 + score >= 74(EARLY_EXTERNAL_KRX_SCORE_MIN) + entry_price > 0이면 즉시 통과
+             B급도 score >= 85이면 통과 (고점수 B급 손실 방지)
+       이유: 로그상 96~100점 A급 종목이 "조기포착 행동단계 전 외부알림 지연"으로 전량 차단
+       개선점: 점수·등급 기준만으로 통과 → exec_score 버그 영향 차단
+       주의점: early_guard_external_delay_reason 있는 경우는 여전히 차단 유지
+  [#3] _is_krx_vi_reference_mode() 호가 소멸 단독 조건 제거
+       기존: ask_qty=0 AND bid_qty=0 → VI/거래정지 유사 판정 → NXT 참고도달만 기록
+       변경: API 명시 플래그(vi_cls_code, vi_yn 등)만으로 판별
+       이유: KRX 개장 직후 호가 미형성 정상 구간도 차단 → NXT선행 종목 전량 krx_vi_reference 처리
+       개선점: 엑스게이트, 에스투더블유, 티엠씨 등 개장 초반 정상 추적 복원
+       주의점: 실제 VI 발동은 API 플래그로 충분히 감지됨
+  이유: 정규장 개장 후 30분간 A급 포착 0건 → 3개 버그 복합 차단
+  개선점: 개장 직후 90~100점 종목 즉시 알람 가능
+  주의점: EARLY_DETECT 알람 증가 가능 — 점수 기준(74점)이 방어선
+  진입불가 게이트 연결: _should_delay_external_general_capture → send_alert 경유 ✅
 - v163.4 (2026-04-14): F구간 활용 확장 — 무재료 급등 종목 자동 추적 + 재료 확인 시 후속 알람
   [#1] analyze() F구간 마킹 조건 절충 확장
        기존 v162.3: 거래대금비율 8배↑ AND 등락률 +10%↑ (너무 엄격 → 신규상장·재부각 누락)
@@ -10246,11 +10272,12 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
     buf.append(sample)
     _prune_execution_snapshots(code, now_ts)
     # v163: VI 발동 감지 → 섹터별 VI 순서 기록
+    # v163.5: get_stock_info 미정의 → get_stock_price 폴백으로 수정
     _vi_price_val = safe_int(payload.get("vi_price", 0))
     if _vi_price_val > 0:
         try:
-            _stock_info = get_stock_info(code) or {}
-            _vi_sector  = str(_stock_info.get("sector", "") or "")
+            _stock_info = get_stock_price(code) or {}
+            _vi_sector  = str(_stock_info.get("bstp_name", "") or _stock_info.get("sector", "") or "")
             _vi_name    = str(_stock_info.get("name", code) or code)
             _update_vi_sector_tracker(code, _vi_name, _vi_sector, _vi_price_val)
         except Exception as _ve:
@@ -14985,14 +15012,14 @@ def get_nxt_surge_stocks() -> list:
             _log_warn_msg("⚠️ [NXT] volume-rank 응답 비어있음 → NXT 유니버스 후보군으로 대체")
             return _rank_from_universe("NXT")
         # v163: NXT 종목도 최초 반응 tracker 업데이트
+        # v163.5: get_stock_info 미정의 → 종목명은 items에서 직접 사용
         try:
             for _ni in items:
                 _ni_code = str(_ni.get("code", "") or "")
                 _ni_chg  = float(_ni.get("change_rate", 0.0) or 0.0)
                 _ni_name = str(_ni.get("name", _ni_code) or _ni_code)
                 if _ni_code and _ni_chg >= SECTOR_FIRST_REACT_THRESHOLD:
-                    _si = get_stock_info(_ni_code) or {}
-                    _ni_sec = str(_si.get("sector", "") or "")
+                    _ni_sec = str(_ni.get("bstp_name", "") or _ni.get("sector", "") or "")
                     _update_sector_first_react(_ni_code, _ni_name, _ni_sec, _ni_chg)
         except Exception as _nfre:
             _swallow_exception(_nfre)
@@ -22846,7 +22873,11 @@ def _maybe_clear_false_trading_halt(code: str, persisted: dict | None = None, cu
     _clear_dart_halt_cache(code, reason or "실시간 정상 거래 확인")
     return True
 def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
-    """KRX 장중이지만 NXT 참고만 허용할 만한 VI/거래정지 유사 상태인지 보수적으로 판별."""
+    """KRX 장중이지만 NXT 참고만 허용할 만한 VI/거래정지 유사 상태인지 보수적으로 판별.
+    v163.5: 호가 소멸(ask_qty=0, bid_qty=0) 단독 조건 제거
+    - 정규장 개장 직후 호가가 아직 안 붙은 정상 상태도 차단하는 오판 발생
+    - 실제 VI/거래정지는 API 플래그(vi_cls_code 등)로만 판별
+    """
     if not is_market_open():
         return False
     if not (is_nxt_open() and is_nxt_listed(code)):
@@ -22854,10 +22885,6 @@ def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
     for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
         if _is_truthy_market_flag(cur.get(_k)):
             return True
-    ask_qty = safe_int(cur.get("ask_qty", 0), 0)
-    bid_qty = safe_int(cur.get("bid_qty", 0), 0)
-    if ask_qty <= 0 and bid_qty <= 0:
-        return True
     return False
 def _is_trading_halt(code: str, cur: dict | None = None) -> bool:
     """v76/v88/v92: 종목 거래정지 여부 통합 판별.
@@ -26985,16 +27012,18 @@ def _should_delay_external_general_capture(signal: dict) -> str:
         is_nxt_premarket = market == "NXT" and _is_signal_nxt_premarket_hint(signal)
         if is_nxt_premarket and score >= 70 and grade in ("A", "B"):
             return ""
-        exec_m = signal.get("execution_metrics") or {}
-        exec_score = safe_int(exec_m.get("execution_speed_score", 0), 0)
-        bid_ask_ratio = _signal_bid_ask_ratio_hint(signal)
+        # v163.5: KRX EARLY_DETECT 외부알림 조건 완화
+        # 기존: exec_score >= 52 OR bid_ask_ratio >= 1.2 필수 → WebSocket 스냅샷 실패 시 전량 차단
+        # 변경: A급 + score >= 74이면 exec_score/bid_ask_ratio 무관하게 통과
+        #       단, early_guard_external_delay_reason이 있으면 여전히 차단
         if (
-            market != "NXT"
+            grade == "A"
             and score >= EARLY_EXTERNAL_KRX_SCORE_MIN
-            and grade == "A"
             and entry_price > 0
-            and (exec_score >= EARLY_EXTERNAL_KRX_EXEC_SCORE_MIN or bid_ask_ratio >= EARLY_EXTERNAL_KRX_BID_ASK_MIN)
         ):
+            return ""
+        # B급도 점수 85 이상이면 통과 (고점수 B급 손실 방지)
+        if grade == "B" and score >= 85 and entry_price > 0:
             return ""
         return "조기포착 행동단계 전 외부알림 지연"
     if bool(signal.get("execution_setup_required")):
