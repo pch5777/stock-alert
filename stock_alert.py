@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.7
+버전: v163.8
 날짜: 2026-04-15
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.8 (2026-04-15): missing_signal_type WARNING 3개 경로 완전 차단
+  [#1] _sanitize_run_scan_alerts(): missing_signal_type 단독 시 경고 로그 없이 조용히 drop
+       이유: v163.7은 _append_scan_alert만 패치했으나 _sanitize_run_scan_alerts 경로가 누락
+             10:45~10:49 구버전 로그에서 이 경로로 대량 WARNING 발생 확인
+       개선점: 세 경로(_append_scan_alert·_sanitize·_drain) 모두 동일 처리로 통일
+       주의점: missing_signal_type + 다른 결측 복합이면 기존대로 WARNING + 큐 등록 유지
+  [#2] _drain_run_scan_repair_queue(): 큐 드레인 시 missing_signal_type 단독 항목 즉시 제거
+       이유: 재시작 후 repair 큐에 이미 쌓인 missing_signal_type 항목이 드레인되며 WARNING 재발
+             10:55~10:57 v163.7 기동 후에도 WARNING 찍힘 확인 (로그 10:56:10~11)
+       개선점: 드레인 루프에서 missing_signal_type 단독이면 큐에서 즉시 제거 (재시도 없음)
+       주의점: 복합 결측(missing_price+missing_signal_type 등)은 기존 재시도 로직 유지
+  이유: v163.7 배포 후에도 missing_signal_type WARNING 계속 발생 — 3개 경로 중 2개 미패치
+  개선점: WARNING 완전 소멸 → 실제 문제(복합 결측)만 로그에 남음
+  주의점: 403 EGW00133 토큰 한도 초과는 코드 문제 아님 — 자정 후 자동 해소
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
 - v163.7 (2026-04-15): 재료·포착 품질 9개 항목 전면 패치
   [#1] _append_scan_alert(): missing_signal_type 단독 시 경고 로그 없이 조용히 return
        이유: _queue_run_scan_repair()가 이미 차단(return)하지만 그 전에 WARNING 로그가 찍혀
@@ -35290,6 +35305,11 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
                 continue
             repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
             if bool(repaired.get("_scan_payload_incomplete")):
+                _drain_reasons = list(repaired.get("_scan_payload_missing_reasons") or [])
+                # v163.8 [#2]: missing_signal_type 단독이면 재시도 없이 즉시 큐에서 제거
+                if _drain_reasons == ["missing_signal_type"]:
+                    remove_codes.append(code)
+                    continue
                 attempts = int(row.get("attempts", 0) or 0) + 1
                 if attempts >= RUN_SCAN_REPAIR_MAX_ATTEMPTS:
                     _emit_run_scan_code_change_request(repaired)
@@ -35433,8 +35453,13 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
         if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
+            _missing_r = list(item.get("_scan_payload_missing_reasons") or [])
+            # v163.8 [#1]: missing_signal_type 단독이면 경고 로그 없이 조용히 drop
+            if _missing_r == ["missing_signal_type"]:
+                _queue_run_scan_repair(item, stage=stage)
+                continue
             _queue_run_scan_repair(item, stage=stage)
-            _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(item.get('_scan_payload_missing_reasons', []))}")
+            _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(_missing_r)}")
             continue
         cleaned.append(item)
     if dropped > 0:
