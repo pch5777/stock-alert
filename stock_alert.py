@@ -3,10 +3,63 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.8
+버전: v163.10
 날짜: 2026-04-15
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.10 (2026-04-15): 후보군 미편입 구조적 해결 + 전날상한가 당일 재상승 재포착 허용
+  [#1] _rank_api_fallback(): 외부소스 top_n 30→80 확대 + 거래대금 상위도 병행 수집
+       이유: 라이콤·머큐리·코위버·기산텔레콤·네이블·에프알텍·에이스테크·이노인스트루먼트 등
+             9종목이 로그에 흔적조차 없음. fallback top_n=30이 실제 30건만 수집해
+             광통신 소형주(30~80위권)가 전부 탈락
+       개선점: top_n=80으로 확대 + 거래대금(amount) 상위 30종목도 병행 수집 후 합산
+               → fallback 후보군 최대 110종목으로 확장
+       주의점: 코스피+코스닥 합산이므로 중복 제거(seen 집합) 유지
+  [#2] refresh_dynamic_candidates(): 섹터 강제감시 등록 종목 동적후보군 자동편입
+       이유: 섹터 대장 후속으로 등록된 종목이 _dynamic_candidates에 미편입되어
+             스캔 루프에서 누락되는 사례 확인 (기산텔레콤·코위버 등)
+       개선점: _sector_forced_watch 내 종목을 refresh 시마다 동적후보군에 자동편입
+       주의점: 이미 편입된 종목은 desc만 갱신 (중복 없음)
+  [#3] _fetch_external_rank_top(): 거래대금 상위도 병행 수집
+       이유: 등락률 상위만 수집하면 꾸준히 오르는 종목(대한전선 +9.5%류)이
+             min_change=1.0 이상이어도 순위 밖으로 밀릴 수 있음
+       개선점: amount(거래대금) 상위 30종목도 병행 수집해 min_change 기준만 통과하면 합산
+       주의점: 등락률 0% 이상 필터 적용 (하락 거래대금 종목 제외)
+  [#4] _pre_send_upper_block() 내 상한가 캐시 체크: 당일 실제 상한가 재검증
+       이유: 루멘스 사례 — 당일 새벽 NEAR_UPPER 포착 후 _upper_limit_alerted_today 등록
+             이후 꾸준히 재상승해도 당일 내내 차단됨
+             4/15 루멘스는 상한가 아닌데 upper_limit_reached 차단(10:29, 11:11 확인)
+       개선점: _upper_limit_alerted_today 등록 종목이라도
+               실시간 change_rate < 27% 이면 차단 해제 → 정상 분석 경로로 복귀
+       주의점: NEAR_UPPER/UPPER_LIMIT 신호 자체는 유지. 실제 상한가(27%+)는 그대로 차단
+  이유: 4/15 시장 상위 35종목 대조 결과 — 후보군 미편입으로 로그 흔적조차 없는 종목 9개
+        등락률 상위(우리넷 +30%, 라이콤 +29.9%, 머큐리 +21.9% 등) 전부 누락 확인
+  개선점: fallback 후보군 30→110종목 확장 + 섹터감시 종목 자동편입으로 구조적 해결
+  주의점: 기존 v163.x 패치 전부 유지
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+- v163.9 (2026-04-15): upper_limit_reached 오판으로 인한 정상 종목 당일 차단 버그 수정
+  [#1] _detect_entry_block_reason(): ask_qty=0 단독으로 upper_limit_reached 판정 강화
+       기존: upper_like(change_rate≥29% OR sig_type=UPPER/NEAR) AND ask_qty≤0 → 즉시 upper_limit_reached
+       변경: upper_price(KIS 실제 상한가 가격) 직접 비교 우선 → price < upper_price이면 upper_limit_reached 차단
+             ask_qty=0이더라도 실제 상한가 미도달이면 no_ask_liquidity로 downgrade
+       이유: 대한전선(001440) 10:29:50 오판 사례
+             change_rate가 높고(광통신 테마 동조 상승) ask_qty가 일시 0이 되면서 upper_like=True로 잡힘
+             → upper_limit_reached 등록 → 당일 내내 재차단 → 이후 계속 오르는 종목 완전 누락
+       개선점: 실제 상한가 가격(upper_price) 도달 여부로 1차 검증 → 미달이면 ask_qty=0을 no_ask_liquidity 처리
+               prdy_vrss_sign=="1"(전일 상한가 기호) 단독으로도 upper_price 재확인 후 판정
+       주의점: upper_price=0(API 미수신)이면 기존 로직 유지 (보수적 처리)
+               NEAR_UPPER/UPPER_LIMIT 신호 자체는 상한가 진입 신호이므로 기존 차단 유지
+  [#2] _finalize_general_alert_dispatch(): upper_limit_reached 등록 시 실시간 등락률 재확인
+       기존: blocked_reason=="upper_limit_reached"이면 무조건 _upper_limit_alerted_today 등록
+       변경: 등록 전 live change_rate >= 28.0% 재확인 — 미달이면 등록 skip (no_ask_liquidity로 처리)
+       이유: _detect_entry_block_reason에서 오판된 upper_limit_reached가 영구 차단으로 굳어지는 것 방지
+       개선점: 오판된 upper_limit_reached가 _upper_limit_alerted_today에 등록되지 않아 다음 사이클에 재시도 가능
+       주의점: 실제 상한가(28%+) 종목은 기존대로 등록. 임계값 28%는 실제 상한가(±30%) 대비 2% 여유
+  이유: 대한전선 사례 — 당일 꾸준히 상승하는 정상 종목이 ask_qty 일시 0으로 오판 후 당일 완전 누락
+        v163.7~v163.8 패치 목록에 누락됐던 항목
+  개선점: 실제 상한가 도달 종목만 차단 → 꾸준히 오르는 종목 포착 가능
+  주의점: 실제 상한가 종목(광전자·엑스게이트 등)은 영향 없음. upper_price 기준 판정이 우선
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
 - v163.8 (2026-04-15): missing_signal_type WARNING 3개 경로 완전 차단
   [#1] _sanitize_run_scan_alerts(): missing_signal_type 단독 시 경고 로그 없이 조용히 drop
        이유: v163.7은 _append_scan_alert만 패치했으나 _sanitize_run_scan_alerts 경로가 누락
@@ -5272,7 +5325,7 @@ def _resolve_watchdog_market_basis() -> str:
 def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: int = 30, market: str = "AUTO") -> list:
     """
     외부 소스(네이버→다음→유니버스) 순으로 시도해 상승 종목 목록 반환.
-    워치독에서는 활성 시장 기준으로 KRX/NXT를 정렬한다.
+    v163.10 [#3]: 거래대금 상위도 병행 수집해 꾸준히 오르는 종목 커버.
     """
     market_basis = str(market or "AUTO").upper()
     if market_basis not in {"KRX", "NXT"}:
@@ -5288,6 +5341,18 @@ def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: in
         if not items:
             raw = _rank_from_universe("KRX")
             items = [{**r, "source": "universe", "market": "KRX"} for r in raw]
+        # v163.10 [#3]: 거래대금 상위 30종목 병행 수집 (대한전선류 커버)
+        try:
+            seen_codes = {normalize_stock_code(r.get("code")) for r in items}
+            amount_items = _fetch_naver_rank("amount", top_n=30)
+            for r in amount_items:
+                code = normalize_stock_code(r.get("code"))
+                chg = float(r.get("change_rate", 0) or 0)
+                if code and code not in seen_codes and chg >= min_change:
+                    items.append(r)
+                    seen_codes.add(code)
+        except Exception as _ae:
+            _swallow_exception(_ae)
     filtered = [r for r in items if float(r.get("change_rate", 0) or 0) >= min_change]
     filtered.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
     return filtered[:top_n]
@@ -13671,6 +13736,23 @@ def refresh_dynamic_candidates(force_rank: bool = False):
         except Exception as _fz_e:
             _swallow_exception(_fz_e)
 
+        # v163.10 [#2]: 섹터 대장 후속 강제감시 종목 동적후보군 자동편입
+        # 기산텔레콤·코위버 등 섹터 감시 등록됐지만 후보군에 미편입된 케이스 해결
+        try:
+            _sfw_active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+            _sfw_added = 0
+            for _sfw_code, _sfw_info in dict(_sfw_active).items():
+                if not isinstance(_sfw_info, dict):
+                    continue
+                _sfw_name = _resolve_stock_name(_sfw_code, _sfw_info.get("name", _sfw_code))
+                _sfw_theme = str(_sfw_info.get("theme", "") or "")
+                _put_candidate({"code": _sfw_code, "name": _sfw_name}, f"섹터강제감시[{_sfw_theme}]")
+                _sfw_added += 1
+            if _sfw_added > 0:
+                _log_info_msg(f"  🧭 섹터강제감시 자동편입: {_sfw_added}종목")
+        except Exception as _sfw_e:
+            _swallow_exception(_sfw_e)
+
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
                 _dynamic_candidates[code] = {"name": info["name"], "desc": info["desc"], "added_ts": time.time()}
@@ -14269,9 +14351,24 @@ def _pre_send_upper_block(signal: dict) -> str:
         return ""
 
     # ① 당일 상한가 캐시 체크
+    # v163.10 [#4]: 캐시 등록 종목이라도 실시간 등락률 재확인 — 루멘스류 오차단 방지
+    # 루멘스 사례: 당일 NEAR_UPPER 포착 후 캐시 등록 → 이후 재상승해도 당일 내내 차단
     today = _now_kst().strftime("%Y%m%d")
     if _upper_limit_alerted_today.get(code) == today:
-        return "upper_limit_reached 당일 재알람 차단"
+        # 실시간 등락률 재검증 — 실제 상한가(27%+)면 차단 유지, 미달이면 해제
+        _live_chg = safe_float(signal.get("change_rate", 0), 0.0)
+        _live_upper = safe_int(signal.get("upper_price", 0), 0)
+        _live_price = safe_int(signal.get("price", 0), 0)
+        _real_upper_now = (
+            (_live_upper > 0 and _live_price >= _live_upper)
+            or _live_chg >= 27.0
+        )
+        if _real_upper_now:
+            return "upper_limit_reached 당일 재알람 차단"
+        # 실제 상한가 미도달 → 캐시에서 제거 후 정상 분석 경로로 복귀
+        _upper_limit_alerted_today.pop(code, None)
+        _save_upper_limit_alerted_today()
+        _log_info_msg(f"  🔓 upper_limit_reached 캐시 해제: {signal.get('name', code)}({code}) 등락률 {_live_chg:.1f}% — 재포착 허용")
 
     # ② 실시간 가격 기준 상한가급 체크
     change_rate = safe_float(signal.get("change_rate", 0), 0.0)
@@ -14896,15 +14993,29 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
     # v83: KIS 불통 시 외부 소스(네이버→다음)도 시도 후 유니버스와 합산
     items = _rank_from_universe(market)
     try:
-        ext = _fetch_external_rank_top(min_change=1.0, top_n=30)
+        # v163.10 [#1]: top_n 30→80으로 확대 + 거래대금 상위도 병행 수집
+        # 라이콤·머큐리·코위버 등 30위권 밖 소형주 누락 방지
+        ext_rise = _fetch_external_rank_top(min_change=1.0, top_n=80)
         ext_codes = {normalize_stock_code(r.get("code")) for r in items}
-        for r in ext:
+        added_rise = 0
+        for r in ext_rise:
             code = normalize_stock_code(r.get("code"))
             if code and code not in ext_codes:
                 items.append(r)
                 ext_codes.add(code)
-        if ext:
-            _log_info_msg(f"  🌐 외부 소스({ext[0].get('source','?')}) {len(ext)}건 보완")
+                added_rise += 1
+        # v163.10 [#1]: 거래대금 상위 30종목 병행 수집 (꾸준히 오르는 종목 커버)
+        ext_amount = _fetch_naver_rank("amount", top_n=30)
+        added_amount = 0
+        for r in ext_amount:
+            code = normalize_stock_code(r.get("code"))
+            chg = float(r.get("change_rate", 0) or 0)
+            if code and code not in ext_codes and chg >= 0:
+                items.append(r)
+                ext_codes.add(code)
+                added_amount += 1
+        if ext_rise or ext_amount:
+            _log_info_msg(f"  🌐 외부 소스({ext_rise[0].get('source','?') if ext_rise else 'none'}) 상승{added_rise}건+거래대금{added_amount}건 보완")
     except Exception as e:
         _swallow_exception(e)
     if not _rank_api_disable_notified:
@@ -22869,11 +22980,22 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
     # v161.29: upper_price(상한가 가격) 직접 비교 — change_rate>=29% 보다 정확
     upper_price = safe_int(cur.get("upper_price", 0), 0)
     prdy_vrss_sign = str(cur.get("prdy_vrss_sign", "") or "")
-    is_upper_price_hit = (upper_price > 0 and price >= upper_price) or prdy_vrss_sign == "1"
-    upper_like = is_upper_price_hit or change_rate >= 29.0 or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
+    # v163.9 [#1]: upper_price 실제 도달 여부로 1차 검증
+    # upper_price가 수신된 경우 — price >= upper_price일 때만 진짜 상한가로 판정
+    # ask_qty=0 + change_rate 높음만으로는 upper_limit_reached 판정 금지 → no_ask_liquidity로 downgrade
+    if upper_price > 0:
+        is_upper_price_hit = price >= upper_price
+    else:
+        # upper_price 미수신(0) — 기존 로직 유지 (보수적)
+        is_upper_price_hit = (prdy_vrss_sign == "1") or change_rate >= 29.0
+    upper_like = is_upper_price_hit or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
+        # v163.9 [#1]: 실제 upper_price 미도달이면 no_ask_liquidity로 downgrade
+        # 대한전선 사례: change_rate 높고 ask_qty 일시 0 → 오판 방지
+        if upper_price > 0 and price < upper_price and sig_type not in ("UPPER_LIMIT", "NEAR_UPPER"):
+            return "no_ask_liquidity"
         return "upper_limit_reached"
     if upper_like and sig_type in ("MID_PULLBACK", "ENTRY_POINT"):
         return "upper_limit_reached"
@@ -27453,11 +27575,20 @@ def _handle_general_alert_entry_block(ctx: dict, source_label: str) -> bool:
     if blocked_reason == "no_ask_liquidity" and _should_keep_internal_watch_on_no_ask_liquidity(live, s):
         kept_internal = _persist_blocked_capture_watch(s, source_label=source_label, blocked_reason=blocked_reason)
     # v161.12: upper_limit_reached 시 당일 코드 기준으로 재알람 차단 기록
+    # v163.9 [#2]: 등록 전 실시간 등락률 재확인 — 오판된 upper_limit_reached 영구차단 방지
     if blocked_reason == "upper_limit_reached":
         code = s.get("code", "")
         today = _now_kst().strftime("%Y%m%d")
-        _upper_limit_alerted_today[code] = today
-        _save_upper_limit_alerted_today()
+        _live_chg = safe_float((live or {}).get("change_rate", 0), 0.0)
+        _live_upper = safe_int((live or {}).get("upper_price", 0), 0)
+        _live_price = safe_int((live or {}).get("price", 0), 0)
+        _real_upper = (_live_upper > 0 and _live_price >= _live_upper) or _live_chg >= 28.0
+        if _real_upper:
+            _upper_limit_alerted_today[code] = today
+            _save_upper_limit_alerted_today()
+        else:
+            # 실제 상한가 미도달 — 등록 skip, 다음 사이클에 재시도 가능
+            _log_info_msg(f"  ⚠️ upper_limit_reached 오판 방지: {s.get('name', code)}({code}) 등락률 {_live_chg:.1f}% < 28% — 차단 등록 skip")
     _log_suppressed_alert(
         s["code"],
         s["name"],
