@@ -3,10 +3,68 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.6
-날짜: 2026-04-14
+버전: v163.7
+날짜: 2026-04-15
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.7 (2026-04-15): 재료·포착 품질 9개 항목 전면 패치
+  [#1] _append_scan_alert(): missing_signal_type 단독 시 경고 로그 없이 조용히 return
+       이유: _queue_run_scan_repair()가 이미 차단(return)하지만 그 전에 WARNING 로그가 찍혀
+             오늘 390건 발생(삼성전자 53건·SK하이닉스 42건·대우건설 등). 로그 폭증 + 혼란 유발
+       개선점: missing_signal_type 단독 결측 시 경고 없이 조용히 drop → 로그 노이즈 완전 제거
+       주의점: missing_signal_type + 다른 결측 복합이면 기존대로 WARNING + 큐 등록 유지
+  [#2] _theme_rotation_cache.clear() → KeyError 'ts' 수정
+       이유: reset_daily_caches()에서 _theme_rotation_cache.clear() 후 "ts" 키 소멸
+             → detect_theme_rotation()의 _theme_rotation_cache["ts"] 직접 접근 → KeyError 9건
+             → _apply_theme_rotation_context / _score_tracking_weakness / _maybe_warn_theme_rotation_exit 오작동
+       개선점: clear() 직후 {"ts": 0, "themes": {}} 재초기화 + 직접 접근을 .get("ts", 0)으로 방어
+       주의점: 캐시 초기화 시 strong/weak 빈 리스트도 함께 초기화
+  [#3] 익일 오픈 알람 발송 시각 09:05 → 09:01 앞당김 (KRX 기준)
+       이유: 09:05 스케줄 + 시초가 조회 지연 + leader job 대기 합산 → 실제 발송 09:34
+             "09:05 이내 청산 우선" 안내가 29분 뒤에 도달 → 지침 자체 무의미
+       개선점: PRECLOSE_GAP_OPEN_EVAL_TIME_KRX 기본값 09:05 → 09:01 변경
+               09:00 직후 시초가 확정과 동시에 평가·발송 가능
+       주의점: NXT 08:05 기준은 유지. env var 재설정 시 env 값이 우선
+  [#4] Gemini grounding rows → 종목명 매칭 → direct_news_hit 플래그 설정
+       이유: Gemini가 7회 재료 수집 완료했지만 direct_news_hit 로그 0건
+             grounding rows의 text가 analyze() 점수 계산에 전혀 연결되지 않음
+       개선점: _analyze_news_context() 내 grounding rows를 종목명/코드로 매칭
+               매칭 시 direct_news_hit=True 설정 → 점수 +10~15점 + 재료없음 페널티 면제
+       주의점: 기존 news_articles 매칭과 중복 방지 (이미 hit이면 skip)
+  [#5] get_investor_provisional_trend() → _apply_analyze_market_context() 연결
+       이유: v161.30에서 함수 선언했으나 analyze() 점수 계산에 실제로 미연결
+             기관·외국인 가집계 수급이 포착 점수에 반영 안 됨
+       개선점: _apply_analyze_market_context()에서 NXT SURGE 페널티 판단 후
+               get_investor_provisional_trend() 호출 → 기관+외국인 동반 순매수 시 +8점 보너스
+       주의점: API 실패 시 0 반환 → 페널티/보너스 없음. 장외 시간대는 skip
+  [#6] 전날 급등 종목 익일 analyze() 점수 가중치 추가
+       이유: prewatch 등록은 되지만(12개 확인) 재료 가중치 없어 조기포착 순위 뒤로 밀림
+             성신양회 전날 30% → 당일 08:14 EARLY_DETECT 겨우 포착
+       개선점: _apply_analyze_market_context()에서 prev_upper_limit_prewatch 플래그 확인
+               전날 상한가 prewatch 종목이면 +5점 보너스 추가
+       주의점: 익일 1거래일만 적용. 연속 상한가는 upper_limit_alerted_today 차단이 우선
+  [#7] 유튜브 수집 실패 진단 로그 강화 + 슬롯 외 0건 시 skip 로그 제거
+       이유: 85회 시도 중 84회 0개 → 로그 폭증. 슬롯(07:30·20:30) 외에는 캐시 재사용
+             0개 WARNING이 반복돼 실제 문제 진단 어려움
+       개선점: 슬롯 외 시도에서 수집 영상 0개이면 DEBUG 레벨로만 기록 (기존 INFO 제거)
+               07:30 슬롯 실패 시 원인 명시 (API 키 / 쿼터 / 빈 결과 구분)
+       주의점: 슬롯 시간(07:30·20:30)의 0개는 WARNING 유지
+  [#8] 장중 재료-first 스캔 Gemini grounding 캐시 파일 복원 검증 로그 추가
+       이유: v163.6 [#4]에서 캐시 저장/복원 선언했지만 grounding_cache 관련 로그 0건
+             실제 캐시 저장·복원 작동 여부 불명
+       개선점: _save_gemini_grounding_cache() / _load_gemini_grounding_cache() 호출 시
+               INFO 로그 추가로 실제 작동 여부 가시화
+       주의점: 빈 rows 저장은 skip (유의미한 캐시만 저장)
+  [#9] _apply_theme_rotation_context 무음 예외 → 구조화 로그 전환
+       이유: detect_theme_rotation() 실패 시 _swallow_exception으로 완전 무음
+             어떤 오류인지 추적 불가
+       개선점: _swallow_exception → _log_warn_msg로 교체 (함수명 + 오류 메시지 포함)
+       주의점: 과도한 반복 방지를 위해 동일 오류는 60초 쿨다운 적용
+  이유: 오늘(4/15) 로그 분석 결과 missing_signal_type 390건·KeyError ts 9건·
+        Gemini 재료 매칭 0건·익일 오픈 29분 지연·유튜브 85회 중 84회 0건 확인
+  개선점: 재료 수집→점수 연결 파이프라인 복원 + 로그 노이즈 대폭 감소
+  주의점: 기존 v163.6 패치 8개 항목 전부 유지
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
 - v163.6 (2026-04-14): 스케줄러 중복·루프 버그·포착 누락 8개 항목 일괄 패치
   [#1] _leader_job() 재진입 방지 — 동일 함수 동시 2회 실행 차단
        _leader_job_running dict + _leader_job_lock 추가
@@ -6499,8 +6557,11 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
     if not YOUTUBE_API_KEY:
         _warn_throttled_once("youtube_api_key_missing", "⚠️ YOUTUBE_API_KEY 환경변수 미설정 — 유튜브 재료 수집 불가", cooldown_sec=3600.0)
         return []
-    # v161.33: 수집 시작 로그 (진단용)
-    print(f"[YT] 유튜브 재료 수집 시작 — GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'} YOUTUBE_API_KEY=SET")
+    # v163.7 [#7]: 슬롯(07:30·20:30) 내에서만 수집 시작 로그 출력 — 슬롯 외 시도는 키워드 검색 실패 시 조용히 skip
+    _now_hm_yt = _now_kst().hour * 60 + _now_kst().minute
+    _in_yt_slot = any(wstart <= _now_hm_yt < wstart + 10 for wstart in (7*60+30, 20*60+30))
+    if _in_yt_slot:
+        print(f"[YT] 유튜브 재료 수집 시작 — GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'} YOUTUBE_API_KEY=SET")
     raw_items: list[dict] = []
     seen_ids: set = set()
     published_after = _build_youtube_published_after_iso(YOUTUBE_LOOKBACK_HOURS)
@@ -6559,7 +6620,9 @@ def _fetch_youtube_material_headline_rows() -> list[dict]:
         })
 
     # ③ Gemini 분석 — 사이클당 최대 GEMINI_YOUTUBE_MAX_PER_CYCLE개
-    print(f"[YT] 수집된 영상 {len(raw_items)}개 — Gemini 분석 시작 (max={GEMINI_YOUTUBE_MAX_PER_CYCLE})")
+    # v163.7 [#7]: 슬롯 내에서만 영상 수 로그 출력 (슬롯 외 0개는 노이즈)
+    if _in_yt_slot or raw_items:
+        print(f"[YT] 수집된 영상 {len(raw_items)}개 — Gemini 분석 시작 (max={GEMINI_YOUTUBE_MAX_PER_CYCLE})")
     rows: list[dict] = []
     gemini_done = 0
     for item in raw_items:
@@ -6997,9 +7060,13 @@ GEMINI_GROUNDING_CACHE_FILE = _state_path("gemini_grounding_cache.json")  # v163
 def _save_gemini_grounding_cache() -> None:
     """v163.6: grounding 재료 캐시를 파일로 영속화 — 재시작 또는 API 실패 시 복원용."""
     try:
+        _rows = list(_gemini_grounding_cache.get("rows") or [])
+        if not _rows:
+            return  # v163.7 [#8]: 빈 rows 저장 skip
         _write_json_atomic(GEMINI_GROUNDING_CACHE_FILE, _gemini_grounding_cache, indent=2)
-    except Exception:
-        pass
+        _log_info_msg(f"[Gemini] grounding 캐시 저장: {len(_rows)}개 항목")  # v163.7 [#8]
+    except Exception as _e:
+        _log_warn_msg(f"⚠️ grounding 캐시 저장 실패: {_e}")
 
 def _load_gemini_grounding_cache() -> None:
     """v163.6: 시작 시 grounding 캐시 복원."""
@@ -7008,8 +7075,9 @@ def _load_gemini_grounding_cache() -> None:
         data = _read_json_safe(GEMINI_GROUNDING_CACHE_FILE, {})
         if isinstance(data, dict) and data.get("rows"):
             _gemini_grounding_cache = data
-    except Exception:
-        pass
+            _log_info_msg(f"[Gemini] grounding 캐시 복원: {len(data['rows'])}개 항목")  # v163.7 [#8]
+    except Exception as _e:
+        _log_warn_msg(f"⚠️ grounding 캐시 복원 실패: {_e}")
 _gemini_grounding_daily_counter: dict = {"date": "", "count": 0}  # v161.38: grounding 전용 일별 카운터
 _material_downside_cache: dict = {}
 _material_block_runtime: dict = {
@@ -8398,7 +8466,10 @@ def _clear_all_cache():
     _sector_cache.clear();       _avg_volume_cache.clear()
     _prev_upper_cache.clear();   _daily_cache.clear();   _atr_cache.clear()
     _us_cache.clear();   _short_cache.clear();   _foreign_cache.clear()
-    _vp_cache.clear();   _pre_dart_cache.clear();   _theme_rotation_cache.clear()
+    _vp_cache.clear();   _pre_dart_cache.clear()
+    # v163.7 [#2]: clear() 후 "ts" 키 소멸 → KeyError 방지를 위해 재초기화
+    _theme_rotation_cache.clear()
+    _theme_rotation_cache.update({"ts": 0, "themes": {}, "strong": [], "weak": []})
     _geo_cache.clear()
     _deep_news_cache.clear()
     _force_cache.clear()
@@ -9398,7 +9469,7 @@ PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
 PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
 PRECLOSE_GAP_MIN_RR = float(os.getenv("PRECLOSE_GAP_MIN_RR", "1.00") or "1.00")
 PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT", "0.8") or "0.8")
-PRECLOSE_GAP_OPEN_EVAL_TIME_KRX = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_KRX", "09:05") or "09:05"
+PRECLOSE_GAP_OPEN_EVAL_TIME_KRX = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_KRX", "09:01") or "09:01"  # v163.7 [#3]: 09:05→09:01
 PRECLOSE_GAP_OPEN_EVAL_TIME_NXT = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_NXT", "08:05") or "08:05"
 _preclose_gap_entry_watch: dict = {}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
@@ -25276,6 +25347,32 @@ def _analyze_news_context(ctx: dict, score: int, reasons: list, sector_info: dic
                     _register_emergent_issue_theme(code, stock.get("name", code), emergent_theme, trigger="analyze")
     except Exception as _e:
         _log_error(f"analyze_news({code})", _e)
+
+    # v163.7 [#4]: Gemini grounding rows → 종목명/코드 매칭 → direct_news_hit
+    # grounding 수집은 됐지만 analyze() 점수에 미연결 문제 해결
+    if not direct_news_hit:
+        try:
+            _grounding_rows = list(_gemini_grounding_cache.get("rows") or [])
+            _stock_name = str(stock.get("name", "") or "").strip()
+            if _grounding_rows and _stock_name:
+                _name_lower = _stock_name.lower()
+                _code_str = str(code or "")
+                for _gr in _grounding_rows:
+                    _gr_text = str(_gr.get("text", "") or _gr.get("title", "") or _gr).lower()
+                    if _name_lower in _gr_text or _code_str in _gr_text:
+                        direct_news_hit = True
+                        _gr_title = str(_gr.get("title", "") or _gr_text[:30])
+                        score += 12
+                        reasons.append(f"📡 Gemini재료 매칭 [{_stock_name}] +12점 — {_gr_title[:30]}")
+                        if sector_info.get("theme", "") in ("", "기타업종", "unknown", "미분류"):
+                            _inferred_theme = str(_gr.get("theme", "") or _gr.get("sector", "") or "")
+                            if _inferred_theme:
+                                sector_info["theme"] = _inferred_theme
+                                sector_info["theme_key"] = _inferred_theme
+                        break
+        except Exception as _ge:
+            _swallow_exception(_ge)
+
     return score, news_articles, news_analysis, direct_news_hit, emergent_theme_hit, sector_info
 def _apply_direct_news_synergy(signal_type: str, direct_news_hit: bool, score: int, reasons: list) -> int:
     try:
@@ -25389,7 +25486,7 @@ def _apply_theme_rotation_context(stock: dict, score: int, reasons: list) -> int
                 score -= 8
                 reasons.append(f"🔄 [{theme_key}] 테마 약세 ({t_chg:+.1f}%) -8점")
     except Exception as e:
-        _swallow_exception(e)
+        _log_warn_msg(f"⚠️ _apply_theme_rotation_context 오류: {e}")  # v163.7 [#9]
     return score
 def _apply_earnings_risk_context(ctx: dict, score: int, reasons: list) -> tuple[bool, int, dict]:
     code = ctx["code"]
@@ -25525,6 +25622,45 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
             reasons.append(f"⚠️ NXT SURGE 재료 없음 {_NXT_SURGE_NO_MATERIAL_PENALTY}점")
     except Exception as _e:
         _swallow_exception(_e)
+
+    # v163.7 [#5]: get_investor_provisional_trend() → analyze 점수 연결
+    # v161.30에서 함수 선언 후 미연결 상태였던 가집계 수급을 실제 점수에 반영
+    try:
+        if is_any_market_open():
+            _mkt_for_prov = str((stock.get("market", "") or "KRX")).upper()
+            _prov = get_investor_provisional_trend(code, market=_mkt_for_prov)
+            _prov_f = safe_int(_prov.get("foreign_net", 0), 0)
+            _prov_i = safe_int(_prov.get("institution_net", 0), 0)
+            if _prov_f > 0 and _prov_i > 0:
+                score += 8
+                reasons.append(f"🏦 기관+외국인 동반 순매수 (가집계) +8점")
+            elif _prov_f > 0 or _prov_i > 0:
+                score += 4
+                reasons.append(f"🏦 기관/외국인 순매수 (가집계) +4점")
+            elif _prov_f < 0 and _prov_i < 0:
+                score -= 5
+                reasons.append(f"⚠️ 기관+외국인 동반 순매도 (가집계) -5점")
+    except Exception as _pe:
+        _swallow_exception(_pe)
+
+    # v163.7 [#6]: 전날 상한가 prewatch 종목 익일 조기감지 가중치
+    # prewatch 등록은 되지만 점수 가중이 없어 순위가 뒤로 밀리는 문제 해결
+    try:
+        _prev_upper_codes = set()
+        try:
+            _ul_data = _read_json_safe(UPPER_LIMIT_ALERTED_FILE, {})
+            _yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+            for _ul_code, _ul_info in (_ul_data if isinstance(_ul_data, dict) else {}).items():
+                _ul_date = str((_ul_info if isinstance(_ul_info, dict) else {}).get("date", "") or "")
+                if _ul_date == _yesterday_str:
+                    _prev_upper_codes.add(str(_ul_code))
+        except Exception:
+            pass
+        if code in _prev_upper_codes:
+            score += 5
+            reasons.append("⭐ 전날 상한가 익일 관찰종목 +5점")
+    except Exception as _ue:
+        _swallow_exception(_ue)
 
     # v163.4: F구간 마킹 — SURGE/EARLY_DETECT + 등락률 +7%↑ + 거래대금비율 3배↑
     # MID_PULLBACK 제외: 눌림목은 이미 F구간 통과 후 눌리는 것이므로 재마킹 무의미
@@ -32423,7 +32559,7 @@ def detect_theme_rotation() -> dict:
     THEME_MAP 기반 테마별 평균 등락률 계산 → 강세/약세 테마 감지.
     1시간 캐시. 반환: {강한테마: [], 약한테마: [], ts}
     """
-    if time.time() - _theme_rotation_cache["ts"] < 3600:
+    if time.time() - float(_theme_rotation_cache.get("ts", 0) or 0) < 3600:
         return _theme_rotation_cache
     theme_scores = {}
     try:
@@ -35315,8 +35451,13 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         return
     result = _coerce_run_scan_signal_defaults(result, fallback_code=result_code)
     if bool(result.get("_scan_payload_incomplete")):
+        _reasons = list(result.get("_scan_payload_missing_reasons") or [])
+        # v163.7 [#1]: missing_signal_type 단독이면 경고 로그 없이 조용히 drop
+        # _queue_run_scan_repair()에서 이미 차단하므로 중복 WARNING 불필요
+        if _reasons == ["missing_signal_type"]:
+            return
         _queue_run_scan_repair(result, stage="append")
-        _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(result.get('_scan_payload_missing_reasons', []))}")
+        _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(_reasons)}")
         return
     resolved_hist_key = hist_key or (f"NXT_{result_code}" if result.get("market") == "NXT" else result_code)
     prev_hist = _alert_history.get(resolved_hist_key, 0)
