@@ -3,10 +3,31 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.15
-날짜: 2026-04-17
+버전: v163.16
+날짜: 2026-04-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.16 (2026-04-18): Groq(Llama) 뉴스 파이프라인 신설 — RSS 크롤링→Groq 분석→재료 캐시 통합, Gemini 한도 소진 시 자동 fallback
+  [#1] _fetch_groq_news_rows() 신규 — fetch_all_news() RSS 헤드라인을 Groq Llama API로 분석하여 재료 rows 생성
+       이유: Gemini grounding 무료 한도 20회/일로 재료 캐시 TTL을 1시간으로 강제 유지 → 재료 파이프라인 병목
+             Groq 무료 티어는 Llama 3.3 70B 기준 14,400회/일 허용 → 한도 제약 없이 주기적 분석 가능
+       개선점: GROQ_API_KEY 환경변수 설정 시 활성화. Gemini grounding 실패/한도 소진 시 자동 fallback으로 동작
+              source="GROQ_GROUNDING" 태그로 기존 파이프라인과 구분. rows 구조는 _fetch_gemini_grounding_rows()와 동일
+       주의점: Groq는 웹 검색 기능 없음 — 봇이 RSS로 수집한 최신 헤드라인 텍스트를 직접 전달하여 분석
+              Gemini와 달리 실시간 검색 불가 → 뉴스 수집(fetch_all_news)→Groq 분석 2단계 구조
+              GROQ_MODEL 기본값: llama-3.3-70b-versatile. GROQ_API_KEY 미설정 시 완전 비활성화
+  [#2] GEMINI_GROUNDING_CACHE_TTL_SEC 3600→1200초(20분), Groq fallback 추가
+       이유: Groq로 한도 여유 생기면서 Gemini 1시간 캐시 유지 이유 소멸 → 20분으로 단축해 재료 신선도 향상
+             Groq 활성화 시 Gemini 실패해도 Groq rows로 재료 공백 없이 운영 가능
+       개선점: _get_material_signal_headline_rows()에서 _fetch_groq_news_rows() 호출 추가 (Gemini 다음 순서)
+       주의점: GEMINI_GROUNDING_CACHE_TTL_SEC 환경변수로 override 가능 (기본값만 변경)
+              GROQ_API_KEY 없으면 Groq 호출 생략 — 기존 Gemini 전용 동작 유지
+  [#3] /재료 명령 출력에 Groq 상태 추가
+       이유: Groq 활성화 여부·마지막 수집 시각을 운영자가 즉시 확인할 수 있도록
+       개선점: Gemini grounding 상태 블록 아래 Groq 상태 1줄 추가
+       주의점: GROQ_API_KEY 미설정 시 "비활성" 표시. 기존 Gemini 출력 변경 없음
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v163.15 (2026-04-17): 로그 분석 4개 패치 — entry_watch no_ask soft allow 확대·ETN 결측 WARNING 억제·네이버 URL 수정·utcnow 제거
   [#1] _should_soft_allow_no_ask_liquidity(): MID_PULLBACK 전용 → SURGE/EARLY_DETECT/STRONG_BUY NXT A등급 soft allow 추가
        이유: entry_watch 경로 no_ask_liquidity 186건 hard block — 씨젠·티엠씨·한국정보통신 등 NXT A등급 SURGE 종목이 진입가 도달 후 매도호가 없음 → 진입불가 차단 반복. MID_PULLBACK만 soft allow 허용하는 로직이 SURGE/EARLY_DETECT를 전량 차단
@@ -6342,8 +6363,16 @@ GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") o
 GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
-GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "3600") or "3600")   # v161.40: 900→3600초(1시간), 무료 RPD 절약
+GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "1200") or "1200")  # v163.16: 3600→1200초(20분), Groq fallback 추가로 한도 여유 생겨 단축
 GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "20") or "20")         # v161.40: 96→20회, 무료 RPD 실제 한도 고려
+# ── Groq API (v163.16) ──────────────────────────────────────────────────────
+# Gemini grounding 대안 — Llama 3.3 70B, 무료 14,400회/일
+# 뉴스 헤드라인(RSS 수집)을 Groq에 전달해 재료 분석 → rows 생성
+# GROQ_API_KEY 미설정 시 완전 비활성화
+GROQ_API_KEY   = str(os.getenv("GROQ_API_KEY", "") or "").strip()
+GROQ_MODEL     = str(os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile").strip()
+GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "1200") or "1200")  # 20분 캐시
+GROQ_GROUNDING_DAILY_LIMIT   = int(os.getenv("GROQ_GROUNDING_DAILY_LIMIT", "200") or "200")      # 하루 최대 호출 수 (여유 있음)
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
 # 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
 YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
@@ -6750,6 +6779,108 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         return list(_gemini_grounding_cache.get("rows", []))
 
 
+def _fetch_groq_news_rows() -> list[dict]:
+    """
+    v163.16: Groq Llama API로 한국 주식 재료 분석.
+    fetch_all_news()로 수집한 RSS 헤드라인을 Groq에 전달 → 재료 구조화.
+    Gemini grounding과 달리 웹 검색 기능 없음 — 봇이 직접 수집한 뉴스 텍스트를 분석.
+    GROQ_API_KEY 미설정 시 즉시 [] 반환.
+    캐시 TTL: GROQ_GROUNDING_CACHE_TTL_SEC (기본 20분).
+    """
+    global _groq_grounding_cache, _groq_grounding_daily_counter
+    if not GROQ_API_KEY:
+        return []
+    now = time.time()
+    # 캐시 유효 시 즉시 반환
+    if _groq_grounding_cache.get("rows") and now - float(_groq_grounding_cache.get("ts", 0) or 0) < GROQ_GROUNDING_CACHE_TTL_SEC:
+        return list(_groq_grounding_cache.get("rows", []))
+    # 일별 한도 체크
+    today = _now_kst().strftime("%Y-%m-%d")
+    if _groq_grounding_daily_counter.get("date") != today:
+        _groq_grounding_daily_counter = {"date": today, "count": 0}
+    if _groq_grounding_daily_counter.get("count", 0) >= GROQ_GROUNDING_DAILY_LIMIT:
+        _warn_throttled_once("groq_grounding_limit", f"⚠️ Groq grounding 일일 한도 도달 ({GROQ_GROUNDING_DAILY_LIMIT}회)", cooldown_sec=3600.0)
+        return list(_groq_grounding_cache.get("rows", []))
+    try:
+        # 뉴스 헤드라인 수집 (fetch_all_news 재사용 — 이미 캐시된 경우 빠름)
+        raw_headlines = []
+        try:
+            raw_headlines = fetch_all_news()
+        except Exception as _e:
+            _swallow_exception(_e)
+        if not raw_headlines:
+            return list(_groq_grounding_cache.get("rows", []))
+        # 상위 30개만 전달 (토큰 절약)
+        headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:30] if h)
+        today_str = _now_kst().strftime("%Y년 %m월 %d일")
+        prompt = (
+            f"오늘({today_str}) 아래 한국 주식 뉴스 헤드라인들을 분석해서 "
+            "주식시장에 영향을 줄 수 있는 주요 재료(호재/악재)를 추출해줘.\n"
+            "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
+            '{"items": [{"theme": "테마명", "direction": "up/down/neutral", "summary": "재료 1~2줄 요약", '
+            '"sectors": ["수혜섹터1", "수혜섹터2"], "stocks": ["종목명1", "종목명2"]}]}\n'
+            "최소 3개, 최대 8개 항목. 리딩방/투자 유도 내용은 제외. 실제 시장 재료만.\n\n"
+            f"뉴스 헤드라인:\n{headlines_text}"
+        )
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1024,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        raw = str((resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+        if not raw:
+            _groq_grounding_cache["ts"] = now
+            return list(_groq_grounding_cache.get("rows", []))
+        import json as _json
+        raw_clean = raw.replace("```json", "").replace("```", "").strip()
+        parsed = _json.loads(raw_clean)
+        items = parsed.get("items") or []
+        rows = []
+        for item in items[:8]:
+            theme = str(item.get("theme", "") or "").strip()
+            direction = str(item.get("direction", "neutral") or "neutral").strip()
+            summary = str(item.get("summary", "") or "").strip()
+            sectors = [str(s) for s in (item.get("sectors") or []) if s]
+            stocks = [str(s) for s in (item.get("stocks") or []) if s]
+            if not theme or not summary:
+                continue
+            dir_label = "📈상승재료" if direction == "up" else ("📉하락재료" if direction == "down" else "")
+            title = f"[Groq재료] {theme} {dir_label} {summary}".strip()
+            rows.append({
+                "title": title,
+                "source": "GROQ_GROUNDING",
+                "published_at": "",
+                "channel_id": "",
+                "live": "",
+                "gemini_stocks": [{"name": s, "theme": theme, "direction": direction, "reason": summary} for s in stocks[:4]],
+                "_sectors": sectors,
+            })
+        _groq_grounding_daily_counter["count"] = _groq_grounding_daily_counter.get("count", 0) + 1
+        _groq_grounding_cache = {"ts": now, "rows": rows}
+        print(f"[Groq] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_groq_grounding_daily_counter['count']}/{GROQ_GROUNDING_DAILY_LIMIT}회)")
+        return rows
+    except Exception as e:
+        _is_quota_err = any(k in str(e) for k in ("429", "rate_limit", "quota"))
+        _warn_throttled_once(
+            "groq_grounding_fetch",
+            f"⚠️ Groq grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
+            cooldown_sec=1800.0,
+        )
+        if _is_quota_err or not _groq_grounding_cache.get("rows"):
+            _groq_grounding_cache["ts"] = now
+        return list(_groq_grounding_cache.get("rows", []))
+
+
 def _fetch_youtube_material_headline_rows() -> list[dict]:
     """
     유튜브 재료 헤드라인 수집.
@@ -6875,6 +7006,10 @@ def _get_material_signal_headline_rows(force: bool = False) -> list[dict]:
         _swallow_exception(e)
     try:
         rows.extend(_fetch_gemini_grounding_rows())  # v161.37: Gemini grounding 재료 통합
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        rows.extend(_fetch_groq_news_rows())  # v163.16: Groq Llama fallback 재료 통합
     except Exception as e:
         _swallow_exception(e)
     try:
@@ -7259,6 +7394,8 @@ _youtube_gemini_analyzed_cache: dict = {}
 _youtube_gemini_daily_counter: dict = {"date": "", "count": 0}  # 하루 호출 카운터
 _youtube_fetch_daily: dict = {"date": "", "count": 0}  # v161.37: YouTube API 하루 fetch 횟수 제한용
 _gemini_grounding_cache: dict = {"ts": 0.0, "rows": []}  # v161.37: Gemini grounding 결과 캐시
+_groq_grounding_cache: dict = {"ts": 0.0, "rows": []}   # v163.16: Groq Llama 재료 분석 캐시
+_groq_grounding_daily_counter: dict = {"date": "", "count": 0}  # v163.16: Groq 전용 일별 호출 카운터
 GEMINI_GROUNDING_CACHE_FILE = _state_path("gemini_grounding_cache.json")  # v163.6: 재시작/실패 복원용
 
 def _save_gemini_grounding_cache() -> None:
@@ -32203,7 +32340,33 @@ def _handle_telegram_material_command():
         except Exception as e:
             _swallow_exception(e)
 
-        # ⑦ 미국 수치지표 (v162.1)
+        # ⑥-B Groq grounding 재료 (v163.16)
+        try:
+            if GROQ_API_KEY:
+                gq_cache = _groq_grounding_cache or {}
+                gq_rows = list(gq_cache.get("rows", []) or [])
+                gq_ts = float(gq_cache.get("ts", 0) or 0)
+                gq_age_m = int((time.time() - gq_ts) / 60) if gq_ts else -1
+                gq_age_str = f"{gq_age_m}분 전" if 0 <= gq_age_m < 60 else (f"{gq_age_m//60}시간 전" if gq_age_m >= 60 else "없음")
+                gq_today = _now_kst().strftime("%Y-%m-%d")
+                gq_cnt = _groq_grounding_daily_counter.get("count", 0) if _groq_grounding_daily_counter.get("date") == gq_today else 0
+                gq_lines = [f"🤖 <b>Groq(Llama) 재료</b> ({gq_age_str}) — 오늘 {gq_cnt}/{GROQ_GROUNDING_DAILY_LIMIT}회"]
+                if not gq_rows:
+                    gq_lines.append(f"  - 수집된 재료 없음 (매 {GROQ_GROUNDING_CACHE_TTL_SEC//60}분 갱신)")
+                else:
+                    for row in gq_rows[:4]:
+                        title = str(row.get("title", "") or "").replace("[Groq재료] ", "").strip()[:60]
+                        stocks = [str(s.get("name", "") or "") for s in (row.get("gemini_stocks") or []) if s.get("name")]
+                        directions = [str(s.get("direction", "") or "") for s in (row.get("gemini_stocks") or [])]
+                        dir_icon = "🔴" if "up" in directions else ("🔵" if "down" in directions else "🟡")
+                        gq_lines.append(f"  {dir_icon} {title}")
+                        if stocks:
+                            gq_lines.append(f"    → {'/'.join(stocks[:4])}")
+                parts.append("\n" + "\n".join(gq_lines))
+            else:
+                parts.append("\n🤖 <b>Groq(Llama) 재료</b> — 비활성 (GROQ_API_KEY 미설정)")
+        except Exception as e:
+            _swallow_exception(e)
         try:
             us = get_us_market_signals()
             us_lines = ["🌐 <b>미국 수치지표</b>"]
