@@ -3,10 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.13
+버전: v163.14
 날짜: 2026-04-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.14 (2026-04-17): v163.13 배포 후 로그 6개 추가 패치 — 대표진입가 즉시도달루프·no_ask드롭·NXT SURGE로그정리·섹터쿨다운·KIS진단·F존완화
+  [#1] register_entry_watch(): 현재가>=진입가 신규등록 시 60초 쿨다운
+       이유: 한국정보통신 대표진입가 갱신 시 현재가=진입가 → 즉시 "1차 진입가 도달" 알람 루프 (14:56·16:11 두 번 발생)
+       개선점: _entry_watch_register_cooldown dict 추가. cur_price >= entry 이고 동일 code:entry 60초 내 재등록 시 차단
+       주의점: _force_entry_watch=True 플래그로 강제 등록 가능. 진입가 도달 알람(entry_hit)은 별도 경로이므로 영향 없음
+  [#2] _handle_entry_watch_block_reason(): no_ask_liquidity soft allow 5회 초과 → 감시 드롭
+       이유: 한국정보통신 no_ask_liquidity 9회 반복 차단. 드롭 없이 계속 감시 → 의미없는 차단 로그만 누적
+       개선점: watch["no_ask_soft_count"] 카운터 추가. 5회 초과 시 _drop_no_ask_overflow=True → expired 처리
+       주의점: _process_entry_watch_item에서 drop 플래그 체크 추가. soft allow 이외 차단(hard block)은 기존 유지
+  [#3] _finalize_general_alert_dispatch(): NXT SURGE ✓ 로그를 쿨다운 통과 후에만 실질적으로 출력
+       이유: 녹십자웰빙 "✓ NXT SURGE" 로그가 16:46·17:03·17:19 찍혔으나 텔레그램은 미발송 → 로그 혼란
+       개선점: 쿨다운 차단 시 ✓ 로그 다음 줄에 ⏭ 쿨다운 로그로 명확히 구분
+       주의점: ✓ 로그 자체는 유지(포착 확인용). 쿨다운 차단 경로는 기존과 동일
+  [#4] _register_sector_leader_follow_seed(): touch_key 쿨다운 600→1800초
+       이유: 섹터 강제감시 매 10분마다 재등록 로그 → 30분 이내 재등록 차단으로 로그 노이즈 감소
+       개선점: 동일 seed_code 30분 내 재등록 차단. 실제 감시 내용은 변경 없음
+       주의점: 배포 직후 첫 1800초는 기존 등록 유지. 새 seed가 감지되면 별도 touch_key로 정상 등록
+  [#5] _rank_api_fallback(): KIS rank API 비활성 ts 기록 + 2시간 초과 시 텔레그램 진단 알림
+       이유: 오늘 정규장 내내 rank fallback[KRX] 상태 지속. F존 미작동 근본 원인. 감지 방법 부재
+       개선점: _disable_rank_api_for_today에 disabled_ts 저장. 2시간 초과 시 _warn_throttled_once로 텔레그램 알림
+       주의점: _warn_throttled_once 쿨다운 7200초(2시간). 같은 원인 반복 알림 방지
+  [#6] analyze(): F존 마킹 조건 완화 7%→5%, 3배→2배 + 재료미확인 시 진단 로그
+       이유: KIS rank API 비활성(fallback) 상태에서도 vol_ratio가 낮게 계산돼 F존 조건 미충족 가능
+       개선점: 7%↑+3배→5%↑+2배로 완화. 재료미확인(has_material=False) 마킹 시 📌 F존 마킹 로그 추가
+       주의점: F존 페널티(-15점)·후속 알람 로직 동일 유지. 조건 완화로 F존 마킹 종목 증가 가능
+
 - v163.13 (2026-04-17): 4/17 로그 진단 6개 패치 — Gemini 503 즉시재시도·NXT universe 공백·연속손절 강제강화·WebSocket 빠른재연결·손절후 MID_PULLBACK 우선스캔·전날상한가 NXT눌림목예외
   [#1] _fetch_gemini_grounding_rows(): 503 등 일시오류 시 ts 갱신 생략 → 다음 스캔에서 캐시 즉시 재사용
        이유: 08:02 Gemini 503 실패 후 ts=now 갱신으로 TTL 3600초 동안 재시도 차단 → NXT 개장 직전 재료 공백
@@ -7348,6 +7374,9 @@ SECTOR_RESEND_ENTRY_DEVIATION_PCT = float(os.getenv("SECTOR_RESEND_ENTRY_DEVIATI
 SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES = int(os.getenv("SECTOR_RESEND_ENTRY_HIT_GRACE_MINUTES", "10") or "10")
 # ── 진입가 감지 ──
 _entry_watch        = {}
+# v163.14 [#1]: 대표진입가=현재가 즉시도달 알람 루프 방지용 쿨다운
+# code → last_same_price_register_ts
+_entry_watch_register_cooldown: dict = {}
 ENTRY_REWATCH_MINS   = 10    # 30→10분 (진입 구간이 빠르게 지나감)
 ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC = int(os.getenv("ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC", "1800") or "1800")  # 동일 보류사유 재알림 최소 30분
 PHASE2_UPGRADE_ALERT_COOLDOWN_SEC = int(os.getenv("PHASE2_UPGRADE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 동일 강화판단 재알림 최소 30분
@@ -15086,7 +15115,8 @@ def _disable_rank_api_for_today(reason: str) -> None:
     try:
         _runtime_state_set(
             "rank_api_disable",
-            {"disabled_date": _now_kst().date().isoformat(), "reason": str(reason)},
+            {"disabled_date": _now_kst().date().isoformat(), "reason": str(reason),
+             "disabled_ts": time.time()},  # v163.14 [#5]: 비활성 시작 ts 기록
             legacy_path=_RANK_API_DISABLE_FILE,
         )
     except Exception as e:
@@ -15148,6 +15178,20 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
             msg += f" body={body_snip}"
         _log_info_msg(msg)
         _rank_api_disable_notified = True
+    else:
+        # v163.14 [#5]: 비활성 2시간 초과 시 추가 진단 알림 (장중 1회)
+        try:
+            obj = _runtime_state_get("rank_api_disable", {}, legacy_path=_RANK_API_DISABLE_FILE)
+            _dis_ts = float((obj or {}).get("disabled_ts", 0) or 0)
+            if _dis_ts and time.time() - _dis_ts > 7200:
+                _warn_throttled_once(
+                    "rank_api_inactive_alert",
+                    f"🔴 [KIS] rank API 비활성 2시간 초과 — F존 미작동 가능. "
+                    f"원인: {(obj or {}).get('reason','?')} / 유니버스 fallback 지속 중",
+                    cooldown_sec=7200.0,
+                )
+        except Exception as _rdiag_e:
+            _swallow_exception(_rdiag_e)
     _log_info_msg(f"  ↪ rank fallback[{market}] {len(items)}건")
     return items
 def get_upper_limit_stocks() -> list:
@@ -17345,7 +17389,7 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
     market = "NXT" if str(seed.get("market", "") or "").upper() == "NXT" else "KRX"
     touch_key = f"{datetime.now().strftime('%Y%m%d')}_{market}_{seed_code}"
     last_touch = float(_sector_leader_follow_seed_touched.get(touch_key, 0) or 0)
-    if time.time() - last_touch < 600:
+    if time.time() - last_touch < 1800:  # v163.14 [#4]: 600→1800초 (매 30분 재등록 로그 노이즈 제거)
         return 0
     theme_name, peers, _ = get_theme_sector_stocks(seed_code)
     if _is_generic_sector_theme(theme_name) or not peers:
@@ -22389,6 +22433,20 @@ def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry:
         return
+    # v163.14 [#1]: 대표진입가=현재가 즉시도달 알람 루프 방지
+    # 현재가 >= 신규 진입가이면서 직전 등록과 동일한 경우 60초 쿨다운
+    _cur_price_chk = safe_int(s.get("price", 0), 0)
+    _code_chk = normalize_stock_code(s.get("code", ""))
+    if _cur_price_chk and entry and _cur_price_chk >= entry and not s.get("_force_entry_watch"):
+        _cd_key = f"{_code_chk}:{entry}"
+        _last_reg = float(_entry_watch_register_cooldown.get(_cd_key, 0) or 0)
+        if time.time() - _last_reg < 60:
+            _log_info_msg(
+                f"  ⏭ 진입가 즉시도달 쿨다운: {_resolve_stock_name(_code_chk, s.get('name',''))} "
+                f"진입가{entry:,}=현재가{_cur_price_chk:,} (60초 쿨다운)"
+            )
+            return
+        _entry_watch_register_cooldown[_cd_key] = time.time()
     if s.get("execution_setup_required") and not s.get("force_register_entry_watch"):
         _register_execution_setup_watch(s)
         return
@@ -23972,12 +24030,22 @@ def _handle_entry_watch_block_reason(watch: dict, cur: dict, price: int, entry: 
     if not blocked_reason:
         return False, changed
     if blocked_reason == "no_ask_liquidity" and _should_soft_allow_no_ask_liquidity(cur, watch):
+        # v163.14 [#2]: no_ask_liquidity soft allow 5회 초과 → 감시 드롭
+        _na_soft_count = safe_int(watch.get("no_ask_soft_count", 0), 0) + 1
+        watch["no_ask_soft_count"] = _na_soft_count
         _log_suppressed_alert(
             watch["code"], watch["name"],
-            f"진입호가 경고(soft) ({blocked_reason})",
+            f"진입호가 경고(soft) ({blocked_reason}) {_na_soft_count}회",
             watch.get("signal_type", ""),
             {"entry_price": entry, "blocked_price": int(price or 0), "change_rate": cur.get("change_rate", 0), "ask_qty": cur.get("ask_qty", 0), "bid_qty": cur.get("bid_qty", 0)}
         )
+        if _na_soft_count >= 5:
+            _log_info_msg(
+                f"  ⏭ no_ask_liquidity {_na_soft_count}회 → 진입가 감시 드롭: "
+                f"{watch.get('name','')} ({watch.get('code','')})"
+            )
+            watch["_drop_no_ask_overflow"] = True
+            return True, True  # expired 처리는 _process_entry_watch_item에서
         if watch.get("entry_hit") and _notify_entry_guard_followup(watch, blocked_reason, price, entry, use_nxt=use_nxt, detail="매도호가가 얇아 실제 체결 품질을 다시 확인해야 합니다."):
             changed = True
         return True, changed
@@ -24044,6 +24112,10 @@ def _process_entry_watch_item(log_key: str, watch: dict, expired: list) -> bool:
         watch["observe_count"] = safe_int(watch.get("observe_count", 0), 0) + 1
         if watch.get("entry_hit_locked"):
             return changed
+        # v163.14 [#2]: no_ask_liquidity 5회 초과 드롭 플래그
+        if watch.get("_drop_no_ask_overflow"):
+            expired.append((log_key, "no_ask_overflow_drop", _entry_watch_final_status(watch, "진입불가드롭")))
+            return True
         entry = watch["entry_price"]
         diff_pct = (price - entry) / entry * 100
         reach_slack_pct = _get_dynamic_entry_reach_slack_pct(watch)
@@ -25987,8 +26059,14 @@ def _apply_analyze_market_context(ctx: dict) -> bool:
             or bool(ctx.get("force_external_capture_alert"))
         )
         _fz_is_surge = _fz_sig_type in ("SURGE", "EARLY_DETECT")
-        if _fz_is_surge and _fz_chg >= 7.0 and _fz_vol >= 3.0 and _fz_code:
+        # v163.14 [#6]: F존 조건 완화 7%→5%, 3배→2배 — KIS rank API 비활성(fallback) 상태에서도 포착
+        if _fz_is_surge and _fz_chg >= 5.0 and _fz_vol >= 2.0 and _fz_code:
             _mark_f_zone(_fz_code, has_material=_fz_has_material)
+            if not _fz_has_material:
+                _log_info_msg(
+                    f"  📌 F존 마킹: {_resolve_stock_name(_fz_code, _fz_code)} "
+                    f"+{_fz_chg:.1f}% 거래량{_fz_vol:.1f}배 재료미확인"
+                )
     except Exception as _e:
         _swallow_exception(_e)
 
@@ -27949,6 +28027,7 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     # v163.6: NXT SURGE 동일 종목 2시간 텔레그램 쿨다운 — 에스투더블유류 7회 중복 발송 방지
     # 진입가 도달 알람은 예외(쿨다운 미적용)
+    # v163.14 [#3]: ✓ 로그는 쿨다운 통과 후에만 의미 있으므로 쿨다운 차단 시 ✓ 대신 ⏭ 로 교체
     if (signal_type == "SURGE"
             and str(s.get("market") or s.get("_market") or "").upper() == "NXT"
             and not s.get("_entry_hit_alert")):
@@ -27957,6 +28036,7 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         if isinstance(prev_nxt, dict):
             elapsed = time.time() - float(prev_nxt.get("ts", 0) or 0)
             if elapsed < 7200:  # 2시간
+                # v163.14 [#3]: ✓ 로그 취소 (이미 출력됨) → 덮어쓰기용 ⏭ 로그
                 _log_info_msg(f"  ⏭ {name} — NXT SURGE 2시간 쿨다운 ({int(elapsed//60)}분 경과, 대표갱신만)")
                 save_signal_log(s)
                 register_entry_watch(s)  # 진입가 갱신은 유지
