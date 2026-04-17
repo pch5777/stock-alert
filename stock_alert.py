@@ -3,10 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.14
+버전: v163.15
 날짜: 2026-04-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.15 (2026-04-17): 로그 분석 4개 패치 — entry_watch no_ask soft allow 확대·ETN 결측 WARNING 억제·네이버 URL 수정·utcnow 제거
+  [#1] _should_soft_allow_no_ask_liquidity(): MID_PULLBACK 전용 → SURGE/EARLY_DETECT/STRONG_BUY NXT A등급 soft allow 추가
+       이유: entry_watch 경로 no_ask_liquidity 186건 hard block — 씨젠·티엠씨·한국정보통신 등 NXT A등급 SURGE 종목이 진입가 도달 후 매도호가 없음 → 진입불가 차단 반복. MID_PULLBACK만 soft allow 허용하는 로직이 SURGE/EARLY_DETECT를 전량 차단
+       개선점: NXT + A등급 + score≥72 + change_rate≥5.0% 조건에서 soft allow True 반환. KRX SURGE는 기존 MID_PULLBACK 조건 유지 (의도적 보수 유지)
+       주의점: entry_watch용 함수 (_should_soft_allow_no_ask_liquidity) 수정. 일반포착용 (_should_soft_allow_no_ask_liquidity_general) 별개 — 변경 없음. no_ask_soft_count 5회 드롭 로직 동일 적용
+  [#2] _queue_run_scan_repair() / _drain_run_scan_repair_queue(): ETN 레버리지/인버스 복합결측 WARNING 억제
+       이유: 정규장 내내 레버리지·인버스 ETN 30종목 "run_scan alert 결측 재복구 대기" WARNING 반복 출력. v163.11에서 ETN 복합결측 큐 차단 패치됐으나 해당 경로(missing_price+missing_signal_type+missing_score)는 WARNING 출력 후 차단되어 노이즈 잔존
+       개선점: is_scoring_only_instrument() 판별 종목(ETN/선물 등)은 결측 WARNING 출력 없이 조용히 드롭. 기존 큐 차단 로직 유지
+       주의점: is_scoring_only_instrument()가 True인 종목만 적용. 일반 주식 결측은 기존대로 WARNING 출력
+  [#3] send_with_chart_buttons(): 네이버 차트 URL 수정
+       이유: finance.naver.com/item/fchart.naver?code={code} → 모바일 미지원 URL 사용 중
+       개선점: m.stock.naver.com/domestic/stock/{code}/total 로 수정 (SKILL.md 명시 정상 URL)
+       주의점: 버튼 텍스트 동일 유지
+  [#4] _build_youtube_published_after_iso(): datetime.utcnow() → datetime.now(timezone.utc) 수정
+       이유: Python 3.12+ DeprecationWarning — datetime.utcnow() 매 배포 시 경고 출력
+       개선점: timezone.utc aware datetime 사용으로 경고 제거
+       주의점: 반환 형식(.isoformat() + "Z") 동일 유지
+
 - v163.14 (2026-04-17): v163.13 배포 후 로그 6개 추가 패치 — 대표진입가 즉시도달루프·no_ask드롭·NXT SURGE로그정리·섹터쿨다운·KIS진단·F존완화
   [#1] register_entry_watch(): 현재가>=진입가 신규등록 시 60초 쿨다운
        이유: 한국정보통신 대표진입가 갱신 시 현재가=진입가 → 즉시 "1차 진입가 도달" 알람 루프 (14:56·16:11 두 번 발생)
@@ -6408,8 +6426,10 @@ def _random_ua() -> dict:
 
 def _build_youtube_published_after_iso(hours: int) -> str:
     lookback = max(1, int(hours or 1))
-    cutoff = datetime.utcnow() - timedelta(hours=lookback)
-    return cutoff.replace(microsecond=0).isoformat() + "Z"
+    # v163.15 [#4]: datetime.utcnow() deprecated → timezone.utc aware datetime 사용
+    from datetime import timezone as _tz
+    cutoff = datetime.now(_tz.utc) - timedelta(hours=lookback)
+    return cutoff.replace(microsecond=0).isoformat().replace("+00:00", "") + "Z"
 
 
 def _gemini_daily_count_ok() -> bool:
@@ -18478,13 +18498,27 @@ def _get_dynamic_entry_reach_slack_pct(watch: dict | None = None) -> float:
 def _should_soft_allow_no_ask_liquidity(cur: dict, signal: dict | None = None) -> bool:
     signal = signal if isinstance(signal, dict) else {}
     sig_type = str(signal.get("signal_type") or "")
-    if sig_type != "MID_PULLBACK":
-        return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
         return False
-    if bid_qty > 0 and float(cur.get("change_rate", 0.0) or 0.0) >= 29.0:
+    change_rate = float(cur.get("change_rate", 0.0) or signal.get("change_rate", 0.0) or 0.0)
+    if bid_qty > 0 and change_rate >= 29.0:
+        return False
+    # v163.15 [#1]: NXT A등급 SURGE/EARLY_DETECT/STRONG_BUY soft allow 추가
+    # entry_watch 경로 no_ask_liquidity 186건 hard block 원인 — MID_PULLBACK만 허용하던 조건 확대
+    if sig_type in ("SURGE", "EARLY_DETECT", "STRONG_BUY"):
+        grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+        score = int(signal.get("score", 0) or 0)
+        market = str(signal.get("market") or "").upper()
+        if market == "NXT" and grade == "A" and score >= 72 and change_rate >= 5.0:
+            return True
+        # 직접뉴스 확인된 경우 KRX도 soft allow
+        if grade == "A" and (signal.get("direct_news_hit") or signal.get("direct_news_theme")):
+            return True
+        return False
+    # MID_PULLBACK 기존 로직 유지
+    if sig_type != "MID_PULLBACK":
         return False
     if signal.get("entry_soft_block_allowed"):
         return True
@@ -24410,7 +24444,8 @@ def send_with_chart_buttons(text: str, code: str, name: str):
     버튼은 기기 기본 브라우저(외부)로 열림
     """
     safe_name = _resolve_stock_name(code, name)
-    naver = f"https://finance.naver.com/item/fchart.naver?code={code}"
+    # v163.15 [#3]: 모바일 지원 URL로 수정 (SKILL.md 명시 정상 URL)
+    naver = f"https://m.stock.naver.com/domestic/stock/{code}/total"
     keyboard = {
         "inline_keyboard": [[
             {"text": f"📈 {safe_name} 차트 보기 (네이버)", "url": naver},
@@ -35865,6 +35900,10 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
         # v163.7 [#1]: missing_signal_type 단독이면 경고 로그 없이 조용히 drop
         # _queue_run_scan_repair()에서 이미 차단하므로 중복 WARNING 불필요
         if _reasons == ["missing_signal_type"]:
+            return
+        # v163.15 [#2]: ETN/레버리지/인버스 복합결측 종목은 WARNING 없이 조용히 드롭
+        _res_name = str(result.get("name") or "")
+        if is_scoring_only_instrument(result_code, _res_name):
             return
         _queue_run_scan_repair(result, stage="append")
         _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(_reasons)}")
