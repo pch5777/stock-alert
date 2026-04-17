@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.16
+버전: v163.17
 날짜: 2026-04-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.17 (2026-04-18): 재료 캐시 TTL 20분→10분 단축
+  [#1] GEMINI_GROUNDING_CACHE_TTL_SEC / GROQ_GROUNDING_CACHE_TTL_SEC 1200→600초
+       이유: Groq 200회/일 한도 기준 최소 주기 7분 → 10분이 한도 내 최적값
+             뉴스 RSS 갱신 주기(5~10분)와 일치 — 더 짧으면 동일 헤드라인 반복 분석
+       개선점: 재료 신선도 20분→10분으로 향상. 환경변수 override 가능
+       주의점: Groq 하루 144회 소비(200회 한도 내 여유). Gemini는 기존 20회/일 한도 유지
+
 - v163.16 (2026-04-18): Groq(Llama) 뉴스 파이프라인 신설 — RSS 크롤링→Groq 분석→재료 캐시 통합, Gemini 한도 소진 시 자동 fallback
   [#1] _fetch_groq_news_rows() 신규 — fetch_all_news() RSS 헤드라인을 Groq Llama API로 분석하여 재료 rows 생성
        이유: Gemini grounding 무료 한도 20회/일로 재료 캐시 TTL을 1시간으로 강제 유지 → 재료 파이프라인 병목
@@ -6363,7 +6370,7 @@ GEMINI_MODEL = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17") o
 GEMINI_YOUTUBE_MAX_PER_CYCLE = int(os.getenv("GEMINI_YOUTUBE_MAX_PER_CYCLE", "2") or "2")   # 사이클당 최대 분석 영상 수 (v161.20: 5→2, 429 방지)
 GEMINI_YOUTUBE_CACHE_TTL_SEC = int(os.getenv("GEMINI_YOUTUBE_CACHE_TTL_SEC", "86400") or "86400")  # 24시간 캐시
 GEMINI_YOUTUBE_DAILY_LIMIT = int(os.getenv("GEMINI_YOUTUBE_DAILY_LIMIT", "200") or "200")    # 하루 최대 호출 수 (무료 250 이하)
-GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "1200") or "1200")  # v163.16: 3600→1200초(20분), Groq fallback 추가로 한도 여유 생겨 단축
+GEMINI_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GEMINI_GROUNDING_CACHE_TTL_SEC", "600") or "600")  # v163.17: 3600→600초(10분), Groq fallback으로 한도 여유 생겨 단축
 GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "20") or "20")         # v161.40: 96→20회, 무료 RPD 실제 한도 고려
 # ── Groq API (v163.16) ──────────────────────────────────────────────────────
 # Gemini grounding 대안 — Llama 3.3 70B, 무료 14,400회/일
@@ -6371,7 +6378,7 @@ GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "20
 # GROQ_API_KEY 미설정 시 완전 비활성화
 GROQ_API_KEY   = str(os.getenv("GROQ_API_KEY", "") or "").strip()
 GROQ_MODEL     = str(os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile").strip()
-GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "1200") or "1200")  # 20분 캐시
+GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "600") or "600")  # v163.17: 10분 캐시 (뉴스 갱신 주기 기준)
 GROQ_GROUNDING_DAILY_LIMIT   = int(os.getenv("GROQ_GROUNDING_DAILY_LIMIT", "200") or "200")      # 하루 최대 호출 수 (여유 있음)
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
 # 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
