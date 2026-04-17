@@ -3,10 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.12
+버전: v163.13
 날짜: 2026-04-17
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.13 (2026-04-17): 4/17 로그 진단 6개 패치 — Gemini 503 즉시재시도·NXT universe 공백·연속손절 강제강화·WebSocket 빠른재연결·손절후 MID_PULLBACK 우선스캔·전날상한가 NXT눌림목예외
+  [#1] _fetch_gemini_grounding_rows(): 503 등 일시오류 시 ts 갱신 생략 → 다음 스캔에서 캐시 즉시 재사용
+       이유: 08:02 Gemini 503 실패 후 ts=now 갱신으로 TTL 3600초 동안 재시도 차단 → NXT 개장 직전 재료 공백
+       개선점: 429/quota 초과는 기존대로 ts 갱신 유지 (루프 방지). rows 있는 503 류만 ts 생략
+       주의점: _is_quota_err 판별에 "429", "quota", "RESOURCE_EXHAUSTED" 포함
+  [#2] _fetch_external_rank_top(): universe_nxt 0건 → get_nxt_surge_stocks() 직접 재시도
+       이유: 오늘 08:16 "상승0건+거래대금0건 보완 → rank fallback[KRX] 15건" — NXT 데이터 없이 KRX 대체 스캔
+       개선점: universe_nxt 결과가 0건이면 KIS NXT volume-rank API 직접 1회 재시도 후 합산
+       주의점: get_nxt_surge_stocks() 실패 시 _swallow_exception 처리로 기존 fallback 유지
+  [#3] WS_RECONNECT_MAX_SEC: 120→15초
+       이유: 09:25 WebSocket Broken pipe 후 최대 120초 백오프 → 실제 40분간 WebSocket 불안정 지속
+       개선점: 장중 재연결 대기 최대 15초로 단축 → Broken pipe 후 빠른 복구
+       주의점: 환경변수 WS_RECONNECT_BASE_SEC는 그대로. WS_RECONNECT_MAX_SEC 환경변수로 override 가능
+  [#4] 연속손절 10회 이상 → min_score 강제 +5 상향 + 3시간 후 자동 복원
+       이유: 12연속 손절에도 auto_tune "유효 파라미터 변경 없음" — 샘플 부족(MIN_SAMPLES) or 데이터 수렴으로 파라미터 미변경
+       개선점: 10연속 이상 시 _dynamic min_score_normal/strict 직접 +5. _check_and_restore_emergency_score_boost()로 3시간 후 복원
+       주의점: auto_tune() 호출 시 복원 체크 실행. 80/88 상한 유지
+  [#5] _stopped_priority_pool: 손절 완료 종목 MID_PULLBACK 우선 스캔
+       이유: 09:25~11:43 12연속 손절 종목(클로봇·미래나노텍·씨젠 등) 이후 눌림목 재진입 신호 미발생
+       개선점: 손절 시 _stopped_priority_pool 등록 → run_mid_pullback_scan에서 일반 후보군보다 먼저 스캔
+       주의점: _clear_reentry_watch_all() 호출 시 함께 초기화. NXT 시간대 차단 필터 동일 적용
+  [#6] NXT 눌림목 차단 예외: 전날상한가 prewatch 종목 or 손절후우선스캔 풀 종목은 비NXT여도 허용
+       이유: 드림시큐리티(4/15 상한가) NXT 시간대 눌림목 차단 → 진입 기회 상실
+       개선점: nxt_only_window에서 is_nxt_listed=False여도 prev_upper_limit prewatch or _stopped_priority_pool 종목은 스캔 허용
+       주의점: 해당 종목에도 기존 cooldown gate(_passes_mid_pullback_cooldown_gate) 동일 적용
+
 - v163.12 (2026-04-17): WebSocket Broken pipe 무한재시도 차단
   [#1] _ws_subscribe() / _ws_unsubscribe(): _ws_connected False 시 즉시 return
        이유: 4/16 08:00:07 WebSocket 연결 실패(Connection to remote host was lost) 후
@@ -5371,6 +5397,15 @@ def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: in
     if market_basis == "NXT":
         raw = _rank_from_universe("NXT")
         items = [{**r, "source": "universe_nxt", "market": "NXT"} for r in raw]
+        # v163.13 [#2]: universe_nxt 0건이면 KIS NXT volume-rank API 직접 재시도
+        if not items:
+            try:
+                nxt_direct = get_nxt_surge_stocks()
+                if nxt_direct:
+                    items = [{**r, "source": "universe_nxt", "market": "NXT"} for r in nxt_direct]
+                    _log_info_msg(f"  🔄 universe_nxt 0건 → NXT volume-rank 직접 재시도 {len(items)}건 확보")
+            except Exception as _nxt_retry_e:
+                _swallow_exception(_nxt_retry_e)
     else:
         items = _fetch_naver_rank("rise", top_n=top_n)
         if not items:
@@ -5868,7 +5903,7 @@ WEBSOCKET_ENABLED      = os.environ.get("WEBSOCKET_ENABLED", "true").strip().low
 WS_URL                 = os.environ.get("WS_URL", "ws://ops.koreainvestment.com:21000").strip().rstrip("/")
 WS_MAX_SUBSCRIPTIONS   = int(os.environ.get("WS_MAX_SUBSCRIPTIONS", "20") or "20")   # KIS 세션당 구독 상한
 WS_RECONNECT_BASE_SEC  = float(os.environ.get("WS_RECONNECT_BASE_SEC", "2.0") or "2.0")
-WS_RECONNECT_MAX_SEC   = float(os.environ.get("WS_RECONNECT_MAX_SEC", "120.0") or "120.0")
+WS_RECONNECT_MAX_SEC   = float(os.environ.get("WS_RECONNECT_MAX_SEC", "15.0") or "15.0")  # v163.13 [#3]: 120→15초 (장중 Broken pipe 후 40분 지연 방지)
 WS_SYNC_INTERVAL_SEC   = int(os.environ.get("WS_SYNC_INTERVAL_SEC", "15") or "15")   # 구독 동기화 주기
 DART_API_KEY       = os.environ.get("DART_API_KEY", "")      # DART 공시 API
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -6650,6 +6685,7 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         print(f"[Gemini] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_gemini_grounding_daily_counter['count']}/{GEMINI_GROUNDING_DAILY_LIMIT}회)")
         return rows
     except Exception as e:
+        _is_quota_err = any(k in str(e) for k in ("429", "quota", "RESOURCE_EXHAUSTED"))
         _warn_throttled_once(
             "gemini_grounding_fetch",
             f"⚠️ Gemini grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
@@ -6658,8 +6694,13 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         # v163.6: 실패 시 파일 캐시에서 rows 복원 — API 오류로 스캔 풀 빈 상태 방지
         if not _gemini_grounding_cache.get("rows"):
             _load_gemini_grounding_cache()
-        # v161.40: 실패해도 캐시 ts 갱신 → TTL 동안 재시도 차단 (429 루프 방지)
-        _gemini_grounding_cache["ts"] = now
+        # v163.13 [#1]: 503/일시오류는 ts를 갱신하지 않아 다음 스캔에서 즉시 재시도 가능하게 허용
+        # 단, 429/quota 초과는 기존대로 ts 갱신해 TTL 동안 재시도 차단 (루프 방지)
+        if _is_quota_err or not _gemini_grounding_cache.get("rows"):
+            _gemini_grounding_cache["ts"] = now
+        else:
+            # 캐시에 rows가 있는 503 류 실패 → ts 갱신 생략 → 다음 호출에서 캐시 재사용 즉시 가능
+            pass
         return list(_gemini_grounding_cache.get("rows", []))
 
 
@@ -7377,6 +7418,9 @@ INFO_FLUSH_INTERVAL  = 300        # 600→300초 (5분)
 # code → {name, stop_price, ts, signal_type, entry, stop, target}
 # 만료 기준: 시간 제한 없이 장 마감(on_market_close)에서 일괄 초기화
 _reentry_watch: dict = {}
+# v163.13 [#5]: 손절 완료 종목 → MID_PULLBACK 스캔 우선 풀 (당일 초기화)
+# code → {name, stop_ts, orig_entry, orig_signal_type}
+_stopped_priority_pool: dict = {}
 # REENTRY_BOUNCE_PCT 제거 — calc_reentry_bounce() ATR 기반으로 대체됨
 REENTRY_VOL_MIN     = 1.5   # 2.0→1.5배 (조건 완화)
 # ============================================================
@@ -9809,6 +9853,7 @@ def _load_reentry_watch() -> None:
         _reentry_watch = {}
 def _clear_reentry_watch_all() -> None:
     _reentry_watch.clear()
+    _stopped_priority_pool.clear()  # v163.13 [#5]: 손절후우선스캔 풀 함께 초기화
     _save_reentry_watch()
 def _save_execution_setup_watch(force: bool = True) -> None:
     global _execution_setup_watch_last_persist_ts
@@ -14331,12 +14376,40 @@ def run_mid_pullback_scan():
         _log_info_msg(f"\n[{datetime.now().strftime('%H:%M:%S')}] 눌림목 스캔{'(NXT포함)' if nxt_open else ''}...")
         _ensure_dynamic_candidates_fresh()
         signals = []
+
+        # v163.13 [#5]: 손절 완료 종목 우선 스캔 (MID_PULLBACK 재진입 포착 강화)
+        _stopped_codes_snapshot = dict(_stopped_priority_pool)
+        for code, meta in _stopped_codes_snapshot.items():
+            name = meta.get("name", code)
+            if nxt_only_window and not is_nxt_listed(code):
+                continue
+            if not _passes_mid_pullback_cooldown_gate(code, name):
+                continue
+            theme_desc = f"손절후재진입[{meta.get('orig_signal_type','')}]"
+            result = _build_mid_pullback_scan_result(code, name, theme_desc)
+            if result:
+                result["_stopped_priority"] = True
+                if nxt_only_window:
+                    result["market"] = "NXT"
+                signals.append(result)
+                _log_info_msg(f"  🔁 손절후우선스캔: {name} ({code})")
+
         for code, name, theme_desc in get_all_scan_candidates():
             # v161.45: NXT 전용 시간대에 KRX 미상장 종목 스캔 제외
             # v163.3: is_nxt_listed() 불안정 → nxt_only_window 필터 통과 종목에 market="NXT" 직접 마킹
+            # v163.13 [#6]: 전날상한가 prewatch 종목 또는 손절후우선스캔 종목은 예외 허용
             if nxt_only_window and not is_nxt_listed(code):
-                _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(눌림목): {name} ({code})")
-                continue
+                _is_prev_upper_prewatch = any(
+                    v.get("source") == "prev_upper_limit"
+                    for v in _news_issue_prewatch.values()
+                    if isinstance(v, dict) and any(
+                        s.get("code") == code for s in (v.get("stocks") or [])
+                    )
+                )
+                _is_stopped_priority = code in _stopped_priority_pool
+                if not _is_prev_upper_prewatch and not _is_stopped_priority:
+                    _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(눌림목): {name} ({code})")
+                    continue
             name = _resolve_stock_name(code, name)
             if not _passes_mid_pullback_cooldown_gate(code, name):
                 continue
@@ -19655,6 +19728,23 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
         if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
             _log_warn_msg(f"  🚨 연속 손절 {_consecutive_loss_count}회 → 긴급 튜닝 평가")
             auto_tune(notify=False)
+        # v163.13 [#4]: 10연속 손절 → auto_tune "변경없음" 루프 돌파용 강제 min_score 상향
+        if _consecutive_loss_count >= 10:
+            _old_n = int(_dynamic.get("min_score_normal", 56))
+            _old_s = int(_dynamic.get("min_score_strict", 66))
+            _new_n = min(_old_n + 5, 80)
+            _new_s = min(_old_s + 5, 88)
+            if _new_n > _old_n or _new_s > _old_s:
+                _dynamic["min_score_normal"] = _new_n
+                _dynamic["min_score_strict"] = _new_s
+                _log_warn_msg(
+                    f"  🛑 연속 손절 {_consecutive_loss_count}회 → 진입 기준 강제 강화: "
+                    f"min_score {_old_n}/{_old_s} → {_new_n}/{_new_s} (3시간 후 자동복원)"
+                )
+                # 3시간 후 복원 예약 (동적 복원 타임스탬프 기록)
+                _dynamic["_emergency_score_boost_ts"] = time.time()
+                _dynamic["_emergency_score_boost_n"] = _old_n
+                _dynamic["_emergency_score_boost_s"] = _old_s
     else:
         if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
             _clear_emergency_tune_state("win_recovered")
@@ -19885,6 +19975,16 @@ def _register_tracking_reentry_watch_from_result(rec: dict) -> None:
         }
         _save_reentry_watch()
         _log_info_msg(f"  🔄 재진입 감시 등록: {name} ({code}) 손절가 {cur_price:,}")
+        # v163.13 [#5]: 손절 완료 종목을 MID_PULLBACK 우선 스캔 풀에 추가
+        try:
+            _stopped_priority_pool[code] = {
+                "name": name,
+                "stop_ts": time.time(),
+                "orig_entry": rec.get("entry_price", 0),
+                "orig_signal_type": rec.get("signal_type", ""),
+            }
+        except Exception as _spp_e:
+            _swallow_exception(_spp_e)
         # v161.11: 손절 완료 종목은 TOP 리스트에서 즉시 제거
         if code in _today_top_signals:
             _today_top_signals.pop(code, None)
@@ -20174,6 +20274,26 @@ _consecutive_loss_count: int = 0
 _consecutive_win_count:  int = 0   # ③ 연속 수익 카운터
 EMERGENCY_TUNE_THRESHOLD   = 3     # 연속 손절 N회 → 즉시 조건 강화
 WIN_STREAK_THRESHOLD       = 4     # 연속 수익 N회 → 공격 모드 진입
+def _check_and_restore_emergency_score_boost():
+    """v163.13 [#4]: 연속손절 강제 min_score 상향 후 3시간 경과 시 원래값으로 복원"""
+    boost_ts = float(_dynamic.get("_emergency_score_boost_ts") or 0)
+    if boost_ts <= 0:
+        return
+    elapsed = time.time() - boost_ts
+    if elapsed >= 10800:  # 3시간 = 10800초
+        orig_n = int(_dynamic.get("_emergency_score_boost_n") or 56)
+        orig_s = int(_dynamic.get("_emergency_score_boost_s") or 66)
+        cur_n = int(_dynamic.get("min_score_normal", 56))
+        cur_s = int(_dynamic.get("min_score_strict", 66))
+        _dynamic["min_score_normal"] = orig_n
+        _dynamic["min_score_strict"] = orig_s
+        _dynamic.pop("_emergency_score_boost_ts", None)
+        _dynamic.pop("_emergency_score_boost_n", None)
+        _dynamic.pop("_emergency_score_boost_s", None)
+        _log_info_msg(
+            f"  ✅ 긴급 min_score 강화 복원: {cur_n}/{cur_s} → {orig_n}/{orig_s} (3시간 경과)"
+        )
+
 def _save_dynamic_params():
     """
     현재 _dynamic 값을 파일에 저장
@@ -21142,6 +21262,8 @@ def auto_tune(notify: bool = True):
     if not _try_acquire_leader_lock():
         _log_info_msg("  ⏸ auto_tune 생략 — 현재 replica는 리더 아님")
         return
+    # v163.13 [#4]: 3시간 경과 시 긴급 min_score 강화 자동 복원
+    _check_and_restore_emergency_score_boost()
     try:
         before_hash = _payload_hash(_current_dynamic_signature())
         tune_state = _get_auto_tune_state()
