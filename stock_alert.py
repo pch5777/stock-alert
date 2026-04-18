@@ -3,10 +3,71 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.17
+버전: v163.20
 날짜: 2026-04-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v163.20 (2026-04-18): _stock_theme_profile 영구 보존으로 변경
+  [#1] _stock_theme_profile TTL 제거 — 영구 보존
+       이유: 종목 간 테마 연동 관계(파이버프로=광통신+방산+우주항공)는
+             테마 활성 여부와 무관하게 영구 보존해야 다음 순환 때 선제 대응 가능
+             수명 만료로 연동 정보가 사라지면 종목 다중테마 구조의 의미가 없어짐
+       개선점: load_dynamic_themes()에서 프로파일 로드 시 TTL 필터 제거 → 전량 복원
+              _profile_ttl_ok() 함수 삭제
+       주의점: _dynamic_theme_map 수명 관리(win→30일/손실→7일/미포착→3일)는 유지
+              프로파일은 영구 보존이지만 last_active·win_count는 계속 갱신됨
+
+- v163.19 (2026-04-18): 종목 다중테마 프로파일 + 성과 기반 수명 관리
+  [#1] _stock_theme_profile 종목 프로파일 테이블 신설
+       이유: 하나의 종목이 여러 테마에 동시 소속 가능 (파이버프로=광통신+방산+우주항공)
+             기존 _dynamic_theme_map은 테마→종목 구조라 종목의 다중 테마 연결 불가
+             24시간 만료로 테마 내 종목간 연동 정보가 매일 소멸
+       개선점: 종목코드→{themes[], win_count, loss_count, first_seen, last_active} 구조
+              종목이 여러 테마 태그를 동시 보유 → 교차 테마 포착 연결
+              stock_theme_profile.json 영속화 → 재시작 후에도 유지
+       주의점: _dynamic_theme_map과 병행 운영 (기존 로직 변경 없음)
+  [#2] _groq_auto_register_dynamic_themes() 완전 재작성
+       이유: 기존은 테마 하나에만 종목 귀속 → 다중테마 소속 불가
+       개선점: 종목별로 themes[] 리스트에 테마 추가. 동일 종목이 여러 테마 rows에 등장하면
+              themes[]에 누적. _dynamic_theme_map에도 교차 등록해 기존 파이프라인 연결 유지
+       주의점: _resolve_stock_code_by_name() 실패 종목은 skip
+  [#3] load_dynamic_themes() 성과 기반 수명 관리
+       이유: 24시간 일괄 만료는 테마 내 종목간 연동 정보를 매일 소멸시킴
+             수익 발생 테마는 장기 유지해야 다음 순환 때 선제 대응 가능
+       개선점: win_count≥1 → 30일 유지 / 뉴스 재감지 갱신 → ts리셋 연장
+              미포착(win=loss=0) → 3일 후 만료 / 손실 누적(loss>win) → 7일 후 만료
+       주의점: _stock_theme_profile도 동일 수명 규칙 적용
+  [#4] _auto_reinforce_dynamic_theme() → _stock_theme_profile win/loss 연동
+       이유: 성과 정보가 _dynamic_theme_map에만 기록되고 프로파일에는 미반영
+       개선점: pnl_pct > 0 시 해당 종목 프로파일 win_count++, last_active 갱신
+              pnl_pct < 0 시 loss_count++ → 수명 단축 트리거
+       주의점: _dynamic_theme_map 기존 조정 로직 동일 유지
+  [#5] _apply_result_labels()에서 _auto_reinforce_dynamic_theme() 자동 호출
+       이유: 결과 확정 시점에 reinforce가 자동 호출 안 돼 성과 반영 누락
+       개선점: pnl 확정 후 코드 기준으로 reinforce 호출 추가
+       주의점: entry_price≤0이면 pnl 미확정으로 skip
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
+- v163.18 (2026-04-18): 신규 테마 자동 포착 강화 — 키워드맵 확장 + Groq 분석 종목 동적 테마 자동 등록
+  [#1] OVERNIGHT_EVENT_KEYWORDS에 2026 주요 신규 테마 키워드 추가
+       이유: 광통신/광반도체·로봇·전력인프라·액침냉각·양자컴퓨터·관세무역·우주항공 등
+             2026년 핵심 테마가 키워드맵에 없어 _discover_new_theme_from_surge() 엔진 미발동
+       개선점: 7개 신규 이벤트 카테고리 추가 → 관련 뉴스 감지 시 자동 발굴 엔진 활성화
+       주의점: 기존 GTC/FOMC/원전/방산/바이오/조선 등 기존 키워드 전부 유지
+  [#2] OVERNIGHT_EVENT_SECTOR_MAP에 신규 수혜섹터 매핑 추가
+       이유: 키워드 감지 후 수혜 섹터 → THEME_MAP 종목 연결 고리가 없으면 포착 불가
+       개선점: 신규 이벤트 7개에 대응하는 수혜섹터 매핑 추가
+       주의점: 기존 매핑 전부 유지
+  [#3] _fetch_groq_news_rows()에 Groq 분석 결과 → _dynamic_theme_map 자동 등록
+       이유: Groq가 뉴스에서 신규 테마·종목명을 추출해도 _dynamic_theme_map에 연결 안 되면 포착 불가
+             광통신처럼 THEME_MAP에 없는 완전 신규 테마도 Groq가 자동으로 등록하게 해야 영구적 해결
+       개선점: Groq rows에서 gemini_stocks(종목명) 추출 → 코드 조회 시도 →
+              _dynamic_theme_map에 "groq_auto_{theme}_{date}" 키로 자동 등록
+              이후 _discover_new_theme_from_surge()와 동일한 파이프라인으로 포착 연결
+       주의점: 종목명→코드 조회는 _resolve_stock_code_by_name() 사용(실패 시 skip)
+              동일 테마 당일 재등록 시 기존 항목 강화(ts 갱신). 24시간 후 자동 만료
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v163.17 (2026-04-18): 재료 캐시 TTL 20분→10분 단축
   [#1] GEMINI_GROUNDING_CACHE_TTL_SEC / GROQ_GROUNDING_CACHE_TTL_SEC 1200→600초
        이유: Groq 200회/일 한도 기준 최소 주기 7분 → 10분이 한도 내 최적값
@@ -6875,6 +6936,12 @@ def _fetch_groq_news_rows() -> list[dict]:
         _groq_grounding_daily_counter["count"] = _groq_grounding_daily_counter.get("count", 0) + 1
         _groq_grounding_cache = {"ts": now, "rows": rows}
         print(f"[Groq] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_groq_grounding_daily_counter['count']}/{GROQ_GROUNDING_DAILY_LIMIT}회)")
+        # v163.18 [#3]: Groq 분석 결과 → _dynamic_theme_map 자동 등록
+        # THEME_MAP에 없는 완전 신규 테마도 자동 포착 파이프라인에 연결
+        try:
+            _groq_auto_register_dynamic_themes(rows)
+        except Exception as _e:
+            _swallow_exception(_e)
         return rows
     except Exception as e:
         _is_quota_err = any(k in str(e) for k in ("429", "rate_limit", "quota"))
@@ -6886,6 +6953,147 @@ def _fetch_groq_news_rows() -> list[dict]:
         if _is_quota_err or not _groq_grounding_cache.get("rows"):
             _groq_grounding_cache["ts"] = now
         return list(_groq_grounding_cache.get("rows", []))
+
+
+def _groq_auto_register_dynamic_themes(rows: list[dict]) -> None:
+    """
+    v163.19: Groq 분석 rows → 종목 다중테마 프로파일 + _dynamic_theme_map 자동 등록.
+    - 하나의 종목이 여러 테마에 동시 소속 가능 (다중테마 교차 지원)
+    - _stock_theme_profile: 종목코드→{themes[], win/loss_count, last_active}
+    - _dynamic_theme_map: 기존 파이프라인 연결 유지 (교차 등록)
+    """
+    global _dynamic_theme_map, _stock_theme_profile
+    if not rows:
+        return
+    today = _now_kst().strftime("%m%d")
+    today_full = _now_kst().strftime("%Y-%m-%d")
+    now_ts = time.time()
+    profile_updated = False
+    theme_map_updated = False
+
+    for row in rows:
+        gs = row.get("gemini_stocks") or []
+        if not gs:
+            continue
+        theme = str((gs[0]).get("theme", "") or "").strip()
+        direction = str((gs[0]).get("direction", "neutral") or "neutral").strip()
+        reason = str((gs[0]).get("reason", "") or "").strip()
+        if not theme:
+            title = str(row.get("title", "") or "")
+            theme = title.replace("[Groq재료]", "").split("📈")[0].split("📉")[0].strip()[:20]
+        if not theme:
+            continue
+
+        stock_pairs_for_map = []
+        for g in gs[:6]:
+            sname = str(g.get("name", "") or "").strip()
+            if not sname:
+                continue
+            scode = _resolve_stock_code_by_name(sname)
+            if not scode:
+                continue
+            stock_pairs_for_map.append((scode, sname))
+
+            # ─── 종목 프로파일: 다중테마 누적 ───
+            prof = _stock_theme_profile.get(scode)
+            if prof is None:
+                _stock_theme_profile[scode] = {
+                    "themes": [theme],
+                    "win_count": 0,
+                    "loss_count": 0,
+                    "first_seen": today_full,
+                    "last_active": now_ts,
+                    "source": "groq_auto",
+                    "name": sname,
+                }
+                _log_info_msg(f"  🤖 종목 프로파일 신규: {sname}({scode}) → [{theme}]")
+            else:
+                existing_themes = prof.get("themes") or []
+                if theme not in existing_themes:
+                    existing_themes.append(theme)
+                    prof["themes"] = existing_themes
+                    _log_info_msg(f"  🤖 테마 추가: {sname}({scode}) +[{theme}] 전체={existing_themes}")
+                prof["last_active"] = now_ts
+            profile_updated = True
+
+        # ─── _dynamic_theme_map 교차 등록 (기존 파이프라인 유지) ───
+        if not stock_pairs_for_map:
+            continue
+        theme_key = f"groq_auto_{theme}_{today}"
+        existing_tm = _dynamic_theme_map.get(theme_key)
+        if existing_tm:
+            existing_codes = {c for c, _ in existing_tm.get("stocks", [])}
+            for pair in stock_pairs_for_map:
+                if pair[0] not in existing_codes:
+                    existing_tm["stocks"].append(pair)
+                    existing_codes.add(pair[0])
+            existing_tm["ts"] = now_ts
+        else:
+            _dynamic_theme_map[theme_key] = {
+                "desc":      f"[Groq자동] {theme} 재료 감지",
+                "events":    [theme],
+                "reason":    reason or f"Groq 뉴스 분석: {theme}",
+                "stocks":    list(stock_pairs_for_map),
+                "ts":        now_ts,
+                "direction": direction,
+                "source":    "groq_auto",
+                "win_count": 0,
+                "loss_count": 0,
+            }
+            _log_info_msg(f"  🤖 동적테마 등록: [{theme_key}] {len(stock_pairs_for_map)}종목")
+        theme_map_updated = True
+
+    if profile_updated:
+        try:
+            _write_json_atomic(STOCK_THEME_PROFILE_FILE, _stock_theme_profile, indent=2)
+        except Exception as e:
+            _swallow_exception(e)
+    if theme_map_updated:
+        try:
+            _write_json_atomic(
+                DYNAMIC_THEME_FILE,
+                {k: {**v, "stocks": v["stocks"]} for k, v in _dynamic_theme_map.items()},
+                indent=2,
+            )
+        except Exception as e:
+            _swallow_exception(e)
+
+
+def _resolve_stock_code_by_name(name: str) -> str:
+    """
+    v163.18: 종목명 → 종목코드 역조회.
+    1) _detected_stocks 캐시에서 이름 매칭
+    2) _dynamic_theme_map 내 기존 종목에서 매칭
+    3) THEME_MAP 전체에서 매칭
+    실패 시 "" 반환.
+    """
+    if not name:
+        return ""
+    name_lower = name.strip().lower()
+    # 1) _detected_stocks 캐시
+    try:
+        for code, info in dict(_detected_stocks).items():
+            if str(info.get("name", "") or "").lower() == name_lower:
+                return code
+    except Exception:
+        pass
+    # 2) _dynamic_theme_map
+    try:
+        for ti in _dynamic_theme_map.values():
+            for c, n in ti.get("stocks", []):
+                if str(n or "").lower() == name_lower:
+                    return c
+    except Exception:
+        pass
+    # 3) THEME_MAP
+    try:
+        for ti in THEME_MAP.values():
+            for c, n in ti.get("stocks", []):
+                if str(n or "").lower() == name_lower:
+                    return c
+    except Exception:
+        pass
+    return ""
 
 
 def _fetch_youtube_material_headline_rows() -> list[dict]:
@@ -7446,6 +7654,9 @@ _early_volume_min_dynamic = EARLY_VOLUME_MIN
 # ── 동적 테마 (가격상관관계 + 뉴스 공동언급으로 자동 생성) ──
 _dynamic_theme_map  = {}
 DYNAMIC_THEME_FILE  = _state_path("dynamic_themes.json")
+# v163.19: 종목 다중테마 프로파일 — 종목코드→{themes[], win/loss_count, 수명 관리}
+STOCK_THEME_PROFILE_FILE = _state_path("stock_theme_profile.json")
+_stock_theme_profile: dict = {}  # code → {themes, win_count, loss_count, first_seen, last_active, source}
 CORR_MIN            = 0.70
 CORR_LOOKBACK       = 20
 NEWS_COOCCUR_FILE   = _state_path("news_cooccur.json")
@@ -7513,6 +7724,21 @@ OVERNIGHT_EVENT_KEYWORDS = {
     "밸류업": ["밸류업","자사주소각","주주환원","배당","상법개정","buyback"],
     "바이오": ["fda","임상","clinical","신약","바이오","aacr","asco","허가"],
     "조선": ["조선","lng","컨테이너선","수주","한화오션","hd현대"],
+    # v163.18: 2026 신규 테마 추가
+    "광통신": ["광통신","광트랜시버","광케이블","광섬유","cpo","실리콘포토닉스","ftth","광반도체",
+               "포토닉스","photonics","optical transceiver","optical fiber","광인터커넥트"],
+    "로봇": ["로봇","humanoid","휴머노이드","협동로봇","물리적ai","physical ai",
+             "레인보우로보틱스","두산로보틱스","로보티즈","Boston Dynamics","피지컬ai"],
+    "전력인프라": ["변압기","전력망","hvdc","초고압","배전","전력기기","스마트그리드",
+                   "LS일렉트릭","HD현대일렉트릭","효성중공업","전력설비","송전","수배전"],
+    "액침냉각": ["액침냉각","immersion cooling","수냉각","데이터센터냉각","서버냉각",
+                "침지냉각","SK엔무브","냉각유","dielectric fluid"],
+    "양자컴퓨터": ["양자컴퓨터","quantum","양자암호","양자통신","quantum computing",
+                  "양자","qubit","큐비트","양자보안"],
+    "관세무역": ["관세","tariff","무역전쟁","trade war","관세부과","수출규제","미국관세",
+                "트럼프관세","상호관세","관세협상","무역협상","미중갈등"],
+    "우주항공": ["우주","space","위성","satellite","발사체","rocketlab","스페이스x",
+               "우주항공청","누리호","달탐사","uam","도심항공"],
 }
 # 이벤트 키워드 → 수혜 국내 섹터/종목 매핑
 OVERNIGHT_EVENT_SECTOR_MAP = {
@@ -7528,6 +7754,14 @@ OVERNIGHT_EVENT_SECTOR_MAP = {
     "호르무즈": ["정유","에너지","해운","방산"],
     "OPEC":   ["정유","에너지","화학"],
     "중동":   ["방산","정유","에너지","조선"],
+    # v163.18: 신규 테마 수혜섹터 매핑
+    "광통신": ["광통신","광반도체","통신장비","AI인프라","데이터센터"],
+    "로봇":   ["로봇","자동화","AI","물류","제조"],
+    "전력인프라": ["전력기기","변압기","전선","중전기","전력망","에너지"],
+    "액침냉각": ["냉각","데이터센터","AI인프라","서버","반도체"],
+    "양자컴퓨터": ["양자","보안","통신","IT","반도체"],
+    "관세무역": ["방산","조선","반도체","자동차","철강","화학"],
+    "우주항공": ["우주","항공","방산","위성","소재"],
 }
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -16263,16 +16497,37 @@ def auto_update_theme(code: str, name: str, trigger: str = "급등"):
     except Exception as e:
         _swallow_exception(e)
 def load_dynamic_themes():
-    """장 시작 시 동적 테마 파일 복원"""
-    global _dynamic_theme_map
+    """장 시작 시 동적 테마 파일 복원 — v163.19: 성과 기반 수명 관리"""
+    global _dynamic_theme_map, _stock_theme_profile
     try:
         data = _read_json_safe(DYNAMIC_THEME_FILE, {})
         if not isinstance(data, dict):
             data = {}
-        today = datetime.now().strftime("%m%d")
-        _dynamic_theme_map = {k: v for k, v in data.items() if today in k or time.time() - v.get("ts", 0) < 86400}
+        now_ts = time.time()
+        def _theme_ttl(v: dict) -> float:
+            """성과 기반 TTL 계산 (초)"""
+            win  = int(v.get("win_count", 0) or 0)
+            loss = int(v.get("loss_count", 0) or 0)
+            if win >= 1:
+                return 86400 * 30   # 수익 발생 → 30일
+            if loss > win:
+                return 86400 * 7    # 손실 누적 → 7일
+            return 86400 * 3        # 미포착 → 3일
+        _dynamic_theme_map = {
+            k: v for k, v in data.items()
+            if now_ts - float(v.get("ts", 0) or 0) < _theme_ttl(v)
+        }
         if _dynamic_theme_map:
             _log_info_msg(f"  📂 동적 테마 {len(_dynamic_theme_map)}개 복원")
+    except Exception as e:
+        _swallow_exception(e)
+    # 종목 프로파일 로드 — 영구 보존 (TTL 없음)
+    try:
+        prof_data = _read_json_safe(STOCK_THEME_PROFILE_FILE, {})
+        if isinstance(prof_data, dict):
+            _stock_theme_profile = prof_data
+            if _stock_theme_profile:
+                _log_info_msg(f"  📂 종목 테마 프로파일 {len(_stock_theme_profile)}종목 복원")
     except Exception as e:
         _swallow_exception(e)
 # ============================================================
@@ -16340,9 +16595,10 @@ def _discover_new_theme_from_surge(code: str, name: str, news_titles: list, chan
 def _auto_reinforce_dynamic_theme(code: str, pnl_pct: float):
     """
     signal_log 결과 반영 → 동적 테마 강도 자동 조정.
-    수익이면 해당 테마 강도↑, 손실이면 강도↓ (score_adj 조정).
+    v163.19: _stock_theme_profile win/loss_count 동시 갱신.
     """
-    global _dynamic_theme_map
+    global _dynamic_theme_map, _stock_theme_profile
+    now_ts = time.time()
     try:
         today = datetime.now().strftime("%m%d")
         for tk, ti in _dynamic_theme_map.items():
@@ -16360,6 +16616,21 @@ def _auto_reinforce_dynamic_theme(code: str, pnl_pct: float):
                 break
     except Exception as e:
         _log_warn_msg(f"⚠️ _auto_reinforce_dynamic_theme: {e}")
+    # v163.19: 종목 프로파일 win/loss 연동
+    try:
+        prof = _stock_theme_profile.get(code)
+        if prof is not None:
+            if pnl_pct > 0:
+                prof["win_count"] = prof.get("win_count", 0) + 1
+            elif pnl_pct < 0:
+                prof["loss_count"] = prof.get("loss_count", 0) + 1
+            prof["last_active"] = now_ts
+            try:
+                _write_json_atomic(STOCK_THEME_PROFILE_FILE, _stock_theme_profile, indent=2)
+            except Exception as e:
+                _swallow_exception(e)
+    except Exception as e:
+        _swallow_exception(e)
 # ============================================================
 # v41.77 #2: NXT 선행상승 → 정규장 추적 전환
 # ============================================================
@@ -18384,6 +18655,13 @@ def _apply_result_labels(rec: dict):
             rec["outcome"] = "loss"
         else:
             rec["outcome"] = "flat"
+        # v163.19: 결과 확정 시 동적테마·종목 프로파일 성과 자동 반영
+        try:
+            code = str(rec.get("code", "") or "")
+            if code and pnl != 0.0:
+                _auto_reinforce_dynamic_theme(code, pnl)
+        except Exception as _re:
+            _swallow_exception(_re)
     except Exception as e:
         _swallow_exception(e)
 TRACK_ACTIVE_STATUSES = {"추적중", "진입준비"}
