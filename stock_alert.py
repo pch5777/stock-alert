@@ -3,10 +3,78 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v163.20
-날짜: 2026-04-18
+버전: v165.0
+날짜: 2026-04-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.0 (2026-04-19): 시초가 진입 알람 신설 + Groq 재료 추론 Chain-of-Thought 재설계
+  [#1] OPENING_GAP_ENTRY 시그널 타입 신설 — 시초가 진입 알람 파이프라인
+       이유: 선진입(PRECLOSE_GAP_ENTRY)을 놓쳤거나 야간 신규 재료 발생 시 시초가 진입 기회 포착
+       개선점: 08:50에 PRECLOSE_GAP_ENTRY 발송 이력 종목 + 야간 Groq 재료 종목을 후보 풀로 구성
+              KIS FHKST01010200 예상체결가 조회 → 예상 갭상승률 계산 → 스코어링 → 알람
+       주의점: OPENING_GAP_ENTRY는 선진입의 "보완책". 진입가가 더 높을 수 있음을 알람에 명시
+  [#2] _fetch_opening_expected_price(code) 신설 — KIS 장전 동시호가 예상체결가 조회
+       이유: 08:30~09:00 예상체결가(antc_cnpr)·예상등락률(antc_cntg_vrss_prdy_ctrt) 미활용
+       개선점: FHKST01010200 output2에서 예상체결가·예상등락률·호가잔량 동시 추출
+       주의점: 동시호가 외 시간대는 antc_cnpr=0 반환. 08:30~09:00 구간에서만 유효
+  [#3] _build_opening_gap_watch_pool() 신설 — 시초가 후보 풀 구성
+       이유: PRECLOSE_GAP_ENTRY 발송 종목 + 야간 Groq 재료 종목을 통합 관리
+       개선점: signal_log PRECLOSE_GAP_ENTRY 이력 + _preclose_gap_entry_watch + Groq gemini_stocks 종목명→코드 변환
+       주의점: 종목명→코드 변환 실패 시 skip. 중복 제거 후 최대 30종목
+  [#4] send_opening_gap_alert() 신설 — 08:50 시초가 알람 발송
+       이유: 08:50은 동시호가(08:30~09:00) 중 예상체결가가 안정화되는 시점
+       개선점: 예상갭 +2% 이상 + 스코어 55점 이상 + 매수잔량비율 1.3배 이상 충족 시 발송
+       주의점: is_market_open() 체크 없이 08:50 고정 실행 (동시호가 구간이므로 정상)
+  [#5] Groq 재료 추론 Chain-of-Thought 프롬프트 재설계
+       이유: 기존은 뉴스→섹터/종목 단순 매핑. "왜 내일도 올라야 하는가" 추론 없음
+       개선점: CoT 구조: 재료발견→인물·정책 특성→시나리오 트리→반대시나리오→오늘반영도→내일지속성→수혜종목
+              신규 필드: today_reflected(already/partial/not_yet) / tomorrow_continuation(strong/moderate/weak)
+                         scenario_confidence(high/medium/low) / counter_scenario / reasoning
+       주의점: max_tokens 1024→2048로 확대. 기존 rows 구조(gemini_stocks 등) 완전 호환 유지
+  [#6] _get_groq_scenario_for_code(code, name) 신설 — 종목별 Groq 시나리오 필드 조회
+       이유: Groq CoT 결과의 today_reflected·tomorrow_continuation을 선진입 스코어에 반영하려면 종목별 조회 필요
+       개선점: _groq_grounding_cache rows에서 gemini_stocks name 매칭 → 시나리오 필드 반환
+       주의점: 이름 매칭이므로 부분 일치도 허용(in 연산자)
+  [#7] _apply_next_open_gap_momentum_consistency() — Groq 시나리오 점수 추가
+       이유: CoT 결과(오늘반영도·내일지속성)를 선진입 스코어에 반영하는 연결 고리 없었음
+       개선점: not_yet+strong→+8 / not_yet+moderate→+5 / already→-4 반영
+       주의점: Groq 미활성 또는 캐시 없으면 해당 블록 skip — 기존 동작 변화 없음
+  진입 체인: send_opening_gap_alert() → _ensure_signal_actionability() 경유 ✅
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
+- v164.0 (2026-04-19): 장중 누적 강도 추적 시스템 — 선진입 스코어링 구조 확장
+  [#1] INTRADAY_SNAP 상수 + intraday_momentum_snapshot.json 상태파일 신설
+       이유: 14:35/19:10 스냅샷 1회만으로는 "오전 강세→오후 하락" 종목과 "하루 내내 지수 대비 강세 유지" 종목을 구별 불가
+       개선점: KRX 5회(10:00/11:00/12:30/13:30/14:00) + NXT 7회(08:10/09:30/11:00/13:00/15:40/17:00/18:30) 스냅샷 수집
+       주의점: 날짜 바뀌면 자동 초기화. 재시작 시 당일 기존 스냅샷 복원
+  [#2] _fetch_kis_amount_rank() 신설 — KIS FHPST01720000 거래대금 순위 API 직접 조회
+       이유: 기존 네이버 크롤링 대체 + 조용한 강세 풀 수집 기반
+       개선점: KIS 공식 API로 최대 200종목 거래대금 순위 조회. 실패 시 _fetch_external_rank_top() fallback
+       주의점: FID_COND_SCR_DIV_CODE=20172 (거래대금 기준). 기존 volume-rank(20171)와 별도
+  [#3] _take_intraday_momentum_snapshot(market) 신설 — 시장별 RS 스냅샷 수집
+       이유: 종목별 RS(등락률 - 코스피 등락률)를 시간대별로 누적해야 모멘텀 지속성 계산 가능
+       개선점: RS>0 종목을 quiet_strong 풀로 추적. 3회 연속 RS>0 유지 시 선진입 후보 풀 자동 편입
+       주의점: KRX/NXT 시장 구분 필수. NXT는 08:10부터 수집 (KRX 개장 전 독립 흐름 반영)
+  [#4] _get_momentum_consistency_score(code, market) 신설 — RS 지속률·추세 계산
+       이유: 선진입 스코어링에서 "오늘 하루 전체 흐름"을 수치로 반영하는 함수가 없었음
+       개선점: RS 지속률(%) + 추세 방향(개선/악화) 반환. 스냅샷 2회 이상 있을 때만 유효
+       주의점: 스냅샷 없으면 (0.0, "unknown", 0) 반환 — 감점 없음
+  [#5] _apply_next_open_gap_momentum_consistency() 신설 — 선진입 스코어 체인에 삽입
+       이유: 장중 모멘텀 지속성 + 외국인·기관 수급을 선진입 스코어에 반영하는 단계가 없었음
+       개선점: RS 지속률 90%↑→+8 / 70%↑→+5 / 50%↑→+2 / 50%↓→-5. 추세개선+3/악화-5
+              외국인 순매수→+5 / 기관 순매수→+4 (get_investor_provisional_trend 활용)
+       주의점: 스냅샷 부족 시 수급만 반영. 기존 스코어 체인 순서: sector_history → 모멘텀(신규) → similar_pattern
+  [#6] _collect_next_open_gap_candidate_codes() — quiet_strong 풀 자동 편입 추가
+       이유: 기존 풀은 알람 발송 종목·signal_log 위주 → "조용히 강한" 종목 누락
+       개선점: 3회 연속 RS>0 유지 종목을 quiet_strong 풀로 별도 관리 → 후보 풀 후반부에 자동 편입
+       주의점: quiet_strong은 선진입 스코어링에서 모멘텀 점수로 재평가됨 (알람 발송 보장 아님)
+  [#7] 스케줄러 KRX 5개 + NXT 7개 스냅샷 시각 등록
+       이유: 장중 관망 구간 전체(KRX 09:00~14:35, NXT 08:00~19:10)에 균등 분포
+       개선점: is_holiday() 체크 내장. 각 스냅샷은 독립 실행 — 스캔 부하 없음
+       주의점: 11:00는 KRX·NXT 중복 — 각각 별도 job으로 등록 (시장 구분 파라미터 다름)
+  진입 체인: _apply_next_open_gap_momentum_consistency() → _ensure_signal_actionability() 경유 유지 ✅
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v163.20 (2026-04-18): _stock_theme_profile 영구 보존으로 변경
   [#1] _stock_theme_profile TTL 제거 — 영구 보존
        이유: 종목 간 테마 연동 관계(파이버프로=광통신+방산+우주항공)는
@@ -2620,6 +2688,7 @@ SIG_LABELS = {
     "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목",
     "ENTRY_POINT": "눌림목", "STRONG_BUY": "강력매수",
     "PRECLOSE_GAP_ENTRY": "종가선진입",
+    "OPENING_GAP_ENTRY":  "시초가진입",
 }
 SIG_TITLES = {
     "UPPER_LIMIT": "상한가 감지", "NEAR_UPPER": "상한가 근접",
@@ -2627,6 +2696,7 @@ SIG_TITLES = {
     "MID_PULLBACK": "눌림목 진입 신호", "ENTRY_POINT": "★ 눌림목 진입 시점 ★",
     "STRONG_BUY": "강력 매수 신호",
     "PRECLOSE_GAP_ENTRY": "★ 익영업일 갭상승 실전 선진입 ★",
+    "OPENING_GAP_ENTRY":  "⚡ 시초가 진입 대기 ⚡",
 }
 def get_signal_label(signal_type: str, default: str = "") -> str:
     return SIG_LABELS.get(str(signal_type or ""), default or str(signal_type or ""))
@@ -3183,6 +3253,164 @@ def _load_intraday_capture_leaders() -> list:
     except Exception as e:
         _swallow_exception(e)
         return []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 장중 모멘텀 스냅샷 시스템 (v164.0)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _default_intraday_snap_state() -> dict:
+    return {"date": "", "snapshots": [], "quiet_strong": {}}
+
+def _load_intraday_snap_state() -> dict:
+    state = _read_json_safe(INTRADAY_SNAP_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    today = datetime.now().strftime("%Y%m%d")
+    if state.get("date", "") != today:
+        state = _default_intraday_snap_state()
+        state["date"] = today
+    if not isinstance(state.get("snapshots"), list):
+        state["snapshots"] = []
+    if not isinstance(state.get("quiet_strong"), dict):
+        state["quiet_strong"] = {}
+    return state
+
+def _save_intraday_snap_state(state: dict) -> None:
+    try:
+        _write_json_atomic(INTRADAY_SNAP_FILE, state)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _fetch_kis_amount_rank(top_n: int = 200) -> list:
+    """KIS FHPST01720000 거래대금 순위 조회 — 네이버 크롤링 대체.
+    실패 시 _fetch_external_rank_top() fallback.
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+            "FHPST01720000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "20172",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "0",
+                "FID_BLNG_CLS_CODE": "0",
+                "FID_TRGT_CLS_CODE": "111111111",
+                "FID_TRGT_EXLS_CLS_CODE": "000000",
+                "FID_INPUT_PRICE_1": "500",
+                "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": str(min(top_n, 200)),
+                "FID_INPUT_DATE_1": "",
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = normalize_stock_code(i.get("mksc_shrn_iscd", "") or "")
+            if not code:
+                continue
+            try:
+                chg = float(i.get("prdy_ctrt", 0) or 0)
+            except Exception:
+                chg = 0.0
+            items.append({"code": code, "name": str(i.get("hts_kor_isnm", code) or code), "change_rate": chg})
+        if items:
+            _log_info_msg(f"[SNAP] KIS 거래대금 순위 {len(items)}건 수집 (FHPST01720000)")
+            return items
+    except Exception as e:
+        _swallow_exception(e)
+    # fallback
+    try:
+        fallback = _fetch_external_rank_top(min_change=-99.0, top_n=top_n)
+        if fallback:
+            _log_info_msg(f"[SNAP] 거래대금 순위 fallback {len(fallback)}건 (외부소스)")
+            return [{"code": str(r.get("code","")), "name": str(r.get("name","")),
+                     "change_rate": float(r.get("change_rate", 0) or 0)} for r in fallback if r.get("code")]
+    except Exception as e:
+        _swallow_exception(e)
+    return []
+
+def _take_intraday_momentum_snapshot(market: str = "KRX") -> None:
+    """장중 RS 스냅샷 수집 — KRX/NXT 공통.
+    kospi 등락률 대비 각 종목 RS 계산 후 quiet_strong 풀 업데이트.
+    """
+    if is_holiday():
+        return
+    market = "NXT" if str(market).upper() == "NXT" else "KRX"
+    if market == "KRX" and not is_market_open():
+        return
+    if market == "NXT" and not is_nxt_open():
+        return
+    try:
+        kospi_chg = get_kospi_change()
+        snap_time = datetime.now().strftime("%H:%M")
+        items = _fetch_kis_amount_rank(top_n=INTRADAY_SNAP_TOP_N)
+        if not items:
+            _log_info_msg(f"[SNAP] {market} {snap_time} 스냅샷 — 종목 0건 (skip)")
+            return
+        state = _load_intraday_snap_state()
+        snap_entry = {"time": snap_time, "market": market, "kospi_chg": round(kospi_chg, 2), "stocks": {}}
+        qs = state.get("quiet_strong", {})
+        for item in items:
+            code = str(item.get("code", "") or "")
+            if not code:
+                continue
+            chg = float(item.get("change_rate", 0) or 0)
+            rs = round(chg - kospi_chg, 2)
+            snap_entry["stocks"][code] = {"chg": round(chg, 2), "rs": rs, "name": str(item.get("name", code) or code)}
+            # quiet_strong 연속 RS>0 추적
+            prev = qs.get(code, {"streak": 0, "name": ""})
+            streak = prev.get("streak", 0) + 1 if rs > 0 else 0
+            qs[code] = {"streak": streak, "name": str(item.get("name", code) or code), "last_rs": rs, "last_time": snap_time}
+        # RS>0 없이 사라진 종목 streak 초기화
+        for code in list(qs.keys()):
+            if code not in snap_entry["stocks"]:
+                qs[code]["streak"] = 0
+        state["quiet_strong"] = qs
+        state["snapshots"].append(snap_entry)
+        # 당일 스냅샷은 최대 20개 유지
+        if len(state["snapshots"]) > 20:
+            state["snapshots"] = state["snapshots"][-20:]
+        _save_intraday_snap_state(state)
+        strong_cnt = sum(1 for v in qs.values() if v.get("streak", 0) >= INTRADAY_SNAP_RS_QUIET_STREAK)
+        _log_info_msg(f"[SNAP] {market} {snap_time} 스냅샷 완료 — {len(items)}종목 / 조용한강세 누적 {strong_cnt}건")
+    except Exception as e:
+        _swallow_exception(e)
+
+def _get_momentum_consistency_score(code: str, market: str = "KRX") -> tuple:
+    """종목의 RS 지속률·추세 반환.
+    Returns: (consistency_pct: float, trend: str, snap_count: int)
+      trend: "improving" | "deteriorating" | "stable" | "unknown"
+    """
+    try:
+        state = _load_intraday_snap_state()
+        snaps = [s for s in (state.get("snapshots") or []) if s.get("market", "KRX") == market.upper()]
+        code = str(code or "")
+        rs_list = []
+        for s in snaps:
+            entry = (s.get("stocks") or {}).get(code)
+            if entry is not None:
+                rs_list.append(float(entry.get("rs", 0) or 0))
+        if len(rs_list) < INTRADAY_SNAP_RS_MIN_SNAPS:
+            return 0.0, "unknown", len(rs_list)
+        positive = sum(1 for r in rs_list if r > 0)
+        consistency_pct = positive / len(rs_list) * 100.0
+        # 추세: 후반부 RS 평균 vs 전반부 RS 평균
+        mid = len(rs_list) // 2
+        first_half = rs_list[:mid] if mid > 0 else rs_list
+        second_half = rs_list[mid:] if mid > 0 else rs_list
+        avg_first = sum(first_half) / len(first_half)
+        avg_second = sum(second_half) / len(second_half)
+        if avg_second > avg_first + 0.3:
+            trend = "improving"
+        elif avg_second < avg_first - 0.3:
+            trend = "deteriorating"
+        else:
+            trend = "stable"
+        return consistency_pct, trend, len(rs_list)
+    except Exception as e:
+        _swallow_exception(e)
+        return 0.0, "unknown", 0
+
 def _collect_intraday_capture_focus(leaders: list) -> list:
      focus = []
      seen = set()
@@ -6164,6 +6392,7 @@ SIGNAL_STOP_PARAMS = {
     "MID_PULLBACK":       {"stop_mult": 1.2, "target_mult": 3.5},   # 눌림목 → 타이트 손절, 높은 목표
     "ENTRY_POINT":        {"stop_mult": 1.5, "target_mult": COMMON_THRESHOLD_3P0},   # 표준
     "PRECLOSE_GAP_ENTRY": {"stop_mult": 1.8, "target_mult": 2.5},   # 선진입 → 여유 손절, 보수적 목표
+    "OPENING_GAP_ENTRY":  {"stop_mult": 1.5, "target_mult": 2.0},   # 시초가진입 → 갭상승 이후라 목표 보수적
     "MANUAL":             {"stop_mult": 1.5, "target_mult": COMMON_THRESHOLD_3P0},   # 수동 = 표준
 }
 # 시간대 필터
@@ -6273,6 +6502,23 @@ PRECLOSE_GAP_FINAL_VALUE_RATIO_STRONG = float(os.getenv("PRECLOSE_GAP_FINAL_VALU
 PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_MINUTE_MA_TOL_PCT", "0.8") or "0.8")
 PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_OPEN_EXIT_GAP_PCT", "1.8") or "1.8")
 PRECLOSE_GAP_FINAL_OPEN_EXIT_PULLBACK_FROM_HIGH_PCT = float(os.getenv("PRECLOSE_GAP_FINAL_OPEN_EXIT_PULLBACK_FROM_HIGH_PCT", "1.2") or "1.2")
+
+# ─── 장중 모멘텀 스냅샷 시스템 (v164.0) ──────────────────────────────────────
+# KRX 관망 구간: 09:00~14:35 / NXT 관망 구간: 08:00~19:10
+# 각 시각마다 거래대금 상위 종목의 RS(종목등락률-코스피등락률)를 기록
+INTRADAY_SNAP_FILE           = _state_path("intraday_momentum_snapshot.json")
+INTRADAY_SNAP_KRX_TIMES      = ["10:00","11:00","12:30","13:30","14:00"]
+INTRADAY_SNAP_NXT_TIMES      = ["08:10","09:30","11:00","13:00","15:40","17:00","18:30"]
+INTRADAY_SNAP_TOP_N          = int(os.getenv("INTRADAY_SNAP_TOP_N", "200") or "200")
+INTRADAY_SNAP_RS_QUIET_STREAK= int(os.getenv("INTRADAY_SNAP_RS_QUIET_STREAK", "3") or "3")  # 조용한 강세 편입 연속 횟수
+INTRADAY_SNAP_RS_MIN_SNAPS   = int(os.getenv("INTRADAY_SNAP_RS_MIN_SNAPS", "2") or "2")     # 모멘텀 스코어 최소 스냅샷 수
+# ─── 시초가 진입 알람 시스템 (v165.0) ────────────────────────────────────────
+OPENING_GAP_SIGNAL_TYPE          = "OPENING_GAP_ENTRY"
+OPENING_GAP_WATCH_FILE           = _state_path("opening_gap_watch.json")
+OPENING_GAP_MIN_EXPECTED_GAP_PCT = float(os.getenv("OPENING_GAP_MIN_EXPECTED_GAP_PCT", "2.0") or "2.0")
+OPENING_GAP_MIN_SCORE            = int(os.getenv("OPENING_GAP_MIN_SCORE", "55") or "55")
+OPENING_GAP_MIN_BID_ASK_RATIO    = float(os.getenv("OPENING_GAP_MIN_BID_ASK_RATIO", "1.3") or "1.3")
+OPENING_GAP_MAX_POOL             = int(os.getenv("OPENING_GAP_MAX_POOL", "30") or "30")
 CROSSDAY_EPISODE_MAX_HOURS = float(os.getenv("CROSSDAY_EPISODE_MAX_HOURS", "42") or "42")
 CROSSDAY_PRIOR_SURGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_SURGE_MIN_PCT", "7.0") or "7.0")
 CROSSDAY_PRIOR_RANGE_MIN_PCT = float(os.getenv("CROSSDAY_PRIOR_RANGE_MIN_PCT", "9.0") or "9.0")
@@ -6878,16 +7124,39 @@ def _fetch_groq_news_rows() -> list[dict]:
             _swallow_exception(_e)
         if not raw_headlines:
             return list(_groq_grounding_cache.get("rows", []))
-        # 상위 30개만 전달 (토큰 절약)
-        headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:30] if h)
+        # 상위 40개 전달 (CoT 분석을 위해 30→40으로 확대)
+        headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:40] if h)
         today_str = _now_kst().strftime("%Y년 %m월 %d일")
-        prompt = (
-            f"오늘({today_str}) 아래 한국 주식 뉴스 헤드라인들을 분석해서 "
-            "주식시장에 영향을 줄 수 있는 주요 재료(호재/악재)를 추출해줘.\n"
+        # v165.0: Chain-of-Thought 재료 추론 프롬프트
+        system_prompt = (
+            "당신은 한국 주식시장 전문 트레이더입니다. "
+            "뉴스 재료를 분석할 때 단순 키워드 매핑이 아니라 "
+            "인물·정책·외교적 맥락까지 고려한 시나리오 추론을 수행합니다. "
+            "특히 '이미 시장에 반영된 재료'와 '아직 덜 반영된 재료'를 구분하고, "
+            "'내일도 시장의 관심이 지속될 재료'를 우선 포착합니다."
+        )
+        user_prompt = (
+            f"오늘({today_str}) 아래 한국 주식 뉴스를 분석해줘.\n\n"
+            "각 재료에 대해 다음 순서로 추론해:\n"
+            "1단계: 핵심 재료 파악 (무엇이 변했는가)\n"
+            "2단계: 관련 인물·정책·기업의 특성 파악 (어떤 성향/이해관계인가)\n"
+            "3단계: 가장 가능성 높은 시나리오 도출 (시장이 어떻게 반응할 것인가)\n"
+            "4단계: 반대 시나리오 검증 (왜 틀릴 수 있는가)\n"
+            "5단계: 오늘 이미 반영됐는지 판단 (already/partial/not_yet)\n"
+            "6단계: 내일 지속 가능성 판단 (strong/moderate/weak)\n"
+            "7단계: 구체적 수혜 종목 선정\n\n"
             "반드시 아래 JSON 형식으로만 답해. 다른 텍스트 없이 JSON만:\n"
-            '{"items": [{"theme": "테마명", "direction": "up/down/neutral", "summary": "재료 1~2줄 요약", '
-            '"sectors": ["수혜섹터1", "수혜섹터2"], "stocks": ["종목명1", "종목명2"]}]}\n'
-            "최소 3개, 최대 8개 항목. 리딩방/투자 유도 내용은 제외. 실제 시장 재료만.\n\n"
+            '{"items": [{"theme": "테마명", "direction": "up/down/neutral", '
+            '"summary": "재료 2~3줄 요약", '
+            '"scenario_confidence": "high/medium/low", '
+            '"today_reflected": "already/partial/not_yet", '
+            '"tomorrow_continuation": "strong/moderate/weak", '
+            '"counter_scenario": "반대 시나리오 한 줄", '
+            '"reasoning": "추론 과정 핵심 한 줄", '
+            '"sectors": ["수혜섹터1", "수혜섹터2"], '
+            '"stocks": ["종목명1", "종목명2"]}]}\n'
+            "최소 3개, 최대 8개 항목. 리딩방·투자유도 제외. 실제 시장 재료만.\n"
+            "today_reflected='not_yet'이고 tomorrow_continuation='strong'인 재료를 최우선 발굴.\n\n"
             f"뉴스 헤드라인:\n{headlines_text}"
         )
         resp = requests.post(
@@ -6898,11 +7167,14 @@ def _fetch_groq_news_rows() -> list[dict]:
             },
             json={
                 "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 2048,
             },
-            timeout=20,
+            timeout=30,
         )
         resp.raise_for_status()
         raw = str((resp.json().get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
@@ -6915,27 +7187,45 @@ def _fetch_groq_news_rows() -> list[dict]:
         items = parsed.get("items") or []
         rows = []
         for item in items[:8]:
-            theme = str(item.get("theme", "") or "").strip()
-            direction = str(item.get("direction", "neutral") or "neutral").strip()
-            summary = str(item.get("summary", "") or "").strip()
-            sectors = [str(s) for s in (item.get("sectors") or []) if s]
-            stocks = [str(s) for s in (item.get("stocks") or []) if s]
+            theme    = str(item.get("theme", "") or "").strip()
+            direction= str(item.get("direction", "neutral") or "neutral").strip()
+            summary  = str(item.get("summary", "") or "").strip()
+            sectors  = [str(s) for s in (item.get("sectors") or []) if s]
+            stocks   = [str(s) for s in (item.get("stocks") or []) if s]
+            # v165.0 신규 CoT 필드
+            scenario_confidence    = str(item.get("scenario_confidence", "medium") or "medium").strip()
+            today_reflected        = str(item.get("today_reflected", "partial") or "partial").strip()
+            tomorrow_continuation  = str(item.get("tomorrow_continuation", "moderate") or "moderate").strip()
+            counter_scenario       = str(item.get("counter_scenario", "") or "").strip()
+            reasoning              = str(item.get("reasoning", "") or "").strip()
             if not theme or not summary:
                 continue
             dir_label = "📈상승재료" if direction == "up" else ("📉하락재료" if direction == "down" else "")
-            title = f"[Groq재료] {theme} {dir_label} {summary}".strip()
+            cot_tag = ""
+            if today_reflected == "not_yet" and tomorrow_continuation == "strong":
+                cot_tag = "🔥"
+            elif today_reflected == "not_yet":
+                cot_tag = "⭐"
+            title = f"[Groq재료]{cot_tag} {theme} {dir_label} {summary}".strip()
             rows.append({
                 "title": title,
                 "source": "GROQ_GROUNDING",
                 "published_at": "",
                 "channel_id": "",
                 "live": "",
-                "gemini_stocks": [{"name": s, "theme": theme, "direction": direction, "reason": summary} for s in stocks[:4]],
+                "gemini_stocks": [{"name": s, "theme": theme, "direction": direction, "reason": summary} for s in stocks[:6]],
                 "_sectors": sectors,
+                # v165.0 CoT 필드 — 선진입 스코어링에서 활용
+                "_scenario_confidence": scenario_confidence,
+                "_today_reflected": today_reflected,
+                "_tomorrow_continuation": tomorrow_continuation,
+                "_counter_scenario": counter_scenario,
+                "_reasoning": reasoning,
             })
         _groq_grounding_daily_counter["count"] = _groq_grounding_daily_counter.get("count", 0) + 1
         _groq_grounding_cache = {"ts": now, "rows": rows}
-        print(f"[Groq] grounding 재료 수집 완료: {len(rows)}개 항목 (오늘 {_groq_grounding_daily_counter['count']}/{GROQ_GROUNDING_DAILY_LIMIT}회)")
+        hot = sum(1 for r in rows if r.get("_today_reflected") == "not_yet" and r.get("_tomorrow_continuation") == "strong")
+        print(f"[Groq] CoT 재료 수집 완료: {len(rows)}개 항목 (🔥미반영강세 {hot}건, 오늘 {_groq_grounding_daily_counter['count']}/{GROQ_GROUNDING_DAILY_LIMIT}회)")
         # v163.18 [#3]: Groq 분석 결과 → _dynamic_theme_map 자동 등록
         # THEME_MAP에 없는 완전 신규 테마도 자동 포착 파이프라인에 연결
         try:
@@ -12665,6 +12955,23 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
                     break
         except Exception as e:
             _swallow_exception(e)
+    # v164.0: 조용한 강세 풀 (RS>0 INTRADAY_SNAP_RS_QUIET_STREAK회 연속 유지 종목) 자동 편입
+    if len(codes) < max_codes:
+        try:
+            snap_state = _load_intraday_snap_state()
+            qs = snap_state.get("quiet_strong", {})
+            quiet_candidates = sorted(
+                [(c, v) for c, v in qs.items() if v.get("streak", 0) >= INTRADAY_SNAP_RS_QUIET_STREAK],
+                key=lambda x: x[1].get("streak", 0), reverse=True
+            )
+            if quiet_candidates:
+                _log_info_msg(f"[SNAP] 조용한 강세 풀 {len(quiet_candidates)}건 → 선진입 후보 편입 시도")
+            for c, v in quiet_candidates:
+                _push_gap_code(c)
+                if len(codes) >= max_codes:
+                    break
+        except Exception as e:
+            _swallow_exception(e)
     return codes[:max_codes]
 def _latest_signal_record_by_code(code: str, records: list) -> dict | None:
     code = normalize_stock_code(code)
@@ -13206,6 +13513,75 @@ def _apply_next_open_gap_flow_context(score: int, reasons: list[str], ctx: dict,
     score += bonus
     reasons.append(f"🧭 {hint.get('reason','시장 자금 이동')} {bonus:+d}점 — 리더 {hint.get('leader_name','')}")
     return score, reasons
+
+def _apply_next_open_gap_momentum_consistency(score: int, reasons: list, cautions: list,
+                                               ctx: dict, stage: str) -> tuple:
+    """장중 RS 지속성 + 외국인·기관 수급 → 선진입 스코어 반영 (v164.0).
+    RS 지속률·추세: 스냅샷 데이터 기반
+    외국인·기관 수급: get_investor_provisional_trend() (FHKST01010900)
+    """
+    code = str(ctx.get("code", "") or "")
+    market = "NXT" if ctx.get("use_nxt") else "KRX"
+    # ── RS 지속성 ──────────────────────────────────────────
+    try:
+        consistency_pct, trend, snap_count = _get_momentum_consistency_score(code, market)
+        if snap_count >= INTRADAY_SNAP_RS_MIN_SNAPS:
+            if consistency_pct >= 90:
+                score += 8; reasons.append(f"📈 장중 RS 지속률 {consistency_pct:.0f}% +8")
+            elif consistency_pct >= 70:
+                score += 5; reasons.append(f"📈 장중 RS 지속률 {consistency_pct:.0f}% +5")
+            elif consistency_pct >= 50:
+                score += 2; reasons.append(f"📊 장중 RS 지속률 {consistency_pct:.0f}% +2")
+            else:
+                score -= 5; cautions.append(f"📉 장중 RS 지속률 {consistency_pct:.0f}% -5 (오후 약화)")
+            if trend == "improving":
+                score += 3; reasons.append("⬆️ RS 추세 개선 중 +3")
+            elif trend == "deteriorating":
+                score -= 5; cautions.append("⬇️ RS 추세 악화 중 -5")
+        else:
+            if snap_count > 0:
+                reasons.append(f"📊 장중 스냅샷 {snap_count}회 (데이터 누적 중)")
+    except Exception as e:
+        _swallow_exception(e)
+    # ── 외국인·기관 수급 ────────────────────────────────────
+    try:
+        inv = get_investor_provisional_trend(code, market=market)
+        if isinstance(inv, dict) and inv:
+            frgn_qty  = int(inv.get("frgn_ntby_qty", 0) or 0)
+            inst_qty  = int(inv.get("orgn_ntby_qty", 0) or 0)
+            frgn_amt  = float(inv.get("frgn_ntby_tr_pbmn", 0) or 0)
+            inst_amt  = float(inv.get("orgn_ntby_tr_pbmn", 0) or 0)
+            if frgn_qty > 0 or frgn_amt > 0:
+                score += 5; reasons.append(f"🌐 외국인 순매수 +5 (수량:{frgn_qty:+,})")
+            elif frgn_qty < 0 and frgn_amt < 0:
+                score -= 3; cautions.append(f"🌐 외국인 순매도 -3")
+            if inst_qty > 0 or inst_amt > 0:
+                score += 4; reasons.append(f"🏦 기관 순매수 +4 (수량:{inst_qty:+,})")
+            elif inst_qty < 0 and inst_amt < 0:
+                score -= 2; cautions.append(f"🏦 기관 순매도 -2")
+    except Exception as e:
+        _swallow_exception(e)
+    # ── Groq CoT 시나리오 점수 (v165.0) ────────────────────────────────────
+    try:
+        gs = _get_groq_scenario_for_code(code, str(ctx.get("name", code) or code))
+        if gs:
+            tr = gs.get("today_reflected", "partial")
+            tc = gs.get("tomorrow_continuation", "moderate")
+            sc_conf = gs.get("scenario_confidence", "medium")
+            if tr == "not_yet" and tc == "strong":
+                score += 8; reasons.append(f"🔥 Groq 미반영·내일강세 +8")
+            elif tr == "not_yet" and tc == "moderate":
+                score += 5; reasons.append(f"⭐ Groq 미반영재료 +5")
+            elif tr == "already":
+                score -= 4; cautions.append("⚠️ Groq 이미반영 -4")
+            if sc_conf == "high":
+                score += 3; reasons.append("🎯 시나리오 신뢰도高 +3")
+            elif sc_conf == "low":
+                score -= 2; cautions.append("❓ 시나리오 신뢰도低 -2")
+    except Exception as e:
+        _swallow_exception(e)
+    return score, reasons, cautions
+
 def _finalize_next_open_gap_candidate(ctx: dict, stage: str, latest_rec: dict | None, us: dict,
                                       sector_info: dict, score: int, reasons: list[str], cautions: list[str],
                                       similar_pattern_stats: dict, similar_pattern_summary: str, phase: str = "initial") -> dict | None:
@@ -13270,6 +13646,7 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
         return None
     score, reasons, cautions = _score_next_open_gap_price_volume(ctx)
     score, reasons, sector_info = _apply_next_open_gap_sector_history(score, reasons, ctx, latest_rec)
+    score, reasons, cautions = _apply_next_open_gap_momentum_consistency(score, reasons, cautions, ctx, stage)  # v164.0
     score, reasons, similar_pattern_stats = _apply_similar_pattern_score(
         score, reasons, ctx["code"], "PRECLOSE_GAP_ENTRY", ctx["change_rate"], ctx["volume_ratio"], weight_mode="strong"
     )
@@ -15992,6 +16369,288 @@ def _get_quiet_orderbook_snapshot(code: str, market: str = "KRX") -> dict:
     return _get_quiet_cached_snapshot("orderbook", code, market, lambda: get_orderbook_depth_snapshot(code, market=market))
 def _get_quiet_trade_snapshot(code: str, market: str = "KRX") -> dict:
     return _get_quiet_cached_snapshot("trade", code, market, lambda: get_trade_intensity_snapshot(code, market=market))
+
+def _get_groq_scenario_for_code(code: str, name: str) -> dict:
+    """Groq CoT 분석 결과에서 종목별 시나리오 필드 반환 (v165.0).
+    gemini_stocks name 부분 매칭으로 조회.
+    Returns: {today_reflected, tomorrow_continuation, scenario_confidence, counter_scenario} 또는 {}
+    """
+    try:
+        rows = list(_groq_grounding_cache.get("rows") or [])
+        name_clean = str(name or "").strip()
+        code_clean = str(code or "").strip()
+        for row in rows:
+            for gs in (row.get("gemini_stocks") or []):
+                gs_name = str(gs.get("name", "") or "")
+                if not gs_name:
+                    continue
+                if gs_name in name_clean or name_clean in gs_name or gs_name == code_clean:
+                    return {
+                        "today_reflected":       row.get("_today_reflected", "partial"),
+                        "tomorrow_continuation": row.get("_tomorrow_continuation", "moderate"),
+                        "scenario_confidence":   row.get("_scenario_confidence", "medium"),
+                        "counter_scenario":      row.get("_counter_scenario", ""),
+                        "theme":                 gs.get("theme", ""),
+                        "direction":             gs.get("direction", "neutral"),
+                        "reason":                gs.get("reason", ""),
+                    }
+    except Exception as e:
+        _swallow_exception(e)
+    return {}
+
+def _fetch_opening_expected_price(code: str) -> dict:
+    """KIS FHKST01010200 output2 — 장전 동시호가 예상체결가 조회 (v165.0).
+    08:30~09:00 동시호가 구간에서만 antc_cnpr 유효.
+    Returns: {expected_price, expected_rate, bid_qty, ask_qty, bid_ask_ratio}
+    """
+    code = normalize_stock_code(code)
+    if not code:
+        return {}
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            "FHKST01010200",
+            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        out2 = None
+        if isinstance(data.get("output2"), dict):
+            out2 = data["output2"]
+        elif isinstance(data.get("output2"), list) and data["output2"]:
+            out2 = data["output2"][0]
+        out1 = None
+        if isinstance(data.get("output1"), dict):
+            out1 = data["output1"]
+        elif isinstance(data.get("output1"), list) and data["output1"]:
+            out1 = data["output1"][0]
+        expected_price = 0
+        expected_rate  = 0.0
+        if out2:
+            expected_price = safe_int(out2.get("antc_cnpr", 0), 0)
+            try:
+                expected_rate = float(out2.get("antc_cntg_vrss_prdy_ctrt", 0) or 0)
+            except Exception:
+                expected_rate = 0.0
+        # 호가잔량은 output1에서
+        bid_qty = ask_qty = 0
+        if out1:
+            bid_qty = safe_int(out1.get("bidp_rsqn1", 0), 0)
+            ask_qty = safe_int(out1.get("askp_rsqn1", 0), 0)
+        if expected_price <= 0:
+            return {}
+        bid_ask_ratio = round(bid_qty / max(ask_qty, 1), 2) if ask_qty > 0 else 0.0
+        return {
+            "expected_price": expected_price,
+            "expected_rate":  round(expected_rate, 2),
+            "bid_qty":        bid_qty,
+            "ask_qty":        ask_qty,
+            "bid_ask_ratio":  bid_ask_ratio,
+        }
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+
+def _build_opening_gap_watch_pool() -> list:
+    """시초가 진입 후보 풀 구성 (v165.0).
+    1) signal_log PRECLOSE_GAP_ENTRY 어제·오늘 발송 종목
+    2) _preclose_gap_entry_watch 현재 추적 종목
+    3) Groq CoT today_reflected=not_yet + tomorrow_continuation=strong 종목
+    Returns: list of {code, name, source}
+    """
+    pool = []
+    seen = set()
+
+    def _push(code, name, source):
+        c = normalize_stock_code(code)
+        if c and c not in seen:
+            seen.add(c)
+            pool.append({"code": c, "name": str(name or c), "source": source})
+
+    # ① PRECLOSE_GAP_ENTRY 발송 이력
+    try:
+        today  = _now_kst().strftime("%Y%m%d")
+        yest   = (_now_kst() - timedelta(days=1)).strftime("%Y%m%d")
+        siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
+        recs   = list(siglog.values()) if isinstance(siglog, dict) else (siglog if isinstance(siglog, list) else [])
+        for rec in recs:
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("signal_type") != PRECLOSE_GAP_SIGNAL_TYPE:
+                continue
+            det_date = str(rec.get("detect_date", "") or "")
+            if det_date not in (today, yest):
+                continue
+            _push(rec.get("code", ""), rec.get("name", ""), "PRECLOSE_GAP")
+    except Exception as e:
+        _swallow_exception(e)
+
+    # ② _preclose_gap_entry_watch 현재 추적 중
+    try:
+        with _state_lock:
+            watch = dict(_preclose_gap_entry_watch or {})
+        for v in watch.values():
+            if isinstance(v, dict):
+                _push(v.get("code", ""), v.get("name", ""), "PRECLOSE_WATCH")
+    except Exception as e:
+        _swallow_exception(e)
+
+    # ③ Groq CoT 미반영·강세 지속 종목
+    try:
+        rows = list(_groq_grounding_cache.get("rows") or [])
+        for row in rows:
+            if row.get("_today_reflected") == "not_yet" and row.get("_tomorrow_continuation") == "strong":
+                for gs in (row.get("gemini_stocks") or []):
+                    gs_name = str(gs.get("name", "") or "")
+                    if not gs_name:
+                        continue
+                    resolved = _resolve_stock_code_by_name(gs_name)
+                    if resolved:
+                        _push(resolved, gs_name, "GROQ_NOT_YET")
+    except Exception as e:
+        _swallow_exception(e)
+
+    if pool:
+        _log_info_msg(f"[OPENING_GAP] 후보 풀 구성: {len(pool)}건 (PRECLOSE:{sum(1 for p in pool if 'PRECLOSE' in p['source'])} / GROQ:{sum(1 for p in pool if 'GROQ' in p['source'])})")
+    return pool[:OPENING_GAP_MAX_POOL]
+
+def send_opening_gap_alert() -> None:
+    """08:50 — 시초가 진입 알람 발송 (v165.0).
+    KIS 예상체결가 조회 → 스코어링 → 조건 충족 시 텔레그램 알람.
+    선진입(PRECLOSE_GAP_ENTRY)의 보완책 — 진입가가 더 높음을 알람에 명시.
+    """
+    if is_holiday():
+        return
+    now_t = _now_kst().time()
+    # 08:30~09:05 사이에만 실행 (동시호가 구간)
+    if not (dtime(8, 28) <= now_t <= dtime(9, 5)):
+        return
+    _log_info_msg("⚡ [시초가진입] 08:50 예상체결가 스캔 시작")
+    pool = _build_opening_gap_watch_pool()
+    if not pool:
+        _log_info_msg("⚡ [시초가진입] 후보 풀 0건 — 종료")
+        return
+    us = get_us_market_signals() or {}
+    candidates = []
+    for item in pool:
+        code = item["code"]
+        name = item["name"]
+        source = item["source"]
+        try:
+            exp = _fetch_opening_expected_price(code)
+            if not exp:
+                continue
+            expected_rate  = float(exp.get("expected_rate", 0) or 0)
+            bid_ask_ratio  = float(exp.get("bid_ask_ratio", 0) or 0)
+            expected_price = int(exp.get("expected_price", 0) or 0)
+            # 최소 조건: 예상 갭상승률 + 매수잔량 우위
+            if expected_rate < OPENING_GAP_MIN_EXPECTED_GAP_PCT:
+                continue
+            if bid_ask_ratio < OPENING_GAP_MIN_BID_ASK_RATIO:
+                continue
+            # 스코어링
+            score = 0
+            reasons = []
+            # 예상 갭상승률
+            if expected_rate >= 8:
+                score += 25; reasons.append(f"🔥 예상갭 {expected_rate:+.1f}% +25")
+            elif expected_rate >= 5:
+                score += 18; reasons.append(f"🔥 예상갭 {expected_rate:+.1f}% +18")
+            elif expected_rate >= 3:
+                score += 12; reasons.append(f"📈 예상갭 {expected_rate:+.1f}% +12")
+            else:
+                score += 6; reasons.append(f"📈 예상갭 {expected_rate:+.1f}% +6")
+            # 매수잔량 비율
+            if bid_ask_ratio >= 3.0:
+                score += 15; reasons.append(f"💪 매수잔량 {bid_ask_ratio:.1f}배 +15")
+            elif bid_ask_ratio >= 2.0:
+                score += 10; reasons.append(f"💪 매수잔량 {bid_ask_ratio:.1f}배 +10")
+            elif bid_ask_ratio >= 1.3:
+                score += 5; reasons.append(f"💪 매수잔량 {bid_ask_ratio:.1f}배 +5")
+            # RS 지속성 (전날 장중 스냅샷)
+            try:
+                consistency_pct, trend, snap_count = _get_momentum_consistency_score(code, "KRX")
+                if snap_count >= 1:
+                    if consistency_pct >= 80:
+                        score += 8; reasons.append(f"📈 전일 RS 지속률 {consistency_pct:.0f}% +8")
+                    elif consistency_pct >= 60:
+                        score += 5; reasons.append(f"📈 전일 RS 지속률 {consistency_pct:.0f}% +5")
+                    if trend == "improving":
+                        score += 3; reasons.append("⬆️ RS 추세 개선 +3")
+            except Exception as _e:
+                _swallow_exception(_e)
+            # Groq CoT 시나리오 점수
+            try:
+                gs = _get_groq_scenario_for_code(code, name)
+                if gs:
+                    tr = gs.get("today_reflected", "partial")
+                    tc = gs.get("tomorrow_continuation", "moderate")
+                    sc = gs.get("scenario_confidence", "medium")
+                    if tr == "not_yet" and tc == "strong":
+                        score += 12; reasons.append(f"🔥 Groq미반영·강세지속 +12")
+                    elif tr == "not_yet":
+                        score += 7; reasons.append(f"⭐ Groq미반영재료 +7")
+                    elif tr == "already":
+                        score -= 5; reasons.append("⚠️ Groq이미반영 -5")
+                    if sc == "high":
+                        score += 4; reasons.append("🎯 시나리오신뢰도高 +4")
+            except Exception as _e:
+                _swallow_exception(_e)
+            # 미국시장 방향
+            gap_signal = str(us.get("gap_signal", "flat") or "flat")
+            if gap_signal == "gap_up":
+                score += 5; reasons.append("🌐 미국 갭상승 +5")
+            elif gap_signal == "gap_down":
+                score -= 5; reasons.append("🌐 미국 갭하락 -5")
+            # 외국인·기관 수급 (전일 가집계)
+            try:
+                inv = get_investor_provisional_trend(code, market="KRX")
+                if isinstance(inv, dict) and inv:
+                    if int(inv.get("frgn_ntby_qty", 0) or 0) > 0:
+                        score += 5; reasons.append("🌐 외국인 순매수 +5")
+                    if int(inv.get("orgn_ntby_qty", 0) or 0) > 0:
+                        score += 4; reasons.append("🏦 기관 순매수 +4")
+            except Exception as _e:
+                _swallow_exception(_e)
+            if score < OPENING_GAP_MIN_SCORE:
+                continue
+            candidates.append({
+                "code": code, "name": name, "score": score,
+                "expected_rate": expected_rate, "expected_price": expected_price,
+                "bid_ask_ratio": bid_ask_ratio, "reasons": reasons[:4], "source": source,
+            })
+            time.sleep(0.08)
+        except Exception as e:
+            _swallow_exception(e)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    if not candidates:
+        _log_info_msg(f"⚡ [시초가진입] 조건 충족 종목 없음 (pool={len(pool)})")
+        return
+    _log_info_msg(f"⚡ [시초가진입] 알람 발송: {len(candidates)}건")
+    for c in candidates[:3]:
+        try:
+            code  = c["code"]
+            name  = c["name"]
+            er    = c["expected_rate"]
+            ep    = c["expected_price"]
+            ba    = c["bid_ask_ratio"]
+            sc    = c["score"]
+            rsns  = "\n".join(f"  • {r}" for r in c["reasons"])
+            src   = c["source"]
+            src_tag = "📌 선진입 이월" if "PRECLOSE" in src else "🔍 Groq재료"
+            msg = (
+                f"⚡ [시초가 진입 대기] {name}({code})\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"예상 시초가: {ep:,}원 ({er:+.1f}%)\n"
+                f"매수잔량비율: {ba:.1f}배\n"
+                f"종합 점수: {sc}점\n"
+                f"{rsns}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"{src_tag} | ⚠️ 갭상승 후 진입으로 선진입 대비 진입가 높을 수 있음\n"
+                f"📌 09:00 시초가 형성 후 매수잔량 유지 재확인 권장"
+            )
+            _send_telegram_message(msg)
+        except Exception as e:
+            _swallow_exception(e)
+
 def get_orderbook_depth_snapshot(code: str, market: str = "KRX") -> dict:
     code = normalize_stock_code(code)
     if not code:
@@ -23257,6 +23916,7 @@ def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | 
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
         "PRECLOSE_GAP_ENTRY": "종가선진입",
+        "OPENING_GAP_ENTRY":  "시초가진입",
     }
     sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
     basis_suffix = f"  <b>{ref_price:,}원</b>" if use_nxt and ref_price > 0 else ""
@@ -23305,6 +23965,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
         "PRECLOSE_GAP_ENTRY": "종가선진입",
+        "OPENING_GAP_ENTRY":  "시초가진입",
     }
     sig = sig_labels.get(watch.get("signal_type", ""), watch.get("signal_type", ""))
     nxt_notice = "\n📡 <b>NXT 기준 가격</b>" if use_nxt else ""
@@ -23383,6 +24044,7 @@ def _prepare_entry_phase_alert_context(watch: dict, cur: dict, price: int, entry
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
         "PRECLOSE_GAP_ENTRY": "종가선진입",
+        "OPENING_GAP_ENTRY":  "시초가진입",
     }
     similar_stats = _get_similar_pattern_stats(
         watch["code"],
@@ -25536,6 +26198,7 @@ def _build_integrated_pullback_phase1_message(signal: dict, watch: dict, price: 
         "UPPER_LIMIT": "상한가", "NEAR_UPPER": "상한가근접", "SURGE": "급등",
         "EARLY_DETECT": "조기포착", "MID_PULLBACK": "눌림목", "ENTRY_POINT": "눌림목",
         "PRECLOSE_GAP_ENTRY": "종가선진입",
+        "OPENING_GAP_ENTRY":  "시초가진입",
     }
     sig = sig_labels.get(str(watch.get("signal_type", "") or "").upper(), watch.get("signal_type", ""))
     details = [
@@ -37123,6 +37786,9 @@ if __name__ == "__main__":
     # v163: 코스피 지수 스냅샷 2분 간격 — 회복력(Resilience) 계산용
     schedule.every(2).minutes.do(record_index_snapshot)
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
+    schedule.every().day.at("08:50").do(_leader_job(  # v165.0: 시초가 진입 알람
+        lambda: None if is_holiday() else send_opening_gap_alert()
+    ))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
     ))
@@ -37138,6 +37804,19 @@ if __name__ == "__main__":
     schedule.every().day.at("19:10").do(_leader_job(  # v161.44: 19:20→19:10
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt", phase="final")
     ))
+    # v164.0: 장중 모멘텀 스냅샷 스케줄러 — KRX 5회 / NXT 7회
+    # KRX 관망 구간(09:00~14:35) 균등 분포
+    for _krx_t in INTRADAY_SNAP_KRX_TIMES:
+        _t = _krx_t  # closure 캡처
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("KRX")
+        ))
+    # NXT 관망 구간(08:00~19:10) 균등 분포
+    for _nxt_t in INTRADAY_SNAP_NXT_TIMES:
+        _t = _nxt_t
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("NXT")
+        ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
     schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
