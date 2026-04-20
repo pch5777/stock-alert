@@ -3,24 +3,59 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.3
+버전: v165.5
 날짜: 2026-04-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v165.3 (2026-04-20): _fetch_kis_amount_rank KIS 30건 한계 보완 — 네이버 병행 수집
-  [#1] _fetch_kis_amount_rank(): KIS 30건 응답 후 네이버 rise/amount 병행 수집 합산
-       이유: KIS volume-rank API(FHPST01710000)는 FID_VOL_CNT에 200을 요청해도
-             실제 응답은 최대 30건으로 제한됨 (API 스펙 상한)
-             로그 확인: "[SNAP] KIS 거래대금 순위 30건 수집" — 200건 의도였으나 30건만 수집
-             INTRADAY_SNAP_TOP_N=200 요청이 의미없어지고 조용한 강세 풀이 30종목으로 제한됨
-       개선점: KIS 30건 수집 후 네이버 rise 상위 80건 + amount 상위 30건 추가 병행 수집
-              중복 제거 후 합산 → 실질 130~150건 수준으로 커버리지 확대
-              snap_combined 카운트 로그로 실제 수집 건수 확인 가능
-       주의점: 네이버 스크래핑은 KIS 실패 시 fallback이 아닌 항상 병행 수집
-              기존 fallback 경로(KIS 실패 시 외부소스만)는 그대로 유지
-  이유: KIS volume-rank API 스펙 제한
-  개선점: SNAP 스냅샷 종목 수 30→130~150건으로 확대. 조용한 강세 풀 품질 향상
-  주의점: 네이버 병행 수집 실패해도 KIS 30건으로 정상 동작
+- v165.5 (2026-04-20): 선진입 job 스레드 분리 + holdover 파일 저장
+  [#1] 선진입 job(14:35/15:08/19:10) 별도 스레드 실행으로 변경
+       이유: schedule 라이브러리 single-thread 특성 — run_scan(10~20분) 처리 중
+             15:08 job이 pending 상태로 대기하다가 15:26에 뒤늦게 실행
+             v165.4에서 15:12 초과 시 skip 추가했으나 이는 알람 자체를 못 보내는 문제
+             근본 원인: job이 정시에 실행되지 않는 것
+       개선점: 14:35/15:08/19:10 세 job을 _threaded_leader_job()으로 감싸서
+              run_scan 실행 중에도 별도 스레드에서 정시 독립 실행
+              _leader_job_running 중복 방지 로직 유지
+       주의점: 선진입 job은 KIS API 호출 포함 → 스레드 내 API 호출 안전성 확인 필요
+              기존 _leader_job() 재진입 방지 로직 동일 적용 (fn_key 기반)
+  [#2] NXT holdover 파일 저장/복원 추가
+       이유: v165.4 holdover가 세션 메모리(_nxt_preclose_holdover dict)만 사용
+             KRX 15:08 스캔 후 Railway 재시작 시 holdover 초기화 → NXT 19:10에 누락
+       개선점: NXT_HOLDOVER_STATE_FILE(nxt_holdover_state.json) 추가
+              _save_nxt_holdover() — 편입/삭제 시마다 저장 (당일 날짜 포함)
+              _load_nxt_holdover() — 봇 시작 시 당일 데이터만 복원 (전날 자동 무시)
+              holdover 편입 시 파일 저장, NXT 스캔 완료 후 초기화
+  [#3] v165.4 시각 초과 skip 로직 제거
+       이유: skip 대신 스레드 분리로 근본 해결했으므로 불필요
+  이유: 선진입 알람 정시 발송 + holdover 재시작 내구성 확보
+  개선점: 14:35/15:08 알람 정시 발송 보장, 재시작 후 holdover 복원
+  주의점: 스레드 분리 job은 예외 발생 시 main 루프에 영향 없음 (daemon=True)
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
+- v165.4 (2026-04-20): 선진입 시각 초과 skip + NXT 이중상장 holdover 편입
+  [#1] send_next_open_gap_alert(): phase=final+stage=krx 시 15:12 초과면 skip
+       이유: 15:08 스케줄 job이 run_scan 처리 밀림으로 15:26에 실행 → 15:28 발송
+             schedule 라이브러리 single-thread 특성상 run_pending() 호출 시점에만 job 실행
+             → 15:12 이후 시각에 실행됐다면 종목 선정 데이터가 이미 15:08 기준이 아님
+             → 발송 자체를 skip해야 잘못된 시각 데이터로 진입하는 오류 방지
+       개선점: PRECLOSE_GAP_FINAL_CONFIRM_END(15:12) 초과 시 skip 로그 남기고 return
+       주의점: stage=nxt(19:10~19:14), stage=krx phase=initial(14:35~14:55)는 기존 로직 유지
+  [#2] build_next_open_gap_candidates(): KRX 스캔에서 NXT 이중상장 종목 holdover 편입
+       이유: 필옵틱스(161580)처럼 KRX+NXT 이중상장 종목이 KRX 15:08 스캔에서 조건 충족
+             → KRX 마감 전 즉시 발송 (KRX 기준) → KRX 장 마감 직전이라 진입 불가
+             더 정확한 접근: KRX 스캔에서 조건 충족 → NXT holdover 풀에 편입
+             → NXT 19:10 스캔 시 NXT 기준 재평가 → 조건 유지 시 NXT 기준으로 발송
+       개선점: stage=krx 스캔에서 is_nxt_listed(code)==True 종목은 candidates에서 제외
+              대신 _nxt_preclose_holdover_codes (세션 메모리) 에 저장
+              stage=nxt 스캔의 _collect_next_open_gap_candidate_codes()에서 holdover 풀 우선 편입
+       주의점: holdover 풀은 당일 세션 메모리만. 재시작 시 초기화됨 (state 파일 불필요)
+              NXT 19:10 스캔에서 재평가이므로 KRX 시점 점수와 무관하게 NXT 기준 재산출
+  [#3] v165.3 패치 통합: _fetch_kis_amount_rank KIS 30건 + 네이버 병행 합산
+       이유: KIS volume-rank API 최대 30건 응답 한계 → SNAP 30종목만 수집
+       개선점: KIS 30 + 네이버 rise 80 + amount 30 → 합산 130~150건
+  이유: 선진입 알람 진입불가 시각 발송 + NXT 이중상장 종목 KRX 기준 발송 구조 문제
+  개선점: 선진입 알람 정시 발송 보장 + NXT 이중상장 종목 NXT 기준 발송
+  주의점: holdover는 재시작 시 초기화됨. NXT 19:10 이전 재시작 시 holdover 종목 재검토 필요
   진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
 
 - v165.2 (2026-04-20): _fetch_kis_amount_rank 파라미터 수정 + no_ask_liquidity 급등 종목 soft 처리
@@ -3366,8 +3401,7 @@ def _fetch_kis_amount_rank(top_n: int = 200) -> list:
     except Exception as e:
         _swallow_exception(e)
 
-    # v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 수집
-    # KIS 성공·실패 무관하게 항상 병행 수집해서 커버리지 확대
+    # v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 수집 (항상 수행)
     seen_codes = {r["code"] for r in kis_items}
     snap_combined = list(kis_items)
     try:
@@ -3897,6 +3931,37 @@ def _leader_job(fn):
         finally:
             with _leader_job_lock:
                 _leader_job_running.pop(fn_key, None)
+    return _wrapped
+
+def _threaded_leader_job(fn):
+    """v165.5: 선진입 등 시각 민감 job을 별도 스레드로 실행.
+    schedule single-thread 특성상 run_scan 처리 중 job이 pending되는 문제 해소.
+    _leader_job의 모든 가드(version_lock, leader_lock, 중복방지)를 스레드 내에서 동일 적용.
+    """
+    def _wrapped(*args, **kwargs):
+        def _run():
+            if _runtime_version_blocked:
+                return
+            was_leader = bool(_RUNTIME_IS_LEADER)
+            if not _try_acquire_leader_lock():
+                return
+            if not _enforce_runtime_version_lock(notify=False):
+                return
+            fn_key = getattr(fn, "__name__", str(fn)) + "_threaded"
+            with _leader_job_lock:
+                if _leader_job_running.get(fn_key):
+                    return
+                _leader_job_running[fn_key] = True
+            try:
+                if not was_leader:
+                    _send_startup_banner_once()
+                fn(*args, **kwargs)
+            except Exception as _e:
+                _log_warn_msg(f"⚠️ threaded_leader_job 오류 [{getattr(fn,'__name__',str(fn))}]: {_e}")
+            finally:
+                with _leader_job_lock:
+                    _leader_job_running.pop(fn_key, None)
+        threading.Thread(target=_run, daemon=True).start()
     return _wrapped
 def _ensure_dir(path: str):
     try:
@@ -8159,6 +8224,35 @@ ENTRY_GUARD_SAME_REASON_COOLDOWN_SEC = int(os.getenv("ENTRY_GUARD_SAME_REASON_CO
 PHASE2_UPGRADE_ALERT_COOLDOWN_SEC = int(os.getenv("PHASE2_UPGRADE_ALERT_COOLDOWN_SEC", "1800") or "1800")  # 동일 강화판단 재알림 최소 30분
 ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC = int(os.getenv("ENTRY_FOLLOWUP_ALERT_COOLDOWN_SEC", "3600") or "3600")  # entry_hit 이후 후속행동 알림 최소 60분
 ENTRY_WATCH_MAX_HOURS = 6    # 진입가 감시 최대 6시간 → 장 마감 시 자동 만료됨
+# v165.4: NXT 이중상장 holdover 풀 — KRX 선진입 스캔에서 조건 충족한 NXT 이중상장 종목 보관
+# KRX 발송 대신 NXT 19:10 스캔까지 보류 후 NXT 기준 재평가
+# v165.5: 세션 메모리 + 파일 저장 병행 (재시작 후 당일 데이터 복원)
+_nxt_preclose_holdover: dict = {}  # code → {name, score, change_rate, added_ts, date}
+
+def _save_nxt_holdover() -> None:
+    """v165.5: NXT holdover 풀을 파일에 저장."""
+    try:
+        _write_json_atomic(NXT_HOLDOVER_STATE_FILE, dict(_nxt_preclose_holdover), indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _load_nxt_holdover() -> None:
+    """v165.5: 봇 시작 시 당일 holdover 복원. 전날 데이터는 무시."""
+    global _nxt_preclose_holdover
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        data = _read_json_safe(NXT_HOLDOVER_STATE_FILE, {})
+        if not isinstance(data, dict):
+            return
+        restored = {
+            code: rec for code, rec in data.items()
+            if isinstance(rec, dict) and str(rec.get("date", "") or "") == today
+        }
+        if restored:
+            _nxt_preclose_holdover = restored
+            _log_info_msg(f"[선진입] NXT holdover {len(restored)}건 복원 (당일 {today})")
+    except Exception as e:
+        _swallow_exception(e)
 # v40.0-#10: 상한가 유지 종목 알림 차단 (당일 1회만 알림, 풀리기 전까지 재알림 없음)
 _upper_limit_day_alerted: dict = {}   # code → {"date": "YYYYMMDD", "alerted": True}
 # ── 분할 청산 가이드(메시지 스팸 방지) ──
@@ -10420,6 +10514,7 @@ RUNTIME_STATE_BUNDLE_FILE = _state_path("runtime_state_bundle.json")
 MARKET_LEADER_STATE_FILE = _state_path("market_leader_sector_state.json")
 NEXT_OPEN_GAP_FILE         = _state_path("next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = _state_path("preclose_gap_run_state.json")
+NXT_HOLDOVER_STATE_FILE     = _state_path("nxt_holdover_state.json")  # v165.5: holdover 파일 저장
 PRECLOSE_GAP_ENTRY_WATCH_FILE = _state_path("preclose_gap_entry_watch.json")
 REENTRY_WATCH_FILE = _state_path("reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = _state_path("execution_setup_watch.json")
@@ -12966,6 +13061,15 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
         if c and c not in seen:
             seen.add(c)
             codes.append(c)
+    # v165.4: NXT holdover 풀 최우선 편입 — KRX 스캔에서 이월된 NXT 이중상장 종목
+    try:
+        holdover_snap = dict(_nxt_preclose_holdover)
+        if holdover_snap:
+            _log_info_msg(f"[선진입] NXT holdover 풀 {len(holdover_snap)}건 → 최우선 편입")
+            for c in holdover_snap.keys():
+                _push_gap_code(c)
+    except Exception as e:
+        _swallow_exception(e)
     # v161.44: 섹터 대장주 발송 이력 → 최우선 편입
     try:
         leader_state = _read_market_leader_state()
@@ -13785,12 +13889,35 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
         try:
             scored = _score_next_open_gap_candidate(code, stage, latest_rec, us, strong_dart_codes, phase=phase)
             if scored:
-                candidates.append(scored)
+                # v165.4: KRX 스캔에서 NXT 이중상장 종목 → holdover 편입 (KRX 발송 대신 NXT 19:10 재평가)
+                if stage == "krx" and is_nxt_listed(code):
+                    _nxt_preclose_holdover[code] = {
+                        "name": str(scored.get("name", code) or code),
+                        "score": int(scored.get("score", 0) or 0),
+                        "change_rate": float(scored.get("change_rate", 0.0) or 0.0),
+                        "added_ts": time.time(),
+                        "date": datetime.now().strftime("%Y%m%d"),  # v165.5: 당일 날짜 — 재시작 복원 시 구분
+                    }
+                    _save_nxt_holdover()  # v165.5: 즉시 파일 저장
+                    _log_info_msg(
+                        f"  📌 NXT holdover 편입: {scored.get('name', code)} "
+                        f"{scored.get('score', 0)}점 ({scored.get('change_rate', 0.0):+.1f}%) "
+                        f"— KRX 발송 제외, NXT 19:10 재평가"
+                    )
+                else:
+                    candidates.append(scored)
         except Exception as e:
             _swallow_exception(e)  # v105 structured silent-exception log
             continue
         time.sleep(0.05)
     candidates.sort(key=lambda x: (x.get("score", 0), x.get("rr", 0), x.get("change_rate", 0), x.get("volume_ratio", 0)), reverse=True)
+    # v165.4: NXT 스캔 결과에서 holdover 종목은 market_note를 "NXT 기준"으로 확정
+    if stage == "nxt":
+        holdover_codes = set(_nxt_preclose_holdover.keys())
+        for c in candidates:
+            if normalize_stock_code(c.get("code", "")) in holdover_codes:
+                c["market_note"] = "NXT 기준"
+                c["market_basis"] = "NXT"
     payload = {
         "ts": time.time(),
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -37913,13 +38040,13 @@ if __name__ == "__main__":
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_leader_job(
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
     ))
-    schedule.every().day.at("14:35").do(_leader_job(  # v161.44: 14:45→14:35
+    schedule.every().day.at("14:35").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="initial")
     ))
-    schedule.every().day.at("15:08").do(_leader_job(  # v161.44: 15:18→15:08
+    schedule.every().day.at("15:08").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="final")
     ))
-    schedule.every().day.at("19:10").do(_leader_job(  # v161.44: 19:20→19:10
+    schedule.every().day.at("19:10").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
         lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt", phase="final")
     ))
     # v164.0: 장중 모멘텀 스냅샷 스케줄러 — KRX 5회 / NXT 7회
@@ -38005,6 +38132,7 @@ if __name__ == "__main__":
             except Exception as e:
                 _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
     _maybe_run_preclose_gap_alert_catchup()
+    _load_nxt_holdover()  # v165.5: 당일 NXT holdover 복원
     _schedule_startup_scan_catchup()
     # v162: WebSocket 스레드 시작
     try:
