@@ -3,30 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.1
+버전: v165.2
 날짜: 2026-04-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v165.1 (2026-04-20): VI발동 거래정지 오판 수정 + Groq trailing comma 방어 + malformed 로그 보강
-  [#1] _has_explicit_halt_market_flag(): temp_stop_yn 분리 + VI코드(55/56) 거래정지 오판 차단
-       이유: raw_status_code = iscd_stat_cls_code OR temp_stop_yn 합산 → VI발동 시 temp_stop_yn="Y"가
-             _is_truthy_market_flag("Y")=True → 실제 거래 중 종목을 거래정지로 오판
-             에스앤더블류 +15.3% A급 SURGE 포착 직후 [포착 취소-거래정지] 오발송 사례
-       개선점: get_stock_price()/get_nxt_stock_price()에서 temp_stop_yn을 raw_status_code에서 분리,
-              별도 필드 raw_temp_stop로 수신. _has_explicit_halt_market_flag에서 vi_cls_code가
-              VI발동 코드(55/56/"V"/"4")이면 real halt 판정 제외. trht_yn="Y"만 실제 거래정지로 인정
-       주의점: vi_cls_code 필드는 기존 VI 감지에도 사용되므로 halt 분기만 수정
-  [#2] _fetch_groq_news_rows(): Groq JSON trailing comma 방어 코드 추가
-       이유: Groq Llama가 JSON 배열 마지막 원소 뒤 쉼표 남기는 경우 JSONDecodeError 발생
-             로그: "Illegal trailing comma before end of array" — 재료 수집 전체 실패
-       개선점: raw_clean 전처리 시 re.sub으로 trailing comma 제거 후 파싱 시도
-              파싱 실패 시에도 기존 캐시 유지 (재료 공백 방지)
-       주의점: 기존 ```json/``` 제거 후 추가 적용
-  [#3] _sanitize_run_scan_alerts(): malformed alert 제거 로그에 종목코드 포함
-       이유: "malformed alert N건 제거 [pre_sector_gate]"만으로는 어떤 종목인지 추적 불가
-             30분 주기로 반복 발생 중이나 원인 종목 미파악
-       개선점: dropped 건 수 외에 제거된 종목명/코드 목록도 함께 로그
-       주의점: 최대 5건만 표시 (로그 폭증 방지)
+- v165.2 (2026-04-20): _fetch_kis_amount_rank 파라미터 수정 + no_ask_liquidity 급등 종목 soft 처리
+  [#1] _fetch_kis_amount_rank(): FID_COND_SCR_DIV_CODE 20172→20171 + FID_RANK_SORT_CLS_CODE="1" 추가
+       이유: KIS volume-rank API의 FID_COND_SCR_DIV_CODE는 "20171" 하나만 존재 (공식 포털 확인)
+             "20172"는 존재하지 않는 스크린코드 → 매 호출마다 실패 → fallback 200건으로 대체
+             KB레버리지 2차전지 ETN(+29%) 등 급등 종목이 유니버스에 미편입 → candidate_miss 35분 침묵
+       개선점: FID_COND_SCR_DIV_CODE="20171" + FID_RANK_SORT_CLS_CODE="1"(거래대금 정렬)로 변경
+              응답 필드 acml_tr_pbmn(거래대금) 추가 파싱으로 ETN 포함 전 종목 거래대금 순위 수집
+       주의점: FID_RANK_SORT_CLS_CODE="0"=거래량순, "1"=거래대금순. 기존 get_volume_surge_stocks()는
+              "0"(거래량순) 유지 — 이 함수만 "1"(거래대금순)로 설정
+  [#2] no_ask_liquidity 급등 종목 hard→soft 완화: 등락률 +10% 이상이면 차단 대신 경고만
+       이유: +10% 이상 급등 중 종목은 VI발동/순간 호가 소진이 정상 현상
+             hard 차단으로 인해 STX엔진(7회), 알지노믹스(6회) 등 A급 종목이 진입감시에서 제거됨
+             이번 로그에서 no_ask_liquidity hard 차단 62건 중 A급 포착 종목이 반복 차단됨
+       개선점: _ensure_signal_actionability()에서 등락률 ≥10% 종목은 no_ask_liquidity soft 처리
+              soft = 진입불가 기록만, 알람 발송은 유지
+       주의점: 등락률 <10% 종목은 기존 hard 차단 유지
+  [#3] v165.1 패치 통합 적용
+       - VI발동/거래정지 오판 수정 (raw_status_code에서 temp_stop_yn 분리, _VI_CODES 도입)
+       - Groq JSON trailing comma 방어 (re.sub)
+       - malformed alert 로그 종목코드 포함
   진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
 
 - v165.0 (2026-04-19): 시초가 진입 알람 신설 + Groq 재료 추론 Chain-of-Thought 재설계
@@ -3304,16 +3304,19 @@ def _save_intraday_snap_state(state: dict) -> None:
         _swallow_exception(e)
 
 def _fetch_kis_amount_rank(top_n: int = 200) -> list:
-    """KIS FHPST01720000 거래대금 순위 조회 — 네이버 크롤링 대체.
+    """KIS FHPST01710000 거래대금 순위 조회 — 네이버 크롤링 대체.
+    v165.2: FID_COND_SCR_DIV_CODE=20171(유일한 volume-rank 스크린코드) +
+            FID_RANK_SORT_CLS_CODE="1"(거래대금 기준 정렬).
+    KIS 공식 포털 확인: "20172" 스크린코드는 존재하지 않음 → 매 호출 실패 원인.
     실패 시 _fetch_external_rank_top() fallback.
     """
     try:
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
-            "FHPST01720000",
+            "FHPST01710000",
             {
                 "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_COND_SCR_DIV_CODE": "20172",
+                "FID_COND_SCR_DIV_CODE": "20171",       # v165.2: 20172→20171 (유일 스크린코드)
                 "FID_INPUT_ISCD": "0000",
                 "FID_DIV_CLS_CODE": "0",
                 "FID_BLNG_CLS_CODE": "0",
@@ -3323,6 +3326,7 @@ def _fetch_kis_amount_rank(top_n: int = 200) -> list:
                 "FID_INPUT_PRICE_2": "",
                 "FID_VOL_CNT": str(min(top_n, 200)),
                 "FID_INPUT_DATE_1": "",
+                "FID_RANK_SORT_CLS_CODE": "1",          # v165.2: 0=거래량순, 1=거래대금순
             },
         )
         items = []
@@ -3334,9 +3338,18 @@ def _fetch_kis_amount_rank(top_n: int = 200) -> list:
                 chg = float(i.get("prdy_ctrt", 0) or 0)
             except Exception:
                 chg = 0.0
-            items.append({"code": code, "name": str(i.get("hts_kor_isnm", code) or code), "change_rate": chg})
+            try:
+                tr_pbmn = int(i.get("acml_tr_pbmn", 0) or 0)
+            except Exception:
+                tr_pbmn = 0
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm", code) or code),
+                "change_rate": chg,
+                "tr_pbmn": tr_pbmn,
+            })
         if items:
-            _log_info_msg(f"[SNAP] KIS 거래대금 순위 {len(items)}건 수집 (FHPST01720000)")
+            _log_info_msg(f"[SNAP] KIS 거래대금 순위 {len(items)}건 수집 (FHPST01710000 거래대금정렬)")
             return items
     except Exception as e:
         _swallow_exception(e)
@@ -6876,7 +6889,7 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: s
             raw = str(resp.text or "").strip()
             import json as _json
             raw_clean = raw.replace("```json", "").replace("```", "").strip()
-            raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma 방어
+            raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma
             parsed = _json.loads(raw_clean)
             stocks = parsed.get("stocks") or []
             summary = str(parsed.get("summary", "") or "").strip()
@@ -7068,6 +7081,7 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
             _gemini_grounding_cache["ts"] = now
             return list(_gemini_grounding_cache.get("rows", []))
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
+        raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma
         parsed = _json.loads(raw_clean)
         items = parsed.get("items") or []
         rows = []
@@ -7206,7 +7220,7 @@ def _fetch_groq_news_rows() -> list[dict]:
             return list(_groq_grounding_cache.get("rows", []))
         import json as _json
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
-        raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma 방어
+        raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma
         parsed = _json.loads(raw_clean)
         items = parsed.get("items") or []
         rows = []
@@ -15456,7 +15470,7 @@ def get_stock_price(code: str) -> dict:
         "bstp_code": o.get("bstp_cls_code",""),
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
-        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리 — VI오판 방지
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리
         "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
         "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
@@ -16308,7 +16322,7 @@ def get_nxt_stock_price(code: str) -> dict:
         "market": "NXT",
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
-        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리 — VI오판 방지
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리
         "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
     }
@@ -24500,16 +24514,15 @@ def _has_explicit_halt_market_flag(cur: dict | None) -> bool:
     if not isinstance(cur, dict):
         return False
     # v165.1: VI발동 코드(55/56/"V"/"4") = 임시 거래정지이지만 2분 후 자동해제 — 실제 거래정지 아님
-    # temp_stop_yn="Y"는 VI발동 포함이므로 raw_status_code에서 분리해 별도 처리
-    _VI_CODES = {"55", "56", "V", "4", "VI"}  # KIS iscd_stat_cls_code VI발동 코드
+    # temp_stop_yn="Y"는 VI발동 포함이므로 raw_status_code에서 분리해 raw_temp_stop으로 별도 처리
+    _VI_CODES = {"55", "56", "V", "4", "VI"}
     for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "is_vi", "raw_status_code"):
         _raw = cur.get(_k)
         _v = str(_raw or "").strip().upper()
         if not _v:
             continue
-        # VI발동 코드는 거래정지 판정에서 제외
         if _k in ("vi_cls_code", "raw_status_code") and _v in _VI_CODES:
-            continue
+            continue  # VI발동 코드 (거래정지 아님)
         if _is_truthy_market_flag(_raw):
             return True
         if _v in ("Y", "1", "T", "TRUE", "H", "2"):
@@ -24518,10 +24531,8 @@ def _has_explicit_halt_market_flag(cur: dict | None) -> bool:
     _temp = str(cur.get("raw_temp_stop", "") or "").strip().upper()
     if _temp in ("Y", "1"):
         _vi = str(cur.get("vi_cls_code", "") or "").strip().upper()
-        # vi_cls_code가 VI발동 코드이면 temp_stop은 VI에 의한 임시정지 → 거래정지 아님
         if _vi in _VI_CODES:
-            return False
-        # vi_cls_code 없이 temp_stop만 "Y"이면 실제 거래정지로 판정
+            return False  # VI에 의한 임시정지 — 거래정지 아님
         return True
     return False
 def _is_live_trading_normal(cur: dict | None) -> bool:
@@ -28587,6 +28598,12 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     # 셀바스AI 06:01 SURGE A급 85점이 no_ask_liquidity로 전량 차단되던 문제 해소
     grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
     if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
+        return True
+    # v165.2: +10% 이상 급등 종목은 체결속도 체크 없이 soft allow
+    # 이유: +10% 급등 중 no_ask_liquidity는 VI발동/순간 호가 소진으로 정상 현상
+    #       exec_speed_score가 WebSocket 스냅샷 미적재 시 ready=False → soft allow 차단
+    #       STX엔진/알지노믹스 등 A급 종목이 7회 반복 hard 차단된 원인
+    if grade == "A" and change_rate >= 10.0:
         return True
     # v161.47: 체결속도 soft allow — A급 + score≥72 + change_rate≥5% + exec_speed 보통 이상 + 흐름 비둔화
     # no_ask_liquidity(매도호가 없음)는 급등 중 매수세가 매도물량을 소화한 상태 → 실제로는 강한 매수 신호
@@ -37042,9 +37059,8 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             continue
         cleaned.append(item)
     if dropped > 0:
-        # v165.1: 제거된 종목 최대 5건 함께 표시 — 원인 종목 추적용
-        names_str = ", ".join(dropped_names[:5])
-        suffix = f" → {names_str}" if names_str else ""
+        # v165.1: 제거된 종목 최대 5건 함께 표시
+        suffix = f" → {', '.join(dropped_names[:5])}" if dropped_names else ""
         _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}{suffix}")
     return cleaned
 
