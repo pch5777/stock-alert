@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.0
-날짜: 2026-04-19
+버전: v165.1
+날짜: 2026-04-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.1 (2026-04-20): VI발동 거래정지 오판 수정 + Groq trailing comma 방어 + malformed 로그 보강
+  [#1] _has_explicit_halt_market_flag(): temp_stop_yn 분리 + VI코드(55/56) 거래정지 오판 차단
+       이유: raw_status_code = iscd_stat_cls_code OR temp_stop_yn 합산 → VI발동 시 temp_stop_yn="Y"가
+             _is_truthy_market_flag("Y")=True → 실제 거래 중 종목을 거래정지로 오판
+             에스앤더블류 +15.3% A급 SURGE 포착 직후 [포착 취소-거래정지] 오발송 사례
+       개선점: get_stock_price()/get_nxt_stock_price()에서 temp_stop_yn을 raw_status_code에서 분리,
+              별도 필드 raw_temp_stop로 수신. _has_explicit_halt_market_flag에서 vi_cls_code가
+              VI발동 코드(55/56/"V"/"4")이면 real halt 판정 제외. trht_yn="Y"만 실제 거래정지로 인정
+       주의점: vi_cls_code 필드는 기존 VI 감지에도 사용되므로 halt 분기만 수정
+  [#2] _fetch_groq_news_rows(): Groq JSON trailing comma 방어 코드 추가
+       이유: Groq Llama가 JSON 배열 마지막 원소 뒤 쉼표 남기는 경우 JSONDecodeError 발생
+             로그: "Illegal trailing comma before end of array" — 재료 수집 전체 실패
+       개선점: raw_clean 전처리 시 re.sub으로 trailing comma 제거 후 파싱 시도
+              파싱 실패 시에도 기존 캐시 유지 (재료 공백 방지)
+       주의점: 기존 ```json/``` 제거 후 추가 적용
+  [#3] _sanitize_run_scan_alerts(): malformed alert 제거 로그에 종목코드 포함
+       이유: "malformed alert N건 제거 [pre_sector_gate]"만으로는 어떤 종목인지 추적 불가
+             30분 주기로 반복 발생 중이나 원인 종목 미파악
+       개선점: dropped 건 수 외에 제거된 종목명/코드 목록도 함께 로그
+       주의점: 최대 5건만 표시 (로그 폭증 방지)
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.0 (2026-04-19): 시초가 진입 알람 신설 + Groq 재료 추론 Chain-of-Thought 재설계
   [#1] OPENING_GAP_ENTRY 시그널 타입 신설 — 시초가 진입 알람 파이프라인
        이유: 선진입(PRECLOSE_GAP_ENTRY)을 놓쳤거나 야간 신규 재료 발생 시 시초가 진입 기회 포착
@@ -6854,6 +6876,7 @@ def _analyze_youtube_video_with_gemini(video_id: str, title: str, description: s
             raw = str(resp.text or "").strip()
             import json as _json
             raw_clean = raw.replace("```json", "").replace("```", "").strip()
+            raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma 방어
             parsed = _json.loads(raw_clean)
             stocks = parsed.get("stocks") or []
             summary = str(parsed.get("summary", "") or "").strip()
@@ -7183,6 +7206,7 @@ def _fetch_groq_news_rows() -> list[dict]:
             return list(_groq_grounding_cache.get("rows", []))
         import json as _json
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
+        raw_clean = re.sub(r',\s*([}\]])', r'\1', raw_clean)  # v165.1: trailing comma 방어
         parsed = _json.loads(raw_clean)
         items = parsed.get("items") or []
         rows = []
@@ -15432,7 +15456,8 @@ def get_stock_price(code: str) -> dict:
         "bstp_code": o.get("bstp_cls_code",""),
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
-        "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리 — VI오판 방지
+        "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
         "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
                       else "mid" if mktcap_raw >= 1000  # 1000억 이상
@@ -16283,7 +16308,8 @@ def get_nxt_stock_price(code: str) -> dict:
         "market": "NXT",
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
         "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
-        "raw_status_code": str(o.get("iscd_stat_cls_code","") or o.get("temp_stop_yn","") or ""),
+        "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리 — VI오판 방지
+        "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
     }
     try:
@@ -24473,12 +24499,30 @@ def _should_persist_trade_halt_title(title: str, rcept_dt: str = "") -> bool:
 def _has_explicit_halt_market_flag(cur: dict | None) -> bool:
     if not isinstance(cur, dict):
         return False
-    for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
-        if _is_truthy_market_flag(cur.get(_k)):
+    # v165.1: VI발동 코드(55/56/"V"/"4") = 임시 거래정지이지만 2분 후 자동해제 — 실제 거래정지 아님
+    # temp_stop_yn="Y"는 VI발동 포함이므로 raw_status_code에서 분리해 별도 처리
+    _VI_CODES = {"55", "56", "V", "4", "VI"}  # KIS iscd_stat_cls_code VI발동 코드
+    for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "is_vi", "raw_status_code"):
+        _raw = cur.get(_k)
+        _v = str(_raw or "").strip().upper()
+        if not _v:
+            continue
+        # VI발동 코드는 거래정지 판정에서 제외
+        if _k in ("vi_cls_code", "raw_status_code") and _v in _VI_CODES:
+            continue
+        if _is_truthy_market_flag(_raw):
             return True
-        _v = str(cur.get(_k) or "").strip().upper()
         if _v in ("Y", "1", "T", "TRUE", "H", "2"):
             return True
+    # raw_temp_stop(temp_stop_yn) — VI발동 시 "Y"이므로 vi_cls_code와 교차 확인
+    _temp = str(cur.get("raw_temp_stop", "") or "").strip().upper()
+    if _temp in ("Y", "1"):
+        _vi = str(cur.get("vi_cls_code", "") or "").strip().upper()
+        # vi_cls_code가 VI발동 코드이면 temp_stop은 VI에 의한 임시정지 → 거래정지 아님
+        if _vi in _VI_CODES:
+            return False
+        # vi_cls_code 없이 temp_stop만 "Y"이면 실제 거래정지로 판정
+        return True
     return False
 def _is_live_trading_normal(cur: dict | None) -> bool:
     if not isinstance(cur, dict):
@@ -24535,7 +24579,7 @@ def _is_krx_vi_reference_mode(cur: dict, code: str) -> bool:
         return False
     if not (is_nxt_open() and is_nxt_listed(code)):
         return False
-    for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "temp_stop_yn", "is_vi", "raw_status_code"):
+    for _k in ("vi_cls_code", "vi_yn", "trht_yn", "halt_yn", "raw_temp_stop", "is_vi", "raw_status_code"):
         if _is_truthy_market_flag(cur.get(_k)):
             return True
     return False
@@ -36966,6 +37010,7 @@ def _coerce_run_scan_signal_defaults(payload: dict | None = None, fallback_code:
 def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     cleaned = []
     dropped = 0
+    dropped_names = []  # v165.1: 제거 종목 추적
     for item in list(alerts or []):
         if not isinstance(item, dict):
             dropped += 1
@@ -36973,10 +37018,11 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
         code = _normalize_scan_signal_code(item)
         if not code:
             dropped += 1
-            _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {item.get('name', '') or item.get('signal_type', '') or 'unknown'}")
+            _nm = item.get('name', '') or item.get('signal_type', '') or 'unknown'
+            dropped_names.append(_nm)
+            _log_warn_msg(f"⚠️ run_scan code 누락 제거{(' [' + stage + ']') if stage else ''}: {_nm}")
             continue
         # v163.11 [#2]: ETN/레버리지/인버스 복합결측 종목 큐 등록 차단
-        # is_scoring_only_instrument에서 이미 ETN 포함이지만 여기서 재확인
         _item_name = str(item.get("name") or "")
         if is_scoring_only_instrument(code, _item_name):
             dropped += 1
@@ -36990,11 +37036,16 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
                 _queue_run_scan_repair(item, stage=stage)
                 continue
             _queue_run_scan_repair(item, stage=stage)
-            _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {item.get('name', code) or code} / {','.join(_missing_r)}")
+            _nm2 = item.get('name', code) or code
+            dropped_names.append(f"{_nm2}({','.join(_missing_r)})")
+            _log_warn_msg(f"⚠️ run_scan 결측 재복구 큐 등록{(' [' + stage + ']') if stage else ''}: {_nm2} / {','.join(_missing_r)}")
             continue
         cleaned.append(item)
     if dropped > 0:
-        _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}")
+        # v165.1: 제거된 종목 최대 5건 함께 표시 — 원인 종목 추적용
+        names_str = ", ".join(dropped_names[:5])
+        suffix = f" → {names_str}" if names_str else ""
+        _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}{suffix}")
     return cleaned
 
 def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str | None = None, seen_code: str | None = None) -> None:
