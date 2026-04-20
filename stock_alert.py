@@ -3,10 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.2
+버전: v165.3
 날짜: 2026-04-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.3 (2026-04-20): _fetch_kis_amount_rank KIS 30건 한계 보완 — 네이버 병행 수집
+  [#1] _fetch_kis_amount_rank(): KIS 30건 응답 후 네이버 rise/amount 병행 수집 합산
+       이유: KIS volume-rank API(FHPST01710000)는 FID_VOL_CNT에 200을 요청해도
+             실제 응답은 최대 30건으로 제한됨 (API 스펙 상한)
+             로그 확인: "[SNAP] KIS 거래대금 순위 30건 수집" — 200건 의도였으나 30건만 수집
+             INTRADAY_SNAP_TOP_N=200 요청이 의미없어지고 조용한 강세 풀이 30종목으로 제한됨
+       개선점: KIS 30건 수집 후 네이버 rise 상위 80건 + amount 상위 30건 추가 병행 수집
+              중복 제거 후 합산 → 실질 130~150건 수준으로 커버리지 확대
+              snap_combined 카운트 로그로 실제 수집 건수 확인 가능
+       주의점: 네이버 스크래핑은 KIS 실패 시 fallback이 아닌 항상 병행 수집
+              기존 fallback 경로(KIS 실패 시 외부소스만)는 그대로 유지
+  이유: KIS volume-rank API 스펙 제한
+  개선점: SNAP 스냅샷 종목 수 30→130~150건으로 확대. 조용한 강세 풀 품질 향상
+  주의점: 네이버 병행 수집 실패해도 KIS 30건으로 정상 동작
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.2 (2026-04-20): _fetch_kis_amount_rank 파라미터 수정 + no_ask_liquidity 급등 종목 soft 처리
   [#1] _fetch_kis_amount_rank(): FID_COND_SCR_DIV_CODE 20172→20171 + FID_RANK_SORT_CLS_CODE="1" 추가
        이유: KIS volume-rank API의 FID_COND_SCR_DIV_CODE는 "20171" 하나만 존재 (공식 포털 확인)
@@ -3304,19 +3320,19 @@ def _save_intraday_snap_state(state: dict) -> None:
         _swallow_exception(e)
 
 def _fetch_kis_amount_rank(top_n: int = 200) -> list:
-    """KIS FHPST01710000 거래대금 순위 조회 — 네이버 크롤링 대체.
-    v165.2: FID_COND_SCR_DIV_CODE=20171(유일한 volume-rank 스크린코드) +
-            FID_RANK_SORT_CLS_CODE="1"(거래대금 기준 정렬).
-    KIS 공식 포털 확인: "20172" 스크린코드는 존재하지 않음 → 매 호출 실패 원인.
-    실패 시 _fetch_external_rank_top() fallback.
+    """KIS FHPST01710000 거래대금 순위 조회 + 네이버 병행 수집 합산.
+    v165.2: FID_COND_SCR_DIV_CODE=20171 + FID_RANK_SORT_CLS_CODE=1(거래대금순).
+    v165.3: KIS API 응답 상한 30건 한계 보완 — 네이버 rise/amount 병행 수집 합산.
+            KIS 30건 + 네이버 rise 80건 + amount 30건 → 중복 제거 후 130~150건 수준.
     """
+    kis_items = []
     try:
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
             "FHPST01710000",
             {
                 "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_COND_SCR_DIV_CODE": "20171",       # v165.2: 20172→20171 (유일 스크린코드)
+                "FID_COND_SCR_DIV_CODE": "20171",
                 "FID_INPUT_ISCD": "0000",
                 "FID_DIV_CLS_CODE": "0",
                 "FID_BLNG_CLS_CODE": "0",
@@ -3326,10 +3342,9 @@ def _fetch_kis_amount_rank(top_n: int = 200) -> list:
                 "FID_INPUT_PRICE_2": "",
                 "FID_VOL_CNT": str(min(top_n, 200)),
                 "FID_INPUT_DATE_1": "",
-                "FID_RANK_SORT_CLS_CODE": "1",          # v165.2: 0=거래량순, 1=거래대금순
+                "FID_RANK_SORT_CLS_CODE": "1",
             },
         )
-        items = []
         for i in (data.get("output") or []):
             code = normalize_stock_code(i.get("mksc_shrn_iscd", "") or "")
             if not code:
@@ -3342,23 +3357,59 @@ def _fetch_kis_amount_rank(top_n: int = 200) -> list:
                 tr_pbmn = int(i.get("acml_tr_pbmn", 0) or 0)
             except Exception:
                 tr_pbmn = 0
-            items.append({
+            kis_items.append({
                 "code": code,
                 "name": str(i.get("hts_kor_isnm", code) or code),
                 "change_rate": chg,
                 "tr_pbmn": tr_pbmn,
             })
-        if items:
-            _log_info_msg(f"[SNAP] KIS 거래대금 순위 {len(items)}건 수집 (FHPST01710000 거래대금정렬)")
-            return items
     except Exception as e:
         _swallow_exception(e)
-    # fallback
+
+    # v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 수집
+    # KIS 성공·실패 무관하게 항상 병행 수집해서 커버리지 확대
+    seen_codes = {r["code"] for r in kis_items}
+    snap_combined = list(kis_items)
+    try:
+        naver_rise = _fetch_naver_rank("rise", top_n=80)
+        for r in naver_rise:
+            code = normalize_stock_code(r.get("code", "") or "")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                snap_combined.append({
+                    "code": code,
+                    "name": str(r.get("name", code) or code),
+                    "change_rate": float(r.get("change_rate", 0) or 0),
+                })
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        naver_amount = _fetch_naver_rank("amount", top_n=30)
+        for r in naver_amount:
+            code = normalize_stock_code(r.get("code", "") or "")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                snap_combined.append({
+                    "code": code,
+                    "name": str(r.get("name", code) or code),
+                    "change_rate": float(r.get("change_rate", 0) or 0),
+                })
+    except Exception as e:
+        _swallow_exception(e)
+
+    if snap_combined:
+        _log_info_msg(
+            f"[SNAP] KIS 거래대금 순위 {len(kis_items)}건 수집 (FHPST01710000 거래대금정렬)"
+            f" + naver_rise·amount 병행 = 합산 {len(snap_combined)}건"
+        )
+        return snap_combined[:top_n]
+
+    # fallback — KIS + 네이버 모두 실패 시
     try:
         fallback = _fetch_external_rank_top(min_change=-99.0, top_n=top_n)
         if fallback:
             _log_info_msg(f"[SNAP] 거래대금 순위 fallback {len(fallback)}건 (외부소스)")
-            return [{"code": str(r.get("code","")), "name": str(r.get("name","")),
+            return [{"code": str(r.get("code", "")), "name": str(r.get("name", "")),
                      "change_rate": float(r.get("change_rate", 0) or 0)} for r in fallback if r.get("code")]
     except Exception as e:
         _swallow_exception(e)
