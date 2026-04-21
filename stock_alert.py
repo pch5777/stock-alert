@@ -3,11 +3,33 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.9
+버전: v165.10
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v165.9 (2026-04-21): "1차 진입가 도달" 알람 발송 후 entry_hit 미기록 버그 수정
+- v165.10 (2026-04-21): 후보군 미포착 + 부팅 병목 2개 수정
+  [#1] _load_dynamic_params(): 재시작 후 min_score 즉시 복원
+       이유: 연속손절 → min_score_normal 56→81 강제 상향 후 dynamic_params.json에 저장
+             봇 재시작 시 81로 복원 → _emergency_score_boost_ts 타이머 리셋
+             → 3시간 자동복원이 영구 실행 안 됨 → min_score=81 영구 유지
+             → LG에너지솔루션 +9.9%, 삼성SDI 18.6% 등 A급 미달로 31분 침묵
+       개선점: _load_dynamic_params() 완료 후 즉시 체크:
+              boost_ts 없고 min_score>56 → 기본값 56/66 즉시 복원 + 저장
+              boost_ts 있고 3시간 이미 경과 → 원래값 즉시 복원 + 저장
+       주의점: boost_ts가 있고 아직 3시간 미경과면 기존대로 유지 (정상 상향 중)
+  [#2] _verify_and_clean_restored_halt_state(): 병렬 API 조회 (직렬→ThreadPoolExecutor)
+       이유: 17개 거래정지 상태 복원 후 종목별 순차 조회 → 12초 부팅 병목
+             13:40:23~13:40:35 KIS API 17회 직렬 호출로 스캔 지연
+       개선점: ThreadPoolExecutor(max_workers=8)로 최대 8개 동시 조회
+              17개 기준 직렬 12초 → 병렬 2초 이내로 단축
+              timeout=10초 설정으로 무한대기 방지
+       주의점: API 호출 실패 시 해당 종목 유지 (보수적 처리 동일)
+  이유: min_score 영구 상향으로 인한 후보군 미포착 근본 수정 + 부팅 병목 해소
+  개선점: 재시작 후 즉시 정상 min_score 적용 → 첫 스캔부터 정상 포착
+  주의점: 연속손절 후 3시간 이내 재시작 시 boost_ts와 elapsed 기준으로 판단
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
+- v165.9 (2026-04-21): 1차 진입가 도달 알람 발송 후 entry_hit 미기록 버그 수정
   [#1] _finalize_general_alert_dispatch(): 알람 발송 직후 entry_hit 동기화
        이유: send_alert()에서 "1차 진입가 도달" 헤더가 붙어 알람이 나갔어도
              _maybe_send_immediate_entry_hit_from_signal()에서 no_ask_liquidity 등으로 차단되면
@@ -21834,6 +21856,27 @@ def _load_dynamic_params():
             f"동적 파라미터 복원 완료 (min_score={_dynamic['min_score_normal']}점, "
             f"atr_stop={_dynamic['atr_stop_mult']})"
         )
+        # v165.10 [#1]: 재시작 후 _emergency_score_boost_ts 기준 즉시 복원 체크
+        # 기존: 3시간 타이머가 재시작으로 리셋 → 81점이 영구 유지
+        # 수정: 복원 직후 boost_ts가 없거나 3시간 경과 시 즉시 원래값 복원
+        boost_ts = float(_dynamic.get("_emergency_score_boost_ts") or 0)
+        if boost_ts <= 0 and _dynamic.get("min_score_normal", 56) > 56:
+            # boost_ts 없이 min_score가 기본값 초과 → 정상화
+            _dynamic["min_score_normal"] = 56
+            _dynamic["min_score_strict"] = 66
+            _log_info_msg("  🔄 min_score 정상화: boost_ts 없음 → 기본값 56/66 복원")
+            _save_dynamic_params()
+        elif boost_ts > 0 and (time.time() - boost_ts) >= 10800:
+            # boost_ts 있고 3시간 이미 경과 → 즉시 복원
+            orig_n = int(_dynamic.get("_emergency_score_boost_n") or 56)
+            orig_s = int(_dynamic.get("_emergency_score_boost_s") or 66)
+            _dynamic["min_score_normal"] = orig_n
+            _dynamic["min_score_strict"] = orig_s
+            _dynamic.pop("_emergency_score_boost_ts", None)
+            _dynamic.pop("_emergency_score_boost_n", None)
+            _dynamic.pop("_emergency_score_boost_s", None)
+            _log_info_msg(f"  🔄 min_score 긴급 복원: 재시작 후 3시간 경과 → {orig_n}/{orig_s}")
+            _save_dynamic_params()
     except FileNotFoundError:
         _log_info_msg("dynamic_params.json 없음 → 기본값 사용")
         # 저장 파일이 없으면 기본값을 즉시 저장해 다음 재시작부터 복원되도록 한다
@@ -30273,19 +30316,40 @@ def _load_trading_halt_state() -> None:
 
 
 def _verify_and_clean_restored_halt_state() -> None:
-    """봇 재시작 후 trading_halt_state.json 복원 시 실시간 조회로 오래된 상태 제거."""
+    """봇 재시작 후 trading_halt_state.json 복원 시 실시간 조회로 오래된 상태 제거.
+    v165.10 [#2]: ThreadPoolExecutor 병렬 조회 — 직렬 12초→2초 이내로 단축"""
     if not isinstance(_trading_halt_state, dict):
         return
     active = _trading_halt_state.get("active") or {}
-    to_remove = []
-    for code in list(active.keys()):
+    codes = list(active.keys())
+    if not codes:
+        return
+
+    def _check_one(code: str) -> tuple[str, bool]:
         try:
             cur = get_stock_price(code)
             if cur and _is_live_trading_normal(cur):
-                to_remove.append(code)
-                _log_info_msg(f"  🗑 거래정지 상태 제거: {code} — 실시간 정상 거래 확인")
+                return code, True  # 정상 → 제거 대상
         except Exception as e:
             _swallow_exception(e)
+        return code, False  # 제거 안 함
+
+    to_remove = []
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(8, len(codes))) as ex:
+            futures = {ex.submit(_check_one, c): c for c in codes}
+            for fut in as_completed(futures, timeout=10):
+                try:
+                    code, should_remove = fut.result()
+                    if should_remove:
+                        to_remove.append(code)
+                        _log_info_msg(f"  🗑 거래정지 상태 제거: {code} — 실시간 정상 거래 확인")
+                except Exception as e:
+                    _swallow_exception(e)
+    except Exception as e:
+        _swallow_exception(e)
+
     for code in to_remove:
         active.pop(code, None)
     if to_remove:
