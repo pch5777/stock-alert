@@ -3,10 +3,42 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.13
+버전: v165.14
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.14 (2026-04-21): NXT 시간대 KRX 전용 종목 처리 제거 + TOP5 코드 표시
+  [#1] _is_nxt_eligible(): NXT 거래가능 종목 캐시 함수 신설
+       이유: NXT 전용 종목이 따로 없고 KRX 상장 종목 중 일부만 NXT 거래 가능
+             종목별 거래가능 여부를 KIS API로 판별하되 당일 캐시로 반복 호출 방지
+       개선점: get_nxt_stock_price(code) 응답(price>0)이면 NXT 가능, 없으면 KRX 전용
+              결과를 _nxt_eligible_cache에 저장 → 이후 캐시 반환
+              장 시작(reset_top_signals_daily) 시 캐시 초기화
+       주의점: 첫 조회 시만 API 1회 호출, 이후 무조건 캐시
+              조회 실패 시 False(KRX 전용으로 보수적 처리)
+  [#2] _sanitize_run_scan_alerts(): NXT 전용 시간대 KRX 전용 종목 필터링
+       이유: NXT 시간대(08:00~09:00, 15:30~20:00)에 KRX 전용 종목이 analyze()까지
+             전부 돌고 마지막에 차단 → 스캔 낭비, APS이노베이션 오발송 등
+       개선점: pre_sector_gate 단계에서 _is_nxt_eligible() 캐시 기반으로 제거
+              market="NXT" 또는 NXT 거래가능 종목만 통과
+       주의점: analyze() 전 단계가 아닌 sanitize 단계 — score 계산 낭비는 일부 잔존
+              build_stock_universe 수정은 영향 범위 크므로 다음 버전에서 검토
+  [#3] check_entry_watch(): NXT 전용 시간대 KRX 전용 종목 watch 처리 스킵
+       이유: KRX 전용 종목은 NXT 시간대에 주가 변동 없음 → 도달 판정, 손절 감시 무의미
+             매 5초마다 반복 조회 → API 낭비
+       개선점: _nxt_only_time() AND market≠NXT AND _is_nxt_eligible(code)=False → continue
+       주의점: 이미 진입한(entry_hit=True) KRX 종목도 스킵 — NXT 시간대엔 가격 변동 없음
+  [#4] _ensure_signal_actionability(): NXT 전용 시간대 비NXT 종목 최종 방어선
+       이유: #2에서 못 잡힌 경로(upper_limit_reached 캐시 해제 후 직접 dispatch 등)
+       개선점: is_nxt_only_time() AND market≠NXT → return False
+  [#5] TOP5 알람 종목코드 <b><code> 태그 추가
+       이유: 최우선 종목 TOP5 알람에 종목코드가 없어 탭 복사 불가
+       개선점: 종목명 옆 <b><code>{code}</code></b> 추가
+  이유: NXT 시간대 KRX 전용 종목 오발송 + 스캔 낭비 구조적 해소
+  개선점: KRX 전용 종목은 NXT 시간대 analyze/watch/send 전부 차단
+  주의점: _nxt_eligible_cache는 당일 캐시 — 분기마다 NXT 종목 목록 변경에 자동 대응
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.13 (2026-04-21): v165.10 min_score 정상화 로직 오적용 수정
   [#1] _load_dynamic_params(): "boost_ts 없음 → 기본값 복원" 조건 제거
        이유: v165.10에서 "boost_ts 없고 min_score>56 → 기본값 56/66 복원" 추가
@@ -11377,6 +11409,7 @@ def _ws_subscribe(ws, code: str) -> bool:
 
 _ws_unsubscribe_fail_count: dict = {}  # v163.6: 구독해제 실패 횟수 추적
 _ws_subscribe_fail_count:   dict = {}  # v165.6 [#6]: 구독 실패 횟수 — Broken pipe 반복 WARNING 억제
+_nxt_eligible_cache: dict = {}         # v165.14: code → bool, NXT 거래가능 종목 캐시 (당일 유지)
 
 def _ws_unsubscribe(ws, code: str) -> bool:
     """종목 체결가 구독 해제."""
@@ -15780,6 +15813,15 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
     if block_reason:
         _log_info_msg(f"  🚫 [게이트 차단] {signal.get('name', code)} — {block_reason}")
         return False
+    # v165.14: NXT 전용 시간대에 비NXT 종목 알람 발송 차단
+    # run_scan 내부 차단과 별개로, upper_limit_reached 캐시 해제 등으로
+    # _ensure_signal_actionability 경유 시 NXT 게이트를 건너뛰는 경로 존재
+    if is_nxt_only_time() and str(signal.get("market") or "").upper() != "NXT":
+        _log_info_msg(
+            f"  ⏭ [게이트 차단] {signal.get('name', code)} — NXT전용 시간대 비NXT 종목 차단 "
+            f"(market={signal.get('market', '')})"
+        )
+        return False
     return True
 
 def send_mid_pullback_alert(s: dict):
@@ -16705,6 +16747,20 @@ def get_nxt_stock_price(code: str) -> dict:
     except Exception as e:
         _swallow_exception(e)
     return payload
+def _is_nxt_eligible(code: str) -> bool:
+    """v165.14: 종목이 NXT 거래 가능한지 캐시 기반으로 판별.
+    get_nxt_stock_price() 응답(price>0)이 있으면 NXT 가능, 없으면 KRX 전용.
+    결과는 당일 캐시에 저장 — 반복 API 호출 방지."""
+    if code in _nxt_eligible_cache:
+        return _nxt_eligible_cache[code]
+    try:
+        cur = get_nxt_stock_price(code)
+        eligible = bool(cur and safe_int(cur.get("price", 0), 0) > 0)
+    except Exception as e:
+        _swallow_exception(e)
+        eligible = False  # 조회 실패 시 KRX 전용으로 보수적 처리
+    _nxt_eligible_cache[code] = eligible
+    return eligible
 def get_nxt_investor_trend(code: str) -> dict:
     """NXT 외인·기관 순매수 조회"""
     data   = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
@@ -23644,8 +23700,10 @@ def send_top_signals():
         stop    = int(_live_w.get("stop_loss",   0) or 0) or t.get("stop_loss",   0)
         target  = int(_live_w.get("target_price",0) or 0) or t.get("target_price",0)
         rr      = round((target - entry) / (entry - stop), 1) if entry and stop and entry > stop else 0
+        # v165.14: 종목명 옆 종목코드 <b><code> 태그 — 탭 1회로 복사 가능
+        _code_tag = f"  <b><code>{_code}</code></b>" if _code else ""
         msg += (
-            f"\n{medal} <b>{t['name']}</b>  {sig}  {t['score']}점{nxt_tag}\n"
+            f"\n{medal} <b>{t['name']}</b>{_code_tag}  {sig}  {t['score']}점{nxt_tag}\n"
             f"   포착: {t['detected_at']}\n"
             f"   🎯 진입 {entry:,}  🛡 손절 {stop:,}  🏆 목표 {target:,}\n"
             f"   손익비: {rr:.1f}:1\n"
@@ -23655,6 +23713,7 @@ def send_top_signals():
 def reset_top_signals_daily():
     """장 시작 시 최우선 종목 풀 초기화"""
     _today_top_signals.clear()
+    _nxt_eligible_cache.clear()  # v165.14: NXT 거래가능 캐시 당일 초기화
 def _get_expire_days_by_regime(signal_type: str = "") -> tuple:
     """
     v84: 레짐 + 신호유형별 만료 일수 반환.
@@ -25774,7 +25833,15 @@ def check_entry_watch():
         return
     expired: list[tuple[str, str, str]] = []
     changed_active = False
+    _nxt_only_now = is_nxt_only_time()
     for log_key, watch in list(_entry_watch.items()):
+        # v165.14: NXT 전용 시간대에 KRX 전용 종목 watch 처리 스킵
+        # KRX 전용 종목은 NXT 시간대에 가격 변동 없음 — 조회/판정 전부 무의미
+        if _nxt_only_now:
+            _w_code = normalize_stock_code(watch.get("code", ""))
+            _w_market = str(watch.get("market") or "").upper()
+            if _w_market != "NXT" and not _is_nxt_eligible(_w_code):
+                continue  # KRX 전용 종목 스킵
         changed_active |= _process_entry_watch_item(log_key, watch, expired)
     changed_active |= _finalize_entry_watch_expired_items(expired)
     if changed_active:
@@ -37567,6 +37634,11 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     cleaned = []
     dropped = 0
     dropped_names = []  # v165.1: 제거 종목 추적
+    # v165.14: NXT 전용 시간대에 비NXT 거래가능 종목 pre_sector_gate 단계에서 제거
+    # analyze() 전 단계가 아닌 여기서 걸러내는 이유:
+    # build_stock_universe 수정 시 영향 범위 크고, 이 단계가 dispatch 직전 최종 정리 포인트
+    # _is_nxt_eligible() 캐시로 반복 API 호출 없음
+    _nxt_only_now = is_nxt_only_time()
     for item in list(alerts or []):
         if not isinstance(item, dict):
             dropped += 1
@@ -37584,6 +37656,12 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             dropped += 1
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
+        # v165.14: NXT 전용 시간대 — NXT 비적격 종목(KRX 전용) 필터링
+        if _nxt_only_now and str(item.get("market") or "").upper() != "NXT":
+            if not _is_nxt_eligible(code):
+                dropped += 1
+                dropped_names.append(f"{item.get('name', code)}(KRX전용)")
+                continue
         if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
             _missing_r = list(item.get("_scan_payload_missing_reasons") or [])
