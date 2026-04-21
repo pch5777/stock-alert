@@ -3,10 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.14
+버전: v165.15
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.15 (2026-04-21): KRX 전용 종목 NXT 시간대 오발송 근본 원인 수정
+  [#1] _is_nxt_eligible(): get_nxt_stock_price 캐시 기반 → _nxt_unavailable/_nxt_cache 기반으로 교체
+       이유: v165.14에서 만든 _nxt_eligible_cache는 get_nxt_stock_price() 응답 여부로 판별
+             KRX 전용 종목도 KIS API 특성상 가끔 NXT 엔드포인트 응답 반환 → eligible=True 오판
+             상지건설(042940) 18:16 오발송 원인: 최초 조회 시 NXT 응답 오자 eligible=True 캐시
+       개선점: 기존 _nxt_unavailable(NXT 비상장 종목 set) + _nxt_cache(NXT 조회 성공 캐시) 활용
+              _nxt_unavailable에 있으면 → False (비상장 확인됨)
+              _nxt_cache에 있으면 → True (상장 확인됨)
+              둘 다 없으면 → get_nxt_stock_price() 강제 조회 → 실패 시 _nxt_unavailable 등록
+       주의점: 강제 조회 결과가 _nxt_unavailable에 등록되므로 이후 is_nxt_listed()와 일관성 유지
+              _nxt_eligible_cache는 전역 dict로 남겨두되 사용하지 않음 (삭제 시 daily reset 코드도 수정 필요)
+  이유: 상지건설 등 KRX 전용 종목이 NXT 시간대에 오발송되는 근본 원인 제거
+  개선점: _nxt_unavailable/_nxt_cache 기반으로 판별 → 기존 눌림목 스캔과 동일한 로직 일관성
+  주의점: 최초 봇 시작 시 _nxt_unavailable 비어있음 → 첫 번째 조회에서 강제 확인 후 등록
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.14 (2026-04-21): NXT 시간대 KRX 전용 종목 처리 제거 + TOP5 코드 표시
   [#1] _is_nxt_eligible(): NXT 거래가능 종목 캐시 함수 신설
        이유: NXT 전용 종목이 따로 없고 KRX 상장 종목 중 일부만 NXT 거래 가능
@@ -16748,19 +16764,25 @@ def get_nxt_stock_price(code: str) -> dict:
         _swallow_exception(e)
     return payload
 def _is_nxt_eligible(code: str) -> bool:
-    """v165.14: 종목이 NXT 거래 가능한지 캐시 기반으로 판별.
-    get_nxt_stock_price() 응답(price>0)이 있으면 NXT 가능, 없으면 KRX 전용.
-    결과는 당일 캐시에 저장 — 반복 API 호출 방지."""
-    if code in _nxt_eligible_cache:
-        return _nxt_eligible_cache[code]
+    """v165.14: NXT 거래가능 종목 판별.
+    v165.15 수정: _nxt_eligible_cache(get_nxt_stock_price 기반) → is_nxt_listed(_nxt_unavailable 기반)으로 교체.
+    is_nxt_listed는 _nxt_unavailable에 없으면 상장으로 간주하는데,
+    최초 조회 전엔 비어있어 KRX 전용 종목도 통과하는 문제가 있음.
+    따라서 is_nxt_listed=True지만 _nxt_cache에도 없으면 강제로 get_nxt_stock_price 조회해서 확인."""
+    if code in _nxt_unavailable:
+        return False  # 이미 NXT 비상장으로 확인됨
+    if code in _nxt_cache:
+        return True   # 이미 NXT 상장으로 확인됨
+    # 캐시 없음 → 강제 1회 조회로 확정
     try:
-        cur = get_nxt_stock_price(code)
-        eligible = bool(cur and safe_int(cur.get("price", 0), 0) > 0)
+        p = get_nxt_stock_price(code)
+        if not p:
+            _nxt_unavailable.add(code)
+            return False
+        return True
     except Exception as e:
         _swallow_exception(e)
-        eligible = False  # 조회 실패 시 KRX 전용으로 보수적 처리
-    _nxt_eligible_cache[code] = eligible
-    return eligible
+        return False  # 조회 실패 → 보수적으로 KRX 전용 처리
 def get_nxt_investor_trend(code: str) -> dict:
     """NXT 외인·기관 순매수 조회"""
     data   = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
