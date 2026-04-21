@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.11
+버전: v165.12
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.12 (2026-04-21): 연속손절 긴급 강화 boost_ts 미저장 버그 수정
+  [#1] _process_auto_tracking_result(): boost_ts 설정 후 _save_dynamic_params() 누락
+       이유: 연속손절 → min_score 강제 상향 시 _emergency_score_boost_ts를 _dynamic에 넣고
+             _save_dynamic_params()를 호출하지 않아 재시작 후 boost_ts가 사라짐
+             → v165.10 패치가 "boost_ts 없음 → 기본값 복원"으로 강제 리셋
+             → min_score=79(auto_tune+연속손절 강화)가 재시작 후 56으로 초기화
+             → 봇 재시작 직후 기준 완화로 저품질 신호 유입 위험
+       개선점: boost_ts/boost_n/boost_s 설정 직후 _save_dynamic_params() 호출
+              재시작 후 boost_ts가 살아있으면 v165.10 즉시 복원 로직이 경과 시간 정확히 판단
+       주의점: auto_tune() 함수 자체는 이미 끝에 _save_dynamic_params() 호출 중 → 정상
+              연속손절 긴급 강화 경로만 누락이었음
+  이유: 재시작 후 min_score 리셋으로 35분 침묵 구간 반복 위험 제거
+  개선점: 연속손절 기준 강화가 재시작 후에도 유지됨
+  주의점: 이미 재시작된 상황이므로 현재 세션 min_score는 56/66으로 복원된 상태
+          다음 연속손절 강화 시부터 정상 저장됨
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.11 (2026-04-21): 뉴스테마 A급 미달 + entry_watch 상한가급 반복 차단 수정
   [#1] send_news_theme_alert(): analyze() 후 direct_news_hit=True 강제 주입 + grade 재판정
        이유: 뉴스테마 경로는 이미 뉴스 필터를 통과한 종목만 진입하는데
@@ -21290,6 +21307,7 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
                 _dynamic["_emergency_score_boost_ts"] = time.time()
                 _dynamic["_emergency_score_boost_n"] = _old_n
                 _dynamic["_emergency_score_boost_s"] = _old_s
+                _save_dynamic_params()  # v165.12: 재시작 후에도 boost_ts 유지되도록 즉시 저장
     else:
         if _consecutive_loss_count >= EMERGENCY_TUNE_THRESHOLD:
             _clear_emergency_tune_state("win_recovered")
