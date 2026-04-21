@@ -3,10 +3,38 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.15
+버전: v165.16
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.16 (2026-04-21): NXT 시간대 KRX 종목 오발송 근본 수정 — market 필드 단일 기준
+  [#1] _scan_rank_and_theme_candidates(): NXT전용 시간대 통과 결과에 market="NXT" 마킹
+       이유: nxt_only_window 필터 통과했는데 analyze() 결과에 market="NXT" 마킹 없이
+             _append_scan_alert 호출 → sanitize 단계에서 market="" → KRX전용으로 오판하거나
+             그냥 통과해버리는 문제
+       개선점: analyze() 결과 r["market"] = "NXT" 명시 (nxt_only_window 시)
+  [#2] _scan_sector_leader_follow_candidates(): is_nxt_listed() → market="NXT" 필드 기준으로 교체
+       이유: is_nxt_listed()가 _nxt_unavailable 기반으로 KRX 종목도 True 반환 가능
+       개선점: market="NXT" 필드 없으면 차단 + 통과 시 market="NXT" 마킹
+  [#3] _sanitize_run_scan_alerts(): _is_nxt_eligible() 제거 → market="NXT" 단일 기준
+       이유: _is_nxt_eligible()이 KIS API KRX 데이터를 NXT로 오판 (엠플러스 259630 케이스)
+             KIS API FID_COND_MRKT_DIV_CODE=NX로 KRX 전용 종목 조회 시 KRX 종가 반환
+             → price>0 → eligible=True 오판 → 통과
+       개선점: market="NXT" 필드가 없으면 무조건 KRX전용 처리
+  [#4] check_entry_watch(): _is_nxt_eligible() 제거 → market="NXT" 단일 기준
+  [#5] _ensure_signal_actionability(): 동일
+       이유/개선점: #3과 동일
+  핵심 원칙: NXT 종목은 스캔 경로에서 반드시 market="NXT" 마킹됨
+             get_nxt_surge_stocks() → market="NXT" ✅
+             _scan_nxt_market_candidates() → r["market"]="NXT" ✅
+             nxt_only_window 통과 → market="NXT" 마킹 (v165.16 추가) ✅
+             market="" 상태로 내려오면 → KRX 전용으로 차단 ✅
+  이유: is_nxt_listed()/_is_nxt_eligible() 두 방법 모두 KIS API 특성으로 불안정
+        market="NXT" 직접 마킹이 v163.3부터 확립된 단일 기준 — 이 원칙 복원
+  주의점: NXT 이중상장 종목이 KRX 스캔 경로로 올라온 경우 market="" → NXT 시간대 차단됨
+          이는 의도된 동작 — NXT 시간대엔 NXT 경로로만 포착
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.15 (2026-04-21): KRX 전용 종목 NXT 시간대 오발송 근본 원인 수정
   [#1] _is_nxt_eligible(): get_nxt_stock_price 캐시 기반 → _nxt_unavailable/_nxt_cache 기반으로 교체
        이유: v165.14에서 만든 _nxt_eligible_cache는 get_nxt_stock_price() 응답 여부로 판별
@@ -15829,9 +15857,8 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
     if block_reason:
         _log_info_msg(f"  🚫 [게이트 차단] {signal.get('name', code)} — {block_reason}")
         return False
-    # v165.14: NXT 전용 시간대에 비NXT 종목 알람 발송 차단
-    # run_scan 내부 차단과 별개로, upper_limit_reached 캐시 해제 등으로
-    # _ensure_signal_actionability 경유 시 NXT 게이트를 건너뛰는 경로 존재
+    # v165.15: NXT 전용 시간대 비NXT 종목 최종 방어선
+    # market="NXT" 필드 단일 기준 — _is_nxt_eligible() 불안정(KIS API KRX 종가 반환) 대신 사용
     if (is_nxt_open() and not is_market_open()) and str(signal.get("market") or "").upper() != "NXT":
         _log_info_msg(
             f"  ⏭ [게이트 차단] {signal.get('name', code)} — NXT전용 시간대 비NXT 종목 차단 "
@@ -25857,12 +25884,11 @@ def check_entry_watch():
     changed_active = False
     _nxt_only_now = is_nxt_open() and not is_market_open()
     for log_key, watch in list(_entry_watch.items()):
-        # v165.14: NXT 전용 시간대에 KRX 전용 종목 watch 처리 스킵
-        # KRX 전용 종목은 NXT 시간대에 가격 변동 없음 — 조회/판정 전부 무의미
+        # v165.15: NXT 전용 시간대에 KRX 전용 종목 watch 처리 스킵
+        # market="NXT" 없으면 KRX 전용으로 판단 — _is_nxt_eligible 불안정 대신 필드 기준 사용
         if _nxt_only_now:
-            _w_code = normalize_stock_code(watch.get("code", ""))
             _w_market = str(watch.get("market") or "").upper()
-            if _w_market != "NXT" and not _is_nxt_eligible(_w_code):
+            if _w_market != "NXT":
                 continue  # KRX 전용 종목 스킵
         changed_active |= _process_entry_watch_item(log_key, watch, expired)
     changed_active |= _finalize_entry_watch_expired_items(expired)
@@ -37678,12 +37704,13 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             dropped += 1
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        # v165.14: NXT 전용 시간대 — NXT 비적격 종목(KRX 전용) 필터링
+        # v165.15: NXT 전용 시간대 — market="NXT" 필드 단일 기준으로 차단
+        # _is_nxt_eligible() 기반은 KIS API가 KRX 전용 종목에도 NXT 응답을 돌려줘서 불안정
+        # 모든 NXT 스캔 경로(get_nxt_surge_stocks, nxt_only_window 통과)에서 market="NXT" 마킹 보장
         if _nxt_only_now and str(item.get("market") or "").upper() != "NXT":
-            if not _is_nxt_eligible(code):
-                dropped += 1
-                dropped_names.append(f"{item.get('name', code)}(KRX전용)")
-                continue
+            dropped += 1
+            dropped_names.append(f"{item.get('name', code)}(KRX전용)")
+            continue
         if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
             _missing_r = list(item.get("_scan_payload_missing_reasons") or [])
@@ -37976,7 +38003,11 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
         # NXT전용 시간대엔 market=="NXT" 명시된 종목만 스캔
         if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
-        _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+        r = analyze(stock)
+        # v165.15: NXT전용 시간대 통과 종목에 market="NXT" 명시 마킹 (sanitize 필터 일관성)
+        if nxt_only_window and isinstance(r, dict):
+            r["market"] = "NXT"
+        _append_scan_alert(alerts, seen, r, seen_code=code)
     for stock in _collect_theme_peer_follow_candidates(existing_codes=seen):
         code = stock.get("code")
         if not code or code in seen:
@@ -37984,18 +38015,27 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
         # NXT전용 시간대엔 market=="NXT" 명시된 종목만 스캔
         if nxt_only_window and str(stock.get("market") or "") != "NXT":
             continue
-        _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+        r = analyze(stock)
+        # v165.15: NXT전용 시간대 통과 종목에 market="NXT" 명시 마킹
+        if nxt_only_window and isinstance(r, dict):
+            r["market"] = "NXT"
+        _append_scan_alert(alerts, seen, r, seen_code=code)
 def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
     nxt_only_window = not is_market_open() and is_nxt_open()  # v161.45
     for stock in _collect_sector_leader_follow_candidates(existing_codes=seen):
         code = stock.get("code")
         if not code or code in seen:
             continue
-        # v161.45: NXT 전용 시간대에 KRX 전용 종목 차단
-        if nxt_only_window and stock.get("market", "") != "NXT" and not is_nxt_listed(code):
+        # v165.15: is_nxt_listed() 불안정 → market="NXT" 필드 단일 기준으로 교체
+        # KRX 전용 종목은 _collect_sector_leader_follow_candidates에서 market=""로 들어옴
+        if nxt_only_window and str(stock.get("market") or "") != "NXT":
             _log_info_msg(f"  ⏭ NXT전용 시간대 비NXT 종목 차단(섹터팔로우): {stock.get('name', code)}")
             continue
-        _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+        r = analyze(stock)
+        # v165.15: NXT전용 시간대 통과 종목에 market="NXT" 명시 마킹
+        if nxt_only_window and isinstance(r, dict):
+            r["market"] = "NXT"
+        _append_scan_alert(alerts, seen, r, seen_code=code)
 # ============================================================
 # ⚡ F구간 VWAP 눌림반등 당일 단타 진입 감지 (v162.4)
 # 근거: F구간(거래대금 8배↑+등락률 10%↑) 소진 후 VWAP 눌림→반등 패턴
