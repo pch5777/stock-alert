@@ -3,10 +3,57 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.5
-날짜: 2026-04-20
+버전: v165.6
+날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.6 (2026-04-21): 거래정지 오판 버그 수정 + 5개 개선 패치
+  [#1] get_stock_price() / get_nxt_stock_price(): vi_cls_code에서 trht_yn/halt_yn 분리
+       이유: vi_cls_code 필드에 trht_yn(거래정지여부)/halt_yn을 fallback으로 합쳐둔 결과
+             KRX 개장 직후 순간적으로 trht_yn="Y"가 오면 VI 코드가 아니라서 거래정지로 오판
+             → 한국정보통신·더블유씨피 등 정상 종목에 [포착 취소 — 거래정지] 알람 오발송
+       개선점: vi_cls_code = vi_cls_code OR vi_yn 만 사용 (VI발동 전용)
+              trht_yn → raw_trht_yn, halt_yn → raw_halt_yn 별도 필드로 분리 (KRX/NXT 양쪽)
+       주의점: KRX/NXT 양쪽 get_stock_price/get_nxt_stock_price 모두 수정 필요
+  [#2] _has_explicit_halt_market_flag(): raw_trht_yn/raw_halt_yn 교차 검증 추가
+       이유: trht_yn="Y"여도 정상 호가/체결이 있으면 KRX 개장 전후 순간 플래그 오판
+       개선점: raw_trht_yn/raw_halt_yn="Y"일 때 price>0 AND (ask>0 OR bid>0 OR vol>0)이면 무시
+              호가·체결 모두 없는 경우만 실제 거래정지로 판정
+       주의점: 실제 거래정지 종목은 ask/bid/vol=0이므로 정상 차단
+  [#3] _notify_trading_halt_cancel(): 발송 직전 현재가 재조회 재검증 추가 (이중 방어)
+       이유: cur가 KRX 개장 직후 순간 snapshot일 수 있음 → 재조회로 최신 상태 확인
+       개선점: _mark_trading_halt_state 후 get_stock_price 재조회 → _is_live_trading_normal True면
+              무음 해제하고 알람 미발송
+       주의점: 재조회 실패 시 기존 로직 유지 (예외 swallow)
+  [#4] _finalize_nxt_preopen_signal(): NXT 장전 진입가 KRX 상한가 캡
+       이유: STX엔진 사례 — NXT 08:15에 +9.9% @ 48,350원 포착 → KRX 상한가 44,000원 미만
+             진입가 48,350원이 상한가보다 높아 KRX에서 도달 불가
+       개선점: entry 설정 후 get_stock_price()로 upper_price 조회 → entry > upper_price이면
+              entry = upper_price - 10원으로 캡. upper_price=0이면 기존 유지
+       주의점: API 호출 실패 시 예외 swallow로 기존 진입가 유지
+  [#5] _select_representative_entry_price(): NXT 장후 진입가 미도달 완화
+       이유: 현대지에프홀딩스·미코 — NXT 16:00~20:00에 +22~24% 유지하는데 진입가 하위에서
+             도달 못 하고 7회/5회 미도달 반복. 기존 갱신 기준(miss 3회/괴리 15%)이 너무 엄격
+       개선점: NXT 장후 시간대(15:30~20:00) AND miss_count >= 1 AND gap_pct >= 3.0이면
+              상향 갱신 허용 (NXT장후완화)
+       주의점: KRX 장중 및 NXT 장전(09:00 이전)은 기존 기준 유지
+  [#6] WebSocket Broken pipe WARNING 반복 억제
+       이유: 024740·209640 등 4~5개 종목에서 Broken pipe 각 60회 = 총 286회 WARNING 반복
+             v163.12에서 무한재시도는 차단했으나 WARNING 로그 자체는 계속 찍힘
+       개선점: _ws_subscribe_fail_count dict 추가 — 종목별 최초 3회만 WARNING, 이후 무시
+              WebSocket 재연결 시 _ws_subscribe_fail_count.clear() 초기화
+       주의점: _ws_unsubscribe 기존 3회 로직과 동일 패턴 적용
+  [#7] 종목코드 표시 <b><code> 통일 — 크게 + 탭 복사
+       이유: 일부 알람은 <code> 태그가 있어 탭 1회로 복사 가능하지만 일부는 일반 텍스트
+             또한 <code>만 있어 시각적으로 작게 보이는 문제
+       개선점: 모든 주식 알람 메시지의 종목코드를 <b><code>{code}</code></b>로 통일
+              F구간 재료 확인 메시지도 동일 포맷 적용
+       주의점: 코드해시·인스턴스ID·함수명 등 시스템 내부 <code> 태그는 변경 없음
+  이유: 거래정지 오판 즉시 수정 + NXT 포착 품질·진입가 정확도 개선 + 로그 노이즈 감소
+  개선점: 정상 종목 거래정지 오발송 차단, NXT 진입가 상한 제한, 장후 진입가 갱신 탄력화
+  주의점: trading_halt_state.json 기존 데이터는 유지됨. 재시작 후 정상 거래 종목은 자동 해제
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.5 (2026-04-20): 선진입 job 스레드 분리 + holdover 파일 저장
   [#1] 선진입 job(14:35/15:08/19:10) 별도 스레드 실행으로 변경
        이유: schedule 라이브러리 single-thread 특성 — run_scan(10~20분) 처리 중
@@ -5213,10 +5260,10 @@ def _check_fzone_material_confirmed_and_alert() -> None:
             chg_str = f"+{chg:.1f}%" if chg >= 0 else f"{chg:.1f}%"
             chart_url = f"https://m.stock.naver.com/domestic/stock/{code}/total"
             msg = (
-                f"⚡ [재료 확인됨] {name} ({code})\n"
+                f"⚡ <b>[재료 확인됨]</b>\n"
+                f"<b>{name}</b>  <b><code>{code}</code></b>\n"
                 f"현재 {price:,}원 {chg_str}\n"
-                f"F구간 포착 후 재료가 확인되었습니다.\n"
-                f"📊 차트: {chart_url}"
+                f"F구간 포착 후 재료가 확인되었습니다."
             )
             send_with_chart_buttons(msg, code, name)
             _log_info_msg(f"[F구간] {name}({code}) 재료 확인 후속 알람 발송 완료")
@@ -11192,11 +11239,18 @@ def _ws_subscribe(ws, code: str) -> bool:
             _ws_subscribed_codes[code] = time.time()
         return True
     except Exception as e:
-        _log_warn_msg(f"⚠️ WebSocket 구독 실패 [{code}]: {e}")
+        # v165.6 [#6]: Broken pipe 반복 WARNING 억제 — 종목별 최초 3회만 WARNING, 이후 무시
+        err_str = str(e)
+        with _ws_lock:
+            _cnt = _ws_subscribe_fail_count.get(code, 0) + 1
+            _ws_subscribe_fail_count[code] = _cnt
+        if _cnt <= 3:
+            _log_warn_msg(f"⚠️ WebSocket 구독 실패 [{code}]: {e}")
         return False
 
 
 _ws_unsubscribe_fail_count: dict = {}  # v163.6: 구독해제 실패 횟수 추적
+_ws_subscribe_fail_count:   dict = {}  # v165.6 [#6]: 구독 실패 횟수 — Broken pipe 반복 WARNING 억제
 
 def _ws_unsubscribe(ws, code: str) -> bool:
     """종목 체결가 구독 해제."""
@@ -11329,6 +11383,7 @@ def _ws_connect_loop() -> None:
             _ws_connected = True
             backoff = WS_RECONNECT_BASE_SEC
             _ws_last_sync_ts = 0.0  # 즉시 동기화 트리거
+            _ws_subscribe_fail_count.clear()    # v165.6 [#6]: 재연결 시 실패 카운트 초기화
             _log_info_msg(f"✅ WebSocket 연결 성공")
 
             # 초기 구독 동기화
@@ -12541,7 +12596,7 @@ def _build_execution_confirmation_message(watch: dict, entry_price: int, stop_pr
     lines = [
         "⚡ <b>[체결속도 확인 → 진입 확정]</b>",
         "━━━━━━━━━━━━━━━",
-        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>",
+        f"🔴 <b>{watch.get('name','')}</b>  <b><code>{watch.get('code','')}</code></b>",
         f"원신호: {sig_label}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  확정: {hit_time.split(' ',1)[-1] if ' ' in hit_time else hit_time}",
     ]
     if pattern_summary:
@@ -14061,7 +14116,7 @@ def _send_preclose_gap_entry_hit_message(watch: dict, hit_price: int, use_nxt: b
     send_with_chart_buttons(
         f"🎯 <b>[선진입가 도달!]</b>{market_tag}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+        f"🔴 <b>{watch.get('name','')}</b>  <b><code>{watch.get('code','')}</code></b>\n"
         f"{pattern_summary_block}"
         f"원신호: 종가선진입  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  {watch.get('market_basis','KRX')}\n"
         f"{reasons_block}"
@@ -15647,9 +15702,11 @@ def get_stock_price(code: str) -> dict:
         "prev_close": int(o.get("stck_sdpr",0)),
         "bstp_code": o.get("bstp_cls_code",""),
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
-        "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
+        "vi_cls_code":  str(o.get("vi_cls_code","") or o.get("vi_yn","") or ""),  # v165.6 [#1]: trht_yn/halt_yn 분리 — VI발동 전용
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리
         "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
+        "raw_trht_yn":     str(o.get("trht_yn","") or ""),             # v165.6 [#1]: 거래정지여부 별도 필드
+        "raw_halt_yn":     str(o.get("halt_yn","") or ""),             # v165.6 [#1]: halt여부 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
         "cap_size":  ("large" if mktcap_raw >= 10000   # 1조 이상
                       else "mid" if mktcap_raw >= 1000  # 1000억 이상
@@ -16499,9 +16556,11 @@ def get_nxt_stock_price(code: str) -> dict:
         "open": int(o.get("stck_oprc",0) or 0),
         "market": "NXT",
         "bstp_name": o.get("bstp_kor_isnm","") or "동일업종",
-        "vi_cls_code": str(o.get("vi_cls_code","") or o.get("vi_yn","") or o.get("trht_yn","") or o.get("halt_yn","") or ""),
+        "vi_cls_code":  str(o.get("vi_cls_code","") or o.get("vi_yn","") or ""),  # v165.6 [#1]: trht_yn/halt_yn 분리 — VI발동 전용
         "raw_status_code": str(o.get("iscd_stat_cls_code","") or ""),  # v165.1: temp_stop_yn 분리
         "raw_temp_stop":   str(o.get("temp_stop_yn","") or ""),        # v165.1: VI임시정지 별도 필드
+        "raw_trht_yn":     str(o.get("trht_yn","") or ""),             # v165.6 [#1]: 거래정지여부 별도 필드
+        "raw_halt_yn":     str(o.get("halt_yn","") or ""),             # v165.6 [#1]: halt여부 별도 필드
         "mrkt_alrm_cls_code": str(o.get("mrkt_alrm_cls_code","") or ""),  # v163.2: 투자주의(01)/경고(02)/위험(03)
     }
     try:
@@ -19750,6 +19809,14 @@ def _select_representative_entry_price(prev_entry: int, next_entry: int, signal_
             if recovery.get("active") and (elapsed >= 1 or safe_int(miss_count, 0) >= 1 or gap_pct >= 6.0):
                 reason = f"회복완화({elapsed}일/{safe_int(miss_count, 0)}회/괴리{gap_pct:.0f}%)"
                 return next_entry, reason
+            # v165.6 [#5]: NXT 장후 시간대 miss 1회 이상 + 괴리 3% 이상이면 상향 갱신 허용
+            # 이유: NXT 15:30~20:00 구간에서 종목이 진입가 위에서 계속 유지 시
+            #        기존 기준(miss 3회/괴리 15%)이 너무 엄격 → 7회 미도달 반복
+            _now_t = datetime.now().time()
+            _is_nxt_after = dtime(15, 30) <= _now_t < dtime(20, 0)
+            if _is_nxt_after and safe_int(miss_count, 0) >= 1 and gap_pct >= 3.0:
+                reason = f"NXT장후완화({safe_int(miss_count,0)}회/괴리{gap_pct:.0f}%)"
+                return next_entry, reason
         return prev_entry, "고점추격방지유지"
     return next_entry, "상향갱신" if next_entry > prev_entry else "기존유지"
 def _apply_entry_price_guard(stock: dict | None, prev_entry: int = 0, detect_date: str = "", miss_count: int = 0) -> tuple[int, str]:
@@ -21311,7 +21378,7 @@ def _build_tracking_result_message(rec: dict, display_rec: dict, header: dict, c
     return (
         f"{header['emoji']} <b>[자동 추적 결과]</b>  {header['title']}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{header['pnl_emoji']} <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
+        f"{header['pnl_emoji']} <b>{rec['name']}</b>  <b><code>{rec['code']}</code></b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"신호: {header['sig_label']}  |  감지: {_format_capture_datetime_label(detect_date=rec.get('detect_date',''), detect_time=rec.get('detect_time',''))}\n"
         f"{header['theme_tag']}\n"
@@ -24119,6 +24186,16 @@ def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | 
                 _log_info_msg(f"  ℹ️ {name}({code}) 전날 거래정지 기록 무음 해제 (ts={_halt_ts:.0f})")
                 return
     _mark_trading_halt_state(code, title=halt_reason, name=name, source="entry_watch_cancel")
+    # v165.6 [#3]: 발송 직전 현재가 재조회 — KRX 개장 직후 순간 플래그 오판 방어
+    try:
+        _re_cur = get_stock_price(code) if not use_nxt else get_nxt_stock_price(code)
+        if _re_cur and _is_live_trading_normal(_re_cur):
+            _clear_trading_halt_state(code, resume_title="발송 직전 재확인 — 정상 거래 확인", source="LIVE_MARKET")
+            _clear_dart_halt_cache(code, "발송 직전 재확인 — 정상 거래")
+            _log_info_msg(f"  ✅ {name}({code}) 거래정지 오판 — 발송 직전 재확인 후 무음 해제")
+            return
+    except Exception as _re_e:
+        _swallow_exception(_re_e)
     if watch.get("halt_cancel_notified"):
         return
     watch["halt_cancel_notified"] = True
@@ -24194,7 +24271,7 @@ def _notify_entry_guard_followup(watch: dict, reason: str, price: int, entry: in
     send_with_chart_buttons(
         f"⚠️ <b>[진입 보류/취소 사유]</b>{nxt_notice}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔴 <b>{watch.get('name','')}</b>  <code>{watch.get('code','')}</code>\n"
+        f"🔴 <b>{watch.get('name','')}</b>  <b><code>{watch.get('code','')}</code></b>\n"
         f"원신호: {sig}  |  1차도달: {hit_time}  |  감지: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"사유: <b>{_entry_guard_reason_label(reason)}</b>{detail_line}\n"
         f"현재가 <b>{int(price or 0):,}원</b>  ({diff_str})\n"
@@ -24309,7 +24386,7 @@ def _send_phase1_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
         send_with_chart_buttons(
             f"🔔 <b>[1차 진입가 도달]</b>{ctx['nxt_notice']}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+            f"🔴 <b>{watch['name']}</b>  <b><code>{watch['code']}</code></b>\n"
             f"원신호: {ctx['sig']}  |  포착: {_format_capture_datetime_label(detect_date=watch.get('detect_date',''), detect_time=watch.get('detect_time',''))}  |  도달: {ctx['entry_hit_ts']}\n\n"
             f"{nxt_delta_block}{ctx['similar_block']}"
             f"{ctx['reasons_block']}"
@@ -24340,7 +24417,7 @@ def _send_phase1_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
         send_with_chart_buttons(
             f"{bottom_title}{ctx['nxt_notice']}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+            f"🔴 <b>{watch['name']}</b>  <b><code>{watch['code']}</code></b>\n"
             f"{bottom_check.get('reason','')}",
             watch["code"], watch["name"]
         )
@@ -24388,7 +24465,7 @@ def _send_phase2_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
     send_with_chart_buttons(
         f"🔔🔔 <b>[2차 진입 판단]</b>{ctx['nxt_notice']}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🔴 <b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+        f"🔴 <b>{watch['name']}</b>  <b><code>{watch['code']}</code></b>\n"
         f"원신호: {ctx['sig']}  |  도달: {ctx['entry_hit_ts']}\n\n"
         f"{ctx['entry_exec_block']}"
         f"━━━━━━━━━━━━━━━\n"
@@ -24712,6 +24789,19 @@ def _has_explicit_halt_market_flag(cur: dict | None) -> bool:
         if _vi in _VI_CODES:
             return False  # VI에 의한 임시정지 — 거래정지 아님
         return True
+    # v165.6 [#2]: raw_trht_yn/raw_halt_yn — 정상 체결(price>0, ask/bid>0)이면 오판이므로 무시
+    for _rk in ("raw_trht_yn", "raw_halt_yn"):
+        _rv = str(cur.get(_rk, "") or "").strip().upper()
+        if _rv not in ("Y", "1"):
+            continue
+        # trht_yn="Y"여도 정상 호가/거래가 있으면 개장 전후 순간 플래그 오판 — 무시
+        _price = safe_int(cur.get("price", 0), 0)
+        _ask   = safe_int(cur.get("ask_qty", cur.get("ask_vol", cur.get("askp1", 0))), 0)
+        _bid   = safe_int(cur.get("bid_qty", cur.get("bid_vol", cur.get("bidp1", 0))), 0)
+        _vol   = safe_int(cur.get("today_vol", cur.get("volume", 0)), 0)
+        if _price > 0 and (_ask > 0 or _bid > 0 or _vol > 0):
+            continue  # 정상 거래 중 — trht_yn 플래그 무시
+        return True  # 호가/체결 없고 trht_yn=Y → 실제 거래정지
     return False
 def _is_live_trading_normal(cur: dict | None) -> bool:
     if not isinstance(cur, dict):
@@ -25477,7 +25567,7 @@ def _process_entry_watch_item(log_key: str, watch: dict, expired: list) -> bool:
             send_with_chart_buttons(
                 f"📈 <b>[진입가 이탈]</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
-                f"<b>{watch['name']}</b>  <code>{watch['code']}</code>\n"
+                f"<b>{watch['name']}</b>  <b><code>{watch['code']}</code></b>\n"
                 f"진입가 {entry:,}원에서 +{diff_pct:.1f}% 상승 이탈\n"
                 f"진입 기회 없이 상승 → 감시 종료",
                 watch["code"], watch["name"]
@@ -26383,7 +26473,7 @@ def _build_capture_focus_message(s: dict, header_line: str, capture_label: str, 
         header_line,
         f"🕐 {capture_label}",
         '━━━━━━━━━━━━━━━',
-        f"{name_dot} <b>{display_name}</b>  <code>{s['code']}</code>",
+        f"{name_dot} <b>{display_name}</b>  <b><code>{s['code']}</code></b>",
     ]
     price_line = _build_capture_focus_price_line(s)
     focus_reasons = _build_capture_focus_reasons(s)
@@ -27929,6 +28019,18 @@ def _finalize_nxt_preopen_signal(ctx: dict) -> dict:
         return {}
     _detail, bid_qty, ask_qty = hoga
     entry = ctx["price"]
+    # v165.6 [#4]: NXT 장전 진입가 KRX 상한가 캡 — NXT에서 이미 고점 포착 시 KRX 상한가 초과 방지
+    try:
+        _krx_cur = get_stock_price(ctx["code"])
+        _upper = safe_int((_krx_cur or {}).get("upper_price", 0), 0)
+        if _upper > 0 and entry > _upper:
+            _log_info_msg(
+                f"  🔒 NXT 장전 진입가 상한가 캡: {_resolve_stock_name(ctx['code'], ctx['stock'].get('name',''))} "
+                f"{entry:,}→{_upper - 10:,}원 (KRX 상한가 {_upper:,})"
+            )
+            entry = _upper - 10
+    except Exception as _ue:
+        _swallow_exception(_ue)
     stop, target, stop_pct, target_pct, atr_used = calc_stop_target(ctx["code"], entry, signal_type="EARLY_DETECT")
     pre_score, pre_reasons, similar_pattern_stats = _apply_similar_pattern_score(ctx["pre_score"], ctx["pre_reasons"], ctx["code"], "EARLY_DETECT", ctx["change_rate"], ctx["volume_ratio"], weight_mode="strong")
     pattern_ctx = ctx.get("pattern_ctx") if isinstance(ctx.get("pattern_ctx"), dict) else {}
@@ -32993,7 +33095,7 @@ def _dispatch_dart_intraday_item(runtime, item):
         f"{ctx['emoji']} <b>[공시+주가 연동]</b>  {ctx['tag']}\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{'🔵' if ctx['is_risk'] else '🟡'} <b>{ctx['company']}</b>  <code>{ctx['code']}</code>\n"
+        f"{'🔵' if ctx['is_risk'] else '🟡'} <b>{ctx['company']}</b>  <b><code>{ctx['code']}</code></b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📌 {ctx['title']}\n"
         f"🔑 키워드: {', '.join(ctx['all_kw'])}"
@@ -34056,7 +34158,7 @@ def _handle_entry_confirm_command(raw: str):
         tgt_pct   = round((target_p - entry_p) / entry_p * 100, 1) if entry_p else 0
         send(f"✅ <b>[진입 확정]</b>\n"
              f"━━━━━━━━━━━━━━━\n"
-             f"🔴 <b>{rec['name']}</b>  <code>{rec['code']}</code>\n"
+             f"🔴 <b>{rec['name']}</b>  <b><code>{rec['code']}</code></b>\n"
              f"━━━━━━━━━━━━━━━\n"
              f"📍 실제 진입가: <b>{entry_p:,}원</b>\n"
              f"🛡 손절가:  <b>{stop_p:,}원</b>  ({stop_pct:+.1f}%)\n"
