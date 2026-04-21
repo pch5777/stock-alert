@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.6
+버전: v165.7
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.7 (2026-04-21): 종가선진입 익일 오픈 체크 2개 버그 수정
+  [#1] update_preclose_gap_open_outcomes() 스케줄 _leader_job → _threaded_leader_job (KRX/NXT)
+       이유: KRX 09:00 직후 run_scan이 실행 중이면 09:01 job이 pending → 09:20~09:30에 뒤늦게 실행
+             v165.5에서 선진입 job들은 _threaded_leader_job으로 분리됐으나 이 job은 누락됨
+             "09:01 이내 청산 우선" 안내가 09:23에 도착 → 지침 자체 무의미
+       개선점: _threaded_leader_job으로 변경 → run_scan 실행 중에도 09:01 정시 독립 실행
+       주의점: NXT(08:05)/KRX(09:01) 양쪽 모두 변경
+  [#2] update_preclose_gap_open_outcomes() detect_date 필터 → 직전 영업일 신호만 처리
+       이유: 기존 detect_date < today 조건은 수주~수개월 전 신호도 포함
+             이노인스트루먼트 entry_price=1,580원(3월 초 신호) → 오늘 시초가 2,430원과 비교
+             → "전날 진입한 적 없는 종목" 알람 오발송
+       개선점: 직전 영업일(평일 -1일, 월요일 -3일) detect_date인 신호만 처리
+       주의점: 주말/공휴일 연속 시 lookback 보정 필요 — 현재 월요일(3일)만 보정, 연휴는 수동 조정 필요
+  이유: 익일 오픈 알람 지연(22분) + 무관 종목 오발송 동시 수정
+  개선점: 알람 09:01 정시 발송 + 어제 선진입 종목만 표시
+  주의점: signal_log.json의 기존 오래된 신호들은 내일부터 자동 제외됨
+
 - v165.6 (2026-04-21): 거래정지 오판 버그 수정 + 5개 개선 패치
   [#1] get_stock_price() / get_nxt_stock_price(): vi_cls_code에서 trht_yn/halt_yn 분리
        이유: vi_cls_code 필드에 trht_yn(거래정지여부)/halt_yn을 fallback으로 합쳐둔 결과
@@ -14220,6 +14237,10 @@ def update_preclose_gap_open_outcomes(stage: str = "all") -> None:
             return
         today = datetime.now().strftime("%Y%m%d")
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # v165.7: 직전 영업일 신호만 처리 — 기존 detect_date < today는 수주 전 신호도 포함하는 버그
+        _weekday = datetime.now().weekday()
+        _lookback = 3 if _weekday == 0 else (2 if _weekday == 6 else 1)  # 월=3일, 일=2일, 평일=1일
+        yesterday = (datetime.now() - timedelta(days=_lookback)).strftime("%Y%m%d")
         changed = False
         exit_rows_by_stage = {"krx": [], "nxt": []}
         for rec in data.values():
@@ -14229,6 +14250,9 @@ def update_preclose_gap_open_outcomes(stage: str = "all") -> None:
                 continue
             detect_date = str(rec.get("detect_date", "") or "")
             if not detect_date or detect_date >= today:
+                continue
+            # v165.7: 직전 영업일 신호만 처리 — 오래된 신호 제외
+            if detect_date < yesterday:
                 continue
             if rec.get("next_open_date") == today:
                 continue
@@ -38136,10 +38160,10 @@ if __name__ == "__main__":
     schedule.every().day.at("08:50").do(_leader_job(  # v165.0: 시초가 진입 알람
         lambda: None if is_holiday() else send_opening_gap_alert()
     ))
-    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_leader_job(
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
     ))
-    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_leader_job(
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
     ))
     schedule.every().day.at("14:35").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
