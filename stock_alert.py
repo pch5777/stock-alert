@@ -3,10 +3,43 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.7
+버전: v165.9
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.9 (2026-04-21): "1차 진입가 도달" 알람 발송 후 entry_hit 미기록 버그 수정
+  [#1] _finalize_general_alert_dispatch(): 알람 발송 직후 entry_hit 동기화
+       이유: send_alert()에서 "1차 진입가 도달" 헤더가 붙어 알람이 나갔어도
+             _maybe_send_immediate_entry_hit_from_signal()에서 no_ask_liquidity 등으로 차단되면
+             entry_hit=True가 watch에 기록되지 않음
+             → _find_existing_entry_hit_watch()가 None 반환
+             → 2시간 후 재포착 시 신규 포착으로 오인 → 동일한 "1차 진입가 도달" 알람 재발송
+             → KEC 사례: 09:05 알람 → 09:06 no_ask_liquidity 차단 → 11:22 동일 알람 재발송
+       개선점: _maybe_send_immediate_entry_hit_from_signal 결과와 무관하게
+              알람 발송 후 watch가 존재하고 price <= entry_price 조건이면 entry_hit=True 강제 기록
+              "알람 발송 = 1차 진입가 도달 인정"으로 일관성 확보
+       주의점: entry_hit_price는 setdefault — 이미 기록된 경우 덮어쓰지 않음
+              entry_hit_locked 상태는 건드리지 않음
+              _maybe_send_immediate_entry_hit_from_signal이 이미 기록한 경우 entry_hit=True 체크로 스킵
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
+- v165.8 (2026-04-21): 거래정지 오발송 근본 원인 2개 추가 수정
+  [#1] _has_explicit_halt_market_flag(): raw_trht_yn 교차 검증 조건 완화
+       이유: no_ask_liquidity 상태(ask=0)일 때 price>0 AND ask>0 조건 실패 → 정상 거래 중인데
+             거래정지로 판정. 금강철강 09:06~11:23 내내 no_ask_liquidity였고 11:23에 오발송
+       개선점: price>0 OR vol>0 → 정상으로 판단 (ask는 순간적으로 0일 수 있음)
+              실제 거래정지는 price=0 AND vol=0 AND ask=0 AND bid=0 모두 성립해야 True
+       주의점: 실제 거래정지 종목은 장중에도 4개 조건이 모두 0이므로 정상 차단
+  [#2] _load_trading_halt_state(): 복원 직후 실시간 검증으로 오래된 상태 제거
+       이유: TRADING_HALT_KEEP_DAYS=14 → 2주 전 일시 거래정지 종목이 파일에 잔류
+             봇 재시작 시 16개 복원 → 정상 거래 종목이 halt 상태로 메모리에 올라와 오발송
+       개선점: _verify_and_clean_restored_halt_state() 신설 — 복원 후 종목별 get_stock_price 조회
+              _is_live_trading_normal() True이면 즉시 제거 후 파일 저장
+       주의점: 복원 시 API 호출 N건 발생 (종목 수만큼) — 시작 시 1회만 실행
+  이유: v165.6 패치 후에도 금강철강 오발송 지속 — no_ask_liquidity + 14일 잔류 상태 복합 원인
+  개선점: 거래정지 오발송 경로 3중 차단 완성 (필드분리 + 교차검증 + 복원검증)
+  주의점: _verify_and_clean_restored_halt_state는 get_stock_price 실패 시 해당 종목 유지 (보수적)
+
 - v165.7 (2026-04-21): 종가선진입 익일 오픈 체크 2개 버그 수정
   [#1] update_preclose_gap_open_outcomes() 스케줄 _leader_job → _threaded_leader_job (KRX/NXT)
        이유: KRX 09:00 직후 run_scan이 실행 중이면 09:01 job이 pending → 09:20~09:30에 뒤늦게 실행
@@ -24813,19 +24846,24 @@ def _has_explicit_halt_market_flag(cur: dict | None) -> bool:
         if _vi in _VI_CODES:
             return False  # VI에 의한 임시정지 — 거래정지 아님
         return True
-    # v165.6 [#2]: raw_trht_yn/raw_halt_yn — 정상 체결(price>0, ask/bid>0)이면 오판이므로 무시
+    # v165.6 [#2] / v165.8 보강: raw_trht_yn/raw_halt_yn — 정상 거래 교차 검증
+    # no_ask_liquidity 상태(ask=0)여도 today_vol > 0이면 정상 거래 중 — 무시
+    # 실제 거래정지는 price=0 AND vol=0 AND ask=0 AND bid=0 이 모두 성립
     for _rk in ("raw_trht_yn", "raw_halt_yn"):
         _rv = str(cur.get(_rk, "") or "").strip().upper()
         if _rv not in ("Y", "1"):
             continue
-        # trht_yn="Y"여도 정상 호가/거래가 있으면 개장 전후 순간 플래그 오판 — 무시
         _price = safe_int(cur.get("price", 0), 0)
         _ask   = safe_int(cur.get("ask_qty", cur.get("ask_vol", cur.get("askp1", 0))), 0)
         _bid   = safe_int(cur.get("bid_qty", cur.get("bid_vol", cur.get("bidp1", 0))), 0)
         _vol   = safe_int(cur.get("today_vol", cur.get("volume", 0)), 0)
-        if _price > 0 and (_ask > 0 or _bid > 0 or _vol > 0):
-            continue  # 정상 거래 중 — trht_yn 플래그 무시
-        return True  # 호가/체결 없고 trht_yn=Y → 실제 거래정지
+        # price > 0 OR vol > 0 → 거래 이력 있음 → 오판 무시 (ask=0은 순간적으로 발생 가능)
+        if _price > 0 or _vol > 0:
+            continue
+        # ask 또는 bid만 있어도 호가 형성 중 → 정상
+        if _ask > 0 or _bid > 0:
+            continue
+        return True  # price=0, vol=0, ask=0, bid=0 → 실제 거래정지
     return False
 def _is_live_trading_normal(cur: dict | None) -> bool:
     if not isinstance(cur, dict):
@@ -29565,6 +29603,24 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     else:
         watch_key = register_entry_watch(s)
     _maybe_send_immediate_entry_hit_from_signal(s, watch_key=watch_key, merge_capture_phase1=False)
+    # v165.9: "1차 진입가 도달" 헤더가 실제로 발송됐는데 entry_hit 미기록된 경우 동기화
+    # 원인: _maybe_send_immediate_entry_hit_from_signal에서 no_ask_liquidity 등으로 차단되면
+    #       entry_hit=True 기록 없이 return → 2시간 후 재포착 시 신규 포착으로 오인 → 동일 알람 재발송
+    # 수정: 알람 발송 시점에 price <= entry_price 조건이 성립했으면 entry_hit 기록 (알람 발송이 곧 hit 인정)
+    if watch_key and watch_key in _entry_watch:
+        _w = _entry_watch.get(watch_key)
+        if (isinstance(_w, dict)
+                and not _w.get("entry_hit")
+                and not _w.get("entry_hit_locked")
+                and _is_general_capture_first_entry_reached(s, live_price=safe_int(s.get("price", 0), 0))):
+            _w["entry_hit"] = True
+            _w.setdefault("entry_hit_time", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            _w.setdefault("entry_hit_price", safe_int(s.get("price", 0), 0))
+            _log_info_msg(f"  📌 {name}({code}) entry_hit 동기화 — 알람 발송 시점 진입가 도달 기록")
+            try:
+                _save_entry_watch_active()
+            except Exception as _e:
+                _swallow_exception(_e)
     register_top_signal(s)
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
         sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
@@ -30209,9 +30265,32 @@ def _load_trading_halt_state() -> None:
         active_cnt = len((_trading_halt_state.get("active") or {})) if isinstance(_trading_halt_state, dict) else 0
         if active_cnt:
             _log_info_msg(f"📂 거래정지 영속 상태 {active_cnt}개 복원")
+            # v165.8: 복원 직후 실시간 검증 — 정상 거래 중인 종목은 즉시 제거
+            _verify_and_clean_restored_halt_state()
     except Exception as e:
-        _swallow_exception(e)  # v105 structured silent-exception log
+        _swallow_exception(e)
         _trading_halt_state = _default_trading_halt_state()
+
+
+def _verify_and_clean_restored_halt_state() -> None:
+    """봇 재시작 후 trading_halt_state.json 복원 시 실시간 조회로 오래된 상태 제거."""
+    if not isinstance(_trading_halt_state, dict):
+        return
+    active = _trading_halt_state.get("active") or {}
+    to_remove = []
+    for code in list(active.keys()):
+        try:
+            cur = get_stock_price(code)
+            if cur and _is_live_trading_normal(cur):
+                to_remove.append(code)
+                _log_info_msg(f"  🗑 거래정지 상태 제거: {code} — 실시간 정상 거래 확인")
+        except Exception as e:
+            _swallow_exception(e)
+    for code in to_remove:
+        active.pop(code, None)
+    if to_remove:
+        _save_trading_halt_state()
+        _log_info_msg(f"  ✅ 거래정지 상태 {len(to_remove)}개 정리 완료 (실시간 검증)")
 def _get_persisted_trading_halt(code: str) -> dict:
     code = normalize_stock_code(code)
     if not code:
