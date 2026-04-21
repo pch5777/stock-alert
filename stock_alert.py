@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.16
+버전: v165.17
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.17 (2026-04-21): repair queue 경유 KRX 종목 NXT 시간대 오발송 수정
+  [#1] _drain_run_scan_repair_queue(): repair 완료 후 NXT 거래량 실증 확인 추가
+       이유: v165.16에서 nxt_only_window 통과 종목에 market="NXT" 마킹 추가
+             → repair queue 등록 시 market="NXT" 상태 → 37543 NXT 체크 통과
+             → repair 완료 후 analyze()가 get_nxt_delta() 경유 market="NXT" 재확인
+             → 삼기에너지솔루션즈/대우건설/수산세보틱스 오발송 (19:38)
+       개선점: repair 완료 후 _append_scan_alert 직전 NXT 전용 시간대면:
+              1) _nxt_unavailable에 있으면 폐기
+              2) _nxt_cache에 없으면 get_nxt_stock_price() 조회 → today_vol=0이면 KRX 전용 → 폐기
+              3) today_vol > 0이면 실제 NXT 거래 확인 → 통과
+       주의점: today_vol 기반 판별: NXT 거래량 0 = KRX 전용 or NXT 비상장
+              NXT 조회 실패 시 보수적으로 폐기
+  [#2] _repair_run_scan_payload(): analyze() 후 market 필드 원래 값 보존
+       이유: analyze() 내부 get_nxt_delta() 호출 시 market="NXT"로 덮어씌워질 수 있음
+             repair 전 market="" 종목이 repair 후 market="NXT"로 바뀌어 오발송
+       개선점: repair 전 market 값(_orig_market)을 보존하고 merged.update 후 복원
+       주의점: _orig_market이 ""이면 기존 로직(item.get market 유지) 유지
+  이유: repair queue가 NXT 시간대 KRX 종목 차단의 우회 경로로 작동하는 문제 차단
+  개선점: today_vol 기반 판별로 KIS API KRX 데이터 오반환 문제 근본 해결
+  주의점: NXT 조회 API 1회 추가 호출 발생 (미캐시 종목만, drain 시점에서 1회)
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.16 (2026-04-21): NXT 시간대 KRX 종목 오발송 근본 수정 — market 필드 단일 기준
   [#1] _scan_rank_and_theme_candidates(): NXT전용 시간대 통과 결과에 market="NXT" 마킹
        이유: nxt_only_window 필터 통과했는데 analyze() 결과에 market="NXT" 마킹 없이
@@ -37561,6 +37583,25 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
                     _run_scan_repair_queue[code] = row
                 continue
             remove_codes.append(code)
+            # v165.17: repair 완료 후에도 NXT 전용 시간대 체크 — analyze()가 market="NXT" 마킹해도 최종 차단
+            # 이유: _scan_rank_and_theme_candidates()가 nxt_only_window 통과 종목에 market="NXT" 마킹 후
+            #       repair queue 등록 → drain 시 analyze()가 get_nxt_delta() 경유 market="NXT" 재마킹
+            #       → 37543 NXT 체크 통과 → 삼기에너지솔루션즈/대우건설/수산세보틱스 오발송
+            if not is_market_open() and is_nxt_open():
+                _rc = normalize_stock_code(repaired.get("code", "") or code)
+                if _rc in _nxt_unavailable:
+                    continue  # 확인된 KRX 전용 → 폐기
+                if _rc not in _nxt_cache:
+                    # NXT 캐시에 없음 → 실제 NXT 거래량 확인
+                    try:
+                        _nxt_q = get_nxt_stock_price(_rc)
+                        _nxt_vol = safe_int((_nxt_q or {}).get("today_vol", 0), 0)
+                        if not _nxt_q or _nxt_vol == 0:
+                            _nxt_unavailable.add(_rc)
+                            continue  # NXT 거래량 없음 → KRX 전용
+                    except Exception as _ne:
+                        _swallow_exception(_ne)
+                        continue  # 조회 실패 → 보수적으로 폐기
             _append_scan_alert(alerts, seen, repaired, hist_key=code, seen_code=code)
         for code in remove_codes:
             _run_scan_repair_queue.pop(code, None)
@@ -37592,8 +37633,13 @@ def _repair_run_scan_payload(payload: dict | None = None, fallback_code: str | N
             analyzed = {}
         if isinstance(analyzed, dict) and _normalize_scan_signal_code(analyzed, fallback_code=code) == code:
             merged = dict(item)
+            _orig_market = str(item.get("market") or "")  # v165.17: repair 전 market 보존
             merged.update(analyzed)
-            if item.get("market") and not merged.get("market"):
+            # v165.17: analyze() 내 get_nxt_delta()가 market="NXT"로 덮어쓰는 것 방지
+            # repair queue 항목은 원래 market 값을 유지 — NXT 판별은 drain 단계에서 실시
+            if _orig_market:
+                merged["market"] = _orig_market
+            elif item.get("market") and not merged.get("market"):
                 merged["market"] = item.get("market")
             merged_reasons = list(item.get("reasons") or []) + list(analyzed.get("reasons") or [])
             if merged_reasons:
