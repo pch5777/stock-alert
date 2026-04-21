@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.12
+버전: v165.13
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.13 (2026-04-21): v165.10 min_score 정상화 로직 오적용 수정
+  [#1] _load_dynamic_params(): "boost_ts 없음 → 기본값 복원" 조건 제거
+       이유: v165.10에서 "boost_ts 없고 min_score>56 → 기본값 56/66 복원" 추가
+             의도: 연속손절 강제 상향분이 재시작 후 영구 유지되는 것 방지
+             부작용: auto_tune이 정상적으로 조정한 min_score(65점 등)도 같이 날림
+             → auto_tune 결과값이 재시작마다 56으로 초기화 → 기준 완화 → 저품질 신호
+       개선점: boost_ts 있고 3시간 경과 시에만 원래값 복원 (기존 elif 유지)
+              boost_ts 없으면 → auto_tune 값 그대로 유지 (건드리지 않음)
+       주의점: 연속손절 긴급 강화 시 boost_ts 저장은 v165.12에서 수정 완료
+              v165.12 이후부터는 boost_ts가 정상 저장되므로 재시작 후에도 정확히 판단
+  이유: 재시작마다 auto_tune 결과값이 56으로 리셋되는 근본 원인 제거
+  개선점: min_score=65 (auto_tune 결과) 재시작 후에도 유지됨
+  주의점: 이번 세션은 이미 56으로 복원된 상태 — auto_tune 다음 사이클에서 재조정
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.12 (2026-04-21): 연속손절 긴급 강화 boost_ts 미저장 버그 수정
   [#1] _process_auto_tracking_result(): boost_ts 설정 후 _save_dynamic_params() 누락
        이유: 연속손절 → min_score 강제 상향 시 _emergency_score_boost_ts를 _dynamic에 넣고
@@ -21896,17 +21911,12 @@ def _load_dynamic_params():
             f"동적 파라미터 복원 완료 (min_score={_dynamic['min_score_normal']}점, "
             f"atr_stop={_dynamic['atr_stop_mult']})"
         )
-        # v165.10 [#1]: 재시작 후 _emergency_score_boost_ts 기준 즉시 복원 체크
-        # 기존: 3시간 타이머가 재시작으로 리셋 → 81점이 영구 유지
-        # 수정: 복원 직후 boost_ts가 없거나 3시간 경과 시 즉시 원래값 복원
+        # v165.10 [#1] / v165.13 수정: boost_ts 기준 긴급 강화 복원
+        # v165.10 원래 로직: boost_ts 없고 min_score>56 → 기본값 복원
+        # 문제: auto_tune이 정상적으로 올린 값(65점 등)도 날려버림
+        # v165.13 수정: boost_ts 있고 3시간 경과 시에만 복원 (boost_ts 없으면 auto_tune 값 유지)
         boost_ts = float(_dynamic.get("_emergency_score_boost_ts") or 0)
-        if boost_ts <= 0 and _dynamic.get("min_score_normal", 56) > 56:
-            # boost_ts 없이 min_score가 기본값 초과 → 정상화
-            _dynamic["min_score_normal"] = 56
-            _dynamic["min_score_strict"] = 66
-            _log_info_msg("  🔄 min_score 정상화: boost_ts 없음 → 기본값 56/66 복원")
-            _save_dynamic_params()
-        elif boost_ts > 0 and (time.time() - boost_ts) >= 10800:
+        if boost_ts > 0 and (time.time() - boost_ts) >= 10800:
             # boost_ts 있고 3시간 이미 경과 → 즉시 복원
             orig_n = int(_dynamic.get("_emergency_score_boost_n") or 56)
             orig_s = int(_dynamic.get("_emergency_score_boost_s") or 66)
