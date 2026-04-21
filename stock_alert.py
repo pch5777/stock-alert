@@ -15816,7 +15816,7 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
     # v165.14: NXT 전용 시간대에 비NXT 종목 알람 발송 차단
     # run_scan 내부 차단과 별개로, upper_limit_reached 캐시 해제 등으로
     # _ensure_signal_actionability 경유 시 NXT 게이트를 건너뛰는 경로 존재
-    if is_nxt_only_time() and str(signal.get("market") or "").upper() != "NXT":
+    if (is_nxt_open() and not is_market_open()) and str(signal.get("market") or "").upper() != "NXT":
         _log_info_msg(
             f"  ⏭ [게이트 차단] {signal.get('name', code)} — NXT전용 시간대 비NXT 종목 차단 "
             f"(market={signal.get('market', '')})"
@@ -25833,7 +25833,7 @@ def check_entry_watch():
         return
     expired: list[tuple[str, str, str]] = []
     changed_active = False
-    _nxt_only_now = is_nxt_only_time()
+    _nxt_only_now = is_nxt_open() and not is_market_open()
     for log_key, watch in list(_entry_watch.items()):
         # v165.14: NXT 전용 시간대에 KRX 전용 종목 watch 처리 스킵
         # KRX 전용 종목은 NXT 시간대에 가격 변동 없음 — 조회/판정 전부 무의미
@@ -37638,7 +37638,7 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
     # analyze() 전 단계가 아닌 여기서 걸러내는 이유:
     # build_stock_universe 수정 시 영향 범위 크고, 이 단계가 dispatch 직전 최종 정리 포인트
     # _is_nxt_eligible() 캐시로 반복 API 호출 없음
-    _nxt_only_now = is_nxt_only_time()
+    _nxt_only_now = is_nxt_open() and not is_market_open()
     for item in list(alerts or []):
         if not isinstance(item, dict):
             dropped += 1
