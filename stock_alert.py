@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.10
+버전: v165.11
 날짜: 2026-04-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.11 (2026-04-21): 뉴스테마 A급 미달 + entry_watch 상한가급 반복 차단 수정
+  [#1] send_news_theme_alert(): analyze() 후 direct_news_hit=True 강제 주입 + grade 재판정
+       이유: 뉴스테마 경로는 이미 뉴스 필터를 통과한 종목만 진입하는데
+             analyze() 내부에서 Gemini/Groq 결과가 없으면 direct_news_hit=False 유지
+             → support_count 1개 손해 → 삼성SDI +19.1%, LG에너지솔루션 +10.4% 등 A급 미달
+       개선점: analyze() 직후 analyzed["direct_news_hit"]=True 주입
+              grade가 B/C이면 _derive_general_signal_grade(direct_news_hit=True)로 재판정
+              A급 승격 시 reasons에 "📰 뉴스테마 경로 direct_news_hit 보정 → A급 승격" 기록
+       주의점: grade 재판정은 A급 미달인 경우만 실행 — 이미 A급이면 스킵
+  [#2] _process_entry_watch_item(): 상한가급(+29% 이상) 종목 entry_watch 자동 만료
+       이유: 어제/오전에 등록된 entry_watch 종목이 상한가급으로 올라가도 계속 감시
+             매 스캔마다 no_ask_liquidity 차단 로그 20건+ 반복 → 스캔 속도 저하
+             삼진엘앤디·에이럭스·오리엔탈정공 등 14:43/14:45/15:09 동일 패턴 반복
+       개선점: price >= upper_price OR change_rate >= 29% OR prdy_vrss_sign="1"이고
+              entry_hit 없는 상태이면 → "상한가도달만료" 처리 후 expired 등록
+              이미 진입(entry_hit=True)한 경우는 만료 안 함 (모니터링 유지)
+       주의점: entry_hit=True 종목은 보유 중이므로 상한가급이어도 만료 안 함
+  이유: 35분 침묵의 구조적 원인 제거 — 뉴스테마 A급 미달 + 상한가급 watch 반복 낭비
+  개선점: 삼성SDI급 종목 뉴스테마 경로에서 즉시 포착 + entry_watch 루프 정리
+  주의점: 뉴스테마 direct_news_hit 보정은 analyze 점수가 GENERAL_A_EXTENDED_SCORE 이상이어야 효과 있음
+  진입불가 게이트 연결: _ensure_signal_actionability() 경유 유지 ✅
+
 - v165.10 (2026-04-21): 후보군 미포착 + 부팅 병목 2개 수정
   [#1] _load_dynamic_params(): 재시작 후 min_score 즉시 복원
        이유: 연속손절 → min_score_normal 56→81 강제 상향 후 dynamic_params.json에 저장
@@ -25658,6 +25680,26 @@ def _process_entry_watch_item(log_key: str, watch: dict, expired: list) -> bool:
         watch["observe_count"] = safe_int(watch.get("observe_count", 0), 0) + 1
         if watch.get("entry_hit_locked"):
             return changed
+        # v165.11 [#2]: entry_watch 상한가급 자동 만료
+        # 기존: 이미 포착된 entry_watch 종목이 상한가급이 돼도 no_ask_liquidity 차단 무한반복
+        # 수정: 현재가 기준 change_rate >= 29% OR price >= upper_price → 감시 자동 만료
+        _ew_chg = safe_float(cur.get("change_rate", 0), 0.0)
+        _ew_upper = safe_int(cur.get("upper_price", 0), 0)
+        _ew_prdy_sign = str(cur.get("prdy_vrss_sign", "") or "")
+        _is_upper_now = (
+            _ew_chg >= 29.0
+            or (_ew_upper > 0 and price >= _ew_upper)
+            or _ew_prdy_sign == "1"
+        )
+        if _is_upper_now and not watch.get("entry_hit"):
+            # entry_hit 없는 상태에서 상한가급 → 진입 기회 없이 상한가 도달 → 만료
+            _log_info_msg(
+                f"  🔝 entry_watch 상한가급 자동 만료: {watch.get('name','')}({watch.get('code','')}) "
+                f"+{_ew_chg:.1f}% — 진입 기회 없이 상한가"
+            )
+            _record_entry_miss(watch, "상한가도달만료", price)
+            expired.append((log_key, "상한가도달만료", _entry_watch_final_status(watch, "상한가도달")))
+            return True
         # v163.14 [#2]: no_ask_liquidity 5회 초과 드롭 플래그
         if watch.get("_drop_no_ask_overflow"):
             expired.append((log_key, "no_ask_overflow_drop", _entry_watch_final_status(watch, "진입불가드롭")))
@@ -32507,6 +32549,28 @@ def send_news_theme_alert(signal: dict):
                 "mktcap":       cur.get("mktcap", 0),
             }
             analyzed = analyze(stock_input)
+            # v165.11 [#1]: 뉴스테마 경로는 이미 뉴스 필터 통과 → direct_news_hit=True 강제 주입
+            # 기존: analyze() 내부에서 Gemini/Groq 결과 없으면 direct_news_hit=False → support_count 손해
+            # 수정: 뉴스테마 경로 진입 자체가 뉴스 hit 증거 → direct_news_hit=True + grade 재판정
+            if analyzed:
+                analyzed["direct_news_hit"] = True
+                _cur_grade = str(analyzed.get("execution_grade") or analyzed.get("grade") or "C").upper()
+                if _cur_grade != "A":
+                    _re_grade = _derive_general_signal_grade(
+                        str(analyzed.get("signal_type") or "SURGE"),
+                        int(analyzed.get("score") or 0),
+                        change_rate=float(analyzed.get("change_rate") or 0),
+                        vol_ratio=float(analyzed.get("volume_ratio") or 0),
+                        sector_info=analyzed.get("sector_info") or {},
+                        direct_news_hit=True,
+                        nxt_delta=int((analyzed.get("nxt") or {}).get("vs_krx_pct") or 0),
+                        market=str(analyzed.get("market") or ""),
+                        reasons=analyzed.get("reasons") or [],
+                    )
+                    if _re_grade == "A":
+                        analyzed["grade"] = "A"
+                        analyzed["execution_grade"] = "A"
+                        analyzed.setdefault("reasons", []).append("📰 뉴스테마 경로 direct_news_hit 보정 → A급 승격")
             analyzed = _apply_theme_chain_capture_adjustment(analyzed, stock_input, signal, source_label="뉴스테마 상승")
             if analyzed and str(analyzed.get("execution_grade") or analyzed.get("grade") or "C").upper() == "A" and analyzed.get("entry_price", 0) > 0:
                 analyzed.setdefault("reasons", []).append(
