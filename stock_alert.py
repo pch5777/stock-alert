@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.18
+버전: v165.19
 날짜: 2026-04-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.19 (2026-04-22): Groq SNAP 컨텍스트 전면 개선 — 장중 모든 스냅샷 상위 진입 종목 수집
+  [#1] _fetch_groq_news_rows() SNAP 컨텍스트: 등락률 상위만 → 장중 전체 스냅샷 순회
+       이유: 마지막 스냅샷 등락률만 보면 오전에 급등 후 빠진 종목 누락 (KEC 사례)
+       개선점: 모든 스냅샷에서 등락률 상위30/RS강세 상위30 기준으로 한 번이라도 진입한
+              종목 전체를 유니온 수집 → 출현횟수·최고등락률·기준(등락률/RS강세/조용한강세) 함께 전달
+       주의점: SNAP 파일 없으면 기존 헤드라인만으로 정상 동작 (fallback 유지)
 - v165.18 (2026-04-22): no_ask 15% 완전허용 / KIS 404 즉각 Naver전환 / F존 buf완화 / 5일결과 20시이후 / 토큰403 non-critical / Groq SNAP컨텍스트 추가
   [#1] _should_soft_allow_no_ask_liquidity_general(): change_rate ≥15.0% 이면 grade 무관 즉시 return True
        이유: 오늘 로그에서 09:06 갭업 구간 30개+ 종목이 no_ask로 차단. ≥15% 급등 중 ask=0은 강한 매수신호
@@ -7578,35 +7584,94 @@ def _fetch_groq_news_rows() -> list[dict]:
         headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:40] if h)
         today_str = _now_kst().strftime("%Y년 %m월 %d일")
 
-        # v165.18 [#6]: 전날 SNAP 상위 종목 컨텍스트 구성 — 가격 움직임 → 재료 역추적
-        # 이유: RSS만으로는 대형주·매크로 편향 → 실제 급등 섹터 미발굴
+        # v165.19 [#1]: SNAP 컨텍스트 전면 개선 — 장중 모든 스냅샷 순회
+        # 등락률/RS강세/조용한강세 기준으로 한 번이라도 상위 진입한 종목 전체 수집
+        # 이유: 마지막 스냅샷 등락률만 보면 오전 급등 후 빠진 종목 누락 (KEC 사례)
         snap_context_text = ""
         try:
             snap_state = _read_json_safe(INTRADAY_SNAP_FILE, {})
             snapshots = snap_state.get("snapshots") or []
             if snapshots:
-                # 당일 스냅샷 전체에서 종목별 최고 등락률 집계
-                code_max_chg: dict = {}
-                code_name: dict = {}
+                TOP_N_PER_SNAP = 30  # 스냅샷당 상위 30위 이내 = 상위 진입 기준
+                # code → {name, appear_cnt, max_chg, max_rs, criteria}
+                code_stats: dict = {}
+
                 for snap in snapshots:
-                    for code, info in (snap.get("stocks") or {}).items():
-                        chg = float(info.get("chg", 0) or 0)
-                        name = str(info.get("name", code) or code)
-                        if abs(chg) > abs(code_max_chg.get(code, 0)):
-                            code_max_chg[code] = chg
-                            code_name[code] = name
-                # 등락률 상위 20개 추출 (상승 위주)
-                top_movers = sorted(
-                    [(c, code_max_chg[c], code_name[c]) for c in code_max_chg if code_max_chg[c] >= 3.0],
-                    key=lambda x: -x[1]
-                )[:20]
-                if top_movers:
-                    lines = [f"- {name}({code}): +{chg:.1f}%" for code, chg, name in top_movers]
+                    stocks_in_snap = snap.get("stocks") or {}
+                    if not stocks_in_snap:
+                        continue
+                    # 등락률 상위 TOP_N_PER_SNAP
+                    by_chg = sorted(
+                        [(c, float(info.get("chg", 0) or 0), str(info.get("name", c) or c),
+                          float(info.get("rs", 0) or 0))
+                         for c, info in stocks_in_snap.items()],
+                        key=lambda x: -x[1]
+                    )
+                    top_chg = {c for c, chg, _, _ in by_chg[:TOP_N_PER_SNAP] if chg >= 1.0}
+                    # RS 상위 TOP_N_PER_SNAP (코스피 대비 강세)
+                    by_rs = sorted(by_chg, key=lambda x: -x[3])
+                    top_rs = {c for c, _, _, rs in by_rs[:TOP_N_PER_SNAP] if rs >= 1.0}
+                    appeared = top_chg | top_rs
+
+                    for c, chg, name, rs in by_chg:
+                        if c not in appeared:
+                            continue
+                        if c not in code_stats:
+                            code_stats[c] = {
+                                "name": name,
+                                "appear_cnt": 0,
+                                "max_chg": 0.0,
+                                "max_rs": 0.0,
+                                "criteria": set(),
+                            }
+                        st = code_stats[c]
+                        st["appear_cnt"] += 1
+                        if chg > st["max_chg"]:
+                            st["max_chg"] = chg
+                        if rs > st["max_rs"]:
+                            st["max_rs"] = rs
+                        if c in top_chg:
+                            st["criteria"].add("등락률")
+                        if c in top_rs:
+                            st["criteria"].add("RS강세")
+
+                # quiet_strong 조용한 강세 종목 추가 (연속 RS>0 2회 이상)
+                qs = snap_state.get("quiet_strong") or {}
+                for c, qinfo in qs.items():
+                    streak = int(qinfo.get("streak", 0) or 0)
+                    if streak < 2:
+                        continue
+                    qname = str(qinfo.get("name", c) or c)
+                    if c not in code_stats:
+                        code_stats[c] = {
+                            "name": qname,
+                            "appear_cnt": streak,
+                            "max_chg": 0.0,
+                            "max_rs": float(qinfo.get("last_rs", 0) or 0),
+                            "criteria": set(),
+                        }
+                    code_stats[c]["criteria"].add("조용한강세")
+
+                if code_stats:
+                    # 출현횟수 내림차순, 동률이면 최고등락률 내림차순 정렬 → 상위 30개
+                    ranked = sorted(
+                        code_stats.items(),
+                        key=lambda x: (-x[1]["appear_cnt"], -x[1]["max_chg"])
+                    )[:30]
                     snap_date = snap_state.get("date", "")
+                    lines = []
+                    for c, st in ranked:
+                        crit = "/".join(sorted(st["criteria"])) or "기타"
+                        chg_s = f"+{st['max_chg']:.1f}%" if st["max_chg"] >= 0 else f"{st['max_chg']:.1f}%"
+                        lines.append(
+                            f"- {st['name']}({c}): 최고{chg_s} 출현{st['appear_cnt']}회 [{crit}]"
+                        )
                     snap_context_text = (
-                        f"\n\n[전날({snap_date}) 실제 급등 종목 — 가격 움직임 기반]\n"
+                        f"\n\n[전날({snap_date}) 장중 상위 진입 종목"
+                        f" — 등락률·RS강세·조용한강세 기준, 한 번이라도 상위30 진입]\n"
                         + "\n".join(lines)
-                        + "\n위 종목들이 왜 올랐는지, 내일도 관련 섹터/연관 종목이 움직일 재료가 있는지 분석에 반영해줘."
+                        + "\n위 종목들이 왜 올랐는지, 어떤 섹터/테마가 주도했는지,"
+                        + " 내일도 연관 종목이 움직일 재료가 있는지 역추적해서 분석에 반영해줘."
                     )
         except Exception as _snap_e:
             _swallow_exception(_snap_e)
