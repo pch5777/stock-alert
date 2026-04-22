@@ -3,10 +3,29 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.18
+버전: v165.20
 날짜: 2026-04-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.20 (2026-04-22): candidate_miss 구조 수정 — 섹터 상한 완화 + 스캔 범위 확대
+  [#1] max_same_sector 기본값 2→3: 실질섹터 중복 허용 수 확대
+       이유: 삼양컴텍 +29.0%가 금속섹터 3번째로 실질섹터 중복 제외 탈락 (삼아알미늄+퍼스텍이 선점)
+       개선점: 같은 섹터 종목 3개까지 포트폴리오 통과 허용
+       주의점: _dynamic["max_same_sector"] 덮어쓰기 — 워치독 완화 시에도 최소 3 유지
+  [#2] RANK_SESSION_SCAN_LIMIT_PER_MARKET 18→30: 랭킹 후보 analyze 범위 확대
+       이유: 인성정보 +29.0%가 rank fallback 158건에 있어도 scan_limit=18로 analyze 미포함
+       개선점: 세션 모드에서 상위 30종목까지 analyze 대상 확대
+       주의점: focus 모드(장초반) scan_limit=30 유지 — session만 변경
+  [#3] SCAN_SECTOR_LIMIT 3→4: 최종 포트폴리오 필터 섹터당 상한 완화
+       이유: sector_limit 로그에서 전기전자 10번째 이상 탈락 반복 → 강세 섹터에서 알람 차단
+       개선점: 섹터당 최대 4개까지 알람 발송 허용
+       주의점: 기타 섹터는 별도 max_signals_misc 기준 유지
+- v165.19 (2026-04-22): Groq SNAP 컨텍스트 전면 개선 — 장중 모든 스냅샷 상위 진입 종목 수집
+  [#1] _fetch_groq_news_rows() SNAP 컨텍스트: 등락률 상위만 → 장중 전체 스냅샷 순회
+       이유: 마지막 스냅샷 등락률만 보면 오전에 급등 후 빠진 종목 누락 (KEC 사례)
+       개선점: 모든 스냅샷에서 등락률 상위30/RS강세 상위30 기준으로 한 번이라도 진입한
+              종목 전체를 유니온 수집 → 출현횟수·최고등락률·기준(등락률/RS강세/조용한강세) 함께 전달
+       주의점: SNAP 파일 없으면 기존 헤드라인만으로 정상 동작 (fallback 유지)
 - v165.18 (2026-04-22): no_ask 15% 완전허용 / KIS 404 즉각 Naver전환 / F존 buf완화 / 5일결과 20시이후 / 토큰403 non-critical / Groq SNAP컨텍스트 추가
   [#1] _should_soft_allow_no_ask_liquidity_general(): change_rate ≥15.0% 이면 grade 무관 즉시 return True
        이유: 오늘 로그에서 09:06 갭업 구간 30개+ 종목이 no_ask로 차단. ≥15% 급등 중 ask=0은 강한 매수신호
@@ -7143,7 +7162,7 @@ YOUTUBE_FETCH_DAILY_LIMIT = int(os.getenv("YOUTUBE_FETCH_DAILY_LIMIT", "2") or "
 # v162.1: YouTube Gemini 분석 캐시 영속화 파일
 YOUTUBE_GEMINI_CACHE_FILE = _state_path("youtube_gemini_cache.json")
 # ── 섹터 제한 (v161.9) ──
-SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
+SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "4") or "4")           # 섹터당 최대 통과 종목 수 (v165.20: 3→4, 강세섹터 알람 차단 완화)
 SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "8.0") or "8.0")    # v161.48: 10→8% — 8% 이상 급등 종목 섹터 제한 면제 (기존 10%는 +8~9% 급등 종목도 차단)
 SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "5") or "5")  # v161.48: 7→5 — 섹터 후보 5개 이상이면 급등장 판단 → limit +3 (기존 7은 감지 늦음)
 MATERIAL_DOWNSIDE_SCENARIOS = [
@@ -7578,35 +7597,94 @@ def _fetch_groq_news_rows() -> list[dict]:
         headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:40] if h)
         today_str = _now_kst().strftime("%Y년 %m월 %d일")
 
-        # v165.18 [#6]: 전날 SNAP 상위 종목 컨텍스트 구성 — 가격 움직임 → 재료 역추적
-        # 이유: RSS만으로는 대형주·매크로 편향 → 실제 급등 섹터 미발굴
+        # v165.19 [#1]: SNAP 컨텍스트 전면 개선 — 장중 모든 스냅샷 순회
+        # 등락률/RS강세/조용한강세 기준으로 한 번이라도 상위 진입한 종목 전체 수집
+        # 이유: 마지막 스냅샷 등락률만 보면 오전 급등 후 빠진 종목 누락 (KEC 사례)
         snap_context_text = ""
         try:
             snap_state = _read_json_safe(INTRADAY_SNAP_FILE, {})
             snapshots = snap_state.get("snapshots") or []
             if snapshots:
-                # 당일 스냅샷 전체에서 종목별 최고 등락률 집계
-                code_max_chg: dict = {}
-                code_name: dict = {}
+                TOP_N_PER_SNAP = 30  # 스냅샷당 상위 30위 이내 = 상위 진입 기준
+                # code → {name, appear_cnt, max_chg, max_rs, criteria}
+                code_stats: dict = {}
+
                 for snap in snapshots:
-                    for code, info in (snap.get("stocks") or {}).items():
-                        chg = float(info.get("chg", 0) or 0)
-                        name = str(info.get("name", code) or code)
-                        if abs(chg) > abs(code_max_chg.get(code, 0)):
-                            code_max_chg[code] = chg
-                            code_name[code] = name
-                # 등락률 상위 20개 추출 (상승 위주)
-                top_movers = sorted(
-                    [(c, code_max_chg[c], code_name[c]) for c in code_max_chg if code_max_chg[c] >= 3.0],
-                    key=lambda x: -x[1]
-                )[:20]
-                if top_movers:
-                    lines = [f"- {name}({code}): +{chg:.1f}%" for code, chg, name in top_movers]
+                    stocks_in_snap = snap.get("stocks") or {}
+                    if not stocks_in_snap:
+                        continue
+                    # 등락률 상위 TOP_N_PER_SNAP
+                    by_chg = sorted(
+                        [(c, float(info.get("chg", 0) or 0), str(info.get("name", c) or c),
+                          float(info.get("rs", 0) or 0))
+                         for c, info in stocks_in_snap.items()],
+                        key=lambda x: -x[1]
+                    )
+                    top_chg = {c for c, chg, _, _ in by_chg[:TOP_N_PER_SNAP] if chg >= 1.0}
+                    # RS 상위 TOP_N_PER_SNAP (코스피 대비 강세)
+                    by_rs = sorted(by_chg, key=lambda x: -x[3])
+                    top_rs = {c for c, _, _, rs in by_rs[:TOP_N_PER_SNAP] if rs >= 1.0}
+                    appeared = top_chg | top_rs
+
+                    for c, chg, name, rs in by_chg:
+                        if c not in appeared:
+                            continue
+                        if c not in code_stats:
+                            code_stats[c] = {
+                                "name": name,
+                                "appear_cnt": 0,
+                                "max_chg": 0.0,
+                                "max_rs": 0.0,
+                                "criteria": set(),
+                            }
+                        st = code_stats[c]
+                        st["appear_cnt"] += 1
+                        if chg > st["max_chg"]:
+                            st["max_chg"] = chg
+                        if rs > st["max_rs"]:
+                            st["max_rs"] = rs
+                        if c in top_chg:
+                            st["criteria"].add("등락률")
+                        if c in top_rs:
+                            st["criteria"].add("RS강세")
+
+                # quiet_strong 조용한 강세 종목 추가 (연속 RS>0 2회 이상)
+                qs = snap_state.get("quiet_strong") or {}
+                for c, qinfo in qs.items():
+                    streak = int(qinfo.get("streak", 0) or 0)
+                    if streak < 2:
+                        continue
+                    qname = str(qinfo.get("name", c) or c)
+                    if c not in code_stats:
+                        code_stats[c] = {
+                            "name": qname,
+                            "appear_cnt": streak,
+                            "max_chg": 0.0,
+                            "max_rs": float(qinfo.get("last_rs", 0) or 0),
+                            "criteria": set(),
+                        }
+                    code_stats[c]["criteria"].add("조용한강세")
+
+                if code_stats:
+                    # 출현횟수 내림차순, 동률이면 최고등락률 내림차순 정렬 → 상위 30개
+                    ranked = sorted(
+                        code_stats.items(),
+                        key=lambda x: (-x[1]["appear_cnt"], -x[1]["max_chg"])
+                    )[:30]
                     snap_date = snap_state.get("date", "")
+                    lines = []
+                    for c, st in ranked:
+                        crit = "/".join(sorted(st["criteria"])) or "기타"
+                        chg_s = f"+{st['max_chg']:.1f}%" if st["max_chg"] >= 0 else f"{st['max_chg']:.1f}%"
+                        lines.append(
+                            f"- {st['name']}({c}): 최고{chg_s} 출현{st['appear_cnt']}회 [{crit}]"
+                        )
                     snap_context_text = (
-                        f"\n\n[전날({snap_date}) 실제 급등 종목 — 가격 움직임 기반]\n"
+                        f"\n\n[전날({snap_date}) 장중 상위 진입 종목"
+                        f" — 등락률·RS강세·조용한강세 기준, 한 번이라도 상위30 진입]\n"
                         + "\n".join(lines)
-                        + "\n위 종목들이 왜 올랐는지, 내일도 관련 섹터/연관 종목이 움직일 재료가 있는지 분석에 반영해줘."
+                        + "\n위 종목들이 왜 올랐는지, 어떤 섹터/테마가 주도했는지,"
+                        + " 내일도 연관 종목이 움직일 재료가 있는지 역추적해서 분석에 반영해줘."
                     )
         except Exception as _snap_e:
             _swallow_exception(_snap_e)
@@ -16049,7 +16127,7 @@ RANK_FOCUS_EXPANDED_TOP_N = int(os.getenv("RANK_FOCUS_EXPANDED_TOP_N", "100") or
 RANK_SESSION_TOP_N = int(os.getenv("RANK_SESSION_TOP_N", "50") or "50")
 RANK_SESSION_EXPANDED_TOP_N = int(os.getenv("RANK_SESSION_EXPANDED_TOP_N", "80") or "80")
 RANK_FOCUS_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_FOCUS_SCAN_LIMIT_PER_MARKET", "30") or "30")
-RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "18") or "18")
+RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "30") or "30")  # v165.20: 18→30 (인성정보 scan_limit 탈락 해소)
 RANK_FOCUS_REFRESH_SEC = int(os.getenv("RANK_FOCUS_REFRESH_SEC", "300") or "300")
 RANK_SESSION_REFRESH_SEC = int(os.getenv("RANK_SESSION_REFRESH_SEC", "900") or "900")
 RANK_MIN_CHANGE = float(os.getenv("RANK_MIN_CHANGE", "0.1") or "0.1")
@@ -22024,7 +22102,7 @@ _dynamic = {
     # ── 손익비 동적 조정 ──
     "atr_target_mult":     ATR_TARGET_MULT,   # 목표가 배수 (변동성 따라 조정)
     # ── 포트폴리오 동시 신호 관리 ──
-    "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
+    "max_same_sector":     3,          # 같은 섹터 동시 신호 최대 (v165.20: 2→3, 삼양컴텍 금속섹터 탈락 해소)
     # ── 해외 한국 ETF(EWY/FLKR) 섹터 가중치 자동학습 ──
     "korea_etf_bucket_weights": {
         "semiconductor": 1.00,
