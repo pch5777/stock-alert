@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.19
+버전: v165.20
 날짜: 2026-04-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.20 (2026-04-22): candidate_miss 구조 수정 — 섹터 상한 완화 + 스캔 범위 확대
+  [#1] max_same_sector 기본값 2→3: 실질섹터 중복 허용 수 확대
+       이유: 삼양컴텍 +29.0%가 금속섹터 3번째로 실질섹터 중복 제외 탈락 (삼아알미늄+퍼스텍이 선점)
+       개선점: 같은 섹터 종목 3개까지 포트폴리오 통과 허용
+       주의점: _dynamic["max_same_sector"] 덮어쓰기 — 워치독 완화 시에도 최소 3 유지
+  [#2] RANK_SESSION_SCAN_LIMIT_PER_MARKET 18→30: 랭킹 후보 analyze 범위 확대
+       이유: 인성정보 +29.0%가 rank fallback 158건에 있어도 scan_limit=18로 analyze 미포함
+       개선점: 세션 모드에서 상위 30종목까지 analyze 대상 확대
+       주의점: focus 모드(장초반) scan_limit=30 유지 — session만 변경
+  [#3] SCAN_SECTOR_LIMIT 3→4: 최종 포트폴리오 필터 섹터당 상한 완화
+       이유: sector_limit 로그에서 전기전자 10번째 이상 탈락 반복 → 강세 섹터에서 알람 차단
+       개선점: 섹터당 최대 4개까지 알람 발송 허용
+       주의점: 기타 섹터는 별도 max_signals_misc 기준 유지
 - v165.19 (2026-04-22): Groq SNAP 컨텍스트 전면 개선 — 장중 모든 스냅샷 상위 진입 종목 수집
   [#1] _fetch_groq_news_rows() SNAP 컨텍스트: 등락률 상위만 → 장중 전체 스냅샷 순회
        이유: 마지막 스냅샷 등락률만 보면 오전에 급등 후 빠진 종목 누락 (KEC 사례)
@@ -7149,7 +7162,7 @@ YOUTUBE_FETCH_DAILY_LIMIT = int(os.getenv("YOUTUBE_FETCH_DAILY_LIMIT", "2") or "
 # v162.1: YouTube Gemini 분석 캐시 영속화 파일
 YOUTUBE_GEMINI_CACHE_FILE = _state_path("youtube_gemini_cache.json")
 # ── 섹터 제한 (v161.9) ──
-SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "3") or "3")           # 섹터당 최대 통과 종목 수 (기본 3)
+SCAN_SECTOR_LIMIT = int(os.getenv("SCAN_SECTOR_LIMIT", "4") or "4")           # 섹터당 최대 통과 종목 수 (v165.20: 3→4, 강세섹터 알람 차단 완화)
 SCAN_SECTOR_EXEMPT_RATE = float(os.getenv("SCAN_SECTOR_EXEMPT_RATE", "8.0") or "8.0")    # v161.48: 10→8% — 8% 이상 급등 종목 섹터 제한 면제 (기존 10%는 +8~9% 급등 종목도 차단)
 SCAN_SECTOR_BURST_THRESHOLD = int(os.getenv("SCAN_SECTOR_BURST_THRESHOLD", "5") or "5")  # v161.48: 7→5 — 섹터 후보 5개 이상이면 급등장 판단 → limit +3 (기존 7은 감지 늦음)
 MATERIAL_DOWNSIDE_SCENARIOS = [
@@ -16114,7 +16127,7 @@ RANK_FOCUS_EXPANDED_TOP_N = int(os.getenv("RANK_FOCUS_EXPANDED_TOP_N", "100") or
 RANK_SESSION_TOP_N = int(os.getenv("RANK_SESSION_TOP_N", "50") or "50")
 RANK_SESSION_EXPANDED_TOP_N = int(os.getenv("RANK_SESSION_EXPANDED_TOP_N", "80") or "80")
 RANK_FOCUS_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_FOCUS_SCAN_LIMIT_PER_MARKET", "30") or "30")
-RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "18") or "18")
+RANK_SESSION_SCAN_LIMIT_PER_MARKET = int(os.getenv("RANK_SESSION_SCAN_LIMIT_PER_MARKET", "30") or "30")  # v165.20: 18→30 (인성정보 scan_limit 탈락 해소)
 RANK_FOCUS_REFRESH_SEC = int(os.getenv("RANK_FOCUS_REFRESH_SEC", "300") or "300")
 RANK_SESSION_REFRESH_SEC = int(os.getenv("RANK_SESSION_REFRESH_SEC", "900") or "900")
 RANK_MIN_CHANGE = float(os.getenv("RANK_MIN_CHANGE", "0.1") or "0.1")
@@ -22089,7 +22102,7 @@ _dynamic = {
     # ── 손익비 동적 조정 ──
     "atr_target_mult":     ATR_TARGET_MULT,   # 목표가 배수 (변동성 따라 조정)
     # ── 포트폴리오 동시 신호 관리 ──
-    "max_same_sector":     2,          # 같은 섹터 동시 신호 최대
+    "max_same_sector":     3,          # 같은 섹터 동시 신호 최대 (v165.20: 2→3, 삼양컴텍 금속섹터 탈락 해소)
     # ── 해외 한국 ETF(EWY/FLKR) 섹터 가중치 자동학습 ──
     "korea_etf_bucket_weights": {
         "semiconductor": 1.00,
