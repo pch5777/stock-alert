@@ -3,10 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.17
-날짜: 2026-04-21
+버전: v165.18
+날짜: 2026-04-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.18 (2026-04-22): no_ask 15% 완전허용 / KIS 404 즉각 Naver전환 / F존 buf완화 / 5일결과 20시이후 / 토큰403 non-critical / Groq SNAP컨텍스트 추가
+  [#1] _should_soft_allow_no_ask_liquidity_general(): change_rate ≥15.0% 이면 grade 무관 즉시 return True
+       이유: 오늘 로그에서 09:06 갭업 구간 30개+ 종목이 no_ask로 차단. ≥15% 급등 중 ask=0은 강한 매수신호
+       개선점: KRX 갭업 급등 종목 진입 기회 확대
+       주의점: 기존 ≥10% A급 조건과 별개로 앞에 배치 — grade 불문 적용
+  [#2] _fetch_external_rank_top(): FHPST01700000 404 오류 시 즉각 Naver rise fallback 전환
+       이유: 08:15 KIS chgrate-pcls-100 API 404 → fallback 지연으로 초반 스캔 누락
+       개선점: 장 초반 API 실패 시 Naver 상승 데이터 즉각 활용
+       주의점: 기존 universe_nxt fallback 경로와 병행 유지
+  [#3] _detect_fzone_vwap_bounce(): WebSocket 스냅샷 최소 요건 buf<5 → buf<2로 완화
+       이유: 로그에서 F존 12종목 등록됐으나 알람 0건 — WS 스냅샷 미적재로 조건 미충족
+       개선점: 스냅샷 2개 이상이면 VWAP 바운스 감지 시도
+       주의점: 샘플 부족 시 vol_decreasing=True 통과 로직 기존 유지
+  [#4] _process_tracking_result_record(): TRACK_TIMEOUT_RESULT 발송을 NXT 마감(20:00) 이후로만 허용
+       이유: 5일 경과 결과가 장중에도 발송되어 타이밍 부적절
+       개선점: 20:00 이후(NXT 마감 후) 또는 휴일에만 발송
+       주의점: 손절가/목표가 도달은 시간 제한 없이 기존과 동일
+  [#5] get_token(): EGW00133 cooldown 중 재시도 시 critical=True → critical=False
+       이유: 1분 쿨다운 중 재호출 시 반복 오류 알람 발송 — 정상 동작인데 사용자에게 알람 과다
+       개선점: 쿨다운 오류는 WARNING 수준으로만 기록
+       주의점: 실제 403 Forbidden 첫 발생 시 critical=True 유지
+  [#6] _fetch_groq_news_rows(): 전날 SNAP 상위 종목 컨텍스트를 Groq 입력에 추가
+       이유: 기존 RSS만으로는 대형주·매크로 편향 → 실제 급등 섹터(2차전지·화학·금속 등) 미발굴
+       개선점: 전날 등락률/거래대금 상위 종목 + 섹터 정보를 뉴스와 함께 Groq에 전달
+              → "왜 올랐나, 내일도 움직일 연관 종목은?" 역추적 가능
+       주의점: SNAP 파일 없을 시 기존 헤드라인만으로 정상 동작 (fallback 보장)
 - v165.17 (2026-04-21): repair queue 경유 KRX 종목 NXT 시간대 오발송 수정
   [#1] _drain_run_scan_repair_queue(): repair 완료 후 NXT 거래량 실증 확인 추가
        이유: v165.16에서 nxt_only_window 통과 종목에 market="NXT" 마킹 추가
@@ -7551,6 +7577,40 @@ def _fetch_groq_news_rows() -> list[dict]:
         # 상위 40개 전달 (CoT 분석을 위해 30→40으로 확대)
         headlines_text = "\n".join(f"- {h}" for h in raw_headlines[:40] if h)
         today_str = _now_kst().strftime("%Y년 %m월 %d일")
+
+        # v165.18 [#6]: 전날 SNAP 상위 종목 컨텍스트 구성 — 가격 움직임 → 재료 역추적
+        # 이유: RSS만으로는 대형주·매크로 편향 → 실제 급등 섹터 미발굴
+        snap_context_text = ""
+        try:
+            snap_state = _read_json_safe(INTRADAY_SNAP_FILE, {})
+            snapshots = snap_state.get("snapshots") or []
+            if snapshots:
+                # 당일 스냅샷 전체에서 종목별 최고 등락률 집계
+                code_max_chg: dict = {}
+                code_name: dict = {}
+                for snap in snapshots:
+                    for code, info in (snap.get("stocks") or {}).items():
+                        chg = float(info.get("chg", 0) or 0)
+                        name = str(info.get("name", code) or code)
+                        if abs(chg) > abs(code_max_chg.get(code, 0)):
+                            code_max_chg[code] = chg
+                            code_name[code] = name
+                # 등락률 상위 20개 추출 (상승 위주)
+                top_movers = sorted(
+                    [(c, code_max_chg[c], code_name[c]) for c in code_max_chg if code_max_chg[c] >= 3.0],
+                    key=lambda x: -x[1]
+                )[:20]
+                if top_movers:
+                    lines = [f"- {name}({code}): +{chg:.1f}%" for code, chg, name in top_movers]
+                    snap_date = snap_state.get("date", "")
+                    snap_context_text = (
+                        f"\n\n[전날({snap_date}) 실제 급등 종목 — 가격 움직임 기반]\n"
+                        + "\n".join(lines)
+                        + "\n위 종목들이 왜 올랐는지, 내일도 관련 섹터/연관 종목이 움직일 재료가 있는지 분석에 반영해줘."
+                    )
+        except Exception as _snap_e:
+            _swallow_exception(_snap_e)
+            snap_context_text = ""
         # v165.0: Chain-of-Thought 재료 추론 프롬프트
         system_prompt = (
             "당신은 한국 주식시장 전문 트레이더입니다. "
@@ -7582,6 +7642,7 @@ def _fetch_groq_news_rows() -> list[dict]:
             "최소 3개, 최대 8개 항목. 리딩방·투자유도 제외. 실제 시장 재료만.\n"
             "today_reflected='not_yet'이고 tomorrow_continuation='strong'인 재료를 최우선 발굴.\n\n"
             f"뉴스 헤드라인:\n{headlines_text}"
+            f"{snap_context_text}"
         )
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -8861,7 +8922,8 @@ def get_token(retry: int = 3) -> str:
                     _set_kis_token_retry_block_until(block_until, reason=body_txt)
                     remain = max(1, int(block_until - time.time()))
                     last_error = RuntimeError(f"KIS tokenP 403 Forbidden | EGW00133 | token retry cooldown {remain}s | body={body_txt or '없음'}")
-                    _log_error(f"get_token(attempt={attempt+1})", last_error, critical=True)
+                    # v165.18 [#5]: cooldown 오류는 정상 동작 — critical=False로 반복 알람 방지
+                    _log_error(f"get_token(attempt={attempt+1})", last_error, critical=False)
                     break
                 _clear_kis_token_state()
                 hint = "실전/모의 URL-키 조합, API신청/권한 상태, 동일일 재발급 여부 점검 필요"
@@ -16430,6 +16492,24 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
         reason = _get_rank_api_disable_reason() or "disabled_today"
     # v83: KIS 불통 시 외부 소스(네이버→다음)도 시도 후 유니버스와 합산
     items = _rank_from_universe(market)
+    # v165.18 [#2]: 404 즉각 Naver rise 직접 수집 — NXT 시간대(08:00~09:00)에
+    # universe_nxt만으로는 33건 수준 → KRX 초반 KEC 등 급등 종목 누락
+    # _fetch_external_rank_top(KRX) 경로와 별개로 naver_rise를 먼저 직접 확보
+    if reason == "404":
+        try:
+            naver_direct = _fetch_naver_rank("rise", top_n=100)
+            nv_codes = {normalize_stock_code(r.get("code")) for r in items}
+            added_nv = 0
+            for r in naver_direct:
+                code = normalize_stock_code(r.get("code"))
+                if code and code not in nv_codes and float(r.get("change_rate", 0) or 0) >= 1.0:
+                    items.append(r)
+                    nv_codes.add(code)
+                    added_nv += 1
+            if added_nv:
+                _log_info_msg(f"  🌐 [404 즉각 보완] naver_rise {added_nv}건 추가 (합산 {len(items)}건)")
+        except Exception as _nv_e:
+            _swallow_exception(_nv_e)
     try:
         # v163.10 [#1]: top_n 30→80으로 확대 + 거래대금 상위도 병행 수집
         # 라이콤·머큐리·코위버 등 30위권 밖 소형주 누락 방지
@@ -21506,7 +21586,12 @@ def _process_tracking_result_record(data, today, log_key, rec):
     if price <= stop:
         exit_reason = "손절가"
     elif elapsed_days >= TRACK_MAX_DAYS and not rec.get("trailing_active"):
-        exit_reason = TRACK_TIMEOUT_RESULT
+        # v165.18 [#4]: 5일 경과 결과는 NXT 마감(20:00) 이후에만 발송
+        # 이유: 장중 발송 시 타이밍 부적절 — 종가 기준 결과가 더 정확함
+        _now_t = _now_kst().time()
+        _after_nxt_close = _now_t >= dtime(20, 0) or _now_t < dtime(7, 0)
+        if _after_nxt_close or is_holiday():
+            exit_reason = TRACK_TIMEOUT_RESULT
     if not exit_reason:
         return True
     _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, log_key)
@@ -29172,6 +29257,10 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
         change_rate = float(signal.get("change_rate", 0.0) or 0.0)
     if bid_qty > 0 and change_rate >= 29.0:
         return False
+    # v165.18 [#1]: +15% 이상 급등 종목은 grade 무관 즉시 soft allow
+    # 이유: KRX 갭업 구간 09:06 no_ask 차단 30건+ — 15% 이상 급등 중 ask=0은 강한 매수 신호
+    if change_rate >= 15.0:
+        return True
     try:
         vol_ratio = max(float(cur.get("volume_ratio", 0.0) or 0.0), float(signal.get("volume_ratio", 0.0) or 0.0))
     except Exception as e:
@@ -29187,14 +29276,10 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     nxt_post_leader = bool(signal.get("nxt_post_leader_hit"))
     leader_priority = bool(signal.get("leader_priority_hit")) or _is_leader_priority_signal(signal) or miss_theme_leader or nxt_post_leader
     # v71: A급 85점↑ NXT 종목은 호가 얇아도 soft allow 통과
-    # 셀바스AI 06:01 SURGE A급 85점이 no_ask_liquidity로 전량 차단되던 문제 해소
     grade = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
     if str(signal.get("market") or "") == "NXT" and grade == "A" and score >= 85 and change_rate >= 5.0:
         return True
-    # v165.2: +10% 이상 급등 종목은 체결속도 체크 없이 soft allow
-    # 이유: +10% 급등 중 no_ask_liquidity는 VI발동/순간 호가 소진으로 정상 현상
-    #       exec_speed_score가 WebSocket 스냅샷 미적재 시 ready=False → soft allow 차단
-    #       STX엔진/알지노믹스 등 A급 종목이 7회 반복 hard 차단된 원인
+    # v165.2: +10% 이상 A급 급등 종목은 체결속도 체크 없이 soft allow
     if grade == "A" and change_rate >= 10.0:
         return True
     # v161.47: 체결속도 soft allow — A급 + score≥72 + change_rate≥5% + exec_speed 보통 이상 + 흐름 비둔화
@@ -38119,9 +38204,9 @@ def _detect_fzone_vwap_bounce(code: str) -> dict | None:
         return None
     if not krx_open and nxt_open and now.time() >= dtime(19, 40):
         return None
-    # WS 스냅샷 확인
+    # WS 스냅샷 확인 — v165.18 [#3]: buf<5 → buf<2 완화 (F존 12종목 알람 0건 해소)
     buf = list((_execution_snapshots.get(code) or []))
-    if len(buf) < 5:
+    if len(buf) < 2:
         return None
     recent = buf[-1]
     vwap = safe_int(recent.get("weighted_avg", 0))
