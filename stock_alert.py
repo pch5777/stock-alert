@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.20
-날짜: 2026-04-22
+버전: v165.21
+날짜: 2026-04-23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.21 (2026-04-23): KRX malformed 로그 노이즈 감소 / 특징주·시황 뉴스소스 3개 추가 / 선진입 Groq에 당일 섹터 컨텍스트 추가
+  [#1] _sanitize_run_scan_alerts(): KRX전용 제거 시 WARNING→INFO 다운그레이드
+       이유: 15:30 이후 매 스캔마다 삼성중공업·가온전선 등 2-3건 WARNING 반복 → 실제 오류 아님
+       개선점: KRX전용 제거는 정상 동작 — INFO로 낮춰 실제 오류 WARNING과 구분
+       주의점: code 결측/payload 불완전은 여전히 WARNING 유지
+  [#2] 뉴스 소스 3개 추가: 특징주·오늘의 시황·섹터테마주 Google News 쿼리
+       이유: 기존 8개 소스 모두 대형주·매크로 편향 → 실제 급등 섹터(전력·금속 등) 미발굴
+       개선점: "오늘의 특징주 섹터 테마주" / "급등주 재료 이유" / "상한가 이슈주 배경" 쿼리 추가
+              → 소형주 급등 재료 발굴 가능성 확대
+       주의점: DOMESTIC_NEWS_SOURCE_FUNCS에 3개 추가 (총 11개 소스)
+  [#3] _fetch_groq_news_rows(): 당일 SNAP 섹터 분포 컨텍스트 추가
+       이유: SNAP 데이터에 섹터 정보가 없어 Groq가 "전력주가 왜 올랐나"를 추론 못함
+       개선점: 당일 급등 상위 종목들의 섹터별 분포를 정리해 Groq 입력에 추가
+              → "전력/케이블 섹터 10종목 급등 중" 같은 패턴 인식 → 연관 섹터 추천 가능
+       주의점: SNAP 없을 시 기존 동작 유지 (fallback 보장)
 - v165.20 (2026-04-22): candidate_miss 구조 수정 — 섹터 상한 완화 + 스캔 범위 확대
   [#1] max_same_sector 기본값 2→3: 실질섹터 중복 허용 수 확대
        이유: 삼양컴텍 +29.0%가 금속섹터 3번째로 실질섹터 중복 제외 탈락 (삼아알미늄+퍼스텍이 선점)
@@ -7679,10 +7694,27 @@ def _fetch_groq_news_rows() -> list[dict]:
                         lines.append(
                             f"- {st['name']}({c}): 최고{chg_s} 출현{st['appear_cnt']}회 [{crit}]"
                         )
+                    # v165.21 [#3]: 섹터 분포 추가 — _stock_theme_profile에서 테마 정보 조회
+                    sector_dist: dict = {}
+                    try:
+                        for c, st in ranked:
+                            prof = _stock_theme_profile.get(c)
+                            if not prof:
+                                continue
+                            themes = prof.get("themes") or []
+                            for th in themes[:2]:  # 종목당 최대 2개 테마
+                                sector_dist[th] = sector_dist.get(th, 0) + 1
+                    except Exception:
+                        pass
+                    sector_lines = []
+                    if sector_dist:
+                        for th, cnt in sorted(sector_dist.items(), key=lambda x: -x[1])[:8]:
+                            sector_lines.append(f"  · {th}: {cnt}종목")
                     snap_context_text = (
                         f"\n\n[전날({snap_date}) 장중 상위 진입 종목"
                         f" — 등락률·RS강세·조용한강세 기준, 한 번이라도 상위30 진입]\n"
                         + "\n".join(lines)
+                        + ("\n\n[전날 주도 섹터/테마 분포]\n" + "\n".join(sector_lines) if sector_lines else "")
                         + "\n위 종목들이 왜 올랐는지, 어떤 섹터/테마가 주도했는지,"
                         + " 내일도 연관 종목이 움직일 재료가 있는지 역추적해서 분석에 반영해줘."
                     )
@@ -30925,6 +30957,21 @@ def fetch_google_news_semicon_export() -> list:
     q = "반도체 OR 수출규제 OR 지정학 OR 전쟁 OR 유가"
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
     return _fetch_rss_headlines(url, max_items=10)
+def fetch_google_news_featured_stocks() -> list:
+    """v165.21: Google News RSS — 특징주·급등주·테마주 (소형주 재료 발굴)"""
+    q = "특징주 OR 급등주 OR 테마주 OR 상한가 OR 섹터 OR 이슈주"
+    url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
+    return _fetch_rss_headlines(url, max_items=12)
+def fetch_google_news_daily_market() -> list:
+    """v165.21: Google News RSS — 오늘의 시황·시장분석 (당일 섹터 흐름 파악)"""
+    q = "오늘의 시황 OR 증시분석 OR 오늘 주식 OR 급등 이유 OR 재료 수혜주"
+    url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
+    return _fetch_rss_headlines(url, max_items=12)
+def fetch_google_news_sector_theme() -> list:
+    """v165.21: Google News RSS — 섹터·테마 분석 (전력·금속·방산 등 실제 급등 섹터)"""
+    q = "전력주 OR 케이블주 OR 방산주 OR 조선주 OR 2차전지 OR 바이오 OR 수주 OR 수혜주"
+    url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ko&gl=KR&ceid=KR:ko"
+    return _fetch_rss_headlines(url, max_items=12)
 DOMESTIC_NEWS_SOURCE_FUNCS = (
     fetch_naver_news,
     fetch_hankyung_news,
@@ -30934,6 +30981,9 @@ DOMESTIC_NEWS_SOURCE_FUNCS = (
     fetch_google_news_kr_market,
     fetch_google_news_semicon_export,
     fetch_google_news_kr_policy_rates,
+    fetch_google_news_featured_stocks,    # v165.21: 특징주·급등주·테마주
+    fetch_google_news_daily_market,       # v165.21: 오늘의 시황·시장분석
+    fetch_google_news_sector_theme,       # v165.21: 섹터·테마주 분석
 )
 def fetch_all_news() -> list:
     # v37.33: Queue 기반 스레드 수집 + 정규화 중복 제거 + 다중 소스 중복 기사 우선 정렬
@@ -37918,6 +37968,7 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
         # 모든 NXT 스캔 경로(get_nxt_surge_stocks, nxt_only_window 통과)에서 market="NXT" 마킹 보장
         if _nxt_only_now and str(item.get("market") or "").upper() != "NXT":
             dropped += 1
+            # v165.21 [#1]: KRX전용 제거는 정상 동작 — INFO로 낮춤 (반복 WARNING 노이즈 제거)
             dropped_names.append(f"{item.get('name', code)}(KRX전용)")
             continue
         if bool(item.get("_scan_payload_incomplete")):
@@ -37934,9 +37985,14 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             continue
         cleaned.append(item)
     if dropped > 0:
-        # v165.1: 제거된 종목 최대 5건 함께 표시
-        suffix = f" → {', '.join(dropped_names[:5])}" if dropped_names else ""
-        _log_warn_msg(f"⚠️ run_scan malformed alert {dropped}건 제거{(' [' + stage + ']') if stage else ''}{suffix}")
+        # v165.21 [#1]: KRX전용 제거는 INFO, 실제 malformed(code 결측/payload 불완전)는 WARNING 구분
+        krx_only = [n for n in dropped_names if "(KRX전용)" in n]
+        real_malformed = [n for n in dropped_names if "(KRX전용)" not in n]
+        if real_malformed:
+            suffix = f" → {', '.join(real_malformed[:5])}" if real_malformed else ""
+            _log_warn_msg(f"⚠️ run_scan malformed alert {len(real_malformed)}건 제거{(' [' + stage + ']') if stage else ''}{suffix}")
+        if krx_only:
+            _log_info_msg(f"  ↪ NXT시간 KRX전용 {len(krx_only)}건 제외{(' [' + stage + ']') if stage else ''}")
     return cleaned
 
 def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str | None = None, seen_code: str | None = None) -> None:
