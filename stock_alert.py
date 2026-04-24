@@ -3,10 +3,37 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.24
+버전: v165.26
 날짜: 2026-04-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.26 (2026-04-24): NXT 애프터마켓 burst 스캔 신설 — 초기 급등 24분 → 15초 주기 포착
+  [#1] _is_nxt_aftermarket_burst_window() + _run_nxt_aftermarket_burst_scan() 신설
+       이유: 동국제강 460860이 15:48 급등 시작했으나 16:12에야 포착 (24분 지연)
+             NXT 프리마켓(08:00~08:59)엔 15초 burst 스캔 있으나 애프터마켓(15:30~20:00)엔 없음
+             메인 스캔 SCAN_INTERVAL=20초이지만 API+처리 시간 누적으로 실질 주기 수분~수십분
+       개선점: NXT 애프터마켓 전용 burst 창 15:30~20:00 정의
+              NXT_PREMARKET_BURST_INTERVAL_SEC(15초) 동일 주기로 재사용
+              → 동국제강류 애프터마켓 초기 급등 캔들 즉각 포착
+       주의점: 15:30~20:00 NXT 전용 시간대에서만 동작. KRX 정규장(~15:30)과 겹치지 않음
+              기존 프리마켓 burst와 독립 state_key 사용(nxt_aftermarket_last_ts)
+              KRX+NXT 동시(09:00~15:30) 구간은 기존 메인 스캔으로 처리 — 변경 없음
+- v165.25 (2026-04-24): 선진입 발송 종목 SURGE 중복 차단 + 종목코드 복사 + 결측 반복경고 제거
+  [#1] _preclose_gap_sent_today dict 신설 → _handle_general_alert_entry_block 차단
+       이유: KEC가 15:10 선진입 알람 발송됐는데 15:54에 또 SURGE 알람 발송됨
+       개선점: 선진입 발송 시 _preclose_gap_sent_today[code]=today 등록
+              _handle_general_alert_entry_block에서 당일 선진입 발송 종목 SURGE 차단
+       주의점: NXT 이중상장 종목은 KRX 선진입 이후에도 NXT 시간대 포착은 허용
+              선진입 발송된 종목의 일반 SURGE/NEAR_UPPER만 차단 (눌림목·뉴스 알람 제외)
+  [#2] send_next_open_gap_alert(): 종목코드 <code> 태그 래핑
+       이유: 선진입 알람에서 종목코드(092220)가 텔레그램 일반 텍스트 출력 → 탭 복사 불가
+       개선점: 종목코드를 <code>092220</code>으로 래핑 → 텔레그램에서 탭하면 클립보드 복사
+       주의점: HTML 파싱 모드(parse_mode="HTML") 사용 중 확인. 다른 알람 포맷 변경 없음
+  [#3] _append_scan_alert(): 장마감 후 NXT시간 복합결측 종목 조용히 폐기
+       이유: KEC missing_price,missing_signal_type,missing_score 경고가 16:09, 16:27 반복
+             NXT시간대에 KRX 전용 데이터 결측은 복구 불가 → 경고 반복만 쌓임
+       개선점: NXT 전용 시간대 + 복합결측(price/signal_type/score 모두 결측) → WARNING 없이 폐기
+       주의점: 단일 결측(missing_signal_type만 등)은 기존 처리 유지
 - v165.24 (2026-04-24): 선진입 run_state 오진 수정 + Groq 429 간격 강화 + SNAP heat 기반 동적 섹터 상한
   [#1] _was_preclose_gap_run(): status="zero" 마킹 후 60분 경과 시 재실행 허용
        이유: 봇 재시작 전 "zero"로 마킹된 상태가 남아 14:35 재실행 시 중복 차단됨
@@ -8564,6 +8591,7 @@ _internal_only_alert_history = {}
 ALERT_HISTORY_FILE = _state_path("alert_history.json")
 # v161.12: upper_limit_reached 당일 알람 차단 캐시 {code: "YYYYMMDD"}
 _upper_limit_alerted_today: dict = {}
+_preclose_gap_sent_today: dict = {}  # v165.25: 선진입 발송 종목 당일 SURGE 중복 차단 {code: "YYYYMMDD"}
 UPPER_LIMIT_ALERTED_FILE = _state_path("upper_limit_alerted_today.json")
 _detected_stocks    = {}
 _pullback_history   = {}
@@ -14984,7 +15012,7 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
             _pullback_entry = _vwap if _vwap and _vwap < _cur else int(_cur * 0.95 / 10) * 10
             item["entry_price"] = _pullback_entry
             item["entry_basis"] = "pullback_wait"
-        msg += f"\n{idx}) <b>{item.get('name','')}</b>  {item.get('code','')}  <b>{item.get('score',0)}점</b>\n"
+        msg += f"\n{idx}) <b>{item.get('name','')}</b>  <code>{item.get('code','')}</code>  <b>{item.get('score',0)}점</b>\n"
         if sim_summary:
             msg += f"  {sim_summary}\n"
         if _is_high_price:
@@ -15016,6 +15044,12 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
                 _pullback_registered += 1
             except Exception as _pw_e:
                 _swallow_exception(_pw_e)
+    # v165.25 [#1]: 선진입 발송 종목 → 당일 SURGE 중복 차단 등록
+    _today_str = _now_kst().strftime("%Y%m%d")
+    for item in cand:
+        _c = normalize_stock_code(item.get("code") or "")
+        if _c:
+            _preclose_gap_sent_today[_c] = _today_str
     if _pullback_registered:
         _log_info_msg(f"  ⏳ 눌림 대기 감시 등록: {_pullback_registered}건")
     _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand), phase=phase)
@@ -15673,9 +15707,11 @@ def refresh_dynamic_candidates(force_rank: bool = False):
         _log_warn_msg(f"⚠️ 동적 후보군 갱신 오류: {e}")
 
 NXT_PREMARKET_BURST_INTERVAL_SEC = int(os.getenv("NXT_PREMARKET_BURST_INTERVAL_SEC", "15") or "15")
+NXT_AFTERMARKET_BURST_INTERVAL_SEC = int(os.getenv("NXT_AFTERMARKET_BURST_INTERVAL_SEC", "15") or "15")  # v165.26: 애프터마켓 15초 burst
 KRX_OPEN_BURST_INTERVAL_SEC = int(os.getenv("KRX_OPEN_BURST_INTERVAL_SEC", "15") or "15")
 _BURST_SCAN_STATE = {
     "nxt_premarket_last_ts": 0.0,
+    "nxt_aftermarket_last_ts": 0.0,   # v165.26: NXT 애프터마켓 burst 상태
     "krx_open_last_ts": 0.0,
     "startup_catchup_done": "",
 }
@@ -15698,16 +15734,38 @@ def _is_krx_open_burst_window(now: datetime | None = None) -> bool:
 
 
 def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
-    state_key = "nxt_premarket_last_ts" if tag == "nxt_premarket" else "krx_open_last_ts"
+    if tag == "nxt_premarket":
+        state_key = "nxt_premarket_last_ts"
+    elif tag == "nxt_aftermarket":
+        state_key = "nxt_aftermarket_last_ts"   # v165.26
+    else:
+        state_key = "krx_open_last_ts"
     last_ts = safe_float(_BURST_SCAN_STATE.get(state_key, 0.0), 0.0)
     if (time.time() - last_ts) < max(interval_sec - 1, 1):
         return
     _BURST_SCAN_STATE[state_key] = time.time()
-    label = "NXT장전" if tag == "nxt_premarket" else "KRX오픈"
+    label_map = {"nxt_premarket": "NXT장전", "nxt_aftermarket": "NXT애프터", "krx_open": "KRX오픈"}
+    label = label_map.get(tag, tag)
     _log_info_msg(f"🚀 버스트 스캔 [{label}] 시작")
     refresh_dynamic_candidates(force_rank=True)
     run_material_first_scan()
     run_scan()
+
+
+def _is_nxt_aftermarket_burst_window(now: datetime | None = None) -> bool:
+    """v165.26: NXT 애프터마켓 burst 창 — 15:30~20:00 (KRX 마감 후 NXT 전용 시간대)."""
+    now = now or _now_kst()
+    if not is_nxt_open() or is_market_open():
+        return False
+    cur = now.timetz().replace(tzinfo=None)
+    return dtime(15, 30, 0) <= cur <= dtime(20, 0, 0)
+
+
+def _run_nxt_aftermarket_burst_scan() -> None:
+    """v165.26: NXT 애프터마켓 15초 burst 스캔 — 동국제강류 초기 급등 캔들 즉각 포착."""
+    if not _is_nxt_aftermarket_burst_window():
+        return
+    _run_scan_burst_window("nxt_aftermarket", NXT_AFTERMARKET_BURST_INTERVAL_SEC)
 
 
 def _run_nxt_premarket_burst_scan() -> None:
@@ -30094,6 +30152,14 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
 def _handle_general_alert_entry_block(ctx: dict, source_label: str) -> bool:
     blocked_reason = ctx["blocked_reason"]
     if not blocked_reason:
+        # v165.25 [#1]: 선진입 발송 종목 당일 SURGE/NEAR_UPPER 중복 차단
+        _code = (ctx.get("signal") or {}).get("code", "")
+        _today = _now_kst().strftime("%Y%m%d")
+        if _code and _preclose_gap_sent_today.get(_code) == _today:
+            _sig_type = str((ctx.get("signal") or {}).get("signal_type", "")).upper()
+            if _sig_type in ("SURGE", "NEAR_UPPER"):
+                _log_info_msg(f"  🚫 선진입 발송 종목 SURGE 중복 차단: {(ctx.get('signal') or {}).get('name', _code)}({_code})")
+                return False
         return True
     s = ctx["signal"]
     live = ctx["live"]
@@ -38338,13 +38404,18 @@ def _append_scan_alert(alerts: list, seen: set, result: dict, *, hist_key: str |
     if bool(result.get("_scan_payload_incomplete")):
         _reasons = list(result.get("_scan_payload_missing_reasons") or [])
         # v163.7 [#1]: missing_signal_type 단독이면 경고 로그 없이 조용히 drop
-        # _queue_run_scan_repair()에서 이미 차단하므로 중복 WARNING 불필요
         if _reasons == ["missing_signal_type"]:
             return
         # v163.15 [#2]: ETN/레버리지/인버스 복합결측 종목은 WARNING 없이 조용히 드롭
         _res_name = str(result.get("name") or "")
         if is_scoring_only_instrument(result_code, _res_name):
             return
+        # v165.25 [#3]: NXT 전용 시간대 복합결측(price+signal_type+score 모두 결측) → 조용히 폐기
+        # 이유: KEC처럼 KRX 데이터가 NXT 시간대에 price/signal_type/score 모두 결측 → 복구 불가, 경고만 반복
+        _nxt_time = not is_market_open() and is_nxt_open()
+        _all_core_missing = all(r in _reasons for r in ("missing_price", "missing_signal_type", "missing_score"))
+        if _nxt_time and _all_core_missing:
+            return  # WARNING 없이 조용히 폐기
         _queue_run_scan_repair(result, stage="append")
         _log_warn_msg(f"⚠️ run_scan alert 결측 재복구 대기: {result.get('name', result_code) or result_code} / {','.join(_reasons)}")
         return
@@ -39137,6 +39208,7 @@ if __name__ == "__main__":
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
     schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
     schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_premarket_burst_scan))
+    schedule.every(NXT_AFTERMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_aftermarket_burst_scan))  # v165.26: NXT 애프터마켓 burst
     schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_krx_open_burst_scan))
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_material_first_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
