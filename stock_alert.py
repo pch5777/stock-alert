@@ -3,10 +3,29 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.23
+버전: v165.24
 날짜: 2026-04-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.24 (2026-04-24): 선진입 run_state 오진 수정 + Groq 429 간격 강화 + SNAP heat 기반 동적 섹터 상한
+  [#1] _was_preclose_gap_run(): status="zero" 마킹 후 60분 경과 시 재실행 허용
+       이유: 봇 재시작 전 "zero"로 마킹된 상태가 남아 14:35 재실행 시 중복 차단됨
+       개선점: status=zero + 경과 60분 이상이면 False 반환 → 재시도 허용
+              status=sent(발송 완료)는 기존대로 중복 차단 유지
+       주의점: sent 상태는 절대 재실행 안 됨. zero만 재시도 허용.
+  [#2] _fetch_groq_news_rows(): 429 발생 시 cooldown 20분 강제 적용
+       이유: 현재 429 발생 후 ts를 now로만 갱신해 10분 캐시TTL과 동일 → 다음 주기 또 429
+             오늘 로그 기준 5회 연속 429 발생 (12:03, 12:33, 13:45, 14:18, 14:50)
+       개선점: 429 발생 시 ts = now + 1200 (20분) → TTL 내에서 캐시 재사용 보장
+       주의점: non-429 실패(503 등)는 기존 처리 유지. 일별 카운터는 성공분만 증가
+  [#3] _apply_scan_sector_gate(): SNAP heat 기반 동적 섹터 상한
+       이유: SCAN_SECTOR_LIMIT=4 고정으로 전기·전자 8~17번째 탈락 반복
+             오늘 로그: "전기·전자 9~17번째 생략" — 강세 섹터임에도 알람 차단
+       개선점: _load_intraday_snap_state()로 최근 SNAP에서 섹터별 등장 횟수 집계
+              상위 N개 섹터(heat_top_sectors)는 base_limit +2 추가 적용
+              → 전력·화장품이 오늘 강할 때 그 섹터만 자동으로 더 통과
+       주의점: SNAP 없거나 오류 시 기존 base_limit 유지 (fallback 보장)
+              heat 판단 기준: SNAP 전체 등장 횟수 상위 3개 섹터 +2 적용
 - v165.23 (2026-04-24): 눌림 대기 모니터링 (_pullback_wait_watch) 신설 — 실제 진입 알람 발동
   [#1] _pullback_wait_watch dict + _save/_load_pullback_wait_watch() 영속화
        이유: v165.22에서 레이블/진입가만 바꿨지만 실제 발동 로직 없음
@@ -7899,7 +7918,10 @@ def _fetch_groq_news_rows() -> list[dict]:
             f"⚠️ Groq grounding 재료 수집 실패: {type(e).__name__}: {str(e)[:100]}",
             cooldown_sec=1800.0,
         )
-        if _is_quota_err or not _groq_grounding_cache.get("rows"):
+        if _is_quota_err:
+            # v165.24 [#2]: 429 발생 시 20분 강제 cooldown — 기존 10분 TTL과 동일하면 바로 재호출 → 연속 429
+            _groq_grounding_cache["ts"] = now + 1200  # 20분 후까지 캐시 유효 처리
+        elif not _groq_grounding_cache.get("rows"):
             _groq_grounding_cache["ts"] = now
         return list(_groq_grounding_cache.get("rows", []))
 
@@ -14859,7 +14881,18 @@ def _was_preclose_gap_run(stage: str, phase: str = "initial") -> bool:
     today = datetime.now().strftime("%Y%m%d")
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
     phase = _normalize_preclose_gap_phase(phase)
-    return f"{today}_{stage}_{phase}" in st
+    key = f"{today}_{stage}_{phase}"
+    if key not in st:
+        return False
+    rec = st[key]
+    # v165.24 [#1]: status=zero + 60분 경과 시 재시도 허용
+    # 이유: 봇 재시작 전 zero 마킹이 남아 14:35 재실행 차단되는 오진 방지
+    if str(rec.get("status") or "") == "zero":
+        elapsed = time.time() - float(rec.get("ts", 0) or 0)
+        if elapsed >= 3600:  # 60분 경과
+            _log_info_msg(f"  ↩️ 선진입 run_state [{key}] zero 마킹 {int(elapsed//60)}분 경과 → 재시도 허용")
+            return False
+    return True
 
 def _maybe_run_preclose_gap_alert_catchup():
     if is_holiday() or not _try_acquire_leader_lock():
@@ -38810,6 +38843,25 @@ def _apply_scan_sector_gate(alerts: list) -> list:
     exempt_rate = float(SCAN_SECTOR_EXEMPT_RATE or 15.0)
     burst_threshold = int(SCAN_SECTOR_BURST_THRESHOLD or 7)
 
+    # v165.24 [#3]: SNAP heat 기반 오늘 강세 섹터 top3 산출 → base_limit +2
+    _heat_top_sectors: set = set()
+    try:
+        snap_state = _load_intraday_snap_state()
+        _sec_appear: dict = {}
+        for snap in (snap_state.get("snapshots") or []):
+            for _c, _info in (snap.get("stocks") or {}).items():
+                _sec = str(_info.get("sector") or _info.get("sector_theme") or "").strip()
+                if _sec and _sec != "기타":
+                    _sec_appear[_sec] = _sec_appear.get(_sec, 0) + 1
+        # 등장 횟수 상위 3개 섹터 → heat_top_sectors
+        if _sec_appear:
+            _top3 = sorted(_sec_appear.items(), key=lambda x: -x[1])[:3]
+            _heat_top_sectors = {s for s, _ in _top3}
+            if _heat_top_sectors:
+                _log_info_msg(f"  🔥 SNAP 오늘 강세 섹터 (동적 상한 +2): {', '.join(_heat_top_sectors)}")
+    except Exception:
+        pass
+
     # 섹터별 후보 수 사전 집계 → 급등장 판단용
     sector_total: dict = {}
     for s in alerts:
@@ -38853,6 +38905,10 @@ def _apply_scan_sector_gate(alerts: list) -> list:
         # 급등장 감지: 이 섹터 전체 후보가 burst_threshold 이상이면 +3
         if sector_total.get(sec, 0) >= burst_threshold:
             base_limit += 3
+
+        # v165.24 [#3]: SNAP 오늘 강세 섹터면 +2 추가
+        if sec in _heat_top_sectors:
+            base_limit += 2
 
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
         if sector_counts[sec] <= base_limit:
