@@ -3,10 +3,37 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.26
+버전: v165.28
 날짜: 2026-04-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.28 (2026-04-24): NXT 공식 640개 종목 초기 화이트리스트 하드코딩
+  [#1] _NXT_INITIAL_CODES frozenset 상수 추가 (2026-04-24 기준 640개)
+       이유: v165.27에서 화이트리스트 자동 누적 구조 도입했으나 첫 배포 후
+             50개 임계값 달성 전까지는 기존 market 필드 방식으로 fallback됨
+             → KEC 오발송이 당일 수 시간 동안 지속될 수 있음
+       개선점: 공식 NXT 거래 가능 종목 640개를 하드코딩으로 초기 로드
+              _load_nxt_confirmed_codes() 시 파일이 없으면 _NXT_INITIAL_CODES를 초기값으로 사용
+              → 봇 시작 즉시 화이트리스트 640개 활성화 (임계값 50개 즉시 초과)
+       주의점: NXT 종목 변동 시(분기별 심사) 파일 재업로드 필요
+              자동 누적(_nxt_confirmed_codes.add)은 계속 동작 → 신규 편입 종목 자동 추가
+- v165.27 (2026-04-24): NXT 상장 종목 화이트리스트 _nxt_confirmed_codes 누적 — KRX 전용 하드 차단
+  [#1] _nxt_confirmed_codes set + NXT_CONFIRMED_FILE 영속화
+       이유: is_nxt_listed()가 "목록에 없으면 상장으로 간주" 방식이라
+             KEC 같은 KRX 전용 종목도 상장으로 오판 → 반복 패치에도 근본 해결 불가
+       개선점: NXT volume-rank API 응답에 포함된 종목코드를 매 스캔마다 _nxt_confirmed_codes에 누적
+              파일로 영속화(nxt_confirmed_codes.json) → 재시작 후에도 복원
+       주의점: 처음 배포 후 수 시간 내에 NXT 실거래 종목이 자연 누적됨
+              KEC처럼 NXT에 한 번도 등장하지 않은 종목은 차단 대상
+  [#2] _sanitize_run_scan_alerts(): NXT 전용 시간대 + 화이트리스트 미포함 종목 INFO로 차단
+       이유: KRX전용 종목이 market="NXT"로 잘못 마킹될 때 최종 안전망 필요
+       개선점: _nxt_only_now=True + market="NXT" 마킹됐지만 _nxt_confirmed_codes에 없는 종목 차단
+              기존 KRX전용 제거 로직 대체 — 더 정확한 판별
+       주의점: _nxt_confirmed_codes 비어있을 때(첫 배포)는 기존 market 필드 기준 차단 유지 (fallback)
+  [#3] is_nxt_listed() 강화: _nxt_confirmed_codes 화이트리스트 우선 참조
+       이유: 기존 "목록에 없으면 상장"에서 "목록에 있어야 상장"으로 전환
+       개선점: _nxt_confirmed_codes에 있으면 True, 비어있으면 기존 로직 fallback
+       주의점: 화이트리스트가 충분히 쌓이기 전 과도한 차단 방지 — 빈 set이면 기존 동작 유지
 - v165.26 (2026-04-24): NXT 애프터마켓 burst 스캔 신설 — 초기 급등 24분 → 15초 주기 포착
   [#1] _is_nxt_aftermarket_burst_window() + _run_nxt_aftermarket_burst_scan() 신설
        이유: 동국제강 460860이 15:48 급등 시작했으나 16:12에야 포착 (24분 지연)
@@ -8962,10 +8989,13 @@ def is_any_market_open() -> bool:
     """
     return is_market_open() or is_nxt_open()
 def is_nxt_listed(code: str) -> bool:
+    """v165.27: NXT 상장 종목 판별 — 화이트리스트 우선, fallback은 기존 방식.
+    _nxt_confirmed_codes(volume-rank 실거래 누적)가 50개 이상이면 화이트리스트 기준.
+    빈 set이면 기존 _nxt_unavailable 블랙리스트 방식으로 fallback.
     """
-    해당 종목이 NXT에 상장돼 있는지 확인
-    _nxt_unavailable에 없으면 상장된 것으로 간주 (조회 시 자동 판별)
-    """
+    if len(_nxt_confirmed_codes) >= 50:
+        return code in _nxt_confirmed_codes
+    # fallback: 기존 방식 (목록에 없으면 상장으로 간주)
     return code not in _nxt_unavailable
 def minutes_since(dt: datetime) -> int:
     seconds = _kst_seconds_since(dt)
@@ -11074,6 +11104,7 @@ PRECLOSE_GAP_RUN_STATE_FILE = _state_path("preclose_gap_run_state.json")
 NXT_HOLDOVER_STATE_FILE     = _state_path("nxt_holdover_state.json")  # v165.5: holdover 파일 저장
 PRECLOSE_GAP_ENTRY_WATCH_FILE = _state_path("preclose_gap_entry_watch.json")
 PULLBACK_WAIT_WATCH_FILE   = _state_path("pullback_wait_watch.json")  # v165.23: 눌림 대기 감시 상태 파일
+NXT_CONFIRMED_FILE         = _state_path("nxt_confirmed_codes.json")  # v165.27: NXT 실거래 확인 종목 화이트리스트
 REENTRY_WATCH_FILE = _state_path("reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = _state_path("execution_setup_watch.json")
 EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC = int(os.getenv("EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC", "45") or "45")
@@ -11158,6 +11189,33 @@ def _save_pullback_wait_watch() -> None:
         _write_json_atomic(PULLBACK_WAIT_WATCH_FILE, _pullback_wait_watch if isinstance(_pullback_wait_watch, dict) else {}, indent=2)
     except Exception as e:
         _swallow_exception(e)
+
+def _save_nxt_confirmed_codes() -> None:
+    """v165.27: NXT 실거래 확인 종목 화이트리스트 저장."""
+    try:
+        _write_json_atomic(NXT_CONFIRMED_FILE, sorted(_nxt_confirmed_codes), indent=0)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _load_nxt_confirmed_codes() -> None:
+    """v165.27: NXT 실거래 확인 종목 화이트리스트 복원.
+    v165.28: 파일 없으면 _NXT_INITIAL_CODES(640개)로 초기화 → 봇 시작 즉시 활성화.
+    """
+    global _nxt_confirmed_codes
+    try:
+        raw = _read_json_safe(NXT_CONFIRMED_FILE, None)
+        if isinstance(raw, list) and raw:
+            _nxt_confirmed_codes = set(_NXT_INITIAL_CODES)  # 초기 640개 베이스
+            _nxt_confirmed_codes.update(str(c) for c in raw if c)
+            _log_info_msg(f"📂 NXT 확인 종목 {len(_nxt_confirmed_codes)}개 복원 (초기640 + 누적)")
+        else:
+            # 파일 없거나 비어있음 → 초기 640개로 시작
+            _nxt_confirmed_codes = set(_NXT_INITIAL_CODES)
+            _log_info_msg(f"📂 NXT 초기 종목 {len(_nxt_confirmed_codes)}개 로드 (2026-04-24 기준)")
+            _save_nxt_confirmed_codes()  # 파일로 저장
+    except Exception as e:
+        _swallow_exception(e)
+        _nxt_confirmed_codes = set(_NXT_INITIAL_CODES)
 def _load_pullback_wait_watch() -> None:
     """v165.23: 눌림 대기 감시 상태 복원 (재시작 후에도 유지)."""
     global _pullback_wait_watch
@@ -17339,6 +17397,15 @@ def get_nxt_surge_stocks() -> list:
         if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
             _log_warn_msg("⚠️ [NXT] volume-rank 응답 비어있음 → NXT 유니버스 후보군으로 대체")
             return _rank_from_universe("NXT")
+        # v165.27 [#1]: NXT volume-rank 응답 종목 → 화이트리스트 누적
+        # 이유: API 응답에 포함된 종목 = NXT 실거래 확인. KEC처럼 한 번도 안 나타나면 KRX 전용
+        _prev_len = len(_nxt_confirmed_codes)
+        for _ni in items:
+            _ni_code = str(_ni.get("code", "") or "")
+            if _ni_code:
+                _nxt_confirmed_codes.add(_ni_code)
+        if len(_nxt_confirmed_codes) > _prev_len:
+            _save_nxt_confirmed_codes()
         # v163: NXT 종목도 최초 반응 tracker 업데이트
         # v163.5: get_stock_info 미정의 → 종목명은 items에서 직접 사용
         try:
@@ -17847,6 +17914,63 @@ def get_trade_intensity_snapshot(code: str, market: str = "KRX") -> dict:
 # NXT 데이터 캐시 (종목별 5분 유효)
 _nxt_cache: dict = {}        # code → {data, ts}
 _nxt_unavailable: set = set()  # NXT 비상장/거래없는 종목 (당일 재조회 안 함)
+# v165.28 [#1]: NXT 공식 거래 가능 종목 초기 화이트리스트 (2026-04-24 기준 640개)
+# 출처: nextrade.co.kr 정규시장 거래현황 실시간 조회 / 분기별 심사로 변동 가능
+_NXT_INITIAL_CODES: frozenset = frozenset({
+    "000070", "000080", "000100", "000120", "000150", "000210", "000240", "000250", "000270", "000320",
+    "000500", "000640", "000660", "000670", "000720", "000810", "000880", "000990", "001040", "001060",
+    "001120", "001130", "001270", "001430", "001450", "001460", "001500", "001530", "001630", "001680",
+    "001720", "001750", "001800", "001820", "001940", "002020", "002030", "002240", "002320", "002380",
+    "002420", "002450", "002680", "002790", "003090", "003160", "003220", "003230", "003380", "003490",
+    "003550", "003600", "003620", "003640", "003670", "003690", "003720", "003800", "004000", "004020",
+    "004040", "004060", "004080", "004090", "004140", "004170", "004200", "004370", "004415", "004490",
+    "004490", "004530", "004990", "005030", "005070", "005090", "005110", "005180", "005290", "005300",
+    "005380", "005385", "005387", "005490", "005500", "005610", "005620", "005690", "005720", "005810",
+    "005830", "005850", "005900", "005930", "005935", "005940", "006040", "006120", "006260", "006280",
+    "006360", "006400", "006405", "006490", "006800", "007070", "007160", "007310", "007660", "007810",
+    "008350", "008560", "008600", "008770", "009070", "009150", "009290", "009420", "009450", "009540",
+    "009780", "009830", "009900", "009970", "010060", "010120", "010130", "010140", "010400", "010620",
+    "010780", "010950", "011000", "011070", "011170", "011200", "011210", "011790", "012200", "012330",
+    "012450", "012630", "013030", "013360", "014620", "014680", "014830", "014840", "014940", "015020",
+    "015760", "016360", "016380", "017000", "017670", "017800", "017860", "017960", "018260", "018290",
+    "018880", "019170", "019680", "020000", "020150", "020560", "021240", "021820", "022100", "022790",
+    "023160", "023530", "023590", "024090", "024110", "024720", "025560", "026490", "027740", "028050",
+    "028260", "028300", "029460", "030000", "030200", "031430", "031980", "032350", "032500", "032830",
+    "033100", "033240", "033500", "033640", "033780", "034020", "034220", "034730", "035420", "035500",
+    "035720", "036200", "036360", "036460", "036460", "036570", "036620", "036810", "039030", "039230",
+    "039440", "039490", "042660", "042700", "044490", "044440", "044820", "045100", "045390", "046890",
+    "047050", "047810", "051600", "051900", "051910", "052690", "053210", "055550", "055560", "057050",
+    "057360", "058470", "058610", "059090", "059720", "060720", "060740", "060980", "064350", "064400",
+    "064760", "064820", "066570", "066970", "068270", "068950", "071050", "071970", "074600", "075580",
+    "077970", "078350", "078600", "079550", "082740", "083450", "083650", "084370", "086280", "086390",
+    "086450", "086520", "086790", "087010", "089010", "089890", "089970", "089980", "090430", "090460",
+    "092460", "093370", "094360", "095340", "096770", "098070", "100090", "100840", "101490", "103140",
+    "103590", "105560", "107640", "108320", "108490", "110990", "112610", "114810", "120110", "121600",
+    "122640", "128940", "137400", "139480", "141080", "161000", "161580", "161890", "171090", "183300",
+    "189300", "192820", "195870", "196170", "199800", "200710", "204320", "207940", "214150", "214370",
+    "214450", "217590", "218410", "222800", "226320", "226950", "229640", "237880", "241560", "247540",
+    "257720", "259960", "263750", "267250", "267260", "267270", "272210", "272290", "277810", "278280",
+    "278470", "290650", "293490", "295310", "298020", "298040", "298380", "307950", "310210", "316140",
+    "323280", "329180", "336260", "336370", "347700", "347850", "348370", "352820", "357780", "358570",
+    "372320", "373220", "375500", "376900", "377300", "378340", "383800", "388210", "394280", "394800",
+    "397030", "399720", "402340", "420770", "425420", "437730", "439090", "439260", "443060", "448280",
+    "448900", "452430", "454910", "456040", "456160", "457190", "458870", "460860", "460930", "466100",
+    "469610", "473980", "475150", "475400", "475560", "475830", "475960", "476060", "476830", "481070",
+    "483650", "484120", "484590", "484810", "484870", "486990", "488280", "488900", "489790", "494120",
+    "499790", "001040", "002790", "003490", "004170", "023590", "033780", "044820", "045390", "053210",
+    "060740", "064400", "003800", "007160", "008560", "009290", "010400", "012200", "019170", "024090",
+    "026490", "029460", "031430", "035500", "044440", "055560", "057050", "057360", "059720", "060720",
+    "060980", "068950", "077970", "092460", "000100", "001130", "002020", "002680", "003090", "003220",
+    "003380", "003600", "003620", "003640", "003720", "004040", "004060", "004080", "004090", "004140",
+    "004200", "004415", "004530", "005030", "005110", "005180", "005300", "005500", "005610", "005620",
+    "005720", "005830", "005850", "005900", "005935", "005937", "006040", "006120", "006490", "007070",
+    "007310", "008350", "008600", "009070", "009450", "009780", "009970", "010620", "010780", "011000",
+    "012630", "013360", "014840", "015020", "016380", "017000", "018880", "019680", "020000", "020560",
+    "021240", "021820", "022790", "024110", "024720", "025560", "027740", "030200", "032350",
+    "036360", "039230", "042660", "053210", "099320", "110990", "099320", "388210", "204320", "372320",
+    "383800", "139480", "064760", "092790", "036620", "017800",
+})
+_nxt_confirmed_codes: set = set()  # v165.27: NXT 실거래 확인 종목 화이트리스트 (volume-rank 누적)
 def get_nxt_info(code: str) -> dict:
     """
     NXT 종합 정보 (캐시 5분)
@@ -38360,14 +38484,23 @@ def _sanitize_run_scan_alerts(alerts: list, stage: str = "") -> list:
             dropped += 1
             continue
         item = _coerce_run_scan_signal_defaults(item, fallback_code=code)
-        # v165.15: NXT 전용 시간대 — market="NXT" 필드 단일 기준으로 차단
-        # _is_nxt_eligible() 기반은 KIS API가 KRX 전용 종목에도 NXT 응답을 돌려줘서 불안정
-        # 모든 NXT 스캔 경로(get_nxt_surge_stocks, nxt_only_window 통과)에서 market="NXT" 마킹 보장
-        if _nxt_only_now and str(item.get("market") or "").upper() != "NXT":
-            dropped += 1
-            # v165.21 [#1]: KRX전용 제거는 정상 동작 — INFO로 낮춤 (반복 WARNING 노이즈 제거)
-            dropped_names.append(f"{item.get('name', code)}(KRX전용)")
-            continue
+        # v165.21 [#1]: NXT 전용 시간대 — market="NXT" 필드 단일 기준으로 차단
+        # v165.27 [#2]: _nxt_confirmed_codes 화이트리스트가 있으면 더 정확하게 판별
+        if _nxt_only_now:
+            _item_market = str(item.get("market") or "").upper()
+            _item_code = code
+            # 화이트리스트가 충분히 쌓였으면(50개 이상) → 화이트리스트 기준 판별
+            if len(_nxt_confirmed_codes) >= 50:
+                if _item_code not in _nxt_confirmed_codes:
+                    dropped += 1
+                    dropped_names.append(f"{item.get('name', code)}(KRX전용확정)")
+                    continue
+            else:
+                # 화이트리스트 미형성 시 기존 market 필드 기준 유지
+                if _item_market != "NXT":
+                    dropped += 1
+                    dropped_names.append(f"{item.get('name', code)}(KRX전용)")
+                    continue
         if bool(item.get("_scan_payload_incomplete")):
             dropped += 1
             _missing_r = list(item.get("_scan_payload_missing_reasons") or [])
@@ -39185,6 +39318,7 @@ if __name__ == "__main__":
         _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
     _load_preclose_gap_entry_watch()
     _load_pullback_wait_watch()            # v165.23: 재시작 시 눌림 대기 감시 복원
+    _load_nxt_confirmed_codes()            # v165.27: NXT 화이트리스트 복원
     _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
     _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
     _load_yt_exclude_keywords()         # v161.36: 재시작 시 YouTube 제외 키워드 복원
