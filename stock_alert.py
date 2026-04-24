@@ -3,10 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.28
-날짜: 2026-04-24
+버전: v165.29
+날짜: 2026-04-25
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.29 (2026-04-25): 결측 drain 강화 + NXT장전 주의문 + 소형주 -10점 + 52주신고가 +5점
+  [#1] _drain_run_scan_repair_queue(): NXT-only time + 복합결측(price+signal_type+score) → NXT 종목도 조용히 폐기
+       이유: KRX 마감 후 NXT 상장 종목이 repair 큐에서 최대 RUN_SCAN_REPAIR_MAX_ATTEMPTS회 재시도 후
+             결국 폐기 — 복구 불가 항목 무의미한 재시도 방지, 큐 점유 해소
+       개선점: KRX-only 제거 로직 직후 NXT 복합결측도 동일 처리 → 즉시 폐기
+       주의점: missing_signal_type 단독(기존 처리)·단일 결측은 기존 로직 유지
+       진입불가 게이트 연결: 해당 없음 (repair queue 정리 로직)
+  [#2] _apply_analyze_entry_and_filters(): NXT 장전(08:00~08:59) EARLY_DETECT 주의 문구 추가
+       이유: 2026-04-24 로그 — NXT 장전 EARLY_DETECT 종목(에코아이/클리오/잇츠한불) 포착 1~28분 내 손절
+             KRX 개장 직후 실거래 물량 유입 시 되돌림 발생, 10회 연속손절 원인 중 하나로 분석
+       개선점: signal_type=EARLY_DETECT + NXT open + KRX closed + 08시대 → reasons에 주의문 자동 추가
+              사용자가 알림 수신 시 09:10 이후 진입 여부 직접 판단 가능
+       주의점: 로직 차단이 아닌 정보 추가 — 기존 스코어/진입가/알림 발송 흐름 변경 없음
+  [#3] _apply_analyze_entry_and_filters(): 소형주(시총 1,000억↓, cap_size=small) SURGE/EARLY_DETECT -10점
+       이유: 2026-04-24 로그 — 소형주 비중 과다(코리아나/CSA코스믹/본느/리더스코스메틱 등) + 연속손절 10회
+             신고가 전략 연구 결과: 시총 500억~2,000억 소형주는 신고가 신뢰도 낮음(세력 조작 가능성)
+       개선점: cap_size=="small" + SURGE/EARLY_DETECT → score -10, reasons에 감점 이유 명시
+       주의점: cap_size 필드가 없거나 unknown이면 적용 안 함 — 안전한 방어적 처리
+  [#4] _check_52w_high_breakout_cached() 신설 + _apply_analyze_entry_and_filters() 연결
+       이유: 신고가 매매 전략 연구 — 52주 신고가 돌파 종목은 매물대 없이 장기 랠리 가능성 높음
+             골드만삭스 보고서·나무위키 백테스트 동일 결론: 신고가 기법이 가장 안정적 수익
+       개선점: 52주(252 거래일) 신고가 돌파 → +5점 / -3% 이내 근접 → +2점 (1시간 캐시로 성능 보호)
+       주의점: lookback_days=252는 get_daily_data 265일 요청 → 캐시 없을 때 첫 호출만 느림
+              analyze() 단계(A급 후보만)에서만 호출 → 전체 289개 후보에 적용 안 됨 (성능 안전)
+       진입 체인: _apply_analyze_entry_and_filters → _build_analyze_result → _dispatch_scan_alerts 연결 확인 ✅
+       진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅ (기존 체인 변경 없음)
 - v165.28 (2026-04-24): NXT 공식 640개 종목 초기 화이트리스트 하드코딩
   [#1] _NXT_INITIAL_CODES frozenset 상수 추가 (2026-04-24 기준 640개)
        이유: v165.27에서 화이트리스트 자동 누적 구조 도입했으나 첫 배포 후
@@ -5732,6 +5758,33 @@ def _get_recent_high_breakout_context(code: str, current_price: int, lookback_da
         "distance_pct": distance_pct,
         "lookback_days": int(lookback_days or 20),
     }
+
+# v165.29 [#4]: 52주 신고가 판별 캐시 (1시간 TTL) — analyze() 호출마다 일별 API 중복 방지
+_52W_HIGH_CACHE: dict = {}  # code → {ts, breakout, distance_pct}
+_52W_HIGH_CACHE_TTL = 3600  # 1시간
+
+def _check_52w_high_breakout_cached(code: str, price: int) -> dict:
+    """52주 신고가 돌파 여부 확인 (1시간 캐시). 반환: {breakout, distance_pct}"""
+    code = normalize_stock_code(code)
+    price = safe_int(price, 0)
+    if not code or price <= 0:
+        return {}
+    now = time.time()
+    cached = _52W_HIGH_CACHE.get(code, {})
+    if now - float(cached.get("ts", 0)) < _52W_HIGH_CACHE_TTL:
+        return cached
+    try:
+        result = _get_recent_high_breakout_context(code, price, lookback_days=252)
+        out = {
+            "ts": now,
+            "breakout": bool(result.get("breakout")),
+            "distance_pct": float(result.get("distance_pct", -999.0) or -999.0),
+        }
+        _52W_HIGH_CACHE[code] = out
+        return out
+    except Exception as _52we:
+        _swallow_exception(_52we)
+        return {}
 def _build_global_pattern_context(stock: dict | None, current_time: str = "", change_rate: float = 0.0,
                                   vol_ratio: float = 0.0) -> dict:
     stock = stock if isinstance(stock, dict) else {}
@@ -28610,6 +28663,31 @@ def _apply_analyze_entry_and_filters(ctx: dict) -> bool:
         _ctx = _multi_tf_block.get("context", {}) or {}
         _log_suppressed_alert(code, stock.get("name", code), _multi_tf_block.get("reason", "주봉·일봉 동반 하락 추세 차단"), signal_type, {"daily_ret20": _ctx.get("daily_ret20", 0.0), "weekly_ret8": _ctx.get("weekly_ret8", 0.0), "daily_flags": _ctx.get("daily_flags", 0), "weekly_flags": _ctx.get("weekly_flags", 0), "change_rate": change_rate, "score": score})
         return False
+    # v165.29 [#2]: NXT 장전(08:00~08:59) EARLY_DETECT → KRX 개장 직후 되돌림 주의 문구 추가
+    # 이유: NXT 장전 EARLY_DETECT 종목이 09:00 KRX 개장 시 되돌림으로 연속 손절 패턴 반복 확인
+    if signal_type == "EARLY_DETECT" and is_nxt_open() and not is_market_open():
+        _now_hm = datetime.now().hour * 60 + datetime.now().minute
+        if _now_hm < 9 * 60:  # 08:00~08:59 KRX 개장 전
+            reasons.append("⚠️ NXT 장전 포착 — KRX 개장 직후 되돌림 주의, 09:10 이후 가격 확인 후 진입 권장")
+    # v165.29 [#3]: 소형주(시총 1,000억 미만, cap_size=small) SURGE/EARLY_DETECT 신뢰도 감소 -10
+    # 이유: 2026-04-24 로그 분석 → 소형주 비중 과다로 연속 손절 10회 발생, 대형주 신고가 신뢰도 대비 낮음
+    _cap_size = stock.get("cap_size", "") or ""
+    if _cap_size == "small" and signal_type in ("SURGE", "EARLY_DETECT"):
+        score -= 10
+        reasons.append("📉 소형주 신뢰도 감소 -10 (시총 1,000억↓)")
+    # v165.29 [#4]: 52주 신고가 돌파 가점 +5 / 근접(-3% 이내) +2 (1시간 캐시, 성능 안전)
+    # 이유: 신고가 돌파 종목은 매물대 없이 장기 랠리 가능성 — 스코어 신뢰도 상향 필요
+    try:
+        _52w = _check_52w_high_breakout_cached(code, price)
+        _52w_dist = float(_52w.get("distance_pct", -999.0) or -999.0)
+        if _52w.get("breakout"):
+            score += 5
+            reasons.append(f"📈 52주 신고가 돌파 +5 ({_52w_dist:+.1f}%)")
+        elif _52w_dist >= -3.0:
+            score += 2
+            reasons.append(f"📈 52주 신고가 근접 {abs(_52w_dist):.1f}%↓ +2")
+    except Exception as _52we:
+        _swallow_exception(_52we)
     ctx.update({
         "score": score, "reasons": reasons, "entry_price": entry, "stop_loss": stop,
         "target_price": target, "stop_pct": stop_pct, "target_pct": target_pct,
@@ -38299,6 +38377,13 @@ def _drain_run_scan_repair_queue(alerts: list, seen: set) -> None:
             if not is_market_open() and is_nxt_open() and str(item.get("market") or "") != "NXT":
                 remove_codes.append(code)
                 continue
+            # v165.29 [#1]: NXT 전용 시간대 + 복합결측(price+signal_type+score 모두) → NXT 종목도 조용히 폐기
+            # KRX 마감 후 NXT 상장 종목도 KRX 분석 데이터 복구 불가 → 재시도 무의미, 경고 반복 방지
+            if not is_market_open() and is_nxt_open():
+                _pre_reasons = _build_run_scan_missing_reasons(item)
+                if all(r in _pre_reasons for r in ("missing_price", "missing_signal_type", "missing_score")):
+                    remove_codes.append(code)
+                    continue
             repaired = _coerce_run_scan_signal_defaults(item, fallback_code=code)
             if bool(repaired.get("_scan_payload_incomplete")):
                 _drain_reasons = list(repaired.get("_scan_payload_missing_reasons") or [])
