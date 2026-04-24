@@ -3,10 +3,42 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.21
-날짜: 2026-04-23
+버전: v165.23
+날짜: 2026-04-24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.23 (2026-04-24): 눌림 대기 모니터링 (_pullback_wait_watch) 신설 — 실제 진입 알람 발동
+  [#1] _pullback_wait_watch dict + _save/_load_pullback_wait_watch() 영속화
+       이유: v165.22에서 레이블/진입가만 바꿨지만 실제 발동 로직 없음
+       개선점: 눌림 대기 등록 종목을 별도 dict에 유지 → 재시작 후에도 복원
+       주의점: 당일 만료 기준 KRX=15:30/NXT=20:00. 만료 종목 자동 정리
+  [#2] send_next_open_gap_alert(): entry_basis=="pullback_wait" 종목 → _pullback_wait_watch 자동 등록
+       이유: 선진입 알람 발송 시 고가 종목(≥15%)은 이미 눌림 대기 레이블로 발송됨 → 모니터링 연결 필요
+       개선점: 발송 직후 _register_pullback_wait()로 watch 등록 → 15분마다 VWAP 감시
+       주의점: entry_basis!="pullback_wait"인 일반 선진입은 기존 _preclose_gap_entry_watch 경로 유지
+              진입불가 게이트 연결: _dispatch_general_alert_signal() 경유 확인 ✅
+  [#3] _run_pullback_wait_monitor(): 15분 주기 VWAP 터치 감지 → 진입 알람 발송
+       이유: 눌림 대기 종목이 VWAP에 닿았는지 자동으로 확인하는 로직이 없어 수동 모니터링 필요
+       개선점: WS 스냅샷 또는 현재가로 price≤entry_price 조건 확인 → 조건 충족 시 Telegram 진입 알람
+              알람 형식: "⚡ [눌림 진입 신호] 종목명 현재가Xxx원 → 등록 진입가 Xxx원 도달"
+       주의점: 한 종목에 알람은 1회만 발송 (alerted=True 플래그). KRX 15:30/NXT 20:00 이후 자동 만료
+- v165.22 (2026-04-24): 선진입 체인 강화 + 장중 섹터 누적 + 고가 눌림 대기 모드
+  [#1] _collect_next_open_gap_candidate_codes(): 당일 SNAP 등락률 상위 30종목 후보풀 직접 추가
+       이유: 선진입 후보풀이 signal_log/detected_stocks 위주라 오늘 처음 포착된 급등주 누락
+             오늘 SNAP에서 여러 번 상위 진입한 종목이 풀에 없어 선진입 0건 발생
+       개선점: INTRADAY_SNAP_FILE에서 당일 등락률 상위 30종목 직접 추가 → 풀 다양화
+       주의점: NEXT_OPEN_GAP_POOL_MAX 20→40 확대 (SNAP 추가분 수용)
+  [#2] _fetch_groq_news_rows() + _apply_next_open_gap_sector_history(): 장중 섹터 누적 캐시
+       이유: Groq CoT 결과를 버리고 있어 오늘 강세 섹터 정보가 선진입 스코어링에 미반영
+       개선점: Groq CoT 실행마다 → _groq_sector_daily_cache에 섹터/테마 누적 (날짜별)
+              선진입 실행 시 오늘 Groq가 강세로 분류한 섹터와 후보 종목 섹터 매칭 → +5점
+       주의점: 캐시 날짜 불일치 시 자동 초기화. 선진입 양방향(KRX/NXT) 동일 적용
+  [#3] build_next_open_gap_candidates() + send_next_open_gap_alert(): 고가(≥15%) 눌림 대기 모드
+       이유: 포착 시점 등락률이 이미 +15% 이상이면 즉시 진입은 고가 매수 위험
+       개선점: current_price 기준 등락률 ≥15% 종목 → entry_basis="pullback_wait"로 표시
+              진입가를 VWAP or (현재가×0.95) 중 낮은값 제시 + 알람에 "눌림 대기 후 진입" 레이블
+       주의점: 県림 대기는 레이블/진입가만 변경. 실제 발동은 v165.23 _pullback_wait_watch에서
+              진입불가 게이트 연결: _dispatch_general_alert_signal() 경유 확인 ✅
 - v165.21 (2026-04-23): KRX malformed 로그 노이즈 감소 / 특징주·시황 뉴스소스 3개 추가 / 선진입 Groq에 당일 섹터 컨텍스트 추가
   [#1] _sanitize_run_scan_alerts(): KRX전용 제거 시 WARNING→INFO 다운그레이드
        이유: 15:30 이후 매 스캔마다 삼성중공업·가온전선 등 2-3건 WARNING 반복 → 실제 오류 아님
@@ -7822,6 +7854,37 @@ def _fetch_groq_news_rows() -> list[dict]:
         _groq_grounding_cache = {"ts": now, "rows": rows}
         hot = sum(1 for r in rows if r.get("_today_reflected") == "not_yet" and r.get("_tomorrow_continuation") == "strong")
         print(f"[Groq] CoT 재료 수집 완료: {len(rows)}개 항목 (🔥미반영강세 {hot}건, 오늘 {_groq_grounding_daily_counter['count']}/{GROQ_GROUNDING_DAILY_LIMIT}회)")
+        # v165.22 [#2]: Groq CoT 결과 → 당일 섹터 누적 캐시에 저장
+        # 이유: Groq가 분석한 강세 테마/섹터를 버리지 않고 선진입 스코어링에 재활용
+        try:
+            global _groq_sector_daily_cache
+            _today_str = _now_kst().strftime("%Y-%m-%d")
+            if _groq_sector_daily_cache.get("date") != _today_str:
+                _groq_sector_daily_cache = {"date": _today_str, "sectors": {}}
+            _sdc = _groq_sector_daily_cache["sectors"]
+            for row in rows:
+                _theme = str(row.get("theme") or row.get("_theme") or "")
+                _cont = str(row.get("_tomorrow_continuation") or "")
+                _ref = str(row.get("_today_reflected") or "")
+                if not _theme:
+                    continue
+                if _theme not in _sdc:
+                    _sdc[_theme] = {"score": 0, "hit_count": 0, "tickers": []}
+                # strong/moderate continuation → 점수 누적
+                if _cont == "strong":
+                    _sdc[_theme]["score"] = _sdc[_theme]["score"] + 3
+                elif _cont == "moderate":
+                    _sdc[_theme]["score"] = _sdc[_theme]["score"] + 1
+                if _ref == "not_yet":
+                    _sdc[_theme]["score"] = _sdc[_theme]["score"] + 2
+                _sdc[_theme]["hit_count"] = _sdc[_theme]["hit_count"] + 1
+                # 수혜 종목 코드 누적
+                for tkr in (row.get("_tickers") or row.get("tickers") or []):
+                    _c = normalize_stock_code(str(tkr.get("code") or tkr) if isinstance(tkr, dict) else str(tkr))
+                    if _c and _c not in _sdc[_theme]["tickers"]:
+                        _sdc[_theme]["tickers"].append(_c)
+        except Exception as _sdc_e:
+            _swallow_exception(_sdc_e)
         # v163.18 [#3]: Groq 분석 결과 → _dynamic_theme_map 자동 등록
         # THEME_MAP에 없는 완전 신규 테마도 자동 포착 파이프라인에 연결
         try:
@@ -8497,6 +8560,7 @@ _youtube_fetch_daily: dict = {"date": "", "count": 0}  # v161.37: YouTube API �
 _gemini_grounding_cache: dict = {"ts": 0.0, "rows": []}  # v161.37: Gemini grounding 결과 캐시
 _groq_grounding_cache: dict = {"ts": 0.0, "rows": []}   # v163.16: Groq Llama 재료 분석 캐시
 _groq_grounding_daily_counter: dict = {"date": "", "count": 0}  # v163.16: Groq 전용 일별 호출 카운터
+_groq_sector_daily_cache: dict = {"date": "", "sectors": {}}  # v165.22: Groq CoT 장중 섹터 누적 캐시
 GEMINI_GROUNDING_CACHE_FILE = _state_path("gemini_grounding_cache.json")  # v163.6: 재시작/실패 복원용
 
 def _save_gemini_grounding_cache() -> None:
@@ -10959,6 +11023,7 @@ NEXT_OPEN_GAP_FILE         = _state_path("next_open_gap_candidates.json")
 PRECLOSE_GAP_RUN_STATE_FILE = _state_path("preclose_gap_run_state.json")
 NXT_HOLDOVER_STATE_FILE     = _state_path("nxt_holdover_state.json")  # v165.5: holdover 파일 저장
 PRECLOSE_GAP_ENTRY_WATCH_FILE = _state_path("preclose_gap_entry_watch.json")
+PULLBACK_WAIT_WATCH_FILE   = _state_path("pullback_wait_watch.json")  # v165.23: 눌림 대기 감시 상태 파일
 REENTRY_WATCH_FILE = _state_path("reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = _state_path("execution_setup_watch.json")
 EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC = int(os.getenv("EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC", "45") or "45")
@@ -10968,7 +11033,7 @@ ENTRY_WATCH_ARCHIVE_FILE = _state_path("entry_watch_archive.json")
 ENTRY_WATCH_CONSUMED_KEEP_DAYS = int(os.getenv("ENTRY_WATCH_CONSUMED_KEEP_DAYS", "7") or "7")
 ENTRY_WATCH_ARCHIVE_KEEP_DAYS = int(os.getenv("ENTRY_WATCH_ARCHIVE_KEEP_DAYS", "30") or "30")
 NEXT_OPEN_GAP_MAX_SHOW     = int(os.getenv("NEXT_OPEN_GAP_MAX_SHOW", "6") or "6")
-NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "20") or "20")
+NEXT_OPEN_GAP_POOL_MAX     = int(os.getenv("NEXT_OPEN_GAP_POOL_MAX", "40") or "40")  # v165.22: 20→40 (SNAP 상위종목 수용)
 NEXT_OPEN_GAP_MIN_SCORE    = int(os.getenv("NEXT_OPEN_GAP_MIN_SCORE", "48") or "48")
 PRECLOSE_GAP_SIGNAL_TYPE = "PRECLOSE_GAP_ENTRY"
 PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_AWAY_PCT", "3.8") or "3.8")
@@ -10977,6 +11042,7 @@ PRECLOSE_GAP_MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("PRECLOSE_GAP_MAX_ENTRY_SL
 PRECLOSE_GAP_OPEN_EVAL_TIME_KRX = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_KRX", "09:01") or "09:01"  # v163.7 [#3]: 09:05→09:01
 PRECLOSE_GAP_OPEN_EVAL_TIME_NXT = os.getenv("PRECLOSE_GAP_OPEN_EVAL_TIME_NXT", "08:05") or "08:05"
 _preclose_gap_entry_watch: dict = {}
+_pullback_wait_watch: dict = {}  # v165.23: 눌림 대기 감시 {code: {entry_price, stop_loss, target_price, name, stage, deadline_ts, alerted}}
 _UNIVERSE_RANK_TTL_SEC = int(os.getenv("UNIVERSE_RANK_TTL_SEC", "45") or "45")  # reuse if set
 def _read_json_safe(path: str, default):
     try:
@@ -11036,6 +11102,36 @@ def _save_preclose_gap_entry_watch() -> None:
         _write_json_atomic(PRECLOSE_GAP_ENTRY_WATCH_FILE, _preclose_gap_entry_watch if isinstance(_preclose_gap_entry_watch, dict) else {}, indent=2)
     except Exception as e:
         _swallow_exception(e)
+def _save_pullback_wait_watch() -> None:
+    """v165.23: 눌림 대기 감시 상태 파일 저장."""
+    try:
+        _write_json_atomic(PULLBACK_WAIT_WATCH_FILE, _pullback_wait_watch if isinstance(_pullback_wait_watch, dict) else {}, indent=2)
+    except Exception as e:
+        _swallow_exception(e)
+def _load_pullback_wait_watch() -> None:
+    """v165.23: 눌림 대기 감시 상태 복원 (재시작 후에도 유지)."""
+    global _pullback_wait_watch
+    try:
+        raw = _read_json_safe(PULLBACK_WAIT_WATCH_FILE, {})
+        if not isinstance(raw, dict):
+            _pullback_wait_watch = {}
+            return
+        now_ts = time.time()
+        restored = {}
+        for code, w in raw.items():
+            if not isinstance(w, dict):
+                continue
+            deadline_ts = float(w.get("deadline_ts", 0) or 0)
+            if deadline_ts and now_ts >= deadline_ts:
+                continue  # 만료된 항목 제외
+            if w.get("alerted"):
+                continue  # 이미 알람 발송된 항목 제외
+            restored[code] = w
+        _pullback_wait_watch = restored
+        _log_info_msg(f"📂 눌림 대기 감시 상태 {len(restored)}개 복원")
+    except Exception as e:
+        _swallow_exception(e)
+        _pullback_wait_watch = {}
 def _load_preclose_gap_entry_watch() -> None:
     global _preclose_gap_entry_watch
     try:
@@ -13600,6 +13696,30 @@ def _collect_next_open_gap_candidate_codes(max_codes: int = NEXT_OPEN_GAP_POOL_M
                     break
         except Exception as e:
             _swallow_exception(e)
+    # v165.22 [#1]: 당일 SNAP 등락률 상위 30종목 후보풀 직접 추가
+    # 이유: signal_log/detected_stocks 위주 풀에서 오늘 처음 포착된 급등주 누락 → 선진입 0건 발생
+    if len(codes) < max_codes:
+        try:
+            snap_state = _load_intraday_snap_state()
+            snapshots = snap_state.get("snapshots") or []
+            _snap_code_chg: dict = {}
+            for snap in snapshots:
+                for c, info in (snap.get("stocks") or {}).items():
+                    chg = float(info.get("chg", 0) or 0)
+                    if chg > _snap_code_chg.get(c, -999):
+                        _snap_code_chg[c] = chg
+            # 등락률 상위 30종목 편입
+            snap_top = sorted(_snap_code_chg.items(), key=lambda x: -x[1])[:30]
+            _snap_added = 0
+            for c, _chg in snap_top:
+                _push_gap_code(c)
+                _snap_added += 1
+                if len(codes) >= max_codes:
+                    break
+            if _snap_added:
+                _log_info_msg(f"[선진입] SNAP 상위 {_snap_added}종목 후보풀 추가 (총 풀={len(codes)})")
+        except Exception as e:
+            _swallow_exception(e)
     # v164.0: 조용한 강세 풀 (RS>0 INTRADAY_SNAP_RS_QUIET_STREAK회 연속 유지 종목) 자동 편입
     if len(codes) < max_codes:
         try:
@@ -14115,6 +14235,25 @@ def _apply_next_open_gap_sector_history(score: int, reasons: list[str], ctx: dic
                 score += 6; reasons.append(f"🧪 당일 포착 강도 {rec_score}점 +6")
         if latest_rec.get("entry_hit"):
             score += 4; reasons.append("🎯 진입가 도달 이력 +4")
+    # v165.22 [#2]: Groq CoT 장중 누적 섹터 캐시 → 오늘 강세 섹터면 +5점
+    try:
+        global _groq_sector_daily_cache
+        _today_str = datetime.now().strftime("%Y-%m-%d")
+        if _groq_sector_daily_cache.get("date") == _today_str:
+            _sdc = _groq_sector_daily_cache.get("sectors") or {}
+            # 후보 종목이 누적 캐시의 어떤 테마에 등장하는지 확인
+            _code = str(ctx.get("code") or "")
+            _matched_themes = []
+            for _th, _th_info in _sdc.items():
+                if _code in (_th_info.get("tickers") or []):
+                    _matched_themes.append((_th, _th_info.get("score", 0)))
+            if _matched_themes:
+                _best_th, _best_sc = max(_matched_themes, key=lambda x: x[1])
+                _bonus = 5 if _best_sc >= 5 else 3
+                score += _bonus
+                reasons.append(f"🔥 Groq 오늘 강세섹터 [{_best_th}] +{_bonus}")
+    except Exception as _sdc_e:
+        _swallow_exception(_sdc_e)
     return score, reasons, sector_info
 def _apply_next_open_gap_market_context(score: int, reasons: list[str], cautions: list[str],
                                         ctx: dict, us: dict, strong_dart_codes: set) -> tuple[int, list[str], list[str]]:
@@ -14796,12 +14935,30 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
     )
     for idx, item in enumerate(cand, 1):
         sim_summary = str(item.get("similar_pattern_summary", "") or "").strip()
+        # v165.22 [#3]: 고가(≥15%) 포착 종목 → 눌림 대기 모드 레이블 + 진입가 VWAP 기준 조정
+        _item_chg = float(item.get("change_rate", 0.0) or 0.0)
+        _is_high_price = _item_chg >= 15.0
+        if _is_high_price:
+            _cur = int(item.get("current_price", 0) or 0)
+            # VWAP 캐시에서 조회, 없으면 현재가×0.95
+            _vwap = 0
+            try:
+                _ws_buf = list((_execution_snapshots.get(item.get("code", "")) or []))
+                if _ws_buf:
+                    _vwap = safe_int(_ws_buf[-1].get("weighted_avg", 0))
+            except Exception:
+                pass
+            _pullback_entry = _vwap if _vwap and _vwap < _cur else int(_cur * 0.95 / 10) * 10
+            item["entry_price"] = _pullback_entry
+            item["entry_basis"] = "pullback_wait"
         msg += f"\n{idx}) <b>{item.get('name','')}</b>  {item.get('code','')}  <b>{item.get('score',0)}점</b>\n"
         if sim_summary:
             msg += f"  {sim_summary}\n"
+        if _is_high_price:
+            msg += f"  ⏳ <b>눌림 대기 진입</b> — 현재 {_item_chg:+.1f}% 고가권, 눌림 후 진입 권장\n"
         msg += (
-            f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({float(item.get('change_rate', 0.0) or 0.0):+.1f}%)\n"
-            f"  🎯 지금 진입가 {int(item.get('entry_price',0) or 0):,}원  ·  손절 {int(item.get('stop_loss',0) or 0):,}원  ·  목표 {int(item.get('target_price',0) or 0):,}원\n"
+            f"  📌 현재가 {int(item.get('current_price',0) or 0):,}원  ({_item_chg:+.1f}%)\n"
+            f"  🎯 {'눌림 후 진입가' if _is_high_price else '지금 진입가'} {int(item.get('entry_price',0) or 0):,}원  ·  손절 {int(item.get('stop_loss',0) or 0):,}원  ·  목표 {int(item.get('target_price',0) or 0):,}원\n"
             f"  ⚖️ 손익비 1:{float(item.get('rr',0.0) or 0.0):.1f}  ·  {item.get('market_note','KRX 기준')}\n"
         )
         for line in item.get("reasons", [])[:3]:
@@ -14817,8 +14974,149 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
         msg += f"⚠️ 본 묶음은 {final_label} 결과입니다. 전고 근접·윗꼬리·1분봉 20선 지지를 다시 확인했습니다.\n"
     msg += "⚠️ 이 알림은 장마감 전 즉시 체결 가능한 가격 기준 실전 선진입 플랜입니다. 현재가보다 낮은 눌림 대기 진입가는 사용하지 않습니다."
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
+    # v165.23 [#2]: entry_basis=="pullback_wait" 종목 → _pullback_wait_watch 자동 등록
+    _pullback_registered = 0
+    for item in cand:
+        if str(item.get("entry_basis") or "") == "pullback_wait":
+            try:
+                _register_pullback_wait(item, stage=stage)
+                _pullback_registered += 1
+            except Exception as _pw_e:
+                _swallow_exception(_pw_e)
+    if _pullback_registered:
+        _log_info_msg(f"  ⏳ 눌림 대기 감시 등록: {_pullback_registered}건")
     _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand), phase=phase)
     _log_info_msg(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
+def _register_pullback_wait(candidate: dict, stage: str = "krx") -> None:
+    """v165.23 [#2]: 선진입 고가 종목을 눌림 대기 감시에 등록."""
+    global _pullback_wait_watch
+    code = normalize_stock_code(candidate.get("code") or "")
+    if not code:
+        return
+    stage = "nxt" if str(stage).lower() == "nxt" else "krx"
+    now = _now_kst()
+    deadline_clock = dtime(20, 0) if stage == "nxt" else dtime(15, 30)
+    deadline_ts = datetime.combine(now.date(), deadline_clock, tzinfo=_KST).timestamp()
+    entry_price = int(candidate.get("entry_price", 0) or 0)
+    if not entry_price:
+        return
+    _pullback_wait_watch[code] = {
+        "code": code,
+        "name": str(candidate.get("name") or code),
+        "stage": stage,
+        "entry_price": entry_price,
+        "stop_loss": int(candidate.get("stop_loss", 0) or 0),
+        "target_price": int(candidate.get("target_price", 0) or 0),
+        "current_price_at_register": int(candidate.get("current_price", 0) or 0),
+        "change_rate_at_register": float(candidate.get("change_rate", 0.0) or 0.0),
+        "rr": float(candidate.get("rr", 0.0) or 0.0),
+        "score": int(candidate.get("score", 0) or 0),
+        "reasons": list(candidate.get("reasons") or [])[:3],
+        "registered_ts": time.time(),
+        "registered_time": now.strftime("%H:%M"),
+        "deadline_ts": deadline_ts,
+        "alerted": False,
+        "alert_count": 0,
+    }
+    _save_pullback_wait_watch()
+    _log_info_msg(
+        f"  \u23f3 눌림 대기 등록: {candidate.get('name', code)} "
+        f"진입가 {entry_price:,}원 (현재 {candidate.get('current_price', 0):,}원) "
+        f"만료 {deadline_clock.strftime('%H:%M')}"
+    )
+
+def _run_pullback_wait_monitor() -> None:
+    """v165.23 [#3]: 눌림 대기 감시 종목의 현재가 터치 확인 -> 진입 알람 발송.
+    15분 스케줄로 실행. KRX 15:30 / NXT 20:00 이후 자동 만료.
+    """
+    global _pullback_wait_watch
+    if not _pullback_wait_watch:
+        return
+    krx_open = is_market_open()
+    nxt_open = is_nxt_open()
+    if not krx_open and not nxt_open:
+        return
+    now_ts = time.time()
+    to_remove = []
+    alerted_names = []
+    for code, w in dict(_pullback_wait_watch).items():
+        if not isinstance(w, dict):
+            to_remove.append(code)
+            continue
+        deadline_ts = float(w.get("deadline_ts", 0) or 0)
+        if deadline_ts and now_ts >= deadline_ts:
+            to_remove.append(code)
+            _log_info_msg(f"  \u23f0 눌림 대기 만료: {w.get('name', code)}")
+            continue
+        if w.get("alerted"):
+            to_remove.append(code)
+            continue
+        stage = str(w.get("stage") or "krx")
+        if stage == "nxt" and not nxt_open:
+            continue
+        if stage == "krx" and not krx_open:
+            continue
+        entry_price = int(w.get("entry_price", 0) or 0)
+        if not entry_price:
+            to_remove.append(code)
+            continue
+        current_price = 0
+        try:
+            ws_buf = list((_execution_snapshots.get(code) or []))
+            if ws_buf:
+                current_price = safe_int(ws_buf[-1].get("price", 0))
+        except Exception:
+            pass
+        if not current_price:
+            try:
+                cur = get_stock_price(code)
+                current_price = safe_int((cur or {}).get("price", 0))
+            except Exception:
+                pass
+        if not current_price:
+            continue
+        if current_price <= entry_price:
+            name = w.get("name", code)
+            reg_price = int(w.get("current_price_at_register", 0) or 0)
+            reg_chg = float(w.get("change_rate_at_register", 0.0) or 0.0)
+            stop_loss = int(w.get("stop_loss", 0) or 0)
+            target_price = int(w.get("target_price", 0) or 0)
+            rr = float(w.get("rr", 0.0) or 0.0)
+            reasons = list(w.get("reasons") or [])
+            msg = (
+                f"\u26a1 <b>[눌림 진입 신호]</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f4cc <b>{name}</b> ({code})\n"
+                f"\U0001f4b0 현재가 <b>{current_price:,}원</b>\n"
+                f"\U0001f3af 진입가 <b>{entry_price:,}원</b> 도달 \u2705\n"
+                f"\U0001f6d1 손절 {stop_loss:,}원  \u00b7  \U0001f381 목표 {target_price:,}원\n"
+                f"\u2696\ufe0f 손익비 1:{rr:.1f}\n"
+            )
+            if reg_price:
+                msg += f"\U0001f4ca 선진입 등록 당시: {reg_price:,}원 ({reg_chg:+.1f}%) -> 눌림 포착\n"
+            for r in reasons[:2]:
+                msg += f"  {r}\n"
+            msg += "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u26a0\ufe0f 1분봉 양봉 확인 후 진입 권장"
+            try:
+                send_by_level(msg, level=ALERT_LEVEL_NORMAL)
+                _pullback_wait_watch[code]["alerted"] = True
+                _pullback_wait_watch[code]["alert_count"] = int(w.get("alert_count", 0)) + 1
+                _pullback_wait_watch[code]["alerted_price"] = current_price
+                _pullback_wait_watch[code]["alerted_ts"] = now_ts
+                alerted_names.append(f"{name}({current_price:,}원)")
+                to_remove.append(code)
+                _log_info_msg(f"  \u26a1 눌림 진입 알람 발송: {name} {current_price:,}원 <= 진입가 {entry_price:,}원")
+            except Exception as _ae:
+                _swallow_exception(_ae)
+    for code in set(to_remove):
+        _pullback_wait_watch.pop(code, None)
+    if to_remove:
+        _save_pullback_wait_watch()
+    if alerted_names:
+        _log_info_msg(f"\u26a1 눌림 대기 진입 알람: {', '.join(alerted_names)}")
+    elif _pullback_wait_watch:
+        _log_info_msg(f"  \u23f3 눌림 대기 감시 중: {len(_pullback_wait_watch)}건 (진입 조건 미충족)")
+
 def _scan_recent_dart_materials(days_back: int = 1, max_items: int = 6) -> list:
     """비장중/장전용: 최근(오늘+어제) DART 공시 중 '재료(강/매우강)'만 추려서 반환.
     반환: [{code,name,corp_name,title,grade}, ...]
@@ -38759,6 +39057,7 @@ if __name__ == "__main__":
     except Exception as _pe:
         _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
     _load_preclose_gap_entry_watch()
+    _load_pullback_wait_watch()            # v165.23: 재시작 시 눌림 대기 감시 복원
     _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
     _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
     _load_yt_exclude_keywords()         # v161.36: 재시작 시 YouTube 제외 키워드 복원
@@ -38830,6 +39129,7 @@ if __name__ == "__main__":
         ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
+    schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
     schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
     schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest(force=True)))
     # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
