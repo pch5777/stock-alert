@@ -3,10 +3,44 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.29
-날짜: 2026-04-25
+버전: v165.31
+날짜: 2026-04-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.31 (2026-04-27): NXT 장전/KRX 오픈 초기 섹터팔로우 스킵 — 첫 스캔 10분 블로킹 해소
+  [#1] _scan_sector_leader_follow_candidates(): NXT 프리마켓 + KRX 오픈 초기 즉시 return
+       이유: _collect_sector_leader_follow_candidates()가 183종목 전부 KIS live quote API
+             순차 호출 → 첫 run_scan() 9~10분 블로킹 → NXT 장전 종목이 +10%+ 오른 후 포착
+             08:00 NXT 개장 → 08:10:46 첫 포착 (이미 +10.6%/+14.8% 등 급등 후)
+             KRX 09:00 오픈도 동일 구조로 수분 지연 발생
+       개선점: _is_nxt_premarket_window()(08:00~08:59) + _is_krx_open_burst_window()(09:00~09:03:30)
+              두 시간대에 섹터팔로우 스캔 전체 스킵 → NXT surge top 30 / KRX 상한가·거래량 우선 처리
+              다음 SCAN_INTERVAL 주기부터 섹터팔로우 정상 재개 (장중 포착 기회 유지)
+       주의점: NXT 장전 08:00~08:59 중 섹터팔로우 종목은 첫 스캔에서 포착 안됨
+              → 대신 09:00 이후 정규장 스캔에서 포착 (허용 범위)
+              _is_nxt_premarket_window(), _is_krx_open_burst_window() 둘 다 False면 기존 동작 완전 동일
+       진입불가 게이트 연결: 해당 없음 (스캔 필터링 전용, send_alert 경로 변경 없음)
+- v165.30 (2026-04-27): 07:30 야간시나리오 중복 제거 + 섹터 파생 종목 자동 발굴
+  [#1] _build_premarket_dart_regime_sections(): _format_overnight_watchlist_block() 호출 제거
+       이유: 07:30 액션보드(send_preopen_watchlist)와 리스크평가(send_premarket_risk_assessment)
+             양쪽에서 야간 시나리오 후보 섹션이 중복 출력됨
+       개선점: 리스크평가 메시지에서 wl_block 블록 제거 → 액션보드에만 1회 출력
+       주의점: 야간 시나리오 내용 손실 없음. 액션보드에 그대로 유지됨
+       진입불가 게이트 연결: 해당 없음 (메시지 포맷팅 전용)
+  [#2] SECTOR_SEED_STOCKS 추가 + _register_sector_seed_stocks() + 09:05 스케줄
+       이유: Groq 자동 등록(_groq_auto_register_dynamic_themes)이 종목명→코드 역조회 실패로
+             처음 등장하는 중소형 파생 종목을 드롭함. THEME_MAP은 대형주 9개 테마뿐이라
+             "변압기", "조선기자재" 등 파생 섹터 후보가 비어 워치리스트가 대형주 위주로만 생성됨
+       개선점: 섹터별 시드 종목코드(SECTOR_SEED_STOCKS) 1회 정의 →
+               09:05 장 시작 직후 KIS 동업종 조회(get_sector_stocks_from_kis) →
+               _dynamic_theme_map에 sectors 필드 포함하여 등록 →
+               _iter_theme_stock_candidates_by_sector()가 섹터명으로 정확히 매칭 →
+               overnight_watchlist에 중소형 파생 종목 자동 포함
+               전일 파일(DYNAMIC_THEME_FILE) 저장 → 다음날 07:30 load_dynamic_themes() 복원
+       주의점: 09:05 실행이므로 당일 07:30 브리핑은 전일 등록 데이터 반영
+               시드 코드 오류 시 get_sector_stocks_from_kis가 빈 결과 반환 → 조용히 skip
+               중복 등록 방지: _sector_seed_registered_date 날짜 체크
+       진입불가 게이트 연결: 해당 없음 (dynamic_theme_map 등록 전용, 알람 발송 없음)
 - v165.29 (2026-04-25): 결측 drain 강화 + NXT장전 주의문 + 소형주 -10점 + 52주신고가 +5점
   [#1] _drain_run_scan_repair_queue(): NXT-only time + 복합결측(price+signal_type+score) → NXT 종목도 조용히 폐기
        이유: KRX 마감 후 NXT 상장 종목이 repair 큐에서 최대 RUN_SCAN_REPAIR_MAX_ATTEMPTS회 재시도 후
@@ -8842,6 +8876,16 @@ OVERNIGHT_EVENT_SECTOR_MAP = {
     "양자컴퓨터": ["양자","보안","통신","IT","반도체"],
     "관세무역": ["방산","조선","반도체","자동차","철강","화학"],
     "우주항공": ["우주","항공","방산","위성","소재"],
+}
+# v165.30 [#2]: 섹터 파생 종목 자동 발굴용 시드 종목코드
+# 섹터명 → 해당 업종을 대표하는 종목코드 (KIS 동업종 조회 진입점)
+# 09:05 장 시작 직후 get_sector_stocks_from_kis()로 동업종 중소형 종목 자동 수집
+SECTOR_SEED_STOCKS: dict[str, str] = {
+    "변압기":      "298040",  # 효성중공업 → 전력기기/변압기 업종
+    "조선기자재":  "009540",  # HD한국조선해양 → 조선기자재 업종
+    "반도체소부장": "042700",  # 한미반도체 → 반도체 장비 업종
+    "우주항공":    "047810",  # 한국항공우주 → 항공/방산 업종
+    "로봇":        "277810",  # 레인보우로보틱스 → 로봇/자동화 업종
 }
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -18482,6 +18526,52 @@ def load_dynamic_themes():
                 _log_info_msg(f"  📂 종목 테마 프로파일 {len(_stock_theme_profile)}종목 복원")
     except Exception as e:
         _swallow_exception(e)
+# v165.30 [#2]: 섹터 시드 → KIS 동업종 자동 등록
+def _register_sector_seed_stocks() -> None:
+    """
+    SECTOR_SEED_STOCKS 시드 종목코드 → KIS 동업종 조회 → _dynamic_theme_map 자동 등록.
+    09:05 장 시작 직후 실행 — volume surge 풀이 활성화된 시점 활용.
+    sectors 필드 포함 등록 → _iter_theme_stock_candidates_by_sector()가 섹터명으로 정확히 매칭.
+    파일 저장 → 다음날 07:30 load_dynamic_themes()로 복원.
+    """
+    global _dynamic_theme_map
+    if not SECTOR_SEED_STOCKS:
+        return
+    today = _now_kst().strftime("%m%d")
+    updated = False
+    for sector_name, seed_code in SECTOR_SEED_STOCKS.items():
+        theme_key = f"sector_seed_{sector_name}_{today}"
+        try:
+            peers = get_sector_stocks_from_kis(seed_code)
+            seed_name = _resolve_stock_name(seed_code, seed_code)
+            all_stocks = [(seed_code, seed_name)] + [(c, n) for c, n in peers if c != seed_code]
+            if not all_stocks:
+                continue
+            _dynamic_theme_map[theme_key] = {
+                "desc":       f"[섹터시드] {sector_name}",
+                "sectors":    [sector_name],
+                "events":     [sector_name],
+                "stocks":     all_stocks[:8],
+                "ts":         time.time(),
+                "direction":  "up",
+                "source":     "sector_seed",
+                "win_count":  0,
+                "loss_count": 0,
+            }
+            _log_info_msg(f"  🌱 섹터시드 등록: [{sector_name}] {len(all_stocks[:8])}종목 (시드: {seed_name})")
+            updated = True
+        except Exception as e:
+            _swallow_exception(e)
+    if updated:
+        try:
+            _write_json_atomic(
+                DYNAMIC_THEME_FILE,
+                {k: {**v, "stocks": v["stocks"]} for k, v in _dynamic_theme_map.items()},
+                indent=2,
+            )
+        except Exception as e:
+            _swallow_exception(e)
+
 # ============================================================
 # v41.77 #1: 테마 자동 발굴 엔진
 # ============================================================
@@ -36407,6 +36497,20 @@ def _send_premarket_risk_update_once():
         _log_info_msg("ℹ️ 08:30 장전 리스크 업데이트 이미 처리됨")
         return
     send_premarket_risk_update_if_changed()
+# v165.30 [#2]: 섹터 시드 자동 등록 래퍼 (09:05, 당일 1회)
+_sector_seed_registered_date: str = ""
+def _register_sector_seed_stocks_once():
+    global _sector_seed_registered_date
+    if is_holiday():
+        return
+    today = _now_kst().strftime("%Y-%m-%d")
+    if _sector_seed_registered_date == today:
+        return
+    _sector_seed_registered_date = today
+    try:
+        _register_sector_seed_stocks()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 섹터시드 자동 등록 오류: {e}")
 def _market_leader_profile(now_dt: datetime | None = None) -> dict:
     now_dt = now_dt or _now_kst()
     hhmm = now_dt.strftime("%H:%M")
@@ -36873,12 +36977,7 @@ def _build_premarket_dart_regime_sections() -> str:
             parts.append(f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n")
     except Exception as e:
         _swallow_exception(e)
-    try:
-        wl_block = _format_overnight_watchlist_block()
-        if wl_block:
-            parts.append(f"\n{wl_block}\n")
-    except Exception as e:
-        _swallow_exception(e)
+    # v165.30 [#1]: wl_block 제거 — 야간시나리오는 send_preopen_watchlist(액션보드)에서만 1회 출력
     return "".join(parts)
 def _build_premarket_nxt_section() -> str:
     try:
@@ -38906,6 +39005,13 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
             r["market"] = "NXT"
         _append_scan_alert(alerts, seen, r, seen_code=code)
 def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
+    # v165.31 [#1]: NXT 프리마켓(08:00~08:59) + KRX 오픈 초기(09:00~09:03:30) 스킵
+    # _collect_sector_leader_follow_candidates()가 183종목 전부 live quote API 순차 호출 →
+    # 첫 run_scan()을 9~10분 블로킹 → NXT/KRX 개장 직후 종목이 이미 급등 후 포착됨
+    # 이 시간대엔 NXT surge / KRX 상한가·거래량 종목 우선 처리 후 다음 주기에 재개
+    if _is_nxt_premarket_window() or _is_krx_open_burst_window():
+        _log_info_msg("  ⏭ 섹터팔로우 스킵 [장전/오픈초기] — surge 우선 처리")
+        return
     nxt_only_window = not is_market_open() and is_nxt_open()  # v161.45
     for stock in _collect_sector_leader_follow_candidates(existing_codes=seen):
         code = stock.get("code")
@@ -39486,6 +39592,7 @@ if __name__ == "__main__":
             lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
         ))
     schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))  # v37.0: 명명 함수
+    schedule.every().day.at("09:05").do(_leader_job(_register_sector_seed_stocks_once))  # v165.30: 섹터시드 동업종 자동 등록
     schedule.every().day.at(MARKET_CLOSE).do(_leader_job(
         lambda: None if is_holiday() else on_market_close()
     ))
