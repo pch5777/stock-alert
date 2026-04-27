@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.31
-날짜: 2026-04-27
+버전: v165.32
+날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.32 (2026-04-28): KRX개장10분 no_ask soft + entry_watch 개장차단 제거 + NXT→KRX 진입가 재설정 + WS 딜레이 강화
+  [#1] _should_soft_allow_no_ask_liquidity_general(): KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow 추가
+       이유: 2026-04-27 로그 — 09:07에 동국제강/서울반도체/플루토스/리센스메디컬/대원전선 A급 전종목 집단 차단
+             동시호가(09:00) 처리 완료 전 ask_qty=0 false positive 30건+, 주요 급등 진입 기회 전손
+       개선점: is_market_open() + 09:00≤now<09:10 + grade=="A" → 즉시 True 반환 (기존 change_rate≥15% 병행)
+       주의점: 09:10 이후는 기존 로직 유지. SURGE/STRONG_BUY/EARLY_DETECT sig_type 체크 유지
+       진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅
+  [#2] _handle_entry_watch_block_reason(): check_entry_watch 경로도 KRX 개장 10분 A급 soft skip
+       이유: dispatch 통과→entry_watch 등록→1분 후 check_entry_watch 재실행 시 재차 no_ask 차단
+             플루토스/리센스메디컬/대원전선: 09:06 발송 → 09:07 check_entry_watch에서 즉시 재차 차단
+       개선점: 09:00~09:10 A급 → "개장10분 no_ask soft skip" 로그 후 (False, False) 반환
+       주의점: 10분 후 기존 로직 복귀. no_ask_soft_count 드롭 로직과 독립 동작
+  [#3] _refresh_nxt_preopen_entry_to_krx() 신설 + register_entry_watch() 연결
+       이유: NXT 08:xx 선포착 종목 진입가가 NXT 기준가 저장 → KRX 개장 후 실거래가 괴리
+             동국제강 13,700원(NXT)→실거래 13,570원 / 서울반도체 13,630원 오차 반복
+       개선점: KRX 개장 10~15분(09:00~09:15) + NXT 선포착 탐지 → KRX 실시간가 기준 2.5% 눌림 예상가 재설정
+              2% 이상 차이 시에만 갱신 (소수점 노이즈 방지). API 실패 시 기존 NXT 진입가 유지
+       진입불가 게이트 연결: register_entry_watch → check_entry_watch 기존 체인 ✅
+  [#4] _ws_sync_subscriptions(): WebSocket 구독 딜레이 0.05→0.2/0.3초, _ws_connected 루프 체크 추가
+       이유: 2026-04-27 09:06-09:09 Broken pipe 4회 연발 — 복수 종목 동시 포착 시 ws.send() 집중
+       개선점: 딜레이 0.2초(첫 3개)/0.3초(4개 이상). 루프 내 _ws_connected 재확인으로 재연결 중 구독 시도 차단
+       주의점: 신규 구독 속도 소폭 감소 (0.05→0.2초) — 대신 pipe 안정성 확보
 - v165.31 (2026-04-27): NXT 장전/KRX 오픈 초기 섹터팔로우 스킵 — 첫 스캔 10분 블로킹 해소
   [#1] _scan_sector_leader_follow_candidates(): NXT 프리마켓 + KRX 오픈 초기 즉시 return
        이유: _collect_sector_leader_follow_candidates()가 183종목 전부 KIS live quote API
@@ -12043,11 +12065,16 @@ def _ws_sync_subscriptions(ws) -> None:
             _ws_unsubscribe(ws, c)
         codes_to_add = codes_to_add[:WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)]
 
-    for code in codes_to_add:
+    # v165.32 [#4]: 동시 구독 Broken pipe 방지 — 딜레이 0.05→0.2/0.3초, _ws_connected 재확인
+    # 이유: 2026-04-27 09:06-09:09 복수 종목 동시 포착 시 ws.send() 집중 → KIS pipe 한도 초과
+    for _ws_idx, code in enumerate(codes_to_add):
         if len(_ws_subscribed_codes) >= WS_MAX_SUBSCRIPTIONS:
             break
+        if not _ws_connected:
+            break
         _ws_subscribe(ws, code)
-        time.sleep(0.05)  # 구독 요청 간 약간의 딜레이
+        _ws_delay = 0.3 if _ws_idx >= 3 else 0.2
+        time.sleep(_ws_delay)
 
 
 def _ws_connect_loop() -> None:
@@ -24960,10 +24987,51 @@ def _should_skip_terminated_rearm(signal: dict) -> bool:
     meaningful_upgrade = new_sig_rank > prev_sig_rank or new_grade_rank > prev_grade_rank or new_score >= prev_score + 8
     return not meaningful_upgrade
 
+def _refresh_nxt_preopen_entry_to_krx(s: dict) -> None:
+    """v165.32 [#3]: NXT 선포착 종목 KRX 개장 직후(09:00~09:15) 진입가를 KRX 실시간 가격으로 재설정.
+    이유: NXT 08:xx 선포착 종목 진입가가 NXT 기준가로 저장 → KRX 개장 후 실거래가 괴리
+    2026-04-27: 동국제강 13,700원(NXT)→KRX 13,570원 / 서울반도체 13,630원 등 오차 반복
+    """
+    try:
+        if not is_market_open():
+            return
+        _now_t = datetime.now().time()
+        if not (dtime(9, 0) <= _now_t < dtime(9, 15)):
+            return
+        _market = str(s.get("market") or "").upper()
+        _detect_t = str(s.get("detect_time") or s.get("detected_at") or "")
+        _is_nxt_preopen = (_market == "NXT") or ("08:" in _detect_t)
+        if not _is_nxt_preopen:
+            return
+        _code = normalize_stock_code(s.get("code", ""))
+        if not _code:
+            return
+        _krx_cur = get_stock_price(_code)
+        _krx_price = safe_int((_krx_cur or {}).get("price", 0), 0)
+        if _krx_price <= 0:
+            return
+        _old_entry = safe_int(s.get("entry_price", 0), 0)
+        if _old_entry <= 0:
+            return
+        _new_entry = int(_krx_price * 0.975)  # 2.5% 눌림 예상가
+        if abs(_new_entry - _old_entry) > _old_entry * 0.02:  # 2% 이상 차이 시에만 갱신
+            s["entry_price"] = _new_entry
+            s["_nxt_entry_refreshed"] = True
+            s["_nxt_entry_orig"] = _old_entry
+            _log_info_msg(
+                f"  🔄 NXT→KRX 진입가 재설정: {s.get('name','')}"
+                f" {_old_entry:,}→{_new_entry:,}원 (KRX현재가 {_krx_price:,})"
+            )
+    except Exception as _e:
+        _swallow_exception(_e)
+
 def register_entry_watch(s: dict):
     entry = s.get("entry_price", 0)
     if not entry:
         return
+    # v165.32 [#3]: NXT 선포착 종목 KRX 개장 직후 진입가 재설정
+    _refresh_nxt_preopen_entry_to_krx(s)
+    entry = s.get("entry_price", entry)  # 재설정 후 재조회
     # v163.14 [#1]: 대표진입가=현재가 즉시도달 알람 루프 방지
     # 현재가 >= 신규 진입가이면서 직전 등록과 동일한 경우 60초 쿨다운
     _cur_price_chk = safe_int(s.get("price", 0), 0)
@@ -26606,6 +26674,17 @@ def _handle_entry_watch_block_reason(watch: dict, cur: dict, price: int, entry: 
     blocked_reason = _detect_entry_block_reason(cur, watch, price, entry)
     if not blocked_reason:
         return False, changed
+    # v165.32 [#2]: check_entry_watch 경로 — KRX 개장 10분 A급 no_ask 자동 soft allow
+    # 이유: dispatch 통과→entry_watch 등록→1분 후 check_entry_watch에서 재차 no_ask 차단
+    # 2026-04-27: 플루토스/리센스메디컬/대원전선 발송 성공 후 09:07 check_entry에서 즉시 차단됨
+    if blocked_reason == "no_ask_liquidity" and is_market_open():
+        _now_t_ew = datetime.now().time()
+        _grade_ew = str(watch.get("execution_grade") or watch.get("grade") or "").upper()
+        if dtime(9, 0) <= _now_t_ew < dtime(9, 10) and _grade_ew == "A":
+            _log_info_msg(
+                f"  ✅ 개장10분 no_ask soft skip: {watch.get('name','')} ({watch.get('code','')}) — 동시호가 잔여 구간"
+            )
+            return False, False  # 차단 안 함, 다음 사이클 재확인
     if blocked_reason == "no_ask_liquidity" and _should_soft_allow_no_ask_liquidity(cur, watch):
         # v163.14 [#2]: no_ask_liquidity soft allow 5회 초과 → 감시 드롭
         _na_soft_count = safe_int(watch.get("no_ask_soft_count", 0), 0) + 1
@@ -30041,6 +30120,14 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
     if ask_qty > 0:
         return False
+    # v165.32 [#1]: KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow
+    # 이유: 동시호가 처리 완료 전 ask_qty=0 false positive 집단 발생
+    # 2026-04-27 로그: 09:07에 동국제강/서울반도체/플루토스 등 전종목 집단 차단 → 진입 기회 전손
+    _grade_now = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+    if is_market_open():
+        _now_t = datetime.now().time()
+        if dtime(9, 0) <= _now_t < dtime(9, 10) and _grade_now == "A":
+            return True  # 개장 10분 A급 → 동시호가 잔여 구간 soft allow
     try:
         change_rate = max(float(cur.get("change_rate", 0.0) or 0.0), float(signal.get("change_rate", 0.0) or 0.0))
     except Exception as e:
