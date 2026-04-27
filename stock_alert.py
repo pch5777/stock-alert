@@ -3,10 +3,41 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.35
+버전: v165.36
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.36 (2026-04-28): 알람 중복 제거 + 우선주 알람 차단 + Yahoo Finance crumb 수정
+  [#1] _append_premarket_stats_lines(): wl_block(_format_overnight_watchlist_block) 제거
+       이유: 장전 액션보드(send_preopen_watchlist)와 리스크 평가(send_premarket_risk_assessment)
+             양쪽 메시지에 야간 시나리오 상방 후보 블록이 중복 출력됨
+             v165.30에서 _build_premarket_dart_regime_sections() 경로는 수정됐으나
+             _append_premarket_stats_lines() 경로는 미처 제거 안 됨
+       개선점: 리스크 평가 메시지에서 wl_block 완전 제거 → 액션보드에서만 1회 출력
+       주의점: 야간 시나리오 내용 손실 없음. 액션보드(07:30)에 그대로 유지됨
+       진입불가 게이트 연결: 해당 없음 (메시지 포맷 수정)
+  [#2] _ensure_signal_actionability(): 우선주·스펙주 알람 발송 차단
+       이유: 우선주(대원전선우 등)·스펙주는 유동성·가격 왜곡으로 매매 부적합
+             실제 매매 불가 종목에 알람이 발송되어 혼선 유발
+       개선점: 종목명 끝 "우/우B/1우B/2우B" 패턴 → 우선주 판정, "스팩"/"SPAC" → 스펙주 판정
+               _ensure_signal_actionability() 내 차단 → signal_log 학습 데이터는 유지
+               Telegram 알람 발송만 차단 (내부 학습용으로 활용 가능)
+       주의점: _ensure_signal_actionability()는 send_alert() 진입점 → signal_log 저장 후 차단
+               "우주항공" 같은 종목명은 끝이 "우" 아니므로 영향 없음
+               re.search(우[B0-9]*$ , compact_name) 패턴으로 정밀 매칭
+       진입불가 게이트 연결: _ensure_signal_actionability() 기존 게이트 내 추가 ✅
+  [#3] _fetch_yahoo_finance_crumb() + _get_yf_crumb() 신설,
+       _fetch_us_market_signal_values() crumb + query2 fallback + 재시도 로직 적용
+       이유: 로그에서 야간 내내 "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지" 9회
+             나스닥선물 +0.0% flat 고정 → 선진입 스코어 오산 및 갭예측 부정확
+             Yahoo Finance 2024+ API는 crumb 없이 호출 시 HTML 반환(비JSON 원인)
+       개선점: ① 세션 쿠키 → crumb 취득 (_fetch_yahoo_finance_crumb, TTL 6시간 캐시)
+               ② query1 실패 시 query2 fallback 자동 전환
+               ③ Accept/Origin 헤더 보강으로 Yahoo 차단 우회
+               ④ 심볼별 실패 시에만 throttled warning (불필요 노이즈 제거)
+       주의점: crumb 취득 실패해도 URL fallback 시도 → 기존 flat 동작 유지 (봇 중단 없음)
+               _yf_crumb_cache 글로벌 변수 추가 (_us_cache 근처)
+       진입불가 게이트 연결: 해당 없음 (외부 데이터 수집 경로)
 - v165.35 (2026-04-28): 메이저 수급 섹터 흐름 수집 + 환율/NVDA/SOX 선진입 스코어 연동
   [#1] _fetch_major_investor_sector_flow() 신설 — KIS FHKST03030100 기반
        기관/외국인/개인 투자자별 코스피+코스닥 순매수 상위 30종목 수집
@@ -16888,6 +16919,16 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
         except Exception as e:
             _swallow_exception(e)
         return False
+    # v165.36 [#2]: 우선주·스펙주 알람 차단 — 내부 signal_log 학습은 유지, Telegram 발송만 차단
+    _nm = str(signal.get("name", "") or "").strip()
+    if _nm:
+        _nm_compact = _nm.replace(" ", "")
+        _is_preferred = bool(re.search(r'우[B\d]*$', _nm_compact))
+        _is_spac = "스팩" in _nm or "SPAC" in _nm.upper()
+        if _is_preferred or _is_spac:
+            _kind = "우선주" if _is_preferred else "스팩주"
+            _log_info_msg(f"  ⏭ [게이트 차단] {_nm}({code}) — {_kind} 알람 차단 (학습 유지)")
+            return False
     # v162.8: 단일 게이트 — 상한가·동시호가 진입불가 체크
     block_reason = _pre_send_upper_block(signal)
     if block_reason:
@@ -36729,12 +36770,8 @@ def _append_premarket_stats_lines(msg: str) -> str:
             msg += f"\n📈 <b>유형별 승률</b>\n  {stats_line}\n"
     except Exception as e:
         _swallow_exception(e)
-    try:
-        wl_block = _format_overnight_watchlist_block()
-        if wl_block:
-            msg += f"\n{wl_block}\n"
-    except Exception as e:
-        _swallow_exception(e)
+    # v165.36 [#1]: wl_block 제거 — 야간 시나리오는 send_preopen_watchlist(액션보드)에서만 1회 출력
+    # _append_premarket_stats_lines는 리스크 평가 메시지용 → 중복 차단
     return msg
 def _build_premarket_risk_payload() -> dict:
     us = get_us_market_signals()
@@ -37685,6 +37722,7 @@ def regime_message_line() -> str:
 # 🌐 미국 시장 선행 지표 (Yahoo Finance — 인증 불필요)
 # ============================================================
 _us_cache: dict = {"ts": 0}  # 1시간 캐시
+_yf_crumb_cache: dict = {"crumb": "", "cookies": {}, "ts": 0.0}  # v165.36: Yahoo Finance crumb 캐시 (TTL 6h)
 _korea_etf_cache: dict = {"ts": 0}  # 90분 캐시
 USE_GLOBAL_KOREA_ETF_SCORE = True
 USE_HOLDINGS_WEIGHTED_SECTOR_BONUS = True
@@ -38152,42 +38190,93 @@ def _fetch_kis_overseas_price(symbol: str, excd: str = "NAS") -> float | None:
         return None
 
 
+def _fetch_yahoo_finance_crumb() -> tuple[str, dict]:
+    """v165.36: Yahoo Finance crumb 취득 — 세션 쿠키 기반.
+    Yahoo Finance 2024+는 crumb 없이 v8 chart API 호출 시 HTML 반환(비JSON).
+    """
+    try:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": random.choice(_UA_POOL),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        s.get("https://finance.yahoo.com/", timeout=8, allow_redirects=True)
+        resp = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=8)
+        crumb = (resp.text or "").strip()
+        if crumb and len(crumb) < 50 and "<" not in crumb and " " not in crumb:
+            return crumb, dict(s.cookies)
+    except Exception as e:
+        _swallow_exception(e)
+    return "", {}
+
+def _get_yf_crumb() -> tuple[str, dict]:
+    """v165.36: crumb 캐시 반환 (TTL 6시간). 실패 시 빈 값 허용."""
+    global _yf_crumb_cache
+    if time.time() - float(_yf_crumb_cache.get("ts", 0) or 0) < 21600 and _yf_crumb_cache.get("crumb"):
+        return _yf_crumb_cache["crumb"], _yf_crumb_cache.get("cookies", {})
+    crumb, cookies = _fetch_yahoo_finance_crumb()
+    if crumb:
+        _yf_crumb_cache.update({"crumb": crumb, "cookies": cookies, "ts": time.time()})
+    return crumb, cookies
+
 def _fetch_us_market_signal_values(symbols: dict) -> dict:
     values = {}
+    crumb, cookies = _get_yf_crumb()
     for sym, key in symbols.items():
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=2d"
-            resp = requests.get(url, timeout=8, headers=_random_ua())
-            data = safe_json_response(resp)
-            chart = data.get("chart", {}) if isinstance(data, dict) else {}
-            results = chart.get("result") or []
-            if not results:
-                _warn_throttled_once("us_market_invalid_json", "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지", cooldown_sec=1800.0)
-                time.sleep(0.2)
-                continue
-            result0 = results[0] if isinstance(results[0], dict) else {}
-            meta = result0.get("meta", {}) if isinstance(result0, dict) else {}
-            indicators = result0.get("indicators", {}) if isinstance(result0, dict) else {}
-            quotes = indicators.get("quote") if isinstance(indicators, dict) else []
-            quote0 = quotes[0] if isinstance(quotes, list) and quotes else {}
-            prev = quote0.get("close") if isinstance(quote0, dict) else []
-            prev_close = [c for c in (prev or []) if c is not None]
-            cur_price = meta.get("regularMarketPrice", 0)
-            if key == "vix":
-                values["vix"] = round(float(cur_price), 1)
-            elif key == "dxy":
-                values["dxy"] = round(float(cur_price), 2)
-            elif key == "tnx":
-                values["tnx"] = round(float(cur_price), 3)
-            elif key == "krw":
-                values["krw_usd"] = round(float(cur_price), 1)
-                if prev_close and cur_price:
-                    values["krw_usd_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
-            elif prev_close and cur_price:
-                values[f"{key}_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
-            time.sleep(0.2)
-        except Exception as e:
-            _warn_throttled_once(f"us_market_symbol:{sym}", f"🌐 미국시장 {sym} 응답 처리 실패 → flat fallback 유지 ({type(e).__name__})", cooldown_sec=1800.0)
+        fetched = False
+        # v165.36: query1 → query2 fallback, crumb 파라미터 추가, 재시도 1회
+        base_urls = [
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=2d",
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=2d",
+        ]
+        if crumb:
+            base_urls = [u + f"&crumb={crumb}" for u in base_urls]
+        _headers = {
+            "User-Agent": random.choice(_UA_POOL),
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://finance.yahoo.com/",
+            "Origin": "https://finance.yahoo.com",
+        }
+        for attempt_url in base_urls:
+            try:
+                resp = requests.get(attempt_url, timeout=8, headers=_headers,
+                                    cookies=cookies if cookies else None)
+                data = safe_json_response(resp)
+                chart = data.get("chart", {}) if isinstance(data, dict) else {}
+                results = chart.get("result") or []
+                if not results:
+                    continue  # 다음 URL 시도
+                result0 = results[0] if isinstance(results[0], dict) else {}
+                meta = result0.get("meta", {}) if isinstance(result0, dict) else {}
+                indicators = result0.get("indicators", {}) if isinstance(result0, dict) else {}
+                quotes = indicators.get("quote") if isinstance(indicators, dict) else []
+                quote0 = quotes[0] if isinstance(quotes, list) and quotes else {}
+                prev = quote0.get("close") if isinstance(quote0, dict) else []
+                prev_close = [c for c in (prev or []) if c is not None]
+                cur_price = meta.get("regularMarketPrice", 0)
+                if key == "vix":
+                    values["vix"] = round(float(cur_price), 1)
+                elif key == "dxy":
+                    values["dxy"] = round(float(cur_price), 2)
+                elif key == "tnx":
+                    values["tnx"] = round(float(cur_price), 3)
+                elif key == "krw":
+                    values["krw_usd"] = round(float(cur_price), 1)
+                    if prev_close and cur_price:
+                        values["krw_usd_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
+                elif prev_close and cur_price:
+                    values[f"{key}_chg"] = round((float(cur_price) - prev_close[-1]) / prev_close[-1] * 100, 2)
+                fetched = True
+                break  # 성공 → 다음 심볼로
+            except Exception as e:
+                _swallow_exception(e)
+        if not fetched:
+            _warn_throttled_once("us_market_invalid_json",
+                                 "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지",
+                                 cooldown_sec=1800.0)
+        time.sleep(0.2)
     return values
 def _evaluate_us_market_signal_result(values: dict) -> dict:
     nasdaq_chg = values.get("nasdaq_chg", 0.0)
