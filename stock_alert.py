@@ -3,10 +3,37 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.32
+버전: v165.33
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.33 (2026-04-28): 이렘식 음수SURGE 차단 + fake_breakout 발송전차단 + 뉴스테마 cap_size 버그 + 섹터한도 예외
+  [#1] _build_fallback_scan_signal_type(): change_rate 음수 종목 거래량 단독 SURGE 판정 차단
+       이유: 이렘(009730) change_rate=-29.4%인데 vol_ratio 폭발로 SURGE 91점 [A] 발송
+             OR 조건(volume_ratio >= 3.0)이 부호 검증 없이 SURGE 반환
+       개선점: change_rate > 0 가드 추가 → 거래량 단독 SURGE는 양수 등락률 종목만 허용
+       주의점: change_rate >= PRICE_SURGE_MIN(양수 조건) 경로는 기존 유지
+       진입불가 게이트 연결: analyze() → _apply_analyze_entry_and_filters → _dispatch 기존 체인 ✅
+  [#2-A] send_news_theme_alert() rising stock_input: cap_size 기본값 "small"→""
+  [#2-B] _collect_issue_prewatch_reacted() stock_input: cap_size 기본값 "small"→""
+       이유: KIS API cap_size 미반환 시 "small" 기본값 → v165.29 소형주 -10점 패치가
+             SK증권/한미반도체/효성중공업/알테오젠 등 대형·중형주에 오적용
+             결과: 2026-04-27 뉴스테마 A급 미달 10건 전부 이 버그로 인한 오판 확인
+       개선점: ""(empty) 기본값 → cap_size 명시 확인된 경우에만 소형주 -10점 적용
+       주의점: 뉴스 경로 외 run_scan 경로는 KIS API에서 cap_size 직접 수신 → 영향 없음
+       진입불가 게이트 연결: analyze() → _dispatch_general_alert_signal 기존 체인 ✅
+  [#2-C] _apply_sector_dedup_gate(): 뉴스+주가연동 직접 상승 종목 섹터 한도 +1 예외
+       이유: SK증권 +15.2% — 뉴스 수혜 직접 상승 중인데 증권섹터 3/3 한도로 차단
+             send_news_theme_alert → _dispatch → _apply_sector_dedup_gate 경로에서 섹터 한도 걸림
+       개선점: _news_theme_rising=True 플래그 주입 → 섹터 한도 max_same_sector+1 허용
+       주의점: 뉴스 경로 외 일반 run_scan 종목은 기존 max_same_sector(3) 한도 유지
+       진입불가 게이트 연결: _dispatch_general_alert_signal → _finalize → 섹터게이트 ✅
+  [#4] _build_general_alert_dispatch_context(): fake_breakout_risk 차단을 Telegram 발송 이전으로
+       이유: 기존 blocked_reason=""로 초기화 → 알람 발송 완료 → 15초 후 entry_watch 뒤늦게 차단
+             이렘/동원수산: "✓ [A]" 알람 수신 직후 "🚫 fake_breakout_risk 차단" 패턴 반복
+       개선점: blocked_reason 유지(초기화 제거) → _handle_general_alert_entry_block이 발송 전 차단
+       주의점: cautions/reasons 경고 문구는 entry_watch 차단 경로에서 계속 활용됨
+       진입불가 게이트 연결: _handle_general_alert_entry_block → 차단 시 return False ✅
 - v165.32 (2026-04-28): KRX개장10분 no_ask soft + entry_watch 개장차단 제거 + NXT→KRX 진입가 재설정 + WS 딜레이 강화
   [#1] _should_soft_allow_no_ask_liquidity_general(): KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow 추가
        이유: 2026-04-27 로그 — 09:07에 동국제강/서울반도체/플루토스/리센스메디컬/대원전선 A급 전종목 집단 차단
@@ -30511,9 +30538,14 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
         try:
             blocked_reason = _detect_entry_block_reason(live or {}, s, live_price, entry)
             if blocked_reason == "fake_breakout_risk":
+                # v165.33 [#4]: fake_breakout_risk 차단을 Telegram 발송 이전으로 이동
+                # 이유: 기존 blocked_reason=""로 초기화 → 알람 발송 → 15초 후 entry_watch에서 뒤늦게 차단
+                # 2026-04-27 이렘/동원수산: "✓ ... [A]" 알람 수신 후 즉시 "🚫 fake_breakout_risk 차단"
+                # 개선점: blocked_reason 유지 → _handle_general_alert_entry_block이 발송 전 차단
+                # 주의점: cautions/reasons 주석은 entry_watch 경로 차단 메시지에서 계속 사용됨
                 s.setdefault("cautions", []).append("⚠️ 가짜 돌파 주의 — 거래량 기준 미달 + 윗꼬리 부담, 신규 진입은 재눌림/재돌파 확인 우선")
                 s.setdefault("reasons", []).append("⚠️ 돌파형은 재눌림 또는 재돌파 확인 후 접근")
-                blocked_reason = ""
+                # blocked_reason = ""  ← 제거: 이 라인이 차단을 해제하여 발송 → entry_watch 뒤늦게 차단
         except Exception as e:
             _swallow_exception(e)
             blocked_reason = ""
@@ -33699,7 +33731,11 @@ def send_news_theme_alert(signal: dict):
                 "prev_close":   cur.get("prev_close", 0),
                 "high":         cur.get("high", 0),
                 "open":         cur.get("open", 0),
-                "cap_size":     cur.get("cap_size", "small"),
+                # v165.33 [#2-A]: cap_size 기본값 "small"→"" 수정
+                # 이유: KIS API가 cap_size 미반환 시 "small" 기본값으로 소형주 취급
+                # → v165.29 소형주 -10점 패치가 SK증권/한미반도체/효성중공업 등 대형주에도 적용됨
+                # 결과: 뉴스+주가연동 경로의 A급 미달 10건 전부 이 버그로 인한 오판
+                "cap_size":     cur.get("cap_size", ""),
                 "mktcap":       cur.get("mktcap", 0),
             }
             analyzed = analyze(stock_input)
@@ -33730,6 +33766,8 @@ def send_news_theme_alert(signal: dict):
                 analyzed.setdefault("reasons", []).append(
                     f"📰 뉴스+주가 연동: {signal['theme_desc'][:25]}"
                 )
+                # v165.33 [#2-C]: 뉴스 직접 상승 종목임을 섹터 게이트에 전달 (한도 +1 예외 활성화)
+                analyzed["_news_theme_rising"] = True
                 dispatched = _dispatch_general_alert_signal(
                     analyzed,
                     source_label="뉴스테마 상승"
@@ -33790,7 +33828,8 @@ def _collect_issue_prewatch_reacted(stocks: list[dict], pw: dict | None = None) 
                     "prev_close": cur.get("prev_close", 0),
                     "high": cur.get("high", 0),
                     "open": cur.get("open", 0),
-                    "cap_size": cur.get("cap_size", "small"),
+                    # v165.33 [#2-B]: cap_size 기본값 "small"→"" (issue_prewatch 경로 동일 수정)
+                    "cap_size": cur.get("cap_size", ""),
                     "mktcap": cur.get("mktcap", 0),
                     "issue_prewatch_min_change": min_change,
                     "issue_prewatch_min_volume": min_volume,
@@ -38373,6 +38412,17 @@ def filter_portfolio_signals(alerts: list) -> list:
             # — 대장 종목이 상한가에 가기 전 후속 종목 조기포착 경로 확보
             if peer.get("_sector_leader_follow") or peer.get("_force_news_recheck"):
                 continue
+            # v165.33 [#2-C]: 뉴스+주가연동 직접 상승 종목은 섹터 한도 +1 추가 허용
+            # 이유: 2026-04-27 SK증권 +15.2% — 뉴스 수혜 직접 상승 중인데 섹터 3/3 한도로 차단
+            # 뉴스테마 rising 경로로 A급 판정된 종목은 섹터 편향이 아닌 뉴스 팩트 기반 포착
+            if peer.get("_news_theme_rising"):
+                _max_news_same = _dynamic.get("max_same_sector", 2) + 1  # 뉴스 직접 상승 +1 여유
+                same_sector_passed_news = sum(
+                    1 for p in passed
+                    if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
+                )
+                if same_sector_passed_news < _max_news_same:
+                    continue  # 섹터 한도 초과 안 했으면 통과
             try:
                 rs = calc_real_sector_score(s["code"], peer["code"],
                                             s["name"], peer["name"])
@@ -38451,8 +38501,13 @@ def _build_fallback_scan_signal_type(item: dict) -> str:
     has_live = safe_int(item.get("price", 0), 0) > 0 and bool(str(item.get("name", "") or "").strip())
     if change_rate >= UPPER_LIMIT_THRESHOLD:
         return "NEAR_UPPER"
-    if change_rate >= max(PRICE_SURGE_MIN, 4.0) or volume_ratio >= max(3.0, COMMON_THRESHOLD_3P0):
+    # v165.33 [#1]: change_rate 음수인 종목이 volume_ratio OR 조건으로 SURGE 판정되는 버그 수정
+    # 이유: 2026-04-28 이렘(009730) — change_rate=-29.4%인데 vol_ratio 폭발로 SURGE 91점 [A] 발송
+    # _build_fallback_scan_signal_type의 OR 조건이 부호 검증 없이 거래량만으로 SURGE 반환 가능
+    if change_rate >= max(PRICE_SURGE_MIN, 4.0):
         return "SURGE"
+    if change_rate > 0 and volume_ratio >= max(3.0, COMMON_THRESHOLD_3P0):
+        return "SURGE"  # 거래량 폭발 단독 SURGE는 반드시 양수 등락률 종목만 허용
     if change_rate >= max(0.8, _early_price_min_dynamic) and volume_ratio >= max(1.2, _early_volume_min_dynamic * 0.7):
         return "EARLY_DETECT"
     if any(token in joined for token in ("MID_PULLBACK", "재상승", "시가회복", "박스돌파", "박스지지")):
