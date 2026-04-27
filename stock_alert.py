@@ -34,6 +34,14 @@
        개선점: blocked_reason 유지(초기화 제거) → _handle_general_alert_entry_block이 발송 전 차단
        주의점: cautions/reasons 경고 문구는 entry_watch 차단 경로에서 계속 활용됨
        진입불가 게이트 연결: _handle_general_alert_entry_block → 차단 시 return False ✅
+  [#5] _collect_sector_leader_follow_candidates(): ts_updates 반영 시 live_active 스냅샷 분리
+       이유: 2026-04-27 13:00:49 RuntimeError: dictionary changed size during iteration
+             _scan_krx/nxt_market_candidates → _register_sector_leader_follow_seed → active 키 추가
+             → ts_updates 반영 루프에서 live_active(원본 참조) 순회 중 크기 변경 충돌
+       개선점: live_active = dict(원본) 스냅샷 + ts_updates도 list() 스냅샷 순회
+              수정된 live_active를 .update()로 원본에 일괄 반영 후 저장 (원자적 처리)
+       주의점: v161.31 패치(active_snapshot 순회)와 동일 원리 — ts_updates 반영 경로 누락됐던 것
+       진입불가 게이트 연결: 해당 없음 (상태 저장 경로)
 - v165.32 (2026-04-28): KRX개장10분 no_ask soft + entry_watch 개장차단 제거 + NXT→KRX 진입가 재설정 + WS 딜레이 강화
   [#1] _should_soft_allow_no_ask_liquidity_general(): KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow 추가
        이유: 2026-04-27 로그 — 09:07에 동국제강/서울반도체/플루토스/리센스메디컬/대원전선 A급 전종목 집단 차단
@@ -20003,10 +20011,19 @@ def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, 
     # 순회 완료 후 last_seen_ts 일괄 반영 (순회 중 dict 수정 방지)
     if ts_updates:
         try:
-            live_active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
-            for code, ts in ts_updates.items():
+            # v165.33 [#5]: live_active 직접 참조 → dict() 스냅샷으로 교체
+            # 이유: _register_sector_leader_follow_seed가 동일 run_scan 사이클에서
+            #       _sector_leader_follow_watch["active"]에 새 키 추가 →
+            #       live_active(원본 참조)를 for 루프로 순회하면 RuntimeError 발생
+            # 2026-04-27 13:00:49: _scan_krx_market_candidates → _register → active 키 추가 →
+            #                      ts_updates 반영 시 live_active 순회 중 크기 변경 충돌
+            live_active = dict((_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {})
+            for code, ts in list(ts_updates.items()):  # ts_updates도 스냅샷 순회
                 if code in live_active and isinstance(live_active[code], dict):
                     live_active[code]["last_seen_ts"] = ts
+            # 수정된 live_active를 원본에 반영 후 저장
+            if isinstance(_sector_leader_follow_watch, dict) and "active" in _sector_leader_follow_watch:
+                _sector_leader_follow_watch["active"].update(live_active)
             _save_sector_leader_follow_state()
         except Exception as e:
             _swallow_exception(e)
