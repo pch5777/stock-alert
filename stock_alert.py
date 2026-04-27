@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.33
+버전: v165.34
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.34 (2026-04-28): 선진입 1차→최종 중복 발송 차단 + 섹터팔로우 5분 타임버짓 (KRX/NXT 공통)
+  [#1] send_next_open_gap_alert() final 스캔: initial 발송 종목 중복 제거 (KRX/NXT 공통)
+       이유: 2026-04-27 피에스텍 — 14:45 1차(15:18발송)·15:18 최종(15:30발송) 동일 내용 중복 수신
+             1차 스캔이 섹터팔로우 루프 블로킹으로 26분 지연 → 1차/최종 거의 동시 실행
+             NXT도 19:10 initial/19:20 final 동일 구조로 같은 버그 잠재 → 동일 패치 적용
+       개선점: _mark_preclose_gap_run에 sent_codes 파라미터 추가 → run_state 파일에 저장
+              final 스캔 시 initial sent_codes와 비교 → 중복 종목 제거 후 신규만 발송
+              전부 중복이면 "신규 후보 없음" 로그 후 dedup_skip 마킹, 발송 생략
+       주의점: initial 발송 이력 없으면(첫 실행/재시작) 기존 로직 그대로 동작
+              dedup_skip 마킹도 was_preclose_gap_run의 "sent" 체크와 무관 → 재시도 영향 없음
+  [#2] _scan_sector_leader_follow_candidates(): 사이클당 5분 타임 버짓 추가
+       이유: 2026-04-27 14:41~15:11 섹터 대장 등록 24종목 × 1.5분 = 35분 run_scan 블로킹
+             공매도 ConnectTimeout 12회(×30초) 복합 → 선진입 스캔 26분 지연의 근본 원인
+       개선점: _sfw_start_ts 기준 300초(5분) 초과 시 루프 break → 나머지 다음 사이클로 연기
+              "섹터팔로우 타임버짓 300초 초과" 로그로 모니터링 가능
+       주의점: 5분 내 처리 못한 종목은 다음 run_scan 사이클에서 자동 재시도 (영구 손실 없음)
+              SECTOR_LEADER_FOLLOW 분석 품질 일부 저하 가능 — 안정성 우선
 - v165.33 (2026-04-28): 이렘식 음수SURGE 차단 + fake_breakout 발송전차단 + 뉴스테마 cap_size 버그 + 섹터한도 예외
   [#1] _build_fallback_scan_signal_type(): change_rate 음수 종목 거래량 단독 SURGE 판정 차단
        이유: 이렘(009730) change_rate=-29.4%인데 vol_ratio 폭발로 SURGE 91점 [A] 발송
@@ -15112,12 +15129,13 @@ def _save_preclose_gap_run_state(state: dict):
         _write_json_atomic(PRECLOSE_GAP_RUN_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
     except Exception as e:
         _log_warn_msg(f"⚠️ preclose_gap_run_state 저장 오류: {e}")
-def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0, phase: str = "initial"):
+def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0, phase: str = "initial", sent_codes: list | None = None):
     st = _get_preclose_gap_run_state()
     today = datetime.now().strftime("%Y%m%d")
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
     phase = _normalize_preclose_gap_phase(phase)
     st_key = f"{today}_{stage}_{phase}"
+    # v165.34 [#1]: sent_codes 저장 — 1차→최종 동일 종목 중복 발송 방지용
     st[st_key] = {
         "date": today,
         "stage": stage,
@@ -15126,6 +15144,7 @@ def _mark_preclose_gap_run(stage: str, status: str, candidate_count: int = 0, ph
         "ts": time.time(),
         "time": datetime.now().strftime("%H:%M:%S"),
         "phase": phase,
+        "sent_codes": list(sent_codes or []),  # v165.34 [#1]: 발송 코드 목록 저장
     }
     _save_preclose_gap_run_state(st)
 def _was_preclose_gap_run(stage: str, phase: str = "initial") -> bool:
@@ -15207,6 +15226,27 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
         _log_info_msg(f"📭 [{stage_tag}] 후보 0건 (pool={pool_count}, candidate={candidate_count})")
         _mark_preclose_gap_run(stage, status="zero", candidate_count=0, phase=phase)
         return
+    # v165.34 [#1]: final 스캔 시 initial에서 이미 발송된 동일 종목 중복 제거 (KRX/NXT 공통)
+    # 이유: 2026-04-27 피에스텍 — 14:45 1차(15:18발송)·15:18 최종(15:30발송) 동일 내용 2회 수신
+    #       1차 스캔이 26분 지연돼 거의 동시에 실행 → initial/final 모두 동일 종목 발송
+    #       NXT도 19:10 initial / 19:20 final 동일 구조로 같은 버그 잠재
+    if phase == "final":
+        _initial_key = f"{datetime.now().strftime('%Y%m%d')}_{stage}_initial"
+        _initial_state = _get_preclose_gap_run_state().get(_initial_key, {})
+        _initial_sent = set(str(c) for c in (_initial_state.get("sent_codes") or []) if c)
+        if _initial_sent:
+            _before = len(cand)
+            cand = [c for c in cand if str(c.get("code", "") or "") not in _initial_sent]
+            _dedup_cnt = _before - len(cand)
+            if _dedup_cnt:
+                _log_info_msg(
+                    f"  ⏭ [{stage_tag}] 1차 발송 중복 종목 {_dedup_cnt}건 제외 "
+                    f"(코드: {', '.join(_initial_sent)})"
+                )
+            if not cand:
+                _log_info_msg(f"  📭 [{stage_tag}] 중복 제거 후 신규 후보 없음 — 발송 생략")
+                _mark_preclose_gap_run(stage, status="dedup_skip", candidate_count=0, phase=phase)
+                return
     for item in cand:
         item["stage"] = stage
         item["phase"] = phase
@@ -15276,7 +15316,11 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
             _preclose_gap_sent_today[_c] = _today_str
     if _pullback_registered:
         _log_info_msg(f"  ⏳ 눌림 대기 감시 등록: {_pullback_registered}건")
-    _mark_preclose_gap_run(stage, status="sent", candidate_count=len(cand), phase=phase)
+    # v165.34 [#1]: 발송된 코드 목록을 run_state에 저장 → 최종 스캔 중복 차단용
+    _mark_preclose_gap_run(
+        stage, status="sent", candidate_count=len(cand), phase=phase,
+        sent_codes=[str(c.get("code", "") or "") for c in cand if c.get("code")]
+    )
     _log_info_msg(f"✅ [{stage_tag}] 선진입 후보 알림 발송 완료 (pool={pool_count}, candidate={candidate_count}, sent={len(cand)})")
 def _register_pullback_wait(candidate: dict, stage: str = "krx") -> None:
     """v165.23 [#2]: 선진입 고가 종목을 눌림 대기 감시에 등록."""
@@ -39181,7 +39225,18 @@ def _scan_sector_leader_follow_candidates(alerts: list, seen: set) -> None:
         _log_info_msg("  ⏭ 섹터팔로우 스킵 [장전/오픈초기] — surge 우선 처리")
         return
     nxt_only_window = not is_market_open() and is_nxt_open()  # v161.45
+    # v165.34 [#2]: 섹터 팔로우 루프 사이클당 타임 버짓 5분 제한
+    # 이유: 2026-04-27 14:41~15:11 섹터 대장 등록 24종목 × 1.5분 = 35분 run_scan 블로킹
+    #       14:45 선진입 스캔이 15:11에 시작 (26분 지연) → 1차/최종 거의 동시 실행 → 중복 발송
+    #       공매도 ConnectTimeout 12회 × 30초도 복합 원인
+    _sfw_time_budget = 300.0  # 5분 (seconds)
+    _sfw_start_ts = time.time()
     for stock in _collect_sector_leader_follow_candidates(existing_codes=seen):
+        if time.time() - _sfw_start_ts > _sfw_time_budget:
+            _log_info_msg(
+                f"  ⏱ 섹터팔로우 타임버짓 {_sfw_time_budget:.0f}초 초과 → 나머지 다음 사이클로 연기"
+            )
+            break
         code = stock.get("code")
         if not code or code in seen:
             continue
