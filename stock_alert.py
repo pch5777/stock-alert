@@ -19980,6 +19980,7 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
     return added
 def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, limit_total: int | None = None) -> list:
     # v161.31: active 원본 대신 얕은 복사본으로 순회 — 순회 중 외부에서 키 추가돼도 RuntimeError 방지
+    global _sector_leader_follow_watch  # v165.33 [#5-B]: ts_updates 경로에서 글로벌 재할당 필요
     active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
     if not active:
         return []
