@@ -3,10 +3,39 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.34
+버전: v165.35
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.35 (2026-04-28): 메이저 수급 섹터 흐름 수집 + 환율/NVDA/SOX 선진입 스코어 연동
+  [#1] _fetch_major_investor_sector_flow() 신설 — KIS FHKST03030100 기반
+       기관/외국인/개인 투자자별 코스피+코스닥 순매수 상위 30종목 수집
+       → get_theme_sector_stocks() 매핑 → 섹터별 빈도 집계 → _major_inv_sector_cache 저장
+       이유: 메이저 수급(기관+외국인)이 집중하는 섹터 파악이 종가매매 핵심 — 개별 종목 가점보다
+             어떤 섹터에 자금이 몰리는지를 파악해 선진입 신뢰도 강화
+       개선점: 기관+외국인 동반 상위 섹터 +4점 / 기관 or 외국인 단독 +2점
+               개인만 집중(기관·외국인 없음) -2점 (역발상 경고)
+       주의점: API 실패 시 빈 dict 반환 → 봇 중단 없음. 캐시 TTL 10분
+       진입불가 게이트 연결: 해당 없음 (스코어링 보조, 직접 알람 발송 없음)
+  [#2] run_major_investor_sector_scan() 신설 — 10분 주기 스케줄러
+       이유: 장중 수급 흐름은 시간대별로 변화 — 10:00부터 선진입 직전까지 지속 수집 필요
+             KRX 10:00~14:35 / NXT 10:00~19:10 시간대 가드
+       개선점: 매 10분마다 _fetch_major_investor_sector_flow() 호출 → 캐시 갱신
+       주의점: KIS API 6회 호출(코스피+코스닥 × 기관+외국인+개인) — 10분 간격으로 부하 미미
+       진입불가 게이트 연결: 해당 없음
+  [#3] _apply_next_open_gap_momentum_consistency(): 달러/원 환율 외국인 수급 보정 추가
+       이유: 환율 ≥1400원 또는 당일 +0.8%↑ → 외국인 매도 압력 증가 → 외국인 순매수 신호 할인 필요
+             환율 -0.8%↓ → 외국인 유입 우호 환경 → 추가 가점 정당화
+       개선점: 환율 고/저 상태를 외국인 수급 점수 해석에 반영 (KRX/NXT 공통)
+       주의점: us = get_us_market_signals() 기존 캐시 활용 (추가 API 호출 없음)
+       진입불가 게이트 연결: _apply_next_open_gap_momentum_consistency → 기존 체인 ✅
+  [#4] _apply_next_open_gap_momentum_consistency(): NVDA/SOX 반도체 섹터 선행지표 추가
+       이유: 전날 밤 NVDA/SOX 강세 → 국내 반도체/AI반도체/HBM 섹터 당일 모멘텀 선행
+             기존 코드에 nvda_chg·sox_chg 데이터는 있었지만 선진입 스코어에 미반영
+       개선점: 반도체 관련 섹터 종목이 선진입 후보일 때 NVDA≥3% or SOX≥2% → +3점
+               NVDA≤-3% or SOX≤-2% → -3점
+       주의점: 섹터 판단은 theme_name 키워드 매칭 (반도체/AI반도체/HBM/엔비디아)
+       진입불가 게이트 연결: _apply_next_open_gap_momentum_consistency → 기존 체인 ✅
 - v165.34 (2026-04-28): 선진입 1차→최종 중복 발송 차단 + 섹터팔로우 5분 타임버짓 (KRX/NXT 공통)
   [#1] send_next_open_gap_alert() final 스캔: initial 발송 종목 중복 제거 (KRX/NXT 공통)
        이유: 2026-04-27 피에스텍 — 14:45 1차(15:18발송)·15:18 최종(15:30발송) 동일 내용 중복 수신
@@ -6294,6 +6323,10 @@ def run_daily_self_audit(stage: str = "krx") -> dict:
 # ============================================================
 # v161.26: 섹터별 거래대금 집계 캐시
 _sector_volume_cache: dict = {"ts": 0, "data": []}
+# v165.35: 메이저 투자자별 순매수 섹터 흐름 캐시
+# {"ts": float, "institution": {sector: count}, "foreign": {sector: count}, "individual": {sector: count},
+#  "top_sectors": {"institution": [str,...], "foreign": [str,...], "both": [str,...]}}
+_major_inv_sector_cache: dict = {"ts": 0, "institution": {}, "foreign": {}, "individual": {}, "top_sectors": {}}
 
 def _fetch_sector_volume_rank(top_n: int = 10) -> list:
     """v161.26: 네이버 증권 업종별 시세에서 거래대금 순위 집계.
@@ -6376,6 +6409,105 @@ def _fetch_sector_volume_rank(top_n: int = 10) -> list:
     except Exception as e:
         _swallow_exception(e)
         return []
+def _fetch_major_investor_sector_flow() -> dict:
+    """v165.35: KIS FHKST03030100 기반 투자자별 순매수 상위 종목 조회 → 섹터 집계.
+    코스피+코스닥 × 기관/외국인/개인 = 최대 6회 API 호출.
+    반환: {"institution": {sector: count}, "foreign": {sector: count}, "individual": {sector: count},
+           "top_sectors": {"institution": [top3], "foreign": [top3], "both": [공통top3]}}
+    캐시 TTL: 10분
+    """
+    global _major_inv_sector_cache
+    now = time.time()
+    if now - _major_inv_sector_cache.get("ts", 0) < 600:
+        return dict(_major_inv_sector_cache)
+
+    # FID_BLNG_CLS_CODE: 1=개인, 2=외국인, 3=기관합계
+    investor_map = {"institution": "3", "foreign": "2", "individual": "1"}
+    market_map   = {"J": "코스피", "Q": "코스닥"}
+
+    sector_counts: dict[str, dict[str, int]] = {k: {} for k in investor_map}
+
+    for inv_key, blng_code in investor_map.items():
+        for mkt_code in ("J", "Q"):
+            try:
+                data = _safe_get(
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/investor",
+                    "FHKST03030100",
+                    {
+                        "FID_COND_MRKT_DIV_CODE":  mkt_code,
+                        "FID_COND_SCR_DIV_CODE":   "20176",
+                        "FID_INPUT_ISCD":          "0000",
+                        "FID_DIV_CLS_CODE":        "0",
+                        "FID_BLNG_CLS_CODE":       blng_code,
+                        "FID_ETC_CLS_CODE":        "0",
+                        "FID_RANK_SORT_CLS_CODE":  "0",
+                        "FID_INPUT_CNT_1":         "30",
+                    },
+                )
+                items = data.get("output") or []
+                for item in items:
+                    code = normalize_stock_code(item.get("mksc_shrn_iscd", "") or "")
+                    if not code:
+                        continue
+                    try:
+                        theme_name, _, _ = get_theme_sector_stocks(code)
+                    except Exception:
+                        theme_name = "기타업종"
+                    if not theme_name or theme_name in ("기타업종", "기타", ""):
+                        continue
+                    sector_counts[inv_key][theme_name] = sector_counts[inv_key].get(theme_name, 0) + 1
+            except Exception as e:
+                _swallow_exception(e)
+            time.sleep(0.15)  # KIS API 호출 간격
+
+    # 상위 3 섹터 추출
+    def _top3(d: dict) -> list:
+        return [s for s, _ in sorted(d.items(), key=lambda x: x[1], reverse=True)[:3]]
+
+    inst_top  = _top3(sector_counts["institution"])
+    frgn_top  = _top3(sector_counts["foreign"])
+    both_top  = [s for s in inst_top if s in frgn_top]  # 기관+외국인 공통
+
+    result = {
+        "ts":          now,
+        "institution": sector_counts["institution"],
+        "foreign":     sector_counts["foreign"],
+        "individual":  sector_counts["individual"],
+        "top_sectors": {
+            "institution": inst_top,
+            "foreign":     frgn_top,
+            "both":        both_top,
+        },
+    }
+    _major_inv_sector_cache.update(result)
+    _log_info_msg(
+        f"  💰 메이저수급 섹터: 기관Top={inst_top} / 외국인Top={frgn_top} / 공통={both_top}"
+    )
+    return result
+
+
+def run_major_investor_sector_scan() -> None:
+    """v165.35: 10분 주기 메이저 투자자 섹터 흐름 수집 스케줄러.
+    KRX 10:00~14:35 / NXT 장중(is_nxt_open) 포함 10:00 이후만 동작.
+    """
+    if is_holiday():
+        return
+    now_kst = _now_kst()
+    hour_ok = now_kst.hour >= 10
+    market_ok = is_market_open() or is_nxt_open()
+    if not (hour_ok and market_ok):
+        return
+    # KRX 선진입 직전(14:35) 이후 KRX 장 마감까지는 스킵 (NXT는 계속)
+    if is_market_open() and not is_nxt_open():
+        krx_cutoff = _now_kst().replace(hour=14, minute=35, second=0, microsecond=0)
+        if now_kst >= krx_cutoff:
+            return
+    try:
+        _fetch_major_investor_sector_flow()
+    except Exception as e:
+        _log_error("run_major_investor_sector_scan", e)
+
+
 def _fetch_naver_rank(category: str = "rise", top_n: int = 30) -> list:
     """
     네이버 증권 순위 스크래핑.
@@ -14653,6 +14785,59 @@ def _apply_next_open_gap_momentum_consistency(score: int, reasons: list, caution
                 score += 3; reasons.append("🎯 시나리오 신뢰도高 +3")
             elif sc_conf == "low":
                 score -= 2; cautions.append("❓ 시나리오 신뢰도低 -2")
+    except Exception as e:
+        _swallow_exception(e)
+    # ── v165.35: 달러/원 환율 외국인 수급 보정 ──────────────────────────
+    try:
+        us = get_us_market_signals()
+        krw = float(us.get("krw_usd", 0.0) or 0.0)
+        krw_chg = float(us.get("krw_usd_chg", 0.0) or 0.0)
+        if krw >= 1400 or krw_chg >= 0.8:
+            score -= 2
+            cautions.append(f"💱 고환율({krw:.0f}원 {krw_chg:+.1f}%) 외인매도압력 -2")
+        elif krw_chg <= -0.8:
+            score += 2
+            reasons.append(f"💱 환율하락({krw_chg:+.1f}%) 외인유입우호 +2")
+    except Exception as e:
+        _swallow_exception(e)
+    # ── v165.35: NVDA/SOX 반도체 섹터 선행지표 ──────────────────────────
+    try:
+        us = get_us_market_signals()
+        nvda_chg = float(us.get("nvda_chg", 0.0) or 0.0)
+        sox_chg  = float(us.get("sox_chg",  0.0) or 0.0)
+        theme_name_for_us, _, _ = get_theme_sector_stocks(code)
+        semi_keywords = ("반도체", "AI반도체", "HBM", "엔비디아", "메모리", "파운드리")
+        is_semi = any(kw in str(theme_name_for_us) for kw in semi_keywords)
+        if is_semi:
+            if nvda_chg >= 3.0 or sox_chg >= 2.0:
+                score += 3
+                reasons.append(f"🔵 NVDA{nvda_chg:+.1f}%/SOX{sox_chg:+.1f}% 반도체 선행 +3")
+            elif nvda_chg <= -3.0 or sox_chg <= -2.0:
+                score -= 3
+                cautions.append(f"📉 NVDA{nvda_chg:+.1f}%/SOX{sox_chg:+.1f}% 반도체 하락압력 -3")
+    except Exception as e:
+        _swallow_exception(e)
+    # ── v165.35: 메이저 수급 섹터 흐름 반영 ─────────────────────────────
+    try:
+        inv_cache = _major_inv_sector_cache
+        if inv_cache.get("ts", 0) > 0:
+            theme_for_inv, _, _ = get_theme_sector_stocks(code)
+            top_both = inv_cache.get("top_sectors", {}).get("both", [])
+            top_inst = inv_cache.get("top_sectors", {}).get("institution", [])
+            top_frgn = inv_cache.get("top_sectors", {}).get("foreign", [])
+            indiv    = inv_cache.get("individual", {})
+            inst_c   = inv_cache.get("institution", {}).get(theme_for_inv, 0)
+            frgn_c   = inv_cache.get("foreign", {}).get(theme_for_inv, 0)
+            indiv_c  = indiv.get(theme_for_inv, 0)
+            if theme_for_inv in top_both:
+                score += 4
+                reasons.append(f"🏦🌐 기관+외국인 공통 순매수 섹터({theme_for_inv}) +4")
+            elif theme_for_inv in top_inst or theme_for_inv in top_frgn:
+                score += 2
+                reasons.append(f"💰 메이저 순매수 섹터({theme_for_inv}) +2")
+            elif indiv_c > 0 and inst_c == 0 and frgn_c == 0:
+                score -= 2
+                cautions.append(f"⚠️ 개인 쏠림 섹터({theme_for_inv}) 메이저 부재 -2")
     except Exception as e:
         _swallow_exception(e)
     return score, reasons, cautions
@@ -39804,6 +39989,7 @@ if __name__ == "__main__":
             lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("NXT")
         ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
+    schedule.every(10).minutes.do(_leader_job(run_major_investor_sector_scan))  # v165.35: 메이저 수급 섹터 흐름
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
     schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
     schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
