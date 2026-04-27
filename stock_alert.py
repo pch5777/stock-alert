@@ -34,13 +34,20 @@
        개선점: blocked_reason 유지(초기화 제거) → _handle_general_alert_entry_block이 발송 전 차단
        주의점: cautions/reasons 경고 문구는 entry_watch 차단 경로에서 계속 활용됨
        진입불가 게이트 연결: _handle_general_alert_entry_block → 차단 시 return False ✅
-  [#5] _collect_sector_leader_follow_candidates(): ts_updates 반영 시 live_active 스냅샷 분리
-       이유: 2026-04-27 13:00:49 RuntimeError: dictionary changed size during iteration
-             _scan_krx/nxt_market_candidates → _register_sector_leader_follow_seed → active 키 추가
-             → ts_updates 반영 루프에서 live_active(원본 참조) 순회 중 크기 변경 충돌
-       개선점: live_active = dict(원본) 스냅샷 + ts_updates도 list() 스냅샷 순회
-              수정된 live_active를 .update()로 원본에 일괄 반영 후 저장 (원자적 처리)
-       주의점: v161.31 패치(active_snapshot 순회)와 동일 원리 — ts_updates 반영 경로 누락됐던 것
+  [#5] RuntimeError: dictionary changed size during iteration 완전 수정 (2차)
+  [#5-A] _register_sector_leader_follow_seed(): active 원본 참조 → dict() 복사본 사용
+       이유: 2026-04-27 13:00:49 / 13:17:18 두 번 반복 — 1차 패치(ts_updates 경로)로 미해소
+             active = .get("active") 가 원본 dict 참조 → active[peer_code]={} 직접 수정
+             동일 run_scan 사이클 내 연속 18회 _register 호출 시 원본 dict 크기 동시 변경
+       개선점: active = dict(.get("active")) 복사본 사용 → 수정은 복사본에만, 원본 불변
+              _prune_sector_leader_follow_state({"active": active}) 로 글로벌 교체 방식 유지
+       주의점: 얕은 복사(dict())이므로 내부 value dict는 공유 — value 수정 시 내부 dict도 복사 필요
+  [#5-B] _collect_sector_leader_follow_candidates(): ts_updates → _prune 경유 원자적 반영
+       이유: 1차 패치의 .update(live_active)가 원본 active dict를 직접 수정하는 구조 잔존
+             이후 _prune 순회 중 크기 변경 충돌 가능성 제거 안 됨
+       개선점: _current_active = dict(스냅샷) + ts_updates 병합 → _prune_sector_leader_follow_state
+              경유 글로벌 교체 → 원본 직접 수정(.update) 완전 제거
+       주의점: _prune 호출이 추가되나 경량 함수(TTL 필터만)라 성능 영향 미미
        진입불가 게이트 연결: 해당 없음 (상태 저장 경로)
 - v165.32 (2026-04-28): KRX개장10분 no_ask soft + entry_watch 개장차단 제거 + NXT→KRX 진입가 재설정 + WS 딜레이 강화
   [#1] _should_soft_allow_no_ask_liquidity_general(): KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow 추가
@@ -19935,7 +19942,11 @@ def _register_sector_leader_follow_seed(seed: dict) -> int:
         return 0
     now_ts = time.time()
     expires_ts = now_ts + max(2, int(SECTOR_LEADER_FOLLOW_KEEP_DAYS or 3)) * 86400
-    active = (_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {}
+    # v165.33 [#5-A]: active 원본 참조 → dict() 복사본 사용
+    # 이유: active = .get("active") 는 원본 dict 참조 → active[peer_code]={} 수정 시
+    #       _collect_sector_leader_follow_candidates의 active_snapshot 이전 단계에서
+    #       동일 run_scan 사이클 내 다중 _register 호출이 원본을 동시 수정 → RuntimeError
+    active = dict((_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {})
     added = 0
     for peer_code, peer_name in list(peers or [])[:max(1, int(SECTOR_LEADER_FOLLOW_MAX_PEERS or 1))]:
         peer_code = normalize_stock_code(peer_code)
@@ -20011,19 +20022,16 @@ def _collect_sector_leader_follow_candidates(existing_codes: set | None = None, 
     # 순회 완료 후 last_seen_ts 일괄 반영 (순회 중 dict 수정 방지)
     if ts_updates:
         try:
-            # v165.33 [#5]: live_active 직접 참조 → dict() 스냅샷으로 교체
-            # 이유: _register_sector_leader_follow_seed가 동일 run_scan 사이클에서
-            #       _sector_leader_follow_watch["active"]에 새 키 추가 →
-            #       live_active(원본 참조)를 for 루프로 순회하면 RuntimeError 발생
-            # 2026-04-27 13:00:49: _scan_krx_market_candidates → _register → active 키 추가 →
-            #                      ts_updates 반영 시 live_active 순회 중 크기 변경 충돌
-            live_active = dict((_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {})
-            for code, ts in list(ts_updates.items()):  # ts_updates도 스냅샷 순회
-                if code in live_active and isinstance(live_active[code], dict):
-                    live_active[code]["last_seen_ts"] = ts
-            # 수정된 live_active를 원본에 반영 후 저장
-            if isinstance(_sector_leader_follow_watch, dict) and "active" in _sector_leader_follow_watch:
-                _sector_leader_follow_watch["active"].update(live_active)
+            # v165.33 [#5-B]: ts_updates 반영 시 원본 직접 수정 → _prune 경유 안전 반영
+            # 이유: .update(live_active)가 원본 active dict를 직접 수정 → 동시 순회 시 RuntimeError 재발
+            # 개선: 현재 active 스냅샷에 ts_updates 병합 → _prune_sector_leader_follow_state 경유
+            #       → 글로벌 교체 방식으로 원자적 반영 (원본 직접 수정 완전 제거)
+            _current_active = dict((_sector_leader_follow_watch.get("active") or {}) if isinstance(_sector_leader_follow_watch, dict) else {})
+            for code, ts in list(ts_updates.items()):
+                if code in _current_active and isinstance(_current_active[code], dict):
+                    _current_active[code] = dict(_current_active[code])  # 내부 dict도 복사
+                    _current_active[code]["last_seen_ts"] = ts
+            _sector_leader_follow_watch = _prune_sector_leader_follow_state({"active": _current_active})
             _save_sector_leader_follow_state()
         except Exception as e:
             _swallow_exception(e)
