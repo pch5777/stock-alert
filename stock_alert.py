@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.41
+버전: v165.42
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.42 (2026-04-28): run_scan 전역 락 추가 — 중복 스캔 실행 차단
+  [#1] run_scan(): _run_scan_global_lock 전역 락 추가, 내부 로직을 _run_scan_body()로 분리
+       이유: 재시작 직후 catch-up 스캔(14:57:46)과 정규 스케줄 스캔(14:58:03)이
+             17초 간격으로 동시에 실행됨 → 모든 로그/알람/차단이 2배로 발생
+             기존 _dispatch_scan_lock은 dispatch 단계만 보호 → analyze부터 중복 실행
+             두 스캔이 각자 독립적으로 완주하므로 lock 해제 후 두 번째 dispatch 실행
+       개선점: _run_scan_global_lock (threading.Lock, non-blocking) 추가
+               acquire 실패 시 즉시 "이미 실행 중" 로그 후 return → 중복 실행 방지
+               락은 _run_scan_body() 완료 후 finally에서 항상 해제
+       주의점: non-blocking acquire → 대기 없이 즉시 스킵 (무한 지연 방지)
+               _dispatch_scan_lock은 기존대로 유지 (이중 보호)
+               섹터 브레이크아웃 특보(v165.40)도 _run_scan_body 내에서 실행되므로 중복 방지됨
+       진입불가 게이트 연결: 해당 없음 (스캔 실행 제어 경로)
 - v165.41 (2026-04-28): 실질섹터 중복 제한 완전 제거
   [#1] filter_portfolio_signals(): max_same_sector 섹터 중복 제한 완전 제거
        이유: 오늘 금속 섹터 브레이크아웃에서 구조 재검토 결과
@@ -40178,7 +40191,20 @@ def run_price_first_scan() -> None:
     run_scan()
 
 
+_run_scan_global_lock = threading.Lock()  # v165.42: 스캔 전체 동시 실행 방지 (재시작 catchup+정규 스캔 중복 문제)
+
 def run_scan():
+    # v165.42: 스캔 전체 레벨 락 — catch-up 스캔과 정규 스캔 동시 실행 차단
+    # 기존 _dispatch_scan_lock은 dispatch 단계만 보호 → analyze 단계부터 중복 실행 방지 필요
+    if not _run_scan_global_lock.acquire(blocking=False):
+        _log_info_msg("  ⏭ run_scan 이미 실행 중 — 이번 스캔 스킵 (중복 방지)")
+        return
+    try:
+        _run_scan_body()
+    finally:
+        _run_scan_global_lock.release()
+
+def _run_scan_body():
     code = ""
     ctx = _build_scan_runtime_context()
     if not ctx:
