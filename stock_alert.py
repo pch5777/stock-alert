@@ -3,10 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.40
+버전: v165.41
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.41 (2026-04-28): 실질섹터 중복 제한 완전 제거
+  [#1] filter_portfolio_signals(): max_same_sector 섹터 중복 제한 완전 제거
+       이유: 오늘 금속 섹터 브레이크아웃에서 구조 재검토 결과
+             _apply_scan_sector_gate(1차 섹터 제한) + max_total=6(2차 전체 제한)이
+             이미 충분히 통제하고 있음
+             max_same_sector=3(→5 완화 시도)은 3중 제한의 마지막 과잉 레이어
+             섹터 전체 상승 장에서 오히려 역효과 — 진짜 기회를 차단
+       개선점: 실질섹터 중복 제외 로직 완전 비활성화
+               max_total(6)이 전체 개수를 통제하므로 종목 선택은 사용자 판단
+               calc_real_sector_score 호출 코드는 향후 참고 목적으로 유지
+       주의점: _sector_leader_follow / _force_news_recheck 면제 코드도 이제 불필요
+               (제거 시 코드 단순화 가능 — 별도 리팩터 세션에서 처리)
+               "섹터내 N/M 탈락" 로그는 더 이상 출력되지 않음
+       진입불가 게이트 연결: 해당 없음 (포트폴리오 필터 경로)
 - v165.40 (2026-04-28): 섹터 전체 상승 미포착 2개 레이어 추가 수정
   [A] filter_portfolio_signals(): burst 섹터 실질섹터 중복 한도 완화 (+2)
       이유: 오늘 금속 섹터 — 하이스틸·동일스틸럭스가 강제감시까지 등록됐으나
@@ -39019,27 +39033,12 @@ def filter_portfolio_signals(alerts: list) -> list:
             try:
                 rs = calc_real_sector_score(s["code"], peer["code"],
                                             s["name"], peer["name"])
-                if rs["score"] >= 50:
-                    # 같은 섹터 내 max_same_sector 개수까지는 허용
-                    same_sector_passed = sum(
-                        1 for p in passed
-                        if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
-                    )
-                    _max_same = _dynamic.get("max_same_sector", 2)
-                    # v165.40 [A]: 섹터 전체 상승(burst)이면 실질섹터 한도 +2 완화
-                    # 이유: 오늘 금속 섹터 14종목 동시 상승 → max_same_sector=3 한도로
-                    #       하이스틸·동일스틸럭스 등이 "섹터내 3/3" 탈락
-                    #       burst 감지(5종목 이상 동시 후보)인데 섹터 다양성 제한은 과잉 보수적
-                    _peer_sec = str(peer.get("sector_theme") or peer.get("sector") or "기타").strip() or "기타"
-                    _peer_sector_total = sum(
-                        1 for _a in sorted_alerts
-                        if str(_a.get("sector_theme") or _a.get("sector") or "기타").strip() == _peer_sec
-                    )
-                    if _peer_sector_total >= SCAN_SECTOR_BURST_THRESHOLD:
-                        _max_same = min(_max_same + 2, _max_same + 2)  # burst 섹터 +2 완화
-                    if same_sector_passed >= _max_same:
-                        excluded.add(peer["code"])
-                        _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
+                # v165.41: 실질섹터 중복 제한 완전 제거
+                # 이유: _apply_scan_sector_gate(1차) + max_total=6(2차)이 이미 충분히 제한
+                #       섹터 전체 상승 장에서 max_same_sector=3(또는 5)은 역효과
+                #       → 가장 좋은 종목 선택은 사용자 판단에 맡김
+                # (rs 계산은 향후 참고용으로 유지)
+                _ = rs  # 사용 안 함 (제거하면 calc_real_sector_score 호출 제거도 가능하나 이후 활용 여지)
             except Exception as e:
                 _swallow_exception(e)
     if len(passed) < len(sorted_alerts):
