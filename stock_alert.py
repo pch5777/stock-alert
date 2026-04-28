@@ -3,10 +3,142 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.43
-날짜: 2026-04-28
+버전: v165.47
+날짜: 2026-04-29
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.47 (2026-04-29): "고려" 제거 + 실행 확정 표현 + partial_exit 기록 + 가중 P&L
+  [1] 알람 메시지 표현 변경 — "고려" 완전 제거, 실행 확정 표현으로 통일
+      이유: "고려"는 선택적 행동 → 봇이 해당 단계를 실행한 것으로 기록해야
+            학습 데이터로 활용 가능 ("고려"가 실제로 이뤄졌는지 알 수 없음)
+      개선점:
+        2차 목표 도달: "전량 매도 고려" → "전량 익절 실행"
+        1차 목표 도달: "일부 매도 고려" → "50% 익절 실행"
+        손절 경고: "50% 축소 후 관망 고려" → "50% 손절 실행"
+      주의점: 메시지 텍스트만 변경, 발송 조건/로직 변경 없음
+      진입불가 게이트 연결: 해당 없음 (추적 결과 알람)
+  [2] _record_partial_exit_in_signal_log() 헬퍼 신설 + 각 이벤트 호출
+      이유: 각 단계(target1/target2/stop_warn) 도달 시 실행된 행동을 signal_log에
+            정확히 기록해야 가중 P&L 계산 및 분할매수 전략 학습 가능
+      개선점: partial_exit_events 리스트에 {type, price, pct, time} 추가
+              target2 도달 → type="target2", pct=100.0
+              target1 도달 → type="target1", pct=50.0
+              stop_warn 도달 → type="stop_warn", pct=50.0
+      주의점: rec.setdefault로 기존 이벤트 누적 (덮어쓰기 아님)
+      진입불가 게이트 연결: 해당 없음 (signal_log 저장 경로)
+  [3] _finalize_tracking_exit_record(): 가중 P&L 계산
+      이유: partial_exit_events 없이 종료가격 기준으로만 P&L 계산하면
+            분할매도 전략의 실제 수익이 반영되지 않음
+            예: 1차 목표(50%)에서 수익 실현했어도 이후 하락 시 전량 손실로 기록
+      개선점: phase2_confirmed + partial_exit_events 있으면 가중 계산:
+              partial_pct별 수익 × 비중 합산 + 잔량 × 종료가 수익
+              gross_pnl_pct = weighted_sum / 100
+              partial_exit_events 없으면 기존 단순 P&L 그대로 (하위 호환)
+      주의점: total_partial_pct > 100이면 remaining_pct = 0으로 보정 (max 사용)
+      진입불가 게이트 연결: 해당 없음 (signal_log 종료 기록)
+- v165.46 (2026-04-28): 분할매수 전략 완성 — target 재계산 + 분할목표 + 분할손절
+  [1] 2차 진입가 높을 때 target_price 재계산 (두 경로 모두)
+      이유: v165.45에서 target_price를 무조건 유지 → 2차가 높아 avg > 1차 entry이면
+            원래 target%를 채워도 실수익률이 줄어드는 버그 존재
+            예: 1차100 target110, 2차108, avg104 → target110이면 실수익률 +5.8%
+            올바른 처리: avg기준 same% → new_target = 104 × 1.10 = 114.4 → 전상향
+      개선점: final_target = max(원래목표, avg×(1+원래target%))
+              avg < entry(눌림): 원래 목표 유지 (실수익률 자연 개선)
+              avg > entry(추가매수): 목표 상향 (원래 수익률 보전)
+      주의점: 낮아지는 일은 수학적으로 없음 (max 사용)
+      진입불가 게이트 연결: 해당 없음 (모니터링 경로)
+  [2] 분할 목표가 1차/2차 구조 설정 (두 경로 모두)
+      이유: 분할매수 종목은 단일 목표가보다 단계별 익절 구조가 수익 극대화에 유리
+      개선점: target_price_phase1 = 1차 목표 (기존 target)
+              target_price_phase2 = 1차 목표 + (1차 목표 - avg) × 0.5 (추가 상승 여지)
+              target_price = target_phase1 (기본 모니터링 기준 유지)
+              signal_log extra에 두 목표 모두 저장 → 학습 데이터 완성
+      주의점: phase2_confirmed=False면 단일 목표가 구조 그대로 (하위 호환)
+      진입불가 게이트 연결: 해당 없음 (모니터링 경로)
+  [3] _handle_tracking_target_reached(): 분할 목표가 도달 알람 분리
+      이유: 분할매수 종목에서 1차 목표 도달 시 "전량 보유"가 아닌 "일부 매도 고려" 안내 필요
+            2차 목표 도달 시 별도 "전량 매도 고려" 알람 필요
+      개선점: phase2_confirmed=True이면:
+                1차 목표 도달 → "🎯 1차 목표가 도달 → 일부 매도 고려" + 2차 목표 표시
+                2차 목표 도달 → "🎯🎯 2차 목표가 도달 → 전량 매도 고려"
+              phase2_confirmed=False(일반): 기존 약화징후 조건부 분기 그대로
+      주의점: 2차 목표 도달은 t2_key (_tracking_notified)로 중복 발송 방지
+      진입불가 게이트 연결: 해당 없음 (추적 결과 알람)
+  [4] _process_tracking_result_record(): 분할 손절 — 경고(50% 축소) + 전량
+      이유: 분할매수 종목에서 손절가 도달 시 즉시 전량 손절이 아닌 경고 먼저
+            급락 후 반등 케이스에서 불필요한 손절 방지
+      개선점: phase2_confirmed=True이면:
+                손절가 위 30% 지점(warn_level) 도달 → "⚠️ 1차 손절 경고 — 50% 축소 고려"
+                실제 손절가 도달 → 기존 전량 손절 경로 (변경 없음)
+              경고 알람은 warn_key로 1회만 발송
+      주의점: 경고 발송 후 return True (추적 계속) — 종료 아님
+              실제 손절(price <= stop)은 기존 exit_reason="손절가" 경로 유지
+      진입불가 게이트 연결: 해당 없음 (추적 결과 알람)
+- v165.45 (2026-04-28): 2차 진입 확정 시 평균단가·손절 실제 반영 — 분할매수 로직 완성
+  [#1] _trigger_general_alert_phase2_upgrade(): 2차 "가능" 확정 시 watch 업데이트
+       이유: 2차 진입 판단 알람에 "평균단가 예상"이 표시됐지만 watch/signal_log에 실제 반영 없음
+             → 이후 check_entry_watch(), track_signal_results() 가 1차 진입가 기준으로 계속 추적
+             → 손절/목표 도달 알람이 잘못된 기준으로 계산되어 학습 데이터 오염
+       개선점: p2_decision == "가능" 확정 시 watch 실제 업데이트:
+               entry_price_phase1 = 1차 진입가 (원본 보존)
+               entry_price = avg_price (평균단가)
+               stop_loss = avg_price × (1 - 원래손절%) (재계산)
+               target_price = 유지 (근거/테마 변경 없음, avg 낮아진 만큼 실수익률 개선)
+               phase2_confirmed=True, phase2_entry_price, phase2_pct, phase2_ts 저장
+               _mark_entry_hit_in_signal_log(extra={...}) → signal_log도 동기화
+       주의점: "보류"/"금지" 판정 시 watch 미변경 (1차 기준 유지)
+               _save_entry_watch_active()는 업데이트 후 호출됨
+       진입불가 게이트 연결: 해당 없음 (진입 후 모니터링 경로)
+  [#2] _send_phase2_entry_alert_message(): 동일 업데이트 (entry_watch 모니터링 경로)
+       이유: [#1]과 동일 — 이 경로(check_entry_watch 2차 알람)도 동일한 미반영 버그 존재
+       개선점: [#1]과 동일 로직 적용
+       주의점: _finalize_entry_phase_alert()가 이후 호출되므로 entry_hit 처리는 기존대로
+       진입불가 게이트 연결: 해당 없음 (진입 후 모니터링 경로)
+  [#3] _mark_entry_hit_in_signal_log(): extra 파라미터 추가
+       이유: 2차 진입 확정 데이터(phase2_confirmed, phase2_avg_entry, phase2_stop)를
+             signal_log에 저장하려면 extra 필드 지원 필요
+       개선점: extra dict의 각 필드를 signal_log record에 저장
+               phase2_confirmed=True이면 entry_price도 avg로 갱신
+               → track_signal_results()가 avg_price 기준으로 수익/손절 추적
+               → "분할매수 조건에서 수익이 났는가"를 정확히 학습
+       주의점: extra가 None이면 기존 동작 그대로 (하위 호환)
+       진입불가 게이트 연결: 해당 없음 (signal_log 저장 경로)
+- v165.44 (2026-04-28): 1차 진입 데이터 보존 + 2차 진입 경로 라우팅 + 섹터 재안내 알람 제거
+  [1] save_signal_log(): _force_new_signal_log_record 플래그 처리
+      이유: entry_hit=True 재포착 시 대표 레코드 갱신으로 1차 signal_log 데이터가 오염됨
+            (entry_price는 보호되나 last_detect_*, latest_signal_score 등이 덮어써짐)
+            → track_signal_results()가 1차 진입 이후 수익/손절 추적 데이터를 잘못 학습
+      개선점: _force_new_signal_log_record=True이면 대표 레코드 갱신 건너뜀
+              log_key에 _2차_{HHMM} suffix → 1차 record와 완전 독립 저장
+              _reopen_label="2차재포착" 태그 추가 → 학습 시 구분 가능
+              1차 데이터(entry_price, stop_loss, target_price, entry_hit 이력)는 원본 그대로 유지
+      주의점: _force_new_signal_log_record는 _is_second_entry_reopen=True 경로에서만 설정됨
+              normal 재포착(entry_hit=False)은 기존 대표 갱신 로직 그대로
+      진입불가 게이트 연결: 해당 없음 (signal_log 저장 경로)
+  [2] _finalize_general_alert_dispatch(): start_sector_monitor from_alert=False
+      이유: "섹터 미반영 종목 재안내" 알람이 포착 3분 뒤 자동 발송됨
+            → 사용자에게 같은 종목 두 번 온다는 혼선 유발
+            → 섹터 모멘텀 정보가 진입 확신보다 알람 노이즈로 더 작용
+            봇이 이미 "진입가 도달 전 근거 약화 시 탈락" 로직을 보유하므로 재안내 불필요
+      개선점: from_alert=True → False 변경 (KRX/NXT 일반알람, mid_pullback 양쪽 모두)
+              start_sector_monitor()는 계속 실행 → calc_sector_momentum() 내부 추적 유지
+              _sector_monitor의 섹터 모멘텀 정보는 내부 스코어링·진입 판단에 계속 활용
+              섹터 재안내 알람 발송(_dispatch_sector_resend_alert) 경로만 비활성화
+      주의점: 섹터 모니터링 자체는 유지 — 단순히 from_alert=False로 재발송 경로 차단
+              _sector_resend_relevance_ok()도 여전히 호출되어 모멘텀 품질 검증
+      진입불가 게이트 연결: 해당 없음 (섹터 모니터링 경로)
+  [3] _finalize_general_alert_dispatch(): entry_hit=True 재포착 → 2차 진입 경로 마킹
+      이유: entry_hit=True 종목이 NXT SURGE 2시간 쿨다운 만료 후 재포착되면
+            _allow_existing_entry_hit_header=True로 "1차 진입가 도달" 헤더 재사용됨
+            → 이미 1차 진입 완료된 종목인데 또 "1차 진입가 도달"이 표시
+            → 사용자가 재진입해야 하는지/이미 들어간 건지 판단 불가
+      개선점: entry_hit=True → _is_second_entry_reopen=True + _force_new_signal_log_record=True 마킹
+              _allow_existing_entry_hit_header 설정하지 않음 → "1차 진입가 도달" 헤더 미표시
+              entry_hit=False → 기존 _allow_existing_entry_hit_header 로직 유지
+              로그: "♻️ {name} — entry_hit 재포착 → 2차진입 경로 (1차 데이터 보존)"
+      주의점: 2차 진입 실제 판단은 기존 _judge_phase2_entry() 경로(check_entry_watch)가 담당
+              이 패치는 신규 포착 경로에서 1차 경로로 잘못 흐르는 것만 차단
+      진입불가 게이트 연결: 기존 _pre_send_upper_block() 게이트 경유 유지 ✅
 - v165.43 (2026-04-28): 경량 급등 감지 스캔 + 등락률순위 API 수정 + WebSocket 한도 확대
   [1] _run_surge_velocity_scan() 신설 + 30초 스케줄 등록
       이유: 기존 run_scan()은 naver_rise 수집→후보군 구성→analyze() 파이프라인에 수분 소요
@@ -16942,7 +17074,8 @@ def _dispatch_mid_pullback_signal(signal: dict) -> None:
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(signal):
         retry_snap = _clone_alert_snapshot_for_sector_retry(signal)
         retry_snap["_alert_sender"] = "mid_pullback"
-        start_sector_monitor(signal["code"], signal["name"], signal.get("signal_type", ""), signal.get("detect_time", ""), True, alert_snapshot=retry_snap)
+        # v165.44 [2]: from_alert=False → 섹터 모멘텀 내부 추적만, 재안내 알람 발송 금지
+        start_sector_monitor(signal["code"], signal["name"], signal.get("signal_type", ""), signal.get("detect_time", ""), False, alert_snapshot=retry_snap)
     _record_mid_pullback_alert_state(signal)
     tag = "[장중돌파]" if signal.get("is_intraday") else "[일봉]"
     _log_info_msg(f"  ✓ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점")
@@ -21978,6 +22111,20 @@ def save_signal_log(stock: dict):
                 stock["target_pct"]   = 10.0
         data = _load_signal_log_data()
         ctx = _build_signal_log_context(stock)
+        # v165.44 [1]: _force_new_signal_log_record=True이면 대표 레코드 갱신 금지 (1차 데이터 보존)
+        # entry_hit=True 재포착(2차진입 시나리오)에서 호출됨 — 1차 signal_log 독립 유지
+        if stock.get("_force_new_signal_log_record"):
+            # log_key에 _2차 suffix 추가로 새 독립 레코드 생성
+            orig_key = ctx["log_key"]
+            ctx["log_key"] = f"{orig_key}_2차_{_now_kst().strftime('%H%M')}"
+            data[ctx["log_key"]] = _build_new_signal_log_record(stock, ctx)
+            data[ctx["log_key"]]["_reopen_label"] = "2차재포착"
+            stock["signal_log_key"] = ctx["log_key"]
+            data = _prune_signal_log(data)
+            _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
+            _record_capture_funnel_event("saved", stock, {"mode": "new_2차"})
+            _log_info_msg(f"  💾 신호 저장(2차재포착): {stock['name']} [{ctx['sig_type']}] → {ctx['log_key']}")
+            return
         if _update_representative_signal_log_record(data, stock, ctx):
             return
         data[ctx["log_key"]] = _build_new_signal_log_record(stock, ctx)
@@ -22794,6 +22941,27 @@ def _process_tracking_trailing_mode(data, log_key, rec, code, rec_name, price, e
 def _handle_tracking_target_reached(data, log_key, rec, code, price, entry, target):
     trailing_key = f"{log_key}_trailing"
     if price < target:
+        # v165.46 [3]: 2차 목표가 도달 체크 (1차 이미 도달한 경우)
+        target2 = safe_int(rec.get("target_price_phase2", 0), 0)
+        if rec.get("phase2_confirmed") and target2 > 0 and price >= target2:
+            t2_key = f"{log_key}_target2"
+            if t2_key not in _tracking_notified:
+                _tracking_notified.add(t2_key)
+                entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=True, include_hit_time=False)
+                send_with_chart_buttons(
+                    f"🎯🎯 <b>[2차 목표가 도달 → 전량 익절 실행]</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🔴 <b>{rec.get('name', code)}</b>  <code>{code}</code>\n"
+                    f"{entry_hit_line}\n"
+                    f"현재가 <b>{price:,}원</b>  2차목표 {target2:,}원\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📤 분할매수 전량 익절 실행\n"
+                    f"📐 평균단가: {entry:,}원  |  수익률: <b>{round((price-entry)/entry*100,1):+.1f}%</b>",
+                    code, rec.get("name", code)
+                )
+                _record_partial_exit_in_signal_log(rec, "target2", price, 100.0)
+                _log_info_msg(f"  🎯🎯 2차 목표 익절 실행: {rec.get('name', code)} {price:,} / 2차목표 {target2:,}")
+            return True, True
         return False, False
     if rec.get("trailing_active"):
         return True, False
@@ -22820,9 +22988,20 @@ def _handle_tracking_target_reached(data, log_key, rec, code, price, entry, targ
     _tracking_notified.add(trailing_key)
     entry_hit_line = _build_entry_hit_line(entry, display_rec, include_hit_price=True, include_hit_time=True)
     weakness_lines = _build_tracking_weakness_reason_lines(weakness)
-    if weakness_score >= TRACKING_WEAKNESS_PARTIAL_EXIT_SCORE:
-        title = "🎯 <b>[목표가 도달 → 분할익절 우선·타이트 트레일링]</b>"
-        body = "⚠️ 힘 약화 징후가 있어 잔량은 더 보수적으로 관리합니다"
+    # v165.46 [3]: 분할매수 종목은 "1차 목표가 도달 → 일부 매도 고려"로 표시
+    is_phase2_confirmed = bool(rec.get("phase2_confirmed"))
+    target2 = safe_int(rec.get("target_price_phase2", 0), 0)
+    if is_phase2_confirmed and target2 > 0:
+        if weakness_score >= TRACKING_WEAKNESS_PARTIAL_EXIT_SCORE:
+            title = "🎯 <b>[1차 목표가 도달 → 50% 익절 실행·타이트 트레일링]</b>"
+            body = "⚠️ 힘 약화 징후 — 1차 물량 50% 익절 실행, 잔량은 보수적으로 관리"
+        else:
+            title = "🎯 <b>[1차 목표가 도달 → 50% 익절 실행]</b>"
+            body = f"📤 분할매수 1차 익절 실행 (50%)\n🎯 2차 목표: <b>{target2:,}원</b> ({round((target2-entry)/entry*100,1):+.1f}%) 잔량 50% 보유"
+        _record_partial_exit_in_signal_log(rec, "target1", price, 50.0)
+    elif weakness_score >= TRACKING_WEAKNESS_PARTIAL_EXIT_SCORE:
+        title = "🎯 <b>[목표가 도달 → 분할익절 실행·타이트 트레일링]</b>"
+        body = "⚠️ 힘 약화 징후 — 분할 익절 실행 후 잔량 보수적 관리"
     else:
         title = "🎯 <b>[목표가 도달 → 보유 유지·트레일링]</b>"
         body = "✅ 지금은 <b>매도 지시가 아니라 보유 유지 구간</b>입니다"
@@ -22840,8 +23019,37 @@ def _handle_tracking_target_reached(data, log_key, rec, code, price, entry, targ
     )
     return True, True
 
+def _record_partial_exit_in_signal_log(rec: dict, exit_type: str, price: int, pct: float) -> None:
+    """v165.47: 분할 매도/손절 이벤트를 signal_log record에 기록.
+    exit_type: "target1" | "target2" | "stop_warn"
+    pct: 실행된 비중 (50.0 = 50%)
+    학습 목적: partial_exit_events가 쌓이면 _finalize_tracking_exit_record()에서 가중 P&L 계산
+    """
+    if not isinstance(rec, dict):
+        return
+    events = rec.setdefault("partial_exit_events", [])
+    events.append({
+        "type": exit_type,
+        "price": int(price),
+        "pct": float(pct),
+        "time": _now_kst().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+    rec["partial_exit_events"] = events
+
 def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, log_key):
-    gross_pnl_pct = round((price - entry) / entry * 100, 2) if entry else 0
+    # v165.47 [3]: 분할매수 종목은 partial_exit_events 기반 가중 P&L 계산
+    partial_events = list(rec.get("partial_exit_events") or [])
+    if partial_events and rec.get("phase2_confirmed") and entry:
+        total_partial_pct = sum(e["pct"] for e in partial_events)
+        remaining_pct = max(0.0, 100.0 - total_partial_pct)
+        weighted_gross = sum(
+            e["pct"] * (e["price"] - entry) / entry * 100
+            for e in partial_events if entry
+        )
+        weighted_gross += remaining_pct * (price - entry) / entry * 100
+        gross_pnl_pct = round(weighted_gross / 100, 2)
+    else:
+        gross_pnl_pct = round((price - entry) / entry * 100, 2) if entry else 0
     net_pnl_pct = _calc_net_pnl_pct(gross_pnl_pct, rec.get("round_trip_cost_pct"))
     status = "수익" if net_pnl_pct > 0 else ("손실" if net_pnl_pct < 0 else "본전")
     rec["status"] = status
@@ -22947,6 +23155,29 @@ def _process_tracking_result_record(data, today, log_key, rec):
         return target_updated or True
     exit_reason = None
     if price <= stop:
+        # v165.46 [4]: 분할매수 종목은 손절도 분할 처리
+        # 1차 경고 손절: 손절가 접근 시 "50% 축소 고려" 알람 (전량 손절 전 경고)
+        if rec.get("phase2_confirmed"):
+            warn_key = f"{log_key}_stop_warn"
+            warn_level = int(stop + (entry - stop) * 0.3) if entry > stop else stop
+            if price <= warn_level and warn_key not in _tracking_notified:
+                _tracking_notified.add(warn_key)
+                entry_hit_line = _build_entry_hit_line(entry, rec, include_hit_price=True, include_hit_time=False)
+                send_with_chart_buttons(
+                    f"⚠️ <b>[손절 경고 — 50% 손절 실행]</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🔵 <b>{rec.get('name', code)}</b>  <code>{code}</code>\n"
+                    f"{entry_hit_line}\n"
+                    f"현재가 <b>{price:,}원</b>  손절가 {stop:,}원\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"⚠️ 손절가 근접 — <b>50% 손절 실행</b>\n"
+                    f"📐 평균단가: {entry:,}원  |  손실률: <b>{round((price-entry)/entry*100,1):+.1f}%</b>\n"
+                    f"🔵 손절가({stop:,}) 도달 시 잔량 전량 청산 실행",
+                    code, rec.get("name", code)
+                )
+                _record_partial_exit_in_signal_log(rec, "stop_warn", price, 50.0)
+                _log_info_msg(f"  ⚠️ 분할손절 50% 실행: {rec.get('name', code)} {price:,} / 손절 {stop:,}")
+                return True  # 경고만 발송, 아직 종료 아님
         exit_reason = "손절가"
     elif elapsed_days >= TRACK_MAX_DAYS and not rec.get("trailing_active"):
         # v165.18 [#4]: 5일 경과 결과는 NXT 마감(20:00) 이후에만 발송
@@ -26243,7 +26474,7 @@ def _send_phase2_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
         f"│ 📍 현재가  <b>{price:,}원</b>  ({ctx['diff_str']})\n"
         f"│ 💰 권장 추가비중: <b>{p2_pct}%</b>\n"
         f"│ 📊 총 누적 권장비중: <b>{total_pct}%</b>\n"
-        f"│ 📐 평균단가 예상: <b>{avg_price:,}원</b>\n"
+        f"│ 📐 평균단가: <b>{avg_price:,}원</b>\n"
         f"│ 🛡 손절가: <b>{stop_adj}</b>\n"
         f"├─────────────────────\n"
         f"│ <b>판단 근거</b>\n"
@@ -26252,6 +26483,51 @@ def _send_phase2_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
         f"└─────────────────────",
         watch["code"], watch["name"]
     )
+    # v165.45: 2차 진입 "가능" 확정 시 watch 실제 업데이트
+    if p2_decision == "가능" and avg_price > 0:
+        orig_stop_pct = abs(ctx["stop_pct"]) / 100 if ctx.get("stop_pct") else 0.07
+        new_stop_final = int(avg_price * (1 - orig_stop_pct) / 10) * 10
+        # v165.46 [1]: target_price 재계산 — avg가 높아진 경우 목표도 올려야 원래 수익률 유지
+        # avg가 낮아진 경우(눌림): max(원래목표, avg기준목표) → 원래 목표 유지 (실수익률 더 개선)
+        # avg가 높아진 경우(모멘텀 추가매수): avg × (1 + 원래target%) → 목표 상향
+        orig_target_price = watch.get("target_price", 0)
+        orig_entry_p1 = watch.get("entry_price", 0)  # 아직 갱신 전
+        if orig_target_price > 0 and orig_entry_p1 > 0:
+            orig_target_pct = (orig_target_price - orig_entry_p1) / orig_entry_p1
+            new_target_from_avg = int(avg_price * (1 + orig_target_pct) / 10) * 10
+            final_target = max(orig_target_price, new_target_from_avg)  # 낮아지는 일 없음
+        else:
+            final_target = orig_target_price
+        # v165.46 [2]: 분할 목표가 — 1차 목표(기존) + 2차 목표(추가 상승 여지)
+        # 2차 목표 = 1차 목표 + (1차 목표 - avg) × 0.5 (절반 추가 상승)
+        target_phase1 = final_target
+        target_phase2 = int((final_target + (final_target - avg_price) * 0.5) / 10) * 10 if final_target > avg_price else final_target
+        watch["phase2_confirmed"] = True
+        watch["phase2_entry_price"] = price
+        watch["phase2_pct"] = p2_pct
+        watch["phase2_ts"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        watch["entry_price_phase1"] = watch.get("entry_price", 0)  # 1차 보존
+        watch["entry_price"] = avg_price   # 평균단가로 업데이트
+        watch["stop_loss"] = new_stop_final  # avg 기준 손절 재계산
+        watch["target_price_phase1"] = target_phase1  # 1차 목표 보존
+        watch["target_price"] = target_phase1          # 현재 모니터링 기준
+        watch["target_price_phase2"] = target_phase2   # 2차 목표 (추가 상승)
+        try:
+            _mark_entry_hit_in_signal_log(
+                watch.get("code", ""),
+                watch.get("signal_type", ""),
+                hit_price=avg_price,
+                hit_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                log_key=watch.get("signal_log_key"),
+                extra={
+                    "phase2_confirmed": True, "phase2_avg_entry": avg_price,
+                    "phase2_stop": new_stop_final, "target_price_phase1": target_phase1,
+                    "target_price_phase2": target_phase2,
+                },
+            )
+        except Exception as _ep2:
+            _swallow_exception(_ep2)
+        _log_info_msg(f"  ✅ 2차진입 확정 — {watch.get('name','')} avg={avg_price:,} stop={new_stop_final:,} target1={target_phase1:,} target2={target_phase2:,}")
 def _finalize_entry_phase_alert(watch: dict, price: int, entry: int, reach_via_recovery: bool, ctx: dict, is_phase1: bool) -> None:
     watch['entry_hit'] = True
     watch['entry_hit_time'] = ctx["entry_hit_ts"]
@@ -26860,8 +27136,10 @@ def _refine_pullback_ratio_from_escape(data: dict):
             _log_info_msg(f"  📊 이탈 후속 분석: 이탈 후 되돌림 {len(came_back)}/{len(recent)} — 현재 비율 {cur_ratio:.2f} 유지")
     except Exception as e:
         _log_warn_msg(f"⚠️ 이탈 후속 비율 조정 오류: {e}")
-def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None, log_key: str | None = None) -> None:
-    """진입가 도달(HIT) 이벤트를 signal_log에 기록. (가상진입/학습용)"""
+def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | None = None, hit_time: str | None = None, log_key: str | None = None, extra: dict | None = None) -> None:
+    """진입가 도달(HIT) 이벤트를 signal_log에 기록. (가상진입/학습용)
+    extra: 2차 진입 확정 시 추가 필드 저장 (phase2_confirmed, phase2_avg_entry, phase2_stop 등)
+    """
     try:
         data = {}
         try:
@@ -26909,6 +27187,16 @@ def _mark_entry_hit_in_signal_log(code: str, signal_type: str, hit_price: int | 
                 rec['entry_hit_date'] = hit_date
             if hit_clock:
                 rec['entry_hit_clock'] = hit_clock
+            # v165.45: 2차 진입 확정 시 extra 필드 저장 (학습 데이터 분할매수 완성)
+            if extra and isinstance(extra, dict):
+                for _ek, _ev in extra.items():
+                    rec[_ek] = _ev
+                # 2차 확정이면 entry_price도 avg로 갱신 (track_signal_results 기준 변경)
+                if extra.get("phase2_confirmed") and extra.get("phase2_avg_entry"):
+                    rec["entry_price_phase1"] = rec.get("entry_price", 0)
+                    rec["entry_price"] = int(extra["phase2_avg_entry"])
+                if extra.get("phase2_stop"):
+                    rec["stop_loss"] = int(extra["phase2_stop"])
             data[target_key] = rec
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
     except Exception as e:
@@ -31288,6 +31576,48 @@ def _trigger_general_alert_phase2_upgrade(s: dict, existing_hit_watch: dict, old
         )
         _mark_phase2_upgrade_alert_sent(existing_hit_watch, new_sig_type, p2_decision, p2_price)
         _mark_entry_followup_alert_sent(existing_hit_watch, "phase2", p2_decision, p2_price)
+        # v165.46 [1][2]: 2차 진입 "가능" 확정 시 watch 완전 업데이트
+        if p2_decision == "가능" and avg_price > 0:
+            orig_entry_p1 = existing_hit_watch.get("entry_price", avg_price)
+            orig_stop_pct = abs((orig_entry_p1 - existing_hit_watch.get("stop_loss", 0)) / orig_entry_p1) if orig_entry_p1 > 0 else 0.07
+            new_stop_final = int(avg_price * (1 - orig_stop_pct) / 10) * 10
+            # [1] target_price 재계산: avg 높아진 경우 목표 상향, 낮아진 경우 원래 목표 유지
+            orig_target = existing_hit_watch.get("target_price", 0)
+            if orig_target > 0 and orig_entry_p1 > 0:
+                orig_target_pct = (orig_target - orig_entry_p1) / orig_entry_p1
+                new_target_from_avg = int(avg_price * (1 + orig_target_pct) / 10) * 10
+                final_target = max(orig_target, new_target_from_avg)
+            else:
+                final_target = orig_target
+            # [2] 분할 목표가 설정
+            target_phase1 = final_target
+            target_phase2 = int((final_target + (final_target - avg_price) * 0.5) / 10) * 10 if final_target > avg_price else final_target
+            existing_hit_watch["phase2_confirmed"] = True
+            existing_hit_watch["phase2_entry_price"] = p2_price
+            existing_hit_watch["phase2_pct"] = p2_pct
+            existing_hit_watch["phase2_ts"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            existing_hit_watch["entry_price_phase1"] = orig_entry_p1
+            existing_hit_watch["entry_price"] = avg_price
+            existing_hit_watch["stop_loss"] = new_stop_final
+            existing_hit_watch["target_price_phase1"] = target_phase1
+            existing_hit_watch["target_price"] = target_phase1
+            existing_hit_watch["target_price_phase2"] = target_phase2
+            try:
+                _mark_entry_hit_in_signal_log(
+                    existing_hit_watch.get("code", ""),
+                    existing_hit_watch.get("signal_type", ""),
+                    hit_price=avg_price,
+                    hit_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    log_key=existing_hit_watch.get("signal_log_key"),
+                    extra={
+                        "phase2_confirmed": True, "phase2_avg_entry": avg_price,
+                        "phase2_stop": new_stop_final, "target_price_phase1": target_phase1,
+                        "target_price_phase2": target_phase2,
+                    },
+                )
+            except Exception as _e2:
+                _swallow_exception(_e2)
+            _log_info_msg(f"  ✅ 2차진입 확정 — {existing_hit_watch.get('name','')} avg={avg_price:,} stop={new_stop_final:,} target1={target_phase1:,} target2={target_phase2:,}")
         _save_entry_watch_active()
     except Exception as e:
         _log_warn_msg(f"  ⚠️ phase2 트리거 오류: {e}")
@@ -31363,9 +31693,20 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     # v161.43: 기존 entry_hit watch 존재 시 헤더에 "+ 1차 진입가 도달" 반영 허용
     # v162.6: notify_count>=1 조건 추가 — 사용자가 실제 1차 알람 받은 경우에만 헤더 반영
     #         1차 알람 미수령(notify_count=0) 상태에서 NEAR_UPPER에 '1차 진입가 도달' 표시 시 혼란
+    # v165.44 [1][3]: entry_hit 상태에 따른 분기
+    # entry_hit=False → 기존대로 _allow_existing_entry_hit_header (1차 도달 헤더 허용)
+    # entry_hit=True  → _is_second_entry_reopen 마킹 (1차 헤더 재사용 금지, signal_log 새 레코드 강제)
     _, _existing_watch_nc = _find_existing_entry_hit_watch(code)
     if _existing_watch_nc is not None and safe_int(_existing_watch_nc.get("notify_count", 0), 0) >= 1:
-        s["_allow_existing_entry_hit_header"] = True
+        if _existing_watch_nc.get("entry_hit"):
+            # 이미 1차 진입 완료된 종목 재포착 → 2차 진입 검토 경로
+            s["_is_second_entry_reopen"] = True
+            s["_allow_existing_entry_hit_header"] = False
+            # signal_log: 1차 데이터 보존 위해 대표 레코드 갱신 금지 (신규 독립 레코드 저장)
+            s["_force_new_signal_log_record"] = True
+            _log_info_msg(f"  ♻️ {name} — entry_hit 재포착 → 2차진입 경로 (1차 데이터 보존)")
+        else:
+            s["_allow_existing_entry_hit_header"] = True
     # v163.1: send_alert 전 게이트 선차단 확인 — 차단 시 register_entry_watch도 스킵
     _gate_block = _pre_send_upper_block(s)
     if _gate_block:
@@ -31421,7 +31762,10 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
     if len(_sector_monitor) < 8 and _needs_sector_resend_for_alert(s):
         sector_retry_snap = _clone_alert_snapshot_for_sector_retry(s)
         sector_retry_snap["_alert_sender"] = "send_alert"
-        start_sector_monitor(code, name, signal_type, s.get("detect_time", ""), True, alert_snapshot=sector_retry_snap)
+        # v165.44 [2]: from_alert=False → 섹터 모니터링·모멘텀 추적은 유지, 재안내 알람 발송 금지
+        # 이유: "섹터 미반영 재안내" 알람이 사용자에게 혼선 유발 (같은 종목 두 번 전송 인상)
+        #       섹터 모멘텀은 내부 스코어링·진입 판단에 계속 활용됨 (_process_sector_monitor_iteration)
+        start_sector_monitor(code, name, signal_type, s.get("detect_time", ""), False, alert_snapshot=sector_retry_snap)
     try:
         threading.Thread(target=auto_update_theme, args=(code, name, signal_type), daemon=True).start()
     except Exception as e:
