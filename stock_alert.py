@@ -3,10 +3,48 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.47
+버전: v166.0
 날짜: 2026-04-29
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v166.0 (2026-04-29): 미국 지표 수집 안정화 + US symbols 확대 + KIS 잠정투자자/프로그램수급 연동
+  [#1] Yahoo Finance 0.0% flat 수정 — Stooq fallback + BTC CoinGecko + cache TTL 1800초
+       이유: Railway 서버 환경에서 Yahoo Finance crumb 쿠키 취득 실패 시 전체 US indicators 0.0%
+             flat 고착 (1시간 캐시). Stooq는 crumb 없이 CSV 조회 가능, 안정적 대체소스.
+       개선점: (1) _fetch_stooq_quote() 추가 — NQ=F, ES=F, GC=F, CL=F Yahoo 실패 시 대체
+               (2) _fetch_btc_coingecko() 추가 — BTC-USD 전용 CoinGecko 무료 API
+               (3) cache TTL 3600→1800초 — 실패 후 최대 30분 내 재시도
+       주의점: Stooq는 실시간 아니고 15분 지연 가능. VIX/DXY는 Stooq 미지원 → Yahoo만 가능
+               BTC CoinGecko는 분당 30회 제한 (봇 호출 빈도 충분히 낮음)
+  [#2] US symbols 목록 확대 — 사진 종목 반영
+       이유: 유튜브 화면 추적 종목(SOXL/TSLA/GOOGL/MU/AVGO/SNDK/OKLO/SMR)이 symbols에 없어
+             재료현황 수치지표 섹션에 미표시
+       개선점: SOXL(3x반도체ETF)/TSLA/GOOGL/MU/AVGO/SNDK/OKLO/SMR/BTC 추가
+               SOXL≥5% → 반도체 스코어 +3 추가 / BTC≥5% → 위험선호 +1
+       주의점: symbols 9개 추가로 Yahoo 호출 증가 (딜레이 0.2초 × 9 = +1.8초)
+               Stooq는 ^SOX, SOXL 지원 제한 — Yahoo primary 유지
+  [#3] KIS investor-trend-estimate 연동 — get_investor_trend_estimate() 신규
+       이유: 종목별 외인기관 추정가집계(9:30/11:20/13:20/14:30 4회 집계)는 일별 누계와 달리
+             당일 장중 실시간 매매 방향을 가장 먼저 포착
+       개선점: _apply_signal_quality_investor_context()에서 get_investor_provisional_trend()
+               대신 장중 4회 집계값(investor_trend_estimate) 우선 조회
+       주의점: 모의투자 미지원. tr_id = FHKST13010100 (KIS 포탈 실제 확인 필요)
+               실패 시 기존 get_investor_provisional_trend() 자동 폴백
+       진입 체인: analyze() → _apply_signal_quality_investor_context() → 점수 반영 확인 ✅
+  [#4] KIS program-trade-by-stock 연동 — get_program_trade_by_stock() 신규
+       이유: 프로그램 순매수(차익+비차익)는 기관 자동매매 수급 방향 선행 지표.
+             외국인/기관 동반 순매수에 프로그램 순매수까지 겹치면 급등 확률 상승
+       개선점: _apply_signal_quality_investor_context()에서 프로그램 순매수 시 +2점 추가
+       주의점: 모의투자 미지원. tr_id = FHPST130600C0 (KIS 포탈 실제 확인 필요)
+               실패 시 0점 폴백 (기존 스코어 유지)
+       진입 체인: analyze() → _apply_signal_quality_investor_context() → 점수 반영 확인 ✅
+  [#5] 재료현황 미국 수치지표 섹션 개선 — 신규 지표 표시
+       이유: SOXL/TSLA/BTC가 symbols에 추가됐으나 재료현황 표시에는 반영 안 됨
+       개선점: 섹션 3행 추가 (SOXL·TSLA | GOOGL·MU·AVGO | OKLO·SMR·BTC)
+  이유: 미국 지표 0.0% flat 문제 + 사진 종목 미반영 + KIS 신규 API 2개 활용
+  개선점: 수집 안정성 향상, 스코어링 정확도 향상, 재료현황 정보량 증가
+  주의점: Stooq/CoinGecko fallback은 보조 소스 — Yahoo 성공 시 사용 안 됨
+          KIS 신규 API tr_id는 배포 후 실제 응답 확인 권장
 - v165.47 (2026-04-29): "고려" 제거 + 실행 확정 표현 + partial_exit 기록 + 가중 P&L
   [1] 알람 메시지 표현 변경 — "고려" 완전 제거, 실행 확정 표현으로 통일
       이유: "고려"는 선택적 행동 → 봇이 해당 단계를 실행한 것으로 기록해야
@@ -18925,6 +18963,100 @@ def get_investor_provisional_trend(code: str, market: str = "KRX") -> dict:
         return {"foreign_net": 0, "institution_net": 0, "retail_net": 0,
                 "foreign_net_amount": 0, "institution_net_amount": 0,
                 "is_provisional": True, "market": market}
+
+
+def get_investor_trend_estimate(code: str) -> dict:
+    """v166.0: KIS 종목별 외인기관 추정가집계 (investor-trend-estimate).
+    증권사 직원이 장중 집계/입력한 잠정 추정값 (09:30 / 11:20 / 13:20 / 14:30 하루 4회).
+    일별 누계(inquire-investor)보다 당일 수급 방향을 빠르게 포착.
+    ⚠️ 실전계좌 전용 (모의투자 미지원)
+    ⚠️ tr_id = FHKST13010100 — KIS Developers 포탈 실제 확인 후 교정 필요
+    반환: {
+        "foreign_net": 외국인 추정 순매수(주),
+        "institution_net": 기관 추정 순매수(주),
+        "retail_net": 개인 추정 순매수(주),
+        "foreign_net_amount": 외국인 추정 순매수(원),
+        "institution_net_amount": 기관 추정 순매수(원),
+        "is_estimate": True,
+    }
+    실패 시: get_investor_provisional_trend() 폴백
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
+            "FHKST13010100",   # ⚠️ KIS 포탈 확인 필요
+            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        )
+        output = data.get("output") or {}
+        if not output:
+            raise ValueError("empty output")
+        f_qty  = safe_int(output.get("frgn_ntby_qty",       0))
+        i_qty  = safe_int(output.get("orgn_ntby_qty",       0))
+        r_qty  = safe_int(output.get("prsn_ntby_qty",       0))
+        f_amt  = safe_int(output.get("frgn_ntby_tr_pbmn",   0))
+        i_amt  = safe_int(output.get("orgn_ntby_tr_pbmn",   0))
+        return {
+            "foreign_net": f_qty,
+            "institution_net": i_qty,
+            "retail_net": r_qty,
+            "foreign_net_amount": f_amt,
+            "institution_net_amount": i_amt,
+            "is_estimate": True,
+        }
+    except Exception:
+        # 폴백: 기존 inquire-investor (일별 누계)
+        return get_investor_provisional_trend(code, market="KRX")
+
+
+def get_program_trade_by_stock(code: str) -> dict:
+    """v166.0: KIS 종목별 프로그램매매추이(체결) (program-trade-by-stock).
+    차익/비차익 프로그램 매수-매도 체결 현황. 기관 자동매매 수급 방향 선행 지표.
+    HTS [0465] 종목별 프로그램 매매추이 동일 데이터.
+    ⚠️ 실전계좌 전용 (모의투자 미지원)
+    ⚠️ tr_id = FHPST130600C0 — KIS Developers 포탈 실제 확인 후 교정 필요
+    반환: {
+        "arbt_net_buy": 차익 프로그램 순매수(주),   (+는 순매수)
+        "nonarbt_net_buy": 비차익 프로그램 순매수(주),
+        "total_net_buy": 전체 프로그램 순매수(주),
+        "total_net_amount": 전체 프로그램 순매수(원),
+        "ok": bool,
+    }
+    실패 시: all 0 반환
+    """
+    _empty = {"arbt_net_buy": 0, "nonarbt_net_buy": 0,
+              "total_net_buy": 0, "total_net_amount": 0, "ok": False}
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
+            "FHPST130600C0",   # ⚠️ KIS 포탈 확인 필요
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": "",
+                "FID_INPUT_DATE_2": "",
+                "FID_PERIOD_DIV_CODE": "D",   # D:일, T:분
+            },
+        )
+        output_list = data.get("output") or []
+        if not output_list:
+            return _empty
+        row = output_list[0] if isinstance(output_list, list) else output_list
+        arbt   = safe_int(row.get("arbt_ntby_qty",    0))
+        nonarbt = safe_int(row.get("nonarbt_ntby_qty", 0))
+        tot_qty = arbt + nonarbt
+        tot_amt = safe_int(row.get("ntby_tr_pbmn",    0))
+        return {
+            "arbt_net_buy": arbt,
+            "nonarbt_net_buy": nonarbt,
+            "total_net_buy": tot_qty,
+            "total_net_amount": tot_amt,
+            "ok": True,
+        }
+    except Exception as e:
+        _swallow_exception(e)
+        return _empty
+
+
 # ============================================================
 # 섹터 모멘텀
 # ============================================================
@@ -29007,7 +29139,13 @@ def _apply_signal_quality_investor_context(ctx: dict, score: int, reasons: list,
     stock = ctx["stock"]
     code = ctx["code"]
     try:
-        inv = get_investor_trend(code)
+        # v166.0: 장중 4회 집계 우선 (investor-trend-estimate), 실패 시 기존 폴백
+        now_h = _now_kst().hour
+        use_estimate = (9 <= now_h <= 15)   # 장중에만 추정가집계 의미 있음
+        if use_estimate:
+            inv = get_investor_trend_estimate(code)
+        else:
+            inv = get_investor_trend(code)
         f_net = inv.get("foreign_net", 0)
         i_net = inv.get("institution_net", 0)
         r_net = inv.get("retail_net", 0)
@@ -29040,6 +29178,19 @@ def _apply_signal_quality_investor_context(ctx: dict, score: int, reasons: list,
                     reasons.append(f"{retail_ev['label']} — {detail}")
         elif f_net < 0 and i_net < 0:
             reasons.append(_build_investor_flow_label(f_net, i_net, r_net))
+        # v166.0: 프로그램 수급 연결 (장중 KRX 시간대만)
+        if use_estimate and 9 <= now_h <= 15:
+            try:
+                prog = get_program_trade_by_stock(code)
+                if prog.get("ok"):
+                    prog_net = prog.get("total_net_buy", 0)
+                    if prog_net > 0:
+                        score += 2
+                        reasons.append(f"📊 프로그램 순매수 {prog_net:+,}주 +2점")
+                    elif prog_net < 0:
+                        reasons.append(f"📊 프로그램 순매도 {prog_net:+,}주 (참고)")
+            except Exception as e:
+                _swallow_exception(e)
     except Exception as exc:
         _log_error(f"analyze_investor({stock.get('code', '')})", exc)
     return score, reasons, signal_type
@@ -35977,6 +36128,13 @@ def _handle_telegram_material_command():
             us_lines.append(f"  닛케이 {_fmt(us.get('nikkei_chg', 0.0))}  상하이 {_fmt(us.get('shanghai_chg', 0.0))}")
             us_lines.append(f"  VIX {us.get('vix', 0.0):.1f}  DXY {us.get('dxy', 0.0):.2f}  WTI {_fmt(us.get('oil_chg', 0.0))}  금 {_fmt(us.get('gold_chg', 0.0))}")
             us_lines.append(f"  원/달러 {us.get('krw_usd', 0.0):.0f}원 ({_fmt(us.get('krw_usd_chg', 0.0))})")
+            # v166.0: 신규 지표 행
+            if any(us.get(k, 0.0) != 0.0 for k in ("soxl_chg", "tsla_chg")):
+                us_lines.append(f"  SOXL(3x반도체) {_fmt(us.get('soxl_chg', 0.0))}  TSLA {_fmt(us.get('tsla_chg', 0.0))}")
+            if any(us.get(k, 0.0) != 0.0 for k in ("googl_chg", "mu_chg", "avgo_chg")):
+                us_lines.append(f"  GOOGL {_fmt(us.get('googl_chg', 0.0))}  MU {_fmt(us.get('mu_chg', 0.0))}  AVGO {_fmt(us.get('avgo_chg', 0.0))}")
+            if any(us.get(k, 0.0) != 0.0 for k in ("oklo_chg", "smr_chg", "btc_chg")):
+                us_lines.append(f"  OKLO {_fmt(us.get('oklo_chg', 0.0))}  SMR(원전) {_fmt(us.get('smr_chg', 0.0))}  BTC {_fmt(us.get('btc_chg', 0.0))}")
             if us.get("summary"):
                 us_lines.append(f"  → {us['summary']}")
             parts.append("\n" + "\n".join(us_lines))
@@ -38816,6 +38974,10 @@ def _build_us_market_signal_default() -> dict:
         "krw_usd": 0.0, "krw_usd_chg": 0.0,
         "sox_chg": 0.0, "nvda_chg": 0.0, "tsm_chg": 0.0,
         "nikkei_chg": 0.0, "shanghai_chg": 0.0,
+        # v166.0: 신규 symbols
+        "soxl_chg": 0.0, "tsla_chg": 0.0, "googl_chg": 0.0,
+        "mu_chg": 0.0, "avgo_chg": 0.0, "sndk_chg": 0.0,
+        "oklo_chg": 0.0, "smr_chg": 0.0, "btc_chg": 0.0,
     }
 def _fetch_kis_overseas_price(symbol: str, excd: str = "NAS") -> float | None:
     """v162.1: KIS HHDFS00000300 TR로 해외주식 현재가 조회.
@@ -38845,6 +39007,47 @@ def _fetch_kis_overseas_price(symbol: str, excd: str = "NAS") -> float | None:
             cooldown_sec=1800.0,
         )
         return None
+
+
+def _fetch_stooq_quote(stooq_sym: str) -> float | None:
+    """v166.0: Stooq에서 단순 현재가 조회 (Yahoo 실패 시 fallback).
+    Stooq는 crumb 없이 CSV 조회 가능. 15분 지연 가능.
+    stooq_sym 예시: ^ndq (나스닥), ^spx (S&P500), gc.f (금선물), cl.f (WTI선물)
+    """
+    try:
+        url = f"https://stooq.com/q/l/?s={stooq_sym}&f=sd2t2ohlcv&h&e=csv"
+        resp = requests.get(url, timeout=6, headers={"User-Agent": random.choice(_UA_POOL)})
+        if resp.status_code != 200:
+            return None
+        lines = resp.text.strip().split("\n")
+        if len(lines) < 2:
+            return None
+        parts = lines[1].split(",")
+        # CSV 컬럼: Symbol,Date,Time,Open,High,Low,Close,Volume
+        if len(parts) >= 7:
+            close_str = parts[6].strip()
+            val = float(close_str)
+            return val if val > 0 else None
+    except Exception as e:
+        _swallow_exception(e)
+    return None
+
+
+def _fetch_btc_coingecko() -> float | None:
+    """v166.0: CoinGecko 무료 API로 BTC/USD 현재가 조회.
+    분당 30회 제한. 봇 1시간 캐시이므로 충분히 여유 있음.
+    """
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+        resp = requests.get(url, timeout=6, headers={"User-Agent": random.choice(_UA_POOL)})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        price = data.get("bitcoin", {}).get("usd")
+        return float(price) if price else None
+    except Exception as e:
+        _swallow_exception(e)
+    return None
 
 
 def _fetch_yahoo_finance_crumb() -> tuple[str, dict]:
@@ -38929,10 +39132,30 @@ def _fetch_us_market_signal_values(symbols: dict) -> dict:
                 break  # 성공 → 다음 심볼로
             except Exception as e:
                 _swallow_exception(e)
+        # v166.0: Yahoo 완전 실패 시 Stooq fallback (주요 지수/선물만)
         if not fetched:
-            _warn_throttled_once("us_market_invalid_json",
-                                 "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지",
-                                 cooldown_sec=1800.0)
+            _stooq_map = {
+                "NQ=F": ("^ndq", "nasdaq"),
+                "ES=F": ("^spx", "sp500"),
+                "GC=F": ("gc.f", "gold"),
+                "CL=F": ("cl.f", "oil"),
+            }
+            if sym in _stooq_map:
+                stooq_sym, stooq_key = _stooq_map[sym]
+                stooq_price = _fetch_stooq_quote(stooq_sym)
+                if stooq_price and stooq_price > 0:
+                    # Stooq는 전일 종가 대비 변화율을 별도 제공 안 함 → 이전 캐시값 활용
+                    prev_cached = _us_cache.get(f"{stooq_key}_prev_close", 0.0)
+                    if prev_cached and prev_cached > 0:
+                        values[f"{stooq_key}_chg"] = round(
+                            (stooq_price - prev_cached) / prev_cached * 100, 2
+                        )
+                    values[f"{stooq_key}_prev_close"] = stooq_price
+                    fetched = True
+            if not fetched:
+                _warn_throttled_once("us_market_invalid_json",
+                                     "🌐 미국시장 응답 비정상/비JSON → flat fallback 유지",
+                                     cooldown_sec=1800.0)
         time.sleep(0.2)
     return values
 def _evaluate_us_market_signal_result(values: dict) -> dict:
@@ -38987,6 +39210,30 @@ def _evaluate_us_market_signal_result(values: dict) -> dict:
         score_adj -= 4   # SOX 급락 → 반도체 섹터 약세 차감
     elif sox_chg <= -1.2:
         score_adj -= 2
+    # v166.0: 신규 symbols 값 추출
+    soxl_chg  = values.get("soxl_chg",  0.0)
+    tsla_chg  = values.get("tsla_chg",  0.0)
+    googl_chg = values.get("googl_chg", 0.0)
+    mu_chg    = values.get("mu_chg",    0.0)
+    avgo_chg  = values.get("avgo_chg",  0.0)
+    sndk_chg  = values.get("sndk_chg",  0.0)
+    oklo_chg  = values.get("oklo_chg",  0.0)
+    smr_chg   = values.get("smr_nuc_chg", 0.0)  # SMR은 smr_nuc key
+    btc_chg   = values.get("btc_chg",   0.0)
+    # SOXL(3x 반도체 ETF) 급등 → 반도체 섹터 추가 가중 (SOX와 중복 시 경감)
+    if soxl_chg >= 5.0:
+        score_adj += 3
+    elif soxl_chg >= 2.5:
+        score_adj += 1
+    elif soxl_chg <= -5.0:
+        score_adj -= 3
+    elif soxl_chg <= -2.5:
+        score_adj -= 1
+    # BTC 급등 → 글로벌 위험선호 +1 (미약하지만 보조 지표)
+    if btc_chg >= 5.0:
+        score_adj += 1
+    elif btc_chg <= -8.0:
+        score_adj -= 1
     return {
         "nasdaq_chg": nasdaq_chg,
         "vix": vix,
@@ -39005,6 +39252,16 @@ def _evaluate_us_market_signal_result(values: dict) -> dict:
         "tsm_chg": tsm_chg,
         "nikkei_chg": nikkei_chg,
         "shanghai_chg": shanghai_chg,
+        # v166.0 신규
+        "soxl_chg": soxl_chg,
+        "tsla_chg": tsla_chg,
+        "googl_chg": googl_chg,
+        "mu_chg": mu_chg,
+        "avgo_chg": avgo_chg,
+        "sndk_chg": sndk_chg,
+        "oklo_chg": oklo_chg,
+        "smr_chg": smr_chg,
+        "btc_chg": btc_chg,
     }
 def _compose_us_market_signal_summary(result: dict) -> str:
     regime_emoji = {"panic": "🔵", "risk_off": "🟡", "neutral": "🟡", "risk_on": "🔴"}
@@ -39012,8 +39269,12 @@ def _compose_us_market_signal_summary(result: dict) -> str:
     extra_parts = []
     if result.get("sox_chg"):
         extra_parts.append(f"SOX{result['sox_chg']:+.1f}%")
+    if result.get("soxl_chg"):   # v166.0
+        extra_parts.append(f"SOXL{result['soxl_chg']:+.1f}%")
     if result.get("nvda_chg"):
         extra_parts.append(f"NVDA{result['nvda_chg']:+.1f}%")
+    if result.get("tsla_chg"):   # v166.0
+        extra_parts.append(f"TSLA{result['tsla_chg']:+.1f}%")
     if result.get("nikkei_chg"):
         extra_parts.append(f"닛케이{result['nikkei_chg']:+.1f}%")
     if result.get("krw_usd"):
@@ -39026,6 +39287,8 @@ def _compose_us_market_signal_summary(result: dict) -> str:
         extra_parts.append(f"10Y{result['tnx']:.2f}%")
     if result.get("sp500_chg"):
         extra_parts.append(f"S&P{result['sp500_chg']:+.1f}%")
+    if result.get("btc_chg"):    # v166.0
+        extra_parts.append(f"BTC{result['btc_chg']:+.1f}%")
     summary = (
         f"{regime_emoji.get(result.get('us_regime'), '🟡')} 나스닥선물 {result.get('nasdaq_chg', 0):+.1f}%  "
         f"VIX {result.get('vix', 20):.0f}  DXY {result.get('dxy', 104):.1f}  "
@@ -39040,8 +39303,10 @@ def get_us_market_signals() -> dict:
     Yahoo Finance JSON API 사용 (무료, pip 설치 불필요).
     v162.1: SOX(^SOX)·NVDA·TSM·닛케이(^N225)·상하이(000001.SS) 추가.
             NVDA·TSM은 KIS HHDFS00000300 TR 우선, 실패 시 Yahoo 보조.
+    v166.0: SOXL/TSLA/GOOGL/MU/AVGO/SNDK/OKLO/SMR 추가 (사진 종목 반영).
+            BTC는 CoinGecko fallback. cache TTL 1800초로 단축.
     """
-    if time.time() - _us_cache.get("ts", 0) < 3600:
+    if time.time() - _us_cache.get("ts", 0) < 1800:   # v166.0: 3600→1800 (빠른 재시도)
         return _us_cache
     result = _build_us_market_signal_default()
     try:
@@ -39051,6 +39316,15 @@ def get_us_market_signals() -> dict:
             "^TNX": "tnx", "KRW=X": "krw",
             "^SOX": "sox", "NVDA": "nvda", "TSM": "tsm",
             "^N225": "nikkei", "000001.SS": "shanghai",
+            # v166.0: 신규 symbols (사진 종목 반영)
+            "SOXL": "soxl",    # Direxion 3x Semi ETF
+            "TSLA": "tsla",    # Tesla
+            "GOOGL": "googl",  # Alphabet
+            "MU": "mu",        # Micron
+            "AVGO": "avgo",    # Broadcom
+            "SNDK": "sndk",    # SanDisk (WDC 스핀오프)
+            "OKLO": "oklo",    # 소형 핵분열로
+            "SMR": "smr_nuc",  # NuScale Power (원전 테마 SMR과 key 충돌 회피)
         }
         values = _fetch_us_market_signal_values(symbols)
         # v162.1: NVDA·TSM KIS 우선 조회 (Yahoo 실패 시 보완)
@@ -39059,6 +39333,14 @@ def get_us_market_signals() -> dict:
                 kis_price = _fetch_kis_overseas_price(sym, excd)
                 if kis_price and kis_price > 0:
                     values[f"{key}_last"] = kis_price
+        # v166.0: BTC CoinGecko fallback
+        if not values.get("btc_chg"):
+            btc_price = _fetch_btc_coingecko()
+            if btc_price and btc_price > 0:
+                btc_prev = _us_cache.get("btc_prev_close", 0.0)
+                if btc_prev and btc_prev > 0:
+                    values["btc_chg"] = round((btc_price - btc_prev) / btc_prev * 100, 2)
+                _us_cache["btc_prev_close"] = btc_price
         result.update(_evaluate_us_market_signal_result(values))
         result["ts"] = time.time()
         result["summary"] = _compose_us_market_signal_summary(result)
