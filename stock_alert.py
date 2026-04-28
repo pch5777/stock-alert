@@ -3,10 +3,42 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.42
+버전: v165.43
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.43 (2026-04-28): 경량 급등 감지 스캔 + 등락률순위 API 수정 + WebSocket 한도 확대
+  [1] _run_surge_velocity_scan() 신설 + 30초 스케줄 등록
+      이유: 기존 run_scan()은 naver_rise 수집→후보군 구성→analyze() 파이프라인에 수분 소요
+            금속 섹터 브레이크아웃처럼 장중 어느 시간대든 급등 초기(+3~5%)를 놓치는 원인
+            "5분 전 대비 가속도"보다 거래량 폭증이 더 선행하는 지표임을 확인 후 복합조건 채택
+      개선점: FHPST01710000(거래량순위) KRX/NXT 30초 직접 호출
+              조건: vol_ratio >= 3.0x AND change_rate >= 3.0% (우선주·스팩 제외)
+              조건 충족 시 즉시 analyze() → 섹터게이트 → 포트폴리오필터 → dispatch
+              종목당 쿨다운 30분(_surge_velocity_seen) → 반복 알람 방지
+              KRX 장중: J마켓, NXT 전용 시간대: NX마켓 자동 전환
+              _surge_velocity_lock으로 중복 실행 방지
+      주의점: 기존 run_scan() 파이프라인과 별도 실행 — 중복 포착 시 hist_key="VEL_{code}"로 구분
+              analyze() 내부 API 호출(공매도 등) 발생 → 30초 간격 + 후보 최대 30건으로 부하 제한
+              _surge_velocity_seen은 재시작 시 초기화됨 (파일 영속화 미적용 — 경량 유지)
+      진입불가 게이트 연결: _apply_scan_sector_gate() + filter_portfolio_signals() + _dispatch_scan_alerts() 경유 ✅
+  [2] get_upper_limit_stocks(): FHPST01700000 endpoint URL + 응답필드 수정
+      이유: 현재 URL /uapi/domestic-stock/v1/quotations/chgrate-pcls-100 → 404 지속
+            KIS 공식 API 문서 기준 올바른 URL: /uapi/domestic-stock/v1/ranking/fluctuation
+            응답 필드도 mksc_shrn_iscd → stck_shrn_iscd (등락률순위 API 기준)
+      개선점: ranking/fluctuation 우선 시도 → 404면 chgrate-pcls-100 레거시 재시도 (호환성 유지)
+              응답 파싱: stck_shrn_iscd OR mksc_shrn_iscd 둘 다 지원
+      주의점: 레거시 fallback 유지로 기존 동작 보장
+              새 URL 성공 시 "chgrate-pcls-100 비활성" 경고 사라질 것
+      진입불가 게이트 연결: 해당 없음 (데이터 수집 경로)
+  [3] WS_MAX_SUBSCRIPTIONS: 20 → 41
+      이유: KIS 공식 문서 기준 세션당 41개까지 구독 가능 (H0STCNT0+H0STASP0 합산)
+            현재 20개 제한으로 실시간 감시 대상이 절반 이하로 제한됨
+      개선점: WS_MAX_SUBSCRIPTIONS 기본값 20→41 → 실시간 구독 종목 수 2배 확대
+              환경변수로 재조정 가능 (WS_MAX_SUBSCRIPTIONS=N)
+      주의점: 세션당 41개가 실제 공식 상한선. 60개 예정이었으나 현재 미확인
+              WebSocket 연결 안정성 모니터링 필요 (구독 수 증가 시 Broken pipe 빈도 변화)
+      진입불가 게이트 연결: 해당 없음 (WebSocket 감시 경로)
 - v165.42 (2026-04-28): run_scan 전역 락 추가 — 중복 스캔 실행 차단
   [#1] run_scan(): _run_scan_global_lock 전역 락 추가, 내부 로직을 _run_scan_body()로 분리
        이유: 재시작 직후 catch-up 스캔(14:57:46)과 정규 스케줄 스캔(14:58:03)이
@@ -7379,7 +7411,7 @@ KIS_BASE_URL       = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvest
 # ── v162: WebSocket 설정 ──
 WEBSOCKET_ENABLED      = os.environ.get("WEBSOCKET_ENABLED", "true").strip().lower() in ("true", "1", "yes")
 WS_URL                 = os.environ.get("WS_URL", "ws://ops.koreainvestment.com:21000").strip().rstrip("/")
-WS_MAX_SUBSCRIPTIONS   = int(os.environ.get("WS_MAX_SUBSCRIPTIONS", "20") or "20")   # KIS 세션당 구독 상한
+WS_MAX_SUBSCRIPTIONS   = int(os.environ.get("WS_MAX_SUBSCRIPTIONS", "41") or "41")   # v165.43: KIS 세션당 구독 상한 20→41 (공식 문서 기준 세션당 41개)
 WS_RECONNECT_BASE_SEC  = float(os.environ.get("WS_RECONNECT_BASE_SEC", "2.0") or "2.0")
 WS_RECONNECT_MAX_SEC   = float(os.environ.get("WS_RECONNECT_MAX_SEC", "15.0") or "15.0")  # v163.13 [#3]: 120→15초 (장중 Broken pipe 후 40분 지연 방지)
 WS_SYNC_INTERVAL_SEC   = int(os.environ.get("WS_SYNC_INTERVAL_SEC", "15") or "15")   # 구독 동기화 주기
@@ -17758,7 +17790,7 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
 def get_upper_limit_stocks() -> list:
     if _rank_api_disabled_today():
         return _rank_api_fallback(_get_rank_api_disable_reason() or 'disabled_today', market='KRX')
-    url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
+    url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation"  # v165.43: chgrate-pcls-100→ranking/fluctuation (올바른 endpoint)
     params = {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20170","FID_INPUT_ISCD":"0000",
         "FID_RANK_SORT_CLS_CODE":"0","FID_INPUT_CNT_1":"30","FID_PRC_CLS_CODE":"0",
@@ -17768,13 +17800,18 @@ def get_upper_limit_stocks() -> list:
     }
     data, status, ct, body = _safe_get_meta(url, "FHPST01700000", params)
     if status == 404:
+        # v165.43: ranking/fluctuation도 404면 chgrate-pcls-100 레거시 URL 재시도
+        legacy_url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/chgrate-pcls-100"
+        data, status, ct, body = _safe_get_meta(legacy_url, "FHPST01700000", params)
+    if status == 404:
         return _rank_api_fallback("404", status=status, ct=ct, body=body, market="KRX")
     if status not in (None, 200):
         return _rank_api_fallback(f"status_{status}", status=status, ct=ct, body=body, market="KRX")
     if not isinstance(data, dict):
         return _rank_api_fallback("invalid_response", status=status, ct=ct, body=body, market="KRX")
     items = [{
-        "code": i.get("mksc_shrn_iscd",""), "name": i.get("hts_kor_isnm",""),
+        # v165.43: 응답 필드 stck_shrn_iscd (등락률순위) + mksc_shrn_iscd (거래량순위) 둘 다 지원
+        "code": i.get("stck_shrn_iscd") or i.get("mksc_shrn_iscd",""), "name": i.get("hts_kor_isnm",""),
         "price": int(i.get("stck_prpr",0)), "change_rate": float(i.get("prdy_ctrt",0)),
         "volume_ratio": float(i.get("vol_inrt",0) or 0), "market":"KRX"
     } for i in (data.get("output", []) if isinstance(data, dict) else [])]
@@ -40192,6 +40229,118 @@ def run_price_first_scan() -> None:
 
 
 _run_scan_global_lock = threading.Lock()  # v165.42: 스캔 전체 동시 실행 방지 (재시작 catchup+정규 스캔 중복 문제)
+_surge_velocity_lock = threading.Lock()   # v165.43: 경량 급등 감지 스캔 중복 실행 방지
+_surge_velocity_seen: dict = {}           # v165.43: {code: last_alerted_ts} — 동일 종목 30분 쿨다운
+
+def _run_surge_velocity_scan() -> None:
+    """v165.43 [1]: 경량 급등 감지 스캔 — 거래량 폭증 + 등락률 복합 조건으로 초기 급등 포착.
+    기존 run_scan()은 naver_rise 수집→후보군→analyze() 파이프라인으로 수분 소요.
+    이 스캔은 30초마다 FHPST01710000(거래량순위)를 직접 호출해 조건 충족 종목을 빠르게 analyze()로 연결.
+
+    포착 조건 (AND):
+      ① vol_ratio(거래량비율) >= 3.0x   — 거래량 폭증 (세력 매집 선행 지표)
+      ② change_rate >= 3.0%            — 가격 반응 시작 확인
+      ③ 우선주·스팩주 제외              — 알람 불가 종목 필터
+
+    KRX 장중 + NXT 운영 시간 모두 동작.
+    종목당 쿨다운 30분 (동일 급등 반복 알람 방지).
+    """
+    if not is_any_market_open() or is_holiday():
+        return
+    if not _surge_velocity_lock.acquire(blocking=False):
+        return
+    try:
+        krx_open = is_market_open()
+        nxt_open = is_nxt_open()
+        markets = []
+        if krx_open:
+            markets.append(("J", "KRX"))
+        if nxt_open and not krx_open:
+            markets.append(("NX", "NXT"))
+        if not markets:
+            return
+
+        now = time.time()
+        candidates = []
+        for mrkt_code, mkt_label in markets:
+            try:
+                data = _safe_get(
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+                    "FHPST01710000",
+                    {
+                        "FID_COND_MRKT_DIV_CODE": mrkt_code,
+                        "FID_COND_SCR_DIV_CODE": "20171",
+                        "FID_INPUT_ISCD": "0000",
+                        "FID_DIV_CLS_CODE": "0",
+                        "FID_BLNG_CLS_CODE": "0",
+                        "FID_TRGT_CLS_CODE": "111111111",
+                        "FID_TRGT_EXLS_CLS_CODE": "000000",
+                        "FID_INPUT_PRICE_1": "1000",
+                        "FID_INPUT_PRICE_2": "",
+                        "FID_VOL_CNT": "30",
+                        "FID_INPUT_DATE_1": "",
+                    },
+                )
+                for item in (data.get("output") or []):
+                    code = normalize_stock_code(item.get("mksc_shrn_iscd", "") or "")
+                    if not code:
+                        continue
+                    try:
+                        cr = float(item.get("prdy_ctrt", 0) or 0)
+                        vr = float(item.get("vol_inrt", 0) or 0)
+                        name = str(item.get("hts_kor_isnm", code) or code)
+                    except Exception:
+                        continue
+                    # 조건 ①②
+                    if vr < 3.0 or cr < 3.0:
+                        continue
+                    # 조건 ③ 우선주·스팩주 제외
+                    nm_c = name.replace(" ", "")
+                    if re.search(r'우[B0-9]*$', nm_c) or "스팩" in nm_c or "SPAC" in nm_c.upper():
+                        continue
+                    # 쿨다운 30분
+                    if now - _surge_velocity_seen.get(code, 0) < 1800:
+                        continue
+                    candidates.append({
+                        "code": code, "name": name,
+                        "change_rate": cr, "volume_ratio": vr,
+                        "price": safe_int(item.get("stck_prpr", 0), 0),
+                        "market": mkt_label,
+                        "_surge_velocity_hit": True,  # 경량 스캔 출처 마킹
+                    })
+            except Exception as e:
+                _swallow_exception(e)
+
+        if not candidates:
+            return
+
+        _log_info_msg(f"  ⚡ [경량급등] {len(candidates)}종목 감지 → analyze() 연결")
+        alerts, seen = [], set()
+        for stock in candidates:
+            code = stock["code"]
+            try:
+                r = analyze(stock)
+                if isinstance(r, dict) and r:
+                    _surge_velocity_seen[code] = now  # 쿨다운 등록
+                    mkt = stock.get("market", "KRX")
+                    if isinstance(r, dict):
+                        r["market"] = mkt
+                    hist_key = f"VEL_{code}"
+                    _append_scan_alert(alerts, seen, r, hist_key=hist_key, seen_code=code)
+            except Exception as e:
+                _swallow_exception(e)
+
+        if alerts:
+            alerts = _sanitize_run_scan_alerts(alerts, stage="pre_sector_gate")
+            alerts = _apply_scan_sector_gate(alerts)
+            alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
+            alerts = filter_portfolio_signals(alerts)
+            alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
+            _dispatch_scan_alerts(alerts)
+    except Exception as e:
+        _log_error("_run_surge_velocity_scan", e)
+    finally:
+        _surge_velocity_lock.release()
 
 def run_scan():
     # v165.42: 스캔 전체 레벨 락 — catch-up 스캔과 정규 스캔 동시 실행 차단
@@ -40350,6 +40499,7 @@ if __name__ == "__main__":
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
     schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
+    schedule.every(30).seconds.do(_leader_job(_run_surge_velocity_scan))  # v165.43: 경량 급등 감지 스캔 (거래량폭증+등락률 복합)
     schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_premarket_burst_scan))
     schedule.every(NXT_AFTERMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_aftermarket_burst_scan))  # v165.26: NXT 애프터마켓 burst
     schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_krx_open_burst_scan))
