@@ -3,10 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v166.0
+버전: v166.1
 날짜: 2026-04-29
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v166.1 (2026-04-29): KIS API tr_id + 응답구조 실전 규격서 기반 전면 교정
+  [#1] get_investor_trend_estimate() — tr_id·파라미터·응답키 전면 수정
+       이유: v166.0에서 추측한 tr_id(FHKST13010100)·파라미터(FID_INPUT_ISCD) 오류
+             → 실전 규격서(v1_국내주식-046) 확인 결과 전혀 다른 구조
+       수정: tr_id FHKST13010100 → HHPTJ04160200
+             파라미터 FID_COND_MRKT_DIV_CODE+FID_INPUT_ISCD → MKSC_SHRN_ISCD
+             응답키 output.frgn_ntby_qty → output2[].frgn_fake_ntby_qty (배열)
+             최신 집계(bsop_hour_gb 최대값) 행 선택 로직 추가
+       주의점: output2는 배열(최대 5행, 시간구분 1~5), 개인 항목 없음
+  [#2] get_program_trade_by_stock() — tr_id·파라미터·응답키 전면 수정
+       이유: v166.0에서 추측한 tr_id(FHPST130600C0)·불필요 파라미터(DATE/PERIOD) 오류
+             → 실전 규격서(v1_국내주식-044) 확인 결과 구 tr_id도 따로 존재
+       수정: tr_id FHPST130600C0 → FHPPG04650101 (신TR, 구TR FHPPG04650100 사용 금지)
+             불필요 파라미터 제거(FID_INPUT_DATE_1/2, FID_PERIOD_DIV_CODE)
+             응답키 arbt_ntby_qty/nonarbt_ntby_qty → whol_smtn_ntby_qty/whol_smtn_ntby_tr_pbmn
+             반환 dict에서 arbt_net_buy/nonarbt_net_buy 제거 (API 미제공)
+       주의점: 프로그램매매 응답도 배열(output[]), 첫 번째 행이 최신
+  이유: 규격서 없이 추측한 tr_id는 API 오류 → 실제 응답 없음
+  개선점: 두 함수 모두 정상 동작 가능 상태로 교정
+  주의점: _apply_signal_quality_investor_context()의 prog["ok"] 체크로 실패 시 자동 스킵
 - v166.0 (2026-04-29): 미국 지표 수집 안정화 + US symbols 확대 + KIS 잠정투자자/프로그램수급 연동
   [#1] Yahoo Finance 0.0% flat 수정 — Stooq fallback + BTC CoinGecko + cache TTL 1800초
        이유: Railway 서버 환경에서 Yahoo Finance crumb 쿠키 취득 실패 시 전체 US indicators 0.0%
@@ -18967,41 +18987,36 @@ def get_investor_provisional_trend(code: str, market: str = "KRX") -> dict:
 
 def get_investor_trend_estimate(code: str) -> dict:
     """v166.0: KIS 종목별 외인기관 추정가집계 (investor-trend-estimate).
-    증권사 직원이 장중 집계/입력한 잠정 추정값 (09:30 / 11:20 / 13:20 / 14:30 하루 4회).
-    일별 누계(inquire-investor)보다 당일 수급 방향을 빠르게 포착.
-    ⚠️ 실전계좌 전용 (모의투자 미지원)
-    ⚠️ tr_id = FHKST13010100 — KIS Developers 포탈 실제 확인 후 교정 필요
-    반환: {
-        "foreign_net": 외국인 추정 순매수(주),
-        "institution_net": 기관 추정 순매수(주),
-        "retail_net": 개인 추정 순매수(주),
-        "foreign_net_amount": 외국인 추정 순매수(원),
-        "institution_net_amount": 기관 추정 순매수(원),
-        "is_estimate": True,
-    }
+    tr_id: HHPTJ04160200 (실전 전용, 모의투자 미지원) — v1_국내주식-046
+    파라미터: MKSC_SHRN_ISCD (종목코드)
+    응답: output2[] — bsop_hour_gb(1~5), frgn_fake_ntby_qty, orgn_fake_ntby_qty, sum_fake_ntby_qty
+    시간구분: 1=09:30 / 2=10:00 / 3=11:20 / 4=13:20 / 5=14:30
+    최신(가장 큰 bsop_hour_gb) 집계값을 사용.
     실패 시: get_investor_provisional_trend() 폴백
     """
     try:
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
-            "FHKST13010100",   # ⚠️ KIS 포탈 확인 필요
-            {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+            "HHPTJ04160200",
+            {"MKSC_SHRN_ISCD": code},
         )
-        output = data.get("output") or {}
-        if not output:
-            raise ValueError("empty output")
-        f_qty  = safe_int(output.get("frgn_ntby_qty",       0))
-        i_qty  = safe_int(output.get("orgn_ntby_qty",       0))
-        r_qty  = safe_int(output.get("prsn_ntby_qty",       0))
-        f_amt  = safe_int(output.get("frgn_ntby_tr_pbmn",   0))
-        i_amt  = safe_int(output.get("orgn_ntby_tr_pbmn",   0))
+        rows = data.get("output2") or []
+        if not rows:
+            raise ValueError("empty output2")
+        # 가장 최신 집계(bsop_hour_gb 최대값) 사용
+        latest = max(rows, key=lambda r: safe_int(r.get("bsop_hour_gb", 0)))
+        f_qty = safe_int(latest.get("frgn_fake_ntby_qty", 0))
+        i_qty = safe_int(latest.get("orgn_fake_ntby_qty", 0))
+        s_qty = safe_int(latest.get("sum_fake_ntby_qty",  0))   # 외인+기관 합산
         return {
             "foreign_net": f_qty,
             "institution_net": i_qty,
-            "retail_net": r_qty,
-            "foreign_net_amount": f_amt,
-            "institution_net_amount": i_amt,
+            "retail_net": 0,                  # 추정가집계에 개인 항목 없음
+            "foreign_net_amount": 0,
+            "institution_net_amount": 0,
+            "sum_net": s_qty,
             "is_estimate": True,
+            "hour_gb": safe_int(latest.get("bsop_hour_gb", 0)),
         }
     except Exception:
         # 폴백: 기존 inquire-investor (일별 누계)
@@ -19010,44 +19025,35 @@ def get_investor_trend_estimate(code: str) -> dict:
 
 def get_program_trade_by_stock(code: str) -> dict:
     """v166.0: KIS 종목별 프로그램매매추이(체결) (program-trade-by-stock).
-    차익/비차익 프로그램 매수-매도 체결 현황. 기관 자동매매 수급 방향 선행 지표.
-    HTS [0465] 종목별 프로그램 매매추이 동일 데이터.
-    ⚠️ 실전계좌 전용 (모의투자 미지원)
-    ⚠️ tr_id = FHPST130600C0 — KIS Developers 포탈 실제 확인 후 교정 필요
+    tr_id: FHPPG04650101 (실전 전용, 모의투자 미지원) — v1_국내주식-044
+           구TR FHPPG04650100은 사전고지 없이 막힐 수 있으므로 신TR 사용
+    파라미터: FID_COND_MRKT_DIV_CODE(J/NX/UN), FID_INPUT_ISCD(종목코드)
+    응답: output[] — whol_smtn_ntby_qty(전체순매수수량), whol_smtn_ntby_tr_pbmn(거래대금)
     반환: {
-        "arbt_net_buy": 차익 프로그램 순매수(주),   (+는 순매수)
-        "nonarbt_net_buy": 비차익 프로그램 순매수(주),
-        "total_net_buy": 전체 프로그램 순매수(주),
-        "total_net_amount": 전체 프로그램 순매수(원),
+        "total_net_buy": 전체 합계 순매수 수량(주),
+        "total_net_amount": 전체 합계 순매수 거래대금(원),
         "ok": bool,
     }
     실패 시: all 0 반환
     """
-    _empty = {"arbt_net_buy": 0, "nonarbt_net_buy": 0,
-              "total_net_buy": 0, "total_net_amount": 0, "ok": False}
+    _empty = {"total_net_buy": 0, "total_net_amount": 0, "ok": False}
     try:
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
-            "FHPST130600C0",   # ⚠️ KIS 포탈 확인 필요
+            "FHPPG04650101",
             {
                 "FID_COND_MRKT_DIV_CODE": "J",
                 "FID_INPUT_ISCD": code,
-                "FID_INPUT_DATE_1": "",
-                "FID_INPUT_DATE_2": "",
-                "FID_PERIOD_DIV_CODE": "D",   # D:일, T:분
             },
         )
-        output_list = data.get("output") or []
-        if not output_list:
+        rows = data.get("output") or []
+        if not rows:
             return _empty
-        row = output_list[0] if isinstance(output_list, list) else output_list
-        arbt   = safe_int(row.get("arbt_ntby_qty",    0))
-        nonarbt = safe_int(row.get("nonarbt_ntby_qty", 0))
-        tot_qty = arbt + nonarbt
-        tot_amt = safe_int(row.get("ntby_tr_pbmn",    0))
+        # 최신(첫 번째) 행 사용
+        row = rows[0] if isinstance(rows, list) else rows
+        tot_qty = safe_int(row.get("whol_smtn_ntby_qty",      0))
+        tot_amt = safe_int(row.get("whol_smtn_ntby_tr_pbmn",  0))
         return {
-            "arbt_net_buy": arbt,
-            "nonarbt_net_buy": nonarbt,
             "total_net_buy": tot_qty,
             "total_net_amount": tot_amt,
             "ok": True,
