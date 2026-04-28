@@ -3,10 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.38
+버전: v165.39
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.39 (2026-04-28): 섹터 제한 구조 버그 수정 — upper_limit 종목 슬롯 선점 차단
+  [#1] _apply_scan_sector_gate(): _upper_limit_alerted_today 등록 종목 섹터 카운트 제외
+       이유: 로그 분석 결과 아주스틸·금강철강·포스코스틸리온·나우IB·세아메카닉스 5종목이
+             모두 상한가 차단(upper_limit_reached) 대상임에도 섹터 카운트를 선점
+             → 금속 섹터 1~5번 슬롯이 이미 채워진 채로 넥스틸이 "14번째"로 밀려 탈락
+             → 어차피 나중에 upper_limit 게이트에서 차단될 종목이 섹터 슬롯만 낭비
+       개선점: _s_code in _upper_limit_alerted_today 체크 → True면 sector_counts 미증가
+               NEAR_UPPER/UPPER_LIMIT + 28% 이상인 종목도 동일하게 적용 (미등록 케이스 보완)
+               pass-through → 나중에 upper_limit 차단, signal_log 저장은 그대로 유지됨
+               넥스틸류 유효 급등 종목의 섹터 슬롯 확보 → 포착 가능
+       주의점: upper_limit 종목은 여전히 filtered_alerts에 포함됨 (나중에 차단)
+               signal_log 저장·학습 경로는 기존과 동일
+               _upper_limit_alerted_today는 당일 재시작 시 복원되므로 재시작 후에도 유효
+       진입불가 게이트 연결: _ensure_signal_actionability() 기존 게이트 유지 ✅
 - v165.38 (2026-04-28): 워치독 오판 수정 + 외부상승 확대 + 메이저수급 API 안정화
   [A] _load_intraday_watchdog_rising(): 우선주·상한가급(≥28%) 필터 추가
       이유: 워치독 외부상승 리스트에 한화솔루션우(우선주+29%), 대호특수강우(우선주+29.9%)
@@ -39937,6 +39951,23 @@ def _apply_scan_sector_gate(alerts: list) -> list:
                 s["sector_theme"] = sec
             filtered_alerts.append(s)
             continue  # sector_counts 증가 없이 통과
+
+        # v165.39: upper_limit_reached 등록 종목 → 섹터 슬롯 소비 차단
+        # 이유: 아주스틸/금강철강 등 당일 상한가 차단 종목이 금속 섹터 1~5번 슬롯을 선점
+        #       → 넥스틸 같은 유효 종목이 "금속 14번째"로 밀려 섹터 제한 탈락
+        #       → 이 종목들은 sector_counts 증가 없이 pass-through (나중에 차단됨)
+        _s_code = str(s.get("code") or "")
+        _is_upper_blocked = _s_code in _upper_limit_alerted_today if _s_code else False
+        if not _is_upper_blocked:
+            _sig_type = str(s.get("signal_type") or "").upper()
+            # NEAR_UPPER/UPPER_LIMIT + 28% 이상 → 사실상 상한가급 → 슬롯 소비 차단
+            if _sig_type in ("NEAR_UPPER", "UPPER_LIMIT") and change_rate >= 28.0:
+                _is_upper_blocked = True
+
+        if _is_upper_blocked:
+            # 섹터 카운트 없이 pass-through → 나중에 upper_limit 게이트에서 차단됨
+            filtered_alerts.append(s)
+            continue
 
         # ── 규칙2: 섹터별 한도 계산
         base_limit = max_signals_misc if sec == "기타" else max_signals_per_sector
