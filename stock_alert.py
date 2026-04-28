@@ -3,10 +3,41 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.37
+버전: v165.38
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.38 (2026-04-28): 워치독 오판 수정 + 외부상승 확대 + 메이저수급 API 안정화
+  [A] _load_intraday_watchdog_rising(): 우선주·상한가급(≥28%) 필터 추가
+      이유: 워치독 외부상승 리스트에 한화솔루션우(우선주+29%), 대호특수강우(우선주+29.9%)
+            등이 포함 → 알람 차단이 정상임에도 candidate_miss 오판 → 코드수정 요청 발송
+            실제 문제인 세미파이브 누락보다 오판 신호가 63분 침묵 원인으로 잘못 진단됨
+      개선점: 우선주(종목명 끝 우[B0-9]*) → 알람 차단 정상 → 워치독 리스트에서 제거
+              스팩주 → 동일하게 제거
+              상한가급(≥28%) → 게이트 선차단이 정상 → 워치독 리스트에서 제거
+              이후 candidate_miss = 진짜 미포착 종목만 남아 정확한 진단 가능
+      주의점: _ensure_signal_actionability() 우선주 차단(v165.36)과 필터 기준 동일하게 맞춤
+              워치독 min_rising(_WATCHDOG_MIN_RISING=5) 기준은 필터 적용 후 종목 수 기준
+      진입불가 게이트 연결: 해당 없음 (워치독 진단 경로)
+  [B] _load_intraday_watchdog_rising(): naver_rise top_n 30→50 확대
+      이유: 세미파이브(394280) +29% — 로그 전혀 없음 → naver_rise 30건 한계로 누락
+            상한가 종목이 많은 날 30건 밖에 있는 급등주를 워치독이 인지 못함
+      개선점: _fetch_external_rank_top top_n=50 호출 후 WATCHDOG_RANK_TOP_N 기준으로 재컷
+              (상수 WATCHDOG_RANK_TOP_N은 유지, 수집만 확대)
+      주의점: 우선주/상한가급 필터 후 남은 종목 기준으로 WATCHDOG_RANK_TOP_N개 반환
+      진입불가 게이트 연결: 해당 없음 (워치독 진단 경로)
+  [C] _fetch_major_investor_sector_flow(): FHKST03030100 호출 6→최대 4회, 오류 시 조기종료
+      이유: 로그에서 FHKST03030100 12회 연속 오류 (10:32, 11:18~11:19 각 6회)
+            개인(FID_BLNG_CLS_CODE=1) 수집은 섹터 판단에 불필요한데 2회 추가 소비
+            빈 응답/예외 2회 시 오늘 하루 비활성 처리 없이 매 10분마다 재시도 반복
+      개선점: 기관(3)+외국인(2)만 수집 → 최대 4회 호출 (J/Q 각 1회씩)
+              빈 응답/예외 2회 연속 → 일별 disable 상태 저장(_runtime_state_set)
+              다음 호출 시 disable 확인 → 오늘 하루 스킵 (당일 자정 리셋)
+              API 오류 12회 로그 노이즈 제거
+      주의점: _major_inv_sector_cache에서 "individual" 키 제거됨
+              호출 코드에서 individual 참조 시 KeyError 방지 위해 .get() 사용 권장
+              일별 disable은 재시작해도 유지됨 (runtime_state 기반)
+      진입불가 게이트 연결: 해당 없음 (외부 데이터 수집 경로)
 - v165.37 (2026-04-28): 랭킹 소스 시간 가드 + NXT 등락률 병합 + analyze 전 pre-filter
   [A] get_nxt_surge_stocks(): 거래량 기준 결과에서 등락률 기준 상위 10종목 병합
        이유: NXT 거래량 상위만 수집 시 거래량은 적지만 급등한 종목(LS ELECTRIC류) 누락
@@ -6486,17 +6517,28 @@ def _fetch_major_investor_sector_flow() -> dict:
     반환: {"institution": {sector: count}, "foreign": {sector: count}, "individual": {sector: count},
            "top_sectors": {"institution": [top3], "foreign": [top3], "both": [공통top3]}}
     캐시 TTL: 10분
+    v165.38 [C]: 연속 실패 시 오늘 하루 비활성화 (12회 오류 로그 낭비 방지).
+                 기관·외국인만 수집 (개인은 섹터 판단에 불필요) → 4회로 축소.
+                 첫 번째 마켓(J) 실패 시 두 번째 마켓(Q) 시도 생략 → 최소 2회.
     """
     global _major_inv_sector_cache
     now = time.time()
     if now - _major_inv_sector_cache.get("ts", 0) < 600:
         return dict(_major_inv_sector_cache)
 
-    # FID_BLNG_CLS_CODE: 1=개인, 2=외국인, 3=기관합계
-    investor_map = {"institution": "3", "foreign": "2", "individual": "1"}
+    # v165.38 [C]: 일별 disable 가드 — 당일 API가 오류나면 재시도 차단
+    _disable_key = "major_investor_disable"
+    _disable_obj = _runtime_state_get(_disable_key, {})
+    if isinstance(_disable_obj, dict) and str(_disable_obj.get("date", "")) == _now_kst().date().isoformat():
+        _log_info_msg("  💰 메이저수급 API 오늘 비활성(연속 오류) → 스킵")
+        return dict(_major_inv_sector_cache) if _major_inv_sector_cache.get("ts") else {"top_sectors": {"institution": [], "foreign": [], "both": []}}
+
+    # v165.38 [C]: 기관·외국인만 수집 (개인 제외) — 최대 4회 호출
+    investor_map = {"institution": "3", "foreign": "2"}
     market_map   = {"J": "코스피", "Q": "코스닥"}
 
     sector_counts: dict[str, dict[str, int]] = {k: {} for k in investor_map}
+    total_errors = 0
 
     for inv_key, blng_code in investor_map.items():
         for mkt_code in ("J", "Q"):
@@ -6516,6 +6558,13 @@ def _fetch_major_investor_sector_flow() -> dict:
                     },
                 )
                 items = data.get("output") or []
+                if not items:
+                    total_errors += 1
+                    if total_errors >= 2:  # v165.38: 2회 연속 빈 응답 → 오늘 비활성
+                        _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": "empty_output"})
+                        _log_warn_msg("⚠️ FHKST03030100 연속 빈 응답 → 오늘 비활성 처리")
+                        break
+                    continue
                 for item in items:
                     code = normalize_stock_code(item.get("mksc_shrn_iscd", "") or "")
                     if not code:
@@ -6528,8 +6577,16 @@ def _fetch_major_investor_sector_flow() -> dict:
                         continue
                     sector_counts[inv_key][theme_name] = sector_counts[inv_key].get(theme_name, 0) + 1
             except Exception as e:
+                total_errors += 1
                 _swallow_exception(e)
+                if total_errors >= 2:  # v165.38: 2회 연속 예외 → 오늘 비활성
+                    _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": str(type(e).__name__)})
+                    _log_warn_msg(f"⚠️ FHKST03030100 연속 오류({type(e).__name__}) → 오늘 비활성 처리")
+                    break
             time.sleep(0.15)  # KIS API 호출 간격
+        else:
+            continue
+        break  # 내부 break → 외부 for도 중단
 
     # 상위 3 섹터 추출
     def _top3(d: dict) -> list:
@@ -6543,7 +6600,6 @@ def _fetch_major_investor_sector_flow() -> dict:
         "ts":          now,
         "institution": sector_counts["institution"],
         "foreign":     sector_counts["foreign"],
-        "individual":  sector_counts["individual"],
         "top_sectors": {
             "institution": inst_top,
             "foreign":     frgn_top,
@@ -6950,8 +7006,33 @@ def _watchdog_restore_relax() -> bool:
             _swallow_exception(e)
     return False
 def _load_intraday_watchdog_rising() -> list:
+    """v165.38 [A][B]: 워치독 외부상승 리스트 품질 개선.
+    [A] 우선주(종목명 끝 우/우B/1우B 등)·상한가급(등락률 ≥28%) 필터 제거
+        → 이들은 알람 차단이 정상이므로 candidate_miss 오판 방지
+    [B] top_n 30→50으로 확대: 세미파이브류 소형 급등주 누락 방지
+    """
     market_basis = _resolve_watchdog_market_basis()
-    return _fetch_external_rank_top(min_change=WATCHDOG_RANK_MIN_CHANGE, top_n=WATCHDOG_RANK_TOP_N, market=market_basis)
+    raw = _fetch_external_rank_top(
+        min_change=WATCHDOG_RANK_MIN_CHANGE,
+        top_n=50,  # v165.38 [B]: 30→50 확대
+        market=market_basis,
+    )
+    # v165.38 [A]: 알람 불가 종목 제거 → candidate_miss 오판 방지
+    filtered = []
+    for r in raw:
+        _nm = str(r.get("name", "") or "").replace(" ", "")
+        _cr = float(r.get("change_rate", 0) or 0)
+        # 우선주 패턴 (종목명 끝이 우/우B/1우B/2우B 등)
+        if re.search(r'우[B0-9]*$', _nm):
+            continue
+        # 스팩주
+        if "스팩" in _nm or "SPAC" in _nm.upper():
+            continue
+        # 상한가급 (≥28%): 게이트에서 선차단이 정상 → 워치독 리스트 제외
+        if _cr >= 28.0:
+            continue
+        filtered.append(r)
+    return filtered[:WATCHDOG_RANK_TOP_N]
 def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
     rising = _load_intraday_watchdog_rising()
     n_rising = len(rising)
