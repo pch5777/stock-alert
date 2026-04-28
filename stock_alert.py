@@ -3,10 +3,35 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.39
+버전: v165.40
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.40 (2026-04-28): 섹터 전체 상승 미포착 2개 레이어 추가 수정
+  [A] filter_portfolio_signals(): burst 섹터 실질섹터 중복 한도 완화 (+2)
+      이유: 오늘 금속 섹터 — 하이스틸·동일스틸럭스가 강제감시까지 등록됐으나
+            filter_portfolio_signals의 실질섹터 중복 제외(섹터내 3/3)에서 추가 탈락
+            _apply_scan_sector_gate의 burst_threshold(+3) 보정과 달리
+            filter_portfolio_signals는 burst 감지와 완전히 단절돼 있었음
+      개선점: peer 종목의 섹터 내 총 후보 수 >= SCAN_SECTOR_BURST_THRESHOLD면
+              _max_same +2 완화 (3→5) → burst 섹터에서 더 많은 종목 통과 허용
+      주의점: sorted_alerts 전체 기준으로 _peer_sector_total 산출 (score 무관)
+              SCAN_SECTOR_BURST_THRESHOLD 환경변수(기본 5)에 연동
+      진입불가 게이트 연결: 해당 없음 (포트폴리오 필터 경로)
+  [B] _detect_and_send_sector_breadth_alert() 신설 + run_scan 호출 연결
+      이유: 섹터 제한·실질섹터 필터로 개별 알람이 전부 차단돼도
+            섹터 전체 상승 자체를 사용자에게 알리는 기능이 전혀 없었음
+            오늘 금속 섹터 14종목 동시 8%+ 상승 → 개별 알람 2건만 발송
+      개선점: 동일 섹터 3종목 이상이 change_rate >= 8% 동시 달성 시
+              "📢 [섹터 브레이크아웃] {섹터명}" 특보 발송
+              평균 등락률·종목 수·상위 6종목 목록 포함
+              섹터당 30분 쿨다운 (반복 발송 방지)
+              _sector_breadth_alert_cache 글로벌 변수로 관리
+              run_scan() 내 is_market_open() 조건 하에 매 스캔 후 호출
+      주의점: naver_rise 상위 80건 기준 (API 추가 호출 1회)
+              KRX 장중에만 작동 (NXT/야간 제외)
+              쿨다운 없는 종목만 발송 → 과잉 알람 방지
+      진입불가 게이트 연결: 해당 없음 (별도 특보 경로, send_alert 미경유)
 - v165.39 (2026-04-28): 섹터 제한 구조 버그 수정 — upper_limit 종목 슬롯 선점 차단
   [#1] _apply_scan_sector_gate(): _upper_limit_alerted_today 등록 종목 섹터 카운트 제외
        이유: 로그 분석 결과 아주스틸·금강철강·포스코스틸리온·나우IB·세아메카닉스 5종목이
@@ -6443,6 +6468,7 @@ _sector_volume_cache: dict = {"ts": 0, "data": []}
 # {"ts": float, "institution": {sector: count}, "foreign": {sector: count}, "individual": {sector: count},
 #  "top_sectors": {"institution": [str,...], "foreign": [str,...], "both": [str,...]}}
 _major_inv_sector_cache: dict = {"ts": 0, "institution": {}, "foreign": {}, "individual": {}, "top_sectors": {}}
+_sector_breadth_alert_cache: dict | None = None  # v165.40 [B]: 섹터 breadth 특보 쿨다운 캐시 {섹터명: 마지막발송ts}
 
 def _fetch_sector_volume_rank(top_n: int = 10) -> list:
     """v161.26: 네이버 증권 업종별 시세에서 거래대금 순위 집계.
@@ -37379,6 +37405,72 @@ def send_market_leading_sector_update(force: bool = False):
         _log_info_msg(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 섹터, heat={payload.get('market_heat', 0)})")
     except Exception as e:
         _log_error("send_market_leading_sector_update", e)
+def _detect_and_send_sector_breadth_alert() -> None:
+    """v165.40 [B]: 섹터 breadth 특보 — 동일 섹터 N개 이상 급등 시 섹터 특보 알람 발송.
+    개별 알람이 섹터 제한에 걸려도 섹터 전체 상승 자체를 사용자에게 알려줌.
+    금속 섹터 14종목 동시 상승 같은 경우 개별 포착이 어려워도 섹터 브레이크아웃 인지 가능.
+    쿨다운: 섹터당 30분 (같은 섹터 반복 발송 방지)
+    발동 조건: 동일 섹터 종목 3개 이상이 change_rate >= 8% 동시 달성
+    """
+    if not is_market_open():
+        return
+    global _sector_breadth_alert_cache
+    now = time.time()
+    try:
+        # 네이버 rise에서 상위 종목 수집
+        rising = _fetch_naver_rank("rise", top_n=80)
+        if not rising:
+            return
+        # 섹터별 급등 종목 집계
+        sector_rising: dict[str, list] = {}
+        for r in rising:
+            code = normalize_stock_code(r.get("code", "") or "")
+            name = str(r.get("name", code) or code)
+            cr = float(r.get("change_rate", 0) or 0)
+            if cr < 8.0:
+                continue
+            try:
+                theme, _, _ = get_theme_sector_stocks(code)
+            except Exception:
+                theme = ""
+            sec = str(theme or "").strip()
+            if not sec or sec in ("기타업종", "기타", ""):
+                continue
+            sector_rising.setdefault(sec, []).append({"code": code, "name": name, "change_rate": cr})
+        # 조건: 3개 이상 동시 급등 섹터 감지
+        BREADTH_MIN = 3
+        BREADTH_MIN_RATE = 8.0
+        for sec, stocks in sector_rising.items():
+            if len(stocks) < BREADTH_MIN:
+                continue
+            # 쿨다운 체크 (섹터당 30분)
+            last_sent = (_sector_breadth_alert_cache or {}).get(sec, 0)
+            if now - last_sent < 1800:
+                continue
+            # 특보 메시지 작성
+            avg_rate = sum(s["change_rate"] for s in stocks) / len(stocks)
+            top_stocks = sorted(stocks, key=lambda x: x["change_rate"], reverse=True)[:6]
+            stock_lines = "\n".join(
+                f"  • {s['name']} <b>{s['change_rate']:+.1f}%</b>"
+                for s in top_stocks
+            )
+            msg = (
+                f"📢 <b>[섹터 브레이크아웃]</b> {sec}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 동시 급등: <b>{len(stocks)}종목</b> (평균 {avg_rate:+.1f}%)\n"
+                f"\n"
+                f"{stock_lines}\n"
+                f"\n"
+                f"⚠️ 섹터 전체 상승 중 — 개별 알람 외 섹터 흐름 직접 확인 권장"
+            )
+            send(msg)
+            if _sector_breadth_alert_cache is None:
+                _sector_breadth_alert_cache = {}
+            _sector_breadth_alert_cache[sec] = now
+            _log_info_msg(f"  📢 섹터 브레이크아웃 특보: {sec} {len(stocks)}종목 avg={avg_rate:+.1f}%")
+    except Exception as e:
+        _swallow_exception(e)
+
 def send_premarket_risk_update_if_changed():
     if is_holiday():
         return
@@ -38934,6 +39026,17 @@ def filter_portfolio_signals(alerts: list) -> list:
                         if calc_real_sector_score(s["code"], p["code"], s["name"], p["name"]).get("score", 0) >= 50
                     )
                     _max_same = _dynamic.get("max_same_sector", 2)
+                    # v165.40 [A]: 섹터 전체 상승(burst)이면 실질섹터 한도 +2 완화
+                    # 이유: 오늘 금속 섹터 14종목 동시 상승 → max_same_sector=3 한도로
+                    #       하이스틸·동일스틸럭스 등이 "섹터내 3/3" 탈락
+                    #       burst 감지(5종목 이상 동시 후보)인데 섹터 다양성 제한은 과잉 보수적
+                    _peer_sec = str(peer.get("sector_theme") or peer.get("sector") or "기타").strip() or "기타"
+                    _peer_sector_total = sum(
+                        1 for _a in sorted_alerts
+                        if str(_a.get("sector_theme") or _a.get("sector") or "기타").strip() == _peer_sec
+                    )
+                    if _peer_sector_total >= SCAN_SECTOR_BURST_THRESHOLD:
+                        _max_same = min(_max_same + 2, _max_same + 2)  # burst 섹터 +2 완화
                     if same_sector_passed >= _max_same:
                         excluded.add(peer["code"])
                         _log_info_msg(f"  🗂️ 실질섹터 중복 제외: {_resolve_stock_name(peer['code'], peer.get('name',''))} ({rs['label']}, {rs['score']}점, 섹터내 {same_sector_passed}/{_max_same})")
@@ -40104,6 +40207,12 @@ def run_scan():
         alerts = filter_portfolio_signals(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
         _dispatch_scan_alerts(alerts)
+        # v165.40 [B]: 섹터 breadth 특보 — 섹터 제한으로 개별 알람 못 받아도 섹터 전체 상승 인지
+        try:
+            if is_market_open():
+                _detect_and_send_sector_breadth_alert()
+        except Exception as _sb_e:
+            _swallow_exception(_sb_e)
         _run_scan_followup_hooks()
     except Exception as e:
         _log_error("run_scan", e, critical=True)
