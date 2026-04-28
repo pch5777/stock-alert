@@ -3,10 +3,41 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v165.36
+버전: v165.37
 날짜: 2026-04-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v165.37 (2026-04-28): 랭킹 소스 시간 가드 + NXT 등락률 병합 + analyze 전 pre-filter
+  [A] get_nxt_surge_stocks(): 거래량 기준 결과에서 등락률 기준 상위 10종목 병합
+       이유: NXT 거래량 상위만 수집 시 거래량은 적지만 급등한 종목(LS ELECTRIC류) 누락
+             등락률 높은 종목이 거래량보다 우선 매매 기회
+       개선점: raw_items에서 change_rate 기준 내림차순 정렬 → 상위 10종목 중 미포함 종목 병합
+       주의점: NXT volume-rank API(FHPST01710000+NX) 결과 자체를 등락률로 재정렬
+               별도 API 추가 없음 → 기존 API 1회 호출로 양쪽 커버
+       진입불가 게이트 연결: 해당 없음 (후보 수집 경로)
+  [B] _fetch_external_rank_top(): KRX 소스 시간 가드 추가
+       이유: KRX 장 외 시간에 네이버 rise/amount 호출 시 전일 종가 기준 데이터 반환
+             NXT 장전(08:01) 스캔에서 전일 KRX 데이터로 후보 편입 → 의미 없는 종목 유입
+       개선점: is_market_open() 체크 → KRX 장 외 시간엔 네이버 rise/amount 스킵
+               대신 _rank_from_universe("KRX") 만 사용 (캐시 기반, API 호출 없음)
+               NXT 소스는 is_nxt_open() 가드 추가 (NXT 미운영 시 빈 리스트 즉시 반환)
+       주의점: KRX 장중에는 기존 동일 (네이버 rise + amount + universe)
+       진입불가 게이트 연결: 해당 없음 (후보 수집 경로)
+  [C] _scan_nxt_market_candidates() + _scan_rank_and_theme_candidates(): pre-filter 추가
+       이유: analyze() 내부에서 KIS API 호출(공매도 잔고 등) → 종목당 0.3~30초 소비
+             30종목 × API timeout = 최대 7분 지연 → LS ELECTRIC +13.9% 포착 후 즉시만료
+       개선점: analyze() 호출 전 change_rate < 1%(NXT)/2%(KRX) AND vol_ratio < 2.0x
+               동시 만족 시 즉시 skip → analyze() API 호출 횟수 대폭 감소
+               NXT 전용 시간대 기준(1.0%)은 KRX 장중(2.0%)보다 완화
+       주의점: pre-filter 통과해야 analyze() 진행 → A급 미달 종목은 자동 제외됨
+               섹터팔로우/prewatch/이슈감시 경로는 별도 스캔함수라 영향 없음
+       진입불가 게이트 연결: 해당 없음 (스캔 사이클 최적화)
+  [D] _fetch_kis_amount_rank(): 시간 가드 + NXT 시간대 NX 마켓 전환
+       이유: KRX 전용 API(FID_COND_MRKT_DIV_CODE=J)를 24시간 호출 → NXT 장전에 의미 없는 빈 응답
+       개선점: is_market_open() → J 마켓, NXT 전용 시간 → NX 마켓, 장 외 → KIS 호출 스킵
+               네이버 rise/amount도 is_market_open() 가드 적용
+       주의점: NXT 시간대 NX 마켓 거래대금 순위 응답이 다를 수 있음 (실거래 기준)
+       진입불가 게이트 연결: 해당 없음 (후보 수집 경로)
 - v165.36 (2026-04-28): 알람 중복 제거 + 우선주 알람 차단 + Yahoo Finance crumb 수정
   [#1] _append_premarket_stats_lines(): wl_block(_format_overnight_watchlist_block) 제거
        이유: 장전 액션보드(send_preopen_watchlist)와 리스크 평가(send_premarket_risk_assessment)
@@ -3994,84 +4025,93 @@ def _save_intraday_snap_state(state: dict) -> None:
 def _fetch_kis_amount_rank(top_n: int = 200) -> list:
     """KIS FHPST01710000 거래대금 순위 조회 + 네이버 병행 수집 합산.
     v165.2: FID_COND_SCR_DIV_CODE=20171 + FID_RANK_SORT_CLS_CODE=1(거래대금순).
-    v165.3: KIS API 응답 상한 30건 한계 보완 — 네이버 rise/amount 병행 수집 합산.
-            KIS 30건 + 네이버 rise 80건 + amount 30건 → 중복 제거 후 130~150건 수준.
+    v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 합산.
+    v165.37 [D]: 시간 가드 — KRX 장중=J, NXT 전용 시간대=NX, 장 외=KIS 호출 스킵.
     """
     kis_items = []
+    krx_open = is_market_open()
+    nxt_only = is_nxt_open() and not krx_open
+    # v165.37: 시장 운영 시간에 맞는 마켓코드 선택 (장 외엔 KIS 호출 없음)
+    mrkt_code = "J" if krx_open else ("NX" if nxt_only else "")
     try:
-        data = _safe_get(
-            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
-            "FHPST01710000",
-            {
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_COND_SCR_DIV_CODE": "20171",
-                "FID_INPUT_ISCD": "0000",
-                "FID_DIV_CLS_CODE": "0",
-                "FID_BLNG_CLS_CODE": "0",
-                "FID_TRGT_CLS_CODE": "111111111",
-                "FID_TRGT_EXLS_CLS_CODE": "000000",
-                "FID_INPUT_PRICE_1": "500",
-                "FID_INPUT_PRICE_2": "",
-                "FID_VOL_CNT": str(min(top_n, 200)),
-                "FID_INPUT_DATE_1": "",
-                "FID_RANK_SORT_CLS_CODE": "1",
-            },
-        )
-        for i in (data.get("output") or []):
-            code = normalize_stock_code(i.get("mksc_shrn_iscd", "") or "")
-            if not code:
-                continue
-            try:
-                chg = float(i.get("prdy_ctrt", 0) or 0)
-            except Exception:
-                chg = 0.0
-            try:
-                tr_pbmn = int(i.get("acml_tr_pbmn", 0) or 0)
-            except Exception:
-                tr_pbmn = 0
-            kis_items.append({
-                "code": code,
-                "name": str(i.get("hts_kor_isnm", code) or code),
-                "change_rate": chg,
-                "tr_pbmn": tr_pbmn,
-            })
+        if mrkt_code:
+            data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
+                "FHPST01710000",
+                {
+                    "FID_COND_MRKT_DIV_CODE": mrkt_code,
+                    "FID_COND_SCR_DIV_CODE": "20171",
+                    "FID_INPUT_ISCD": "0000",
+                    "FID_DIV_CLS_CODE": "0",
+                    "FID_BLNG_CLS_CODE": "0",
+                    "FID_TRGT_CLS_CODE": "111111111",
+                    "FID_TRGT_EXLS_CLS_CODE": "000000",
+                    "FID_INPUT_PRICE_1": "500",
+                    "FID_INPUT_PRICE_2": "",
+                    "FID_VOL_CNT": str(min(top_n, 200)),
+                    "FID_INPUT_DATE_1": "",
+                    "FID_RANK_SORT_CLS_CODE": "1",
+                },
+            )
+            for i in (data.get("output") or []):
+                code = normalize_stock_code(i.get("mksc_shrn_iscd", "") or "")
+                if not code:
+                    continue
+                try:
+                    chg = float(i.get("prdy_ctrt", 0) or 0)
+                except Exception:
+                    chg = 0.0
+                try:
+                    tr_pbmn = int(i.get("acml_tr_pbmn", 0) or 0)
+                except Exception:
+                    tr_pbmn = 0
+                kis_items.append({
+                    "code": code,
+                    "name": str(i.get("hts_kor_isnm", code) or code),
+                    "change_rate": chg,
+                    "tr_pbmn": tr_pbmn,
+                    "market": "NXT" if mrkt_code == "NX" else "KRX",
+                })
     except Exception as e:
         _swallow_exception(e)
 
-    # v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 수집 (항상 수행)
+    # v165.3: KIS 30건 한계 보완 — 네이버 rise/amount 병행 수집
+    # v165.37: 네이버 rise는 KRX 장중에만 유효 (장 외엔 전일 데이터 반환)
     seen_codes = {r["code"] for r in kis_items}
     snap_combined = list(kis_items)
-    try:
-        naver_rise = _fetch_naver_rank("rise", top_n=80)
-        for r in naver_rise:
-            code = normalize_stock_code(r.get("code", "") or "")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                snap_combined.append({
-                    "code": code,
-                    "name": str(r.get("name", code) or code),
-                    "change_rate": float(r.get("change_rate", 0) or 0),
-                })
-    except Exception as e:
-        _swallow_exception(e)
-    try:
-        naver_amount = _fetch_naver_rank("amount", top_n=30)
-        for r in naver_amount:
-            code = normalize_stock_code(r.get("code", "") or "")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                snap_combined.append({
-                    "code": code,
-                    "name": str(r.get("name", code) or code),
-                    "change_rate": float(r.get("change_rate", 0) or 0),
-                })
-    except Exception as e:
-        _swallow_exception(e)
+    if krx_open:  # v165.37: KRX 장중에만 네이버 상승/거래대금 수집
+        try:
+            naver_rise = _fetch_naver_rank("rise", top_n=80)
+            for r in naver_rise:
+                code = normalize_stock_code(r.get("code", "") or "")
+                if code and code not in seen_codes:
+                    seen_codes.add(code)
+                    snap_combined.append({
+                        "code": code,
+                        "name": str(r.get("name", code) or code),
+                        "change_rate": float(r.get("change_rate", 0) or 0),
+                    })
+        except Exception as e:
+            _swallow_exception(e)
+        try:
+            naver_amount = _fetch_naver_rank("amount", top_n=30)
+            for r in naver_amount:
+                code = normalize_stock_code(r.get("code", "") or "")
+                if code and code not in seen_codes:
+                    seen_codes.add(code)
+                    snap_combined.append({
+                        "code": code,
+                        "name": str(r.get("name", code) or code),
+                        "change_rate": float(r.get("change_rate", 0) or 0),
+                    })
+        except Exception as e:
+            _swallow_exception(e)
 
     if snap_combined:
+        mkt_label = f"{mrkt_code}마켓" if mrkt_code else "장외"
         _log_info_msg(
-            f"[SNAP] KIS 거래대금 순위 {len(kis_items)}건 수집 (FHPST01710000 거래대금정렬)"
-            f" + naver_rise·amount 병행 = 합산 {len(snap_combined)}건"
+            f"[SNAP] KIS 거래대금 순위 {len(kis_items)}건 ({mkt_label})"
+            f" + 네이버 병행 = 합산 {len(snap_combined)}건"
         )
         return snap_combined[:top_n]
 
@@ -6668,12 +6708,17 @@ def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: in
     """
     외부 소스(네이버→다음→유니버스) 순으로 시도해 상승 종목 목록 반환.
     v163.10 [#3]: 거래대금 상위도 병행 수집해 꾸준히 오르는 종목 커버.
+    v165.37 [B]: KRX 소스는 KRX 장중에만, NXT 소스는 NXT 시간대에만 호출.
+                 KRX 장 외(네이버 rise)는 전일 데이터라 의미 없음 → is_market_open() 가드 추가.
     """
     market_basis = str(market or "AUTO").upper()
     if market_basis not in {"KRX", "NXT"}:
         market_basis = _resolve_watchdog_market_basis()
     items = []
     if market_basis == "NXT":
+        # v165.37: NXT 시간대에만 NXT 소스 사용
+        if not is_nxt_open():
+            return []
         raw = _rank_from_universe("NXT")
         items = [{**r, "source": "universe_nxt", "market": "NXT"} for r in raw]
         # v163.13 [#2]: universe_nxt 0건이면 KIS NXT volume-rank API 직접 재시도
@@ -6686,24 +6731,30 @@ def _fetch_external_rank_top(min_change: float = COMMON_THRESHOLD_3P0, top_n: in
             except Exception as _nxt_retry_e:
                 _swallow_exception(_nxt_retry_e)
     else:
-        items = _fetch_naver_rank("rise", top_n=top_n)
-        if not items:
-            items = _fetch_daum_rank(top_n=top_n)
-        if not items:
+        # v165.37: KRX 소스(네이버 rise/amount)는 KRX 장중에만 의미있음
+        if is_market_open():
+            items = _fetch_naver_rank("rise", top_n=top_n)
+            if not items:
+                items = _fetch_daum_rank(top_n=top_n)
+            if not items:
+                raw = _rank_from_universe("KRX")
+                items = [{**r, "source": "universe", "market": "KRX"} for r in raw]
+            # v163.10 [#3]: 거래대금 상위 30종목 병행 수집 (대한전선류 커버)
+            try:
+                seen_codes = {normalize_stock_code(r.get("code")) for r in items}
+                amount_items = _fetch_naver_rank("amount", top_n=30)
+                for r in amount_items:
+                    code = normalize_stock_code(r.get("code"))
+                    chg = float(r.get("change_rate", 0) or 0)
+                    if code and code not in seen_codes and chg >= min_change:
+                        items.append(r)
+                        seen_codes.add(code)
+            except Exception as _ae:
+                _swallow_exception(_ae)
+        else:
+            # KRX 장 외 시간 — 네이버는 전일 데이터라 유니버스만 사용
             raw = _rank_from_universe("KRX")
             items = [{**r, "source": "universe", "market": "KRX"} for r in raw]
-        # v163.10 [#3]: 거래대금 상위 30종목 병행 수집 (대한전선류 커버)
-        try:
-            seen_codes = {normalize_stock_code(r.get("code")) for r in items}
-            amount_items = _fetch_naver_rank("amount", top_n=30)
-            for r in amount_items:
-                code = normalize_stock_code(r.get("code"))
-                chg = float(r.get("change_rate", 0) or 0)
-                if code and code not in seen_codes and chg >= min_change:
-                    items.append(r)
-                    seen_codes.add(code)
-        except Exception as _ae:
-            _swallow_exception(_ae)
     filtered = [r for r in items if float(r.get("change_rate", 0) or 0) >= min_change]
     filtered.sort(key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
     return filtered[:top_n]
@@ -17816,7 +17867,9 @@ def is_nxt_open() -> bool:
     if is_holiday(): return False
     return NXT_OPEN <= datetime.now().time() <= NXT_CLOSE
 def get_nxt_surge_stocks() -> list:
-    """NXT 급등/거래량 상위 종목 조회"""
+    """NXT 급등/거래량 상위 종목 조회.
+    v165.37 [A]: 거래량 상위 결과에서 등락률 기준 상위도 병합 → 거래량은 적어도 급등한 종목 포착.
+    """
     try:
         data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
                          "FHPST01710000", {
@@ -17826,13 +17879,22 @@ def get_nxt_surge_stocks() -> list:
             "FID_INPUT_PRICE_1":"1000","FID_INPUT_PRICE_2":"",
             "FID_VOL_CNT":str(_get_nxt_volume_rank_count()),"FID_INPUT_DATE_1":"",
         })
-        items = [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
-                  "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
-                  "volume_ratio":float(i.get("vol_inrt",0) or 0), "today_vol": int(i.get("acml_vol",0) or 0), "market":"NXT"}
-                 for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
-        if not items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
+        raw_items = [{"code":i.get("mksc_shrn_iscd",""),"name":i.get("hts_kor_isnm",""),
+                      "price":int(i.get("stck_prpr",0)),"change_rate":float(i.get("prdy_ctrt",0)),
+                      "volume_ratio":float(i.get("vol_inrt",0) or 0), "today_vol": int(i.get("acml_vol",0) or 0), "market":"NXT"}
+                     for i in data.get("output",[]) if i.get("mksc_shrn_iscd")]
+        if not raw_items and os.getenv("ENABLE_UNIVERSE_FALLBACK", "1") == "1":
             _log_warn_msg("⚠️ [NXT] volume-rank 응답 비어있음 → NXT 유니버스 후보군으로 대체")
             return _rank_from_universe("NXT")
+        # v165.37 [A]: 등락률 기준 상위도 병합 (거래량 기준에서 누락된 급등 종목 포착)
+        items = list(raw_items)
+        if raw_items:
+            seen_codes = {i["code"] for i in raw_items}
+            chg_sorted = sorted(raw_items, key=lambda x: float(x.get("change_rate", 0) or 0), reverse=True)
+            for it in chg_sorted[:10]:  # 등락률 상위 10종목 중 미편입 종목 추가
+                if it["code"] not in seen_codes:
+                    items.append(it)
+                    seen_codes.add(it["code"])
         # v165.27 [#1]: NXT volume-rank 응답 종목 → 화이트리스트 누적
         # 이유: API 응답에 포함된 종목 = NXT 실거래 확인. KEC처럼 한 번도 안 나타나면 KRX 전용
         _prev_len = len(_nxt_confirmed_codes)
@@ -39406,6 +39468,13 @@ def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
             if not gate.get("allow"):
                 continue
             stock["_nxt_premarket_gate"] = gate
+        else:
+            # v165.37 [C]: NXT 장중/장후 — analyze() 전 빠른 pre-filter
+            # 등락률 1% 미만 AND 거래량비율 1.5배 미만 → analyze() API 호출 비용 절감
+            _cr = float(stock.get("change_rate", 0) or 0)
+            _vr = float(stock.get("volume_ratio", 0) or 0)
+            if _cr < 1.0 and _vr < 1.5:
+                continue
         r = analyze(stock)
         if isinstance(r, dict):
             r["market"] = "NXT"
@@ -39472,6 +39541,12 @@ def _scan_rank_and_theme_candidates(alerts: list, seen: set) -> None:
             continue
         # NXT전용 시간대엔 market=="NXT" 명시된 종목만 스캔
         if nxt_only_window and str(stock.get("market") or "") != "NXT":
+            continue
+        # v165.37 [C]: analyze() 전 빠른 pre-filter — API 호출 비용 절감
+        _cr = float(stock.get("change_rate", 0) or 0)
+        _vr = float(stock.get("volume_ratio", 0) or 0)
+        _pre_min_cr = 1.0 if nxt_only_window else 2.0  # NXT 장전/장후는 완화
+        if _cr < _pre_min_cr and _vr < 2.0:
             continue
         r = analyze(stock)
         # v165.15: NXT전용 시간대 통과 종목에 market="NXT" 명시 마킹 (sanitize 필터 일관성)
