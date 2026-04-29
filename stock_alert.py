@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.1
+버전: v169.2
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.2 (2026-04-30): KIS API 3종 URI/파라미터 규격서 기반 수정 (404 오류 수정)
+  이유: v169.0에서 URI를 추정해 구현 → 404 반복 (HHMCM 27건, HHPSTH 2건)
+  개선점:
+    HHMCM000100C0 (HTS조회상위): hts-inquiry-top → hts-top-view, 파라미터 없음, output1[]
+    FHKST01011800 (국내뉴스): FID_COND_MRKT_DIV_CODE → FID_COND_MRKT_CLS_CODE,
+                               FID_TITL_CNTT/FID_INPUT_HOUR_1 등 누락 파라미터 추가
+    HHPSTH60100C1 (해외뉴스): overseas-stock → overseas-price, INFO_GB/NATION_CD 등 파라미터,
+                               output[] → outblock1[], news_ttl → title 필드명 수정
+    FHKST01011801 (해외속보): FID_COND_MRKT_CLS_CODE 등 파라미터 규격서 기준으로 수정
+  주의점: 규격서 없이 URI/파라미터/응답필드 추정 절대 금지 (스킬 원칙)
+
 - v169.1 (2026-04-30): 선진입·08:50브리핑 등급 기반 동적 필터링
   [#1] _get_preclose_gap_grade() 신설: 85↑=강함 / 65~84=보통 / 64↓=약함
   [#2] build_next_open_gap_candidates: 고정 max_items 슬라이싱 → 등급 기반 동적 필터링
@@ -8608,34 +8619,35 @@ _hts_top_cache: list = []
 _hts_top_cache_ts: float = 0.0
 
 def get_hts_top_stocks() -> list:
-    """HTS 조회상위 20종목 (HHMCM000100C0) — 시장 관심 집중도.
-    시장 참여자들이 지금 무엇을 보는지 = 오늘 테마/섹터 선행 지표.
-    캐시: 10분
+    """HTS 조회상위 20종목 (HHMCM000100C0).
+    URI: /uapi/domestic-stock/v1/ranking/hts-top-view
+    파라미터: 없음 (Request Query Parameter 없음)
+    응답: output1[] → mrkt_div_cls_code, mksc_shrn_iscd
+    캐시: 10분. 모의투자 미지원.
     """
     global _hts_top_cache, _hts_top_cache_ts
     if _hts_top_cache and time.time() - _hts_top_cache_ts < 600:
         return _hts_top_cache
     try:
         data = _safe_get(
-            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/hts-inquiry-top",
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/hts-top-view",
             "HHMCM000100C0",
-            {"FID_COND_MRKT_DIV_CODE": "J"},
+            {},  # 파라미터 없음 (규격서 확인)
         )
         if not isinstance(data, dict):
             return []
         items = []
-        for i in (data.get("output") or []):
+        for i in (data.get("output1") or []):  # output1[] 배열 (규격서 확인)
             if not isinstance(i, dict):
                 continue
-            code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
+            code = str(i.get("mksc_shrn_iscd") or "").strip()
             if not code:
                 continue
             items.append({
-                "code":        code,
-                "name":        str(i.get("hts_kor_isnm") or ""),
-                "rank":        safe_int(i.get("data_rank") or 0, 0),
-                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
-                "price":       safe_int(i.get("stck_prpr") or 0, 0),
+                "code":  code,
+                "name":  _resolve_stock_name(code, ""),
+                "rank":  len(items) + 1,
+                "market": str(i.get("mrkt_div_cls_code") or ""),
             })
         _hts_top_cache = items
         _hts_top_cache_ts = time.time()
@@ -8652,9 +8664,13 @@ _kis_domestic_news_cache: list = []
 _kis_domestic_news_cache_ts: float = 0.0
 
 def get_kis_domestic_news(max_items: int = 20) -> list:
-    """종합시황/공시 제목 (FHKST01011800) — KIS 자체 국내 뉴스.
-    RSS보다 빠르고 증시 직결 뉴스 중심. 장전 재료 수집 강화.
-    캐시: 5분
+    """종합 시황/공시(제목) (FHKST01011800).
+    URI: /uapi/domestic-stock/v1/quotations/news-title
+    파라미터(규격서 확인): FID_NEWS_OFER_ENTP_CODE, FID_COND_MRKT_CLS_CODE(주의: DIV아님),
+                          FID_INPUT_ISCD, FID_TITL_CNTT, FID_INPUT_DATE_1,
+                          FID_INPUT_HOUR_1, FID_RANK_SORT_CLS_CODE, FID_INPUT_SRNO
+    응답 필드: hts_pbnt_titl_cntt (제목), dorg (자료원), data_dt, data_tm
+    캐시: 5분. 모의투자 미지원.
     """
     global _kis_domestic_news_cache, _kis_domestic_news_cache_ts
     if _kis_domestic_news_cache and time.time() - _kis_domestic_news_cache_ts < 300:
@@ -8664,12 +8680,14 @@ def get_kis_domestic_news(max_items: int = 20) -> list:
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
             "FHKST01011800",
             {
-                "FID_NEWS_OFER_ENTP_CODE": "",
-                "FID_COND_MRKT_DIV_CODE":  "V",
-                "FID_INPUT_ISCD":           "0000000",
-                "FID_NEWS_CLSS_CODE":       "",
-                "FID_INPUT_DATE_1":         "",
-                "FID_INPUT_DATE_2":         "",
+                "FID_NEWS_OFER_ENTP_CODE": "",   # 공백: 전체 업체
+                "FID_COND_MRKT_CLS_CODE":  "",   # 규격서 확인: DIV 아닌 CLS
+                "FID_INPUT_ISCD":           "",   # 공백: 전체 종목
+                "FID_TITL_CNTT":            "",   # 공백 필수
+                "FID_INPUT_DATE_1":         "",   # 공백: 현재 기준
+                "FID_INPUT_HOUR_1":         "",   # 공백: 현재 기준
+                "FID_RANK_SORT_CLS_CODE":   "",   # 공백 필수
+                "FID_INPUT_SRNO":           "",   # 공백 필수
             },
         )
         if not isinstance(data, dict):
@@ -8678,7 +8696,7 @@ def get_kis_domestic_news(max_items: int = 20) -> list:
         for i in (data.get("output") or [])[:max_items]:
             if not isinstance(i, dict):
                 continue
-            title = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
+            title = str(i.get("hts_pbnt_titl_cntt") or "").strip()
             if title:
                 items.append(title)
         _kis_domestic_news_cache = items
@@ -8694,10 +8712,72 @@ _kis_overseas_news_cache: list = []
 _kis_overseas_news_cache_ts: float = 0.0
 
 def get_kis_overseas_news(max_items: int = 20) -> list:
-    """해외뉴스종합(HHPSTH60100C1) + 해외속보(FHKST01011801) — KIS 해외 뉴스.
-    야간 시나리오 분석 보완. RSS보다 빠른 실시간 해외 속보.
-    캐시: 5분
+    """해외뉴스종합(제목) (HHPSTH60100C1) + 해외속보(FHKST01011801) — 규격서 기반 재구현.
+    HHPSTH60100C1:
+      URI: /uapi/overseas-price/v1/quotations/news-title  (overseas-price, 규격서 확인)
+      파라미터: INFO_GB, CLASS_CD, NATION_CD, EXCHANGE_CD, SYMB, DATA_DT, DATA_TM, CTS
+      응답: outblock1[] → title 필드 (규격서 확인)
+    FHKST01011801:
+      URI: /uapi/domestic-stock/v1/quotations/news-title
+      응답: output[] → hts_pbnt_titl_cntt
+    캐시: 5분. 모의투자 미지원.
     """
+    global _kis_overseas_news_cache, _kis_overseas_news_cache_ts
+    if _kis_overseas_news_cache and time.time() - _kis_overseas_news_cache_ts < 300:
+        return _kis_overseas_news_cache
+    items = []
+    # 해외뉴스종합 (HHPSTH60100C1) — overseas-price (규격서 확인)
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/overseas-price/v1/quotations/news-title",
+            "HHPSTH60100C1",
+            {
+                "INFO_GB":     "",    # 공백: 전체
+                "CLASS_CD":    "",    # 공백: 전체
+                "NATION_CD":   "US",  # 미국 뉴스 중심
+                "EXCHANGE_CD": "",    # 공백: 전체
+                "SYMB":        "",    # 공백: 전체 종목
+                "DATA_DT":     "",    # 공백: 현재 기준
+                "DATA_TM":     "",    # 공백: 현재 기준
+                "CTS":         "",    # 공백: 첫 페이지
+            },
+        )
+        if isinstance(data, dict):
+            for i in (data.get("outblock1") or [])[:max_items]:  # outblock1[] 규격서 확인
+                if isinstance(i, dict):
+                    t = str(i.get("title") or "").strip()  # title 필드 (규격서 확인)
+                    if t:
+                        items.append(t)
+    except Exception as e:
+        _swallow_exception(e)
+    # 해외속보 (FHKST01011801) — FHKST01011800과 동일 URI/파라미터 패턴
+    try:
+        data2 = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
+            "FHKST01011801",
+            {
+                "FID_NEWS_OFER_ENTP_CODE": "",
+                "FID_COND_MRKT_CLS_CODE":  "",
+                "FID_INPUT_ISCD":           "",
+                "FID_TITL_CNTT":            "",
+                "FID_INPUT_DATE_1":         "",
+                "FID_INPUT_HOUR_1":         "",
+                "FID_RANK_SORT_CLS_CODE":   "",
+                "FID_INPUT_SRNO":           "",
+            },
+        )
+        if isinstance(data2, dict):
+            for i in (data2.get("output") or [])[:max_items]:
+                if isinstance(i, dict):
+                    t = str(i.get("hts_pbnt_titl_cntt") or "").strip()
+                    if t and t not in items:
+                        items.append(t)
+    except Exception as e:
+        _swallow_exception(e)
+    _kis_overseas_news_cache = items[:max_items]
+    _kis_overseas_news_cache_ts = time.time()
+    return _kis_overseas_news_cache
+
     global _kis_overseas_news_cache, _kis_overseas_news_cache_ts
     if _kis_overseas_news_cache and time.time() - _kis_overseas_news_cache_ts < 300:
         return _kis_overseas_news_cache
