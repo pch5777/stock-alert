@@ -3,10 +3,39 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v168.1
-날짜: 2026-04-29
+버전: v169.1
+날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.1 (2026-04-30): 선진입·08:50브리핑 등급 기반 동적 필터링
+  [#1] _get_preclose_gap_grade() 신설: 85↑=강함 / 65~84=보통 / 64↓=약함
+  [#2] build_next_open_gap_candidates: 고정 max_items 슬라이싱 → 등급 기반 동적 필터링
+       이유: 강함 4개↑ → 강함만, 강함 적으면 보통 보완, 없으면 약함까지. 최대 상한 10개
+       개선점: 시장 강세일 강함 종목만 발송 → 알람 품질↑, 조용한 날 보통/약함 보완 → 정보 유지
+       주의점: KRX/NXT 동일 로직 적용 (스킬 15조 준수)
+  [#3] 선진입 알람 메시지: 종목별 등급 표시 (🔴강함 / 🟡보통 / 🔵약함)
+  [#4] _build_premarket_sector_snapshot: 섹터 등급 기반 필터링
+       이유: 고정 8개 슬라이싱 → 강함 섹터 적어도 약함 섹터가 자리 차지
+       개선점: 강함 4↑ → 강함만, 아니면 보통까지, 없으면 약함까지. SEC_MAX=10
+  [#5] _build_premarket_sector_snapshot: 섹터 내 종목 상승 조건 필터
+       이유: 섹터에 등록된 모든 종목 표시 → 실제 오늘 오를 종목 불명확
+       개선점: NXT 등락률≥3% / 예상체결≥2% / 신고가 근접 / HTS 조회상위 / 전일 포착 중
+               1개 이상 충족 종목만 표시. 강함 섹터 종목은 조건 무관 포함
+       주의점: 조건 소스 API 실패 시 빈 셋 → 강함 섹터 종목은 fallback 보장
+  [#6] 08:50 브리핑: 섹터별 등급 아이콘 표시 (🔴강함 / 🟡보통 / 🔵약함)
+
+- v169.0 (2026-04-30): 섹터 자동발굴 파이프라인 전면 재설계 — 수동 시드 → 포착 즉시 자동 등록
+  정수 버전업: 기존 SECTOR_SEED_STOCKS 하드코딩→09:05 1회 → 포착즉시 bstp_code 자동등록 파이프라인 변경
+  [#1] _auto_register_sector_from_signal(): SURGE 포착 즉시 bstp_code→동업종 중소형주 자동 등록
+  [#2] _register_sector_seed_from_yesterday_once() 07:28 신설: 전일 결과로 NXT 08:00 전 섹터 준비
+  [#3] _collect_and_save_today_sector_results() 20:05 신설: NXT 마감 후 결과 집계 → 내일 시드 순환
+  [#4] KIS 6종 신규 API: FHPUP02140000(전섹터지수)/HHMCM000100C0(HTS조회상위)/
+       FHKST01011800(국내뉴스)/HHPSTH60100C1+FHKST01011801(해외뉴스)/
+       HHDFS76260000(미국급등)/HHDFS76280000(미국체결강도)
+  [#5] 전체 파이프라인 연결: 헤드라인수집+시나리오우선순위+야간워치+동적후보+NXT스캔+US가점
+  [#6] DOMESTIC_SECTOR_US_STOCKS 신설 + NXT 선진입 US 프리마켓 개별 가점(BE/PLUG/ETN 등)
+  [#7] 08:50 통합 브리핑: 집중섹터8개+시초가후보3개+미국컨텍스트 단일 메시지
+  [#8] 스케줄 정비: 09:05→09:10, 07:28 신설, 20:05 결과집계 추가
 - v168.1 (2026-04-29): 선진입 진입가 확정 + stale entry_hit 재발 방지 + 시나리오 품질 개선 + THEME_MAP 전력섹터 확장
   [#1] _maybe_send_immediate_entry_hit_from_signal: watch entry_hit=True 즉시 signal_log 동기화
        이유: v168 이전에 watch에만 entry_hit=True 기록 → _purge_stale가 signal_log 기준 체크 → stale 판정 → 재발
@@ -6605,6 +6634,86 @@ def _queue_material_block_digest_row(code: str, name: str, meta: dict, stage: st
     })
 
 
+
+# v169.0: 오늘 강세 섹터 결과 집계 및 저장
+# NXT 20:05에 호출 → 야간 시나리오 입력, 08:05 섹터 시드로 활용
+TODAY_SECTOR_RESULTS_FILE = _state_path("today_sector_results.json")
+_today_sector_results: dict = {}   # sector_name → {codes, avg_chg, count, ts}
+
+def _collect_and_save_today_sector_results() -> dict:
+    """NXT 20:00 마감 직후: 오늘 signal_log에서 섹터별 강세 결과 집계.
+    반환: {sector_name: {codes, names, avg_chg, max_chg, count, ts}}
+    이 데이터를:
+      ① 08:05 섹터 시드 1차 등록 (NXT 오픈 직후 준비)
+      ② collect_market_scenarios_24h() 입력 (야간 시나리오 강화)
+      ③ 07:30 장전 브리핑 "오늘 집중 섹터" 섹션
+    """
+    global _today_sector_results
+    try:
+        today = _now_kst().strftime("%Y%m%d")
+        siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
+        sector_map: dict = {}
+        for rec in siglog.values():
+            if not isinstance(rec, dict):
+                continue
+            rec_date = str(rec.get("detect_date") or "").replace("-", "")
+            if rec_date != today:
+                continue
+            code = normalize_stock_code(rec.get("code") or "")
+            name = str(rec.get("name") or "")
+            cr = safe_float(rec.get("change_rate") or 0, 0.0)
+            sector = str(rec.get("sector_theme") or rec.get("theme") or "")
+            if not code or cr < 3.0 or not sector:
+                continue
+            entry = sector_map.setdefault(sector, {"codes": [], "names": [], "chgs": []})
+            if code not in entry["codes"]:
+                entry["codes"].append(code)
+                entry["names"].append(name)
+                entry["chgs"].append(cr)
+        results = {}
+        for sector, data in sector_map.items():
+            if len(data["codes"]) == 0:
+                continue
+            avg_chg = round(sum(data["chgs"]) / len(data["chgs"]), 1)
+            results[sector] = {
+                "codes":   data["codes"][:6],
+                "names":   data["names"][:6],
+                "avg_chg": avg_chg,
+                "max_chg": round(max(data["chgs"]), 1),
+                "count":   len(data["codes"]),
+                "date":    today,
+                "ts":      time.time(),
+            }
+        # 강세순 정렬
+        results = dict(sorted(results.items(), key=lambda x: x[1]["avg_chg"], reverse=True))
+        _today_sector_results = results
+        _write_json_atomic(TODAY_SECTOR_RESULTS_FILE, results, indent=2)
+        if results:
+            top3 = list(results.items())[:3]
+            summary = " / ".join(f"{s}({v['avg_chg']:+.1f}%,{v['count']}종목)" for s, v in top3)
+            _log_info_msg(f"  📊 [오늘 섹터 결과] {summary}")
+        return results
+    except Exception as e:
+        _log_warn_msg(f"⚠️ _collect_and_save_today_sector_results: {e}")
+        return {}
+
+def _load_today_sector_results() -> dict:
+    """오늘 섹터 결과 로드 (07:30 브리핑, 08:05 시드 등록에서 사용)."""
+    global _today_sector_results
+    if _today_sector_results:
+        return _today_sector_results
+    try:
+        data = _read_json_safe(TODAY_SECTOR_RESULTS_FILE, {})
+        today = _now_kst().strftime("%Y%m%d")
+        # 오늘 데이터만 유효 (어제 데이터는 익익영업일 브리핑에 혼선 야기)
+        valid = {s: v for s, v in data.items()
+                 if isinstance(v, dict) and str(v.get("date", "")) == today}
+        _today_sector_results = valid
+        return valid
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+
 def _send_market_scenario_digest(force: bool = False) -> None:
     runtime = _material_block_runtime if isinstance(_material_block_runtime, dict) else {}
     rows = list(runtime.get("digest_rows", []) or [])
@@ -6993,6 +7102,26 @@ _quiet_snapshot_cache: dict = {}
 _quiet_scan_cycle_state: dict = {"started_ts": 0.0, "calls": 0, "budget": 0, "skipped_budget": 0}
 _quiet_scan_cursor: dict = {"all": 0}
 # v41.77 #1: 동적 테마 자동 발굴 — 야간 이벤트 키워드 → 국내 종목 매핑 테이블
+# v169.0: 국내 섹터 → 연관 미국 종목 매핑 (NXT 선진입 개별 US 프리마켓 가점용)
+DOMESTIC_SECTOR_US_STOCKS: dict = {
+    "연료전지":    ["BE", "PLUG", "FCEL"],
+    "수소":        ["BE", "PLUG", "FCEL"],
+    "에너지인프라": ["BE", "CEG", "ETN"],
+    "원전":        ["CEG", "OKLO", "SMR"],
+    "반도체":      ["NVDA", "AMD", "MU", "AVGO"],
+    "AI반도체":    ["NVDA", "AMD", "AVGO"],
+    "AI인프라":    ["NVDA", "GOOGL"],
+    "2차전지":     ["TSLA", "ALB"],
+    "전력기기":    ["ETN"],
+    "전선":        ["ETN"],
+    "방산":        ["LMT", "RTX"],
+    "바이오":      ["MRNA", "BNTX"],
+    "조선":        ["HII"],
+    "자동차":      ["TSLA"],
+    "로봇":        ["NVDA", "ISRG"],
+    "광통신":      ["VIAV", "LITE"],
+}
+
 OVERNIGHT_EVENT_KEYWORDS = {
     "GTC": ["엔비디아","nvidia","gtc","젠슨황","gpu","hbm","ai반도체","blackwell","베라루빈"],
     "FOMC": ["fomc","연준","금리","fed","파월","기준금리"],
@@ -7050,6 +7179,12 @@ SECTOR_SEED_STOCKS: dict[str, str] = {
     "반도체소부장": "042700",  # 한미반도체 → 반도체 장비 업종
     "우주항공":    "047810",  # 한국항공우주 → 항공/방산 업종
     "로봇":        "277810",  # 레인보우로보틱스 → 로봇/자동화 업종
+    # v168.2: 오늘 급등 섹터(전선/연료전지 등) 파생 종목 자동 수집용 시드 추가
+    "전선":        "229640",  # LS에코에너지 → 전선/케이블 업종
+    "전력기기":    "010120",  # LS ELECTRIC → 전력기기/중전기 업종
+    "연료전지":    "336260",  # 두산퓨얼셀 → 연료전지/수소 업종
+    "정밀화학":    "004000",  # 롯데정밀화학 → 정밀화학 업종
+    "2차전지소재": "247540",  # 에코프로비엠 → 양극재/2차전지소재 업종
 }
 # ── 섹터 지속 모니터링 ──
 _sector_monitor     = {}
@@ -8409,6 +8544,199 @@ def get_ma20_deviation(code: str) -> float:
 # ⑯ 코스피 상대강도 (시장 중립 필터)
 # ============================================================
 _kospi_cache = {"change": 0.0, "ts": 0}
+
+# ============================================================
+# v169.0: 신규 KIS API 4종 구현
+# FHPUP02140000 / HHMCM000100C0 / FHKST01011800 / HHPSTH60100C1+FHKST01011801
+# ============================================================
+
+# ── 1. 국내업종 구분별전체시세 (FHPUP02140000) ──────────────────
+_all_sector_index_cache: list = []
+_all_sector_index_cache_ts: float = 0.0
+
+def get_all_sector_index(market: str = "J") -> list:
+    """업종 구분별 전체 시세 (FHPUP02140000) — 1회 호출로 전 섹터 지수 수신.
+    장전: 전일 종가 기준 섹터 강약 / 장중: 실시간 등락 기반 오늘 주도 섹터 판별.
+    반환: [{bstp_code, bstp_name, change_rate, index, volume}, ...]
+    캐시: 5분
+    """
+    global _all_sector_index_cache, _all_sector_index_cache_ts
+    if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 300:
+        return _all_sector_index_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-member",
+            "FHPUP02140000",
+            {
+                "fid_cond_mrkt_div_code": market,
+                "fid_cond_scr_div_code":  "20214",
+                "fid_div_cls_code":        "1",   # 1=업종구분
+                "fid_input_iscd":          "0001",
+                "fid_trgt_cls_code":       "0",
+                "fid_trgt_exls_cls_code":  "0",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            bstp_code = str(i.get("bstp_cls_code") or i.get("bstp_code") or "").strip()
+            bstp_name = str(i.get("bstp_kor_isnm") or i.get("bstp_name") or "").strip()
+            if not bstp_code or not bstp_name:
+                continue
+            items.append({
+                "bstp_code":   bstp_code,
+                "bstp_name":   bstp_name,
+                "change_rate": safe_float(i.get("bstp_nmix_prdy_ctrt") or i.get("prdy_ctrt") or 0, 0.0),
+                "index":       safe_float(i.get("bstp_nmix_prpr") or i.get("prpr") or 0, 0.0),
+                "volume":      safe_int(i.get("acml_vol") or 0, 0),
+                "trade_value": safe_int(i.get("acml_tr_pbmn") or 0, 0),
+            })
+        items.sort(key=lambda x: x["change_rate"], reverse=True)
+        _all_sector_index_cache = items
+        _all_sector_index_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+# ── 2. HTS 조회상위 20종목 (HHMCM000100C0) ────────────────────
+_hts_top_cache: list = []
+_hts_top_cache_ts: float = 0.0
+
+def get_hts_top_stocks() -> list:
+    """HTS 조회상위 20종목 (HHMCM000100C0) — 시장 관심 집중도.
+    시장 참여자들이 지금 무엇을 보는지 = 오늘 테마/섹터 선행 지표.
+    캐시: 10분
+    """
+    global _hts_top_cache, _hts_top_cache_ts
+    if _hts_top_cache and time.time() - _hts_top_cache_ts < 600:
+        return _hts_top_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/hts-inquiry-top",
+            "HHMCM000100C0",
+            {"FID_COND_MRKT_DIV_CODE": "J"},
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code":        code,
+                "name":        str(i.get("hts_kor_isnm") or ""),
+                "rank":        safe_int(i.get("data_rank") or 0, 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "price":       safe_int(i.get("stck_prpr") or 0, 0),
+            })
+        _hts_top_cache = items
+        _hts_top_cache_ts = time.time()
+        if items:
+            _log_info_msg(f"  👀 HTS 조회상위 {len(items)}종목 수집 (HHMCM000100C0)")
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+# ── 3. KIS 국내 뉴스 (FHKST01011800) ─────────────────────────
+_kis_domestic_news_cache: list = []
+_kis_domestic_news_cache_ts: float = 0.0
+
+def get_kis_domestic_news(max_items: int = 20) -> list:
+    """종합시황/공시 제목 (FHKST01011800) — KIS 자체 국내 뉴스.
+    RSS보다 빠르고 증시 직결 뉴스 중심. 장전 재료 수집 강화.
+    캐시: 5분
+    """
+    global _kis_domestic_news_cache, _kis_domestic_news_cache_ts
+    if _kis_domestic_news_cache and time.time() - _kis_domestic_news_cache_ts < 300:
+        return _kis_domestic_news_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
+            "FHKST01011800",
+            {
+                "FID_NEWS_OFER_ENTP_CODE": "",
+                "FID_COND_MRKT_DIV_CODE":  "V",
+                "FID_INPUT_ISCD":           "0000000",
+                "FID_NEWS_CLSS_CODE":       "",
+                "FID_INPUT_DATE_1":         "",
+                "FID_INPUT_DATE_2":         "",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or [])[:max_items]:
+            if not isinstance(i, dict):
+                continue
+            title = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
+            if title:
+                items.append(title)
+        _kis_domestic_news_cache = items
+        _kis_domestic_news_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+# ── 4. KIS 해외 뉴스 (HHPSTH60100C1 + FHKST01011801) ─────────
+_kis_overseas_news_cache: list = []
+_kis_overseas_news_cache_ts: float = 0.0
+
+def get_kis_overseas_news(max_items: int = 20) -> list:
+    """해외뉴스종합(HHPSTH60100C1) + 해외속보(FHKST01011801) — KIS 해외 뉴스.
+    야간 시나리오 분석 보완. RSS보다 빠른 실시간 해외 속보.
+    캐시: 5분
+    """
+    global _kis_overseas_news_cache, _kis_overseas_news_cache_ts
+    if _kis_overseas_news_cache and time.time() - _kis_overseas_news_cache_ts < 300:
+        return _kis_overseas_news_cache
+    items = []
+    # 해외뉴스종합
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/overseas-stock/v1/quotations/news-title",
+            "HHPSTH60100C1",
+            {"FID_COND_MRKT_DIV_CODE": "N", "FID_INPUT_ISCD": "", "FID_INPUT_DATE_1": ""},
+        )
+        if isinstance(data, dict):
+            for i in (data.get("output") or [])[:max_items]:
+                if isinstance(i, dict):
+                    t = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
+                    if t:
+                        items.append(t)
+    except Exception as e:
+        _swallow_exception(e)
+    # 해외속보 (보완)
+    try:
+        data2 = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
+            "FHKST01011801",
+            {"FID_NEWS_OFER_ENTP_CODE": "", "FID_COND_MRKT_DIV_CODE": "V",
+             "FID_INPUT_ISCD": "0000000", "FID_NEWS_CLSS_CODE": ""},
+        )
+        if isinstance(data2, dict):
+            for i in (data2.get("output") or [])[:max_items]:
+                if isinstance(i, dict):
+                    t = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
+                    if t and t not in items:
+                        items.append(t)
+    except Exception as e:
+        _swallow_exception(e)
+    _kis_overseas_news_cache = items[:max_items]
+    _kis_overseas_news_cache_ts = time.time()
+    return _kis_overseas_news_cache
+
 def get_kospi_change() -> float:
     """코스피 당일 등락률"""
     if time.time() - _kospi_cache["ts"] < 300:
@@ -12661,6 +12989,33 @@ def _apply_next_open_gap_market_context(score: int, reasons: list[str], cautions
                 score -= 4; cautions.append(f"🔵 NXT 탄력 둔화 -4 ({ctx['change_rate']:+.1f}%)")
         except Exception as e:
             _swallow_exception(e)
+        # v169.0: 종목 섹터 → DOMESTIC_SECTOR_US_STOCKS → US 프리마켓 개별 가점
+        # NXT 선진입 시점(19:10)은 미국 프리마켓 진행 중 → 섹터 연계 US 종목 반영
+        try:
+            _sector = str(ctx.get("sector_theme") or ctx.get("theme") or "")
+            _us_now = get_us_market_signals() or {}
+            _us_bonus = 0
+            _us_hit_names = []
+            for _sec_token in [_sector] + _sector.replace("·", "/").split("/"):
+                _us_syms = DOMESTIC_SECTOR_US_STOCKS.get(_sec_token.strip(), [])
+                for _sym in _us_syms:
+                    _key = f"{_sym.lower()}_chg"
+                    _chg = safe_float(_us_now.get(_key, 0.0), 0.0)
+                    if _chg >= 3.0:
+                        _add = min(8, int(_chg // 2))
+                        _us_bonus = max(_us_bonus, _add)
+                        _us_hit_names.append(f"{_sym} {_chg:+.1f}%")
+                    elif _chg <= -3.0:
+                        _us_bonus = min(_us_bonus, -4)
+                        _us_hit_names.append(f"{_sym} {_chg:+.1f}%")
+            if _us_bonus > 0 and _us_hit_names:
+                score += _us_bonus
+                reasons.append(f"🌐 US프리마켓 연동 +{_us_bonus} ({', '.join(_us_hit_names[:2])})")
+            elif _us_bonus < 0 and _us_hit_names:
+                score += _us_bonus
+                cautions.append(f"🌐 US프리마켓 약세 {_us_bonus} ({', '.join(_us_hit_names[:2])})")
+        except Exception as e:
+            _swallow_exception(e)
     return score, reasons, cautions
 def _apply_next_open_gap_flow_context(score: int, reasons: list[str], ctx: dict, stage: str) -> tuple[int, list[str]]:
     market_basis = "NXT" if str(stage or "").lower() == "nxt" else "KRX"
@@ -12866,6 +13221,20 @@ def _score_next_open_gap_candidate(code: str, stage: str, latest_rec: dict | Non
     score, reasons, cautions = _apply_preclose_gap_close_betting_context(score, reasons, cautions, ctx, stage, phase)
     score, reasons, cautions = _apply_next_open_gap_market_context(score, reasons, cautions, ctx, us, strong_dart_codes)
     return _finalize_next_open_gap_candidate(ctx, stage, latest_rec, us, sector_info, score, reasons, cautions, similar_pattern_stats, similar_pattern_summary, phase=phase)
+def _get_preclose_gap_grade(score: int) -> str:
+    """v169.1: 선진입 종목 등급 판정.
+    강함: score ≥ 85  — A급 재료+모멘텀 복합
+    보통: score 65~84 — B급 조건 충족
+    약함: score < 65  — 참고용 수준
+    """
+    s = int(score or 0)
+    if s >= 85:
+        return "강함"
+    if s >= 65:
+        return "보통"
+    return "약함"
+
+
 def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPEN_GAP_MAX_SHOW, phase: str = "initial") -> dict:
     """장후반/NXT 후반 기준 익영업일 갭상승 선진입 후보를 점수화해 저장."""
     stage = "nxt" if str(stage).lower() == "nxt" else "krx"
@@ -12929,6 +13298,23 @@ def build_next_open_gap_candidates(stage: str = "krx", max_items: int = NEXT_OPE
             continue
         time.sleep(0.05)
     candidates.sort(key=lambda x: (x.get("score", 0), x.get("rr", 0), x.get("change_rate", 0), x.get("volume_ratio", 0)), reverse=True)
+    # v169.1: 등급 필드 주입 (강함/보통/약함)
+    for c in candidates:
+        c["gap_grade"] = _get_preclose_gap_grade(int(c.get("score", 0) or 0))
+    # v169.1: 등급 기반 동적 필터링 — 고정 개수 제한 제거
+    # 강함 많으면 강함만, 적으면 보통까지, 없으면 약함까지
+    # 최대 상한만 유지 (알람이 너무 길어지는 것 방지)
+    GAP_MAX = 10  # 절대 상한
+    strong = [c for c in candidates if c["gap_grade"] == "강함"]
+    normal = [c for c in candidates if c["gap_grade"] == "보통"]
+    weak   = [c for c in candidates if c["gap_grade"] == "약함"]
+    if len(strong) >= 4:
+        filtered = strong[:GAP_MAX]
+    elif strong or len(normal) >= 2:
+        filtered = (strong + normal)[:GAP_MAX]
+    else:
+        filtered = (strong + normal + weak)[:GAP_MAX]
+    candidates = filtered
     # v165.4: NXT 스캔 결과에서 holdover 종목은 market_note를 "NXT 기준"으로 확정
     if stage == "nxt":
         holdover_codes = set(_nxt_preclose_holdover.keys())
@@ -13401,6 +13787,8 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
         #       "현재가보다 낮은 눌림 대기 진입가는 사용하지 않습니다" 문구와도 모순
         # 수정: 현재가를 진입가로 확정 → 손절/목표 재계산 → 학습 가능한 데이터로 기록
         _item_chg = float(item.get("change_rate", 0.0) or 0.0)
+        _gap_grade = str(item.get("gap_grade") or _get_preclose_gap_grade(int(item.get("score", 0) or 0)))
+        _grade_emoji = {"강함": "🔴", "보통": "🟡", "약함": "🔵"}.get(_gap_grade, "🟡")
         _is_high_price = _item_chg >= 15.0
         if _is_high_price:
             _cur = int(item.get("current_price", 0) or 0)
@@ -13418,7 +13806,7 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
                     item["rr"] = round(_rr_num, 1)
                 except Exception:
                     pass
-        msg += f"\n{idx}) <b>{item.get('name','')}</b>  <code>{item.get('code','')}</code>  <b>{item.get('score',0)}점</b>\n"
+        msg += f"\n{idx}) {_grade_emoji} <b>{item.get('name','')}</b>  <code>{item.get('code','')}</code>  <b>{item.get('score',0)}점({_gap_grade})</b>\n"
         if sim_summary:
             msg += f"  {sim_summary}\n"
         if _is_high_price:
@@ -14097,6 +14485,13 @@ def refresh_dynamic_candidates(force_rank: bool = False):
                 _log_info_msg(f"  🧭 섹터강제감시 자동편입: {_sfw_added}종목")
         except Exception as _sfw_e:
             _swallow_exception(_sfw_e)
+
+        # v169.0: HTS 조회상위 → 시장 관심 집중 종목 후보 편입
+        try:
+            for hts_item in get_hts_top_stocks():
+                _put_candidate(hts_item, "HTS조회상위")
+        except Exception as _hts_e:
+            _swallow_exception(_hts_e)
 
         for code, info in candidates.items():
             if code not in _dynamic_candidates:
@@ -16645,6 +17040,242 @@ def _build_opening_gap_watch_pool() -> list:
         _log_info_msg(f"[OPENING_GAP] 후보 풀 구성: {len(pool)}건 (PRECLOSE:{sum(1 for p in pool if 'PRECLOSE' in p['source'])} / GROQ:{sum(1 for p in pool if 'GROQ' in p['source'])})")
     return pool[:OPENING_GAP_MAX_POOL]
 
+
+def _build_premarket_sector_snapshot() -> dict:
+    """v169.0: 08:30~08:50 장전 섹터 스냅샷 생성.
+    소스:
+      ① get_overtime_fluctuation_rank() — NXT 등락률 상위
+      ② get_overtime_volume_rank()      — NXT 거래량 상위
+      ③ get_volume_power_rank("Q")      — NXT 체결강도 상위
+      ④ get_near_new_highlow_rank()     — 신고가 근접
+      ⑤ get_exp_trans_updown_rank()     — 장전 예상체결 상위
+      ⑥ get_all_sector_index()          — 전 업종 지수
+      ⑦ get_hts_top_stocks()            — HTS 조회상위
+      ⑧ _load_today_sector_results()    — 전일 강세 섹터
+    반환: {
+      "top_sectors": [(sector_name, score, reasons), ...],  # 오늘 집중 섹터
+      "top_stocks":  [{code, name, score, reasons}, ...],   # 즉시 주목 종목
+      "us_context":  str,                                   # 미국 시장 요약
+      "ts": float,
+    }
+    """
+    try:
+        result = {"top_sectors": [], "top_stocks": [], "us_context": "", "ts": time.time()}
+        sector_scores: dict = {}  # sector_name → {score, codes, names, reasons}
+
+        def _add_sector(name: str, code: str, stock_name: str, score: int, reason: str):
+            if not name:
+                return
+            entry = sector_scores.setdefault(name, {"score": 0, "codes": [], "names": [], "reasons": []})
+            entry["score"] += score
+            if code and code not in entry["codes"]:
+                entry["codes"].append(code)
+                entry["names"].append(stock_name)
+            if reason and reason not in entry["reasons"]:
+                entry["reasons"].append(reason)
+
+        def _code_to_sector(code: str, name: str) -> str:
+            """종목코드 → 섹터명 추론 (bstp_name 캐시 우선)"""
+            cached = _sector_cache.get(code)
+            if cached and cached.get("sector"):
+                return str(cached["sector"])
+            # _dynamic_theme_map에서 역탐색
+            for tk, ti in (_dynamic_theme_map or {}).items():
+                if not isinstance(ti, dict):
+                    continue
+                for c, n in (ti.get("stocks") or []):
+                    if normalize_stock_code(c) == code:
+                        secs = ti.get("sectors") or []
+                        return secs[0] if secs else str(tk)
+            return ""
+
+        # ① NXT 등락률/거래량/체결강도 교집합 → 강세 섹터
+        try:
+            nxt_fluct = {normalize_stock_code(x.get("code")): x for x in get_overtime_fluctuation_rank() if x.get("change_rate", 0) >= 3}
+            nxt_vol   = {normalize_stock_code(x.get("code")): x for x in get_overtime_volume_rank()}
+            nxt_power = {normalize_stock_code(x.get("code")): x for x in get_volume_power_rank("Q")}
+            for code, item in nxt_fluct.items():
+                if not code:
+                    continue
+                n = str(item.get("name") or "")
+                cr = float(item.get("change_rate") or 0)
+                sec = _code_to_sector(code, n)
+                vol_bonus = 1 if code in nxt_vol else 0
+                pwr_bonus = 2 if code in nxt_power else 0
+                score = int(cr) + vol_bonus + pwr_bonus
+                _add_sector(sec or n, code, n, score, f"NXT {cr:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ② 신고가 근접 → 추세 지속성
+        try:
+            for item in get_near_new_highlow_rank(high=True):
+                code = normalize_stock_code(item.get("code"))
+                n = str(item.get("name") or "")
+                sec = _code_to_sector(code, n)
+                _add_sector(sec or n, code, n, 3, "신고가근접")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ③ 예상체결 상위 → KRX 시초 강세 예측
+        try:
+            for item in get_exp_trans_updown_rank(before_open=True):
+                code = normalize_stock_code(item.get("code"))
+                n = str(item.get("name") or "")
+                cr = float(item.get("change_rate") or 0)
+                sec = _code_to_sector(code, n)
+                _add_sector(sec or n, code, n, int(cr) + 2, f"예상체결 {cr:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ④ 전 업종 지수 → 섹터 레벨 강약
+        try:
+            for idx in get_all_sector_index():
+                cr = float(idx.get("change_rate") or 0)
+                if cr >= 1.0:
+                    bstp_name = str(idx.get("bstp_name") or "")
+                    _add_sector(bstp_name, "", "", int(cr * 2), f"업종지수 {cr:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑤ HTS 조회상위 → 관심 섹터 가중
+        try:
+            for item in get_hts_top_stocks()[:10]:
+                code = normalize_stock_code(item.get("code"))
+                n = str(item.get("name") or "")
+                sec = _code_to_sector(code, n)
+                rank = safe_int(item.get("rank") or 10, 10)
+                _add_sector(sec or n, code, n, max(1, 5 - rank), "HTS관심")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑥ 전일 강세 섹터 → 연속성 가중
+        try:
+            for sector, v in (_load_today_sector_results() or {}).items():
+                avg = float(v.get("avg_chg") or 0)
+                if avg >= 3:
+                    _add_sector(sector, "", "", int(avg), f"전일 {avg:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑦ US 프리마켓 섹터 연동 (DOMESTIC_SECTOR_US_STOCKS)
+        try:
+            us = get_us_market_signals() or {}
+            for sector, syms in DOMESTIC_SECTOR_US_STOCKS.items():
+                for sym in syms:
+                    chg = safe_float(us.get(f"{sym.lower()}_chg") or us.get(f"{sym.lower().replace('-','_')}_chg") or 0, 0.0)
+                    if chg >= 3.0:
+                        _add_sector(sector, "", "", min(8, int(chg)), f"US {sym} {chg:+.1f}%")
+                    elif chg <= -3.0:
+                        _add_sector(sector, "", "", max(-5, int(chg)), f"US {sym} {chg:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # v169.1: 섹터 등급 판정 + 등급 기반 동적 필터링
+        def _sector_grade(score: int) -> str:
+            if score >= 8:  return "강함"
+            if score >= 4:  return "보통"
+            return "약함"
+
+        sorted_sectors = sorted(
+            [(name, data) for name, data in sector_scores.items() if name and data["score"] >= 2],
+            key=lambda x: x[1]["score"], reverse=True
+        )
+        # 강함 섹터 많으면 강함만, 적으면 보통까지, 없으면 약함까지
+        strong_secs = [(n, d) for n, d in sorted_sectors if _sector_grade(d["score"]) == "강함"]
+        normal_secs = [(n, d) for n, d in sorted_sectors if _sector_grade(d["score"]) == "보통"]
+        weak_secs   = [(n, d) for n, d in sorted_sectors if _sector_grade(d["score"]) == "약함"]
+        SEC_MAX = 10
+        if len(strong_secs) >= 4:
+            filtered_sectors = strong_secs[:SEC_MAX]
+        elif strong_secs or len(normal_secs) >= 2:
+            filtered_sectors = (strong_secs + normal_secs)[:SEC_MAX]
+        else:
+            filtered_sectors = (strong_secs + normal_secs + weak_secs)[:SEC_MAX]
+
+        result["top_sectors"] = [
+            {
+                "sector":  name,
+                "score":   data["score"],
+                "grade":   _sector_grade(data["score"]),
+                "codes":   data["codes"][:4],
+                "names":   data["names"][:4],
+                "reasons": data["reasons"][:3],
+            }
+            for name, data in filtered_sectors
+        ]
+
+        # v169.1: 종목 상승 조건 필터 — 조건 없는 종목 제외
+        # 조건: ① NXT 등락률 ≥ 3% ② 예상체결 ≥ 2% ③ 신고가 근접 ④ HTS 조회상위 ⑤ 전일 포착
+        # 수집한 소스 코드 셋 구성
+        nxt_strong_codes: set = set()
+        try:
+            for x in get_overtime_fluctuation_rank():
+                if float(x.get("change_rate") or 0) >= 3.0:
+                    nxt_strong_codes.add(normalize_stock_code(x.get("code")))
+        except Exception:
+            pass
+        exp_codes: set = set()
+        try:
+            for x in get_exp_trans_updown_rank(before_open=True):
+                if float(x.get("change_rate") or 0) >= 2.0:
+                    exp_codes.add(normalize_stock_code(x.get("code")))
+        except Exception:
+            pass
+        highlow_codes: set = set()
+        try:
+            for x in get_near_new_highlow_rank(high=True):
+                highlow_codes.add(normalize_stock_code(x.get("code")))
+        except Exception:
+            pass
+        hts_codes: set = set()
+        try:
+            for x in get_hts_top_stocks():
+                hts_codes.add(normalize_stock_code(x.get("code")))
+        except Exception:
+            pass
+        yesterday_codes: set = set()
+        try:
+            for v in (_load_today_sector_results() or {}).values():
+                for c in v.get("codes", []):
+                    yesterday_codes.add(normalize_stock_code(c))
+        except Exception:
+            pass
+        condition_codes = nxt_strong_codes | exp_codes | highlow_codes | hts_codes | yesterday_codes
+
+        seen_codes: set = set()
+        top_stocks = []
+        for sec_entry in result["top_sectors"]:
+            for code, name in zip(sec_entry["codes"], sec_entry["names"]):
+                if not code or code in seen_codes:
+                    continue
+                # 상승 조건 1개 이상 충족 or 강함 섹터 종목은 무조건 포함
+                if code in condition_codes or sec_entry["grade"] == "강함":
+                    seen_codes.add(code)
+                    top_stocks.append({
+                        "code":    code,
+                        "name":    name,
+                        "sector":  sec_entry["sector"],
+                        "grade":   sec_entry["grade"],
+                        "score":   sec_entry["score"],
+                        "reasons": sec_entry["reasons"],
+                    })
+        result["top_stocks"] = top_stocks
+
+        # US 컨텍스트 요약
+        try:
+            us = get_us_market_signals() or {}
+            nq = safe_float(us.get("nasdaq_chg") or 0, 0.0)
+            vix = safe_float(us.get("vix") or 20, 20.0)
+            result["us_context"] = f"나스닥 {nq:+.1f}% · VIX {vix:.0f}"
+        except Exception:
+            pass
+
+        return result
+    except Exception as e:
+        _log_warn_msg(f"⚠️ _build_premarket_sector_snapshot: {e}")
+        return {"top_sectors": [], "top_stocks": [], "us_context": "", "ts": time.time()}
+
 def send_opening_gap_alert() -> None:
     """08:50 — 시초가 진입 알람 발송 (v165.0).
     KIS 예상체결가 조회 → 스코어링 → 조건 충족 시 텔레그램 알람.
@@ -16754,35 +17385,93 @@ def send_opening_gap_alert() -> None:
         except Exception as e:
             _swallow_exception(e)
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    if not candidates:
-        _log_info_msg(f"⚡ [시초가진입] 조건 충족 종목 없음 (pool={len(pool)})")
-        return
-    _log_info_msg(f"⚡ [시초가진입] 알람 발송: {len(candidates)}건")
-    for c in candidates[:3]:
-        try:
-            code  = c["code"]
-            name  = c["name"]
-            er    = c["expected_rate"]
-            ep    = c["expected_price"]
-            ba    = c["bid_ask_ratio"]
-            sc    = c["score"]
-            rsns  = "\n".join(f"  • {r}" for r in c["reasons"])
-            src   = c["source"]
-            src_tag = "📌 선진입 이월" if "PRECLOSE" in src else "🔍 Groq재료"
-            msg = (
-                f"⚡ [시초가 진입 대기] {name}({code})\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"예상 시초가: {ep:,}원 ({er:+.1f}%)\n"
-                f"매수잔량비율: {ba:.1f}배\n"
-                f"종합 점수: {sc}점\n"
-                f"{rsns}\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"{src_tag} | ⚠️ 갭상승 후 진입으로 선진입 대비 진입가 높을 수 있음\n"
-                f"📌 09:00 시초가 형성 후 매수잔량 유지 재확인 권장"
-            )
-            _send_telegram_message(msg)
-        except Exception as e:
-            _swallow_exception(e)
+    # v169.0: 장전 섹터 스냅샷 생성 (시초가 알람과 통합)
+    snapshot = {}
+    try:
+        snapshot = _build_premarket_sector_snapshot()
+    except Exception as _se:
+        _swallow_exception(_se)
+    # ── 08:50 최종 장전 브리핑 (섹터 + 시초가 통합 메시지) ──────────
+    try:
+        now_str = _now_kst().strftime("%H:%M")
+        lines = [
+            f"🔔 <b>[{now_str} 장전 최종 브리핑]</b>",
+            "━━━━━━━━━━━━━━━",
+        ]
+        # 미국 컨텍스트
+        if snapshot.get("us_context"):
+            lines.append(f"🌐 {snapshot['us_context']}")
+            lines.append("━━━━━━━━━━━━━━━")
+        # 오늘 집중 섹터 (상위 5개)
+        top_sectors = snapshot.get("top_sectors") or []
+        if top_sectors:
+            lines.append("📊 <b>오늘 집중 섹터</b>")
+            for sec in top_sectors:
+                sec_name = sec.get("sector", "")
+                sec_grade = sec.get("grade", "보통")
+                grade_emoji = {"강함": "🔴", "보통": "🟡", "약함": "🔵"}.get(sec_grade, "🟡")
+                reasons_str = " · ".join(sec.get("reasons", [])[:2])
+                names_str = "/".join(n for n in sec.get("names", [])[:3] if n)
+                lines.append(
+                    f"  {grade_emoji} <b>{sec_name}</b>({sec_grade})"
+                    + (f"  <i>({reasons_str})</i>" if reasons_str else "")
+                )
+                if names_str:
+                    lines.append(f"     📌 {names_str}")
+        else:
+            lines.append("📊 집중 섹터: 데이터 수집 중")
+        lines.append("━━━━━━━━━━━━━━━")
+        # 시초가 진입 후보
+        if candidates:
+            lines.append(f"🎯 <b>시초가 즉시 진입 후보</b> ({len(candidates)}건)")
+            for c in candidates[:3]:
+                code = c["code"]; name = c["name"]
+                er = c["expected_rate"]; ep = c["expected_price"]
+                ba = c["bid_ask_ratio"]; sc = c["score"]
+                # 섹터 정보 추가
+                sec_for_stock = ""
+                for sec in top_sectors:
+                    if code in sec.get("codes", []):
+                        sec_for_stock = sec.get("sector", "")
+                        break
+                lines.append(
+                    f"\n  {name}  <code>{code}</code>  {sc}점\n"
+                    f"  예상시초가 {ep:,}원 ({er:+.1f}%) · 매수잔량 {ba:.1f}배"
+                    + (f"\n  🏭 {sec_for_stock}" if sec_for_stock else "")
+                )
+                rsns_str = " / ".join(c.get("reasons", [])[:2])
+                if rsns_str:
+                    lines.append(f"  {rsns_str}")
+        else:
+            lines.append("🎯 시초가 진입 후보: 없음\n  (장 시작 후 거래량·호가 확인 후 대응)")
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("⚠️ 09:00 시초가 형성 후 매수잔량 유지 재확인 권장")
+        full_msg = "\n".join(lines)
+        _send_telegram_message(full_msg)
+        _log_info_msg(f"⚡ [08:50 장전브리핑] 섹터{len(top_sectors)}개 + 시초가{len(candidates)}건 발송")
+    except Exception as e:
+        _swallow_exception(e)
+        # fallback: 기존 개별 알람 방식
+        if candidates:
+            _log_info_msg(f"⚡ [시초가진입] fallback 개별 발송: {len(candidates)}건")
+            for c in candidates[:3]:
+                try:
+                    code = c["code"]; name = c["name"]
+                    er = c["expected_rate"]; ep = c["expected_price"]
+                    ba = c["bid_ask_ratio"]; sc = c["score"]
+                    rsns = "\n".join(f"  • {r}" for r in c["reasons"])
+                    msg = (
+                        f"⚡ [시초가 진입 대기] {name}({code})\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"예상 시초가: {ep:,}원 ({er:+.1f}%)\n"
+                        f"매수잔량비율: {ba:.1f}배\n"
+                        f"종합 점수: {sc}점\n{rsns}\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ 갭상승 후 진입으로 선진입 대비 진입가 높을 수 있음"
+                    )
+                    _send_telegram_message(msg)
+                except Exception as _fe:
+                    _swallow_exception(_fe)
 
 def get_orderbook_depth_snapshot(code: str, market: str = "KRX") -> dict:
     code = normalize_stock_code(code)
@@ -17460,6 +18149,70 @@ def load_dynamic_themes():
     except Exception as e:
         _swallow_exception(e)
 # v165.30 [#2]: 섹터 시드 → KIS 동업종 자동 등록
+
+def _auto_register_sector_from_signal(code: str, name: str, change_rate: float = 0.0) -> None:
+    """v169.0: 포착 즉시 bstp_code 기반 동업종 자동 섹터 등록.
+    SECTOR_SEED_STOCKS 하드코딩 없이 어떤 종목이든 포착 시 자동으로 섹터 시드가 됨.
+    이유: 급등 종목이 SECTOR_SEED_STOCKS에 없으면 섹터 시나리오 후보가 대형주로 고정됨.
+    동작: bstp_code 조회 → 동업종 중소형주 수집 → _dynamic_theme_map 등록.
+    """
+    global _dynamic_theme_map
+    try:
+        if not code:
+            return
+        today = _now_kst().strftime("%m%d")
+        existing_key = f"auto_sector_{code}_{today}"
+        if existing_key in _dynamic_theme_map:
+            return
+        base_ctx = _load_sector_stock_base_context(code)
+        bstp_code = base_ctx.get("bstp_code", "")
+        bstp_name = base_ctx.get("bstp_name", "")
+        if not bstp_code or not bstp_name:
+            return
+        # 동일 업종코드 오늘 이미 등록됐으면 스킵
+        bstp_key = f"auto_sector_bstp_{bstp_code}_{today}"
+        if bstp_key in _dynamic_theme_map:
+            _dynamic_theme_map[existing_key] = {"ref": bstp_key, "ts": time.time()}
+            return
+        candidates = _collect_sector_stock_candidates(code)
+        peers = _collect_same_sector_peers_from_candidates(candidates, bstp_code, limit=8)
+        seed_name = _resolve_stock_name(code, name)
+        all_stocks = [(code, seed_name)] + [(c, n) for c, n in peers if c != code]
+        if not all_stocks:
+            return
+        normalized_sector = _normalize_geo_sector_name(bstp_name)
+        _dynamic_theme_map[bstp_key] = {
+            "desc":        f"[자동감지] {normalized_sector} ({bstp_name})",
+            "sectors":     [normalized_sector, bstp_name],
+            "events":      [normalized_sector],
+            "stocks":      all_stocks[:8],
+            "ts":          time.time(),
+            "direction":   "up",
+            "source":      "auto_capture",
+            "bstp_code":   bstp_code,
+            "seed_code":   code,
+            "seed_name":   seed_name,
+            "trigger_chg": round(float(change_rate or 0), 1),
+            "win_count":   0,
+            "loss_count":  0,
+        }
+        _dynamic_theme_map[existing_key] = {"ref": bstp_key, "ts": time.time()}
+        _log_info_msg(
+            f"  🌱 [자동섹터] {normalized_sector}({bstp_code}) 등록: "
+            f"{seed_name} +{change_rate:.1f}% → 동업종 {len(all_stocks)}종목"
+        )
+        try:
+            _write_json_atomic(
+                DYNAMIC_THEME_FILE,
+                {k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()
+                 if isinstance(v, dict) and "ref" not in v},
+                indent=2,
+            )
+        except Exception as _e:
+            _swallow_exception(_e)
+    except Exception as e:
+        _swallow_exception(e)
+
 def _register_sector_seed_stocks() -> None:
     """
     SECTOR_SEED_STOCKS 시드 종목코드 → KIS 동업종 조회 → _dynamic_theme_map 자동 등록.
@@ -18182,6 +18935,28 @@ def _build_overnight_watchlist(detected_events: dict):
                 _log_info_msg(f"  🌙 야간 시나리오 워치리스트 저장: {len(watchlist)}종목")
         except Exception as e:
             _swallow_exception(e)
+        # v169.0: HTS 조회상위 → 시장 관심 종목 보완 편입
+        try:
+            hts_items = get_hts_top_stocks()
+            for h in hts_items[:10]:
+                code = normalize_stock_code(h.get("code"))
+                if not code or code in watchlist:
+                    continue
+                watchlist[code] = {
+                    "name":           _resolve_stock_name(code, h.get("name", "")),
+                    "event":          "HTS조회상위",
+                    "keywords":       ["시장관심"],
+                    "sectors":        [],
+                    "cause":          f"HTS 조회상위 {h.get('rank','')}위",
+                    "direction":      "up",
+                    "priority_score": max(0, 5 - safe_int(h.get("rank", 10), 10)),
+                    "source":         "hts_top",
+                    "ts":             time.time(),
+                }
+            if hts_items:
+                _log_info_msg(f"  👀 HTS 조회상위 {len(hts_items)}종목 워치리스트 보완")
+        except Exception as _he:
+            _swallow_exception(_he)
     except Exception as e:
         _log_warn_msg(f"⚠️ _build_overnight_watchlist: {e}")
 
@@ -18246,6 +19021,39 @@ def collect_market_scenarios_24h(force: bool = False, external_headlines: dict |
     except Exception as e:
         _swallow_exception(e)
     items = sorted(scenario_map.values(), key=lambda item: (int(item.get("priority_score", 0) or 0), len(item.get("primary_candidates", []) or [])), reverse=True)
+    # v169.0: 업종 지수 강세 섹터 → 시나리오 priority_score 보강
+    # 이유: RSS/Groq 텍스트 기반으로만 우선순위 결정 → 실제 장중 강세 섹터 반영 못함
+    try:
+        sector_idx = get_all_sector_index()
+        if sector_idx:
+            top_sectors = {s["bstp_name"]: s["change_rate"]
+                           for s in sector_idx[:10] if s["change_rate"] >= 1.0}
+            for item in items:
+                sectors = list(item.get("kr_sector_bull") or [])
+                bonus = 0
+                for sec in sectors:
+                    for bstp_name, cr in top_sectors.items():
+                        if sec in bstp_name or bstp_name in sec:
+                            bonus = max(bonus, min(5, int(cr)))
+                if bonus:
+                    item["priority_score"] = int(item.get("priority_score", 0) or 0) + bonus
+            items = sorted(items, key=lambda x: (int(x.get("priority_score", 0) or 0), len(x.get("primary_candidates", []) or [])), reverse=True)
+    except Exception as _si_e:
+        _swallow_exception(_si_e)
+    # v169.0: 오늘 실제 포착 섹터 결과 → 시나리오 priority_score 추가 보강
+    try:
+        today_res = _load_today_sector_results()
+        if today_res:
+            for item in items:
+                sectors = list(item.get("kr_sector_bull") or [])
+                for sec in sectors:
+                    for sector_name, v in today_res.items():
+                        if sec in sector_name or sector_name in sec:
+                            boost = min(6, int(v.get("avg_chg", 0) / 2))
+                            item["priority_score"] = int(item.get("priority_score", 0) or 0) + boost
+            items = sorted(items, key=lambda x: (int(x.get("priority_score", 0) or 0), len(x.get("primary_candidates", []) or [])), reverse=True)
+    except Exception as _tr_e:
+        _swallow_exception(_tr_e)
     items = items[:MARKET_SCENARIO_MAX_ITEMS]
     state = {"items": items, "updated_ts": now_ts}
     _save_market_scenario_state(state)
@@ -30090,6 +30898,17 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         threading.Thread(target=auto_update_theme, args=(code, name, signal_type), daemon=True).start()
     except Exception as e:
         _swallow_exception(e)
+    # v169.0: 포착 즉시 자동 섹터 등록 — SECTOR_SEED_STOCKS 하드코딩 불필요
+    # 5%↑ 포착 종목의 bstp_code 기반으로 동업종 중소형주를 _dynamic_theme_map에 자동 등록
+    try:
+        if safe_float(s.get("change_rate", 0), 0.0) >= 5.0 and signal_type in ("SURGE", "NEAR_UPPER", "STRONG_BUY", "UPPER_LIMIT", "EARLY_DETECT"):
+            threading.Thread(
+                target=_auto_register_sector_from_signal,
+                args=(code, name, safe_float(s.get("change_rate", 0), 0.0)),
+                daemon=True,
+            ).start()
+    except Exception as e:
+        _swallow_exception(e)
     try:
         if safe_float(s.get("change_rate", 0), 0.0) >= 5.0:
             news_titles = [r for r in s.get("reasons", []) if isinstance(r, str)]
@@ -31848,6 +32667,19 @@ def _fetch_multi_source_headlines() -> dict:
         domestic = fetch_all_news()
         if domestic:
             results["국내뉴스"] = domestic[:20]
+    # v169.0: KIS 자체 뉴스 추가 (RSS보다 빠름, 증시 직결)
+    try:
+        kis_dom = get_kis_domestic_news(max_items=15)
+        if kis_dom:
+            results["KIS국내뉴스"] = kis_dom
+    except Exception as _ke:
+        _swallow_exception(_ke)
+    try:
+        kis_ov = get_kis_overseas_news(max_items=15)
+        if kis_ov:
+            results["KIS해외뉴스"] = kis_ov
+    except Exception as _ke2:
+        _swallow_exception(_ke2)
     return results
 def _detect_geo_keywords(headlines_flat: list) -> list:
     """헤드라인 목록에서 지정학 키워드 감지 → 감지된 키워드 반환"""
@@ -35892,6 +36724,63 @@ def _send_premarket_risk_update_once():
     send_premarket_risk_update_if_changed()
 # v165.30 [#2]: 섹터 시드 자동 등록 래퍼 (09:05, 당일 1회)
 _sector_seed_registered_date: str = ""
+
+def _register_sector_seed_from_yesterday_once():
+    """07:28 장전 브리핑 직전: 어제 강세 섹터 기반 섹터 시드 1차 등록.
+    이유: 09:10 등록은 NXT 오픈(08:00) 후 1시간 이상 섹터 풀 미준비 상태.
+    장중 포착 즉시 _auto_register_sector_from_signal()이 실시간 갱신하므로
+    이 함수는 "최소 보장 준비" 역할.
+    """
+    global _nxt_sector_seed_registered_date, _dynamic_theme_map
+    if is_holiday():
+        return
+    today = _now_kst().strftime("%Y-%m-%d")
+    if _nxt_sector_seed_registered_date == today:
+        return
+    _nxt_sector_seed_registered_date = today
+    try:
+        yesterday_results = _load_today_sector_results()
+        if not yesterday_results:
+            _log_info_msg("  ℹ️ [07:28 섹터시드] 전일 결과 없음 — 기본 시드로 대체")
+            _register_sector_seed_stocks()
+            return
+        registered = 0
+        today_mmdd = _now_kst().strftime("%m%d")
+        for sector_name, v in list(yesterday_results.items())[:8]:
+            codes = v.get("codes") or []
+            if not codes:
+                continue
+            seed_code = normalize_stock_code(codes[0])
+            if not seed_code:
+                continue
+            bstp_key = f"auto_sector_bstp_pre_{seed_code[:4]}_{today_mmdd}"
+            if bstp_key in _dynamic_theme_map:
+                continue
+            all_stocks = [(normalize_stock_code(c), n)
+                          for c, n in zip(v.get("codes", []), v.get("names", []))
+                          if c]
+            if not all_stocks:
+                continue
+            _dynamic_theme_map[bstp_key] = {
+                "desc":        f"[전일강세] {sector_name}",
+                "sectors":     [sector_name],
+                "events":      [sector_name],
+                "stocks":      all_stocks[:8],
+                "ts":          time.time(),
+                "direction":   "up",
+                "source":      "yesterday_result",
+                "seed_code":   seed_code,
+                "trigger_chg": float(v.get("avg_chg", 0)),
+                "win_count":   0,
+                "loss_count":  0,
+            }
+            registered += 1
+        if registered:
+            _log_info_msg(f"  🌅 [07:28 섹터시드] 전일 강세 {registered}개 섹터 등록 완료")
+        threading.Thread(target=_register_sector_seed_stocks, daemon=True).start()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ _register_sector_seed_from_yesterday_once: {e}")
+
 def _register_sector_seed_stocks_once():
     global _sector_seed_registered_date
     if is_holiday():
@@ -37214,6 +38103,115 @@ def _build_us_market_signal_default() -> dict:
         "mu_chg": 0.0, "avgo_chg": 0.0, "sndk_chg": 0.0,
         "oklo_chg": 0.0, "smr_chg": 0.0, "btc_chg": 0.0,
     }
+
+# v169.0: 미국 급등 종목 조회 (HHDFS76260000) — 실전계좌 전용
+_us_movers_cache: list = []
+_us_movers_cache_ts: float = 0.0
+
+def get_us_stock_movers(excd: str = "NAS", limit: int = 20) -> list:
+    """미국 가격급등락 상위 종목 조회 (HHDFS76260000).
+    excd: NAS(나스닥)/NYS(뉴욕)/AMS(아멕스)
+    반환: [{symbol, name, price, change_rate, volume}, ...]
+    캐시: 10분 (야간 시나리오 분석용, 잦은 호출 불필요)
+    """
+    global _us_movers_cache, _us_movers_cache_ts
+    if _us_movers_cache and time.time() - _us_movers_cache_ts < 600:
+        return _us_movers_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/overseas-stock/v1/ranking/fluctuation",
+            "HHDFS76260000",
+            {
+                "AUTH":     "",
+                "EXCD":     excd,
+                "KEYB":     "",
+                "GUBN":     "0",   # 0=급등, 1=급락
+                "BYMD":     "",
+                "MODP":     "1",   # 1=등락률순
+                "PINC":     "0",
+                "MATP":     "1",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            sym = str(i.get("symb") or "").strip()
+            if not sym:
+                continue
+            items.append({
+                "symbol":      sym,
+                "name":        str(i.get("name") or ""),
+                "price":       safe_float(i.get("last") or 0, 0.0),
+                "change_rate": safe_float(i.get("rate") or i.get("diff_rate") or 0, 0.0),
+                "volume":      safe_int(i.get("tvol") or 0, 0),
+                "excd":        excd,
+            })
+            if len(items) >= limit:
+                break
+        _us_movers_cache = items
+        _us_movers_cache_ts = time.time()
+        if items:
+            _log_info_msg(f"  🇺🇸 미국 급등 종목 {len(items)}건 조회 (HHDFS76260000/{excd})")
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+# v169.0: 미국 매수체결강도 상위 (HHDFS76280000) — 실전계좌 전용
+_us_buy_strength_cache: list = []
+_us_buy_strength_cache_ts: float = 0.0
+
+def get_us_buy_strength_rank(excd: str = "NAS", limit: int = 20) -> list:
+    """미국 매수체결강도 상위 종목 조회 (HHDFS76280000).
+    진짜 매수세가 있는 종목 식별 — 섹터 연계 강도 확인용
+    """
+    global _us_buy_strength_cache, _us_buy_strength_cache_ts
+    if _us_buy_strength_cache and time.time() - _us_buy_strength_cache_ts < 600:
+        return _us_buy_strength_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/overseas-stock/v1/ranking/buy-strength",
+            "HHDFS76280000",
+            {
+                "AUTH": "",
+                "EXCD": excd,
+                "KEYB": "",
+                "GUBN": "0",
+                "BYMD": "",
+                "MODP": "1",
+                "PINC": "0",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            sym = str(i.get("symb") or "").strip()
+            if not sym:
+                continue
+            items.append({
+                "symbol":      sym,
+                "name":        str(i.get("name") or ""),
+                "price":       safe_float(i.get("last") or 0, 0.0),
+                "change_rate": safe_float(i.get("rate") or 0, 0.0),
+                "buy_strength": safe_float(i.get("buy_str") or i.get("ctnr") or 0, 0.0),
+                "excd":        excd,
+            })
+            if len(items) >= limit:
+                break
+        _us_buy_strength_cache = items
+        _us_buy_strength_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
 def _fetch_kis_overseas_price(symbol: str, excd: str = "NAS") -> float | None:
     """v162.1: KIS HHDFS00000300 TR로 해외주식 현재가 조회.
     symbol: 종목코드 (예: NVDA, TSM, QQQ)
@@ -37560,6 +38558,14 @@ def get_us_market_signals() -> dict:
             "SNDK": "sndk",    # SanDisk (WDC 스핀오프)
             "OKLO": "oklo",    # 소형 핵분열로
             "SMR": "smr_nuc",  # NuScale Power (원전 테마 SMR과 key 충돌 회피)
+            # v169.0: 국내 섹터 선행지표 US 종목 (NXT 선진입 개별 종목 가점용)
+            "BE":   "be",      # Bloom Energy — 연료전지/수소
+            "PLUG": "plug",    # Plug Power — 연료전지
+            "FCEL": "fcel",    # FuelCell Energy
+            "CEG":  "ceg",     # Constellation Energy — 원전/청정에너지
+            "ETN":  "etn_pw",  # Eaton Corp — 전력기기 (key충돌 회피: etn)
+            "LMT":  "lmt",     # Lockheed Martin — 방산
+            "ALB":  "alb",     # Albemarle — 리튬/2차전지
         }
         values = _fetch_us_market_signal_values(symbols)
         # v162.1: NVDA·TSM KIS 우선 조회 (Yahoo 실패 시 보완)
@@ -38640,8 +39646,11 @@ def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
         try:
             ot_fluct = get_overtime_fluctuation_rank()
             ot_vol   = get_overtime_volume_rank()
+            # v169.0: NXT 시간대 체결강도·신고가 소스 추가
+            ot_power = get_volume_power_rank("Q")   # Q=NXT 시장코드
+            ot_high  = get_near_new_highlow_rank(high=True)
             seen_ot  = set()
-            for it in ot_fluct + ot_vol:
+            for it in ot_fluct + ot_vol + ot_power + ot_high:
                 c = normalize_stock_code(it.get("code", ""))
                 if c and c not in seen_ot:
                     seen_ot.add(c)
@@ -39544,27 +40553,34 @@ if __name__ == "__main__":
         schedule.every().day.at(_top_hhmm).do(_leader_job(
             lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
         ))
-    schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))  # v37.0: 명명 함수
-    schedule.every().day.at("09:05").do(_leader_job(_register_sector_seed_stocks_once))  # v165.30: 섹터시드 동업종 자동 등록
+    schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))
+    # v169.0: 09:05 → 09:10으로 변경 (KRX 오픈 후 거래량 충분히 쌓인 시점)
+    schedule.every().day.at("09:10").do(_leader_job(_register_sector_seed_stocks_once))
     schedule.every().day.at(MARKET_CLOSE).do(_leader_job(
         lambda: None if is_holiday() else on_market_close()
     ))
-    # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전, 매도 가능 시간)
+    # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전)
     schedule.every().day.at("15:10").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
     ))
-    # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전, 매도 가능 시간)
+    # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전)
     schedule.every().day.at("19:40").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
     ))
-    # NXT 완전 마감 후 잔여 재진입 감시 초기화 + 결과 미입력 알림 (NXT 상장 종목용)
+    # NXT 완전 마감 후 — 결과 집계 + 재진입 초기화 + 미입력 알림
     schedule.every().day.at("20:05").do(_leader_job(
         lambda: (
+            _collect_and_save_today_sector_results(),  # v169.0: 오늘 강세 섹터 결과 저장
             run_daily_self_audit(stage="nxt"),
             _clear_reentry_watch_all(),
-            _send_pending_result_reminder(),   # NXT 마감 후 최종 미입력 알림
-            _log_info_msg("📡 NXT 마감(20:00) — 재진입 감시 전체 초기화")
+            _send_pending_result_reminder(),
+            _log_info_msg("📡 NXT 마감(20:00) — 섹터결과 집계 + 재진입 감시 초기화")
         ) if not is_holiday() else None
+    ))
+    # v169.0: 07:30 장전 브리핑 직전 섹터시드 1차 등록 (어제 결과 기반)
+    # 이유: 08:00 NXT 오픈 전에 미리 섹터 풀 준비 → NXT 08:00~08:59 대응 가능
+    schedule.every().day.at("07:28").do(_leader_job(
+        lambda: None if is_holiday() else _register_sector_seed_from_yesterday_once()
     ))
     # 24시간 시나리오 수집 (20분마다)
     schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
