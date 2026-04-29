@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v167.0
+버전: v168.0
 날짜: 2026-04-29
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v168.0 (2026-04-29): overtime rank API 버그 수정 + short_balance 타임아웃 개선 + fluctuation_rank fallback 연동
+  [#1] get_overtime_fluctuation_rank / get_overtime_volume_rank — `isinstance(data, dict)` guard 추가
+       이유: 장후 KIS API가 dict 아닌 list/str 응답 반환 시 data.get() 호출 → AttributeError 반복(count=6)
+       개선점: `if not isinstance(data, dict): return []` + `if not isinstance(i, dict): continue` 추가
+       주의점: 동일 패턴으로 get_exp_trans_updown_rank / get_volume_power_rank / get_near_new_highlow_rank / get_fluctuation_rank 6개 함수 전체 동일 guard 적용
+  [#2] get_short_sell_ratio — ConnectTimeout 실패 캐시 추가 + timeout 5→3초 단축
+       이유: inquire-short-balance ConnectTimeout count=9 누적 → 매 스캔마다 3~5초 블로킹
+             실패 시에도 _short_cache에 저장 안 되므로 다음 스캔에서 또 시도 → 무한 반복
+       개선점: `_short_fail_cache` 전역 추가. 3회↑ 실패 시 10분간 스킵. 성공 시 카운트 리셋. timeout 3초 단축
+       주의점: 실패 캐시는 _short_cache와 독립 관리. 차단 중에도 기존 캐시값 반환
+  [#3] _rank_api_fallback — get_fluctuation_rank(FHPST01700000) 보완 연동
+       이유: rank API 비활성 시 naver_rise 134건 한계 → KIS 등락률 상위 종목 누락 가능
+             폴라리스AI/와이씨켐 등 naver에 미포함된 상위 종목 미포착 방지
+       개선점: fallback 마지막 단계에서 KIS 등락률순위 직접 호출, change_rate≥3% 누락 종목만 추가
+       주의점: is_any_market_open() + market=KRX 조건에서만 동작. 중복 코드 자동 제거
 - v167.0 (2026-04-29): KIS 신규 API 11개 연동 + 스캔 파이프라인 전면 강화
   [#1] get_overtime_fluctuation_rank() / get_overtime_volume_rank() 신규
        이유: NXT 시간외 스캔이 KRX 거래량순위(FHPST01710000) 재활용 → NXT 전용 소스 없음
@@ -18043,6 +18058,25 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
         except Exception as _rdiag_e:
             _swallow_exception(_rdiag_e)
     _log_info_msg(f"  ↪ rank fallback[{market}] {len(items)}건")
+    # v168.0: rank API 비활성 시 KIS 등락률순위(FHPST01700000) 직접 보완
+    # 목적: naver_rise 134건 한계 → KIS get_fluctuation_rank로 상승률 상위 누락 보완
+    # (폴라리스AI/와이씨켐 등 naver 미포함 급등 종목 포착률↑)
+    if market in ("KRX", "J") and is_any_market_open():
+        try:
+            fluc_items = get_fluctuation_rank(market="J", sort="0")
+            existing_codes = {normalize_stock_code(r.get("code")) for r in items}
+            added_fluc = 0
+            for r in fluc_items:
+                code = normalize_stock_code(r.get("code"))
+                chg = float(r.get("change_rate", 0) or 0)
+                if code and code not in existing_codes and chg >= 3.0:
+                    items.append(r)
+                    existing_codes.add(code)
+                    added_fluc += 1
+            if added_fluc:
+                _log_info_msg(f"  📈 [fluctuation_rank 보완] KIS등락률순위 {added_fluc}건 추가")
+        except Exception as _fluc_e:
+            _swallow_exception(_fluc_e)
     return items
 def get_upper_limit_stocks() -> list:
     if _rank_api_disabled_today():
@@ -18329,8 +18363,12 @@ def get_overtime_fluctuation_rank(market: str = "J") -> list:
                 "FID_TRGT_EXLS_CLS_CODE": "",
             },
         )
+        if not isinstance(data, dict):  # v168.0: list/str 응답 방어 (AttributeError 수정)
+            return []
         items = []
         for i in (data.get("output1") or data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 배열 내 비dict 원소 방어
+                continue
             code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -18367,8 +18405,12 @@ def get_overtime_volume_rank(market: str = "J") -> list:
                 "FID_TRGT_EXLS_CLS_CODE": "",
             },
         )
+        if not isinstance(data, dict):  # v168.0: list/str 응답 방어
+            return []
         items = []
         for i in (data.get("output1") or data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 배열 내 비dict 원소 방어
+                continue
             code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -18407,8 +18449,12 @@ def get_exp_trans_updown_rank(before_open: bool = True) -> list:
                 "fid_mkop_cls_code": "0" if before_open else "1",
             },
         )
+        if not isinstance(data, dict):  # v168.0: dict guard
+            return []
         items = []
         for i in (data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 비dict 원소 방어
+                continue
             code = str(i.get("stck_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -18446,8 +18492,12 @@ def get_volume_power_rank(market: str = "J") -> list:
                 "fid_trgt_cls_code": "0",
             },
         )
+        if not isinstance(data, dict):  # v168.0: dict guard
+            return []
         items = []
         for i in (data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 비dict 원소 방어
+                continue
             code = str(i.get("stck_shrn_iscd") or i.get("mksc_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -18490,8 +18540,12 @@ def get_near_new_highlow_rank(high: bool = True) -> list:
                 "fid_aply_rang_prc_1": "", "fid_aply_rang_prc_2": "",
             },
         )
+        if not isinstance(data, dict):  # v168.0: dict guard
+            return []
         items = []
         for i in (data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 비dict 원소 방어
+                continue
             code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -18536,8 +18590,12 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "fid_rsfl_rate1": "2",      # 2% 이상 상승만
             },
         )
+        if not isinstance(data, dict):  # v168.0: dict guard
+            return []
         items = []
         for i in (data.get("output") or []):
+            if not isinstance(i, dict):  # v168.0: 비dict 원소 방어
+                continue
             code = str(i.get("stck_shrn_iscd") or "").strip()
             if not code:
                 continue
@@ -39215,6 +39273,7 @@ except Exception as e:
 # 📉 공매도 잔고 비율 + 외국인 연속 순매수
 # ============================================================
 _short_cache:   dict = {}  # code → {ratio, ts}
+_short_fail_cache: dict = {}  # v168.0: code → {ts, count} — ConnectTimeout 실패 캐시
 _foreign_cache: dict = {}  # code → {days, ts}
 # ============================================================
 # 📢 공시 전 이상 거래량 감지 (선매수 세력 포착)
@@ -39265,6 +39324,10 @@ def get_short_sell_ratio(code: str) -> float:
     cached = _short_cache.get(code)
     if cached and time.time() - cached["ts"] < 3600:
         return cached["ratio"]
+    # v168.0: ConnectTimeout 반복 방지 — 3회↑ 실패 시 10분 스킵
+    _fail = _short_fail_cache.get(code, {})
+    if _fail.get("count", 0) >= 3 and time.time() - _fail.get("ts", 0) < 600:
+        return 0.0
     try:
         token  = get_token()
         url    = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-short-balance"
@@ -39276,14 +39339,18 @@ def get_short_sell_ratio(code: str) -> float:
             "Content-Type": "application/json; charset=utf-8",
         }
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
-        resp  = requests.get(url, headers=headers, params=params, timeout=5)
+        resp  = requests.get(url, headers=headers, params=params, timeout=3)  # v168.0: 5→3초
         data  = safe_json_response(resp)
         output = data.get("output", {}) if isinstance(data, dict) else {}
         raw_ratio = output.get("ssts_rsqn_rate", 0) if isinstance(output, dict) else 0
         ratio = float(raw_ratio or 0)
         _short_cache[code] = {"ratio": ratio, "ts": time.time()}
+        _short_fail_cache.pop(code, None)  # v168.0: 성공 시 실패 카운트 리셋
         return ratio
     except Exception as e:
+        # v168.0: 실패 카운트 누적
+        _prev = _short_fail_cache.get(code, {"ts": time.time(), "count": 0})
+        _short_fail_cache[code] = {"ts": time.time(), "count": _prev.get("count", 0) + 1}
         _warn_throttled_once(f"short_sell_ratio:{code}", f"⚠️ 공매도 잔고 응답 비정상 → 0.0 기본값 ({code}, {type(e).__name__})", cooldown_sec=1800.0)
         return 0.0
 def _get_daily_investor_data(code: str) -> list:
