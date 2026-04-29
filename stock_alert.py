@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.2
+버전: v169.3
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.3 (2026-04-30): _nxt_sector_seed_registered_date 전역 선언 누락 수정
+  이유: v169.0에서 _register_sector_seed_from_yesterday_once() 추가 시
+       함수 내 global 참조는 있으나 파일 전역 선언이 없어 07:28 스케줄 실행 시
+       NameError 발생 → 메인 루프 크래시 → 07:30 장전 브리핑 포함 전체 스케줄 미실행
+  개선점: _sector_seed_registered_date: str = "" 선언 바로 아래에 "" 초기화 추가
+  주의점: 오류 없이 해결됨. 재배포 후 07:28/07:30 스케줄 정상 확인 필요
+
 - v169.2 (2026-04-30): KIS API 3종 URI/파라미터 규격서 기반 수정 (404 오류 수정)
   이유: v169.0에서 URI를 추정해 구현 → 404 반복 (HHMCM 27건, HHPSTH 2건)
   개선점:
@@ -36765,6 +36772,7 @@ def _send_premarket_risk_update_once():
     send_premarket_risk_update_if_changed()
 # v165.30 [#2]: 섹터 시드 자동 등록 래퍼 (09:05, 당일 1회)
 _sector_seed_registered_date: str = ""
+_nxt_sector_seed_registered_date: str = ""  # v169.3: 누락된 전역 선언 추가 (NameError → 메인루프 크래시 수정)
 
 def _register_sector_seed_from_yesterday_once():
     """07:28 장전 브리핑 직전: 어제 강세 섹터 기반 섹터 시드 1차 등록.
