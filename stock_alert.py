@@ -3,10 +3,67 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v166.1
+버전: v167.0
 날짜: 2026-04-29
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v167.0 (2026-04-29): KIS 신규 API 11개 연동 + 스캔 파이프라인 전면 강화
+  [#1] get_overtime_fluctuation_rank() / get_overtime_volume_rank() 신규
+       이유: NXT 시간외 스캔이 KRX 거래량순위(FHPST01710000) 재활용 → NXT 전용 소스 없음
+       개선점: FHPST02340000/02350000 → NXT overtime 전용 유니버스 소스 추가
+               _scan_nxt_market_candidates()에 overtime 소스 병합
+       주의점: output1[] 배열 구조, 응답키 ovtm_untp_exch_vol(거래량)/prdy_ctrt(등락률)
+       진입 체인: analyze() → _dispatch_alert() 연결 확인 ✅
+  [#2] get_exp_trans_updown_rank() 신규 — 예상체결 상승/하락 상위 (FHPST01820000)
+       이유: 장전 8~9시 예상체결 상위 포착이 야간시나리오 추정 방식에 의존
+       개선점: fid_mkop_cls_code=0(장전)/1(장마감) 분기 → 장전 선진입 후보 실데이터 수신
+       주의점: output[] 배열, stck_shrn_iscd/prdy_ctrt 응답키
+       진입 체인: analyze() → _dispatch_alert() 연결 확인 ✅
+  [#3] get_volume_power_rank() 신규 — 체결강도 상위 (FHPST01680000)
+       이유: 종목별 체결강도 계산이 개별 API 호출 기반 → 이미 정렬된 리스트 수신이 효율적
+       개선점: _scan_krx_market_candidates()에 체결강도 상위 소스 추가
+       주의점: fid_cond_scr_div_code=20168 필수
+       진입 체인: analyze() → _dispatch_alert() 연결 확인 ✅
+  [#4] get_near_new_highlow_rank() 신규 — 신고/신저근접 상위 (FHPST01870000)
+       이유: 52주 신고가 근접 돌파 후보를 개별 지표 계산으로만 포착 → 미리 정렬된 리스트 수신
+       개선점: fid_prc_cls_code=0(신고) 신고가 근접 종목 → _scan_krx_market_candidates() 병합
+       진입 체인: analyze() → _dispatch_alert() 연결 확인 ✅
+  [#5] get_fluctuation_rank() 신규 — 등락률 순위 (FHPST01700000)
+       이유: 장중 급등 종목을 거래량순위에서 누락되는 경우 보완
+       개선점: KRX/NXT 모두 fid_cond_mrkt_div_code 분기 지원
+       진입 체인: analyze() → _dispatch_alert() 연결 확인 ✅
+  [#6] get_market_investor_trend() 신규 — 시장별 투자자매매동향 (FHPTJ04030000)
+       이유: 외국인/기관 전체 방향이 VIX/나스닥 기반으로만 추정됨
+       개선점: KSP(코스피)/KSQ(코스닥) 실시간 외인순매수 방향 → score_adj ±3
+               _us_cache에 krx_foreign_net/krx_institution_net 필드 추가
+       주의점: fid_input_iscd=KSP 또는 KSQ, output.frgn_ntby_qty/orgn_ntby_qty
+  [#7] get_vi_status() 신규 — VI(변동성완화장치) 현황 (FHPST01390000)
+       이유: VI 발동 종목 사전 감지 없이 진입 시 슬리피지 위험
+       개선점: VI 발동 종목 코드 → _vi_blocked_codes 캐시 등록 → analyze() 진입 차단
+               _update_vi_blocked_codes() → run_scan 주기 시작 시 갱신
+       주의점: FID_DIV_CLS_CODE=0(전체) 사용, 5분 캐시
+       진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅
+  [#8] get_capture_uplowprice() 신규 — 상하한가 포착 (FHKST130000C0)
+       이유: 상한가 캐시(_upper_limit_alerted_today)가 당일 API 미발송 종목엔 등록 안 됨
+       개선점: 상한가 포착 API → 당일 상한가 종목 자동으로 _upper_limit_alerted_today 등록
+               FID_PRC_CLS_CODE=0(상한가) / FID_DIV_CLS_CODE=0(상한가종목)
+       주의점: 5분 캐시, 장중에만 호출
+  [#9] get_foreign_institution_total() 신규 — 국내기관/외국인 가집계 (FHPTJ04400000)
+       이유: 종목별 외인기관 추정만 있고 시장 전체 순매수 상위 종목 리스트 없음
+       개선점: FID_ETC_CLS_CODE=1(외국인)/2(기관) 순매수 상위 종목 → prewatch 시드 보완
+       주의점: output[] 배열, FID_RANK_SORT_CLS_CODE=0(순매수상위)
+  [#10] get_frgnmem_trade_estimate() 신규 — 외국계 매매종목 가집계 (FHKST644100C0)
+        이유: 일반 외국인 집계보다 외국계 증권사(골드만·모건 등) 선행 신호가 더 빠름
+        개선점: 순매수 상위 종목 → prewatch 시드 + 재료현황 섹션 추가
+        주의점: FID_COND_SCR_DIV_CODE=16441 필수
+  [#11] _fetch_kis_futures_price() 신규 — 해외선물 현재가 (HHDFC55010000)
+        이유: Yahoo Finance crumb 실패 시 NQ/ES/GC/CL 0.0% 고착
+        개선점: KIS 해외선물 현재가 API → Yahoo fallback 전 1차 시도
+        주의점: 거래소별 excd 코드 (CME=NQ/ES, CBOT=ZB, NYMEX=CL, COMEX=GC)
+  이유: 규격서 46개 파일 전수 분석 → 즉시 도입 11개 선별, 실전 계좌 전용 확인
+  개선점: NXT overtime 포착률↑, 상한가 자동차단↑, VI 진입 보호↑, 수급 정확도↑
+  주의점: 새 함수 모두 실전계좌 전용. 오류 시 _swallow_exception → 기존 로직 유지
+          VI 차단은 analyze() 진입 단계 전 pre-filter (게이트 함수 내부 아님)
 - v166.1 (2026-04-29): KIS API tr_id + 응답구조 실전 규격서 기반 전면 교정
   [#1] get_investor_trend_estimate() — tr_id·파라미터·응답키 전면 수정
        이유: v166.0에서 추측한 tr_id(FHKST13010100)·파라미터(FID_INPUT_ISCD) 오류
@@ -9370,6 +9427,15 @@ _internal_only_alert_history = {}
 ALERT_HISTORY_FILE = _state_path("alert_history.json")
 # v161.12: upper_limit_reached 당일 알람 차단 캐시 {code: "YYYYMMDD"}
 _upper_limit_alerted_today: dict = {}
+# v167.0: 신규 전역 캐시 변수
+_vi_blocked_codes: dict = {}          # {code: expire_ts} — VI 발동 종목 (5분 캐시)
+_vi_cache_ts: float = 0.0             # 마지막 VI 조회 타임스탬프
+_market_investor_cache: dict = {}     # 시장별 외인기관 방향 캐시
+_capture_uplowprice_ts: float = 0.0   # 상하한가 포착 마지막 조회 ts
+_frgnmem_estimate_cache: list = []    # 외국계 가집계 캐시 (10분)
+_frgnmem_estimate_cache_ts: float = 0.0
+_foreign_inst_total_cache: list = []  # 기관외국인 가집계 캐시 (10분)
+_foreign_inst_total_cache_ts: float = 0.0
 _preclose_gap_sent_today: dict = {}  # v165.25: 선진입 발송 종목 당일 SURGE 중복 차단 {code: "YYYYMMDD"}
 UPPER_LIMIT_ALERTED_FILE = _state_path("upper_limit_alerted_today.json")
 _detected_stocks    = {}
@@ -18242,6 +18308,534 @@ def is_nxt_open() -> bool:
     """NXT는 주말/공휴일 제외, 08:00~20:00"""
     if is_holiday(): return False
     return NXT_OPEN <= datetime.now().time() <= NXT_CLOSE
+def get_overtime_fluctuation_rank(market: str = "J") -> list:
+    """v167.0: 시간외 등락률 순위 (FHPST02340000) — NXT overtime 전용 유니버스.
+    규격서: v1_국내주식-138, output1[] 배열
+    market: J(KRX 전체, 시간외 포함), NX(NXT) — NXT는 J로 조회 후 필터
+    반환: [{"code","name","price","change_rate","volume","market":"NXT"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/overtime-fluctuation",
+            "FHPST02340000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_MRKT_CLS_CODE": "",
+                "FID_COND_SCR_DIV_CODE": "20234",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "2",    # 2:상승률
+                "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "", "FID_TRGT_CLS_CODE": "",
+                "FID_TRGT_EXLS_CLS_CODE": "",
+            },
+        )
+        items = []
+        for i in (data.get("output1") or data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or i.get("ovtm_untp_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or i.get("ovtm_untp_prdy_ctrt") or 0, 0.0),
+                "volume": safe_int(i.get("acml_vol") or i.get("ovtm_untp_exch_vol") or 0),
+                "market": "NXT",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_overtime_volume_rank(market: str = "J") -> list:
+    """v167.0: 시간외 거래량 순위 (FHPST02350000) — NXT overtime 전용 유니버스.
+    규격서: 국내주식-139, output1[] 배열
+    반환: [{"code","name","price","change_rate","volume","market":"NXT"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/overtime-volume",
+            "FHPST02350000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "20235",
+                "FID_INPUT_ISCD": "0000",
+                "FID_RANK_SORT_CLS_CODE": "2",   # 2:거래량
+                "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "", "FID_TRGT_CLS_CODE": "",
+                "FID_TRGT_EXLS_CLS_CODE": "",
+            },
+        )
+        items = []
+        for i in (data.get("output1") or data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or i.get("ovtm_untp_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or i.get("ovtm_untp_prdy_ctrt") or 0, 0.0),
+                "volume": safe_int(i.get("acml_vol") or i.get("ovtm_untp_exch_vol") or 0),
+                "market": "NXT",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_exp_trans_updown_rank(before_open: bool = True) -> list:
+    """v167.0: 예상체결 상승/하락 상위 (FHPST01820000) — 장전/장마감 예상체결 상위.
+    규격서: v1_국내주식-103
+    before_open=True → fid_mkop_cls_code=0(장전예상), False → 1(장마감예상)
+    반환: [{"code","name","price","change_rate","exp_volume"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/exp-trans-updown",
+            "FHPST01820000",
+            {
+                "fid_rank_sort_cls_code": "0",   # 0:상승률순
+                "fid_cond_mrkt_div_code": "J",
+                "fid_cond_scr_div_code": "20182",
+                "fid_input_iscd": "0000",
+                "fid_div_cls_code": "0",
+                "fid_aply_rang_prc_1": "", "fid_vol_cnt": "",
+                "fid_pbmn": "", "fid_blng_cls_code": "0",
+                "fid_mkop_cls_code": "0" if before_open else "1",
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "exp_volume": safe_int(i.get("acml_vol") or 0),
+                "market": "KRX",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_volume_power_rank(market: str = "J") -> list:
+    """v167.0: 체결강도 상위 (FHPST01680000) — 매수 체결강도 상위.
+    규격서: v1_국내주식-101
+    반환: [{"code","name","price","change_rate","volume_ratio","cttg_str"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/volume-power",
+            "FHPST01680000",
+            {
+                "fid_trgt_exls_cls_code": "0",
+                "fid_cond_mrkt_div_code": market,
+                "fid_cond_scr_div_code": "20168",
+                "fid_input_iscd": "0000",
+                "fid_div_cls_code": "0",
+                "fid_input_price_1": "", "fid_input_price_2": "",
+                "fid_vol_cnt": "10000",    # 최소 거래량 필터
+                "fid_trgt_cls_code": "0",
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("stck_shrn_iscd") or i.get("mksc_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "volume_ratio": safe_float(i.get("vol_inrt") or 0, 0.0),
+                "cttg_str": safe_float(i.get("cttr") or 0, 0.0),   # 체결강도
+                "market": "KRX" if market == "J" else "NXT",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_near_new_highlow_rank(high: bool = True) -> list:
+    """v167.0: 신고/신저근접 상위 (FHPST01870000) — 52주 신고가/신저가 근접 종목.
+    규격서: v1_국내주식-105
+    high=True → 신고가 근접(fid_prc_cls_code=0), False → 신저가 근접(1)
+    반환: [{"code","name","price","change_rate","week52_high","disparity"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/near-new-highlow",
+            "FHPST01870000",
+            {
+                "fid_aply_rang_vol": "0",
+                "fid_cond_mrkt_div_code": "J",
+                "fid_cond_scr_div_code": "20187",
+                "fid_div_cls_code": "0",
+                "fid_input_cnt_1": "0",     # 괴리율 최소
+                "fid_input_cnt_2": "5",     # 괴리율 최대 5% 이내
+                "fid_prc_cls_code": "0" if high else "1",
+                "fid_input_iscd": "0000",
+                "fid_trgt_cls_code": "0",
+                "fid_trgt_exls_cls_code": "0",
+                "fid_aply_rang_prc_1": "", "fid_aply_rang_prc_2": "",
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "week52_high": safe_int(i.get("d250_hgpr") or 0),
+                "disparity": safe_float(i.get("stck_prpr_drate") or 0, 0.0),
+                "market": "KRX",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
+    """v167.0: 등락률 순위 (FHPST01700000).
+    규격서: v1_국내주식-088
+    sort: 0=상승률순, 1=하락률순
+    반환: [{"code","name","price","change_rate","volume_ratio"}, ...]
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
+            "FHPST01700000",
+            {
+                "fid_rsfl_rate2": "",
+                "fid_cond_mrkt_div_code": market,
+                "fid_cond_scr_div_code": "20170",
+                "fid_input_iscd": "0000",
+                "fid_rank_sort_cls_code": sort,
+                "fid_input_cnt_1": "0",
+                "fid_prc_cls_code": "0",
+                "fid_input_price_1": "", "fid_input_price_2": "",
+                "fid_vol_cnt": "10000",
+                "fid_trgt_cls_code": "0",
+                "fid_trgt_exls_cls_code": "0",
+                "fid_div_cls_code": "0",
+                "fid_rsfl_rate1": "2",      # 2% 이상 상승만
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "volume_ratio": safe_float(i.get("vol_inrt") or 0, 0.0),
+                "market": "KRX" if market == "J" else "NXT",
+            })
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_market_investor_trend(iscd: str = "KSP") -> dict:
+    """v167.0: 시장별 투자자매매동향(시세) — FHPTJ04030000.
+    규격서: v1_국내주식-074
+    iscd: KSP(코스피), KSQ(코스닥)
+    반환: {
+      "foreign_net_buy": 외국인순매수(주), "institution_net_buy": 기관순매수(주),
+      "foreign_net_amount": 외국인순매수(원), "institution_net_amount": 기관순매수(원),
+      "market": iscd, "ts": time.time()
+    }
+    """
+    global _market_investor_cache
+    cache_key = f"mit_{iscd}"
+    cached = _market_investor_cache.get(cache_key, {})
+    if cached.get("ts", 0) and time.time() - cached["ts"] < 300:   # 5분 캐시
+        return cached
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market",
+            "FHPTJ04030000",
+            {
+                "fid_input_iscd": iscd,
+                "fid_input_iscd_2": "0001" if iscd == "KSP" else "1001",
+            },
+        )
+        rows = data.get("output") or []
+        # 최신 행(첫번째) 사용
+        row = rows[0] if rows else {}
+        result = {
+            "foreign_net_buy":       safe_int(row.get("frgn_ntby_qty", 0)),
+            "institution_net_buy":   safe_int(row.get("orgn_ntby_qty", 0)),
+            "foreign_net_amount":    safe_int(row.get("frgn_ntby_tr_pbmn", 0)),
+            "institution_net_amount": safe_int(row.get("orgn_ntby_tr_pbmn", 0)),
+            "market": iscd,
+            "ts": time.time(),
+        }
+        _market_investor_cache[cache_key] = result
+        return result
+    except Exception as e:
+        _swallow_exception(e)
+        return {"foreign_net_buy": 0, "institution_net_buy": 0,
+                "foreign_net_amount": 0, "institution_net_amount": 0,
+                "market": iscd, "ts": 0}
+
+
+def get_vi_status(market: str = "J") -> list:
+    """v167.0: VI(변동성완화장치) 현황 (FHPST01390000).
+    규격서: v1_국내주식-055
+    반환: [{"code","name","vi_type","vi_std_price"}, ...]
+    전역 _vi_blocked_codes 캐시 자동 갱신 (5분 TTL)
+    """
+    global _vi_blocked_codes, _vi_cache_ts
+    now_ts = time.time()
+    if now_ts - _vi_cache_ts < 300:   # 5분 캐시
+        return []
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-vi-status",
+            "FHPST01390000",
+            {
+                "FID_COND_MRKT_DIV_CODE": market,
+                "FID_DIV_CLS_CODE": "0",    # 0:전체
+            },
+        )
+        items = []
+        new_blocked = {}
+        expire_at = now_ts + 300   # 5분 후 만료
+        for i in (data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            new_blocked[code] = expire_at
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "vi_type": str(i.get("vi_cls_code") or ""),
+                "vi_std_price": safe_int(i.get("vi_stnd_prc") or 0),
+            })
+        # 만료된 것 정리 + 새 VI 종목 등록
+        _vi_blocked_codes = {k: v for k, v in _vi_blocked_codes.items() if v > now_ts}
+        _vi_blocked_codes.update(new_blocked)
+        _vi_cache_ts = now_ts
+        if items:
+            _log_info_msg(f"  🚦 VI 발동 {len(items)}종목 차단 등록")
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        _vi_cache_ts = now_ts   # 실패해도 5분 쿨다운
+        return []
+
+
+def get_capture_uplowprice(prc_cls: str = "0") -> list:
+    """v167.0: 상하한가 포착 (FHKST130000C0).
+    규격서: 국내주식-190
+    prc_cls: 0=상한가, 1=하한가
+    자동으로 _upper_limit_alerted_today 캐시 갱신.
+    반환: [{"code","name","change_rate","price"}, ...]
+    """
+    global _capture_uplowprice_ts
+    now_ts = time.time()
+    if now_ts - _capture_uplowprice_ts < 300:   # 5분 캐시
+        return []
+    if not is_market_open():
+        return []
+    try:
+        today_date = datetime.now().strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/capture-uplowprice",
+            "FHKST130000C0",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "11300",
+                "FID_PRC_CLS_CODE": prc_cls,
+                "FID_DIV_CLS_CODE": "0",    # 0:상하한가 종목
+                "FID_INPUT_ISCD": "0000",
+                "FID_TRGT_CLS_CODE": "",
+                "FID_TRGT_EXLS_CLS_CODE": "",
+                "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "",
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            # 상한가 종목 → _upper_limit_alerted_today 자동 등록
+            if prc_cls == "0" and code not in _upper_limit_alerted_today:
+                _upper_limit_alerted_today[code] = today_date
+                _log_info_msg(f"  🔒 상한가 포착 자동차단: {i.get('hts_kor_isnm', code)}")
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "price": safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+            })
+        _capture_uplowprice_ts = now_ts
+        if items:
+            _log_info_msg(f"  {'🔴' if prc_cls=='0' else '🔵'} {'상한가' if prc_cls=='0' else '하한가'} 포착 {len(items)}종목")
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        _capture_uplowprice_ts = now_ts
+        return []
+
+
+def get_foreign_institution_total(rank_type: str = "0", etc_cls: str = "1") -> list:
+    """v167.0: 국내기관/외국인 매매종목 가집계 (FHPTJ04400000).
+    규격서: 국내주식-037
+    rank_type: 0=순매수상위, 1=순매도상위
+    etc_cls: 0=전체, 1=외국인, 2=기관계, 3=기타
+    10분 캐시. 반환: [{"code","name","net_buy","net_amount"}, ...]
+    """
+    global _foreign_inst_total_cache, _foreign_inst_total_cache_ts
+    cache_key_ts_min = int(time.time() / 600)
+    if _foreign_inst_total_cache and time.time() - _foreign_inst_total_cache_ts < 600:
+        return _foreign_inst_total_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+            "FHPTJ04400000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "V",
+                "FID_COND_SCR_DIV_CODE": "16449",
+                "FID_INPUT_ISCD": "0000",
+                "FID_DIV_CLS_CODE": "0",
+                "FID_RANK_SORT_CLS_CODE": rank_type,
+                "FID_ETC_CLS_CODE": etc_cls,
+            },
+        )
+        items = []
+        for i in (data.get("Output") or data.get("output") or []):
+            code = str(i.get("mksc_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "net_buy": safe_int(i.get("ntby_qty") or 0),
+                "net_amount": safe_int(i.get("ntby_tr_pbmn") or 0),
+                "market": "KRX",
+            })
+        _foreign_inst_total_cache = items
+        _foreign_inst_total_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def get_frgnmem_trade_estimate(sort: str = "0") -> list:
+    """v167.0: 외국계 매매종목 가집계 (FHKST644100C0).
+    규격서: 국내주식-161. 골드만/모건 등 외국계 증권사 선행 순매수.
+    sort: 0=금액순, 1=수량순
+    10분 캐시. 반환: [{"code","name","net_buy","net_amount"}, ...]
+    """
+    global _frgnmem_estimate_cache, _frgnmem_estimate_cache_ts
+    if _frgnmem_estimate_cache and time.time() - _frgnmem_estimate_cache_ts < 600:
+        return _frgnmem_estimate_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/frgnmem-trade-estimate",
+            "FHKST644100C0",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "16441",
+                "FID_INPUT_ISCD": "0000",
+                "FID_RANK_SORT_CLS_CODE": sort,
+                "FID_RANK_SORT_CLS_CODE_2": "0",   # 0=매수순
+            },
+        )
+        items = []
+        for i in (data.get("output") or []):
+            code = str(i.get("stck_shrn_iscd") or i.get("mksc_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": str(i.get("hts_kor_isnm") or ""),
+                "net_buy": safe_int(i.get("ntby_qty") or 0),
+                "net_amount": safe_int(i.get("ntby_tr_pbmn") or 0),
+                "market": "KRX",
+            })
+        _frgnmem_estimate_cache = items
+        _frgnmem_estimate_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+def _fetch_kis_futures_price(symbol: str, excd: str) -> float | None:
+    """v167.0: KIS 해외선물 현재가 조회 (HHDFC55010000).
+    규격서: v1_해외선물-009
+    symbol 예: NQ (나스닥선물), ES (S&P), GC (금), CL (WTI)
+    excd 예: CME, NYMEX, COMEX
+    반환: 현재가(float) 또는 None
+    """
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/overseas-futureoption/v1/quotations/inquire-price",
+            "HHDFC55010000",
+            {"SRS_CD": symbol, "EXCD": excd},
+        )
+        output = data.get("output") or {}
+        price_str = output.get("LAST") or output.get("last") or ""
+        val = float(price_str) if price_str else None
+        return val if val and val > 0 else None
+    except Exception as e:
+        _swallow_exception(e)
+        return None
+
+
+def _update_market_investor_score_adj() -> int:
+    """v167.0: 시장별 투자자 수급 방향 → score_adj 계산.
+    코스피 외인 순매수 방향 기반: 순매수 → +3, 순매도 → -3, 혼재 → 0
+    _us_cache에 krx_foreign_net/krx_institution_net 필드 업데이트.
+    """
+    try:
+        now_h = _now_kst().hour
+        if not (9 <= now_h <= 15):
+            return 0
+        mit = get_market_investor_trend("KSP")
+        f_net = mit.get("foreign_net_buy", 0)
+        i_net = mit.get("institution_net_buy", 0)
+        adj = 0
+        if f_net > 0:
+            adj += 3
+        elif f_net < 0:
+            adj -= 3
+        if i_net > 0:
+            adj += 1
+        elif i_net < 0:
+            adj -= 1
+        _us_cache["krx_foreign_net"] = f_net
+        _us_cache["krx_institution_net"] = i_net
+        return adj
+    except Exception as e:
+        _swallow_exception(e)
+        return 0
+
+
 def get_nxt_surge_stocks() -> list:
     """NXT 급등/거래량 상위 종목 조회.
     v165.37 [A]: 거래량 상위 결과에서 등락률 기준 상위도 병합 → 거래량은 적어도 급등한 종목 포착.
@@ -36141,11 +36735,45 @@ def _handle_telegram_material_command():
                 us_lines.append(f"  GOOGL {_fmt(us.get('googl_chg', 0.0))}  MU {_fmt(us.get('mu_chg', 0.0))}  AVGO {_fmt(us.get('avgo_chg', 0.0))}")
             if any(us.get(k, 0.0) != 0.0 for k in ("oklo_chg", "smr_chg", "btc_chg")):
                 us_lines.append(f"  OKLO {_fmt(us.get('oklo_chg', 0.0))}  SMR(원전) {_fmt(us.get('smr_chg', 0.0))}  BTC {_fmt(us.get('btc_chg', 0.0))}")
+            # v167.0: 시장 수급 방향 (코스피 외인/기관)
+            krx_f = _us_cache.get("krx_foreign_net", 0)
+            krx_i = _us_cache.get("krx_institution_net", 0)
+            if krx_f or krx_i:
+                f_icon = "🔴" if krx_f > 0 else ("🔵" if krx_f < 0 else "🟡")
+                i_icon = "🔴" if krx_i > 0 else ("🔵" if krx_i < 0 else "🟡")
+                us_lines.append(f"  코스피수급: 외국인{f_icon}{krx_f:+,}주  기관{i_icon}{krx_i:+,}주")
             if us.get("summary"):
                 us_lines.append(f"  → {us['summary']}")
             parts.append("\n" + "\n".join(us_lines))
         except Exception as e:
             _swallow_exception(e)
+
+        # v167.0: 외국계/기관외국인 가집계 섹션
+        try:
+            if is_market_open():
+                frgn_items  = get_frgnmem_trade_estimate()
+                fiotal_items = get_foreign_institution_total(etc_cls="1")   # 외국인
+                inst_items  = get_foreign_institution_total(etc_cls="2")    # 기관
+                fg_lines = ["🌍 <b>당일 수급 가집계</b>"]
+                if frgn_items:
+                    top5 = frgn_items[:5]
+                    fg_lines.append(f"  외국계 순매수: " + " / ".join(
+                        f"{it.get('name','?')}({it.get('net_amount',0)//100000000:.0f}억)" for it in top5
+                    ))
+                if fiotal_items:
+                    top5f = fiotal_items[:5]
+                    fg_lines.append(f"  외국인 순매수: " + " / ".join(
+                        f"{it.get('name','?')}" for it in top5f
+                    ))
+                if inst_items:
+                    top5i = inst_items[:5]
+                    fg_lines.append(f"  기관 순매수: " + " / ".join(
+                        f"{it.get('name','?')}" for it in top5i
+                    ))
+                if len(fg_lines) > 1:
+                    parts.append("\n" + "\n".join(fg_lines))
+        except Exception as _fge:
+            _swallow_exception(_fge)
 
         send("\n".join(parts))
     except Exception as e:
@@ -39339,6 +39967,22 @@ def get_us_market_signals() -> dict:
                 kis_price = _fetch_kis_overseas_price(sym, excd)
                 if kis_price and kis_price > 0:
                     values[f"{key}_last"] = kis_price
+        # v167.0: KIS 해외선물 현재가 → Yahoo 실패 시 NQ/ES/GC/CL 보완
+        # 거래소 코드: NQ=CME 나스닥선물, ES=CME S&P500선물, GC=COMEX 금선물, CL=NYMEX WTI선물
+        _kis_fut_map = [
+            ("NQ", "CME", "nasdaq", "nasdaq_prev_close"),
+            ("ES", "CME", "sp500",  "sp500_prev_close"),
+            ("GC", "COMEX", "gold", "gold_prev_close"),
+            ("CL", "NYMEX", "oil",  "oil_prev_close"),
+        ]
+        for _fsym, _excd, _key, _prev_key in _kis_fut_map:
+            if values.get(f"{_key}_chg", 0.0) == 0.0:  # Yahoo 0.0% → KIS 시도
+                _fp = _fetch_kis_futures_price(_fsym, _excd)
+                if _fp and _fp > 0:
+                    _prev = _us_cache.get(_prev_key, 0.0)
+                    if _prev and _prev > 0:
+                        values[f"{_key}_chg"] = round((_fp - _prev) / _prev * 100, 2)
+                    _us_cache[_prev_key] = _fp
         # v166.0: BTC CoinGecko fallback
         if not values.get("btc_chg"):
             btc_price = _fetch_btc_coingecko()
@@ -40293,6 +40937,11 @@ def _scan_issue_prewatch_candidates(alerts: list, seen: set) -> None:
 
 def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
     today_date = datetime.now().strftime("%Y%m%d")
+    # v167.0: 상한가 포착 API → _upper_limit_alerted_today 자동 갱신 (장중에만)
+    try:
+        get_capture_uplowprice(prc_cls="0")
+    except Exception as _cue:
+        _swallow_exception(_cue)
     for stock in get_upper_limit_stocks():
         code = normalize_stock_code(stock.get("code", ""))
         if not code:
@@ -40324,15 +40973,82 @@ def _scan_krx_market_candidates(alerts: list, seen: set) -> None:
         _register_sector_leader_follow_seed(stock)
         if code in seen:
             continue
-        # v162.7: _upper_limit_alerted_today 기준 실시간 하드블록 — 상태파일 복원 실패 보험
-        # get_upper_limit_stocks 루프에서 _upper_limit_day_alerted로 걸리더라도
-        # volume_surge 경로에서 재진입되는 케이스 차단
         _ul_today = _upper_limit_alerted_today.get(code)
         if _ul_today and _ul_today == today_date:
             continue
+        # v167.0: VI 발동 종목 진입 차단
+        if _vi_blocked_codes.get(code, 0) > time.time():
+            _log_info_msg(f"  🚦 VI 차단 스킵 (KRX): {stock.get('name', code)}")
+            continue
         _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+    # v167.0: 체결강도 상위 소스 추가 — 거래량 기준 누락 급등 종목 보완
+    try:
+        for stock in get_volume_power_rank("J"):
+            code = normalize_stock_code(stock.get("code", ""))
+            if not code or code in seen:
+                continue
+            if _upper_limit_alerted_today.get(code) == today_date:
+                continue
+            if _vi_blocked_codes.get(code, 0) > time.time():
+                continue
+            cr = float(stock.get("change_rate", 0) or 0)
+            if cr < 2.0:
+                continue
+            _register_sector_leader_follow_seed(stock)
+            _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+    except Exception as _vpe:
+        _swallow_exception(_vpe)
+    # v167.0: 신고가 근접 소스 추가 — 52주 신고가 5% 이내 돌파 후보
+    try:
+        for stock in get_near_new_highlow_rank(high=True):
+            code = normalize_stock_code(stock.get("code", ""))
+            if not code or code in seen:
+                continue
+            if _upper_limit_alerted_today.get(code) == today_date:
+                continue
+            cr = float(stock.get("change_rate", 0) or 0)
+            if cr < 1.0:
+                continue
+            _register_sector_leader_follow_seed(stock)
+            _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+    except Exception as _nhe:
+        _swallow_exception(_nhe)
+    # v167.0: 등락률 순위 소스 추가 — 거래량 기준 미포착 등락률 상위 보완
+    try:
+        for stock in get_fluctuation_rank("J", "0"):
+            code = normalize_stock_code(stock.get("code", ""))
+            if not code or code in seen:
+                continue
+            if _upper_limit_alerted_today.get(code) == today_date:
+                continue
+            if _vi_blocked_codes.get(code, 0) > time.time():
+                continue
+            cr = float(stock.get("change_rate", 0) or 0)
+            if cr < 3.0:    # KRX 등락률 3% 이상만 (중복 방지)
+                continue
+            _register_sector_leader_follow_seed(stock)
+            _append_scan_alert(alerts, seen, analyze(stock), seen_code=code)
+    except Exception as _fre:
+        _swallow_exception(_fre)
 def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
-    for stock in get_nxt_surge_stocks():
+    # v167.0: NXT 시간외 구간(KRX 닫힘+NXT 열림)에는 overtime 전용 소스 우선 사용
+    nxt_only_window = not is_market_open() and is_nxt_open()
+    # v167.0: overtime 소스 수집 (NXT 전용 등락률/거래량 순위)
+    overtime_items: list = []
+    if nxt_only_window:
+        try:
+            ot_fluct = get_overtime_fluctuation_rank()
+            ot_vol   = get_overtime_volume_rank()
+            seen_ot  = set()
+            for it in ot_fluct + ot_vol:
+                c = normalize_stock_code(it.get("code", ""))
+                if c and c not in seen_ot:
+                    seen_ot.add(c)
+                    it["market"] = "NXT"
+                    overtime_items.append(it)
+        except Exception as _ote:
+            _swallow_exception(_ote)
+    for stock in (overtime_items if overtime_items else []) + list(get_nxt_surge_stocks()):
         code = normalize_stock_code(stock.get("code", ""))
         if not code:
             _log_warn_msg("⚠️ run_scan NXT 후보 code 누락 스킵")
@@ -40342,14 +41058,16 @@ def _scan_nxt_market_candidates(alerts: list, seen: set) -> None:
         _register_sector_leader_follow_seed(stock)
         if code in seen:
             continue
+        # v167.0: VI 발동 종목 진입 차단
+        if _vi_blocked_codes.get(code, 0) > time.time():
+            _log_info_msg(f"  🚦 VI 차단 스킵 (NXT): {stock.get('name', code)}")
+            continue
         if _is_nxt_premarket_window():
             gate = stock.get("_nxt_premarket_gate") if isinstance(stock.get("_nxt_premarket_gate"), dict) else _get_nxt_premarket_quality_gate(stock)
             if not gate.get("allow"):
                 continue
             stock["_nxt_premarket_gate"] = gate
         else:
-            # v165.37 [C]: NXT 장중/장후 — analyze() 전 빠른 pre-filter
-            # 등락률 1% 미만 AND 거래량비율 1.5배 미만 → analyze() API 호출 비용 절감
             _cr = float(stock.get("change_rate", 0) or 0)
             _vr = float(stock.get("volume_ratio", 0) or 0)
             if _cr < 1.0 and _vr < 1.5:
@@ -40994,6 +41712,40 @@ def _run_scan_body():
     try:
         _ensure_dynamic_candidates_fresh()
         alerts, seen = [], set()
+        # v167.0: VI 현황 갱신 (5분 캐시) — 장중에만 의미 있음
+        if ctx["krx_open"]:
+            try:
+                get_vi_status()
+            except Exception as _vi_e:
+                _swallow_exception(_vi_e)
+        # v167.0: 시장별 투자자 수급 방향 → _us_cache score_adj 보완 (장중에만)
+        if ctx["krx_open"]:
+            try:
+                mit_adj = _update_market_investor_score_adj()
+                if mit_adj:
+                    _log_info_msg(f"  📊 시장수급 adj: {mit_adj:+d}점 (코스피 외인/기관 방향)")
+            except Exception as _mit_e:
+                _swallow_exception(_mit_e)
+        # v167.0: 장전(08:00~08:59) 예상체결 상위 → prewatch 시드 보완
+        now_h = _now_kst().hour
+        if not ctx["krx_open"] and ctx["nxt_open"] and now_h == 8:
+            try:
+                exp_stocks = get_exp_trans_updown_rank(before_open=True)
+                exp_headlines = []
+                for es in exp_stocks[:10]:
+                    es_code = normalize_stock_code(es.get("code", ""))
+                    cr = es.get("change_rate", 0)
+                    if es_code and cr >= 2.0:
+                        exp_headlines.append({
+                            "code": es_code,
+                            "name": es.get("name", es_code),
+                            "headline": f"장전예상체결상승{cr:.1f}%",
+                            "quality_score": 4,
+                        })
+                if exp_headlines:
+                    _register_material_seed_prewatch(exp_headlines, source_label="exp_trans_updown")
+            except Exception as _exp_e:
+                _swallow_exception(_exp_e)
         _drain_run_scan_repair_queue(alerts, seen)
         _scan_overnight_watchlist_candidates(alerts, seen, ctx["krx_open"])
         _scan_scenario_action_board_candidates(alerts, seen, ctx["krx_open"])
@@ -41013,7 +41765,6 @@ def _run_scan_body():
         alerts = filter_portfolio_signals(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_dispatch")
         _dispatch_scan_alerts(alerts)
-        # v165.40 [B]: 섹터 breadth 특보 — 섹터 제한으로 개별 알람 못 받아도 섹터 전체 상승 인지
         try:
             if is_market_open():
                 _detect_and_send_sector_breadth_alert()
