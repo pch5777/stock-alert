@@ -8743,14 +8743,14 @@ def get_kis_overseas_news(max_items: int = 20) -> list:
             },
         )
         if isinstance(data, dict):
-            for i in (data.get("outblock1") or [])[:max_items]:  # outblock1[] 규격서 확인
+            for i in (data.get("outblock1") or [])[:max_items]:
                 if isinstance(i, dict):
-                    t = str(i.get("title") or "").strip()  # title 필드 (규격서 확인)
+                    t = str(i.get("title") or "").strip()
                     if t:
                         items.append(t)
     except Exception as e:
         _swallow_exception(e)
-    # 해외속보 (FHKST01011801) — FHKST01011800과 동일 URI/파라미터 패턴
+    # 해외속보 (FHKST01011801) — 규격서 기반 파라미터
     try:
         data2 = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
@@ -8770,45 +8770,6 @@ def get_kis_overseas_news(max_items: int = 20) -> list:
             for i in (data2.get("output") or [])[:max_items]:
                 if isinstance(i, dict):
                     t = str(i.get("hts_pbnt_titl_cntt") or "").strip()
-                    if t and t not in items:
-                        items.append(t)
-    except Exception as e:
-        _swallow_exception(e)
-    _kis_overseas_news_cache = items[:max_items]
-    _kis_overseas_news_cache_ts = time.time()
-    return _kis_overseas_news_cache
-
-    global _kis_overseas_news_cache, _kis_overseas_news_cache_ts
-    if _kis_overseas_news_cache and time.time() - _kis_overseas_news_cache_ts < 300:
-        return _kis_overseas_news_cache
-    items = []
-    # 해외뉴스종합
-    try:
-        data = _safe_get(
-            f"{KIS_BASE_URL}/uapi/overseas-stock/v1/quotations/news-title",
-            "HHPSTH60100C1",
-            {"FID_COND_MRKT_DIV_CODE": "N", "FID_INPUT_ISCD": "", "FID_INPUT_DATE_1": ""},
-        )
-        if isinstance(data, dict):
-            for i in (data.get("output") or [])[:max_items]:
-                if isinstance(i, dict):
-                    t = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
-                    if t:
-                        items.append(t)
-    except Exception as e:
-        _swallow_exception(e)
-    # 해외속보 (보완)
-    try:
-        data2 = _safe_get(
-            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/news-title",
-            "FHKST01011801",
-            {"FID_NEWS_OFER_ENTP_CODE": "", "FID_COND_MRKT_DIV_CODE": "V",
-             "FID_INPUT_ISCD": "0000000", "FID_NEWS_CLSS_CODE": ""},
-        )
-        if isinstance(data2, dict):
-            for i in (data2.get("output") or [])[:max_items]:
-                if isinstance(i, dict):
-                    t = str(i.get("news_ttl") or i.get("hts_pbnt_titl_cntt") or "").strip()
                     if t and t not in items:
                         items.append(t)
     except Exception as e:
