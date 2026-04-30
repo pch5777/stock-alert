@@ -1,8 +1,8 @@
-requests==2.31.0
+requests
 schedule==1.2.1
 beautifulsoup4==4.12.2
 psycopg2-binary
-pytz==2024.1
-APScheduler==3.10.4
+pytz
+APScheduler
 google-genai>=1.0.0
-websocket-client
+flask>=3.0.0

@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1920">
+<title>📈 실시간 주식 보드</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothic Neo",sans-serif;overflow:hidden;height:100vh}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:#070d1a}
+::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+
+/* ══ 헤더 ══ */
+#hdr{
+  height:34px;display:flex;align-items:center;gap:10px;
+  padding:0 12px;background:#0c1525;border-bottom:1px solid #1e293b;flex-shrink:0;
+}
+.logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
+.badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
+.ts{font-size:10px;color:#b8ccd8;margin-left:auto}
+
+/* ══ 메인 레이아웃 ══
+   섹터A(350) + 섹터B(350) + 포착(420) + 알람(400) + 랭킹(400) = 1920px
+══════════════════════════════════════════════ */
+#main{
+  display:grid;
+  /* 섹터A(350) + 섹터B(350) + 포착(480) + 알람(340) + 랭킹(400) = 1920px */
+  grid-template-columns: 350px 350px 480px 340px 400px;
+  height:calc(100vh - 34px);
+  overflow:hidden;
+}
+
+/* ══ 공통 컬럼 스타일 ══ */
+.col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
+.col:last-child{border-right:none}
+
+/* 컬럼 최상단 타이틀바 */
+.col-title{
+  height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;
+  background:#0a1628;border-bottom:1px solid #1e2d45;
+}
+.col-title span{font-size:11px;font-weight:700;letter-spacing:.8px}
+.sub-tag{font-size:9px;color:#c8e4f8;background:#0f172a;border:1px solid #2a4060;border-radius:3px;padding:1px 5px}
+
+/* 컬럼 헤더 (종목명,코드,등락률... 한번만) */
+.tbl-head{
+  display:grid;height:20px;padding:0 5px;align-items:center;flex-shrink:0;
+  background:#050a15;border-bottom:1px solid #0d1520;
+}
+.tbl-head span{font-size:9px;font-weight:700;color:#c8e4f8;letter-spacing:.3px}
+.tbl-head span:not(:first-child){text-align:right}
+
+/* 스크롤 바디 */
+.col-body{overflow-y:auto;flex:1}
+
+/* ══ 섹터 목록 (A/B 두 컬럼) ══ */
+.col.sec{border-right:1px solid #1a2d45;background:#060c1a}
+#sec-a{border-right:1px solid #1a2d45}
+#sec-b{border-right:2px solid #1e3a5f}
+
+/* 섹터 서브헤더 (섹터명) */
+.sec-sub{
+  display:flex;align-items:center;gap:6px;
+  height:24px;padding:0 8px;flex-shrink:0;
+  border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;
+  position:sticky;top:0;z-index:5;
+}
+.sec-sub.pos{background:#0d2518}
+.sec-sub.neg{background:#22100a}
+.sec-rnk{width:16px;height:16px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:9px;color:#0a0f1e;flex-shrink:0}
+.sec-nm{font-size:11px;font-weight:700;color:#e2e8f0}
+.sec-chg{margin-left:auto;font-size:12px;font-weight:700}
+
+/* 종목 한줄 (섹터 내부) */
+.stk-row{
+  display:grid;
+  grid-template-columns:95px 54px 46px 56px 70px;
+  height:23px;padding:0 8px;align-items:center;
+  border-bottom:1px solid #09111e;transition:background .1s;
+}
+.stk-row:hover{background:#0d1e30}
+.stk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cp{
+  cursor:pointer;user-select:none;font-family:"Courier New",monospace;font-size:9px;
+  padding:0 3px;border-radius:2px;border:1px solid #2a4a65;background:#050a14;color:#c8e4f8;
+  transition:all .12s;text-align:center;
+}
+.cp:hover{border-color:#ff444470;color:#ff4444}
+.cp.ok{color:#ff4444;border-color:#ff444460}
+.chg-v{font-size:11px;font-weight:700;text-align:right}
+.vol-v{font-size:10px;color:#c8e4f8;text-align:right}
+.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
+
+/* ══ 포착 목록 ══ */
+.cap-head{grid-template-columns:105px 52px 46px 72px 90px 84px}
+.cap-row{
+  display:grid;
+  grid-template-columns:105px 52px 46px 72px 90px 84px;
+  height:24px;padding:0 8px;align-items:center;
+  border-bottom:1px solid #09111e;transition:background .1s;
+}
+.cap-row:hover{background:#0d1e30}
+.cap-row.hit{background:#081510}
+.cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
+
+/* ══ 알람 목록 ══ */
+.live-dot{width:7px;height:7px;border-radius:50%;background:#00d97e;box-shadow:0 0 5px #00d97e;animation:pulse 2s infinite}
+.alr{padding:6px 12px;border-bottom:1px solid #09111e;transition:background .1s}
+.alr:hover{background:#0d1a2a}
+.alr.red   {border-left:3px solid #00c070}
+.alr.yellow{border-left:3px solid #f59e0b}
+.alr.blue  {border-left:3px solid #3b82f6}
+.alr-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.alr-dot.red{background:#00d97e}.alr-dot.yellow{background:#fbbf24}.alr-dot.blue{background:#60a5fa}
+.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.alr-time{margin-left:auto;font-size:10px;color:#b8ccd8;flex-shrink:0;padding-left:6px}
+.alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap}
+
+/* ══ 랭킹 통합 컬럼 ══ */
+/* 섹션 구분 헤더 (등락률상위 / 거래량상위 / 조회수상위) */
+.rank-sec-title{
+  height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;
+  border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;
+  background:#0a1225;position:sticky;top:0;z-index:5;
+}
+.rank-sec-title span{font-size:10px;font-weight:700}
+/* 랭킹 종목 한줄 */
+.rk-row{
+  display:grid;
+  grid-template-columns:20px 100px 54px 48px 58px 80px;
+  height:23px;padding:0 8px;align-items:center;
+  border-bottom:1px solid #09111e;transition:background .1s;
+}
+.rk-row:hover{background:#0d1e30}
+.rk-no{font-size:10px;font-weight:700;color:#c8e4f8}
+.rk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rk-head{grid-template-columns:20px 100px 54px 48px 58px 80px}
+</style>
+</head>
+<body>
+
+<!-- ══ 헤더 ══ -->
+<div id="hdr">
+  <span class="logo">📈 실시간 주식 보드</span>
+  <span class="badge">🟢 장 운영중</span>
+  <span style="font-size:9px;color:#c8e4f8">목업 · 10초 자동갱신</span>
+  <span class="ts">
+    다음 영업일: <b id="next-biz">--</b>
+    &nbsp;|&nbsp;
+    마지막 갱신: <b id="ts">--:--:--</b>
+  </span>
+</div>
+
+<div id="main">
+
+  <!-- ══ 섹터 A (홀수 랭크) ══ -->
+  <div class="col sec" id="sec-a">
+    <div class="col-title">
+      <span style="color:#60a5fa">SECTOR LIST</span>
+      <span class="sub-tag">등락률순 실시간</span>
+    </div>
+    <!-- 컬럼 헤더: 딱 한번만 -->
+    <div class="tbl-head" style="grid-template-columns:95px 54px 46px 56px 70px;padding:0 8px">
+      <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span>
+    </div>
+    <div class="col-body" id="sec-a-body"></div>
+  </div>
+
+  <!-- ══ 섹터 B (짝수 랭크) ══ -->
+  <div class="col sec" id="sec-b">
+    <div class="col-title">
+      <span style="color:#60a5fa">SECTOR LIST</span>
+      <span class="sub-tag">등락률순 실시간</span>
+    </div>
+    <div class="tbl-head" style="grid-template-columns:95px 54px 46px 56px 70px;padding:0 8px">
+      <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span>
+    </div>
+    <div class="col-body" id="sec-b-body"></div>
+  </div>
+
+  <!-- ══ 포착 목록 ══ -->
+  <div class="col">
+    <div class="col-title">
+      <span style="color:#a78bfa">🎯 종목 포착</span>
+      <span class="sub-tag" style="color:#ff4444;border-color:#ff444425">✓도달</span>
+    </div>
+    <!-- 컬럼 헤더: 딱 한번만 -->
+    <div class="tbl-head cap-head" style="padding:0 8px">
+      <span style="text-align:left">종목명</span><span>코드</span><span>등락률</span><span>현재가</span><span>목표가</span><span>손절가</span>
+    </div>
+    <div class="col-body" id="cap-body"></div>
+  </div>
+
+  <!-- ══ 알람 목록 ══ -->
+  <div class="col">
+    <div class="col-title">
+      <span style="color:#d4eaf8">📨 알람 목록</span>
+      <span class="live-dot"></span>
+    </div>
+    <div class="col-body" id="alr-body"></div>
+  </div>
+
+  <!-- ══ 랭킹 통합 (등락률→거래량→조회수 순서대로) ══ -->
+  <div class="col">
+    <div class="col-title">
+      <span style="color:#00d97e">📋 상위 랭킹</span>
+    </div>
+    <!-- 컬럼 헤더: 딱 한번만 -->
+    <div class="tbl-head rk-head" style="padding:0 8px">
+      <span>#</span><span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span>
+    </div>
+    <div class="col-body" id="rank-body"></div>
+  </div>
+
+</div><!-- /#main -->
+
+<script>
+// ══ 데이터 ══════════════════════════════════════════
+let sectors=[
+  {id:"semi",name:"반도체",chg:3.82,stocks:[
+    {name:"삼성전자",   code:"005930",chg:4.21,vol:"18,342만",amt:"1조2,840억"},
+    {name:"SK하이닉스", code:"000660",chg:3.95,vol:"8,120만", amt:"9,210억"},
+    {name:"한미반도체", code:"042700",chg:2.80,vol:"3,440만", amt:"4,320억"},
+    {name:"DB하이텍",   code:"000990",chg:1.52,vol:"1,230만", amt:"1,840억"},
+    {name:"원익IPS",    code:"240810",chg:1.18,vol:"980만",   amt:"1,120억"},
+  ]},
+  {id:"bat",name:"2차전지",chg:2.14,stocks:[
+    {name:"LG에너지솔루션",code:"373220",chg:2.65,vol:"2,870만",amt:"8,910억"},
+    {name:"삼성SDI",      code:"006400",chg:1.92,vol:"1,230만",amt:"5,640억"},
+    {name:"에코프로비엠",  code:"247540",chg:1.44,vol:"2,150만",amt:"3,200억"},
+    {name:"포스코퓨처엠",  code:"003670",chg:0.98,vol:"1,540만",amt:"2,100억"},
+  ]},
+  {id:"ai",name:"AI·로봇",chg:1.73,stocks:[
+    {name:"두산로보틱스",    code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
+    {name:"레인보우로보틱스",code:"277810",chg:2.40,vol:"1,980만",amt:"1,540억"},
+    {name:"현대로보틱스",    code:"267270",chg:0.88,vol:"980만",  amt:"820억"},
+    {name:"티로보틱스",      code:"388260",chg:0.65,vol:"640만",  amt:"480억"},
+  ]},
+  {id:"def",name:"방산",chg:0.85,stocks:[
+    {name:"한화에어로스페이스",code:"012450",chg:1.10,vol:"1,120만",amt:"5,400억"},
+    {name:"LIG넥스원",        code:"079550",chg:0.88,vol:"480만",  amt:"1,920억"},
+    {name:"현대로템",          code:"064350",chg:0.62,vol:"880만",  amt:"2,100억"},
+    {name:"한화시스템",        code:"272210",chg:0.44,vol:"1,340만",amt:"1,650억"},
+  ]},
+  {id:"bio",name:"바이오",chg:-0.42,stocks:[
+    {name:"삼성바이오로직스",code:"207940",chg:-0.21,vol:"980만", amt:"6,320억"},
+    {name:"셀트리온",        code:"068270",chg:-0.55,vol:"1,540만",amt:"3,180억"},
+    {name:"알테오젠",        code:"196170",chg:-0.88,vol:"2,230만",amt:"2,760억"},
+    {name:"유한양행",        code:"000100",chg:-1.12,vol:"870만", amt:"1,640억"},
+  ]},
+  {id:"ship",name:"조선",chg:-0.95,stocks:[
+    {name:"HD한국조선해양",code:"009540",chg:-0.72,vol:"1,340만",amt:"4,210억"},
+    {name:"HD현대중공업",  code:"329180",chg:-0.98,vol:"920만",  amt:"3,540억"},
+    {name:"삼성중공업",    code:"010140",chg:-1.24,vol:"3,810만",amt:"2,960억"},
+  ]},
+];
+
+let captured=[
+  {name:"삼성전자",        code:"005930",price:79200, entry:78400, target:86240, stop:72900, hit:true, chg:4.21},
+  {name:"SK하이닉스",      code:"000660",price:197000,entry:195000,target:214500,stop:181400,hit:true, chg:3.95},
+  {name:"두산로보틱스",    code:"454910",price:38900, entry:38500, target:42350, stop:35800, hit:true, chg:3.10},
+  {name:"LG에너지솔루션",  code:"373220",price:312500,entry:310000,target:341000,stop:288300,hit:false,chg:2.65},
+  {name:"레인보우로보틱스",code:"277810",price:64800, entry:64200, target:70620, stop:59700, hit:false,chg:2.40},
+  {name:"에코프로비엠",    code:"247540",price:112500,entry:112000,target:123200,stop:104200,hit:false,chg:1.44},
+  {name:"셀트리온",        code:"068270",price:54200, entry:55000, target:60500, stop:51150, hit:false,chg:-0.55},
+];
+
+const alerts=[
+  {lvl:"red",   time:"14:52",title:"두산로보틱스 급등포착",   body:"등락률 +3.1%  거래량 급증 420%\n진입 38,500  목표 42,350  손절 35,800"},
+  {lvl:"red",   time:"14:48",title:"삼성전자 SURGE 신호",     body:"등락률 +4.2%  거래량 급증 380%\n진입 78,400  목표 86,240  손절 72,900"},
+  {lvl:"yellow",time:"14:31",title:"에코프로비엠 눌림목",     body:"등락률 +1.4%  눌림목 구간 진입\n진입 112,000  목표 123,200  손절 104,200"},
+  {lvl:"blue",  time:"14:12",title:"셀트리온 약세 주의",      body:"등락률 -0.6%  진입 보류"},
+  {lvl:"red",   time:"13:55",title:"SK하이닉스 강세 유지",    body:"등락률 +3.9%\n진입 195,000  목표 214,500  손절 181,400"},
+  {lvl:"yellow",time:"13:20",title:"레인보우로보틱스 선진입", body:"등락률 +2.4%\n진입 64,200  목표 70,620  손절 59,700"},
+  {lvl:"red",   time:"12:44",title:"한미반도체 급등 2차",     body:"등락률 +2.8%\n진입 58,200  목표 64,020  손절 54,100"},
+  {lvl:"yellow",time:"12:10",title:"LIG넥스원 상승 감지",    body:"등락률 +0.9%\n진입 198,500  목표 218,000  손절 184,700"},
+];
+
+let rChg=[
+  {name:"삼성전자",   code:"005930",chg:4.21,vol:"18,342만",amt:"1조2,840억"},
+  {name:"SK하이닉스", code:"000660",chg:3.95,vol:"8,120만", amt:"9,210억"},
+  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
+  {name:"한미반도체", code:"042700",chg:2.80,vol:"3,440만", amt:"4,320억"},
+  {name:"레인보우",   code:"277810",chg:2.40,vol:"1,980만", amt:"1,540억"},
+  {name:"LG에너지",   code:"373220",chg:2.65,vol:"2,870만", amt:"8,910억"},
+  {name:"에코프로비엠",code:"247540",chg:1.44,vol:"2,150만",amt:"3,200억"},
+  {name:"DB하이텍",   code:"000990",chg:1.52,vol:"1,230만", amt:"1,840억"},
+  {name:"포스코퓨처엠",code:"003670",chg:0.98,vol:"1,540만",amt:"2,100억"},
+  {name:"셀트리온",   code:"068270",chg:-0.55,vol:"1,540만",amt:"3,180억"},
+  {name:"알테오젠",   code:"196170",chg:-0.88,vol:"2,230만",amt:"2,760억"},
+  {name:"삼성중공업", code:"010140",chg:-1.24,vol:"3,810만",amt:"2,960억"},
+];
+let rVol=[
+  {name:"삼성전자",  code:"005930",chg:4.21, vol:"18,342만",amt:"1조2,840억"},
+  {name:"카카오",    code:"035720",chg:-0.32,vol:"12,540만",amt:"4,210억"},
+  {name:"셀트리온",  code:"068270",chg:-0.55,vol:"11,340만",amt:"3,180억"},
+  {name:"SK하이닉스",code:"000660",chg:3.95, vol:"8,120만", amt:"9,210억"},
+  {name:"POSCO",     code:"005490",chg:1.12, vol:"6,880만", amt:"3,820억"},
+  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
+  {name:"삼성중공업",code:"010140",chg:-1.24,vol:"3,810만", amt:"2,960억"},
+  {name:"LG에너지",  code:"373220",chg:2.65, vol:"2,870만", amt:"8,910억"},
+  {name:"알테오젠",  code:"196170",chg:-0.88,vol:"2,230만", amt:"2,760억"},
+  {name:"에코프로",  code:"247540",chg:1.44, vol:"2,150만", amt:"3,200억"},
+  {name:"현대차",    code:"005380",chg:0.44, vol:"2,140만", amt:"5,620억"},
+  {name:"레인보우",  code:"277810",chg:2.40, vol:"1,980만", amt:"1,540억"},
+];
+let rView=[
+  {name:"삼성전자",  code:"005930",chg:4.21, vol:"18,342만",amt:"1조2,840억"},
+  {name:"SK하이닉스",code:"000660",chg:3.95, vol:"8,120만", amt:"9,210억"},
+  {name:"카카오",    code:"035720",chg:-0.32,vol:"12,540만",amt:"4,210억"},
+  {name:"LG에너지",  code:"373220",chg:2.65, vol:"2,870만", amt:"8,910억"},
+  {name:"POSCO",     code:"005490",chg:1.12, vol:"6,880만", amt:"3,820억"},
+  {name:"현대차",    code:"005380",chg:0.44, vol:"2,140만", amt:"5,620억"},
+  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
+  {name:"한화에어로", code:"012450",chg:1.10, vol:"1,120만", amt:"5,400억"},
+  {name:"셀트리온",  code:"068270",chg:-0.55,vol:"1,540만", amt:"3,180억"},
+  {name:"삼성바이오", code:"207940",chg:-0.21,vol:"980만",  amt:"6,320억"},
+  {name:"삼성중공업", code:"010140",chg:-1.24,vol:"3,810만", amt:"2,960억"},
+  {name:"에코프로",  code:"247540",chg:1.44, vol:"2,150만", amt:"3,200억"},
+];
+
+// ══ 유틸 ════════════════════════════════════════════
+const fg=v=>(v>=0?"+":"")+v.toFixed(2)+"%";
+const cc=v=>v>0?"#ff4444":v<0?"#00d97e":"#b8ccd8";
+const fmt=n=>Number(n).toLocaleString("ko-KR");
+const pct=(a,b)=>b>0?((a-b)/b*100):0;
+const rnd=(v,d)=>+(v+(Math.random()-.47)*d).toFixed(2);
+
+function cp(el,code){
+  try{navigator.clipboard.writeText(code)}catch{}
+  const p=el.textContent;el.textContent="✓";el.classList.add("ok");
+  setTimeout(()=>{el.textContent=p;el.classList.remove("ok")},1400);
+}
+
+// ══ 섹터 렌더 ═══════════════════════════════════════
+function renderSectors(){
+  const sorted=[...sectors].sort((a,b)=>b.chg-a.chg);
+  // A: 홀수 랭크(1,3,5...), B: 짝수 랭크(2,4,6...)
+  const a=sorted.filter((_,i)=>i%2===0);
+  const b=sorted.filter((_,i)=>i%2!==0);
+  document.getElementById("sec-a-body").innerHTML=secHTML(a,0);
+  document.getElementById("sec-b-body").innerHTML=secHTML(b,1);
+}
+
+function secHTML(list,offset){
+  return list.map((sec,li)=>{
+    const rank=(li*2)+offset+1;
+    const pos=sec.chg>=0, ac=pos?"#ff4444":"#00d97e";
+    const ss=[...sec.stocks].sort((a,b)=>b.chg-a.chg);
+    return `
+      <div class="sec-sub ${pos?"pos":"neg"}">
+        <div class="sec-rnk" style="background:${ac}">${rank}</div>
+        <span class="sec-nm">${sec.name}</span>
+        <span class="sec-chg" style="color:${ac}">${fg(sec.chg)}</span>
+      </div>
+      ${ss.map(s=>`
+        <div class="stk-row">
+          <span class="stk-nm">${s.name}</span>
+          <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+          <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
+          <span class="vol-v">${s.vol}</span>
+          <span class="amt-v">${s.amt}</span>
+        </div>`).join("")}`;
+  }).join("");
+}
+
+// ══ 포착 렌더 ═══════════════════════════════════════
+function renderCapture(){
+  const sorted=[...captured].sort((a,b)=>b.chg-a.chg);
+  document.getElementById("cap-body").innerHTML=sorted.map(s=>{
+    const toT=pct(s.target,s.price), toS=pct(s.price,s.stop);
+    return `<div class="cap-row ${s.hit?"hit":""}">
+      <span class="cap-nm">${s.name}</span>
+      <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+      <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
+      <span style="font-size:10px;color:#eef4fa;text-align:right">${fmt(s.price)}</span>
+      <span style="font-size:10px;color:#60a5fa;text-align:right;white-space:nowrap">${fmt(s.target)}<span style="font-size:8px;color:#3b82f6">(+${toT.toFixed(1)}%)</span></span>
+      <span style="font-size:10px;color:#00d97e;text-align:right;white-space:nowrap">${fmt(s.stop)}<span style="font-size:8px;color:#00c070">(-${toS.toFixed(1)}%)</span></span>
+    </div>`;
+  }).join("");
+}
+
+// ══ 알람 렌더 ═══════════════════════════════════════
+function renderAlerts(){
+  document.getElementById("alr-body").innerHTML=alerts.map(a=>`
+    <div class="alr ${a.lvl}">
+      <div class="alr-top">
+        <span class="alr-dot ${a.lvl}"></span>
+        <span class="alr-ttl">${a.title}</span>
+        <span class="alr-time">${a.time}</span>
+      </div>
+      <div class="alr-body">${a.body}</div>
+    </div>`).join("");
+}
+
+// ══ 랭킹 통합 렌더 (등락률→거래량→조회수 순서대로 한 컬럼) ══
+function renderRanking(){
+  const sections=[
+    {title:"🔥 등락률 상위", color:"#00d97e", data:[...rChg].sort((a,b)=>b.chg-a.chg)},
+    {title:"📊 거래량 상위", color:"#60a5fa", data:[...rVol].sort((a,b)=>b.chg-a.chg)},
+    {title:"👁 조회수 상위", color:"#a78bfa", data:[...rView].sort((a,b)=>b.chg-a.chg)},
+  ];
+  document.getElementById("rank-body").innerHTML=sections.map(sec=>`
+    <div class="rank-sec-title">
+      <span style="color:${sec.color}">${sec.title}</span>
+    </div>
+    ${sec.data.map((s,i)=>`
+      <div class="rk-row">
+        <span class="rk-no">${i+1}</span>
+        <span class="rk-nm">${s.name}</span>
+        <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+        <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
+        <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.vol}</span>
+        <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.amt}</span>
+      </div>`).join("")}
+  `).join("");
+}
+
+// ══ 실데이터 폴링 (/api/data 10초마다) ══════════════
+async function fetchAndRender(){
+  try{
+    const res = await fetch('/api/data');
+    if(!res.ok) throw new Error(res.status);
+    const d = await res.json();
+    if(d.sectors   && d.sectors.length)   sectors  = d.sectors;
+    if(d.captured  && d.captured.length)  captured = d.captured;
+    if(d.alerts    && d.alerts.length)    alerts   = d.alerts;
+    if(d.rank_chg  && d.rank_chg.length)  rChg     = d.rank_chg;
+    if(d.rank_vol  && d.rank_vol.length)  rVol     = d.rank_vol;
+    if(d.rank_view && d.rank_view.length) rView    = d.rank_view;
+    if(d.next_biz_day) document.getElementById("next-biz").textContent = d.next_biz_day;
+    renderAll(d.updated_at);
+  }catch(e){
+    console.warn("fetch /api/data 실패:", e);
+  }
+}
+function renderAll(ts){
+  renderSectors();renderCapture();renderAlerts();renderRanking();
+  if(ts) document.getElementById("ts").textContent = ts;
+  else document.getElementById("ts").textContent = new Date().toLocaleTimeString("ko-KR");
+}
+fetchAndRender();
+setInterval(fetchAndRender, 10000);
+
+// ══ 다음 영업일 ══════════════════════════════════
+function getNextBizDay(){
+  const DAYS=["일","월","화","수","목","금","토"];
+  const HOLIDAYS=new Set([
+    "2026-01-01","2026-03-01","2026-05-05","2026-06-06",
+    "2026-08-15","2026-10-03","2026-10-09","2026-12-25",
+  ]);
+  const d=new Date();
+  d.setHours(0,0,0,0);
+  const now=new Date();
+  // 15:30 이후면 내일부터 탐색
+  if(now.getHours()>15||(now.getHours()===15&&now.getMinutes()>=30)){
+    d.setDate(d.getDate()+1);
+  }
+  for(let i=0;i<10;i++){
+    const dow=d.getDay();
+    const ymd=d.toISOString().slice(0,10);
+    if(dow!==0&&dow!==6&&!HOLIDAYS.has(ymd)){
+      return `${d.getMonth()+1}월 ${d.getDate()}일 (${DAYS[dow]})`;
+    }
+    d.setDate(d.getDate()+1);
+  }
+  return "--";
+}
+document.getElementById("next-biz").textContent=getNextBizDay();
+</script>
+</body>
+</html>

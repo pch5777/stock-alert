@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.8
-날짜: 2026-04-30
+버전: v169.9
+날짜: 2026-05-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.9 (2026-05-01): 실시간 웹 대시보드 추가 (Flask)
+  [#1] Flask 웹서버 daemon 스레드 추가 (/board, /api/data)
+  [#2] _push_dashboard_json(): 알람·섹터·포착 데이터 → JSON 원자적 쓰기
+  [#3] send_alert() 끝에 _push_dashboard_json() 훅 추가
+  [#4] dashboard.html (v16 확정본) → 인라인 서빙
+  이유: 텔레그램 대신 브라우저로 실시간 보드 확인
+  개선점: Railway URL로 폰/PC 어디서든 접속 가능
+  주의점: Flask port는 PORT 환경변수 사용, 기존 봇 로직 무변경
 - v169.8 (2026-04-30): MID_PULLBACK(눌림목) entry_hit 미기록 버그 수정
   이유: SURGE는 _send_entry_phase_alert()에서 entry_hit=True + signal_log 동기화됨
        MID_PULLBACK은 send_mid_pullback_alert() 별도 경로 → entry_hit 미기록
@@ -1447,6 +1455,7 @@ def _derive_stats_cohort(version: str | None) -> str:
     return ver.split(".", 1)[0] or ver
 
 import os, requests, time, schedule, json, random, threading, math
+from flask import Flask as _Flask, jsonify as _jsonify, send_file as _send_file, Response as _FlaskResponse
 from collections import deque, defaultdict
 import xml.etree.ElementTree as ET
 import html
@@ -27436,9 +27445,199 @@ def update_dashboard(force: bool = False) -> None:
         if mid2:
             state["message_id"] = mid2
             _save_dashboard_state(state)
+
+# ══════════════════════════════════════════════════════════════
+# v169.9: 실시간 웹 대시보드
+# ══════════════════════════════════════════════════════════════
+_WEB_DASHBOARD_JSON   = _state_path("web_dashboard.json")
+_WEB_DASHBOARD_ALERTS: list = []          # 최근 50건 FIFO
+_WEB_DASHBOARD_LOCK   = threading.Lock()
+
+def _next_biz_day_str() -> str:
+    """다음 영업일 문자열 반환 (예: '5월 2일 (금)')"""
+    DAYS = ["일","월","화","수","목","금","토"]
+    try:
+        holidays = set(getattr(_load_kr_holidays, "_cache", {}).get(datetime.now().year, []))
+    except Exception:
+        holidays = set()
+    d = datetime.now()
+    d = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now()
+    # 15:30 이후면 내일부터
+    if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
+        from datetime import timedelta as _td
+        d += _td(days=1)
+    from datetime import timedelta as _td2
+    for _ in range(10):
+        dow = d.weekday()  # 0=월 … 6=일
+        ymd = d.strftime("%Y-%m-%d")
+        if dow < 5 and ymd not in holidays:
+            return f"{d.month}월 {d.day}일 ({DAYS[d.weekday()+1 if d.weekday()<6 else 0]})"
+        d += _td2(days=1)
+    return "--"
+
+def _push_dashboard_json() -> None:
+    """알람·섹터·포착 데이터를 web_dashboard.json 에 원자적으로 기록"""
+    try:
+        # ── 섹터 데이터 ──
+        sectors_raw = []
+        try:
+            sector_data = get_all_sector_index() or []
+            for sec in sector_data[:12]:
+                name  = sec.get("hts_kor_isnm") or sec.get("idx_name") or ""
+                chg   = float(sec.get("bstp_nmix_prdy_ctrt") or 0)
+                stocks_raw = []
+                try:
+                    theme_stocks = get_theme_sector_stocks(name)[2] if name else []
+                    for ts in (theme_stocks or [])[:6]:
+                        code = normalize_stock_code(ts.get("code",""))
+                        if not code:
+                            continue
+                        p = get_stock_price(code) or {}
+                        stocks_raw.append({
+                            "name": ts.get("name",""),
+                            "code": code,
+                            "chg":  float(p.get("change_rate") or ts.get("chg") or 0),
+                            "vol":  _fmt_vol(safe_int(p.get("acml_vol") or 0)),
+                            "amt":  _fmt_amt(safe_int(p.get("acml_tr_pbmn") or 0)),
+                        })
+                except Exception:
+                    pass
+                sectors_raw.append({"name": name, "chg": chg, "stocks": stocks_raw})
+        except Exception:
+            pass
+
+        # ── 포착 목록 ──
+        captured_raw = []
+        try:
+            sig_data = _load_signal_log_data() or {}
+            for key, rec in list(sig_data.items())[:20]:
+                if not isinstance(rec, dict):
+                    continue
+                code  = normalize_stock_code(rec.get("code",""))
+                price = safe_int(get_stock_price(code).get("stck_prpr") or rec.get("price") or 0) if code else 0
+                entry = safe_int(rec.get("entry_price") or 0)
+                captured_raw.append({
+                    "name":   rec.get("name",""),
+                    "code":   code,
+                    "price":  price,
+                    "entry":  entry,
+                    "target": safe_int(rec.get("target_price") or 0),
+                    "stop":   safe_int(rec.get("stop_loss") or 0),
+                    "hit":    bool(rec.get("entry_hit")),
+                    "chg":    float(rec.get("change_rate") or 0),
+                })
+        except Exception:
+            pass
+
+        # ── 랭킹 ──
+        rank_chg, rank_vol, rank_view = [], [], []
+        try:
+            for item in (get_fluctuation_rank() or [])[:12]:
+                code = normalize_stock_code(item.get("stck_shrn_iscd",""))
+                rank_chg.append({
+                    "name": item.get("hts_kor_isnm",""), "code": code,
+                    "chg":  float(item.get("prdy_ctrt") or 0),
+                    "vol":  _fmt_vol(safe_int(item.get("acml_vol") or 0)),
+                    "amt":  _fmt_amt(safe_int(item.get("acml_tr_pbmn") or 0)),
+                })
+        except Exception:
+            pass
+        try:
+            for item in (get_volume_surge_stocks() or [])[:12]:
+                code = normalize_stock_code(item.get("mksc_shrn_iscd","") or item.get("code",""))
+                rank_vol.append({
+                    "name": item.get("hts_kor_isnm","") or item.get("name",""), "code": code,
+                    "chg":  float(item.get("prdy_ctrt") or item.get("chg") or 0),
+                    "vol":  _fmt_vol(safe_int(item.get("acml_vol") or 0)),
+                    "amt":  _fmt_amt(safe_int(item.get("acml_tr_pbmn") or 0)),
+                })
+        except Exception:
+            pass
+        try:
+            for item in (get_hts_top_stocks() or [])[:12]:
+                code = normalize_stock_code(item.get("mksc_shrn_iscd","") or item.get("code",""))
+                p = get_stock_price(code) or {} if code else {}
+                rank_view.append({
+                    "name": _resolve_stock_name(code, item.get("name","")), "code": code,
+                    "chg":  float(p.get("change_rate") or 0),
+                    "vol":  _fmt_vol(safe_int(p.get("acml_vol") or 0)),
+                    "amt":  _fmt_amt(safe_int(p.get("acml_tr_pbmn") or 0)),
+                })
+        except Exception:
+            pass
+
+        payload = {
+            "updated_at":   datetime.now().strftime("%H:%M:%S"),
+            "next_biz_day": _next_biz_day_str(),
+            "sectors":      sorted(sectors_raw, key=lambda x: -x["chg"]),
+            "captured":     sorted(captured_raw, key=lambda x: -x["chg"]),
+            "alerts":       list(_WEB_DASHBOARD_ALERTS),
+            "rank_chg":     sorted(rank_chg,  key=lambda x: -x["chg"]),
+            "rank_vol":     sorted(rank_vol,  key=lambda x: -float(x["vol"].replace(",","").replace("만","").replace("억","") or 0)),
+            "rank_view":    rank_view,
+        }
+
+        # 원자적 쓰기
+        tmp = _WEB_DASHBOARD_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, _WEB_DASHBOARD_JSON)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _fmt_vol(v: int) -> str:
+    if v >= 100_000_000: return f"{v/100_000_000:.1f}억주"
+    if v >= 10_000:      return f"{v//10_000}만주"
+    return f"{v:,}주"
+
+def _fmt_amt(v: int) -> str:
+    if v >= 1_000_000_000_000: return f"{v/1_000_000_000_000:.1f}조"
+    if v >= 100_000_000:       return f"{v//100_000_000}억"
+    if v >= 10_000:            return f"{v//10_000}만"
+    return f"{v:,}"
+
+# ── Flask 앱 ──────────────────────────────────────────────────
+_flask_app = _Flask(__name__)
+
+@_flask_app.route("/board")
+def _flask_board():
+    """대시보드 HTML 서빙"""
+    dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    if os.path.exists(dashboard_path):
+        return _send_file(dashboard_path)
+    return "dashboard.html not found", 404
+
+@_flask_app.route("/api/data")
+def _flask_api_data():
+    """최신 JSON 반환"""
+    try:
+        if os.path.exists(_WEB_DASHBOARD_JSON):
+            with open(_WEB_DASHBOARD_JSON, "r", encoding="utf-8") as f:
+                return _FlaskResponse(f.read(), mimetype="application/json")
+    except Exception:
+        pass
+    return _jsonify({"updated_at": "--", "sectors": [], "captured": [], "alerts": [],
+                     "rank_chg": [], "rank_vol": [], "rank_view": []})
+
+@_flask_app.route("/health")
+def _flask_health():
+    return "ok", 200
+
+def _start_flask_server() -> None:
+    """Flask를 daemon 스레드로 실행 — 봇 메인루프 블로킹 없음"""
+    port = int(os.environ.get("PORT", 8080))
+    try:
+        import logging as _lg
+        _lg.getLogger("werkzeug").setLevel(_lg.ERROR)
+        _flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        _log_warn_msg(f"⚠️ Flask 서버 시작 실패: {e}")
+
 def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
                   code: str = "", name: str = ""):
     """
+
     중요도별 알림 발송
     CRITICAL / NORMAL → 즉시 발송
     INFO              → 사용자 발송 안 함
@@ -27950,6 +28149,22 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
     header_line = header_override if header_override else f"{emoji} <b>[{title}]</b>"
     msg = _build_capture_focus_message(s, header_line, now_str, name_dot=name_dot)
     send_by_level(msg.rstrip(), level, s["code"], s["name"])
+    # v169.9: 웹 대시보드 알람 피드 갱신
+    try:
+        lvl_map = {"CRITICAL": "red", "NORMAL": "yellow", "INFO": "blue"}
+        alert_entry = {
+            "lvl":   lvl_map.get(level, "yellow"),
+            "time":  datetime.now().strftime("%H:%M"),
+            "title": f"{s.get('name','')} {title}",
+            "body":  f"등락률 {float(s.get('change_rate',0)):+.1f}%  진입 {safe_int(s.get('entry_price',0),0):,}  목표 {safe_int(s.get('target_price',0),0):,}  손절 {safe_int(s.get('stop_loss',0),0):,}",
+        }
+        with _WEB_DASHBOARD_LOCK:
+            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
+            if len(_WEB_DASHBOARD_ALERTS) > 50:
+                _WEB_DASHBOARD_ALERTS.pop()
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    except Exception as _de:
+        _swallow_exception(_de)
 # ============================================================
 # 🔍 D: 실패 패턴 필터 (v38.6)
 # ============================================================
@@ -40628,6 +40843,12 @@ if __name__ == "__main__":
         _log_info_msg(f"✅ 텔레그램 폴링 전용 루프 시작 ({TELEGRAM_POLL_INTERVAL}s)")
     except Exception as e:
         _log_warn_msg(f"⚠️ 텔레그램 폴링 루프 시작 실패: {e}")
+    # v169.9: Flask 웹 대시보드 서버 시작
+    try:
+        threading.Thread(target=_start_flask_server, daemon=True).start()
+        _log_info_msg(f"✅ 웹 대시보드 서버 시작 (PORT={os.environ.get('PORT', 8080)}) → /board")
+    except Exception as e:
+        _log_warn_msg(f"⚠️ Flask 서버 시작 실패: {e}")
     # ── 공휴일/주말 → 종료 대신 대기 모드로 전환 ──
     if is_holiday():
         _log_info_msg(f"📅 오늘은 공휴일/주말 — 대기 모드로 실행")
