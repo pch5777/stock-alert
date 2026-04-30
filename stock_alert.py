@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.7
+버전: v169.8
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.8 (2026-04-30): MID_PULLBACK(눌림목) entry_hit 미기록 버그 수정
+  이유: SURGE는 _send_entry_phase_alert()에서 entry_hit=True + signal_log 동기화됨
+       MID_PULLBACK은 send_mid_pullback_alert() 별도 경로 → entry_hit 미기록
+       → v169.5 스킵 조건(prior_entry_hit=True) 무력화 → 동일 진입가 재갱신 → 재알람
+  개선점:
+    [#1] send_mid_pullback_alert() 발송 직후 _entry_watch entry_hit=True + signal_log 동기화
+    [#2] 현재가=진입가(±0.5%) 시 헤더 "+ 1차 진입가 도달" 표시
+  주의점: entry_hit는 code 기준 모든 watch에 일괄 적용. header_override 있으면 기존 유지
+
 - v169.7 (2026-04-30): 종가 선진입(14:35/15:08/19:10) 스케줄 미실행 버그 수정
   이유: _threaded_leader_job에 lambda를 전달하면 __name__="<lambda>"로 동일
         → fn_key = "<lambda>_threaded"로 3개 스케줄이 충돌
@@ -15413,7 +15422,20 @@ def send_mid_pullback_alert(s: dict):
     grade_text = {"A": "A등급 (최우선)", "B": "B등급 (우선)", "C": "C등급 (참고)"}.get(s.get("grade"), "")
     intraday_tag = "  ⚡️ 장중 돌파" if s.get("is_intraday") else ""
     header_override = str(s.get("_header_override", "") or "").strip()
-    header_line = header_override if header_override else f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
+    # v169.8: 현재가=진입가이면 "1차 진입가 도달" 헤더 추가
+    # 이유: SURGE는 _send_entry_phase_alert()에서 헤더가 붙지만 MID_PULLBACK은 별도 경로라 미표시
+    #       → 사용자가 "왜 진입가 도달인데 헤더 없냐" 혼란 + entry_hit 미기록으로 재알람 발생
+    if not header_override:
+        _live_price_now = safe_int(s.get("price", 0) or s.get("current_price", 0), 0)
+        _entry_now = safe_int(s.get("entry_price", 0), 0)
+        _hit_now = _entry_now > 0 and _live_price_now > 0 and abs(_live_price_now - _entry_now) / _entry_now <= 0.005
+        header_line = (
+            f"{grade_emoji} <b>[눌림목 진입 신호 + 1차 진입가 도달]</b>  {grade_text}{intraday_tag}"
+            if _hit_now else
+            f"{grade_emoji} <b>[눌림목 진입 신호]</b>  {grade_text}{intraday_tag}"
+        )
+    else:
+        header_line = header_override
     capture_label = _format_capture_datetime_label(
         detected_at=s.get("detected_at"),
         detect_date=s.get("detect_date", ""),
@@ -15421,6 +15443,27 @@ def send_mid_pullback_alert(s: dict):
     ) or _format_capture_datetime_label(detected_at=datetime.now())
     message = _build_capture_focus_message(s, header_line, capture_label, name_dot="🟣")
     send_with_chart_buttons(message, s["code"], stock_name)
+    # v169.8: MID_PULLBACK 발송 직후 entry_hit=True 기록 + signal_log 동기화
+    # 이유: SURGE는 _send_entry_phase_alert()에서 entry_hit 기록되지만
+    #       MID_PULLBACK은 별도 경로(send_mid_pullback_alert)로 발송 → entry_hit 미기록
+    #       → v169.5 스킵 조건(prior_entry_hit=True) 무력화 → 동일 진입가로 재갱신 → 재알람 발생
+    try:
+        code = str(s.get("code") or "")
+        sig_type = str(s.get("signal_type") or "")
+        ep = safe_int(s.get("entry_price", 0), 0)
+        if code and ep > 0:
+            hit_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # _entry_watch 직접 갱신
+            for _wk, _w in list(_entry_watch.items()):
+                if not isinstance(_w, dict): continue
+                if normalize_stock_code(_w.get("code")) == normalize_stock_code(code):
+                    _w["entry_hit"] = True
+                    _w["entry_hit_time"] = hit_time
+                    _w["entry_hit_price"] = ep
+            # signal_log 동기화 (stale 정리 방지)
+            _mark_entry_hit_in_signal_log(code, sig_type, hit_price=ep, hit_time=hit_time)
+    except Exception as _eh:
+        _swallow_exception(_eh)
 # ============================================================
 # 주가 조회
 # ============================================================
