@@ -3,10 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.6
+버전: v169.7
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.7 (2026-04-30): 종가 선진입(14:35/15:08/19:10) 스케줄 미실행 버그 수정
+  이유: _threaded_leader_job에 lambda를 전달하면 __name__="<lambda>"로 동일
+        → fn_key = "<lambda>_threaded"로 3개 스케줄이 충돌
+        → 14:35 실행 중 15:08/19:10이 _leader_job_running 체크에서 스킵
+        → 14:35도 이전 lambda job이 실행 중이면 동일 key 충돌로 스킵 가능
+  개선: named wrapper 함수 3개 추가(_job_preclose_krx_initial/final, _job_preclose_nxt_final)
+        → fn_key가 각각 고유하게 구분되어 독립 실행 보장
+  주의점: _leader_job_running 체크는 유지 (동일 job 중복 실행 방지)
+          named function 이름이 바뀌면 fn_key도 바뀜 — 이름 변경 금지
+
 - v169.6 (2026-04-30): no_ask_liquidity A급 고점수 SURGE 예외 — 급등 중 포착 누락 수정
   이유: _should_soft_allow_no_ask_liquidity_general()에서 ask_qty > 0이면 이후 조건 전체 미체크
        → KBI메탈+22% / 해성옵틱스+18.7% / 제룡산업+15% 등 A급 고점수 종목 37회 차단
@@ -40336,6 +40346,20 @@ def _run_scan_followup_hooks() -> None:
 def run_price_first_scan() -> None:
     run_scan()
 
+# v169.7: 선진입 스케줄용 named wrapper — lambda는 __name__="<lambda>"로 동일해져
+#          _leader_job_running fn_key 충돌 → 14:35/15:08/19:10 중 하나만 실행되는 버그 수정
+def _job_preclose_krx_initial():
+    if not is_holiday():
+        send_next_open_gap_alert(stage="krx", phase="initial")
+
+def _job_preclose_krx_final():
+    if not is_holiday():
+        send_next_open_gap_alert(stage="krx", phase="final")
+
+def _job_preclose_nxt_final():
+    if not is_holiday():
+        send_next_open_gap_alert(stage="nxt", phase="final")
+
 
 _run_scan_global_lock = threading.Lock()  # v165.42: 스캔 전체 동시 실행 방지 (재시작 catchup+정규 스캔 중복 문제)
 _surge_velocity_lock = threading.Lock()   # v165.43: 경량 급등 감지 스캔 중복 실행 방지
@@ -40668,14 +40692,14 @@ if __name__ == "__main__":
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
     ))
-    schedule.every().day.at("14:35").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
-        lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="initial")
+    schedule.every().day.at("14:35").do(_threaded_leader_job(  # v169.7: lambda→named (fn_key 충돌 수정)
+        _job_preclose_krx_initial
     ))
-    schedule.every().day.at("15:08").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
-        lambda: None if is_holiday() else send_next_open_gap_alert(stage="krx", phase="final")
+    schedule.every().day.at("15:08").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_krx_final
     ))
-    schedule.every().day.at("19:10").do(_threaded_leader_job(  # v165.5: _leader_job→_threaded_leader_job (정시 실행)
-        lambda: None if is_holiday() else send_next_open_gap_alert(stage="nxt", phase="final")
+    schedule.every().day.at("19:10").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_nxt_final
     ))
     # v164.0: 장중 모멘텀 스냅샷 스케줄러 — KRX 5회 / NXT 7회
     # KRX 관망 구간(09:00~14:35) 균등 분포
