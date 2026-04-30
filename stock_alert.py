@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.4
+버전: v169.6
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.6 (2026-04-30): no_ask_liquidity A급 고점수 SURGE 예외 — 급등 중 포착 누락 수정
+  이유: _should_soft_allow_no_ask_liquidity_general()에서 ask_qty > 0이면 이후 조건 전체 미체크
+       → KBI메탈+22% / 해성옵틱스+18.7% / 제룡산업+15% 등 A급 고점수 종목 37회 차단
+       급등 중 호가창은 완전 0이 아닌 경우가 많아 change_rate≥15% 등 예외 조건이 작동 안 됨
+  개선: ask_qty > 0이어도 A급(grade=A) + 85점↑ + 10%↑ 조건 충족 시 차단하지 않고
+        이후 change_rate≥15% / score≥72 / 체결속도 등 기존 soft allow 조건으로 계속 판단
+  주의점: A급+85점+10% 미충족 종목은 기존대로 차단 유지 (오판 방지)
+
+- v169.5 (2026-04-30): 대표갱신 시 entry_hit 승계 + 진입가 동일+entry_hit 재알람 방지
+  [#1] _prepare_entry_watch_registration_context: prior_entry_hit/prior_entry_hit_time 수집
+  [#2] _build_entry_watch_active_record: entry_hit/entry_hit_time 승계 필드 추가
+  [#3] 진입가 동일+prior_entry_hit=True → 대표갱신 스킵(ctx=None 반환)
+       이유: 시선AI처럼 현재가=진입가=3,510원에서 1차 알람 발송 → 대표갱신 시
+             entry_hit 소실 → 현재가 이미 돌파 상태에서 재알람 (10:33 2차 알람 발생)
+       개선: 진입가 변동 없고 기존 entry_hit=True이면 갱신 자체를 스킵
+       주의점: 진입가가 달라지는 경우(눌림 후 진입가 조정)는 기존 경로 유지
+
 - v169.4 (2026-04-30): KIS 순위 API 다중소스 유니버스 편입 + HHDFC55010000 비활성화
   [#1] refresh_dynamic_candidates: KIS 순위 API 5개 소스 메인 유니버스 직접 편입
        이유: 거래량(vol_stocks) 1개 소스만으로 운영 → KRX API 0건 시 포착 전면 불가
@@ -24730,6 +24747,9 @@ def _prepare_entry_watch_registration_context(s: dict, code: str, stock_name: st
     # v161.31: 대표갱신 시 notify 이력 승계용 — 중복 도달 알람 방지
     prior_last_notified_ts = max((safe_int((w or {}).get("last_notified_ts", 0), 0) for _, w in old_items), default=0)
     prior_notify_count = max((safe_int((w or {}).get("notify_count", 0), 0) for _, w in old_items), default=0)
+    # v169.5: entry_hit 승계 — 대표갱신 시 기존 entry_hit=True가 소실되어 재알람 발생하는 버그 수정
+    prior_entry_hit = any((w or {}).get("entry_hit") for _, w in old_items)
+    prior_entry_hit_time = next((str((w or {}).get("entry_hit_time", "") or "") for _, w in old_items if (w or {}).get("entry_hit")), "")
     entry, entry_guard_mode = _apply_entry_price_guard(
         s,
         previous_entry,
@@ -24737,6 +24757,15 @@ def _prepare_entry_watch_registration_context(s: dict, code: str, stock_name: st
         miss_count=previous_miss_count,
     )
     s["entry_price"] = int(entry or 0)
+    # v169.5: 진입가 동일 + 기존 entry_hit=True → 대표갱신 스킵 (재알람 방지)
+    # 이유: 진입가 3,510→3,510 동일 갱신 시에도 새 watch가 등록되어 entry_hit 소실
+    #       entry_hit=False 상태로 재감시 → 현재가 이미 진입가 돌파 시 즉시 재알람
+    if prior_entry_hit and old_items and entry == previous_entry:
+        _log_info_msg(
+            f"  ⏭ 대표갱신 스킵: {s.get('name','')}"
+            f" 진입가={entry:,}원 동일 + entry_hit 유지 — 재알람 방지"
+        )
+        return None  # 호출부에서 None 체크 필요
     expire_days, escape_pct = _get_expire_days_by_regime(s.get("signal_type", ""))
     current_price = safe_int(s.get("price", 0), 0)
     return {
@@ -24758,6 +24787,8 @@ def _prepare_entry_watch_registration_context(s: dict, code: str, stock_name: st
         "code": code,
         "prior_last_notified_ts": prior_last_notified_ts,  # v161.31
         "prior_notify_count": prior_notify_count,          # v161.31
+        "prior_entry_hit": prior_entry_hit,                # v169.5: entry_hit 승계
+        "prior_entry_hit_time": prior_entry_hit_time,      # v169.5
     }
 def _should_skip_entry_watch_registration(ctx: dict, regime_mode: str) -> bool:
     current_price = ctx["current_price"]
@@ -24846,6 +24877,9 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
     # v161.31: 대표갱신 재등록 시 기존 notify 이력 승계 — last_notified_ts=0 초기화로 중복 도달 알람 방지
     _prior_last_notified_ts = ctx.get("prior_last_notified_ts", 0)
     _prior_notify_count = ctx.get("prior_notify_count", 0)
+    # v169.5: 대표갱신 시 entry_hit 승계 — 기존 entry_hit=True 소실 → 재알람 방지
+    _prior_entry_hit = bool(ctx.get("prior_entry_hit", False))
+    _prior_entry_hit_time = str(ctx.get("prior_entry_hit_time", "") or "")
     return {
         "code": ctx["code"],
         "name": ctx["stock_name"],
@@ -24859,6 +24893,8 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
         "first_detect_date": ctx["previous_first_detect_date"] or ctx["detect_date"],
         "last_notified_ts": _prior_last_notified_ts,  # v161.31: 기존 notify 시각 승계
         "notify_count": _prior_notify_count,           # v161.31: 기존 notify 횟수 승계
+        "entry_hit": _prior_entry_hit,                 # v169.5: entry_hit 승계 (True이면 재알람 방지)
+        "entry_hit_time": _prior_entry_hit_time,       # v169.5
         "miss_count": ctx["previous_miss_count"] + len(ctx["old_items"]),
         "registered_ts": time.time(),
         "expire_ts": s.get("expire_ts") or (time.time() + 86400 * ctx["expire_days"]) if ctx["expire_days"] > 0 else (s.get("expire_ts") or time.time() + 3600),
@@ -25062,6 +25098,8 @@ def register_entry_watch(s: dict):
         _log_info_msg(f"  🔒 재포착 진입가 갱신 생략: {stock_name} (이미 대표 진입 확정)")
         return
     ctx = _prepare_entry_watch_registration_context(s, code, stock_name)
+    if ctx is None:  # v169.5: 진입가 동일+entry_hit 상태 → 대표갱신 스킵
+        return None
     if _should_skip_entry_watch_registration(ctx, _dynamic.get("regime_mode", "normal")):
         return None
     _sync_entry_watch_representative_log(s, ctx)
@@ -30207,8 +30245,15 @@ def _should_soft_allow_no_ask_liquidity_general(cur: dict, signal: dict | None =
         return False
     ask_qty = safe_int(cur.get("ask_qty", 0), 0)
     bid_qty = safe_int(cur.get("bid_qty", 0), 0)
+    # v169.6: ask_qty > 0이어도 A급 85점↑ +10%↑ SURGE는 통과
+    # 이유: 급등 중 호가 얇지만 완전 0이 아닌 경우 이후 조건 전체 차단됨
+    #       KBI메탈+22%/해성옵틱스+18.7%/제룡산업+15% 등 A급 고점수 종목 전부 차단 발생
     if ask_qty > 0:
-        return False
+        _grade_q = str(signal.get("execution_grade") or signal.get("grade") or "").upper()
+        _cr_q = max(float(cur.get("change_rate", 0) or 0), float(signal.get("change_rate", 0) or 0))
+        _sc_q = int(signal.get("score", 0) or 0)
+        if not (_grade_q == "A" and _sc_q >= 85 and _cr_q >= 10.0):
+            return False  # 조건 미충족 시만 차단, 충족 시 아래로 계속
     # v165.32 [#1]: KRX 개장 직후 10분(09:00~09:10) A급 자동 soft allow
     # 이유: 동시호가 처리 완료 전 ask_qty=0 false positive 집단 발생
     # 2026-04-27 로그: 09:07에 동국제강/서울반도체/플루토스 등 전종목 집단 차단 → 진입 기회 전손
