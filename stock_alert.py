@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.3
+버전: v169.4
 날짜: 2026-04-30
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.4 (2026-04-30): KIS 순위 API 다중소스 유니버스 편입 + HHDFC55010000 비활성화
+  [#1] refresh_dynamic_candidates: KIS 순위 API 5개 소스 메인 유니버스 직접 편입
+       이유: 거래량(vol_stocks) 1개 소스만으로 운영 → KRX API 0건 시 포착 전면 불가
+             get_fluctuation_rank·get_volume_power_rank·get_near_new_highlow_rank 등은
+             기존에 fallback/NXT전용/개별분석에만 연결, KRX 메인 스캔과 단절됨
+       개선: 5개 소스(①KIS등락률순위 ②체결강도 ③신고가근접 ④상한가근접 ⑤외국계순매수)
+             병렬 수집 → 합집합 → _put_candidate 편입 → KRX 0건이어도 독립 동작
+       주의점: 각 소스 try/except 독립 처리, 1개 실패해도 나머지 동작
+               조건: 등락률≥2%, 신고가변화율≥1%, 외국계 net_buy_qty>0 필터 적용
+  [#2] _fetch_kis_futures_price(HHDFC55010000): 비활성화
+       이유: CME SUB거래소 미신청(EGW00550) → 500 오류 반복 (로그 확인)
+             CME는 유료($228/월), Yahoo/Stooq로 NQ/ES 이미 수집 중
+       개선: return None 즉시 반환, 코드 주석 보존 (CME 신청 시 즉시 복구 가능)
+       주의점: get_us_market_signals()의 Yahoo→Stooq fallback 경로 유지
+
 - v169.3 (2026-04-30): _nxt_sector_seed_registered_date 전역 선언 누락 수정
   이유: v169.0에서 _register_sector_seed_from_yesterday_once() 추가 시
        함수 내 global 참조는 있으나 파일 전역 선언이 없어 07:28 스케줄 실행 시
@@ -14455,6 +14470,44 @@ def refresh_dynamic_candidates(force_rank: bool = False):
         nxt_stocks = get_nxt_surge_stocks() if nxt_open else []
         krx_rank_stocks = _collect_market_rank_candidates("KRX", scan_limit=None, force=force_rank) if krx_open else []
         nxt_rank_stocks = _collect_market_rank_candidates("NXT", scan_limit=None, force=force_rank) if nxt_open else []
+
+        # v169.4: KIS 순위 API 6개 소스 직접 유니버스 편입
+        # 이유: 거래량(vol_stocks) 1개 소스만으로는 KRX API 0건 시 전면 포착 불가
+        #       get_fluctuation_rank/get_volume_power_rank/get_near_new_highlow_rank 등은
+        #       기존엔 fallback·NXT전용·개별분석에만 쓰여 KRX 메인 스캔과 단절됨
+        # 개선: 6개 소스 병렬 수집 → 합집합 → KRX 0건이어도 독립 동작
+        _extra_krx: list = []
+        if is_any_market_open():
+            try:
+                # ① KIS 등락률 순위 (FHPST01700000) — 2%↑만
+                for _r in get_fluctuation_rank(market="J", sort="0"):
+                    if float(_r.get("change_rate", 0) or 0) >= 2.0:
+                        _extra_krx.append({**_r, "desc": "KIS등락률상위"})
+            except Exception as _e: _swallow_exception(_e)
+            try:
+                # ② KIS 체결강도 상위 (FHPST01680000)
+                for _r in get_volume_power_rank(market="J"):
+                    _extra_krx.append({**_r, "desc": "KIS체결강도상위"})
+            except Exception as _e: _swallow_exception(_e)
+            try:
+                # ③ KIS 신고가 근접 (FHPST01870000)
+                for _r in get_near_new_highlow_rank(high=True):
+                    if float(_r.get("change_rate", 0) or 0) >= 1.0:
+                        _extra_krx.append({**_r, "desc": "KIS신고가근접"})
+            except Exception as _e: _swallow_exception(_e)
+            try:
+                # ④ KIS 상하한가 포착 (FHKST130000C0) — 상한가 근접
+                for _r in get_capture_uplowprice(prc_cls="0"):
+                    _extra_krx.append({**_r, "desc": "KIS상한가근접"})
+            except Exception as _e: _swallow_exception(_e)
+            try:
+                # ⑤ KIS 외국계 매매 상위 (FHKST644100C0) — 외국계 순매수
+                for _r in get_frgnmem_trade_estimate(sort="0"):
+                    if int(_r.get("net_buy_qty", 0) or 0) > 0:
+                        _extra_krx.append({**_r, "desc": "KIS외국계순매수"})
+            except Exception as _e: _swallow_exception(_e)
+        if _extra_krx:
+            _log_info_msg(f"  📡 [KIS 다중소스] {len(_extra_krx)}건 수집 (등락률/체결강도/신고가/상한가/외국계)")
         candidates = {}
         excluded_cnt = 0
         early_rank_cnt = 0
@@ -14488,6 +14541,8 @@ def refresh_dynamic_candidates(force_rank: bool = False):
         for item in vol_stocks + upper_stocks + nxt_stocks:
             desc = "NXT자동편입" if str(item.get("market", "")) == "NXT" else "자동편입"
             _put_candidate(item, desc)
+        for item in _extra_krx:  # v169.4: KIS 다중소스
+            _put_candidate(item, item.get("desc", "KIS다중소스"))
         for item in krx_rank_stocks:
             _put_candidate(item, item.get("desc", f"KRX랭킹후보[{rank_mode}]"))
         for item in nxt_rank_stocks:
@@ -14553,6 +14608,7 @@ def refresh_dynamic_candidates(force_rank: bool = False):
         _log_info_msg(
             f"  🔄 동적 후보군: {len(_dynamic_candidates)}개 종목 "
             f"(제외 {excluded_cnt}개, KRX_seed={len(vol_stocks)+len(upper_stocks)} [{krx_rank_source}], "
+            f"KIS다중소스={len(_extra_krx)}, "
             f"KRX_rank={len(krx_rank_stocks)} [{rank_mode}], NXT_seed={len(nxt_stocks)}, NXT_rank={len(nxt_rank_stocks)}, "
             f"랭킹후보={early_rank_cnt}, material_prewatch={material_prewatch_cnt}, 피드백={adaptive_cnt}, 테마피드백={theme_feedback_cnt}, 장후NXT={nxt_post_cnt}, force_rank={int(bool(force_rank))})"
         )
@@ -16711,25 +16767,24 @@ def get_frgnmem_trade_estimate(sort: str = "0") -> list:
 
 
 def _fetch_kis_futures_price(symbol: str, excd: str) -> float | None:
-    """v167.0: KIS 해외선물 현재가 조회 (HHDFC55010000).
-    규격서: v1_해외선물-009
-    symbol 예: NQ (나스닥선물), ES (S&P), GC (금), CL (WTI)
-    excd 예: CME, NYMEX, COMEX
-    반환: 현재가(float) 또는 None
+    """v169.4: HHDFC55010000 비활성화.
+    이유: CME SUB거래소 미신청(EGW00550) → 500 오류 반복. CME는 유료($228/월).
+    대체: Yahoo Finance(1차) → Stooq(2차) fallback으로 NQ/ES/GC/CL 수집 중.
+    CME 신청 완료 시 아래 주석 해제.
     """
-    try:
-        data = _safe_get(
-            f"{KIS_BASE_URL}/uapi/overseas-futureoption/v1/quotations/inquire-price",
-            "HHDFC55010000",
-            {"SRS_CD": symbol, "EXCD": excd},
-        )
-        output = data.get("output") or {}
-        price_str = output.get("LAST") or output.get("last") or ""
-        val = float(price_str) if price_str else None
-        return val if val and val > 0 else None
-    except Exception as e:
-        _swallow_exception(e)
-        return None
+    # try:
+    #     data = _safe_get(
+    #         f"{KIS_BASE_URL}/uapi/overseas-futureoption/v1/quotations/inquire-price",
+    #         "HHDFC55010000",
+    #         {"SRS_CD": symbol, "EXCD": excd},
+    #     )
+    #     output = data.get("output") or {}
+    #     price_str = output.get("LAST") or output.get("last") or ""
+    #     val = float(price_str) if price_str else None
+    #     return val if val and val > 0 else None
+    # except Exception as e:
+    #     _swallow_exception(e)
+    return None  # Yahoo/Stooq fallback 사용
 
 
 def _update_market_investor_score_adj() -> int:
