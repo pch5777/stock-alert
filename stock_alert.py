@@ -10505,6 +10505,12 @@ def _ws_on_message(data: str) -> None:
                 _ws_stats["recv_count"] += 1
             except Exception as e:
                 _swallow_exception(e)
+        # v169.9: 틱 수신 즉시 대시보드 갱신 (3초 쓰로틀)
+        try:
+            if time.time() - _WEB_DASHBOARD_LAST_PUSH >= _WEB_DASHBOARD_THROTTLE_SEC:
+                threading.Thread(target=_push_dashboard_json, daemon=True).start()
+        except Exception:
+            pass
         return
 
     # JSON 응답 (구독 확인, 에러, PINGPONG)
@@ -27445,15 +27451,141 @@ def update_dashboard(force: bool = False) -> None:
         if mid2:
             state["message_id"] = mid2
             _save_dashboard_state(state)
-
+    # v169.9: 웹 대시보드 섹터/랭킹/포착 데이터 갱신 (10분마다)
+    threading.Thread(target=_push_dashboard_json, daemon=True).start()
 # ══════════════════════════════════════════════════════════════
 # v169.9: 실시간 웹 대시보드
 # ══════════════════════════════════════════════════════════════
-_WEB_DASHBOARD_JSON   = _state_path("web_dashboard.json")
-_WEB_DASHBOARD_ALERTS: list = []          # 최근 50건 FIFO
-_WEB_DASHBOARD_LOCK   = threading.Lock()
+_WEB_DASHBOARD_JSON          = _state_path("web_dashboard.json")
+_WEB_DASHBOARD_ALERTS: list  = []        # 최근 50건 FIFO
+_WEB_DASHBOARD_LOCK          = threading.Lock()
+_WEB_DASHBOARD_LAST_PUSH: float = 0.0   # 쓰로틀용
+_WEB_DASHBOARD_THROTTLE_SEC  = 3.0      # 최소 push 간격
 
 def _next_biz_day_str() -> str:
+    DAYS = ["일","월","화","수","목","금","토"]
+    KR_HOL = {
+        "2026-01-01","2026-01-28","2026-01-29","2026-01-30",
+        "2026-03-01","2026-05-01","2026-05-05","2026-05-25",
+        "2026-06-06","2026-08-15",
+        "2026-09-24","2026-09-25","2026-09-26",
+        "2026-10-03","2026-10-09","2026-12-25",
+    }
+    from datetime import timedelta as _td
+    d = datetime.now().replace(hour=0,minute=0,second=0,microsecond=0) + _td(days=1)
+    for _ in range(14):
+        ymd = d.strftime("%Y-%m-%d")
+        dow = d.weekday()
+        if dow < 5 and ymd not in KR_HOL:
+            kr = (dow+1)%7
+            return f"{d.month}월 {d.day}일 ({DAYS[kr]})"
+        d += _td(days=1)
+    return "--"
+
+def _fmt_vol(v: int) -> str:
+    if v >= 100_000_000: return f"{v/100_000_000:.1f}억주"
+    if v >= 10_000:      return f"{v//10_000}만주"
+    return f"{v:,}주"
+
+def _fmt_amt(v: int) -> str:
+    if v >= 1_000_000_000_000: return f"{v/1_000_000_000_000:.1f}조"
+    if v >= 100_000_000:       return f"{v//100_000_000}억"
+    if v >= 10_000:            return f"{v//10_000}만"
+    return f"{v:,}"
+
+def _get_snap(code: str) -> dict:
+    """웹소켓 _execution_snapshots 에서 최신 틱 반환 — KIS API 추가호출 없음"""
+    buf = _execution_snapshots.get(code)
+    return buf[-1] if buf else {}
+
+def _push_dashboard_json() -> None:
+    """웹 대시보드 JSON 원자적 갱신 — 웹소켓 스냅샷 직접 사용"""
+    global _WEB_DASHBOARD_LAST_PUSH
+    now_ts = time.time()
+    if now_ts - _WEB_DASHBOARD_LAST_PUSH < _WEB_DASHBOARD_THROTTLE_SEC:
+        return
+    _WEB_DASHBOARD_LAST_PUSH = now_ts
+    try:
+        # ── 섹터 (기존 섹터 캐시 + 웹소켓 가격) ──────────
+        sectors_raw = []
+        try:
+            scache = _sector_cache.get("data") if hasattr(_sector_cache,"get") else []
+            for sec in (scache or [])[:12]:
+                stocks_raw = []
+                for st in (sec.get("stocks") or [])[:8]:
+                    code = normalize_stock_code(st.get("code",""))
+                    snap = _get_snap(code)
+                    stocks_raw.append({
+                        "name": st.get("name",""),
+                        "code": code,
+                        "chg":  float(snap.get("change_rate") or st.get("chg") or 0),
+                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or st.get("vol_raw") or 0)),
+                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or st.get("amt_raw") or 0)),
+                    })
+                stocks_raw.sort(key=lambda x: -x["chg"])
+                sectors_raw.append({"name":sec.get("name",""),"chg":float(sec.get("chg") or 0),"stocks":stocks_raw})
+            sectors_raw.sort(key=lambda x: -x["chg"])
+        except Exception:
+            pass
+
+        # ── 포착 목록 (signal_log + 웹소켓 가격) ─────────
+        captured_raw = []
+        try:
+            for key, rec in list((_load_signal_log_data() or {}).items())[:20]:
+                if not isinstance(rec, dict): continue
+                code = normalize_stock_code(rec.get("code",""))
+                snap = _get_snap(code)
+                captured_raw.append({
+                    "name":   rec.get("name",""),
+                    "code":   code,
+                    "price":  safe_int(snap.get("price") or rec.get("price") or 0),
+                    "entry":  safe_int(rec.get("entry_price") or 0),
+                    "target": safe_int(rec.get("target_price") or 0),
+                    "stop":   safe_int(rec.get("stop_loss") or 0),
+                    "hit":    bool(rec.get("entry_hit")),
+                    "chg":    float(snap.get("change_rate") or rec.get("change_rate") or 0),
+                })
+            captured_raw.sort(key=lambda x: -x["chg"])
+        except Exception:
+            pass
+
+        # ── 랭킹 (웹소켓 구독 종목 전체 기반) ────────────
+        rank_base = []
+        try:
+            for code, buf in list(_execution_snapshots.items()):
+                if not buf: continue
+                snap = buf[-1]
+                if time.time() - float(snap.get("ts",0)) > 300: continue
+                rank_base.append({
+                    "name":    _resolve_stock_name(code,""),
+                    "code":    code,
+                    "chg":     float(snap.get("change_rate") or 0),
+                    "vol_raw": safe_int(snap.get("today_vol") or 0),
+                    "amt_raw": safe_int(snap.get("acml_tr_pbmn") or 0),
+                    "vol":     _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                    "amt":     _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                })
+        except Exception:
+            pass
+
+        payload = {
+            "updated_at":   datetime.now().strftime("%H:%M:%S"),
+            "next_biz_day": _next_biz_day_str(),
+            "sectors":      sectors_raw,
+            "captured":     captured_raw,
+            "alerts":       list(_WEB_DASHBOARD_ALERTS),
+            "rank_chg":     sorted(rank_base, key=lambda x:-x["chg"])[:12],
+            "rank_vol":     sorted(rank_base, key=lambda x:-x["vol_raw"])[:12],
+            "rank_view":    sorted(rank_base, key=lambda x:-x["amt_raw"])[:12],
+        }
+        tmp = _WEB_DASHBOARD_JSON + ".tmp"
+        with open(tmp,"w",encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, _WEB_DASHBOARD_JSON)
+    except Exception as e:
+        _swallow_exception(e)
+
+
     """다음 영업일 문자열 반환 (예: '5월 2일 (금)')"""
     DAYS = ["일","월","화","수","목","금","토"]
     try:
@@ -27476,126 +27608,6 @@ def _next_biz_day_str() -> str:
         d += _td2(days=1)
     return "--"
 
-def _push_dashboard_json() -> None:
-    """알람·섹터·포착 데이터를 web_dashboard.json 에 원자적으로 기록"""
-    try:
-        # ── 섹터 데이터 ──
-        sectors_raw = []
-        try:
-            sector_data = get_all_sector_index() or []
-            for sec in sector_data[:12]:
-                name  = sec.get("hts_kor_isnm") or sec.get("idx_name") or ""
-                chg   = float(sec.get("bstp_nmix_prdy_ctrt") or 0)
-                stocks_raw = []
-                try:
-                    theme_stocks = get_theme_sector_stocks(name)[2] if name else []
-                    for ts in (theme_stocks or [])[:6]:
-                        code = normalize_stock_code(ts.get("code",""))
-                        if not code:
-                            continue
-                        p = get_stock_price(code) or {}
-                        stocks_raw.append({
-                            "name": ts.get("name",""),
-                            "code": code,
-                            "chg":  float(p.get("change_rate") or ts.get("chg") or 0),
-                            "vol":  _fmt_vol(safe_int(p.get("acml_vol") or 0)),
-                            "amt":  _fmt_amt(safe_int(p.get("acml_tr_pbmn") or 0)),
-                        })
-                except Exception:
-                    pass
-                sectors_raw.append({"name": name, "chg": chg, "stocks": stocks_raw})
-        except Exception:
-            pass
-
-        # ── 포착 목록 ──
-        captured_raw = []
-        try:
-            sig_data = _load_signal_log_data() or {}
-            for key, rec in list(sig_data.items())[:20]:
-                if not isinstance(rec, dict):
-                    continue
-                code  = normalize_stock_code(rec.get("code",""))
-                price = safe_int(get_stock_price(code).get("stck_prpr") or rec.get("price") or 0) if code else 0
-                entry = safe_int(rec.get("entry_price") or 0)
-                captured_raw.append({
-                    "name":   rec.get("name",""),
-                    "code":   code,
-                    "price":  price,
-                    "entry":  entry,
-                    "target": safe_int(rec.get("target_price") or 0),
-                    "stop":   safe_int(rec.get("stop_loss") or 0),
-                    "hit":    bool(rec.get("entry_hit")),
-                    "chg":    float(rec.get("change_rate") or 0),
-                })
-        except Exception:
-            pass
-
-        # ── 랭킹 ──
-        rank_chg, rank_vol, rank_view = [], [], []
-        try:
-            for item in (get_fluctuation_rank() or [])[:12]:
-                code = normalize_stock_code(item.get("stck_shrn_iscd",""))
-                rank_chg.append({
-                    "name": item.get("hts_kor_isnm",""), "code": code,
-                    "chg":  float(item.get("prdy_ctrt") or 0),
-                    "vol":  _fmt_vol(safe_int(item.get("acml_vol") or 0)),
-                    "amt":  _fmt_amt(safe_int(item.get("acml_tr_pbmn") or 0)),
-                })
-        except Exception:
-            pass
-        try:
-            for item in (get_volume_surge_stocks() or [])[:12]:
-                code = normalize_stock_code(item.get("mksc_shrn_iscd","") or item.get("code",""))
-                rank_vol.append({
-                    "name": item.get("hts_kor_isnm","") or item.get("name",""), "code": code,
-                    "chg":  float(item.get("prdy_ctrt") or item.get("chg") or 0),
-                    "vol":  _fmt_vol(safe_int(item.get("acml_vol") or 0)),
-                    "amt":  _fmt_amt(safe_int(item.get("acml_tr_pbmn") or 0)),
-                })
-        except Exception:
-            pass
-        try:
-            for item in (get_hts_top_stocks() or [])[:12]:
-                code = normalize_stock_code(item.get("mksc_shrn_iscd","") or item.get("code",""))
-                p = get_stock_price(code) or {} if code else {}
-                rank_view.append({
-                    "name": _resolve_stock_name(code, item.get("name","")), "code": code,
-                    "chg":  float(p.get("change_rate") or 0),
-                    "vol":  _fmt_vol(safe_int(p.get("acml_vol") or 0)),
-                    "amt":  _fmt_amt(safe_int(p.get("acml_tr_pbmn") or 0)),
-                })
-        except Exception:
-            pass
-
-        payload = {
-            "updated_at":   datetime.now().strftime("%H:%M:%S"),
-            "next_biz_day": _next_biz_day_str(),
-            "sectors":      sorted(sectors_raw, key=lambda x: -x["chg"]),
-            "captured":     sorted(captured_raw, key=lambda x: -x["chg"]),
-            "alerts":       list(_WEB_DASHBOARD_ALERTS),
-            "rank_chg":     sorted(rank_chg,  key=lambda x: -x["chg"]),
-            "rank_vol":     sorted(rank_vol,  key=lambda x: -float(x["vol"].replace(",","").replace("만","").replace("억","") or 0)),
-            "rank_view":    rank_view,
-        }
-
-        # 원자적 쓰기
-        tmp = _WEB_DASHBOARD_JSON + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, _WEB_DASHBOARD_JSON)
-    except Exception as e:
-        _swallow_exception(e)
-
-def _fmt_vol(v: int) -> str:
-    if v >= 100_000_000: return f"{v/100_000_000:.1f}억주"
-    if v >= 10_000:      return f"{v//10_000}만주"
-    return f"{v:,}주"
-
-def _fmt_amt(v: int) -> str:
-    if v >= 1_000_000_000_000: return f"{v/1_000_000_000_000:.1f}조"
-    if v >= 100_000_000:       return f"{v//100_000_000}억"
-    if v >= 10_000:            return f"{v//10_000}만"
-    return f"{v:,}"
 
 # ── Flask 앱 ──────────────────────────────────────────────────
 _flask_app = _Flask(__name__)
@@ -27652,6 +27664,26 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
         send_with_chart_buttons(text, code, name)
     else:
         send(text)
+    # v169.9: 웹 대시보드 알람 피드 갱신 (모든 알람 경로 커버)
+    try:
+        lvl_map = {"CRITICAL": "red", "NORMAL": "yellow", "INFO": "blue"}
+        # 메시지에서 첫줄을 제목으로, 나머지를 본문으로
+        lines   = text.replace("<b>","").replace("</b>","").split("\n")
+        title   = next((l.strip() for l in lines if l.strip() and not l.strip().startswith("━")), name or "알람")
+        body    = "\n".join(l.strip() for l in lines[1:] if l.strip() and not l.strip().startswith("━"))[:200]
+        alert_entry = {
+            "lvl":   lvl_map.get(level, "yellow"),
+            "time":  datetime.now().strftime("%H:%M"),
+            "title": title[:50],
+            "body":  body,
+        }
+        with _WEB_DASHBOARD_LOCK:
+            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
+            if len(_WEB_DASHBOARD_ALERTS) > 50:
+                _WEB_DASHBOARD_ALERTS.pop()
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    except Exception as _de:
+        _swallow_exception(_de)
 def flush_info_alerts():
     """INFO 알림은 사용자 발송 없이 큐만 정리"""
     try:
@@ -28149,22 +28181,6 @@ def _send_alert_detail(s, emoji, title, nxt_badge, name_dot, stars, now_str,
     header_line = header_override if header_override else f"{emoji} <b>[{title}]</b>"
     msg = _build_capture_focus_message(s, header_line, now_str, name_dot=name_dot)
     send_by_level(msg.rstrip(), level, s["code"], s["name"])
-    # v169.9: 웹 대시보드 알람 피드 갱신
-    try:
-        lvl_map = {"CRITICAL": "red", "NORMAL": "yellow", "INFO": "blue"}
-        alert_entry = {
-            "lvl":   lvl_map.get(level, "yellow"),
-            "time":  datetime.now().strftime("%H:%M"),
-            "title": f"{s.get('name','')} {title}",
-            "body":  f"등락률 {float(s.get('change_rate',0)):+.1f}%  진입 {safe_int(s.get('entry_price',0),0):,}  목표 {safe_int(s.get('target_price',0),0):,}  손절 {safe_int(s.get('stop_loss',0),0):,}",
-        }
-        with _WEB_DASHBOARD_LOCK:
-            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
-            if len(_WEB_DASHBOARD_ALERTS) > 50:
-                _WEB_DASHBOARD_ALERTS.pop()
-        threading.Thread(target=_push_dashboard_json, daemon=True).start()
-    except Exception as _de:
-        _swallow_exception(_de)
 # ============================================================
 # 🔍 D: 실패 패턴 필터 (v38.6)
 # ============================================================

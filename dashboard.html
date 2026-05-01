@@ -33,7 +33,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 }
 
 /* ══ 공통 컬럼 스타일 ══ */
-.col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
+.col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden;min-height:0}
 .col:last-child{border-right:none}
 
 /* 컬럼 최상단 타이틀바 */
@@ -53,7 +53,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .tbl-head span:not(:first-child){text-align:right}
 
 /* 스크롤 바디 */
-.col-body{overflow-y:auto;flex:1}
+.col-body{overflow-y:auto;flex:1;min-height:0}
 
 /* ══ 섹터 목록 (A/B 두 컬럼) ══ */
 .col.sec{border-right:1px solid #1a2d45;background:#060c1a}
