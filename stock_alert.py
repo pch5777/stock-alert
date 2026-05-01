@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.9
+버전: v169.10
 날짜: 2026-05-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.10 (2026-05-01): 대시보드 알람 누락 수정 + 실시간 반영 개선
+  [#1] 알람 훅을 send_by_level → send() 로 이동 (모든 알람 경로 커버)
+       배포알람·크래시·브리핑 등 send() 직접 호출 케이스도 대시보드 반영
+  [#2] _push_dashboard_json: KIS API 재호출 제거 → _execution_snapshots 직접 사용
+       웹소켓 틱 수신마다 즉시 갱신 (3초 쓰로틀), 텔레그램과 동일한 실시간성
+  [#3] _ws_on_message: 틱 수신 시 대시보드 push 훅 추가
+  이유: 배포알람이 텔레그램엔 오는데 대시보드엔 안 오던 문제 수정
+  개선점: send() 공통 경로에 훅 → 향후 어떤 알람도 누락 없음
+  주의점: send()의 대시보드 훅은 예외를 삼켜서 기존 텔레그램 발송에 영향 없음
 - v169.9 (2026-05-01): 실시간 웹 대시보드 추가 (Flask)
   [#1] Flask 웹서버 daemon 스레드 추가 (/board, /api/data)
   [#2] _push_dashboard_json(): 알람·섹터·포착 데이터 → JSON 원자적 쓰기
@@ -27286,12 +27295,34 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
     if reply_markup:
         payload["reply_markup"] = reply_markup
     res = _tg_request("sendMessage", payload)
+    msg_id = None
     try:
         if res and res.get("ok") and "result" in res:
-            return res["result"].get("message_id")
+            msg_id = res["result"].get("message_id")
     except Exception as e:
         _swallow_exception(e)
-    return None
+    # v169.9: 모든 send() 호출을 대시보드 알람 피드에 반영
+    try:
+        clean = decorated_text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
+        lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith("━")]
+        title = lines[0][:60] if lines else "알람"
+        body  = "\n".join(lines[1:4])  # 최대 3줄
+        lvl   = "red" if any(k in clean for k in ["급등","SURGE","포착","돌파","상한"]) else \
+                "blue" if any(k in clean for k in ["시작","배포","완료","연결","✅","📌"]) else "yellow"
+        alert_entry = {
+            "lvl":   lvl,
+            "time":  datetime.now().strftime("%H:%M"),
+            "title": title,
+            "body":  body,
+        }
+        with _WEB_DASHBOARD_LOCK:
+            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
+            if len(_WEB_DASHBOARD_ALERTS) > 50:
+                _WEB_DASHBOARD_ALERTS.pop()
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    except Exception as _de:
+        _swallow_exception(_de)
+    return msg_id
 # =======================================================
 # Crash guard (Step 1): unhandled exception hook
 # =======================================================
@@ -27664,26 +27695,6 @@ def send_by_level(text: str, level: str = ALERT_LEVEL_NORMAL,
         send_with_chart_buttons(text, code, name)
     else:
         send(text)
-    # v169.9: 웹 대시보드 알람 피드 갱신 (모든 알람 경로 커버)
-    try:
-        lvl_map = {"CRITICAL": "red", "NORMAL": "yellow", "INFO": "blue"}
-        # 메시지에서 첫줄을 제목으로, 나머지를 본문으로
-        lines   = text.replace("<b>","").replace("</b>","").split("\n")
-        title   = next((l.strip() for l in lines if l.strip() and not l.strip().startswith("━")), name or "알람")
-        body    = "\n".join(l.strip() for l in lines[1:] if l.strip() and not l.strip().startswith("━"))[:200]
-        alert_entry = {
-            "lvl":   lvl_map.get(level, "yellow"),
-            "time":  datetime.now().strftime("%H:%M"),
-            "title": title[:50],
-            "body":  body,
-        }
-        with _WEB_DASHBOARD_LOCK:
-            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
-            if len(_WEB_DASHBOARD_ALERTS) > 50:
-                _WEB_DASHBOARD_ALERTS.pop()
-        threading.Thread(target=_push_dashboard_json, daemon=True).start()
-    except Exception as _de:
-        _swallow_exception(_de)
 def flush_info_alerts():
     """INFO 알림은 사용자 발송 없이 큐만 정리"""
     try:
