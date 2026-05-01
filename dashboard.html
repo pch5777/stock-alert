@@ -148,7 +148,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 <div id="hdr">
   <span class="logo">📈 실시간 주식 보드</span>
   <span class="badge" id="mkt-badge">⏳ 확인중</span>
-  <span style="font-size:9px;color:#c8e4f8">목업 · 10초 자동갱신</span>
+  <span style="font-size:9px;color:#c8e4f8">실시간 · 3초 갱신</span>
   <span class="ts">
     다음 영업일: <b id="next-biz">--</b>
     &nbsp;|&nbsp;
@@ -477,7 +477,7 @@ function getNextBizDay(){
   return "--";
 }
 
-// ══ 실데이터 폴링 (/api/data 10초마다) ══════════════
+// ══ 실데이터 폴링 (/api/data 3초마다) ══════════════
 async function fetchAndRender(){
   try{
     const res = await fetch('/api/data');
@@ -506,7 +506,7 @@ function renderAll(){
 updateMarketBadge();
 document.getElementById("next-biz").textContent = getNextBizDay();
 fetchAndRender();
-setInterval(fetchAndRender, 10000);
+setInterval(fetchAndRender, 3000);
 setInterval(updateMarketBadge, 60000); // 1분마다 장 상태 갱신
 
 </script>

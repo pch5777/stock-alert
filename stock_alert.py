@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.11
+버전: v169.12
 날짜: 2026-05-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v169.11 (2026-05-01): 대시보드 알람 누락 수정 + 알람 영속 저장
+- v169.12 (2026-05-01): 대시보드 알람 미표시 근본 원인 수정
+  [#1] 시작 순서 수정: _load_dashboard_alerts() → update_dashboard() 순으로 변경
+       기존: update_dashboard() 먼저 → send() 훅 → 빈 _WEB_DASHBOARD_ALERTS로 JSON 씀
+            → 그 다음 _load_dashboard_alerts() → 이전 알람 로드되지만 JSON엔 반영 안 됨
+       수정: 이전 알람 먼저 로드 → update_dashboard() → JSON에 이전 알람 포함됨
+  [#2] 시작 직후 _push_dashboard_json() 한 번 더 실행 → 최신 상태 즉시 반영
+  이유: 배포 알람이 텔레그램엔 오는데 대시보드엔 빈 화면으로 나오는 문제
+  개선점: 재시작 후 이전 알람 50건 즉시 복원되어 표시
+  주의점: _load_dashboard_alerts는 반드시 update_dashboard 앞에 위치해야 함
   [#1] send() 공통 경로에 대시보드 훅 이동 — 배포알람 등 모든 경로 커버
   [#2] _load_dashboard_alerts() / _save_dashboard_alerts() 신설 — 재시작 후 알람 유지
   [#3] _push_dashboard_json 섹터 소스 수정 — _sector_cache.get("data") → get_all_sector_index()
@@ -40891,8 +40899,10 @@ if __name__ == "__main__":
     _log_info_msg(f"   업데이트: {BOT_DATE}")
     _log_info_msg("="*55)
     install_excepthook()
+    _load_dashboard_alerts()  # v169.12: 반드시 update_dashboard 전에 로드해야 JSON에 이전 알람 포함됨
     update_dashboard(force=True)
-    _load_dashboard_alerts()  # v169.10: 이전 알람 목록 복원
+    # update_dashboard → send() → 훅 실행 후 push 한 번 더 보장
+    threading.Thread(target=_push_dashboard_json, daemon=True).start()
     # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
     _migrate_legacy_files()
     _storage_diagnostics_once()
