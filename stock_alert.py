@@ -3,20 +3,36 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.10
+버전: v169.11
 날짜: 2026-05-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v169.10 (2026-05-01): 대시보드 알람 누락 수정 + 실시간 반영 개선
-  [#1] 알람 훅을 send_by_level → send() 로 이동 (모든 알람 경로 커버)
-       배포알람·크래시·브리핑 등 send() 직접 호출 케이스도 대시보드 반영
+- v169.11 (2026-05-01): 대시보드 알람 누락 수정 + 알람 영속 저장
+  [#1] send() 공통 경로에 대시보드 훅 이동 — 배포알람 등 모든 경로 커버
+  [#2] _load_dashboard_alerts() / _save_dashboard_alerts() 신설 — 재시작 후 알람 유지
+  [#3] _push_dashboard_json 섹터 소스 수정 — _sector_cache.get("data") → get_all_sector_index()
+  [#4] 잔재 고아 코드 블록 제거
+  이유: 배포 알람이 텔레그램엔 오는데 대시보드엔 안 오는 문제 / 재시작 시 알람 초기화 문제
+  개선점: send() 단일 경로 훅으로 향후 어떤 알람도 누락 없음 / 텔레그램처럼 알람 누적 유지
+  주의점: send() 훅은 예외를 삼켜서 기존 텔레그램 발송에 영향 없음
+
+- v169.10 (2026-05-01): 대시보드 알람 훅 위치 수정 + 웹소켓 실시간 반영
+  [#1] 알람 훅을 send_by_level → send() 로 이동
   [#2] _push_dashboard_json: KIS API 재호출 제거 → _execution_snapshots 직접 사용
-       웹소켓 틱 수신마다 즉시 갱신 (3초 쓰로틀), 텔레그램과 동일한 실시간성
-  [#3] _ws_on_message: 틱 수신 시 대시보드 push 훅 추가
-  이유: 배포알람이 텔레그램엔 오는데 대시보드엔 안 오던 문제 수정
-  개선점: send() 공통 경로에 훅 → 향후 어떤 알람도 누락 없음
-  주의점: send()의 대시보드 훅은 예외를 삼켜서 기존 텔레그램 발송에 영향 없음
+  [#3] _ws_on_message 틱 수신 시 대시보드 즉시 push (3초 쓰로틀)
+  이유: send_by_level 우회 경로 알람 누락 / KIS API 재호출로 인한 지연
+  개선점: 웹소켓 틱마다 실시간 갱신 — 텔레그램과 동일한 즉시성
+  주의점: _WEB_DASHBOARD_THROTTLE_SEC=3.0 으로 과부하 방지
+
 - v169.9 (2026-05-01): 실시간 웹 대시보드 추가 (Flask)
+  [#1] Flask 웹서버 daemon 스레드 추가 (/board, /api/data, /health)
+  [#2] _push_dashboard_json() 신설 — JSON 원자적 쓰기
+  [#3] dashboard.html (v16 확정본) 서빙
+  이유: 텔레그램 대신 브라우저로 실시간 보드 확인
+  개선점: Railway URL로 폰/PC 어디서든 접속 가능
+  주의점: PORT 환경변수 사용 / dashboard.html은 stock_alert.py와 동일 폴더
+
+- v169.8 (2026-04-30): MID_PULLBACK(눌림목) entry_hit 미기록 버그 수정
   [#1] Flask 웹서버 daemon 스레드 추가 (/board, /api/data)
   [#2] _push_dashboard_json(): 알람·섹터·포착 데이터 → JSON 원자적 쓰기
   [#3] send_alert() 끝에 _push_dashboard_json() 훅 추가
@@ -27319,6 +27335,7 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
             _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
             if len(_WEB_DASHBOARD_ALERTS) > 50:
                 _WEB_DASHBOARD_ALERTS.pop()
+        _save_dashboard_alerts()  # 파일에도 저장 → 재시작 후에도 유지
         threading.Thread(target=_push_dashboard_json, daemon=True).start()
     except Exception as _de:
         _swallow_exception(_de)
@@ -27488,10 +27505,33 @@ def update_dashboard(force: bool = False) -> None:
 # v169.9: 실시간 웹 대시보드
 # ══════════════════════════════════════════════════════════════
 _WEB_DASHBOARD_JSON          = _state_path("web_dashboard.json")
-_WEB_DASHBOARD_ALERTS: list  = []        # 최근 50건 FIFO
+_WEB_DASHBOARD_ALERTS_JSON   = _state_path("web_dashboard_alerts.json")  # 알람 영속 저장
+_WEB_DASHBOARD_ALERTS: list  = []
 _WEB_DASHBOARD_LOCK          = threading.Lock()
-_WEB_DASHBOARD_LAST_PUSH: float = 0.0   # 쓰로틀용
-_WEB_DASHBOARD_THROTTLE_SEC  = 3.0      # 최소 push 간격
+_WEB_DASHBOARD_LAST_PUSH: float = 0.0
+_WEB_DASHBOARD_THROTTLE_SEC  = 3.0
+
+def _load_dashboard_alerts() -> None:
+    """봇 시작 시 이전 알람 목록 로드"""
+    global _WEB_DASHBOARD_ALERTS
+    try:
+        if os.path.exists(_WEB_DASHBOARD_ALERTS_JSON):
+            with open(_WEB_DASHBOARD_ALERTS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    _WEB_DASHBOARD_ALERTS = data[:50]
+    except Exception:
+        pass
+
+def _save_dashboard_alerts() -> None:
+    """알람 목록을 파일에 저장 (재시작 후에도 유지)"""
+    try:
+        tmp = _WEB_DASHBOARD_ALERTS_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_WEB_DASHBOARD_ALERTS[:50], f, ensure_ascii=False)
+        os.replace(tmp, _WEB_DASHBOARD_ALERTS_JSON)
+    except Exception:
+        pass
 
 def _next_biz_day_str() -> str:
     DAYS = ["일","월","화","수","목","금","토"]
@@ -27537,24 +27577,35 @@ def _push_dashboard_json() -> None:
         return
     _WEB_DASHBOARD_LAST_PUSH = now_ts
     try:
-        # ── 섹터 (기존 섹터 캐시 + 웹소켓 가격) ──────────
+        # ── 섹터 (get_all_sector_index + 섹터별 종목) ─────
         sectors_raw = []
         try:
-            scache = _sector_cache.get("data") if hasattr(_sector_cache,"get") else []
-            for sec in (scache or [])[:12]:
+            sector_list = get_all_sector_index() or []
+            for sec in sector_list[:12]:
+                bstp_code = sec.get("bstp_code","")
+                name      = sec.get("bstp_name","")
+                chg       = float(sec.get("change_rate") or 0)
                 stocks_raw = []
-                for st in (sec.get("stocks") or [])[:8]:
-                    code = normalize_stock_code(st.get("code",""))
-                    snap = _get_snap(code)
-                    stocks_raw.append({
-                        "name": st.get("name",""),
-                        "code": code,
-                        "chg":  float(snap.get("change_rate") or st.get("chg") or 0),
-                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or st.get("vol_raw") or 0)),
-                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or st.get("amt_raw") or 0)),
-                    })
-                stocks_raw.sort(key=lambda x: -x["chg"])
-                sectors_raw.append({"name":sec.get("name",""),"chg":float(sec.get("chg") or 0),"stocks":stocks_raw})
+                try:
+                    # 섹터 내 종목: _sector_cache에서 해당 섹터 종목 수집
+                    for code, cdata in list(_sector_cache.items())[:200]:
+                        if not isinstance(cdata, dict): continue
+                        if cdata.get("sector","") != name: continue
+                        snap = _get_snap(code)
+                        sname = _resolve_stock_name(code, "")
+                        stocks_raw.append({
+                            "name": sname,
+                            "code": code,
+                            "chg":  float(snap.get("change_rate") or 0),
+                            "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                            "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                        })
+                    stocks_raw.sort(key=lambda x: -x["chg"])
+                    stocks_raw = stocks_raw[:8]
+                except Exception:
+                    pass
+                if name:
+                    sectors_raw.append({"name": name, "chg": chg, "stocks": stocks_raw})
             sectors_raw.sort(key=lambda x: -x["chg"])
         except Exception:
             pass
@@ -27580,7 +27631,7 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
-        # ── 랭킹 (웹소켓 구독 종목 전체 기반) ────────────
+        # ── 랭킹 (웹소켓 구독 종목 기반) ─────────────────
         rank_base = []
         try:
             for code, buf in list(_execution_snapshots.items()):
@@ -27599,12 +27650,15 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
+        with _WEB_DASHBOARD_LOCK:
+            alerts_snapshot = list(_WEB_DASHBOARD_ALERTS)
+
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
             "next_biz_day": _next_biz_day_str(),
             "sectors":      sectors_raw,
             "captured":     captured_raw,
-            "alerts":       list(_WEB_DASHBOARD_ALERTS),
+            "alerts":       alerts_snapshot,
             "rank_chg":     sorted(rank_base, key=lambda x:-x["chg"])[:12],
             "rank_vol":     sorted(rank_base, key=lambda x:-x["vol_raw"])[:12],
             "rank_view":    sorted(rank_base, key=lambda x:-x["amt_raw"])[:12],
@@ -27615,29 +27669,6 @@ def _push_dashboard_json() -> None:
         os.replace(tmp, _WEB_DASHBOARD_JSON)
     except Exception as e:
         _swallow_exception(e)
-
-
-    """다음 영업일 문자열 반환 (예: '5월 2일 (금)')"""
-    DAYS = ["일","월","화","수","목","금","토"]
-    try:
-        holidays = set(getattr(_load_kr_holidays, "_cache", {}).get(datetime.now().year, []))
-    except Exception:
-        holidays = set()
-    d = datetime.now()
-    d = d.replace(hour=0, minute=0, second=0, microsecond=0)
-    now = datetime.now()
-    # 15:30 이후면 내일부터
-    if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
-        from datetime import timedelta as _td
-        d += _td(days=1)
-    from datetime import timedelta as _td2
-    for _ in range(10):
-        dow = d.weekday()  # 0=월 … 6=일
-        ymd = d.strftime("%Y-%m-%d")
-        if dow < 5 and ymd not in holidays:
-            return f"{d.month}월 {d.day}일 ({DAYS[d.weekday()+1 if d.weekday()<6 else 0]})"
-        d += _td2(days=1)
-    return "--"
 
 
 # ── Flask 앱 ──────────────────────────────────────────────────
@@ -40861,6 +40892,7 @@ if __name__ == "__main__":
     _log_info_msg("="*55)
     install_excepthook()
     update_dashboard(force=True)
+    _load_dashboard_alerts()  # v169.10: 이전 알람 목록 복원
     # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
     _migrate_legacy_files()
     _storage_diagnostics_once()
