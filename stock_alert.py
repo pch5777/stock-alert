@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.13
+버전: v169.14
 날짜: 2026-05-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v169.13 (2026-05-01): 대시보드 렌더링 버그 수정 (dashboard.html)
+- v169.14 (2026-05-01): 장전/장마감 섹터 시나리오 표시
+  [#1] _refresh_premarket_sectors(): _build_premarket_sector_snapshot() 결과를 섹터 형식으로 변환
+  [#2] _push_dashboard_json(): 장중=실시간섹터, 장마감/휴장=장전시나리오섹터 분기
+  [#3] _load_premarket_sectors() / _save_premarket_sectors(): 재시작 후 유지
+  [#4] update_dashboard()에 장마감 시 _refresh_premarket_sectors() 훅 추가
+  [#5] dashboard.html: 장전 섹터 표시 시 등급+스코어+이유 표시
+  이유: 장마감/공휴일에 섹터 목록이 비어있던 문제
+  개선점: 익영업일 상승 가능성 높은 섹터를 점수순으로 표시, 재시작 후에도 유지
+  주의점: premarket:true 플래그로 장전/장중 구분, 등락률 대신 score*0.5 사용(정렬용)
   [#1] 목업 초기 데이터 전체 제거 → 빈 배열로 교체
   [#2] fetchAndRender 길이 체크 제거 → API 데이터 무조건 반영
   이유: /api/data에 실데이터 있어도 목업이 화면에 남아있던 문제
@@ -27513,16 +27521,82 @@ def update_dashboard(force: bool = False) -> None:
             state["message_id"] = mid2
             _save_dashboard_state(state)
     # v169.9: 웹 대시보드 섹터/랭킹/포착 데이터 갱신 (10분마다)
+    # v169.14: 장 마감/휴장 시 장전 섹터도 갱신
+    if not is_any_market_open():
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     threading.Thread(target=_push_dashboard_json, daemon=True).start()
 # ══════════════════════════════════════════════════════════════
 # v169.9: 실시간 웹 대시보드
 # ══════════════════════════════════════════════════════════════
 _WEB_DASHBOARD_JSON          = _state_path("web_dashboard.json")
-_WEB_DASHBOARD_ALERTS_JSON   = _state_path("web_dashboard_alerts.json")  # 알람 영속 저장
+_WEB_DASHBOARD_ALERTS_JSON   = _state_path("web_dashboard_alerts.json")
+_WEB_DASHBOARD_PREMARKET_JSON= _state_path("web_dashboard_premarket.json")  # v169.14: 장전 섹터 캐시
 _WEB_DASHBOARD_ALERTS: list  = []
 _WEB_DASHBOARD_LOCK          = threading.Lock()
 _WEB_DASHBOARD_LAST_PUSH: float = 0.0
 _WEB_DASHBOARD_THROTTLE_SEC  = 3.0
+_WEB_DASHBOARD_PREMARKET_SECTORS: list = []  # v169.14: 장전/장마감 섹터 캐시
+
+def _load_premarket_sectors() -> None:
+    """재시작 후 장전 섹터 캐시 복원"""
+    global _WEB_DASHBOARD_PREMARKET_SECTORS
+    try:
+        if os.path.exists(_WEB_DASHBOARD_PREMARKET_JSON):
+            with open(_WEB_DASHBOARD_PREMARKET_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    _WEB_DASHBOARD_PREMARKET_SECTORS = data
+    except Exception:
+        pass
+
+def _save_premarket_sectors() -> None:
+    """장전 섹터 파일 저장"""
+    try:
+        tmp = _WEB_DASHBOARD_PREMARKET_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_WEB_DASHBOARD_PREMARKET_SECTORS, f, ensure_ascii=False)
+        os.replace(tmp, _WEB_DASHBOARD_PREMARKET_JSON)
+    except Exception:
+        pass
+
+def _refresh_premarket_sectors() -> None:
+    """장전/장마감 섹터를 _build_premarket_sector_snapshot()으로 갱신"""
+    global _WEB_DASHBOARD_PREMARKET_SECTORS
+    try:
+        snapshot = _build_premarket_sector_snapshot()
+        top = snapshot.get("top_sectors") or []
+        if not top:
+            return
+        sectors_out = []
+        for item in top:
+            codes  = item.get("codes") or []
+            names  = item.get("names") or []
+            score  = item.get("score", 0)
+            grade  = item.get("grade", "")
+            reasons= item.get("reasons") or []
+            stocks = []
+            for i, code in enumerate(codes):
+                snap = _get_snap(code)
+                stocks.append({
+                    "name": names[i] if i < len(names) else _resolve_stock_name(code, ""),
+                    "code": code,
+                    "chg":  float(snap.get("change_rate") or 0),
+                    "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                    "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                })
+            sectors_out.append({
+                "name":    item.get("sector", ""),
+                "chg":     float(score) * 0.5,  # score → 가상 등락률로 변환 (정렬용)
+                "score":   score,
+                "grade":   grade,
+                "reasons": reasons,
+                "stocks":  stocks,
+                "premarket": True,  # 장전 데이터 표시 플래그
+            })
+        _WEB_DASHBOARD_PREMARKET_SECTORS = sectors_out
+        _save_premarket_sectors()
+    except Exception as e:
+        _swallow_exception(e)
 
 def _load_dashboard_alerts() -> None:
     """봇 시작 시 이전 알람 목록 로드"""
@@ -27590,36 +27664,39 @@ def _push_dashboard_json() -> None:
         return
     _WEB_DASHBOARD_LAST_PUSH = now_ts
     try:
-        # ── 섹터 (get_all_sector_index + 섹터별 종목) ─────
+        # ── 섹터 (장중=실시간, 장마감/휴장=장전 시나리오) ──
         sectors_raw = []
+        market_open = is_any_market_open()
         try:
-            sector_list = get_all_sector_index() or []
-            for sec in sector_list[:12]:
-                bstp_code = sec.get("bstp_code","")
-                name      = sec.get("bstp_name","")
-                chg       = float(sec.get("change_rate") or 0)
-                stocks_raw = []
-                try:
-                    # 섹터 내 종목: _sector_cache에서 해당 섹터 종목 수집
-                    for code, cdata in list(_sector_cache.items())[:200]:
-                        if not isinstance(cdata, dict): continue
-                        if cdata.get("sector","") != name: continue
-                        snap = _get_snap(code)
-                        sname = _resolve_stock_name(code, "")
-                        stocks_raw.append({
-                            "name": sname,
-                            "code": code,
-                            "chg":  float(snap.get("change_rate") or 0),
-                            "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                            "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
-                        })
-                    stocks_raw.sort(key=lambda x: -x["chg"])
-                    stocks_raw = stocks_raw[:8]
-                except Exception:
-                    pass
-                if name:
-                    sectors_raw.append({"name": name, "chg": chg, "stocks": stocks_raw})
-            sectors_raw.sort(key=lambda x: -x["chg"])
+            if market_open:
+                # 장중: get_all_sector_index + _sector_cache 실시간 가격
+                sector_list = get_all_sector_index() or []
+                for sec in sector_list[:12]:
+                    name = sec.get("bstp_name","")
+                    chg  = float(sec.get("change_rate") or 0)
+                    stocks_raw = []
+                    try:
+                        for code, cdata in list(_sector_cache.items())[:300]:
+                            if not isinstance(cdata, dict): continue
+                            if cdata.get("sector","") != name: continue
+                            snap = _get_snap(code)
+                            stocks_raw.append({
+                                "name": _resolve_stock_name(code,""),
+                                "code": code,
+                                "chg":  float(snap.get("change_rate") or 0),
+                                "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                                "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                            })
+                        stocks_raw.sort(key=lambda x:-x["chg"])
+                        stocks_raw = stocks_raw[:8]
+                    except Exception:
+                        pass
+                    if name:
+                        sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
+                sectors_raw.sort(key=lambda x:-x["chg"])
+            else:
+                # 장마감/휴장: 캐시된 장전 섹터 사용
+                sectors_raw = list(_WEB_DASHBOARD_PREMARKET_SECTORS)
         except Exception:
             pass
 
@@ -40905,6 +40982,7 @@ if __name__ == "__main__":
     _log_info_msg("="*55)
     install_excepthook()
     _load_dashboard_alerts()  # v169.12: 반드시 update_dashboard 전에 로드해야 JSON에 이전 알람 포함됨
+    _load_premarket_sectors() # v169.14: 장전 섹터 캐시 복원
     update_dashboard(force=True)
     # update_dashboard → send() → 훅 실행 후 push 한 번 더 보장
     threading.Thread(target=_push_dashboard_json, daemon=True).start()

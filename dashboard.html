@@ -254,13 +254,22 @@ function renderSectors(){
 function secHTML(list,offset){
   return list.map((sec,li)=>{
     const rank=(li*2)+offset+1;
+    const isPre=!!sec.premarket;
     const pos=sec.chg>=0, ac=pos?"#ff4444":"#00d97e";
     const ss=[...sec.stocks].sort((a,b)=>b.chg-a.chg);
+    // 장전: 등락률 대신 스코어+등급 표시
+    const chgLabel = isPre
+      ? `<span style="font-size:10px;color:#fbbf24;font-weight:700">${sec.grade||''} ${sec.score||0}pt</span>`
+      : `<span class="sec-chg" style="color:${ac}">${fg(sec.chg)}</span>`;
+    const reasonLabel = isPre && sec.reasons && sec.reasons.length
+      ? `<span style="font-size:9px;color:#7ab0d4;margin-left:4px">${sec.reasons[0]}</span>`
+      : '';
     return `
       <div class="sec-sub ${pos?"pos":"neg"}">
-        <div class="sec-rnk" style="background:${ac}">${rank}</div>
+        <div class="sec-rnk" style="background:${isPre?"#fbbf24":ac}">${rank}</div>
         <span class="sec-nm">${sec.name}</span>
-        <span class="sec-chg" style="color:${ac}">${fg(sec.chg)}</span>
+        ${reasonLabel}
+        ${chgLabel}
       </div>
       ${ss.map(s=>`
         <div class="stk-row">
