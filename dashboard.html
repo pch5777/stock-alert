@@ -220,109 +220,13 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 </div><!-- /#main -->
 
 <script>
-// ══ 데이터 ══════════════════════════════════════════
-let sectors=[
-  {id:"semi",name:"반도체",chg:3.82,stocks:[
-    {name:"삼성전자",   code:"005930",chg:4.21,vol:"18,342만",amt:"1조2,840억"},
-    {name:"SK하이닉스", code:"000660",chg:3.95,vol:"8,120만", amt:"9,210억"},
-    {name:"한미반도체", code:"042700",chg:2.80,vol:"3,440만", amt:"4,320억"},
-    {name:"DB하이텍",   code:"000990",chg:1.52,vol:"1,230만", amt:"1,840억"},
-    {name:"원익IPS",    code:"240810",chg:1.18,vol:"980만",   amt:"1,120억"},
-  ]},
-  {id:"bat",name:"2차전지",chg:2.14,stocks:[
-    {name:"LG에너지솔루션",code:"373220",chg:2.65,vol:"2,870만",amt:"8,910억"},
-    {name:"삼성SDI",      code:"006400",chg:1.92,vol:"1,230만",amt:"5,640억"},
-    {name:"에코프로비엠",  code:"247540",chg:1.44,vol:"2,150만",amt:"3,200억"},
-    {name:"포스코퓨처엠",  code:"003670",chg:0.98,vol:"1,540만",amt:"2,100억"},
-  ]},
-  {id:"ai",name:"AI·로봇",chg:1.73,stocks:[
-    {name:"두산로보틱스",    code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
-    {name:"레인보우로보틱스",code:"277810",chg:2.40,vol:"1,980만",amt:"1,540억"},
-    {name:"현대로보틱스",    code:"267270",chg:0.88,vol:"980만",  amt:"820억"},
-    {name:"티로보틱스",      code:"388260",chg:0.65,vol:"640만",  amt:"480억"},
-  ]},
-  {id:"def",name:"방산",chg:0.85,stocks:[
-    {name:"한화에어로스페이스",code:"012450",chg:1.10,vol:"1,120만",amt:"5,400억"},
-    {name:"LIG넥스원",        code:"079550",chg:0.88,vol:"480만",  amt:"1,920억"},
-    {name:"현대로템",          code:"064350",chg:0.62,vol:"880만",  amt:"2,100억"},
-    {name:"한화시스템",        code:"272210",chg:0.44,vol:"1,340만",amt:"1,650억"},
-  ]},
-  {id:"bio",name:"바이오",chg:-0.42,stocks:[
-    {name:"삼성바이오로직스",code:"207940",chg:-0.21,vol:"980만", amt:"6,320억"},
-    {name:"셀트리온",        code:"068270",chg:-0.55,vol:"1,540만",amt:"3,180억"},
-    {name:"알테오젠",        code:"196170",chg:-0.88,vol:"2,230만",amt:"2,760억"},
-    {name:"유한양행",        code:"000100",chg:-1.12,vol:"870만", amt:"1,640억"},
-  ]},
-  {id:"ship",name:"조선",chg:-0.95,stocks:[
-    {name:"HD한국조선해양",code:"009540",chg:-0.72,vol:"1,340만",amt:"4,210억"},
-    {name:"HD현대중공업",  code:"329180",chg:-0.98,vol:"920만",  amt:"3,540억"},
-    {name:"삼성중공업",    code:"010140",chg:-1.24,vol:"3,810만",amt:"2,960억"},
-  ]},
-];
-
-let captured=[
-  {name:"삼성전자",        code:"005930",price:79200, entry:78400, target:86240, stop:72900, hit:true, chg:4.21},
-  {name:"SK하이닉스",      code:"000660",price:197000,entry:195000,target:214500,stop:181400,hit:true, chg:3.95},
-  {name:"두산로보틱스",    code:"454910",price:38900, entry:38500, target:42350, stop:35800, hit:true, chg:3.10},
-  {name:"LG에너지솔루션",  code:"373220",price:312500,entry:310000,target:341000,stop:288300,hit:false,chg:2.65},
-  {name:"레인보우로보틱스",code:"277810",price:64800, entry:64200, target:70620, stop:59700, hit:false,chg:2.40},
-  {name:"에코프로비엠",    code:"247540",price:112500,entry:112000,target:123200,stop:104200,hit:false,chg:1.44},
-  {name:"셀트리온",        code:"068270",price:54200, entry:55000, target:60500, stop:51150, hit:false,chg:-0.55},
-];
-
-const alerts=[
-  {lvl:"red",   time:"14:52",title:"두산로보틱스 급등포착",   body:"등락률 +3.1%  거래량 급증 420%\n진입 38,500  목표 42,350  손절 35,800"},
-  {lvl:"red",   time:"14:48",title:"삼성전자 SURGE 신호",     body:"등락률 +4.2%  거래량 급증 380%\n진입 78,400  목표 86,240  손절 72,900"},
-  {lvl:"yellow",time:"14:31",title:"에코프로비엠 눌림목",     body:"등락률 +1.4%  눌림목 구간 진입\n진입 112,000  목표 123,200  손절 104,200"},
-  {lvl:"blue",  time:"14:12",title:"셀트리온 약세 주의",      body:"등락률 -0.6%  진입 보류"},
-  {lvl:"red",   time:"13:55",title:"SK하이닉스 강세 유지",    body:"등락률 +3.9%\n진입 195,000  목표 214,500  손절 181,400"},
-  {lvl:"yellow",time:"13:20",title:"레인보우로보틱스 선진입", body:"등락률 +2.4%\n진입 64,200  목표 70,620  손절 59,700"},
-  {lvl:"red",   time:"12:44",title:"한미반도체 급등 2차",     body:"등락률 +2.8%\n진입 58,200  목표 64,020  손절 54,100"},
-  {lvl:"yellow",time:"12:10",title:"LIG넥스원 상승 감지",    body:"등락률 +0.9%\n진입 198,500  목표 218,000  손절 184,700"},
-];
-
-let rChg=[
-  {name:"삼성전자",   code:"005930",chg:4.21,vol:"18,342만",amt:"1조2,840억"},
-  {name:"SK하이닉스", code:"000660",chg:3.95,vol:"8,120만", amt:"9,210억"},
-  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
-  {name:"한미반도체", code:"042700",chg:2.80,vol:"3,440만", amt:"4,320억"},
-  {name:"레인보우",   code:"277810",chg:2.40,vol:"1,980만", amt:"1,540억"},
-  {name:"LG에너지",   code:"373220",chg:2.65,vol:"2,870만", amt:"8,910억"},
-  {name:"에코프로비엠",code:"247540",chg:1.44,vol:"2,150만",amt:"3,200억"},
-  {name:"DB하이텍",   code:"000990",chg:1.52,vol:"1,230만", amt:"1,840억"},
-  {name:"포스코퓨처엠",code:"003670",chg:0.98,vol:"1,540만",amt:"2,100억"},
-  {name:"셀트리온",   code:"068270",chg:-0.55,vol:"1,540만",amt:"3,180억"},
-  {name:"알테오젠",   code:"196170",chg:-0.88,vol:"2,230만",amt:"2,760억"},
-  {name:"삼성중공업", code:"010140",chg:-1.24,vol:"3,810만",amt:"2,960억"},
-];
-let rVol=[
-  {name:"삼성전자",  code:"005930",chg:4.21, vol:"18,342만",amt:"1조2,840억"},
-  {name:"카카오",    code:"035720",chg:-0.32,vol:"12,540만",amt:"4,210억"},
-  {name:"셀트리온",  code:"068270",chg:-0.55,vol:"11,340만",amt:"3,180억"},
-  {name:"SK하이닉스",code:"000660",chg:3.95, vol:"8,120만", amt:"9,210억"},
-  {name:"POSCO",     code:"005490",chg:1.12, vol:"6,880만", amt:"3,820억"},
-  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
-  {name:"삼성중공업",code:"010140",chg:-1.24,vol:"3,810만", amt:"2,960억"},
-  {name:"LG에너지",  code:"373220",chg:2.65, vol:"2,870만", amt:"8,910억"},
-  {name:"알테오젠",  code:"196170",chg:-0.88,vol:"2,230만", amt:"2,760억"},
-  {name:"에코프로",  code:"247540",chg:1.44, vol:"2,150만", amt:"3,200억"},
-  {name:"현대차",    code:"005380",chg:0.44, vol:"2,140만", amt:"5,620억"},
-  {name:"레인보우",  code:"277810",chg:2.40, vol:"1,980만", amt:"1,540억"},
-];
-let rView=[
-  {name:"삼성전자",  code:"005930",chg:4.21, vol:"18,342만",amt:"1조2,840억"},
-  {name:"SK하이닉스",code:"000660",chg:3.95, vol:"8,120만", amt:"9,210억"},
-  {name:"카카오",    code:"035720",chg:-0.32,vol:"12,540만",amt:"4,210억"},
-  {name:"LG에너지",  code:"373220",chg:2.65, vol:"2,870만", amt:"8,910억"},
-  {name:"POSCO",     code:"005490",chg:1.12, vol:"6,880만", amt:"3,820억"},
-  {name:"현대차",    code:"005380",chg:0.44, vol:"2,140만", amt:"5,620억"},
-  {name:"두산로보틱스",code:"454910",chg:3.10,vol:"4,230만",amt:"2,980억"},
-  {name:"한화에어로", code:"012450",chg:1.10, vol:"1,120만", amt:"5,400억"},
-  {name:"셀트리온",  code:"068270",chg:-0.55,vol:"1,540만", amt:"3,180억"},
-  {name:"삼성바이오", code:"207940",chg:-0.21,vol:"980만",  amt:"6,320억"},
-  {name:"삼성중공업", code:"010140",chg:-1.24,vol:"3,810만", amt:"2,960억"},
-  {name:"에코프로",  code:"247540",chg:1.44, vol:"2,150만", amt:"3,200억"},
-];
+// ══ 데이터 (초기값 빈 배열 — /api/data 로 채워짐) ══
+let sectors=[];
+let captured=[];
+let alerts=[];
+let rChg=[];
+let rVol=[];
+let rView=[];
 
 // ══ 유틸 ════════════════════════════════════════════
 const fg=v=>(v>=0?"+":"")+v.toFixed(2)+"%";
@@ -483,13 +387,12 @@ async function fetchAndRender(){
     const res = await fetch('/api/data');
     if(!res.ok) throw new Error(res.status);
     const d = await res.json();
-    // 실데이터가 있을 때만 교체 (목업 덮어쓰기 방지)
-    if(d.sectors   && d.sectors.length)   sectors  = d.sectors;
-    if(d.captured  && d.captured.length)  captured = d.captured;
-    if(d.alerts    && d.alerts.length)    alerts   = d.alerts;
-    if(d.rank_chg  && d.rank_chg.length)  rChg     = d.rank_chg;
-    if(d.rank_vol  && d.rank_vol.length)  rVol     = d.rank_vol;
-    if(d.rank_view && d.rank_view.length) rView    = d.rank_view;
+    sectors  = d.sectors  || sectors;
+    captured = d.captured || captured;
+    alerts   = d.alerts   || alerts;
+    rChg     = d.rank_chg || rChg;
+    rVol     = d.rank_vol || rVol;
+    rView    = d.rank_view|| rView;
     // 헤더 갱신
     if(d.next_biz_day) document.getElementById("next-biz").textContent = d.next_biz_day;
     if(d.updated_at)   document.getElementById("ts").textContent = d.updated_at;
