@@ -146,7 +146,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 <!-- ══ 헤더 ══ -->
 <div id="hdr">
   <span class="logo">📈 실시간 주식 보드</span>
-  <span class="badge">🟢 장 운영중</span>
+  <span class="badge" id="mkt-badge">⏳ 확인중</span>
   <span style="font-size:9px;color:#c8e4f8">목업 · 10초 자동갱신</span>
   <span class="ts">
     다음 영업일: <b id="next-biz">--</b>
@@ -420,57 +420,94 @@ function renderRanking(){
   `).join("");
 }
 
-// ══ 실데이터 폴링 (/api/data 10초마다) ══════════════
-async function fetchAndRender(){
-  try{
-    const res = await fetch('/api/data');
-    if(!res.ok) throw new Error(res.status);
-    const d = await res.json();
-    if(d.sectors   && d.sectors.length)   sectors  = d.sectors;
-    if(d.captured  && d.captured.length)  captured = d.captured;
-    if(d.alerts    && d.alerts.length)    alerts   = d.alerts;
-    if(d.rank_chg  && d.rank_chg.length)  rChg     = d.rank_chg;
-    if(d.rank_vol  && d.rank_vol.length)  rVol     = d.rank_vol;
-    if(d.rank_view && d.rank_view.length) rView    = d.rank_view;
-    if(d.next_biz_day) document.getElementById("next-biz").textContent = d.next_biz_day;
-    renderAll(d.updated_at);
-  }catch(e){
-    console.warn("fetch /api/data 실패:", e);
-  }
-}
-function renderAll(ts){
-  renderSectors();renderCapture();renderAlerts();renderRanking();
-  if(ts) document.getElementById("ts").textContent = ts;
-  else document.getElementById("ts").textContent = new Date().toLocaleTimeString("ko-KR");
-}
-fetchAndRender();
-setInterval(fetchAndRender, 10000);
+// ══ 공휴일 목록 (한국) ══════════════════════════════
+const KR_HOLIDAYS = new Set([
+  "2026-01-01","2026-01-28","2026-01-29","2026-01-30", // 신정, 설연휴
+  "2026-03-01","2026-05-01","2026-05-05","2026-05-25", // 삼일절, 근로자의날, 어린이날, 부처님오신날
+  "2026-06-06","2026-08-15",                           // 현충일, 광복절
+  "2026-09-24","2026-09-25","2026-09-26",              // 추석연휴
+  "2026-10-03","2026-10-09","2026-12-25",              // 개천절, 한글날, 크리스마스
+]);
 
-// ══ 다음 영업일 ══════════════════════════════════
+// ══ 장 상태 계산 ════════════════════════════════════
+function getMarketStatus(){
+  const now = new Date();
+  const dow  = now.getDay();        // 0=일, 6=토
+  const ymd  = now.toISOString().slice(0,10);
+  const hhmm = now.getHours()*100 + now.getMinutes();
+  // 주말/공휴일
+  if(dow===0 || dow===6 || KR_HOLIDAYS.has(ymd)){
+    return {text:"🔴 휴장", color:"#f87171", bg:"#f8717115", border:"#f8717130"};
+  }
+  if(hhmm >= 800  && hhmm < 900)
+    return {text:"🟡 장전 (NXT)", color:"#fbbf24", bg:"#fbbf2415", border:"#fbbf2430"};
+  if(hhmm >= 900  && hhmm < 1530)
+    return {text:"🟢 장 운영중",  color:"#00d97e", bg:"#00d97e15", border:"#00d97e30"};
+  if(hhmm >= 1530 && hhmm < 2000)
+    return {text:"🟡 장후 (NXT)", color:"#fbbf24", bg:"#fbbf2415", border:"#fbbf2430"};
+  return {text:"🔴 장 마감", color:"#f87171", bg:"#f8717115", border:"#f8717130"};
+}
+
+function updateMarketBadge(){
+  const s = getMarketStatus();
+  const el = document.getElementById("mkt-badge");
+  if(!el) return;
+  el.textContent = s.text;
+  el.style.color  = s.color;
+  el.style.background = s.bg;
+  el.style.borderColor = s.border;
+}
+
+// ══ 다음 영업일 계산 (항상 내일 이후) ═══════════════
 function getNextBizDay(){
   const DAYS=["일","월","화","수","목","금","토"];
-  const HOLIDAYS=new Set([
-    "2026-01-01","2026-03-01","2026-05-05","2026-06-06",
-    "2026-08-15","2026-10-03","2026-10-09","2026-12-25",
-  ]);
-  const d=new Date();
+  // 항상 내일부터 탐색
+  const d = new Date();
+  d.setDate(d.getDate()+1);
   d.setHours(0,0,0,0);
-  const now=new Date();
-  // 15:30 이후면 내일부터 탐색
-  if(now.getHours()>15||(now.getHours()===15&&now.getMinutes()>=30)){
-    d.setDate(d.getDate()+1);
-  }
-  for(let i=0;i<10;i++){
-    const dow=d.getDay();
-    const ymd=d.toISOString().slice(0,10);
-    if(dow!==0&&dow!==6&&!HOLIDAYS.has(ymd)){
+  for(let i=0;i<14;i++){
+    const dow = d.getDay();
+    const ymd = d.toISOString().slice(0,10);
+    if(dow!==0 && dow!==6 && !KR_HOLIDAYS.has(ymd)){
       return `${d.getMonth()+1}월 ${d.getDate()}일 (${DAYS[dow]})`;
     }
     d.setDate(d.getDate()+1);
   }
   return "--";
 }
-document.getElementById("next-biz").textContent=getNextBizDay();
+
+// ══ 실데이터 폴링 (/api/data 10초마다) ══════════════
+async function fetchAndRender(){
+  try{
+    const res = await fetch('/api/data');
+    if(!res.ok) throw new Error(res.status);
+    const d = await res.json();
+    // 실데이터가 있을 때만 교체 (목업 덮어쓰기 방지)
+    if(d.sectors   && d.sectors.length)   sectors  = d.sectors;
+    if(d.captured  && d.captured.length)  captured = d.captured;
+    if(d.alerts    && d.alerts.length)    alerts   = d.alerts;
+    if(d.rank_chg  && d.rank_chg.length)  rChg     = d.rank_chg;
+    if(d.rank_vol  && d.rank_vol.length)  rVol     = d.rank_vol;
+    if(d.rank_view && d.rank_view.length) rView    = d.rank_view;
+    // 헤더 갱신
+    if(d.next_biz_day) document.getElementById("next-biz").textContent = d.next_biz_day;
+    if(d.updated_at)   document.getElementById("ts").textContent = d.updated_at;
+    renderAll();
+  }catch(e){
+    console.warn("fetch /api/data 실패:", e);
+  }
+}
+function renderAll(){
+  renderSectors();renderCapture();renderAlerts();renderRanking();
+}
+
+// ══ 초기화 ══════════════════════════════════════════
+updateMarketBadge();
+document.getElementById("next-biz").textContent = getNextBizDay();
+fetchAndRender();
+setInterval(fetchAndRender, 10000);
+setInterval(updateMarketBadge, 60000); // 1분마다 장 상태 갱신
+
 </script>
 </body>
 </html>
