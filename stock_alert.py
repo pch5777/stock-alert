@@ -3,11 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.14
-날짜: 2026-05-01
+버전: v169.15
+날짜: 2026-05-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v169.14 (2026-05-01): 장전/장마감 섹터 시나리오 표시
+- v169.15 (2026-05-02): 알람훅 안전화 + ETF필터 + 장전섹터 즉시갱신
+  [#1] send() 훅: globals()로 안전한 전역변수 접근 — 초기화 순서 오류 방지
+  [#2] 포착목록 ETF/선물/옵션 필터링 — KODEX/TIGER 등 이름 마커 + 코드 6자리 검증
+  [#3] _refresh_premarket_sectors(): _load_today_sector_results() fallback 추가
+  [#4] 시작 시 장마감이면 즉시 _refresh_premarket_sectors() 스레드 실행
+  [#5] _refresh_premarket_sectors() 완료 후 _push_dashboard_json() 즉시 호출
+  이유: 알람 미표시/ETF종목표시/장전섹터빈화면 3가지 버그 동시 수정
+  개선점: 재시작 직후부터 장전섹터 표시, 일반주식만 포착목록에 표시
+  주의점: ETF 필터는 이름 기반이므로 ETF명과 동일한 일반주식은 없음(실제로 없음)
   [#1] _refresh_premarket_sectors(): _build_premarket_sector_snapshot() 결과를 섹터 형식으로 변환
   [#2] _push_dashboard_json(): 장중=실시간섹터, 장마감/휴장=장전시나리오섹터 분기
   [#3] _load_premarket_sectors() / _save_premarket_sectors(): 재시작 후 유지
@@ -27338,12 +27346,16 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
             msg_id = res["result"].get("message_id")
     except Exception as e:
         _swallow_exception(e)
-    # v169.9: 모든 send() 호출을 대시보드 알람 피드에 반영
+    # v169.9: 모든 send() 호출을 대시보드 알람 피드에 반영 (v169.15: 안전한 전역변수 접근)
     try:
+        _alerts = globals().get("_WEB_DASHBOARD_ALERTS")
+        _lock   = globals().get("_WEB_DASHBOARD_LOCK")
+        if _alerts is None or _lock is None:
+            return msg_id
         clean = decorated_text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
         lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith("━")]
         title = lines[0][:60] if lines else "알람"
-        body  = "\n".join(lines[1:4])  # 최대 3줄
+        body  = "\n".join(lines[1:4])
         lvl   = "red" if any(k in clean for k in ["급등","SURGE","포착","돌파","상한"]) else \
                 "blue" if any(k in clean for k in ["시작","배포","완료","연결","✅","📌"]) else "yellow"
         alert_entry = {
@@ -27352,11 +27364,11 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
             "title": title,
             "body":  body,
         }
-        with _WEB_DASHBOARD_LOCK:
-            _WEB_DASHBOARD_ALERTS.insert(0, alert_entry)
-            if len(_WEB_DASHBOARD_ALERTS) > 50:
-                _WEB_DASHBOARD_ALERTS.pop()
-        _save_dashboard_alerts()  # 파일에도 저장 → 재시작 후에도 유지
+        with _lock:
+            _alerts.insert(0, alert_entry)
+            if len(_alerts) > 50:
+                _alerts.pop()
+        _save_dashboard_alerts()
         threading.Thread(target=_push_dashboard_json, daemon=True).start()
     except Exception as _de:
         _swallow_exception(_de)
@@ -27560,41 +27572,73 @@ def _save_premarket_sectors() -> None:
         pass
 
 def _refresh_premarket_sectors() -> None:
-    """장전/장마감 섹터를 _build_premarket_sector_snapshot()으로 갱신"""
+    """장전/장마감 섹터를 _build_premarket_sector_snapshot()으로 갱신.
+    API 결과가 없으면 _load_today_sector_results() 기반 fallback 사용."""
     global _WEB_DASHBOARD_PREMARKET_SECTORS
     try:
         snapshot = _build_premarket_sector_snapshot()
         top = snapshot.get("top_sectors") or []
+
+        # fallback: 오늘 섹터 결과 파일 사용
+        if not top:
+            today_results = _load_today_sector_results() or {}
+            if today_results:
+                for sector_name, v in sorted(today_results.items(), key=lambda x: -float(x[1].get("avg_chg",0) or 0))[:12]:
+                    avg_chg = float(v.get("avg_chg",0) or 0)
+                    codes   = list(v.get("codes",[]) or [])[:4]
+                    names   = list(v.get("names",[]) or [])[:4]
+                    stocks  = []
+                    for i, code in enumerate(codes):
+                        snap = _get_snap(code)
+                        stocks.append({
+                            "name": names[i] if i < len(names) else _resolve_stock_name(code,""),
+                            "code": code,
+                            "chg":  float(snap.get("change_rate") or avg_chg or 0),
+                            "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                            "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                        })
+                    top.append({
+                        "sector":  sector_name,
+                        "score":   int(avg_chg * 2),
+                        "grade":   "강함" if avg_chg >= 4 else "보통" if avg_chg >= 2 else "약함",
+                        "reasons": [f"전일 {avg_chg:+.1f}%"],
+                        "codes":   codes,
+                        "names":   names,
+                    })
+
         if not top:
             return
+
         sectors_out = []
         for item in top:
-            codes  = item.get("codes") or []
-            names  = item.get("names") or []
-            score  = item.get("score", 0)
-            grade  = item.get("grade", "")
-            reasons= item.get("reasons") or []
-            stocks = []
+            codes   = item.get("codes") or []
+            names   = item.get("names") or []
+            score   = item.get("score", 0)
+            grade   = item.get("grade", "")
+            reasons = item.get("reasons") or []
+            stocks  = []
             for i, code in enumerate(codes):
                 snap = _get_snap(code)
                 stocks.append({
-                    "name": names[i] if i < len(names) else _resolve_stock_name(code, ""),
+                    "name": names[i] if i < len(names) else _resolve_stock_name(code,""),
                     "code": code,
                     "chg":  float(snap.get("change_rate") or 0),
                     "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
                     "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
                 })
             sectors_out.append({
-                "name":    item.get("sector", ""),
-                "chg":     float(score) * 0.5,  # score → 가상 등락률로 변환 (정렬용)
-                "score":   score,
-                "grade":   grade,
-                "reasons": reasons,
-                "stocks":  stocks,
-                "premarket": True,  # 장전 데이터 표시 플래그
+                "name":     item.get("sector",""),
+                "chg":      float(score) * 0.5,
+                "score":    score,
+                "grade":    grade,
+                "reasons":  reasons,
+                "stocks":   stocks,
+                "premarket": True,
             })
         _WEB_DASHBOARD_PREMARKET_SECTORS = sectors_out
         _save_premarket_sectors()
+        # JSON 즉시 갱신
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
     except Exception as e:
         _swallow_exception(e)
 
@@ -27700,15 +27744,20 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
-        # ── 포착 목록 (signal_log + 웹소켓 가격) ─────────
+        # ── 포착 목록 (signal_log + 웹소켓 가격, ETF/선물 제외) ──
         captured_raw = []
+        _ETF_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스")
         try:
-            for key, rec in list((_load_signal_log_data() or {}).items())[:20]:
+            for key, rec in list((_load_signal_log_data() or {}).items())[:50]:
                 if not isinstance(rec, dict): continue
                 code = normalize_stock_code(rec.get("code",""))
+                name = rec.get("name","")
+                # ETF/선물/옵션 제외: 이름에 마커 포함이거나 코드가 6자리 아닌 경우
+                if not code or len(code) != 6: continue
+                if any(m in name for m in _ETF_MARKERS): continue
                 snap = _get_snap(code)
                 captured_raw.append({
-                    "name":   rec.get("name",""),
+                    "name":   name,
                     "code":   code,
                     "price":  safe_int(snap.get("price") or rec.get("price") or 0),
                     "entry":  safe_int(rec.get("entry_price") or 0),
@@ -27718,6 +27767,7 @@ def _push_dashboard_json() -> None:
                     "chg":    float(snap.get("change_rate") or rec.get("change_rate") or 0),
                 })
             captured_raw.sort(key=lambda x: -x["chg"])
+            captured_raw = captured_raw[:20]
         except Exception:
             pass
 
@@ -40981,8 +41031,11 @@ if __name__ == "__main__":
     _log_info_msg(f"   업데이트: {BOT_DATE}")
     _log_info_msg("="*55)
     install_excepthook()
-    _load_dashboard_alerts()  # v169.12: 반드시 update_dashboard 전에 로드해야 JSON에 이전 알람 포함됨
+    _load_dashboard_alerts()  # v169.12: 반드시 update_dashboard 전에 로드
     _load_premarket_sectors() # v169.14: 장전 섹터 캐시 복원
+    # v169.15: 시작 시 장마감/휴장이면 즉시 장전 섹터 갱신 (첫 10분 공백 제거)
+    if not is_any_market_open():
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     update_dashboard(force=True)
     # update_dashboard → send() → 훅 실행 후 push 한 번 더 보장
     threading.Thread(target=_push_dashboard_json, daemon=True).start()
