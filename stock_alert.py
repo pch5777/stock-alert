@@ -3,11 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.15
+버전: v169.16
 날짜: 2026-05-02
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v169.15 (2026-05-02): 알람훅 안전화 + ETF필터 + 장전섹터 즉시갱신
+- v169.16 (2026-05-02): 포착목록 컬럼변경 + 레이아웃 + 섹터버그수정
+  [#1] 포착목록: 현재가 제거 → 진입가+수익률 추가 (7컬럼)
+       수익률=진입가대비 현재가, 양수=노란색 음수=보라색으로 등락률과 색상 구분
+       진입가 도달 시 진입가 셀 초록색으로 강조
+  [#2] 레이아웃: 섹터패널 350→310px, 포착패널 480→560px
+  [#3] 장전섹터: 섹터명=종목명인 미확인 종목 → "기타" 섹터로 묶기
+       _refresh_premarket_sectors() 주기적 재실행 시 섹터 확인되면 해당 섹터로 이동
+  이유: 진입가 대비 수익률 직관적 확인/섹터 미확인 종목 개별 나열 버그
+  개선점: 등락률(빨/초)과 수익률(노/보)로 색상 완전 구분
+  주의점: 수익률은 price>0 && entry>0 조건 필요, 장마감시 price=0으로 "-" 표시
   [#1] send() 훅: globals()로 안전한 전역변수 접근 — 초기화 순서 오류 방지
   [#2] 포착목록 ETF/선물/옵션 필터링 — KODEX/TIGER 등 이름 마커 + 코드 6자리 검증
   [#3] _refresh_premarket_sectors(): _load_today_sector_results() fallback 추가
@@ -27610,30 +27619,42 @@ def _refresh_premarket_sectors() -> None:
             return
 
         sectors_out = []
+        etc_stocks = []  # 섹터 미확인 종목 → 기타로
         for item in top:
             codes   = item.get("codes") or []
             names   = item.get("names") or []
             score   = item.get("score", 0)
             grade   = item.get("grade", "")
             reasons = item.get("reasons") or []
+            sector_name = item.get("sector","")
             stocks  = []
             for i, code in enumerate(codes):
                 snap = _get_snap(code)
-                stocks.append({
-                    "name": names[i] if i < len(names) else _resolve_stock_name(code,""),
-                    "code": code,
+                sname = names[i] if i < len(names) else _resolve_stock_name(code,"")
+                stk = {
+                    "name": sname, "code": code,
                     "chg":  float(snap.get("change_rate") or 0),
                     "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
                     "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                }
+                # 섹터명이 종목명과 동일 = 섹터 미확인 → 기타
+                if sector_name and sector_name.strip() == sname.strip():
+                    etc_stocks.append(stk)
+                else:
+                    stocks.append(stk)
+            if sector_name and stocks:
+                sectors_out.append({
+                    "name": sector_name, "chg": float(score)*0.5,
+                    "score": score, "grade": grade, "reasons": reasons,
+                    "stocks": stocks, "premarket": True,
                 })
+            elif stocks:
+                etc_stocks.extend(stocks)
+        if etc_stocks:
             sectors_out.append({
-                "name":     item.get("sector",""),
-                "chg":      float(score) * 0.5,
-                "score":    score,
-                "grade":    grade,
-                "reasons":  reasons,
-                "stocks":   stocks,
-                "premarket": True,
+                "name": "기타", "chg": 0.0, "score": 0,
+                "grade": "확인중", "reasons": ["섹터 확인 중"],
+                "stocks": etc_stocks[:8], "premarket": True,
             })
         _WEB_DASHBOARD_PREMARKET_SECTORS = sectors_out
         _save_premarket_sectors()

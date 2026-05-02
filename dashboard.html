@@ -28,7 +28,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 #main{
   display:grid;
   /* 섹터A(350) + 섹터B(350) + 포착(480) + 알람(340) + 랭킹(400) = 1920px */
-  grid-template-columns: 350px 350px 480px 340px 400px;
+  grid-template-columns: 310px 310px 560px 340px 400px;
   height:calc(100vh - 34px);
   overflow:hidden;
 }
@@ -77,7 +77,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 /* 종목 한줄 (섹터 내부) */
 .stk-row{
   display:grid;
-  grid-template-columns:95px 54px 46px 56px 70px;
+  grid-template-columns:80px 50px 44px 52px 64px;
   height:23px;padding:0 8px;align-items:center;
   border-bottom:1px solid #09111e;transition:background .1s;
 }
@@ -95,10 +95,10 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 
 /* ══ 포착 목록 ══ */
-.cap-head{grid-template-columns:105px 52px 46px 72px 90px 84px}
+.cap-head{grid-template-columns:100px 50px 44px 68px 52px 74px 68px}
 .cap-row{
   display:grid;
-  grid-template-columns:105px 52px 46px 72px 90px 84px;
+  grid-template-columns:100px 50px 44px 68px 52px 74px 68px;
   height:24px;padding:0 8px;align-items:center;
   border-bottom:1px solid #09111e;transition:background .1s;
 }
@@ -165,7 +165,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
       <span class="sub-tag">등락률순 실시간</span>
     </div>
     <!-- 컬럼 헤더: 딱 한번만 -->
-    <div class="tbl-head" style="grid-template-columns:95px 54px 46px 56px 70px;padding:0 8px">
+    <div class="tbl-head" style="grid-template-columns:80px 50px 44px 52px 64px;padding:0 8px">
       <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span>
     </div>
     <div class="col-body" id="sec-a-body"></div>
@@ -177,7 +177,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
       <span style="color:#60a5fa">SECTOR LIST</span>
       <span class="sub-tag">등락률순 실시간</span>
     </div>
-    <div class="tbl-head" style="grid-template-columns:95px 54px 46px 56px 70px;padding:0 8px">
+    <div class="tbl-head" style="grid-template-columns:80px 50px 44px 52px 64px;padding:0 8px">
       <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span>
     </div>
     <div class="col-body" id="sec-b-body"></div>
@@ -191,7 +191,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
     </div>
     <!-- 컬럼 헤더: 딱 한번만 -->
     <div class="tbl-head cap-head" style="padding:0 8px">
-      <span style="text-align:left">종목명</span><span>코드</span><span>등락률</span><span>현재가</span><span>목표가</span><span>손절가</span>
+      <span style="text-align:left">종목명</span><span>코드</span><span>등락률</span><span>진입가</span><span>수익률</span><span>목표가</span><span>손절가</span>
     </div>
     <div class="col-body" id="cap-body"></div>
   </div>
@@ -287,11 +287,20 @@ function renderCapture(){
   const sorted=[...captured].sort((a,b)=>b.chg-a.chg);
   document.getElementById("cap-body").innerHTML=sorted.map(s=>{
     const toT=pct(s.target,s.price), toS=pct(s.price,s.stop);
+    // 수익률: 진입가 대비 현재가 (진입가 0이면 표시 불가)
+    const profit = s.entry>0 && s.price>0 ? ((s.price-s.entry)/s.entry*100) : null;
+    const profitStr = profit!==null
+      ? `<span style="font-size:10px;font-weight:700;color:${profit>=0?"#fbbf24":"#a78bfa"};text-align:right">${profit>=0?"+":""}${profit.toFixed(1)}%</span>`
+      : `<span style="font-size:10px;color:#334155;text-align:right">-</span>`;
+    // 진입가 셀: 도달 여부에 따라 색상 변경
+    const entryColor = s.hit ? "#00d97e" : "#94a3b8";
+    const entryWeight = s.hit ? "700" : "400";
     return `<div class="cap-row ${s.hit?"hit":""}">
       <span class="cap-nm">${s.name}</span>
       <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
       <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
-      <span style="font-size:10px;color:#eef4fa;text-align:right">${fmt(s.price)}</span>
+      <span style="font-size:10px;font-weight:${entryWeight};color:${entryColor};text-align:right">${fmt(s.entry)}</span>
+      ${profitStr}
       <span style="font-size:10px;color:#60a5fa;text-align:right;white-space:nowrap">${fmt(s.target)}<span style="font-size:8px;color:#3b82f6">(+${toT.toFixed(1)}%)</span></span>
       <span style="font-size:10px;color:#00d97e;text-align:right;white-space:nowrap">${fmt(s.stop)}<span style="font-size:8px;color:#00c070">(-${toS.toFixed(1)}%)</span></span>
     </div>`;
