@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.20
+버전: v169.21
 날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.21 (2026-05-03): 모바일 세로 모드 컨텐츠 표시 복구
+  [#1] body CSS: overflow:hidden + height:100vh 제거
+       → 모바일 세로 모드에서 body가 컨텐츠를 clip하던 문제 해결
+  [#2] #hdr: position:sticky;top:0;z-index:10 추가 → 모바일 스크롤 시 헤더 고정
+  이유: body{overflow:hidden;height:100vh}가 모바일 portrait에서 컨텐츠 clipping
+  개선점: 세로/가로 모드 모두 정상 표시
+  주의점: #main height:calc(100vh - 34px)는 유지 — 데스크탑 레이아웃 그대로
+
 - v169.20 (2026-05-03): 대시보드 수익률 오류 수정 + 순위 날짜 레이블
   [#1] 수익률: hit=True(진입 도달) 종목만 표시. 미도달 종목은 "진입까지 ±X%" 표시
        (진입가 대비 현재가 거리 — 몇 % 남았는지 또는 얼마나 지났는지)
@@ -27933,12 +27941,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <title>📈 실시간 주식 보드</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothic Neo",sans-serif;overflow:hidden;height:100vh}
+body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothic Neo",sans-serif}
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-track{background:#070d1a}
 ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
-#hdr{height:34px;display:flex;align-items:center;gap:10px;padding:0 12px;background:#0c1525;border-bottom:1px solid #1e293b;flex-shrink:0}
+#hdr{height:34px;display:flex;align-items:center;gap:10px;padding:0 12px;background:#0c1525;border-bottom:1px solid #1e293b;flex-shrink:0;position:sticky;top:0;z-index:10}
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
