@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.17
+버전: v169.18
 날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.18 (2026-05-03): 대시보드 포착목록 소스 통합 (_entry_watch 단일화)
+  [#1] _push_dashboard_json() 포착목록: signal_log → _entry_watch + _detected_stocks 로 교체
+       텔레그램 /list 와 동일한 소스 사용 → 두 화면 항상 일치
+  [#2] 이월 종목(_detected_stocks)도 포착목록에 포함 (진입가 있으면 표시)
+  [#3] 정렬: hit 종목 상단 우선, 동순위는 등락률 내림차순
+  [#4] 표시 한도: 20 → 30건 확대 (활성 감시 종목 전체 커버)
+  [#5] miss_count 필드 추가 (재포착 횟수 — 향후 UI 표시 대비)
+  이유: 텔레그램 감시종목 현황과 대시보드 포착목록이 다른 소스로 읽어 내용 불일치
+        signal_log는 수익/손실 확정 종목도 포함 → 대시보드에 종료된 종목이 섞임
+        _entry_watch가 유일한 활성 감시 소스임에도 대시보드만 별도 소스 사용
+  개선점: 두 화면 완전 일치, 활성 감시 종목만 표시, 통합 학습/모니터링
+  주의점: signal_log는 /stats·학습·백테스트 용도로 그대로 유지 — 이 패치는 표시만 변경
+          _entry_watch가 비어있으면 포착목록 빈 화면 정상 (실제 감시 종목 없음)
+  진입불가 게이트 연결: 신규 발송 경로 없음 — 표시 로직만 변경 ✅
+
 - v169.17 (2026-05-03): 대기모드 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
   [#1] 대기모드 스케줄: 5분마다 _push_dashboard_json() → updated_at 타임스탬프 갱신
   [#2] 대기모드 스케줄: 120분마다 _refresh_premarket_sectors() → 섹터목록 갱신
@@ -27779,30 +27794,58 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
-        # ── 포착 목록 (signal_log + 웹소켓 가격, ETF/선물 제외) ──
+        # ── 포착 목록 (_entry_watch 기반 — 텔레그램 /list 동일 소스) v170.0 ──
         captured_raw = []
         _ETF_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스")
         try:
-            for key, rec in list((_load_signal_log_data() or {}).items())[:50]:
-                if not isinstance(rec, dict): continue
-                code = normalize_stock_code(rec.get("code",""))
-                name = rec.get("name","")
-                # ETF/선물/옵션 제외: 이름에 마커 포함이거나 코드가 6자리 아닌 경우
+            seen_cap: set = set()
+            # ① _entry_watch: 진입가 감시 중 + 진입 도달 후 목표가 추적 중
+            for _, watch in list((_entry_watch or {}).items()):
+                if not isinstance(watch, dict): continue
+                code = normalize_stock_code(watch.get("code",""))
+                name = watch.get("name","") or _resolve_stock_name(code,"")
                 if not code or len(code) != 6: continue
                 if any(m in name for m in _ETF_MARKERS): continue
+                if code in seen_cap: continue
+                seen_cap.add(code)
+                snap    = _get_snap(code)
+                cur_price = safe_int(snap.get("price") or 0)
+                e_price   = safe_int(watch.get("entry_price") or 0)
+                hit = bool(watch.get("entry_hit")) or (
+                    cur_price > 0 and e_price > 0 and cur_price >= e_price)
+                captured_raw.append({
+                    "name":       name,
+                    "code":       code,
+                    "price":      cur_price,
+                    "entry":      e_price,
+                    "target":     safe_int(watch.get("target_price") or 0),
+                    "stop":       safe_int(watch.get("stop_loss") or 0),
+                    "hit":        hit,
+                    "chg":        float(snap.get("change_rate") or watch.get("change_at_detect") or 0),
+                    "miss_count": int(watch.get("miss_count") or 0),
+                })
+            # ② _detected_stocks: 이월 종목 (entry_price 있으면 포함)
+            for code, rec in list((_detected_stocks or {}).items()):
+                code = normalize_stock_code(str(code or ""))
+                if not code or len(code) != 6 or code in seen_cap: continue
+                name = rec.get("name","") or _resolve_stock_name(code,"")
+                if any(m in name for m in _ETF_MARKERS): continue
+                seen_cap.add(code)
                 snap = _get_snap(code)
                 captured_raw.append({
-                    "name":   name,
-                    "code":   code,
-                    "price":  safe_int(snap.get("price") or rec.get("price") or 0),
-                    "entry":  safe_int(rec.get("entry_price") or 0),
-                    "target": safe_int(rec.get("target_price") or 0),
-                    "stop":   safe_int(rec.get("stop_loss") or 0),
-                    "hit":    bool(rec.get("entry_hit")),
-                    "chg":    float(snap.get("change_rate") or rec.get("change_rate") or 0),
+                    "name":       name,
+                    "code":       code,
+                    "price":      safe_int(snap.get("price") or 0),
+                    "entry":      safe_int(rec.get("entry_price") or 0),
+                    "target":     safe_int(rec.get("target_price") or 0),
+                    "stop":       safe_int(rec.get("stop_loss") or 0),
+                    "hit":        False,
+                    "chg":        float(snap.get("change_rate") or 0),
+                    "miss_count": 0,
                 })
-            captured_raw.sort(key=lambda x: -x["chg"])
-            captured_raw = captured_raw[:20]
+            # hit 종목 상단 우선, 동순위는 등락률 내림차순
+            captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
+            captured_raw = captured_raw[:30]
         except Exception:
             pass
 
