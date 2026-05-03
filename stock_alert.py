@@ -3,10 +3,26 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.18
+버전: v169.19
 날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.19 (2026-05-03): 대시보드 4가지 개선 + HTML 인라인 임베드
+  [#1] 포착목록 전종목 표시: hit=True/False 모두 표시, hit 우선 정렬, 수익률 컬럼 추가
+       - _entry_watch: peak_price 가격 폴백 (장마감 후 스냅 비어있어도 표시)
+       - _detected_stocks: high_price 가격 폴백
+       - 수익률: price=0이면 "--", 양수=노란색, 음수=보라색
+  [#2] 장마감 후 수익률: 최종 현재가(peak_price/high_price) 기준으로 수익률 표시
+  [#3] 순위목록: market_open=False 시 "🏁 장 마감" 메시지 표시 (빈 데이터 아님)
+       payload에 market_open 필드 추가 → 대시보드 JS가 읽어 분기
+  [#4] 포착·랭킹·알람 목록: col-body overflow-y:auto 명시 (스크롤)
+  [#5] 대시보드 HTML 인라인 임베드 (_DASHBOARD_HTML 상수) → dashboard.html 파일 불필요
+       _flask_board: 파일 있으면 파일 우선, 없으면 상수 서빙
+  이유: 장마감 후 포착목록 price=0 → 수익률 "--", 순위목록에 stale 데이터 노출
+        도달 종목만 표시되는 HTML 필터 문제, 스크롤 미동작 컬럼 존재
+  개선점: 장운영시간 관계없이 포착목록 전체 표시, 장마감 순위 안내 메시지
+  주의점: _DASHBOARD_HTML은 버전과 함께 관리 — 대시보드 수정 시 반드시 이 상수도 갱신
+
 - v169.18 (2026-05-03): 대시보드 포착목록 소스 통합 (_entry_watch 단일화)
   [#1] _push_dashboard_json() 포착목록: signal_log → _entry_watch + _detected_stocks 로 교체
        텔레그램 /list 와 동일한 소스 사용 → 두 화면 항상 일치
@@ -27809,7 +27825,8 @@ def _push_dashboard_json() -> None:
                 if code in seen_cap: continue
                 seen_cap.add(code)
                 snap    = _get_snap(code)
-                cur_price = safe_int(snap.get("price") or 0)
+                # v169.19: 장마감 후 snap 비어도 peak_price 폴백
+                cur_price = safe_int(snap.get("price") or watch.get("peak_price") or 0)
                 e_price   = safe_int(watch.get("entry_price") or 0)
                 hit = bool(watch.get("entry_hit")) or (
                     cur_price > 0 and e_price > 0 and cur_price >= e_price)
@@ -27832,10 +27849,12 @@ def _push_dashboard_json() -> None:
                 if any(m in name for m in _ETF_MARKERS): continue
                 seen_cap.add(code)
                 snap = _get_snap(code)
+                # v169.19: 장마감 후 snap 비어도 high_price 폴백
+                d_price = safe_int(snap.get("price") or rec.get("high_price") or 0)
                 captured_raw.append({
                     "name":       name,
                     "code":       code,
-                    "price":      safe_int(snap.get("price") or 0),
+                    "price":      d_price,
                     "entry":      safe_int(rec.get("entry_price") or 0),
                     "target":     safe_int(rec.get("target_price") or 0),
                     "stop":       safe_int(rec.get("stop_loss") or 0),
@@ -27874,6 +27893,7 @@ def _push_dashboard_json() -> None:
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
             "next_biz_day": _next_biz_day_str(),
+            "market_open":  is_any_market_open(),
             "sectors":      sectors_raw,
             "captured":     captured_raw,
             "alerts":       alerts_snapshot,
@@ -27892,13 +27912,260 @@ def _push_dashboard_json() -> None:
 # ── Flask 앱 ──────────────────────────────────────────────────
 _flask_app = _Flask(__name__)
 
+# v169.19: 대시보드 HTML 인라인 임베드 (dashboard.html 파일 불필요)
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1920">
+<title>📈 실시간 주식 보드</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothic Neo",sans-serif;overflow:hidden;height:100vh}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:#070d1a}
+::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+#hdr{height:34px;display:flex;align-items:center;gap:10px;padding:0 12px;background:#0c1525;border-bottom:1px solid #1e293b;flex-shrink:0}
+.logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
+.badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
+.ts{font-size:10px;color:#b8ccd8;margin-left:auto}
+#main{display:grid;grid-template-columns:310px 310px 560px 340px 400px;height:calc(100vh - 34px);overflow:hidden}
+.col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
+.col:last-child{border-right:none}
+.col-title{height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;background:#0a1628;border-bottom:1px solid #1e2d45}
+.col-title span{font-size:11px;font-weight:700;letter-spacing:.8px}
+.sub-tag{font-size:9px;color:#c8e4f8;background:#0f172a;border:1px solid #2a4060;border-radius:3px;padding:1px 5px}
+.tbl-head{display:grid;height:20px;padding:0 5px;align-items:center;flex-shrink:0;background:#050a15;border-bottom:1px solid #0d1520}
+.tbl-head span{font-size:9px;font-weight:700;color:#c8e4f8;letter-spacing:.3px}
+.tbl-head span:not(:first-child){text-align:right}
+.col-body{overflow-y:auto;overflow-x:hidden;flex:1}
+.col.sec{border-right:1px solid #1a2d45;background:#060c1a}
+#sec-a{border-right:1px solid #1a2d45}
+#sec-b{border-right:2px solid #1e3a5f}
+.sec-sub{display:flex;align-items:center;gap:6px;height:24px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;position:sticky;top:0;z-index:5}
+.sec-sub.pos{background:#0d2518}.sec-sub.neg{background:#22100a}
+.sec-rnk{width:16px;height:16px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:9px;color:#0a0f1e;flex-shrink:0}
+.sec-nm{font-size:11px;font-weight:700;color:#e2e8f0}.sec-chg{margin-left:auto;font-size:12px;font-weight:700}
+.stk-row{display:grid;grid-template-columns:90px 54px 46px 56px 64px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.stk-row:hover{background:#0d1e30}
+.stk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cp{cursor:pointer;user-select:none;font-family:"Courier New",monospace;font-size:9px;padding:0 3px;border-radius:2px;border:1px solid #2a4a65;background:#050a14;color:#c8e4f8;transition:all .12s;text-align:center}
+.cp:hover{border-color:#ff444470;color:#ff4444}.cp.ok{color:#ff4444;border-color:#ff444460}
+.chg-v{font-size:11px;font-weight:700;text-align:right}
+.vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
+/* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
+.cap-head{grid-template-columns:110px 54px 44px 68px 56px 82px 74px}
+.cap-row{display:grid;grid-template-columns:110px 54px 44px 68px 56px 82px 74px;height:24px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
+.cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
+.live-dot{width:7px;height:7px;border-radius:50%;background:#00d97e;box-shadow:0 0 5px #00d97e;animation:pulse 2s infinite}
+.alr{padding:6px 12px;border-bottom:1px solid #09111e;transition:background .1s}
+.alr:hover{background:#0d1a2a}
+.alr.red{border-left:3px solid #00c070}.alr.yellow{border-left:3px solid #f59e0b}.alr.blue{border-left:3px solid #3b82f6}
+.alr-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.alr-dot.red{background:#00d97e}.alr-dot.yellow{background:#fbbf24}.alr-dot.blue{background:#60a5fa}
+.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.alr-time{margin-left:auto;font-size:10px;color:#b8ccd8;flex-shrink:0;padding-left:6px}
+.alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap}
+.rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
+.rank-sec-title span{font-size:10px;font-weight:700}
+.rk-row{display:grid;grid-template-columns:20px 100px 54px 48px 58px 80px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.rk-row:hover{background:#0d1e30}
+.rk-no{font-size:10px;font-weight:700;color:#c8e4f8}
+.rk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rk-head{grid-template-columns:20px 100px 54px 48px 58px 80px}
+.mkt-closed{padding:30px 12px;text-align:center;color:#607080}
+.mkt-closed p{font-size:13px;margin-bottom:6px}
+.mkt-closed small{font-size:10px;color:#405060}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <span class="logo">📈 실시간 주식 보드</span>
+  <span class="badge" id="mkt-badge">🟢 장 운영중</span>
+  <span class="ts">다음 영업일: <b id="next-biz">--</b> &nbsp;|&nbsp; 마지막 갱신: <b id="ts">--:--:--</b></span>
+</div>
+<div id="main">
+  <div class="col sec" id="sec-a">
+    <div class="col-title"><span style="color:#60a5fa">SECTOR LIST</span><span class="sub-tag">등락률순 실시간</span></div>
+    <div class="tbl-head" style="grid-template-columns:90px 54px 46px 56px 64px;padding:0 8px">
+      <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span></div>
+    <div class="col-body" id="sec-a-body"></div>
+  </div>
+  <div class="col sec" id="sec-b">
+    <div class="col-title"><span style="color:#60a5fa">SECTOR LIST</span><span class="sub-tag">등락률순 실시간</span></div>
+    <div class="tbl-head" style="grid-template-columns:90px 54px 46px 56px 64px;padding:0 8px">
+      <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span></div>
+    <div class="col-body" id="sec-b-body"></div>
+  </div>
+  <div class="col">
+    <div class="col-title">
+      <span style="color:#a78bfa">🎯 종목 포착</span>
+      <span class="sub-tag" style="color:#ff4444;border-color:#ff444425">전체</span>
+    </div>
+    <div class="tbl-head cap-head" style="padding:0 8px">
+      <span style="text-align:left">종목명</span><span>코드</span><span>등락률</span>
+      <span>진입가</span><span>수익률</span><span>목표가</span><span>손절가</span></div>
+    <div class="col-body" id="cap-body"></div>
+  </div>
+  <div class="col">
+    <div class="col-title"><span style="color:#d4eaf8">📨 알람 목록</span><span class="live-dot"></span></div>
+    <div class="col-body" id="alr-body"></div>
+  </div>
+  <div class="col">
+    <div class="col-title"><span style="color:#00d97e">📋 상위 랭킹</span><span class="sub-tag" id="rank-badge">장중만</span></div>
+    <div class="tbl-head rk-head" style="padding:0 8px" id="rank-head">
+      <span>#</span><span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span></div>
+    <div class="col-body" id="rank-body"></div>
+  </div>
+</div>
+<script>
+let sectors=[],captured=[],alerts=[],rChg=[],rVol=[],rView=[];
+let marketOpen=false;
+const fg=v=>(v>=0?"+":"")+v.toFixed(2)+"%";
+const cc=v=>v>0?"#ff4444":v<0?"#00d97e":"#b8ccd8";
+const fmt=n=>n>0?Number(n).toLocaleString("ko-KR"):"--";
+const pct=(a,b)=>b>0?((a-b)/b*100):0;
+function cp(el,code){
+  try{navigator.clipboard.writeText(code)}catch{}
+  const p=el.textContent;el.textContent="✓";el.classList.add("ok");
+  setTimeout(()=>{el.textContent=p;el.classList.remove("ok")},1400);
+}
+function renderSectors(){
+  const sorted=[...sectors].sort((a,b)=>b.chg-a.chg);
+  const a=sorted.filter((_,i)=>i%2===0),b=sorted.filter((_,i)=>i%2!==0);
+  document.getElementById("sec-a-body").innerHTML=secHTML(a,0);
+  document.getElementById("sec-b-body").innerHTML=secHTML(b,1);
+}
+function secHTML(list,offset){
+  return list.map((sec,li)=>{
+    const rank=(li*2)+offset+1,pos=sec.chg>=0,ac=pos?"#ff4444":"#00d97e";
+    const ss=[...sec.stocks].sort((a,b)=>b.chg-a.chg);
+    return `<div class="sec-sub ${pos?"pos":"neg"}">
+      <div class="sec-rnk" style="background:${ac}">${rank}</div>
+      <span class="sec-nm">${sec.name}</span>
+      <span class="sec-chg" style="color:${ac}">${fg(sec.chg)}</span></div>
+      ${ss.map(s=>`<div class="stk-row">
+        <span class="stk-nm">${s.name}</span>
+        <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+        <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
+        <span class="vol-v">${s.vol||""}</span>
+        <span class="amt-v">${s.amt||""}</span>
+      </div>`).join("")}`;
+  }).join("");
+}
+function renderCapture(){
+  // hit 우선, 동순위는 등락률 내림차순 — 전체 표시 (필터 없음)
+  const sorted=[...captured].sort((a,b)=>(b.hit-a.hit)||b.chg-a.chg);
+  document.getElementById("cap-body").innerHTML=sorted.length===0
+    ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">포착 종목 없음</div>'
+    :sorted.map(s=>{
+      const pnlPct=(s.price>0&&s.entry>0)?((s.price-s.entry)/s.entry*100):null;
+      const pnlTxt=pnlPct!==null?`${pnlPct>=0?"+":""}${pnlPct.toFixed(1)}%`:"--";
+      const pnlClr=pnlPct===null?"#607080":pnlPct>=0?"#fbbf24":"#c084fc";
+      const eClr=s.hit?"#00d97e":"#eef4fa";
+      return `<div class="cap-row ${s.hit?"hit":""}">
+        <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>
+        <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+        <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
+        <span style="font-size:10px;color:${eClr};text-align:right">${s.entry>0?Number(s.entry).toLocaleString("ko-KR"):"--"}</span>
+        <span style="font-size:10px;color:${pnlClr};text-align:right">${pnlTxt}</span>
+        <span style="font-size:10px;color:#60a5fa;text-align:right">${s.target>0?Number(s.target).toLocaleString("ko-KR"):"--"}</span>
+        <span style="font-size:10px;color:#00d97e;text-align:right">${s.stop>0?Number(s.stop).toLocaleString("ko-KR"):"--"}</span>
+      </div>`;
+    }).join("");
+}
+function renderAlerts(){
+  document.getElementById("alr-body").innerHTML=alerts.length===0
+    ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
+    :alerts.map(a=>`<div class="alr ${a.lvl}">
+      <div class="alr-top"><span class="alr-dot ${a.lvl}"></span>
+      <span class="alr-ttl">${a.title}</span>
+      <span class="alr-time">${a.time}</span></div>
+      <div class="alr-body">${a.body||""}</div></div>`).join("");
+}
+function renderRanking(){
+  const rb=document.getElementById("rank-body");
+  const rh=document.getElementById("rank-head");
+  if(!marketOpen){
+    rh.style.display="none";
+    rb.innerHTML='<div class="mkt-closed"><p>🏁 장 마감</p><small>장 운영 시간에만 표시됩니다</small></div>';
+    return;
+  }
+  rh.style.display="";
+  const sections=[
+    {title:"🔥 등락률 상위",color:"#00d97e",data:[...rChg].sort((a,b)=>b.chg-a.chg)},
+    {title:"📊 거래량 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.chg-a.chg)},
+    {title:"👁 조회수 상위",color:"#a78bfa",data:[...rView].sort((a,b)=>b.chg-a.chg)},
+  ];
+  rb.innerHTML=sections.map(sec=>`
+    <div class="rank-sec-title"><span style="color:${sec.color}">${sec.title}</span></div>
+    ${sec.data.map((s,i)=>`<div class="rk-row">
+      <span class="rk-no">${i+1}</span>
+      <span class="rk-nm">${s.name}</span>
+      <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+      <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
+      <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.vol||""}</span>
+      <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.amt||""}</span>
+    </div>`).join("")}`).join("");
+}
+function renderAll(ts){
+  renderSectors();renderCapture();renderAlerts();renderRanking();
+  if(ts) document.getElementById("ts").textContent=ts;
+  else document.getElementById("ts").textContent=new Date().toLocaleTimeString("ko-KR");
+}
+async function fetchAndRender(){
+  try{
+    const res=await fetch("/api/data");
+    if(!res.ok) throw new Error(res.status);
+    const d=await res.json();
+    if(d.sectors&&d.sectors.length) sectors=d.sectors;
+    if(d.captured) captured=d.captured;
+    if(d.alerts&&d.alerts.length) alerts=d.alerts;
+    if(d.rank_chg&&d.rank_chg.length) rChg=d.rank_chg;
+    if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
+    if(d.rank_view&&d.rank_view.length) rView=d.rank_view;
+    if(d.next_biz_day) document.getElementById("next-biz").textContent=d.next_biz_day;
+    if(d.market_open!==undefined){
+      marketOpen=d.market_open;
+      const badge=document.getElementById("mkt-badge");
+      badge.textContent=marketOpen?"🟢 장 운영중":"🔴 장 마감";
+      badge.style.color=marketOpen?"#00d97e":"#ff4444";
+      badge.style.borderColor=marketOpen?"#00d97e30":"#ff444430";
+    }
+    renderAll(d.updated_at);
+  }catch(e){console.warn("fetch /api/data 실패:",e)}
+}
+function getNextBizDay(){
+  const DAYS=["일","월","화","수","목","금","토"];
+  const HOLIDAYS=new Set(["2026-01-01","2026-03-01","2026-05-05","2026-06-06","2026-08-15","2026-10-03","2026-10-09","2026-12-25"]);
+  const d=new Date();d.setHours(0,0,0,0);
+  const now=new Date();
+  if(now.getHours()>15||(now.getHours()===15&&now.getMinutes()>=30)) d.setDate(d.getDate()+1);
+  for(let i=0;i<10;i++){
+    const dow=d.getDay(),ymd=d.toISOString().slice(0,10);
+    if(dow!==0&&dow!==6&&!HOLIDAYS.has(ymd)) return `${d.getMonth()+1}월 ${d.getDate()}일 (${DAYS[dow]})`;
+    d.setDate(d.getDate()+1);
+  }
+  return "--";
+}
+document.getElementById("next-biz").textContent=getNextBizDay();
+fetchAndRender();
+setInterval(fetchAndRender,10000);
+</script>
+</body>
+</html>"""
+
 @_flask_app.route("/board")
 def _flask_board():
-    """대시보드 HTML 서빙"""
+    """대시보드 HTML 서빙 — v169.19: 파일 우선, 없으면 인라인 상수"""
     dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
     if os.path.exists(dashboard_path):
         return _send_file(dashboard_path)
-    return "dashboard.html not found", 404
+    return _DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @_flask_app.route("/api/data")
 def _flask_api_data():
