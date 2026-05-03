@@ -6,3 +6,4 @@ pytz
 APScheduler
 google-genai>=1.0.0
 flask>=3.0.0
+websocket-client>=1.6.0
