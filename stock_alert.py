@@ -3,10 +3,23 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.21
+버전: v169.22
 날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.22 (2026-05-03): 순위 데이터 마지막 장 기준 저장·복원
+  [#1] _WEB_DASHBOARD_RANK_FILE 신설 (web_dashboard_rank.json)
+       장중 라이브 순위 → 파일 저장 (rank_date 타임스탬프 포함)
+       재시작/장마감 → 파일에서 마지막 순위 복원 → 대시보드에 표시
+  [#2] payload에 rank_date(MM-DD HH:MM) 추가
+       JS fetchAndRender: dataDate = rank_date 로 업데이트
+       "📅 05-02 17:58 기준" 형태로 마지막 장 NXT 종가 시점 표시
+  이유: 재시작 후 _execution_snapshots 비어 순위 데이터 소실
+        마지막 장 기준 순위를 유지해 날짜 맥락과 함께 보여줘야 함
+  개선점: NXT 장마감(20:00) 시점 순위가 재시작 후에도 유지됨
+  주의점: _execution_snapshots 300초 타임아웃 체크 제거 — 장마감 직후
+          마지막 스냅샷이 300초 이상 지난 경우도 저장 대상에 포함
+
 - v169.21 (2026-05-03): 모바일 세로 모드 컨텐츠 표시 복구
   [#1] body CSS: overflow:hidden + height:100vh 제거
        → 모바일 세로 모드에서 body가 컨텐츠를 clip하던 문제 해결
@@ -27615,6 +27628,7 @@ def update_dashboard(force: bool = False) -> None:
 _WEB_DASHBOARD_JSON          = _state_path("web_dashboard.json")
 _WEB_DASHBOARD_ALERTS_JSON   = _state_path("web_dashboard_alerts.json")
 _WEB_DASHBOARD_PREMARKET_JSON= _state_path("web_dashboard_premarket.json")  # v169.14: 장전 섹터 캐시
+_WEB_DASHBOARD_RANK_FILE     = _state_path("web_dashboard_rank.json")       # v169.22: 마지막 장 순위 캐시
 _WEB_DASHBOARD_ALERTS: list  = []
 _WEB_DASHBOARD_LOCK          = threading.Lock()
 _WEB_DASHBOARD_LAST_PUSH: float = 0.0
@@ -27887,13 +27901,14 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
-        # ── 랭킹 (웹소켓 구독 종목 기반) ─────────────────
+        # ── 랭킹 (웹소켓 구독 종목 기반, 장마감 후 캐시 복원) v169.22 ──
         rank_base = []
+        rank_date_str = datetime.now().strftime("%m-%d %H:%M")
         try:
             for code, buf in list(_execution_snapshots.items()):
                 if not buf: continue
                 snap = buf[-1]
-                if time.time() - float(snap.get("ts",0)) > 300: continue
+                # v169.22: 300초 타임아웃 제거 — 장마감 직후 마지막 스냅도 저장 대상
                 rank_base.append({
                     "name":    _resolve_stock_name(code,""),
                     "code":    code,
@@ -27906,20 +27921,48 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
+        rank_chg_out  = sorted(rank_base, key=lambda x:-x["chg"])[:12]
+        rank_vol_out  = sorted(rank_base, key=lambda x:-x["vol_raw"])[:12]
+        rank_view_out = sorted(rank_base, key=lambda x:-x["amt_raw"])[:12]
+
+        if rank_base:
+            # 장중 라이브 데이터 → 파일 저장
+            try:
+                _write_json_atomic(_WEB_DASHBOARD_RANK_FILE, {
+                    "rank_date": datetime.now().strftime("%m-%d %H:%M"),
+                    "rank_chg":  rank_chg_out,
+                    "rank_vol":  rank_vol_out,
+                    "rank_view": rank_view_out,
+                })
+            except Exception:
+                pass
+        else:
+            # 장마감/재시작 → 저장된 마지막 순위 복원
+            try:
+                saved = _read_json_locked(_WEB_DASHBOARD_RANK_FILE)
+                if saved and isinstance(saved, dict):
+                    rank_date_str  = saved.get("rank_date", rank_date_str)
+                    rank_chg_out   = saved.get("rank_chg", [])
+                    rank_vol_out   = saved.get("rank_vol", [])
+                    rank_view_out  = saved.get("rank_view", [])
+            except Exception:
+                pass
+
         with _WEB_DASHBOARD_LOCK:
             alerts_snapshot = list(_WEB_DASHBOARD_ALERTS)
 
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
             "data_date":    datetime.now().strftime("%m-%d"),
+            "rank_date":    rank_date_str,
             "next_biz_day": _next_biz_day_str(),
             "market_open":  is_any_market_open(),
             "sectors":      sectors_raw,
             "captured":     captured_raw,
             "alerts":       alerts_snapshot,
-            "rank_chg":     sorted(rank_base, key=lambda x:-x["chg"])[:12],
-            "rank_vol":     sorted(rank_base, key=lambda x:-x["vol_raw"])[:12],
-            "rank_view":    sorted(rank_base, key=lambda x:-x["amt_raw"])[:12],
+            "rank_chg":     rank_chg_out,
+            "rank_vol":     rank_vol_out,
+            "rank_view":    rank_view_out,
         }
         tmp = _WEB_DASHBOARD_JSON + ".tmp"
         with open(tmp,"w",encoding="utf-8") as f:
@@ -28166,7 +28209,7 @@ async function fetchAndRender(){
     if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
     if(d.rank_view&&d.rank_view.length) rView=d.rank_view;
     if(d.next_biz_day) document.getElementById("next-biz").textContent=d.next_biz_day;
-    if(d.data_date) dataDate=d.data_date;
+    if(d.rank_date) dataDate=d.rank_date;  // v169.22: 순위 기준 시점 (MM-DD HH:MM)
     if(d.market_open!==undefined){
       marketOpen=d.market_open;
       const badge=document.getElementById("mkt-badge");
