@@ -3,10 +3,33 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.23
+버전: v169.25
 날짜: 2026-05-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.25 (2026-05-04): 대시보드 4개 이슈 통합 수정
+  [#1] 알람 목록 잘림: alr-ttl overflow:hidden 제거, alr-top flex-wrap:wrap 추가
+       → flex 컨테이너 안에서 제목이 잘리던 문제 해결
+  [#2] 섹터 목록 빈칸: _sector_cache 미매핑 시 _execution_snapshots 기반 자체 섹터 빌드 폴백
+       → NXT 장(08~09시) 포함 섹터 API 실패 시에도 보유 틱 데이터로 섹터 표시
+  [#3] 종목 사라짐: _get_snap() 가격=0 시 watch 내 모든 가격 폴백 강화
+       entry_price / target_price / stop_loss / change_at_detect 직접 사용
+  [#4] 순위 12→30개 확대, #main overflow:hidden 제거 → 스크롤 가능
+  이유: alr-top flex+overflow:hidden 조합으로 제목 잘림 / 섹터 API KRX전용 / 순위 12개 고정
+  개선점: 알람 전체 표시, NXT 장에도 섹터 표시, 순위 30개 스크롤
+  주의점: 섹터 자체빌드는 _execution_snapshots 기반 — 틱 없으면 빈칸 유지
+
+- v169.24 (2026-05-04): 미국시장 알람 실값 발송 보장
+  [#1] _handle_telegram_us_command: _us_cache.clear() 제거
+       캐시 있으면 즉시 사용, 없거나 nasdaq_chg=0.0이면 최대 3회 재시도(12초 간격)
+       3회 모두 0.0이면 "데이터 수집 중" 안내 발송
+  [#2] crumb TTL 21600초(6h) → 3600초(1h)
+       Yahoo 세션 만료로 인한 비JSON 빈도 감소
+  이유: _us_cache.clear() 후 Yahoo 1차 호출 HTML 반환(비JSON)
+        → nasdaq_chg=0.0 / vix=20 기본값 그대로 발송되던 문제
+  개선점: 실값 확보 후 발송 보장, 기본값 발송 차단
+  주의점: 재시도 최대 36초 지연 가능 — 스레드에서 실행되므로 봇 블로킹 없음
+
 - v169.23 (2026-05-04): 대시보드 알람 목록 내용 잘림 수정
   [#1] .alr-ttl: white-space:nowrap + text-overflow:ellipsis 제거
        → 긴 제목이 줄바꿈되어 전체 표시
@@ -27846,6 +27869,31 @@ def _push_dashboard_json() -> None:
                     if name:
                         sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                 sectors_raw.sort(key=lambda x:-x["chg"])
+                # v169.25: 섹터 종목 없으면 _execution_snapshots 기반 자체 빌드 폴백
+                if not any(s["stocks"] for s in sectors_raw):
+                    snap_groups: dict = {}
+                    for code, buf in list(_execution_snapshots.items()):
+                        if not buf: continue
+                        snap = buf[-1]
+                        sec_name = (_sector_cache.get(code) or {}).get("sector") or "기타"
+                        chg_v = float(snap.get("change_rate") or 0)
+                        if sec_name not in snap_groups:
+                            snap_groups[sec_name] = {"chg_sum": 0, "cnt": 0, "stocks": []}
+                        snap_groups[sec_name]["chg_sum"] += chg_v
+                        snap_groups[sec_name]["cnt"] += 1
+                        snap_groups[sec_name]["stocks"].append({
+                            "name": _resolve_stock_name(code, ""),
+                            "code": code,
+                            "chg":  chg_v,
+                            "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                            "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                        })
+                    sectors_raw = []
+                    for sec_name, g in snap_groups.items():
+                        avg = g["chg_sum"] / max(g["cnt"], 1)
+                        top = sorted(g["stocks"], key=lambda x: -x["chg"])[:8]
+                        sectors_raw.append({"name": sec_name, "chg": round(avg, 2), "stocks": top})
+                    sectors_raw.sort(key=lambda x: -x["chg"])
             else:
                 # 장마감/휴장: 캐시된 장전 섹터 사용
                 sectors_raw = list(_WEB_DASHBOARD_PREMARKET_SECTORS)
@@ -27867,8 +27915,17 @@ def _push_dashboard_json() -> None:
                 if code in seen_cap: continue
                 seen_cap.add(code)
                 snap    = _get_snap(code)
-                # v169.19: 장마감 후 snap 비어도 peak_price 폴백
-                cur_price = safe_int(snap.get("price") or watch.get("peak_price") or 0)
+                # v169.25: 장 시작 직후 snap 비어도 watch 내 모든 가격 폴백
+                cur_price = safe_int(
+                    snap.get("price") or
+                    watch.get("peak_price") or
+                    watch.get("last_price") or
+                    watch.get("entry_price") or 0
+                )
+                chg_val = float(
+                    snap.get("change_rate") or
+                    watch.get("change_at_detect") or 0
+                )
                 e_price   = safe_int(watch.get("entry_price") or 0)
                 hit = bool(watch.get("entry_hit")) or (
                     cur_price > 0 and e_price > 0 and cur_price >= e_price)
@@ -27880,7 +27937,7 @@ def _push_dashboard_json() -> None:
                     "target":     safe_int(watch.get("target_price") or 0),
                     "stop":       safe_int(watch.get("stop_loss") or 0),
                     "hit":        hit,
-                    "chg":        float(snap.get("change_rate") or watch.get("change_at_detect") or 0),
+                    "chg":        chg_val,
                     "miss_count": int(watch.get("miss_count") or 0),
                 })
             # ② _detected_stocks: 이월 종목 (entry_price 있으면 포함)
@@ -27930,9 +27987,9 @@ def _push_dashboard_json() -> None:
         except Exception:
             pass
 
-        rank_chg_out  = sorted(rank_base, key=lambda x:-x["chg"])[:12]
-        rank_vol_out  = sorted(rank_base, key=lambda x:-x["vol_raw"])[:12]
-        rank_view_out = sorted(rank_base, key=lambda x:-x["amt_raw"])[:12]
+        rank_chg_out  = sorted(rank_base, key=lambda x:-x["chg"])[:30]
+        rank_vol_out  = sorted(rank_base, key=lambda x:-x["vol_raw"])[:30]
+        rank_view_out = sorted(rank_base, key=lambda x:-x["amt_raw"])[:30]
 
         if rank_base:
             # 장중 라이브 데이터 → 파일 저장
@@ -28002,7 +28059,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
-#main{display:grid;grid-template-columns:310px 310px 560px 340px 400px;height:calc(100vh - 34px);overflow:hidden}
+#main{display:grid;grid-template-columns:310px 310px 560px 340px 400px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
 .col:last-child{border-right:none}
 .col-title{height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;background:#0a1628;border-bottom:1px solid #1e2d45}
@@ -28036,10 +28093,10 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr{padding:6px 12px;border-bottom:1px solid #09111e;transition:background .1s}
 .alr:hover{background:#0d1a2a}
 .alr.red{border-left:3px solid #00c070}.alr.yellow{border-left:3px solid #f59e0b}.alr.blue{border-left:3px solid #3b82f6}
-.alr-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
-.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.alr-top{display:flex;align-items:flex-start;gap:5px;margin-bottom:3px;flex-wrap:wrap}
+.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:3px}
 .alr-dot.red{background:#00d97e}.alr-dot.yellow{background:#fbbf24}.alr-dot.blue{background:#60a5fa}
-.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;overflow:hidden;word-break:break-word}
+.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;word-break:break-word;flex:1;min-width:0}
 .alr-time{margin-left:auto;font-size:10px;color:#b8ccd8;flex-shrink:0;padding-left:6px}
 .alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
@@ -36485,24 +36542,37 @@ def _handle_telegram_geo_command():
             send(f"❌ 오류: {e}")
     threading.Thread(target=_run_geo, daemon=True).start()
 def _handle_telegram_us_command():
-    try:
-        _us_cache.clear()
-        us = get_us_market_signals()
-        gap_emoji = {"gap_up": "⬆️ 갭상승 기대", "flat": "➡️ 갭 없음", "gap_down": "⬇️ 갭하락 주의"}
-        regime_kor = {"panic": "🔵 급락장", "risk_off": "🔵 약세장", "neutral": "🔴 보통장", "risk_on": "🔴 강세장", "crash": "🔵 급락장", "bear": "🔵 약세장", "bull": "🔴 강세장"}
-        msg = (
-            f"🌐 <b>미국 시장 현황</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"나스닥선물: {us.get('nasdaq_chg',0):+.2f}%\n"
-            f"VIX 공포지수: {us.get('vix',0):.1f}\n"
-            f"달러인덱스: {us.get('dxy',0):.2f}\n"
-            f"시장 국면: {regime_kor.get(us.get('us_regime','neutral'),'🟡 중립')}\n"
-            f"갭 예측: {gap_emoji.get(us.get('gap_signal','flat'),'➡️')}\n"
-            f"점수 보정: {int(us.get('score_adj',0) or 0):+d}점"
-        )
-        send(msg)
-    except Exception as e:
-        send(f"❌ 미국 시장 조회 오류: {e}")
+    """v169.24: 실값 확보 후 발송 — nasdaq_chg=0.0(fallback) 이면 최대 3회 재시도."""
+    def _do():
+        try:
+            us = None
+            for attempt in range(3):
+                if attempt > 0:
+                    _us_cache.clear()   # crumb 포함 전체 초기화 후 재시도
+                    time.sleep(12)
+                us = get_us_market_signals()
+                if float(us.get("nasdaq_chg", 0.0) or 0.0) != 0.0:
+                    break
+            if not us or float(us.get("nasdaq_chg", 0.0) or 0.0) == 0.0:
+                send("🌐 미국시장 데이터 수집 중입니다. 잠시 후 /us 를 다시 시도해 주세요.")
+                return
+            gap_emoji = {"gap_up": "⬆️ 갭상승 기대", "flat": "➡️ 갭 없음", "gap_down": "⬇️ 갭하락 주의"}
+            regime_kor = {"panic": "🔵 급락장", "risk_off": "🔵 약세장", "neutral": "🟡 보통장",
+                          "risk_on": "🔴 강세장", "crash": "🔵 급락장", "bear": "🔵 약세장", "bull": "🔴 강세장"}
+            msg = (
+                f"🌐 <b>미국 시장 현황</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"나스닥선물: {us.get('nasdaq_chg', 0):+.2f}%\n"
+                f"VIX 공포지수: {us.get('vix', 0):.1f}\n"
+                f"달러인덱스: {us.get('dxy', 0):.2f}\n"
+                f"시장 국면: {regime_kor.get(us.get('us_regime', 'neutral'), '🟡 중립')}\n"
+                f"갭 예측: {gap_emoji.get(us.get('gap_signal', 'flat'), '➡️')}\n"
+                f"점수 보정: {int(us.get('score_adj', 0) or 0):+d}점"
+            )
+            send(msg)
+        except Exception as e:
+            send(f"❌ 미국 시장 조회 오류: {e}")
+    threading.Thread(target=_do, daemon=True).start()
 def _handle_telegram_yt_exclude_command(raw: str) -> None:
     """
     /yt_exclude 추가 키워드  — 제외 키워드 추가
@@ -39384,7 +39454,7 @@ def _fetch_yahoo_finance_crumb() -> tuple[str, dict]:
 def _get_yf_crumb() -> tuple[str, dict]:
     """v165.36: crumb 캐시 반환 (TTL 6시간). 실패 시 빈 값 허용."""
     global _yf_crumb_cache
-    if time.time() - float(_yf_crumb_cache.get("ts", 0) or 0) < 21600 and _yf_crumb_cache.get("crumb"):
+    if time.time() - float(_yf_crumb_cache.get("ts", 0) or 0) < 3600 and _yf_crumb_cache.get("crumb"):  # v169.24: 6h→1h
         return _yf_crumb_cache["crumb"], _yf_crumb_cache.get("cookies", {})
     crumb, cookies = _fetch_yahoo_finance_crumb()
     if crumb:
