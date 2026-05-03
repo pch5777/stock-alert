@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.19
+버전: v169.20
 날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.20 (2026-05-03): 대시보드 수익률 오류 수정 + 순위 날짜 레이블
+  [#1] 수익률: hit=True(진입 도달) 종목만 표시. 미도달 종목은 "진입까지 ±X%" 표시
+       (진입가 대비 현재가 거리 — 몇 % 남았는지 또는 얼마나 지났는지)
+       현재가=0이면 두 경우 모두 "--"
+  [#2] 순위목록: 장마감 시 숨기지 않고 "📅 MM-DD 기준" 레이블로 마지막 장 날짜 표시
+       payload에 data_date(MM-DD) 추가 → JS가 랭킹 헤더에 표시
+  이유: 미도달 종목에 수익률 표시 = 투자하지도 않은 수익률 → 오해 소지
+        순위목록 숨기면 참고 불가 → 날짜 레이블로 언제 기준인지 명시
+  개선점: 진입 전 종목은 진입까지 거리(%)/진입 후 종목은 실현 수익률 명확 구분
+  주의점: hit 판정은 watch.entry_hit 또는 price>=entry 중 하나라도 True여야 함
+
 - v169.19 (2026-05-03): 대시보드 4가지 개선 + HTML 인라인 임베드
   [#1] 포착목록 전종목 표시: hit=True/False 모두 표시, hit 우선 정렬, 수익률 컬럼 추가
        - _entry_watch: peak_price 가격 폴백 (장마감 후 스냅 비어있어도 표시)
@@ -27892,6 +27903,7 @@ def _push_dashboard_json() -> None:
 
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
+            "data_date":    datetime.now().strftime("%m-%d"),
             "next_biz_day": _next_biz_day_str(),
             "market_open":  is_any_market_open(),
             "sectors":      sectors_raw,
@@ -28024,7 +28036,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 </div>
 <script>
 let sectors=[],captured=[],alerts=[],rChg=[],rVol=[],rView=[];
-let marketOpen=false;
+let marketOpen=false,dataDate="--";
 const fg=v=>(v>=0?"+":"")+v.toFixed(2)+"%";
 const cc=v=>v>0?"#ff4444":v<0?"#00d97e":"#b8ccd8";
 const fmt=n=>n>0?Number(n).toLocaleString("ko-KR"):"--";
@@ -28058,14 +28070,25 @@ function secHTML(list,offset){
   }).join("");
 }
 function renderCapture(){
-  // hit 우선, 동순위는 등락률 내림차순 — 전체 표시 (필터 없음)
+  // hit 우선, 동순위는 등락률 내림차순 — 전체 표시
   const sorted=[...captured].sort((a,b)=>(b.hit-a.hit)||b.chg-a.chg);
   document.getElementById("cap-body").innerHTML=sorted.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">포착 종목 없음</div>'
     :sorted.map(s=>{
-      const pnlPct=(s.price>0&&s.entry>0)?((s.price-s.entry)/s.entry*100):null;
-      const pnlTxt=pnlPct!==null?`${pnlPct>=0?"+":""}${pnlPct.toFixed(1)}%`:"--";
-      const pnlClr=pnlPct===null?"#607080":pnlPct>=0?"#fbbf24":"#c084fc";
+      // ── 수익률(hit 종목) / 진입까지(미도달 종목) 구분 ──
+      let pnlTxt="--", pnlClr="#607080";
+      if(s.price>0 && s.entry>0){
+        const diff=(s.price-s.entry)/s.entry*100;
+        if(s.hit){
+          // 진입 완료 → 실현 수익률
+          pnlTxt=(diff>=0?"+":"")+diff.toFixed(1)+"%";
+          pnlClr=diff>=0?"#fbbf24":"#c084fc";
+        } else {
+          // 미도달 → 진입가까지 거리
+          pnlTxt=(diff>=0?"↑":"")+diff.toFixed(1)+"%";
+          pnlClr=diff>=0?"#60a5fa":"#94a3b8";  // 파랑=이미 진입가 넘음(지연), 회색=아직 못 미침
+        }
+      }
       const eClr=s.hit?"#00d97e":"#eef4fa";
       return `<div class="cap-row ${s.hit?"hit":""}">
         <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>
@@ -28090,10 +28113,16 @@ function renderAlerts(){
 function renderRanking(){
   const rb=document.getElementById("rank-body");
   const rh=document.getElementById("rank-head");
+  const badge=document.getElementById("rank-badge");
   if(!marketOpen){
-    rh.style.display="none";
-    rb.innerHTML='<div class="mkt-closed"><p>🏁 장 마감</p><small>장 운영 시간에만 표시됩니다</small></div>';
-    return;
+    // 장마감: 데이터 유지하되 날짜 레이블 표시
+    badge.textContent=`📅 ${dataDate} 기준`;
+    badge.style.color="#94a3b8";
+    badge.style.borderColor="#2a3a50";
+  } else {
+    badge.textContent="장중 실시간";
+    badge.style.color="#00d97e";
+    badge.style.borderColor="#00d97e30";
   }
   rh.style.display="";
   const sections=[
@@ -28129,6 +28158,7 @@ async function fetchAndRender(){
     if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
     if(d.rank_view&&d.rank_view.length) rView=d.rank_view;
     if(d.next_biz_day) document.getElementById("next-biz").textContent=d.next_biz_day;
+    if(d.data_date) dataDate=d.data_date;
     if(d.market_open!==undefined){
       marketOpen=d.market_open;
       const badge=document.getElementById("mkt-badge");
