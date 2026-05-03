@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.16
-날짜: 2026-05-02
+버전: v169.17
+날짜: 2026-05-03
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.17 (2026-05-03): 대기모드 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
+  [#1] 대기모드 스케줄: 5분마다 _push_dashboard_json() → updated_at 타임스탬프 갱신
+  [#2] 대기모드 스케줄: 120분마다 _refresh_premarket_sectors() → 섹터목록 갱신
+  [#3] _auto_push_us_market_info() 신설: 미국 시장 현황 변경 감지 → 자동 텔레그램 알람
+       180분마다 실행, regime/VIX/gap_signal/NQ방향 해시 비교 → 변경 시에만 발송
+  [#4] 대기모드 진입 시 _refresh_premarket_sectors + _auto_push_us_market_info 즉시 1회 실행
+  [#5] update_dashboard() 장 마감 시에도 _push_dashboard_json() 호출 (타임스탬프 갱신)
+  이유: 주말/공휴일 대시보드 15:07:11 고정 / 섹터목록 업데이트 안됨 / 미국시장 자동알람 없음
+  개선점: 대기모드에서도 대시보드 실시간 갱신, 미국시장 변화 시 자동 텔레그램 발송
+  주의점: _auto_push_us_market_info는 _handle_telegram_us_command 재사용 — 해시 변동 시에만 호출
+
 - v169.16 (2026-05-02): 포착목록 컬럼변경 + 레이아웃 + 섹터버그수정
   [#1] 포착목록: 현재가 제거 → 진입가+수익률 추가 (7컬럼)
        수익률=진입가대비 현재가, 양수=노란색 음수=보라색으로 등락률과 색상 구분
@@ -27469,6 +27480,8 @@ def _save_dashboard_state(state: dict) -> None:
 def update_dashboard(force: bool = False) -> None:
     # 장 운영 시간에만 텔레그램 대시보드 갱신
     if not is_any_market_open():
+        # v169.17: 장 마감/휴장 시에도 대시보드 JSON push (updated_at 타임스탬프 갱신)
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
         return
     # ensure MARKET_REGIME is populated; fall back to US signals if needed
     try:
@@ -27557,6 +27570,7 @@ _WEB_DASHBOARD_LOCK          = threading.Lock()
 _WEB_DASHBOARD_LAST_PUSH: float = 0.0
 _WEB_DASHBOARD_THROTTLE_SEC  = 3.0
 _WEB_DASHBOARD_PREMARKET_SECTORS: list = []  # v169.14: 장전/장마감 섹터 캐시
+_INFO_AUTO_PUSH_HASHES: dict = {}  # v169.17: 정보성 자동 알람 변경 감지 해시
 
 def _load_premarket_sectors() -> None:
     """재시작 후 장전 섹터 캐시 복원"""
@@ -37141,6 +37155,32 @@ def _classify_risk_causes(us: dict, geo_state: dict, kospi_5d: float = 0.0) -> l
     except Exception as e:
         _swallow_exception(e)
     return sorted(causes, key=lambda x: -x["score"])
+
+def _auto_push_us_market_info() -> None:
+    """v169.17: 미국 시장 현황 변경 감지 → 자동 텔레그램 알람.
+    regime/VIX버킷/gap_signal/NQ방향 해시 비교 → 변경 시에만 _handle_telegram_us_command() 호출.
+    대기모드(주말/휴장) 및 장중 모두 동작. 180분마다 스케줄."""
+    global _INFO_AUTO_PUSH_HASHES
+    try:
+        us = get_us_market_signals()
+        if not us:
+            return
+        regime    = str(us.get("us_regime") or "neutral")
+        vix_bkt   = str(round(float(us.get("vix") or 0) / 5) * 5)   # 5단위 반올림
+        gap_sig   = str(us.get("gap_signal") or "flat")
+        nq_chg    = float(us.get("nasdaq_chg") or 0)
+        nq_dir    = "up" if nq_chg > 0.5 else ("down" if nq_chg < -0.5 else "flat")
+        key       = f"{regime}|{vix_bkt}|{gap_sig}|{nq_dir}"
+        import hashlib as _hl
+        h = _hl.md5(key.encode()).hexdigest()[:10]
+        if _INFO_AUTO_PUSH_HASHES.get("us") == h:
+            return   # 변동 없음 — 발송 스킵
+        _INFO_AUTO_PUSH_HASHES["us"] = h
+        _log_info_msg(f"[AutoInfo] 미국 시장 변화 감지 → 자동 알람 발송 (key={key})")
+        _handle_telegram_us_command()
+    except Exception as e:
+        _swallow_exception(e)
+
 def _run_holiday_standby_until_trading_day():
     """주말/공휴일 대기 모드 유지. 평일 전환 시 스케줄을 비우고 정상 모드로 복귀."""
     _log_info_msg("✅ 대기 모드 스케줄 등록 완료")
@@ -41120,6 +41160,12 @@ if __name__ == "__main__":
         _load_gemini_grounding_cache()  # v163.6: 재시작 후 grounding 재료 캐시 복원
         schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
         schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
+        # v169.17: 대기모드 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
+        schedule.every(5).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start())
+        schedule.every(120).minutes.do(_leader_job(_refresh_premarket_sectors))
+        schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
+        threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
         _run_holiday_standby_until_trading_day()
     _strict_cleanup_legacy_entry_hits()
     load_carry_stocks()
