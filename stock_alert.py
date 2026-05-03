@@ -3,10 +3,19 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.22
-날짜: 2026-05-03
+버전: v169.23
+날짜: 2026-05-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.23 (2026-05-04): 대시보드 알람 목록 내용 잘림 수정
+  [#1] .alr-ttl: white-space:nowrap + text-overflow:ellipsis 제거
+       → 긴 제목이 줄바꿈되어 전체 표시
+  [#2] .alr-body: word-break:break-word 추가
+       → 긴 URL/종목명 등이 컬럼 밖으로 넘치지 않고 줄바꿈
+  이유: alr-ttl에 nowrap+ellipsis 조합으로 제목이 ... 으로 잘림
+  개선점: 알람 제목·본문 내용 전체 표시
+  주의점: 알람 항목 높이가 내용에 따라 가변 — 스크롤로 확인
+
 - v169.22 (2026-05-03): 순위 데이터 마지막 장 기준 저장·복원
   [#1] _WEB_DASHBOARD_RANK_FILE 신설 (web_dashboard_rank.json)
        장중 라이브 순위 → 파일 저장 (rank_date 타임스탬프 포함)
@@ -28030,9 +28039,9 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
 .alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .alr-dot.red{background:#00d97e}.alr-dot.yellow{background:#fbbf24}.alr-dot.blue{background:#60a5fa}
-.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;overflow:hidden;word-break:break-word}
 .alr-time{margin-left:auto;font-size:10px;color:#b8ccd8;flex-shrink:0;padding-left:6px}
-.alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap}
+.alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
 .rank-sec-title span{font-size:10px;font-weight:700}
 .rk-row{display:grid;grid-template-columns:20px 100px 54px 48px 58px 80px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
