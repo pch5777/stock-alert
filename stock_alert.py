@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.25
+버전: v169.26
 날짜: 2026-05-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.26 (2026-05-04): 섹터/순위/종목 3대 이슈 통합 수정
+  [#1] 섹터: get_all_sector_index() 결과 없거나 종목 0개면 _execution_snapshots 폴백
+       → NXT 장(08~09시) KRX API 빈 결과 시에도 섹터 표시
+  [#2] 순위: 각 섹션(등락률/거래량/조회수) 독립 div + max-height+overflow-y:auto
+       → 섹션별 독립 스크롤 (전체 페이지 스크롤 아님)
+  [#3] _purge_stale_entry_watch_hits: expire_ts 미설정 종목은 당일 삭제 금지
+       → 재시작 후 _entry_watch 복원 종목이 즉시 purge되는 문제 방지
+  이유: NXT장 KRX API 빈배열→섹터 빈칸 / #main overflow제거만으론 섹션별 스크롤 불가 / expire_ts없는 종목 재시작 즉시 삭제
+  개선점: NXT장 섹터 표시, 순위 섹션별 독립 스크롤, 재시작 후 종목 유지
+  주의점: 섹터 폴백은 틱 수신 후 채워짐 (연결 직후 수분 공백 정상)
+
 - v169.25 (2026-05-04): 대시보드 4개 이슈 통합 수정
   [#1] 알람 목록 잘림: alr-ttl overflow:hidden 제거, alr-top flex-wrap:wrap 추가
        → flex 컨테이너 안에서 제목이 잘리던 문제 해결
@@ -5255,6 +5266,11 @@ def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
                     pass  # 만료된 것만 정리
                 else:
                     continue  # 당일 entry_hit는 만료 전까지 유지
+            # v169.26: expire_ts 미설정 종목은 당일이면 삭제 금지
+            # 이유: 재시작 시 _entry_watch 복원 종목에 expire_ts 없는 경우 즉시 purge됨
+            expire_ts_raw = float(watch.get("expire_ts", 0) or 0)
+            if not expire_ts_raw and detect_date == today_str:
+                continue
             latest_rec = latest_by_code.get(code) if code else None
             if not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
                 purged.append(key)
@@ -27839,7 +27855,7 @@ def _push_dashboard_json() -> None:
         return
     _WEB_DASHBOARD_LAST_PUSH = now_ts
     try:
-        # ── 섹터 (장중=실시간, 장마감/휴장=장전 시나리오) ──
+        # ── 섹터 (장중=실시간, 장마감/휴장=장전 시나리오) v169.26 ──
         sectors_raw = []
         market_open = is_any_market_open()
         try:
@@ -27869,8 +27885,8 @@ def _push_dashboard_json() -> None:
                     if name:
                         sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                 sectors_raw.sort(key=lambda x:-x["chg"])
-                # v169.25: 섹터 종목 없으면 _execution_snapshots 기반 자체 빌드 폴백
-                if not any(s["stocks"] for s in sectors_raw):
+                # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
+                if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
                     for code, buf in list(_execution_snapshots.items()):
                         if not buf: continue
@@ -27883,8 +27899,7 @@ def _push_dashboard_json() -> None:
                         snap_groups[sec_name]["cnt"] += 1
                         snap_groups[sec_name]["stocks"].append({
                             "name": _resolve_stock_name(code, ""),
-                            "code": code,
-                            "chg":  chg_v,
+                            "code": code, "chg": chg_v,
                             "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
                             "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
                         })
@@ -28069,6 +28084,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .tbl-head span{font-size:9px;font-weight:700;color:#c8e4f8;letter-spacing:.3px}
 .tbl-head span:not(:first-child){text-align:right}
 .col-body{overflow-y:auto;overflow-x:hidden;flex:1}
+#rank-body{display:flex;flex-direction:column;flex:1;overflow:hidden}
 .col.sec{border-right:1px solid #1a2d45;background:#060c1a}
 #sec-a{border-right:1px solid #1a2d45}
 #sec-b{border-right:2px solid #1e3a5f}
@@ -28232,31 +28248,36 @@ function renderRanking(){
   const rh=document.getElementById("rank-head");
   const badge=document.getElementById("rank-badge");
   if(!marketOpen){
-    // 장마감: 데이터 유지하되 날짜 레이블 표시
     badge.textContent=`📅 ${dataDate} 기준`;
-    badge.style.color="#94a3b8";
-    badge.style.borderColor="#2a3a50";
+    badge.style.color="#94a3b8";badge.style.borderColor="#2a3a50";
   } else {
     badge.textContent="장중 실시간";
-    badge.style.color="#00d97e";
-    badge.style.borderColor="#00d97e30";
+    badge.style.color="#00d97e";badge.style.borderColor="#00d97e30";
   }
-  rh.style.display="";
+  rh.style.display="none"; // 헤더는 각 섹션에 포함
   const sections=[
     {title:"🔥 등락률 상위",color:"#00d97e",data:[...rChg].sort((a,b)=>b.chg-a.chg)},
-    {title:"📊 거래량 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.chg-a.chg)},
-    {title:"👁 조회수 상위",color:"#a78bfa",data:[...rView].sort((a,b)=>b.chg-a.chg)},
+    {title:"📊 거래량 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.vol_raw-a.vol_raw)},
+    {title:"👁 조회수 상위",color:"#a78bfa",data:[...rView].sort((a,b)=>b.amt_raw-a.amt_raw)},
   ];
+  // v169.26: 각 섹션 독립 div + 내부 스크롤
   rb.innerHTML=sections.map(sec=>`
-    <div class="rank-sec-title"><span style="color:${sec.color}">${sec.title}</span></div>
-    ${sec.data.map((s,i)=>`<div class="rk-row">
-      <span class="rk-no">${i+1}</span>
-      <span class="rk-nm">${s.name}</span>
-      <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
-      <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
-      <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.vol||""}</span>
-      <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.amt||""}</span>
-    </div>`).join("")}`).join("");
+    <div style="display:flex;flex-direction:column;flex:1;min-height:0;border-bottom:1px solid #1a2d45">
+      <div class="rank-sec-title"><span style="color:${sec.color}">${sec.title}</span></div>
+      <div style="overflow-y:auto;flex:1">
+        ${sec.data.map((s,i)=>`<div class="rk-row">
+          <span class="rk-no">${i+1}</span>
+          <span class="rk-nm">${s.name}</span>
+          <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
+          <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
+          <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.vol||""}</span>
+          <span style="font-size:9px;color:#c8e4f8;text-align:right">${s.amt||""}</span>
+        </div>`).join("")}
+      </div>
+    </div>`).join("");
+  // 3 섹션 균등 분할
+  rb.style.display="flex";
+  rb.style.flexDirection="column";
 }
 function renderAll(ts){
   renderSectors();renderCapture();renderAlerts();renderRanking();
