@@ -3,10 +3,28 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.26
+버전: v169.27
 날짜: 2026-05-04
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.27 (2026-05-04): 순위/알람/종목/섹터 4대 이슈 완전 수정
+  [#1] 순위 3섹션 동시표시 + 각각 독립 내부 스크롤
+       #rank-body: display:flex;flex-direction:column;height:100%
+       각 섹션: flex:1(균등 1/3 분할) + 내부 리스트 div overflow-y:auto
+       → 등락률/거래량/조회수 항상 동시 표시, 각자 독립 스크롤
+  [#2] 알람 잘림 근본 수정
+       alr-time을 alr-top 밖으로 이동 → 제목이 전체 너비 사용
+       alr-top: 제목+점만, 시각은 별도 줄
+  [#3] 종목 purge 완전 방어
+       _purge_stale_entry_watch_hits: entry_hit 없어도 당일 detect_date 종목 삭제 금지
+       → 재시작 복원 종목 전체 보호 (entry_hit 유무 무관)
+  [#4] 섹터 KRX API 캐시 TTL 단축: 5분→1분
+       → 장시작 후 섹터 데이터 더 빨리 반영
+  이유: 섹션 1/3분할 미적용으로 하위섹션 밀림 / alr-time이 flex공간 빼앗아 제목 잘림
+        entry_hit 없는 당일 종목도 purge됨 / 섹터 캐시 5분 지연
+  개선점: 3섹션 동시 + 스크롤, 알람 전체 표시, 복원 종목 완전 보호, 섹터 빠른 갱신
+  주의점: alr-time 위치 변경으로 알람 레이아웃 변경됨
+
 - v169.26 (2026-05-04): 섹터/순위/종목 3대 이슈 통합 수정
   [#1] 섹터: get_all_sector_index() 결과 없거나 종목 0개면 _execution_snapshots 폴백
        → NXT 장(08~09시) KRX API 빈 결과 시에도 섹터 표시
@@ -5260,17 +5278,11 @@ def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
             # 이유: _mark_entry_hit_in_signal_log 후에도 status!=추적중이면 latest_rec=None or actionable=False
             #       → 동기화 직후 수십 분 내 stale 정리 → 재포착 → 재트리거 반복
             detect_date = str(watch.get("detect_date") or watch.get("first_detect_date") or "")
-            if watch.get("entry_hit") and detect_date == today_str:
+            # v169.27: entry_hit 유무 무관 당일 종목 전체 삭제 금지
+            if detect_date == today_str:
                 expire_ts = float(watch.get("expire_ts", 0) or 0)
-                if expire_ts and now_ts >= expire_ts:
-                    pass  # 만료된 것만 정리
-                else:
-                    continue  # 당일 entry_hit는 만료 전까지 유지
-            # v169.26: expire_ts 미설정 종목은 당일이면 삭제 금지
-            # 이유: 재시작 시 _entry_watch 복원 종목에 expire_ts 없는 경우 즉시 purge됨
-            expire_ts_raw = float(watch.get("expire_ts", 0) or 0)
-            if not expire_ts_raw and detect_date == today_str:
-                continue
+                if not expire_ts or now_ts < expire_ts:
+                    continue  # 당일 종목은 만료 전까지 무조건 유지
             latest_rec = latest_by_code.get(code) if code else None
             if not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
                 purged.append(key)
@@ -8826,7 +8838,7 @@ def get_all_sector_index(market: str = "J") -> list:
     캐시: 5분
     """
     global _all_sector_index_cache, _all_sector_index_cache_ts
-    if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 300:
+    if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 60:  # v169.27: 5분→1분
         return _all_sector_index_cache
     try:
         data = _safe_get(
@@ -28109,11 +28121,11 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr{padding:6px 12px;border-bottom:1px solid #09111e;transition:background .1s}
 .alr:hover{background:#0d1a2a}
 .alr.red{border-left:3px solid #00c070}.alr.yellow{border-left:3px solid #f59e0b}.alr.blue{border-left:3px solid #3b82f6}
-.alr-top{display:flex;align-items:flex-start;gap:5px;margin-bottom:3px;flex-wrap:wrap}
-.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:3px}
+.alr-top{display:flex;align-items:center;gap:5px;margin-bottom:2px}
+.alr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .alr-dot.red{background:#00d97e}.alr-dot.yellow{background:#fbbf24}.alr-dot.blue{background:#60a5fa}
 .alr-ttl{font-size:11px;font-weight:700;color:#e2e8f0;word-break:break-word;flex:1;min-width:0}
-.alr-time{margin-left:auto;font-size:10px;color:#b8ccd8;flex-shrink:0;padding-left:6px}
+.alr-time{font-size:9px;color:#607080;margin-bottom:3px}
 .alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
 .rank-sec-title span{font-size:10px;font-weight:700}
@@ -28238,9 +28250,9 @@ function renderAlerts(){
   document.getElementById("alr-body").innerHTML=alerts.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
     :alerts.map(a=>`<div class="alr ${a.lvl}">
+      <div class="alr-time">${a.time}</div>
       <div class="alr-top"><span class="alr-dot ${a.lvl}"></span>
-      <span class="alr-ttl">${a.title}</span>
-      <span class="alr-time">${a.time}</span></div>
+      <span class="alr-ttl">${a.title}</span></div>
       <div class="alr-body">${a.body||""}</div></div>`).join("");
 }
 function renderRanking(){
@@ -28254,17 +28266,18 @@ function renderRanking(){
     badge.textContent="장중 실시간";
     badge.style.color="#00d97e";badge.style.borderColor="#00d97e30";
   }
-  rh.style.display="none"; // 헤더는 각 섹션에 포함
+  rh.style.display="none";
   const sections=[
     {title:"🔥 등락률 상위",color:"#00d97e",data:[...rChg].sort((a,b)=>b.chg-a.chg)},
     {title:"📊 거래량 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.vol_raw-a.vol_raw)},
     {title:"👁 조회수 상위",color:"#a78bfa",data:[...rView].sort((a,b)=>b.amt_raw-a.amt_raw)},
   ];
-  // v169.26: 각 섹션 독립 div + 내부 스크롤
+  // v169.27: 각 섹션 flex:1(1/3 균등) + 내부 리스트만 overflow-y:auto
+  rb.style.cssText="display:flex;flex-direction:column;flex:1;overflow:hidden;";
   rb.innerHTML=sections.map(sec=>`
-    <div style="display:flex;flex-direction:column;flex:1;min-height:0;border-bottom:1px solid #1a2d45">
-      <div class="rank-sec-title"><span style="color:${sec.color}">${sec.title}</span></div>
-      <div style="overflow-y:auto;flex:1">
+    <div style="flex:1;display:flex;flex-direction:column;min-height:0;border-bottom:1px solid #1a2d45">
+      <div class="rank-sec-title" style="flex-shrink:0"><span style="color:${sec.color}">${sec.title}</span></div>
+      <div style="overflow-y:auto;flex:1;min-height:0">
         ${sec.data.map((s,i)=>`<div class="rk-row">
           <span class="rk-no">${i+1}</span>
           <span class="rk-nm">${s.name}</span>
@@ -28275,9 +28288,6 @@ function renderRanking(){
         </div>`).join("")}
       </div>
     </div>`).join("");
-  // 3 섹션 균등 분할
-  rb.style.display="flex";
-  rb.style.flexDirection="column";
 }
 function renderAll(ts){
   renderSectors();renderCapture();renderAlerts();renderRanking();
