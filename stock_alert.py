@@ -3,10 +3,39 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.27
-날짜: 2026-05-04
+버전: v169.28
+날짜: 2026-05-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.28 (2026-05-06): 대시보드 5대 이슈 패치
+  [#1] 섹터 목록 보강 — market_leader_state 대장주/follower 병행 소스 추가
+       기존: get_all_sector_index → _sector_cache 매핑만 (매핑 누락 시 종목 빈칸)
+       변경: 오늘 발송된 market_leader_state.sectors를 보조 소스로 활용
+             기존 섹터에 종목 보완 + 매핑 없는 섹터명은 신규 추가
+       이유: _sector_cache에 "sector" 키 없는 종목은 섹터 목록에 미표시
+       개선점: NXT 대장주 섹터(화학/전기전자/밸류업 등) 당일 데이터 즉시 반영
+       주의점: market_leader_state sent_at이 오늘 날짜인 경우에만 적용
+  [#2] 섹터 거래대금 잘림 수정
+       stk-row grid: 90+54+46+56+64=310px → 82+54+46+52+60=294px (padding 16px 포함 310px)
+       tbl-head도 동일 컬럼 폭으로 통일
+       이유: padding:0 8px(=16px)을 감안하지 않아 마지막 거래대금 열 overflow 잘림
+       개선점: 거래대금 열 항상 완전 표시
+  [#3] 알람 body 잘림 수정
+       send() 내 body 줄 수: lines[1:4] → lines[1:9] (3줄→8줄)
+       이유: 긴 알람(섹터모니터링/공시+주가/뉴스+주가 등) body가 3줄로 잘림
+       개선점: 최대 8줄까지 표시 (알람 내용 실질적으로 잘리지 않음)
+  [#4] 종목포착 알람 → 포착목록 즉시 반영
+       _finalize_general_alert_dispatch() return True 직전에 _push_dashboard_json 스레드 추가
+       이유: send() 내 훅은 register_entry_watch() 실행 전에 dashboard를 갱신하여
+             _entry_watch가 비어있는 상태로 포착목록 빌드 → 방금 포착된 종목 미반영
+       개선점: register_entry_watch 완료 후 갱신 → 포착 알람과 동시에 포착목록 표시
+       주의점: send() 내 기존 훅도 유지 (다른 알람 경로 커버)
+  [#5] 상위랭킹 선물/우선주/ETF/지수 제외
+       rank_base 빌드 시 _RANK_EXCLUDE_MARKERS 필터 + 6자리 코드 검증 + 우선주 정규식 추가
+       이유: _execution_snapshots에 KODEX/TIGER 등 ETF, 우선주(우B 등), 지수코드 포함
+       개선점: 일반 주식만 랭킹에 표시
+       주의점: import re는 함수 내 로컬 import (_re alias 사용)
+
 - v169.27 (2026-05-04): 순위/알람/종목/섹터 4대 이슈 완전 수정
   [#1] 순위 3섹션 동시표시 + 각각 독립 내부 스크롤
        #rank-body: display:flex;flex-direction:column;height:100%
@@ -27498,7 +27527,7 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
         clean = decorated_text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
         lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith("━")]
         title = lines[0][:60] if lines else "알람"
-        body  = "\n".join(lines[1:4])
+        body  = "\n".join(lines[1:9])
         lvl   = "red" if any(k in clean for k in ["급등","SURGE","포착","돌파","상한"]) else \
                 "blue" if any(k in clean for k in ["시작","배포","완료","연결","✅","📌"]) else "yellow"
         alert_entry = {
@@ -27867,7 +27896,7 @@ def _push_dashboard_json() -> None:
         return
     _WEB_DASHBOARD_LAST_PUSH = now_ts
     try:
-        # ── 섹터 (장중=실시간, 장마감/휴장=장전 시나리오) v169.26 ──
+        # ── 섹터 (장중=실시간, 장마감/휴장=장전 시나리오) v169.28 ──
         sectors_raw = []
         market_open = is_any_market_open()
         try:
@@ -27897,6 +27926,58 @@ def _push_dashboard_json() -> None:
                     if name:
                         sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                 sectors_raw.sort(key=lambda x:-x["chg"])
+                # v169.28 [이슈2]: 섹터 종목 없으면 market_leader_state 대장주/follower 보완
+                try:
+                    _leader_state = _read_market_leader_state()
+                    _leader_sectors = _leader_state.get("sectors", [])
+                    _today_str = _now_kst().strftime("%Y-%m-%d")
+                    _sent_at = str(_leader_state.get("sent_at", "") or "")
+                    if _leader_sectors and _sent_at.startswith(_today_str):
+                        _leader_sec_map: dict = {s["name"]: s for s in sectors_raw}
+                        for lsec in _leader_sectors:
+                            theme = str(lsec.get("theme","") or "")
+                            if not theme: continue
+                            leader = lsec.get("leader") or {}
+                            followers = lsec.get("followers") or []
+                            all_members = ([leader] if leader else []) + list(followers)
+                            if not all_members: continue
+                            # 기존 섹터에 종목 보완
+                            matched = next((s for s in sectors_raw if theme in s["name"] or s["name"] in theme), None)
+                            if matched:
+                                existing_codes = {st["code"] for st in matched["stocks"]}
+                                for m in all_members:
+                                    mc = str(m.get("code","") or "")
+                                    if not mc or mc in existing_codes: continue
+                                    snap = _get_snap(mc)
+                                    matched["stocks"].append({
+                                        "name": m.get("name","") or _resolve_stock_name(mc,""),
+                                        "code": mc,
+                                        "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
+                                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                                    })
+                                matched["stocks"].sort(key=lambda x:-x["chg"])
+                                matched["stocks"] = matched["stocks"][:8]
+                            else:
+                                # 섹터 자체가 없으면 신규 추가
+                                new_stocks = []
+                                for m in all_members:
+                                    mc = str(m.get("code","") or "")
+                                    if not mc: continue
+                                    snap = _get_snap(mc)
+                                    new_stocks.append({
+                                        "name": m.get("name","") or _resolve_stock_name(mc,""),
+                                        "code": mc,
+                                        "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
+                                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                                    })
+                                if new_stocks:
+                                    avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
+                                    sectors_raw.append({"name": theme, "chg": round(avg_chg,2), "stocks": new_stocks[:8]})
+                        sectors_raw.sort(key=lambda x:-x["chg"])
+                except Exception:
+                    pass
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
                 if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
@@ -27997,13 +28078,22 @@ def _push_dashboard_json() -> None:
         # ── 랭킹 (웹소켓 구독 종목 기반, 장마감 후 캐시 복원) v169.22 ──
         rank_base = []
         rank_date_str = datetime.now().strftime("%m-%d %H:%M")
+        # v169.28 [이슈5]: 선물/우선주/ETF/지수 제외 필터
+        _RANK_EXCLUDE_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
         try:
             for code, buf in list(_execution_snapshots.items()):
                 if not buf: continue
+                if not code or len(code) != 6: continue  # 지수코드(4자리 등) 제외
                 snap = buf[-1]
+                _rk_name = _resolve_stock_name(code,"")
+                # ETF/선물/인버스/레버리지 제외
+                if any(m in _rk_name for m in _RANK_EXCLUDE_MARKERS): continue
+                # 우선주 제외 (종목명 끝이 우/우B/1우B/2우B 등)
+                import re as _re
+                if _re.search(r'우[B\d]*$', _rk_name): continue
                 # v169.22: 300초 타임아웃 제거 — 장마감 직후 마지막 스냅도 저장 대상
                 rank_base.append({
-                    "name":    _resolve_stock_name(code,""),
+                    "name":    _rk_name,
                     "code":    code,
                     "chg":     float(snap.get("change_rate") or 0),
                     "vol_raw": safe_int(snap.get("today_vol") or 0),
@@ -28104,7 +28194,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .sec-sub.pos{background:#0d2518}.sec-sub.neg{background:#22100a}
 .sec-rnk{width:16px;height:16px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:9px;color:#0a0f1e;flex-shrink:0}
 .sec-nm{font-size:11px;font-weight:700;color:#e2e8f0}.sec-chg{margin-left:auto;font-size:12px;font-weight:700}
-.stk-row{display:grid;grid-template-columns:90px 54px 46px 56px 64px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.stk-row{display:grid;grid-template-columns:82px 54px 46px 52px 60px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .stk-row:hover{background:#0d1e30}
 .stk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cp{cursor:pointer;user-select:none;font-family:"Courier New",monospace;font-size:9px;padding:0 3px;border-radius:2px;border:1px solid #2a4a65;background:#050a14;color:#c8e4f8;transition:all .12s;text-align:center}
@@ -28148,13 +28238,13 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 <div id="main">
   <div class="col sec" id="sec-a">
     <div class="col-title"><span style="color:#60a5fa">SECTOR LIST</span><span class="sub-tag">등락률순 실시간</span></div>
-    <div class="tbl-head" style="grid-template-columns:90px 54px 46px 56px 64px;padding:0 8px">
+    <div class="tbl-head" style="grid-template-columns:82px 54px 46px 52px 60px;padding:0 8px">
       <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span></div>
     <div class="col-body" id="sec-a-body"></div>
   </div>
   <div class="col sec" id="sec-b">
     <div class="col-title"><span style="color:#60a5fa">SECTOR LIST</span><span class="sub-tag">등락률순 실시간</span></div>
-    <div class="tbl-head" style="grid-template-columns:90px 54px 46px 56px 64px;padding:0 8px">
+    <div class="tbl-head" style="grid-template-columns:82px 54px 46px 52px 60px;padding:0 8px">
       <span>종목명</span><span>코드</span><span>등락률</span><span>거래량</span><span>거래대금</span></div>
     <div class="col-body" id="sec-b-body"></div>
   </div>
@@ -32067,6 +32157,12 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
             }
         elif safe_int(s.get("price", 0), 0) > safe_int(_detected_stocks[code].get("high_price", 0), 0):
             _detected_stocks[code]["high_price"] = safe_int(s.get("price", 0), 0)
+    # v169.28 [이슈4]: register_entry_watch 완료 후 대시보드 갱신 — send() 내 훅보다 늦게 실행되므로
+    # _entry_watch가 이미 등록된 상태에서 포착목록을 빌드 → 종목포착 알람 즉시 포착목록 반영
+    try:
+        threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    except Exception as _pde:
+        _swallow_exception(_pde)
     return True
 def _expire_entry_watch_for_upper_limit(code: str, name: str) -> None:
     """NEAR_UPPER/UPPER_LIMIT 발송 즉시 해당 종목 entry_watch 전부 만료 처리.
@@ -41724,6 +41820,249 @@ if __name__ == "__main__":
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
     schedule.every().day.at("08:50").do(_leader_job(  # v165.0: 시초가 진입 알람
         lambda: None if is_holiday() else send_opening_gap_alert()
+    ))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
+    ))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
+    ))
+    schedule.every().day.at("14:35").do(_threaded_leader_job(  # v169.7: lambda→named (fn_key 충돌 수정)
+        _job_preclose_krx_initial
+    ))
+    schedule.every().day.at("15:08").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_krx_final
+    ))
+    schedule.every().day.at("19:10").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_nxt_final
+    ))
+    # v164.0: 장중 모멘텀 스냅샷 스케줄러 — KRX 5회 / NXT 7회
+    # KRX 관망 구간(09:00~14:35) 균등 분포
+    for _krx_t in INTRADAY_SNAP_KRX_TIMES:
+        _t = _krx_t  # closure 캡처
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("KRX")
+        ))
+    # NXT 관망 구간(08:00~19:10) 균등 분포
+    for _nxt_t in INTRADAY_SNAP_NXT_TIMES:
+        _t = _nxt_t
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("NXT")
+        ))
+    schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
+    schedule.every(10).minutes.do(_leader_job(run_major_investor_sector_scan))  # v165.35: 메이저 수급 섹터 흐름
+    schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
+    schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
+    schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
+    schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest(force=True)))
+    # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
+    # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
+    for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
+        schedule.every().day.at(_top_hhmm).do(_leader_job(
+            lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
+        ))
+    schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))
+    # v169.0: 09:05 → 09:10으로 변경 (KRX 오픈 후 거래량 충분히 쌓인 시점)
+    schedule.every().day.at("09:10").do(_leader_job(_register_sector_seed_stocks_once))
+    schedule.every().day.at(MARKET_CLOSE).do(_leader_job(
+        lambda: None if is_holiday() else on_market_close()
+    ))
+    # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전)
+    schedule.every().day.at("15:10").do(_leader_job(
+        lambda: None if is_holiday() else send_overnight_risk_alerts()
+    ))
+    # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전)
+    schedule.every().day.at("19:40").do(_leader_job(
+        lambda: None if is_holiday() else send_overnight_risk_alerts()
+    ))
+    # NXT 완전 마감 후 — 결과 집계 + 재진입 초기화 + 미입력 알림
+    schedule.every().day.at("20:05").do(_leader_job(
+        lambda: (
+            _collect_and_save_today_sector_results(),  # v169.0: 오늘 강세 섹터 결과 저장
+            run_daily_self_audit(stage="nxt"),
+            _clear_reentry_watch_all(),
+            _send_pending_result_reminder(),
+            _log_info_msg("📡 NXT 마감(20:00) — 섹터결과 집계 + 재진입 감시 초기화")
+        ) if not is_holiday() else None
+    ))
+    # v169.0: 07:30 장전 브리핑 직전 섹터시드 1차 등록 (어제 결과 기반)
+    # 이유: 08:00 NXT 오픈 전에 미리 섹터 풀 준비 → NXT 08:00~08:59 대응 가능
+    schedule.every().day.at("07:28").do(_leader_job(
+        lambda: None if is_holiday() else _register_sector_seed_from_yesterday_once()
+    ))
+    # 24시간 시나리오 수집 (20분마다)
+    schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
+    # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
+    schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
+    # 지정학 뉴스 스캔 (1시간마다)
+    schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
+    # 평일만 백업 (장 운영일에만)
+    schedule.every(BACKUP_INTERVAL_H).hours.do(_leader_job(
+        lambda: run_auto_backup(notify=False) if not is_holiday() else None
+    ))
+    # v41.60: 20:10 자동 종료 제거 — 장마감 후에도 야간 모니터링 지속,
+    # 지정학/해외시장 이슈를 누적해 다음날 07:30/08:50 브리핑에 반영.
+    schedule.every().day.at("20:10").do(_leader_job(
+        lambda:
+            _log_info_msg("🌙 20:10 이후 야간 모니터링 모드 전환 — 프로세스 유지")
+        if not is_holiday() else None
+    ))
+    # v39.3: 시작 시 07:30/08:30 장전 메시지 놓침 보완 (leader/passive와 무관하게 날짜별 1회 보장)
+    _now = datetime.now()
+    if not is_holiday():
+        if dtime(7, 30) <= _now.time() <= dtime(9, 0):
+            try:
+                _log_info_msg("📋 시작 시 장전 브리핑 보완 발송")
+                _send_preopen_watchlist_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 브리핑 보완 실패: {e}")
+        if dtime(7, 30) <= _now.time() < dtime(8, 30):
+            try:
+                _log_info_msg("🛡 시작 시 장전 리스크 평가 보완 발송")
+                _send_premarket_risk_assessment_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
+        elif dtime(8, 30) <= _now.time() < dtime(8, 45):
+            try:
+                _log_info_msg("🔄 시작 시 장전 리스크 업데이트 보완 발송")
+                _send_premarket_risk_update_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
+    _maybe_run_preclose_gap_alert_catchup()
+    _load_nxt_holdover()  # v165.5: 당일 NXT holdover 복원
+    _schedule_startup_scan_catchup()
+    # v162: WebSocket 스레드 시작
+    try:
+        _ws_start()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ WebSocket 시작 실패 (REST fallback 유지): {e}")
+    while True:
+        try:
+            schedule.run_pending(); time.sleep(1)
+        except Exception as e:
+            _log_warn_msg(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5) if is_holiday() else send_opening_gap_alert()
+    ))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
+    ))
+    schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_KRX).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
+        lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="krx")
+    ))
+    schedule.every().day.at("14:35").do(_threaded_leader_job(  # v169.7: lambda→named (fn_key 충돌 수정)
+        _job_preclose_krx_initial
+    ))
+    schedule.every().day.at("15:08").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_krx_final
+    ))
+    schedule.every().day.at("19:10").do(_threaded_leader_job(  # v169.7: lambda→named
+        _job_preclose_nxt_final
+    ))
+    # v164.0: 장중 모멘텀 스냅샷 스케줄러 — KRX 5회 / NXT 7회
+    # KRX 관망 구간(09:00~14:35) 균등 분포
+    for _krx_t in INTRADAY_SNAP_KRX_TIMES:
+        _t = _krx_t  # closure 캡처
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("KRX")
+        ))
+    # NXT 관망 구간(08:00~19:10) 균등 분포
+    for _nxt_t in INTRADAY_SNAP_NXT_TIMES:
+        _t = _nxt_t
+        schedule.every().day.at(_t).do(_leader_job(
+            lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("NXT")
+        ))
+    schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
+    schedule.every(10).minutes.do(_leader_job(run_major_investor_sector_scan))  # v165.35: 메이저 수급 섹터 흐름
+    schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
+    schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
+    schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
+    schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest(force=True)))
+    # TOP 5: 10:00부터 장마감까지 1시간마다 자동 발송
+    # KRX only 종목: ~15:30, NXT 상장 종목 포함 시: ~20:00
+    for _top_hhmm in ["10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00"]:
+        schedule.every().day.at(_top_hhmm).do(_leader_job(
+            lambda: None if is_holiday() or not is_any_market_open() else send_top_signals()
+        ))
+    schedule.every().day.at(MARKET_OPEN).do(_leader_job(_on_market_open))
+    # v169.0: 09:05 → 09:10으로 변경 (KRX 오픈 후 거래량 충분히 쌓인 시점)
+    schedule.every().day.at("09:10").do(_leader_job(_register_sector_seed_stocks_once))
+    schedule.every().day.at(MARKET_CLOSE).do(_leader_job(
+        lambda: None if is_holiday() else on_market_close()
+    ))
+    # 오버나이트 위험 알림 (15:10 — KRX 마감 20분 전)
+    schedule.every().day.at("15:10").do(_leader_job(
+        lambda: None if is_holiday() else send_overnight_risk_alerts()
+    ))
+    # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전)
+    schedule.every().day.at("19:40").do(_leader_job(
+        lambda: None if is_holiday() else send_overnight_risk_alerts()
+    ))
+    # NXT 완전 마감 후 — 결과 집계 + 재진입 초기화 + 미입력 알림
+    schedule.every().day.at("20:05").do(_leader_job(
+        lambda: (
+            _collect_and_save_today_sector_results(),  # v169.0: 오늘 강세 섹터 결과 저장
+            run_daily_self_audit(stage="nxt"),
+            _clear_reentry_watch_all(),
+            _send_pending_result_reminder(),
+            _log_info_msg("📡 NXT 마감(20:00) — 섹터결과 집계 + 재진입 감시 초기화")
+        ) if not is_holiday() else None
+    ))
+    # v169.0: 07:30 장전 브리핑 직전 섹터시드 1차 등록 (어제 결과 기반)
+    # 이유: 08:00 NXT 오픈 전에 미리 섹터 풀 준비 → NXT 08:00~08:59 대응 가능
+    schedule.every().day.at("07:28").do(_leader_job(
+        lambda: None if is_holiday() else _register_sector_seed_from_yesterday_once()
+    ))
+    # 24시간 시나리오 수집 (20분마다)
+    schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
+    # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
+    schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
+    # 지정학 뉴스 스캔 (1시간마다)
+    schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
+    # 평일만 백업 (장 운영일에만)
+    schedule.every(BACKUP_INTERVAL_H).hours.do(_leader_job(
+        lambda: run_auto_backup(notify=False) if not is_holiday() else None
+    ))
+    # v41.60: 20:10 자동 종료 제거 — 장마감 후에도 야간 모니터링 지속,
+    # 지정학/해외시장 이슈를 누적해 다음날 07:30/08:50 브리핑에 반영.
+    schedule.every().day.at("20:10").do(_leader_job(
+        lambda:
+            _log_info_msg("🌙 20:10 이후 야간 모니터링 모드 전환 — 프로세스 유지")
+        if not is_holiday() else None
+    ))
+    # v39.3: 시작 시 07:30/08:30 장전 메시지 놓침 보완 (leader/passive와 무관하게 날짜별 1회 보장)
+    _now = datetime.now()
+    if not is_holiday():
+        if dtime(7, 30) <= _now.time() <= dtime(9, 0):
+            try:
+                _log_info_msg("📋 시작 시 장전 브리핑 보완 발송")
+                _send_preopen_watchlist_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 브리핑 보완 실패: {e}")
+        if dtime(7, 30) <= _now.time() < dtime(8, 30):
+            try:
+                _log_info_msg("🛡 시작 시 장전 리스크 평가 보완 발송")
+                _send_premarket_risk_assessment_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
+        elif dtime(8, 30) <= _now.time() < dtime(8, 45):
+            try:
+                _log_info_msg("🔄 시작 시 장전 리스크 업데이트 보완 발송")
+                _send_premarket_risk_update_once()
+            except Exception as e:
+                _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
+    _maybe_run_preclose_gap_alert_catchup()
+    _load_nxt_holdover()  # v165.5: 당일 NXT holdover 복원
+    _schedule_startup_scan_catchup()
+    # v162: WebSocket 스레드 시작
+    try:
+        _ws_start()
+    except Exception as e:
+        _log_warn_msg(f"⚠️ WebSocket 시작 실패 (REST fallback 유지): {e}")
+    while True:
+        try:
+            schedule.run_pending(); time.sleep(1)
+        except Exception as e:
+            _log_warn_msg(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+ if is_holiday() else send_opening_gap_alert()
     ))
     schedule.every().day.at(PRECLOSE_GAP_OPEN_EVAL_TIME_NXT).do(_threaded_leader_job(  # v165.7: _leader_job→_threaded_leader_job (run_scan 지연 차단)
         lambda: None if is_holiday() else update_preclose_gap_open_outcomes(stage="nxt")
