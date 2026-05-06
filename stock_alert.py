@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.30
+버전: v169.31
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.31 (2026-05-07): 포착 시간 표시 버그 수정
+  [#1] detect_date 파싱 수정: "%Y%m%d"(8자리) → "MM/DD" 변환 fmtDate 헬퍼 추가
+       이유: detect_date가 "20260506" 형식이면 .slice(5)="506" 으로 잘못 표시됨
+       개선점: "05/06 14:06" 형식으로 정상 표시
+       주의점: 기존 "2026-05-06" 형식(10자리)도 .slice(5,10)으로 정상 처리
 - v169.30 (2026-05-07): 대시보드 레이아웃 조정 + SyntaxWarning 수정
   [#1] 메인 그리드: 포착 470→520px, 알람 420→370px
        이유: 손절가 컬럼 잘림 방지
@@ -28514,7 +28519,8 @@ function renderCapture(){
       const eClr=s.hit?"#00d97e":"#eef4fa";
       // 포착시간/도달시간 표시
       const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
-      const capTs=s.detect_date?(s.detect_date.slice(5)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():"";
+      const fmtDate=d=>{if(!d)return"";const v=String(d).trim();return v.length===8?v.slice(4,6)+"/"+v.slice(6,8):v.length>=10?v.slice(5,10):v;};
+      const capTs=s.detect_date?(fmtDate(s.detect_date)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
       const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
         :capTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}</div>`:"";
