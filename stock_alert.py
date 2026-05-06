@@ -28167,6 +28167,9 @@ def _push_dashboard_json() -> None:
                     "hit":        False,
                     "chg":        float(snap.get("change_rate") or 0),
                     "miss_count": 0,
+                    "detect_date": str(rec.get("detect_date") or ""),
+                    "detect_time": str(rec.get("detect_time") or ""),
+                    "hit_time":    "",
                 })
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
             captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
@@ -28318,11 +28321,11 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
 .rank-sec-title span{font-size:10px;font-weight:700}
-.rk-row{display:grid;grid-template-columns:20px 100px 54px 48px 58px 80px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.rk-row{display:grid;grid-template-columns:20px 95px 50px 46px 55px 70px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .rk-row:hover{background:#0d1e30}
 .rk-no{font-size:10px;font-weight:700;color:#c8e4f8}
 .rk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rk-head{grid-template-columns:20px 100px 54px 48px 58px 80px}
+.rk-head{grid-template-columns:20px 95px 50px 46px 55px 70px}
 .mkt-closed{padding:30px 12px;text-align:center;color:#607080}
 .mkt-closed p{font-size:13px;margin-bottom:6px}
 .mkt-closed small{font-size:10px;color:#405060}
@@ -28425,8 +28428,8 @@ function renderCapture(){
       }
       const eClr=s.hit?"#00d97e":"#eef4fa";
       // 포착시간/도달시간 표시
-      const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||ts];return(t[0]||"").slice(5)+" "+(t[1]||"").slice(0,5);};
-      const capTs=s.detect_date?(s.detect_date.slice(5)+" "+(s.detect_time||"").slice(0,5)).trim():"";
+      const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
+      const capTs=s.detect_date?(s.detect_date.slice(5)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
       const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
         :capTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}</div>`:"";
