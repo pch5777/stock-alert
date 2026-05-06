@@ -3,10 +3,17 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.34
+버전: v169.35
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.35 (2026-05-07): 거래대금 캐시 포맷 + 포착시간 폴백 수정
+  [#1] 랭킹 캐시 로드 시 amt_raw → _fmt_amt 재변환
+       이유: 장마감 후 캐시 파일에 구버전 조 단위 문자열 잔존
+       개선점: 재배포 없이도 포맷 변경 즉시 반영
+  [#2] _entry_watch / _detected_stocks detect_date 폴백 추가
+       이유: first_detect_date 있어도 detect_date 없으면 포착시간 미표시
+       개선점: 비도달 종목도 포착시간 정상 표시
 - v169.34 (2026-05-07): 부팅 불가 SyntaxError + SyntaxWarning 수정
   [#1] 파일 말미 복원: run_overnight_monit 에서 잘린 파일 완성
        이유: '(' was never closed SyntaxError → 봇 시작 불가
@@ -28250,8 +28257,8 @@ def _push_dashboard_json() -> None:
                     "hit":          hit,
                     "chg":          chg_val,
                     "miss_count":   int(watch.get("miss_count") or 0),
-                    "detect_date":  str(watch.get("detect_date") or ""),
-                    "detect_time":  str(watch.get("detect_time") or ""),
+                    "detect_date":  str(watch.get("detect_date") or watch.get("first_detect_date") or ""),
+                    "detect_time":  str(watch.get("detect_time") or watch.get("first_detect_time") or ""),
                     "hit_time":     str(watch.get("entry_hit_time") or ""),
                 })
             # ② _detected_stocks: 이월 종목 (entry_price 있으면 포함)
@@ -28274,8 +28281,8 @@ def _push_dashboard_json() -> None:
                     "hit":        False,
                     "chg":        float(snap.get("change_rate") or 0),
                     "miss_count": 0,
-                    "detect_date": str(rec.get("detect_date") or ""),
-                    "detect_time": str(rec.get("detect_time") or ""),
+                    "detect_date": str(rec.get("detect_date") or rec.get("first_detect_date") or ""),
+                    "detect_time": str(rec.get("detect_time") or rec.get("first_detect_time") or ""),
                     "hit_time":    "",
                 })
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
@@ -28337,6 +28344,11 @@ def _push_dashboard_json() -> None:
                     rank_chg_out   = saved.get("rank_chg", [])
                     rank_vol_out   = saved.get("rank_vol", [])
                     rank_view_out  = saved.get("rank_view", [])
+                    # amt_raw 있으면 최신 포맷으로 재변환 (캐시 포맷 자동 갱신)
+                    for _lst in (rank_chg_out, rank_vol_out, rank_view_out):
+                        for _item in _lst:
+                            if "amt_raw" in _item:
+                                _item["amt"] = _fmt_amt(_item["amt_raw"])
             except Exception:
                 pass
 
