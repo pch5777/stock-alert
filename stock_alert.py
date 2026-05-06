@@ -19579,6 +19579,8 @@ def run_market_scenario_collection_cycle(force: bool = False) -> None:
         if _bot_paused:
             return
         collect_market_scenarios_24h(force=force)
+        # v169.29: 시나리오 수집 완료 → 섹터 목록 즉시 갱신 (20분 주기와 동기화)
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     except Exception as e:
         _log_error("run_market_scenario_collection_cycle", e)
 
