@@ -3,10 +3,18 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.32
+버전: v169.33
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.33 (2026-05-07): 컬럼 오버플로우 수정 + 거래대금 억 단위 통일
+  [#1] cap-row 코드컬럼 158→154px: gap 5px×6=30px 포함 520px 예산 내 딱 맞춤
+       이유: 478+30+16=524px > 520px 오버플로우 수정
+  [#2] rk-row column-gap:4px 추가, 거래량 66→60px, 거래대금 82→78px
+       이유: 20+84+46+46+60+78=334px + gap 20px + padding 16px = 370px 딱 맞춤
+       개선점: 코드-등락률 시각적 간격 확보
+  [#3] _fmt_amt() 조 브랜치 제거 → 항상 억 단위 표시 (예: 12,840억)
+       이유: 사용자 요청 - 거래대금 전부 억 단위로 통일
 - v169.32 (2026-05-07): 포착 목록 코드-등락률 간격 수정
   [#1] cap-row/cap-head에 column-gap:5px 추가
        이유: 컬럼 크기만 키워서는 셀이 붙어보임 — gap이 없었음
@@ -28068,9 +28076,8 @@ def _fmt_vol(v: int) -> str:
     return f"{v:,}주"
 
 def _fmt_amt(v: int) -> str:
-    if v >= 1_000_000_000_000: return f"{v/1_000_000_000_000:.1f}조"
-    if v >= 100_000_000:       return f"{v//100_000_000}억"
-    if v >= 10_000:            return f"{v//10_000}만"
+    if v >= 100_000_000: return f"{v//100_000_000:,}억"
+    if v >= 10_000:      return f"{v//10_000}만"
     return f"{v:,}"
 
 def _get_snap(code: str) -> dict:
@@ -28398,8 +28405,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:158px 52px 44px 56px 48px 62px 58px;column-gap:5px}
-.cap-row{display:grid;grid-template-columns:158px 52px 44px 56px 48px 62px 58px;column-gap:5px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:154px 52px 44px 56px 48px 62px 58px;column-gap:5px}
+.cap-row{display:grid;grid-template-columns:154px 52px 44px 56px 48px 62px 58px;column-gap:5px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -28415,11 +28422,11 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
 .rank-sec-title span{font-size:10px;font-weight:700}
-.rk-row{display:grid;grid-template-columns:20px 84px 46px 46px 66px 82px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.rk-row{display:grid;grid-template-columns:20px 84px 46px 46px 60px 78px;column-gap:4px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .rk-row:hover{background:#0d1e30}
 .rk-no{font-size:10px;font-weight:700;color:#c8e4f8}
 .rk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rk-head{grid-template-columns:20px 84px 46px 46px 66px 82px}
+.rk-head{grid-template-columns:20px 84px 46px 46px 60px 78px;column-gap:4px}
 .mkt-closed{padding:30px 12px;text-align:center;color:#607080}
 .mkt-closed p{font-size:13px;margin-bottom:6px}
 .mkt-closed small{font-size:10px;color:#405060}
@@ -42098,44 +42105,4 @@ if __name__ == "__main__":
     # 24시간 시나리오 수집 (20분마다)
     schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
     # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
-    schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
-    # 지정학 뉴스 스캔 (1시간마다)
-    schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
-    # 평일만 백업 (장 운영일에만)
-    schedule.every(BACKUP_INTERVAL_H).hours.do(_leader_job(
-        lambda: run_auto_backup(notify=False) if not is_holiday() else None
-    ))
-    # v41.60: 20:10 자동 종료 제거 — 장마감 후에도 야간 모니터링 지속,
-    # 지정학/해외시장 이슈를 누적해 다음날 07:30/08:50 브리핑에 반영.
-    schedule.every().day.at("20:10").do(_leader_job(
-        lambda:
-            _log_info_msg("🌙 20:10 이후 야간 모니터링 모드 전환 — 프로세스 유지")
-        if not is_holiday() else None
-    ))
-    # v39.3: 시작 시 07:30/08:30 장전 메시지 놓침 보완 (leader/passive와 무관하게 날짜별 1회 보장)
-    _now = datetime.now()
-    if not is_holiday():
-        if dtime(7, 30) <= _now.time() <= dtime(9, 0):
-            try:
-                _log_info_msg("📋 시작 시 장전 브리핑 보완 발송")
-                _send_preopen_watchlist_once()
-            except Exception as e:
-                _log_warn_msg(f"⚠️ 장전 브리핑 보완 실패: {e}")
-        if dtime(7, 30) <= _now.time() < dtime(8, 30):
-            try:
-                _log_info_msg("🛡 시작 시 장전 리스크 평가 보완 발송")
-                _send_premarket_risk_assessment_once()
-            except Exception as e:
-                _log_warn_msg(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
-        elif dtime(8, 30) <= _now.time() < dtime(8, 45):
-            try:
-                _log_info_msg("🛡 시작 시 장전 리스크 재평가 보완 발송")
-                _send_premarket_risk_assessment_once()
-            except Exception as e:
-                _log_warn_msg(f"⚠️ 장전 리스크 재평가 보완 실패: {e}")
-
-while True:
-    try:
-        schedule.run_pending(); time.sleep(1)
-    except Exception as e:
-        _log_warn_msg(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+    schedule.every(30).minutes.do(_leader_job(run_overnight_monit
