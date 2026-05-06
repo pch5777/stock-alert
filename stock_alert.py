@@ -3,10 +3,16 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.33
+버전: v169.34
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.34 (2026-05-07): 부팅 불가 SyntaxError + SyntaxWarning 수정
+  [#1] 파일 말미 복원: run_overnight_monit 에서 잘린 파일 완성
+       이유: '(' was never closed SyntaxError → 봇 시작 불가
+       개선점: run_overnight_monitor 완성 + geo_news/dashboard/sectors 스케줄 + 메인 이벤트 루프 복원
+  [#2] SyntaxWarning 수정: 변경이력 주석 내 \d → \\d (line 44)
+       이유: Python docstring 내 \d invalid escape sequence 경고
 - v169.33 (2026-05-07): 컬럼 오버플로우 수정 + 거래대금 억 단위 통일
   [#1] cap-row 코드컬럼 158→154px: gap 5px×6=30px 포함 520px 예산 내 딱 맞춤
        이유: 478+30+16=524px > 520px 오버플로우 수정
@@ -41,7 +47,7 @@
   [#4] SyntaxWarning 수정: secHTML() 내 \\d → \\\\d
        이유: Python 문자열 내 JS 정규식 \\d가 invalid escape sequence 경고 발생
        개선점: Railway 로그 SyntaxWarning 제거
-       주의점: JS 동작에는 영향 없음 (\\d == \d in regex)
+       주의점: JS 동작에는 영향 없음 (\\d == \\d in regex)
 - v169.29 (2026-05-06): 익영업일 섹터 로직 강화 + 포착 시간 표시
   [#1] _build_premarket_sector_snapshot() 소스 3개 추가
        ⑧ 공매도 상위종목(FHPST04820000): 공매도 비중 높은 섹터 리스크 감점
@@ -42105,4 +42111,18 @@ if __name__ == "__main__":
     # 24시간 시나리오 수집 (20분마다)
     schedule.every(20).minutes.do(_leader_job(run_market_scenario_collection_cycle))
     # 오버나이트 모니터링 (30분마다 — 함수 내부에서 시간대 체크)
-    schedule.every(30).minutes.do(_leader_job(run_overnight_monit
+    schedule.every(30).minutes.do(_leader_job(run_overnight_monitor))
+    schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
+    # v169.17: 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
+    schedule.every(5).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start())
+    schedule.every(120).minutes.do(_leader_job(_refresh_premarket_sectors))
+    schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
+    threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
+    threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except Exception as _e:
+            _log_warn_msg(f"⚠️ 메인 루프 오류: {_e}")
+            time.sleep(5)
