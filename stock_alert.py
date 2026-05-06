@@ -3,10 +3,21 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.28
+버전: v169.29
 날짜: 2026-05-06
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.29 (2026-05-06): 익영업일 섹터 로직 강화 + 포착 시간 표시
+  [#1] _build_premarket_sector_snapshot() 소스 3개 추가
+       ⑧ 공매도 상위종목(FHPST04820000): 공매도 비중 높은 섹터 리스크 감점
+       ⑨ 장마감 예상체결가(FHKST117300C0): 장마감 후 강세 예상 섹터 가점
+       ⑩ 증시자금 종합(FHKST649100C0): 고객예탁금 증감으로 전체 시장 자금 흐름 반영
+       이유: KIS API 장마감 후 실시간 데이터 없어도 당일 누적 정보로 익일 섹터 예측 강화
+  [#2] 해외지수 섹터 조정 임계값 ±3% → ±0.5%로 완화, 하락 감점 3단계(-2/-4/-7) 강화
+       이유: 소폭 등락도 섹터 방향성에 영향, 보합권 무시로 정보 손실 방지
+  [#3] 포착목록 JSON에 detect_date/detect_time/hit_time 필드 추가
+  [#4] 대시보드 포착 행: 포착시간 + 도달시간 표시 (도달 전이면 포착시간만)
+       이유: 진입 타이밍 추적 가시성 향상
 - v169.28 (2026-05-06): 대시보드 5대 이슈 패치
   [#1] 섹터 목록 보강 — market_leader_state 대장주/follower 병행 소스 추가
        기존: get_all_sector_index → _sector_cache 매핑만 (매핑 누락 시 종목 빈칸)
@@ -17574,16 +17585,101 @@ def _build_premarket_sector_snapshot() -> dict:
         except Exception as e:
             _swallow_exception(e)
 
-        # ⑦ US 프리마켓 섹터 연동 (DOMESTIC_SECTOR_US_STOCKS)
+        # ⑦ US 프리마켓/야간 섹터 연동 (DOMESTIC_SECTOR_US_STOCKS) — v169.29: 임계값 ±3%→±0.5%, 하락 감점 강화
         try:
             us = get_us_market_signals() or {}
             for sector, syms in DOMESTIC_SECTOR_US_STOCKS.items():
+                sec_chg_sum = 0.0
+                sec_cnt = 0
                 for sym in syms:
                     chg = safe_float(us.get(f"{sym.lower()}_chg") or us.get(f"{sym.lower().replace('-','_')}_chg") or 0, 0.0)
-                    if chg >= 3.0:
-                        _add_sector(sector, "", "", min(8, int(chg)), f"US {sym} {chg:+.1f}%")
-                    elif chg <= -3.0:
-                        _add_sector(sector, "", "", max(-5, int(chg)), f"US {sym} {chg:+.1f}%")
+                    if abs(chg) < 0.5:
+                        continue
+                    sec_chg_sum += chg
+                    sec_cnt += 1
+                    if chg >= 0.5:
+                        _add_sector(sector, "", "", min(8, max(1, int(chg * 2))), f"US {sym} {chg:+.1f}%")
+                    elif chg <= -0.5:
+                        # 하락 시 감점 강화: -0.5~-2% → -2점, -2~-4% → -4점, -4% 이하 → -7점
+                        penalty = -2 if chg >= -2.0 else (-4 if chg >= -4.0 else -7)
+                        _add_sector(sector, "", "", penalty, f"US {sym} {chg:+.1f}%↓")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑧ 공매도 상위종목 — v169.29 신규: 공매도 비중 높은 섹터 리스크 감점
+        try:
+            short_data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/short-sale",
+                "FHPST04820000",
+                {
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_COND_SCR_DIV_CODE": "20482",
+                    "FID_INPUT_ISCD": "0000",
+                    "FID_PERIOD_DIV_CODE": "D",
+                    "FID_INPUT_CNT_1": "1",
+                    "FID_APLY_RANG_VOL": "0",
+                    "FID_TRGT_CLS_CODE": "0",
+                    "FID_TRGT_EXLS_CLS_CODE": "0",
+                },
+            )
+            for item in (short_data.get("output") or [])[:20]:
+                code = normalize_stock_code(str(item.get("mksc_shrn_iscd") or ""))
+                name = str(item.get("hts_kor_isnm") or "")
+                ratio = safe_float(item.get("ssts_vol_rlim") or 0, 0.0)  # 공매도 거래량 비중(%)
+                if not code or ratio < 5.0:
+                    continue
+                sec = _code_to_sector(code, name)
+                if sec:
+                    penalty = -3 if ratio >= 15.0 else (-2 if ratio >= 10.0 else -1)
+                    _add_sector(sec, "", "", penalty, f"공매도비중 {ratio:.1f}%↑")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑨ 장마감 예상체결가 — v169.29 신규: 장마감 후 강세 예상 종목 섹터 가점
+        try:
+            exp_close_data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/exp-price-close",
+                "FHKST117300C0",
+                {
+                    "FID_RANK_SORT_CLS_CODE": "0",
+                    "FID_COND_MRKT_DIV_CODE": "J",
+                    "FID_COND_SCR_DIV_CODE": "11173",
+                    "FID_INPUT_ISCD": "0000",
+                    "FID_BLNG_CLS_CODE": "0",
+                },
+            )
+            for item in (exp_close_data.get("output1") or [])[:15]:
+                code = normalize_stock_code(str(item.get("stck_shrn_iscd") or ""))
+                name = str(item.get("hts_kor_isnm") or "")
+                chg = safe_float(item.get("prdy_ctrt") or 0, 0.0)
+                if not code or chg < 1.0:
+                    continue
+                sec = _code_to_sector(code, name)
+                _add_sector(sec or name, code, name, min(6, int(chg) + 1), f"장마감예상 {chg:+.1f}%")
+        except Exception as e:
+            _swallow_exception(e)
+
+        # ⑩ 국내 증시자금 종합 — v169.29 신규: 고객예탁금 증감으로 전체 시장 자금 흐름 반영
+        try:
+            fund_data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/market-fund",
+                "FHKST649100C0",
+                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "0001"},
+            )
+            fund_rows = fund_data.get("output") or []
+            if fund_rows:
+                latest = fund_rows[0]
+                prev   = fund_rows[1] if len(fund_rows) > 1 else {}
+                dep_now  = safe_int(latest.get("cust_dpmn_amt") or 0)
+                dep_prev = safe_int(prev.get("cust_dpmn_amt") or dep_now)
+                if dep_prev > 0:
+                    dep_chg_pct = (dep_now - dep_prev) / dep_prev * 100
+                    # 예탁금 증가 → 전 섹터 공통 +1 (시장 유입 자금 ↑)
+                    # 예탁금 감소 → 전 섹터 공통 -1 (자금 유출)
+                    if dep_chg_pct >= 3.0:
+                        _add_sector("__market__", "", "", 2, f"예탁금 {dep_chg_pct:+.1f}%↑")
+                    elif dep_chg_pct <= -3.0:
+                        _add_sector("__market__", "", "", -2, f"예탁금 {dep_chg_pct:+.1f}%↓")
         except Exception as e:
             _swallow_exception(e)
 
@@ -28038,15 +28134,18 @@ def _push_dashboard_json() -> None:
                 hit = bool(watch.get("entry_hit")) or (
                     cur_price > 0 and e_price > 0 and cur_price >= e_price)
                 captured_raw.append({
-                    "name":       name,
-                    "code":       code,
-                    "price":      cur_price,
-                    "entry":      e_price,
-                    "target":     safe_int(watch.get("target_price") or 0),
-                    "stop":       safe_int(watch.get("stop_loss") or 0),
-                    "hit":        hit,
-                    "chg":        chg_val,
-                    "miss_count": int(watch.get("miss_count") or 0),
+                    "name":         name,
+                    "code":         code,
+                    "price":        cur_price,
+                    "entry":        e_price,
+                    "target":       safe_int(watch.get("target_price") or 0),
+                    "stop":         safe_int(watch.get("stop_loss") or 0),
+                    "hit":          hit,
+                    "chg":          chg_val,
+                    "miss_count":   int(watch.get("miss_count") or 0),
+                    "detect_date":  str(watch.get("detect_date") or ""),
+                    "detect_time":  str(watch.get("detect_time") or ""),
+                    "hit_time":     str(watch.get("entry_hit_time") or ""),
                 })
             # ② _detected_stocks: 이월 종목 (entry_price 있으면 포함)
             for code, rec in list((_detected_stocks or {}).items()):
@@ -28325,8 +28424,14 @@ function renderCapture(){
         }
       }
       const eClr=s.hit?"#00d97e":"#eef4fa";
+      // 포착시간/도달시간 표시
+      const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||ts];return(t[0]||"").slice(5)+" "+(t[1]||"").slice(0,5);};
+      const capTs=s.detect_date?(s.detect_date.slice(5)+" "+(s.detect_time||"").slice(0,5)).trim():"";
+      const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
+      const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
+        :capTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}</div>`:"";
       return `<div class="cap-row ${s.hit?"hit":""}">
-        <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>
+        <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}${tsLine}</span>
         <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
         <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
         <span style="font-size:10px;color:${eClr};text-align:right">${s.entry>0?Number(s.entry).toLocaleString("ko-KR"):"--"}</span>
@@ -41924,20 +42029,13 @@ if __name__ == "__main__":
                 _log_warn_msg(f"⚠️ 장전 리스크 평가 보완 실패: {e}")
         elif dtime(8, 30) <= _now.time() < dtime(8, 45):
             try:
-                _log_info_msg("🔄 시작 시 장전 리스크 업데이트 보완 발송")
-                _send_premarket_risk_update_once()
+                _log_info_msg("🛡 시작 시 장전 리스크 재평가 보완 발송")
+                _send_premarket_risk_assessment_once()
             except Exception as e:
-                _log_warn_msg(f"⚠️ 장전 리스크 업데이트 보완 실패: {e}")
-    _maybe_run_preclose_gap_alert_catchup()
-    _load_nxt_holdover()  # v165.5: 당일 NXT holdover 복원
-    _schedule_startup_scan_catchup()
-    # v162: WebSocket 스레드 시작
+                _log_warn_msg(f"⚠️ 장전 리스크 재평가 보완 실패: {e}")
+
+while True:
     try:
-        _ws_start()
+        schedule.run_pending(); time.sleep(1)
     except Exception as e:
-        _log_warn_msg(f"⚠️ WebSocket 시작 실패 (REST fallback 유지): {e}")
-    while True:
-        try:
-            schedule.run_pending(); time.sleep(1)
-        except Exception as e:
-            _log_warn_msg(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
+        _log_warn_msg(f"⚠️ 메인 루프 오류: {e}"); time.sleep(5)
