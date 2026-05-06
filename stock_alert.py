@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.29
-날짜: 2026-05-06
+버전: v169.30
+날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.30 (2026-05-07): 대시보드 레이아웃 조정 + SyntaxWarning 수정
+  [#1] 메인 그리드: 포착 470→520px, 알람 420→370px
+       이유: 손절가 컬럼 잘림 방지
+       개선점: 포착 목록 전체 표시 확보
+       주의점: 총합 1920px 유지
+  [#2] cap-row 그리드: 코드 46→52px, 등락률 36→44px, 손절가 52→58px
+       이유: 코드-등락률 사이 시각적 여백 확보 + 손절가 잘림 방지
+       개선점: 숫자 가독성 향상
+       주의점: 종목명 160→158px (-2px 조정으로 총합 맞춤)
+  [#3] 포착 목록 숫자 font-size: 10px→11px (등락률/진입가/수익률/목표가/손절가)
+       이유: 숫자 가독성 향상 요청
+       개선점: 전체적으로 한 단계 큰 숫자 표시
+       주의점: 없음
+  [#4] SyntaxWarning 수정: secHTML() 내 \\d → \\\\d
+       이유: Python 문자열 내 JS 정규식 \\d가 invalid escape sequence 경고 발생
+       개선점: Railway 로그 SyntaxWarning 제거
+       주의점: JS 동작에는 영향 없음 (\\d == \d in regex)
 - v169.29 (2026-05-06): 익영업일 섹터 로직 강화 + 포착 시간 표시
   [#1] _build_premarket_sector_snapshot() 소스 3개 추가
        ⑧ 공매도 상위종목(FHPST04820000): 공매도 비중 높은 섹터 리스크 감점
@@ -28345,7 +28362,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
-#main{display:grid;grid-template-columns:330px 330px 470px 420px 370px;height:calc(100vh - 34px)}
+#main{display:grid;grid-template-columns:330px 330px 520px 370px 370px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
 .col:last-child{border-right:none}
 .col-title{height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;background:#0a1628;border-bottom:1px solid #1e2d45}
@@ -28371,8 +28388,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:160px 46px 36px 56px 48px 62px 52px}
-.cap-row{display:grid;grid-template-columns:160px 46px 36px 56px 48px 62px 52px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:158px 52px 44px 56px 48px 62px 58px}
+.cap-row{display:grid;grid-template-columns:158px 52px 44px 56px 48px 62px 58px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -28459,7 +28476,7 @@ function renderSectors(){
 function secHTML(list,offset){
   return list.map((sec,li)=>{
     const rank=(li*2)+offset+1,pos=sec.chg>=0,ac=pos?"#ff4444":"#00d97e";
-    const _excl=/(?:우[B\d]*|스팩|SPAC|KODEX|TIGER|KOSEF|KBSTAR|ARIRANG|HANARO|ACE|SOL)$/i;
+    const _excl=/(?:우[B\\d]*|스팩|SPAC|KODEX|TIGER|KOSEF|KBSTAR|ARIRANG|HANARO|ACE|SOL)$/i;
     const ss=[...sec.stocks].filter(s=>!_excl.test(s.name)).sort((a,b)=>b.chg-a.chg);
     return `<div class="sec-sub ${pos?"pos":"neg"}">
       <div class="sec-rnk" style="background:${ac}">${rank}</div>
@@ -28505,11 +28522,11 @@ function renderCapture(){
         <div style="display:flex;flex-direction:column;justify-content:center">
           <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>${tsLine}</div>
         <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
-        <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
-        <span style="font-size:10px;color:${eClr};text-align:right">${s.entry>0?Number(s.entry).toLocaleString("ko-KR"):"--"}</span>
-        <span style="font-size:10px;color:${pnlClr};text-align:right">${pnlTxt}</span>
-        <span style="font-size:10px;color:#60a5fa;text-align:right">${s.target>0?Number(s.target).toLocaleString("ko-KR"):"--"}</span>
-        <span style="font-size:10px;color:#00d97e;text-align:right">${s.stop>0?Number(s.stop).toLocaleString("ko-KR"):"--"}</span>
+        <span style="font-size:11px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
+        <span style="font-size:11px;color:${eClr};text-align:right">${s.entry>0?Number(s.entry).toLocaleString("ko-KR"):"--"}</span>
+        <span style="font-size:11px;color:${pnlClr};text-align:right">${pnlTxt}</span>
+        <span style="font-size:11px;color:#60a5fa;text-align:right">${s.target>0?Number(s.target).toLocaleString("ko-KR"):"--"}</span>
+        <span style="font-size:11px;color:#00d97e;text-align:right">${s.stop>0?Number(s.stop).toLocaleString("ko-KR"):"--"}</span>
       </div>`;
     }).join("");
 }
