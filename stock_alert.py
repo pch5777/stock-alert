@@ -3,10 +3,15 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.31
+버전: v169.32
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v169.32 (2026-05-07): 포착 목록 코드-등락률 간격 수정
+  [#1] cap-row/cap-head에 column-gap:5px 추가
+       이유: 컬럼 크기만 키워서는 셀이 붙어보임 — gap이 없었음
+       개선점: 코드 버튼과 등락률 사이 시각적 여백 확보
+       주의점: 7컬럼 합계 478px + gap 30px = 508px → 포착 520-padding 16=504px 이내 OK
 - v169.31 (2026-05-07): 포착 시간 표시 버그 수정
   [#1] detect_date 파싱 수정: "%Y%m%d"(8자리) → "MM/DD" 변환 fmtDate 헬퍼 추가
        이유: detect_date가 "20260506" 형식이면 .slice(5)="506" 으로 잘못 표시됨
@@ -28393,8 +28398,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:158px 52px 44px 56px 48px 62px 58px}
-.cap-row{display:grid;grid-template-columns:158px 52px 44px 56px 48px 62px 58px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:158px 52px 44px 56px 48px 62px 58px;column-gap:5px}
+.cap-row{display:grid;grid-template-columns:158px 52px 44px 56px 48px 62px 58px;column-gap:5px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
