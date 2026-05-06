@@ -28372,7 +28372,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
 .cap-head{grid-template-columns:130px 40px 34px 50px 44px 58px 48px}
-.cap-row{display:grid;grid-template-columns:130px 40px 34px 50px 44px 58px 48px;height:36px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-row{display:grid;grid-template-columns:130px 40px 34px 50px 44px 58px 48px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -28499,10 +28499,11 @@ function renderCapture(){
       const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
       const capTs=s.detect_date?(s.detect_date.slice(5)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
-      const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
-        :capTs?`<div style="font-size:9px;color:#94a3b8;margin-top:1px">포착 ${capTs}</div>`:"";
+      const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
+        :capTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}</div>`:"";
       return `<div class="cap-row ${s.hit?"hit":""}">
-        <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}${tsLine}</span>
+        <div style="overflow:hidden;display:flex;flex-direction:column;justify-content:center;min-width:0">
+          <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>${tsLine}</div>
         <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
         <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
         <span style="font-size:10px;color:${eClr};text-align:right">${s.entry>0?Number(s.entry).toLocaleString("ko-KR"):"--"}</span>
