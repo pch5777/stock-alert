@@ -28371,8 +28371,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:130px 40px 34px 50px 44px 58px 48px}
-.cap-row{display:grid;grid-template-columns:130px 40px 34px 50px 44px 58px 48px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:160px 36px 30px 46px 40px 52px 44px}
+.cap-row{display:grid;grid-template-columns:160px 36px 30px 46px 40px 52px 44px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -28502,7 +28502,7 @@ function renderCapture(){
       const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
         :capTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}</div>`:"";
       return `<div class="cap-row ${s.hit?"hit":""}">
-        <div style="overflow:hidden;display:flex;flex-direction:column;justify-content:center;min-width:0">
+        <div style="display:flex;flex-direction:column;justify-content:center">
           <span class="cap-nm">${s.name}${s.hit?'<span class="hit-b">도달</span>':""}</span>${tsLine}</div>
         <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
         <span style="font-size:10px;font-weight:700;color:${cc(s.chg)};text-align:right">${fg(s.chg)}</span>
