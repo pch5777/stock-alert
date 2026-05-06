@@ -28550,7 +28550,7 @@ function renderCapture(){
       // 포착시간/도달시간 표시
       const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
       const fmtDate=d=>{if(!d)return"";const v=String(d).trim();return v.length===8?v.slice(4,6)+"/"+v.slice(6,8):v.length>=10?v.slice(5,10):v;};
-      const capTs=s.detect_date?(fmtDate(s.detect_date)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():"";
+      const capTs=s.detect_date?(fmtDate(s.detect_date)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():s.detect_time?(s.detect_time||"").slice(0,5):"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
       const tsLine=hitTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}${capTs&&hitTs?" / ":""}도달 ${hitTs}</div>`
         :capTs?`<div style="font-size:9px;color:#94a3b8;line-height:1.3">포착 ${capTs}</div>`:"";
