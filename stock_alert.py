@@ -27919,6 +27919,71 @@ def _refresh_premarket_sectors() -> None:
                 "grade": "확인중", "reasons": ["섹터 확인 중"],
                 "stocks": etc_stocks[:8], "premarket": True,
             })
+        # ── 시나리오/알람 정보 섹터 반영 (v169.29) ──────────────────
+        # _premarket_action_board의 kr_sector_bull/bear → 섹터 score 보정
+        try:
+            board = _load_premarket_action_board()
+            board_items = list((board or {}).get("items", []) or [])
+            # 섹터별 시나리오 가중치 집계
+            scenario_score: dict = {}  # sector_name → score_delta
+            for row in board_items:
+                priority = int(row.get("priority_score", 0) or 0)
+                weight = max(1, min(priority // 10, 5))  # 최대 +5
+                for sec in list(row.get("kr_sector_bull", []) or []):
+                    scenario_score[sec] = scenario_score.get(sec, 0) + weight
+                for sec in list(row.get("kr_sector_bear", []) or []):
+                    scenario_score[sec] = scenario_score.get(sec, 0) - weight
+            if scenario_score:
+                # 기존 섹터에 시나리오 점수 반영
+                existing_names = {s["name"] for s in sectors_out}
+                for s in sectors_out:
+                    name = s["name"]
+                    # 섹터명 부분 일치 검색
+                    delta = 0
+                    for sc_name, sc_val in scenario_score.items():
+                        if sc_name in name or name in sc_name:
+                            delta += sc_val
+                    if delta != 0:
+                        s["score"] = int(s.get("score", 0)) + delta
+                        s["chg"] = s["score"] * 0.5
+                        if delta > 0:
+                            s.setdefault("reasons", [])
+                            s["reasons"] = [f"📡 시나리오 상방({delta:+d})"] + s["reasons"][:2]
+                        else:
+                            s.setdefault("reasons", [])
+                            s["reasons"] = [f"📡 시나리오 하방({delta:+d})"] + s["reasons"][:2]
+                # 시나리오에만 있고 섹터목록에 없는 bull 섹터 → 신규 추가
+                for sc_name, sc_val in scenario_score.items():
+                    if sc_val <= 0:
+                        continue
+                    if any(sc_name in s["name"] or s["name"] in sc_name for s in sectors_out):
+                        continue
+                    # 해당 섹터 후보 종목 찾기
+                    cands = _build_scenario_candidates_from_sectors([sc_name], max_items=4)
+                    stocks_new = []
+                    for c in cands:
+                        code = c.get("code","")
+                        snap = _get_snap(code)
+                        stocks_new.append({
+                            "name": c.get("name",""),
+                            "code": code,
+                            "chg":  float(snap.get("change_rate") or 0),
+                            "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                            "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                        })
+                    if stocks_new:
+                        sectors_out.append({
+                            "name": sc_name, "chg": sc_val * 0.5,
+                            "score": sc_val, "grade": "보통",
+                            "reasons": [f"📡 시나리오 상방"],
+                            "stocks": stocks_new, "premarket": True,
+                        })
+                # 재정렬: 시나리오 반영 후 score 내림차순
+                sectors_out.sort(key=lambda x: -int(x.get("score", 0)))
+        except Exception as _se:
+            _swallow_exception(_se)
+        # ────────────────────────────────────────────────────────────────
+
         _WEB_DASHBOARD_PREMARKET_SECTORS = sectors_out
         _save_premarket_sectors()
         # JSON 즉시 갱신
@@ -28278,7 +28343,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
-#main{display:grid;grid-template-columns:340px 340px 500px 320px 420px;height:calc(100vh - 34px)}
+#main{display:grid;grid-template-columns:330px 330px 460px 410px 390px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
 .col:last-child{border-right:none}
 .col-title{height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;background:#0a1628;border-bottom:1px solid #1e2d45}
@@ -28304,8 +28369,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:130px 48px 40px 62px 52px 70px 58px}
-.cap-row{display:grid;grid-template-columns:130px 48px 40px 62px 52px 70px 58px;height:36px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:115px 46px 38px 58px 50px 66px 55px}
+.cap-row{display:grid;grid-template-columns:115px 46px 38px 58px 50px 66px 55px;height:36px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -28321,11 +28386,11 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .alr-body{font-size:10px;color:#cce4f8;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .rank-sec-title{height:26px;display:flex;align-items:center;gap:6px;padding:0 8px;flex-shrink:0;border-bottom:1px solid #0d1520;border-top:1px solid #0d1520;background:#0a1225;position:sticky;top:0;z-index:5}
 .rank-sec-title span{font-size:10px;font-weight:700}
-.rk-row{display:grid;grid-template-columns:20px 100px 50px 50px 80px 96px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.rk-row{display:grid;grid-template-columns:20px 90px 48px 48px 72px 88px;height:23px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .rk-row:hover{background:#0d1e30}
 .rk-no{font-size:10px;font-weight:700;color:#c8e4f8}
 .rk-nm{font-size:11px;color:#dceef8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rk-head{grid-template-columns:20px 100px 50px 50px 80px 96px}
+.rk-head{grid-template-columns:20px 90px 48px 48px 72px 88px}
 .mkt-closed{padding:30px 12px;text-align:center;color:#607080}
 .mkt-closed p{font-size:13px;margin-bottom:6px}
 .mkt-closed small{font-size:10px;color:#405060}
