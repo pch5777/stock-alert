@@ -28345,7 +28345,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
-#main{display:grid;grid-template-columns:330px 330px 430px 460px 370px;height:calc(100vh - 34px)}
+#main{display:grid;grid-template-columns:330px 330px 470px 420px 370px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
 .col:last-child{border-right:none}
 .col-title{height:28px;display:flex;align-items:center;gap:7px;padding:0 10px;flex-shrink:0;background:#0a1628;border-bottom:1px solid #1e2d45}
@@ -28371,8 +28371,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:160px 36px 30px 46px 40px 52px 44px}
-.cap-row{display:grid;grid-template-columns:160px 36px 30px 46px 40px 52px 44px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:160px 46px 36px 56px 48px 62px 52px}
+.cap-row{display:grid;grid-template-columns:160px 46px 36px 56px 48px 62px 52px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
