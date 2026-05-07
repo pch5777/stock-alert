@@ -7,6 +7,11 @@
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v171.2 (2026-05-07): 섹터 목록 필터 코드 범위로 수정
+  [#1] 이름 키워드 필터 → bstp_cls_code 범위 필터로 교체
+       이유: "K200" 키워드로 K건설/K금융 등 실제 섹터까지 제거됨
+       개선점: 코스피 업종 1~99, 코스닥 업종 1001~1099 범위만 허용
+- v171.1 (2026-05-07): 섹터 목록 지수/파생상품 필터링 (키워드 방식, 결함 있음)
 - v171.0 (2026-05-07): get_all_sector_index() KIS API 규격서 기반 수정
   [#1] URI 수정: inquire-member → inquire-index-category-price (FHPUP02140000)
        이유: 잘못된 URI로 API 호출 자체가 실패 → 섹터 목록 항상 빈칸
@@ -8975,6 +8980,7 @@ def get_all_sector_index(market: str = "J") -> list:
                 bstp_name = str(i.get("hts_kor_isnm") or "").strip()
                 if not bstp_code or not bstp_name:
                     continue
+
                 items.append({
                     "bstp_code":   bstp_code,
                     "bstp_name":   bstp_name,
@@ -42177,14 +42183,4 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
     # v169.17: 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
     schedule.every(5).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start())
-    schedule.every(120).minutes.do(_leader_job(_refresh_premarket_sectors))
-    schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
-    threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
-    threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except Exception as _e:
-            _log_warn_msg(f"⚠️ 메인 루프 오류: {_e}")
-            time.sleep(5)
+    schedule.e
