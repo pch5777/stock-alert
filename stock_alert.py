@@ -3,10 +3,20 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v169.35
+버전: v170.1
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v170.1 (2026-05-07): 대시보드 실시간 반영 + min_score 과강화 억제
+  [#1] 장중 대시보드 1분 주기 독립 갱신 스케줄 추가
+       이유: run_scan 블로킹 시 섹터/순위/포착 목록이 5분~10분 지연됨
+       개선점: is_any_market_open() 조건으로 장중에만 1분마다 push → 실시간 반영
+       주의점: 기존 5분 스케줄(대기모드용)은 유지. 쓰로틀 3초로 과부하 방지
+  [#2] 10연속 손절 min_score 강제 상향 cap 완화 (80→72, 88→78)
+       이유: WebSocket 재연결 gap + 시장 급변 시 손절 누적 → min_score 80/88까지
+             상향 → EARLY_DETECT/SURGE 포착 전부 미달 → 진입가 너무 높아지는 악순환
+       개선점: cap 72/78로 낮춰 포착 기준이 과도하게 올라가지 않도록 제한
+       주의점: auto_tune 3시간 후 자동 복원 로직은 그대로 유지
 - v169.35 (2026-05-07): 거래대금 캐시 포맷 + 포착시간 폴백 수정
   [#1] 랭킹 캐시 로드 시 amt_raw → _fmt_amt 재변환
        이유: 장마감 후 캐시 파일에 구버전 조 단위 문자열 잔존
@@ -22746,8 +22756,8 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
         if _consecutive_loss_count >= 10:
             _old_n = int(_dynamic.get("min_score_normal", 56))
             _old_s = int(_dynamic.get("min_score_strict", 66))
-            _new_n = min(_old_n + 5, 80)
-            _new_s = min(_old_s + 5, 88)
+            _new_n = min(_old_n + 5, 72)  # v170.1 [#2]: cap 80→72 — 과도한 기준 상향으로 포착 미달 방지
+            _new_s = min(_old_s + 5, 78)  # v170.1 [#2]: cap 88→78
             if _new_n > _old_n or _new_s > _old_s:
                 _dynamic["min_score_normal"] = _new_n
                 _dynamic["min_score_strict"] = _new_s
@@ -23160,6 +23170,8 @@ def _restore_carry_snapshot(sig_data: dict) -> None:
                 "target_price": safe_int(info.get("target_price", 0), 0),
                 "detected_at": detected_at,
                 "carry_day": safe_int(info.get("carry_day", 0), 0),
+                "detect_date": detected_at.strftime("%Y%m%d"),
+                "detect_time": detected_at.strftime("%H:%M"),
             }
         if _detected_stocks:
             _log_info_msg(f"📂 이월 종목 {len(_detected_stocks)}개 복원")
@@ -23181,6 +23193,8 @@ def _restore_tracking_from_signal_log(sig_data: dict) -> None:
                 "target_price": rec.get("target_price", 0),
                 "detected_at": datetime.now(),
                 "carry_day": 0,
+                "detect_date": str(rec.get("detect_date") or ""),
+                "detect_time": str(rec.get("detect_time") or ""),
             }
             restored += 1
         if restored:
@@ -27676,11 +27690,15 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
         body  = "\n".join(lines[1:9])
         lvl   = "red" if any(k in clean for k in ["급등","SURGE","포착","돌파","상한"]) else \
                 "blue" if any(k in clean for k in ["시작","배포","완료","연결","✅","📌"]) else "yellow"
+        import re as _re
+        _code_m = _re.search(r'\b(\d{6})\b', clean)
+        _alr_code = _code_m.group(1) if _code_m else ""
         alert_entry = {
             "lvl":   lvl,
             "time":  datetime.now().strftime("%H:%M"),
             "title": title,
             "body":  body,
+            "code":  _alr_code,
         }
         with _lock:
             _alerts.insert(0, alert_entry)
@@ -28570,7 +28588,7 @@ function renderAlerts(){
   document.getElementById("alr-body").innerHTML=alerts.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
     :alerts.map(a=>`<div class="alr ${a.lvl}">
-      <div class="alr-time">${a.time}</div>
+      <div class="alr-time">${a.time}${a.code?`<button class="cp" style="margin-left:6px" onclick="cp(this,'${a.code}')">${a.code}</button>`:""}</div>
       <div class="alr-top"><span class="alr-dot ${a.lvl}"></span>
       <span class="alr-ttl">${a.title}</span></div>
       <div class="alr-body">${a.body||""}</div></div>`).join("");
@@ -28620,7 +28638,7 @@ async function fetchAndRender(){
     if(!res.ok) throw new Error(res.status);
     const d=await res.json();
     if(d.sectors&&d.sectors.length) sectors=d.sectors;
-    if(d.captured) captured=d.captured;
+    if(d.captured&&d.captured.length) captured=d.captured;
     if(d.alerts&&d.alerts.length) alerts=d.alerts;
     if(d.rank_chg&&d.rank_chg.length) rChg=d.rank_chg;
     if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
@@ -42080,6 +42098,8 @@ if __name__ == "__main__":
             lambda t=_t: None if is_holiday() else _take_intraday_momentum_snapshot("NXT")
         ))
     schedule.every(10).minutes.do(_leader_job(lambda: update_dashboard(force=False)))
+    # v170.1 [#1]: 장중 대시보드 1분 주기 독립 갱신 — run_scan 블로킹과 무관하게 섹터/순위/포착 실시간 반영
+    schedule.every(1).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start() if is_any_market_open() else None)
     schedule.every(10).minutes.do(_leader_job(run_major_investor_sector_scan))  # v165.35: 메이저 수급 섹터 흐름
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
     schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
