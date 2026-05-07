@@ -42183,4 +42183,14 @@ if __name__ == "__main__":
     schedule.every(60).minutes.do(_leader_job(run_geo_news_scan))
     # v169.17: 대시보드 갱신 + 섹터 업데이트 + 미국시장 자동 알람
     schedule.every(5).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start())
-    schedule.e
+    schedule.every(120).minutes.do(_leader_job(_refresh_premarket_sectors))
+    schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
+    threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
+    threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except Exception as _e:
+            _log_warn_msg(f"⚠️ 메인 루프 오류: {_e}")
+            time.sleep(5)
