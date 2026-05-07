@@ -3,10 +3,32 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v171.0
+버전: v171.3
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v171.3 (2026-05-07): 섹터 블랙리스트 + 선진입 시간 게이팅 + 알람 종목코드 cp 버튼
+  [#1] get_all_sector_index(): _is_excluded_sector_name 헬퍼 추가
+       이유: KIS FHPUP02140000 응답에 KOSPI200 시리즈/레버리지/인버스/F-K200/TR/NTR/Nikkei
+             /KRX 금현물 등 지수·파생 다수 포함. v171.2 코드범위 필터는 changelog만 있고
+             실제 코드 누락 → 사용자 화면에 "Nikkei 225 Futures Leveraged Index",
+             "KRX 금현물 레버리지" 등이 섹터로 노출됨.
+       개선점: 정규식 단어경계 처리(`^K[가-힣]`, `^K\d`, `^F-K\d`, `\bTR\b` 등)로 v171.1
+              "K200 키워드가 K건설을 잘못 잡던" 결함 회피. 일반 거래소 업종(건설/기계·장비/
+              운수창고/일반서비스 등)만 통과.
+       주의점: KIS 응답에 새 패턴 추가되면 _SECTOR_EXCLUDE_PATTERNS 갱신 필요.
+  [#2] send_next_open_gap_alert(): 발송 직전 시간 게이팅 추가
+       이유: 함수 시작 시점만 is_market_open() 체크 → KIS API 지연으로 14:35 initial이
+             15:30 넘어 발송되는 사례 발생. 사용자 보고 "장마감 후 알람 옴".
+       개선점: send_by_level 직전 _now_kst로 KRX initial>15:25, final>15:12, NXT>19:50
+              에서 skip. _mark_preclose_gap_run(status="time_skip")로 상태 기록.
+       주의점: 정상 시간대(14:35~15:25) 발송에는 영향 없음.
+  [#3] dashboard.html renderAlerts(): body의 6자리 종목코드 cp 버튼 변환
+       이유: 알람 body 텍스트의 (220100), (001740) 같은 코드가 그냥 텍스트로 렌더링되어
+             클릭 복사 불가. alr-time 옆 a.code 버튼은 별도 필드로만 동작.
+       개선점: 정규식 `(?<![\d,])(\d{6})(?![\d,])`로 단어경계 6자리만 cp 버튼 변환.
+              가격(199,800)·콤마 인접 숫자는 오탐 제외.
+       주의점: 알람 body는 stock_alert.py에서 textually 저장되므로 봇 측 변경 없음.
 - v171.2 (2026-05-07): 섹터 목록 필터 코드 범위로 수정
   [#1] 이름 키워드 필터 → bstp_cls_code 범위 필터로 교체
        이유: "K200" 키워드로 K건설/K금융 등 실제 섹터까지 제거됨
@@ -8946,12 +8968,38 @@ _kospi_cache = {"change": 0.0, "ts": 0}
 _all_sector_index_cache: list = []
 _all_sector_index_cache_ts: float = 0.0
 
+# v171.3 [#1]: 섹터 이름 블랙리스트 — 일반 보통주 섹터만 통과시킴
+# 규격서 응답에 KOSPI200 시리즈(K건설/K금융/K커뮤니케이션 등), 레버리지, 인버스, 선물(F-K200),
+# TR/NTR, KOSPI200 비중상한, TWAP 선물지수, Nikkei/Index, KRX 금현물 등이 섞여 옴.
+_SECTOR_EXCLUDE_PATTERNS = (
+    _re.compile(r'^K[가-힣]'),                            # K건설/K금융/K커뮤니케이션 등 KOSPI200 섹터 시리즈
+    _re.compile(r'^K\d'),                                          # K200/K100/K50 시리즈
+    _re.compile(r'^F-K\d'),                                        # F-K200 선물 시리즈
+    _re.compile(r'레버리지|Leveraged', _re.IGNORECASE),
+    _re.compile(r'인버스|Inverse', _re.IGNORECASE),
+    _re.compile(r'선물|Futures|TWAP', _re.IGNORECASE),
+    _re.compile(r'\bTR\b|\bNTR\b'),
+    _re.compile(r'코스피\s*\d+|코스닥\s*\d+|KOSPI\d+|KOSDAQ\d+', _re.IGNORECASE),
+    _re.compile(r'Nikkei|S&P|다우|Dow|Index|지수', _re.IGNORECASE),
+    _re.compile(r'KRX\s*금'),
+    _re.compile(r'예측|비중상한|가치저변동성|중소형주|방어소비재|고배당'),
+)
+def _is_excluded_sector_name(name: str) -> bool:
+    """KIS 응답 섹터명에서 지수/파생/레버리지/TR/F-K200 등을 거른다."""
+    if not name:
+        return True
+    for _pat in _SECTOR_EXCLUDE_PATTERNS:
+        if _pat.search(name):
+            return True
+    return False
+
 def get_all_sector_index(market: str = "J") -> list:
     """업종 구분별 전체 시세 (FHPUP02140000) — v171.0 규격서 기반 수정.
     URL: /uapi/domestic-stock/v1/quotations/inquire-index-category-price
     코스피(K) + 코스닥(Q) 각각 호출 후 합산.
     반환: [{bstp_code, bstp_name, change_rate, index, volume, trade_value}, ...]
     캐시: 1분
+    v171.3 [#1]: _is_excluded_sector_name으로 지수/파생/레버리지 제외
     """
     global _all_sector_index_cache, _all_sector_index_cache_ts
     if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 60:
@@ -8979,6 +9027,9 @@ def get_all_sector_index(market: str = "J") -> list:
                 bstp_code = str(i.get("bstp_cls_code") or "").strip()
                 bstp_name = str(i.get("hts_kor_isnm") or "").strip()
                 if not bstp_code or not bstp_name:
+                    continue
+                # v171.3 [#1]: 일반 보통주 섹터만 통과 — KOSPI200 시리즈/레버리지/인버스/선물/TR/Nikkei/F-K200 제외
+                if _is_excluded_sector_name(bstp_name):
                     continue
 
                 items.append({
@@ -14261,6 +14312,19 @@ def send_next_open_gap_alert(stage: str = "krx", phase: str = "initial"):
         final_label = "15:18 종가베팅 final confirm" if stage == "krx" else "19:20 NXT 종가베팅 final confirm"
         msg += f"⚠️ 본 묶음은 {final_label} 결과입니다. 전고 근접·윗꼬리·1분봉 20선 지지를 다시 확인했습니다.\n"
     msg += "⚠️ 이 알림은 장마감 전 즉시 체결 가능한 현재가 기준 실전 선진입 플랜입니다. 고가권 종목도 현재가를 진입가로 확정해 다음날 갭상승 결과를 추적합니다."
+    # v171.3 [#2]: 발송 직전 시간 게이팅 — KIS API 지연으로 장마감 후 발송되는 것 차단
+    _now_hm = _now_kst().strftime("%H:%M")
+    if stage == "krx":
+        _krx_cutoff = "15:12" if phase == "final" else "15:25"
+        if _now_hm > _krx_cutoff:
+            _log_info_msg(f"⏸ [{stage_tag}] 발송 직전 차단 — {_now_hm} > {_krx_cutoff} (KRX 마감 임박)")
+            _mark_preclose_gap_run(stage, status="time_skip", candidate_count=len(cand), phase=phase)
+            return
+    elif stage == "nxt":
+        if _now_hm > "19:50":
+            _log_info_msg(f"⏸ [{stage_tag}] 발송 직전 차단 — {_now_hm} > 19:50 (NXT 마감 임박)")
+            _mark_preclose_gap_run(stage, status="time_skip", candidate_count=len(cand), phase=phase)
+            return
     send_by_level(msg, level=ALERT_LEVEL_NORMAL)
     # v165.23 [#2]: entry_basis=="pullback_wait" 종목 → _pullback_wait_watch 자동 등록
     _pullback_registered = 0
@@ -28621,13 +28685,16 @@ function renderCapture(){
     }).join("");
 }
 function renderAlerts(){
+  // v171.3 [#3]: body 텍스트의 6자리 종목코드를 cp 버튼으로 자동 변환 (가격/콤마 인접은 제외)
+  const _cpify=(s)=>String(s||"").replace(/(?<![\d,])(\d{6})(?![\d,])/g,
+    '<button class="cp" onclick="cp(this,\'$1\')">$1</button>');
   document.getElementById("alr-body").innerHTML=alerts.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
     :alerts.map(a=>`<div class="alr ${a.lvl}">
       <div class="alr-time">${a.time}${a.code?`<button class="cp" style="margin-left:6px" onclick="cp(this,'${a.code}')">${a.code}</button>`:""}</div>
       <div class="alr-top"><span class="alr-dot ${a.lvl}"></span>
       <span class="alr-ttl">${a.title}</span></div>
-      <div class="alr-body">${a.body||""}</div></div>`).join("");
+      <div class="alr-body">${_cpify(a.body)}</div></div>`).join("");
 }
 function renderRanking(){
   const rb=document.getElementById("rank-body");
