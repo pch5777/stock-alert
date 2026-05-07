@@ -3,10 +3,22 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v170.1
+버전: v171.0
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v171.0 (2026-05-07): get_all_sector_index() KIS API 규격서 기반 수정
+  [#1] URI 수정: inquire-member → inquire-index-category-price (FHPUP02140000)
+       이유: 잘못된 URI로 API 호출 자체가 실패 → 섹터 목록 항상 빈칸
+       개선점: 규격서(v1_국내주식-066) 정확한 파라미터/응답필드 적용
+               코스피(K/0001) + 코스닥(Q/1001) 각각 호출 후 합산
+               응답키 output→output2, bstp_kor_isnm→hts_kor_isnm 수정
+- v170.2 (2026-05-07): 섹터 목록 종목 표시 수정
+  [#1] _record_execution_snapshot에 bstp_name 저장
+       이유: _sector_cache는 run_scan 흐름 종목만 채워져 대부분 빈칸 → 섹터 매칭 0건
+       개선점: get_volume_surge_stocks() payload의 bstp_name을 snap에 저장
+               → _push_dashboard_json에서 snap["bstp_name"]으로 직접 매칭
+       주의점: WebSocket 체결 snap은 bstp_name 없음 → _sector_cache 폴백 유지
 - v170.1 (2026-05-07): 대시보드 실시간 반영 + min_score 과강화 억제
   [#1] 장중 대시보드 1분 주기 독립 갱신 스케줄 추가
        이유: run_scan 블로킹 시 섹터/순위/포착 목록이 5분~10분 지연됨
@@ -8930,45 +8942,47 @@ _all_sector_index_cache: list = []
 _all_sector_index_cache_ts: float = 0.0
 
 def get_all_sector_index(market: str = "J") -> list:
-    """업종 구분별 전체 시세 (FHPUP02140000) — 1회 호출로 전 섹터 지수 수신.
-    장전: 전일 종가 기준 섹터 강약 / 장중: 실시간 등락 기반 오늘 주도 섹터 판별.
-    반환: [{bstp_code, bstp_name, change_rate, index, volume}, ...]
-    캐시: 5분
+    """업종 구분별 전체 시세 (FHPUP02140000) — v171.0 규격서 기반 수정.
+    URL: /uapi/domestic-stock/v1/quotations/inquire-index-category-price
+    코스피(K) + 코스닥(Q) 각각 호출 후 합산.
+    반환: [{bstp_code, bstp_name, change_rate, index, volume, trade_value}, ...]
+    캐시: 1분
     """
     global _all_sector_index_cache, _all_sector_index_cache_ts
-    if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 60:  # v169.27: 5분→1분
+    if _all_sector_index_cache and time.time() - _all_sector_index_cache_ts < 60:
         return _all_sector_index_cache
     try:
-        data = _safe_get(
-            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-member",
-            "FHPUP02140000",
-            {
-                "fid_cond_mrkt_div_code": market,
-                "fid_cond_scr_div_code":  "20214",
-                "fid_div_cls_code":        "1",   # 1=업종구분
-                "fid_input_iscd":          "0001",
-                "fid_trgt_cls_code":       "0",
-                "fid_trgt_exls_cls_code":  "0",
-            },
-        )
-        if not isinstance(data, dict):
-            return []
         items = []
-        for i in (data.get("output") or []):
-            if not isinstance(i, dict):
+        # 코스피(K, iscd=0001) + 코스닥(Q, iscd=1001) 각각 조회
+        for mrkt_cls, iscd in [("K", "0001"), ("Q", "1001")]:
+            data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-index-category-price",
+                "FHPUP02140000",
+                {
+                    "FID_COND_MRKT_DIV_CODE": "U",
+                    "FID_INPUT_ISCD":          iscd,
+                    "FID_COND_SCR_DIV_CODE":   "20214",
+                    "FID_MRKT_CLS_CODE":        mrkt_cls,
+                    "FID_BLNG_CLS_CODE":        "0",
+                },
+            )
+            if not isinstance(data, dict):
                 continue
-            bstp_code = str(i.get("bstp_cls_code") or i.get("bstp_code") or "").strip()
-            bstp_name = str(i.get("bstp_kor_isnm") or i.get("bstp_name") or "").strip()
-            if not bstp_code or not bstp_name:
-                continue
-            items.append({
-                "bstp_code":   bstp_code,
-                "bstp_name":   bstp_name,
-                "change_rate": safe_float(i.get("bstp_nmix_prdy_ctrt") or i.get("prdy_ctrt") or 0, 0.0),
-                "index":       safe_float(i.get("bstp_nmix_prpr") or i.get("prpr") or 0, 0.0),
-                "volume":      safe_int(i.get("acml_vol") or 0, 0),
-                "trade_value": safe_int(i.get("acml_tr_pbmn") or 0, 0),
-            })
+            for i in (data.get("output2") or []):
+                if not isinstance(i, dict):
+                    continue
+                bstp_code = str(i.get("bstp_cls_code") or "").strip()
+                bstp_name = str(i.get("hts_kor_isnm") or "").strip()
+                if not bstp_code or not bstp_name:
+                    continue
+                items.append({
+                    "bstp_code":   bstp_code,
+                    "bstp_name":   bstp_name,
+                    "change_rate": safe_float(i.get("bstp_nmix_prdy_ctrt") or 0, 0.0),
+                    "index":       safe_float(i.get("bstp_nmix_prpr") or 0, 0.0),
+                    "volume":      safe_int(i.get("acml_vol") or 0, 0),
+                    "trade_value": safe_int(i.get("acml_tr_pbmn") or 0, 0),
+                })
         items.sort(key=lambda x: x["change_rate"], reverse=True)
         _all_sector_index_cache = items
         _all_sector_index_cache_ts = time.time()
@@ -11166,6 +11180,8 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
         "low": safe_int(payload.get("low", 0)),
         # v163: VI 발동 기준가 저장
         "vi_price": safe_int(payload.get("vi_price", 0)),
+        # v170.2: 섹터명 저장 — 대시보드 섹터 분류용 (WebSocket 틱엔 없으므로 이전 값 유지)
+        "bstp_name": str(payload.get("bstp_name", "") or prev.get("bstp_name", "") or ""),
     }
     if prev and prev.get("price") == price and prev.get("today_vol") == today_vol:
         return
@@ -28130,25 +28146,39 @@ def _push_dashboard_json() -> None:
         try:
             if market_open:
                 # 장중: get_all_sector_index + _sector_cache 실시간 가격
+                # v170.2 [#1]: snap의 bstp_name으로 섹터 직접 분류
+                # 이유: _sector_cache는 run_scan 흐름 종목만 채워져 대부분 빈칸
+                #       → 이제 _record_execution_snapshot이 bstp_name을 snap에 저장
+                #       → snap["bstp_name"]으로 바로 매칭 가능
+                snap_by_sector: dict = {}
+                for _scode, _sbuf in list(_execution_snapshots.items()):
+                    if not _sbuf or not _scode or len(_scode) != 6: continue
+                    _snap = _sbuf[-1]
+                    _sec_name = str(_snap.get("bstp_name") or "").strip()
+                    if not _sec_name:
+                        # 폴백: _sector_cache
+                        _sc = _sector_cache.get(_scode)
+                        _sec_name = ((_sc or {}).get("sector") or "") if isinstance(_sc, dict) else ""
+                    if not _sec_name:
+                        continue
+                    snap_by_sector.setdefault(_sec_name, []).append((_scode, _snap))
+
                 sector_list = get_all_sector_index() or []
                 for sec in sector_list[:12]:
                     name = sec.get("bstp_name","")
                     chg  = float(sec.get("change_rate") or 0)
                     stocks_raw = []
                     try:
-                        for code, cdata in list(_sector_cache.items())[:300]:
-                            if not isinstance(cdata, dict): continue
-                            if cdata.get("sector","") != name: continue
-                            snap = _get_snap(code)
+                        snaps_for_sec = snap_by_sector.get(name, [])
+                        snaps_for_sec.sort(key=lambda x: -float(x[1].get("change_rate") or 0))
+                        for _scode, _snap in snaps_for_sec[:8]:
                             stocks_raw.append({
-                                "name": _resolve_stock_name(code,""),
-                                "code": code,
-                                "chg":  float(snap.get("change_rate") or 0),
-                                "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                                "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                                "name": _resolve_stock_name(_scode,""),
+                                "code": _scode,
+                                "chg":  float(_snap.get("change_rate") or 0),
+                                "vol":  _fmt_vol(safe_int(_snap.get("today_vol") or 0)),
+                                "amt":  _fmt_amt(safe_int(_snap.get("acml_tr_pbmn") or 0)),
                             })
-                        stocks_raw.sort(key=lambda x:-x["chg"])
-                        stocks_raw = stocks_raw[:8]
                     except Exception:
                         pass
                     if name:
