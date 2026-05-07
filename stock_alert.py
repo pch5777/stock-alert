@@ -3,10 +3,33 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v171.5
+버전: v172.0
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v172.0 (2026-05-07): 테마 섹터 우선 노출 + 대장주 👑 표시 + Groq SWR
+  [#1] _push_dashboard_json sectors 빌드 — market_leader_state 1순위, 거래소 업종은 보완용
+       이유: SECTOR LIST에 KOSPI200/레버리지/F-K200 같은 일반 지수 대신 AI/원전/2차전지 등
+             테마 섹터를 즉시 매매 가능 종목군과 함께 노출하라는 사용자 요청.
+       개선점: market_leader_state.sectors가 있고 sent_at이 오늘이면 테마를 먼저 빌드하여
+              sectors_raw에 push. 거래소 업종(get_all_sector_index)은 sectors_raw가 5개 미만일
+              때만 폴백 보충하여 화면 자리 채움.
+       주의점: market_leader_state는 텔레그램 발송 사이클(10~30분)에 갱신되므로 분 단위로는
+              stale일 수 있음. 야간/주말은 기존 로직대로 캡쳐 모드 유지.
+  [#2] sectors 안 leader 종목 "👑" 첨부 + (is_leader desc, change_rate desc) 정렬
+       이유: 대장주를 한눈에 식별하라는 사용자 요청. market_leader_state에 이미 leader.code가
+             들어있어 추가 비용 없이 표시 가능.
+       개선점: members 빌드 시 mc == leader_code인 종목의 name 앞에 "👑 " prefix.
+              정렬 키를 (not is_leader, -chg)로 두어 leader가 항상 첫 번째.
+       주의점: leader 정보가 없는 sector(레거시)는 그대로 chg 정렬만 적용.
+  [#3] _fetch_groq_news_rows() stale-while-revalidate 캐시 패턴
+       이유: Groq 429(rate limit)가 빈발해 테마 섹터 데이터 재집계가 끊길 위험. 이전에는
+             TTL(600s) 만료 즉시 sync fetch → 429 받으면 빈 리스트 반환되어 섹터 갱신 누락.
+       개선점: TTL 만료 후 cache_age < TTL*3 윈도우 안이면 stale 캐시를 즉시 반환하고
+              백그라운드 thread로 재호출. threading.Lock(non-blocking)으로 동시 fetch 방지.
+              force_revalidate=True 인자로 백그라운드 호출은 캐시 분기 우회 후 sync fetch 진행.
+       주의점: 캐시가 비어있는 첫 호출은 기존대로 sync fetch. stale 윈도우(TTL*3=30분)를
+              넘기면 다시 sync fetch 폴백.
 - v171.5 (2026-05-07): _cpify JS SyntaxError 수정 (대시보드 화면 공백 root cause)
   [#1] _DASHBOARD_HTML 안 _cpify replace 두번째 인자 outer quote 변경
        `'<button ... onclick="cp(this,\\'$1\\')">$1</button>'`
@@ -5984,6 +6007,8 @@ GROQ_API_KEY   = str(os.getenv("GROQ_API_KEY", "") or "").strip()
 GROQ_MODEL     = str(os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile").strip()
 GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "600") or "600")  # v163.17: 10분 캐시 (뉴스 갱신 주기 기준)
 GROQ_GROUNDING_DAILY_LIMIT   = int(os.getenv("GROQ_GROUNDING_DAILY_LIMIT", "200") or "200")      # 하루 최대 호출 수 (여유 있음)
+# v172.0 [D]: stale-while-revalidate 동시 fetch 방지용 락
+_groq_revalidate_lock = threading.Lock()
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
 # 유료유도 제외 키워드 — _fetch_youtube_keyword_search_rows()에서 영상 필터링에 사용
 YOUTUBE_EXCLUDE_KEYWORDS = [x.strip() for x in str(os.getenv("YOUTUBE_EXCLUDE_KEYWORDS", "리딩방,단톡방,무료 추천주,급등주,조건 검색식") or "").split(",") if x.strip()]
@@ -6392,21 +6417,35 @@ def _fetch_gemini_grounding_rows() -> list[dict]:
         return list(_gemini_grounding_cache.get("rows", []))
 
 
-def _fetch_groq_news_rows() -> list[dict]:
+def _fetch_groq_news_rows(force_revalidate: bool = False) -> list[dict]:
     """
     v163.16: Groq Llama API로 한국 주식 재료 분석.
     fetch_all_news()로 수집한 RSS 헤드라인을 Groq에 전달 → 재료 구조화.
     Gemini grounding과 달리 웹 검색 기능 없음 — 봇이 직접 수집한 뉴스 텍스트를 분석.
     GROQ_API_KEY 미설정 시 즉시 [] 반환.
     캐시 TTL: GROQ_GROUNDING_CACHE_TTL_SEC (기본 20분).
+    v172.0 [D]: stale-while-revalidate — TTL 만료 후 호출 시 백그라운드 재호출 + stale 즉시 반환.
+                force_revalidate=True (백그라운드 재호출 전용) 시 캐시 분기 우회하고 sync fetch.
     """
     global _groq_grounding_cache, _groq_grounding_daily_counter
     if not GROQ_API_KEY:
         return []
     now = time.time()
-    # 캐시 유효 시 즉시 반환
-    if _groq_grounding_cache.get("rows") and now - float(_groq_grounding_cache.get("ts", 0) or 0) < GROQ_GROUNDING_CACHE_TTL_SEC:
-        return list(_groq_grounding_cache.get("rows", []))
+    cached_rows = list(_groq_grounding_cache.get("rows", []))
+    cache_age = now - float(_groq_grounding_cache.get("ts", 0) or 0)
+    # 신선한 캐시 → 즉시 반환
+    if not force_revalidate and cached_rows and cache_age < GROQ_GROUNDING_CACHE_TTL_SEC:
+        return cached_rows
+    # v172.0 [D]: 캐시 만료지만 stale 윈도우(3xTTL) 안이면 백그라운드 재호출 + stale 즉시 반환
+    if not force_revalidate and cached_rows and cache_age < GROQ_GROUNDING_CACHE_TTL_SEC * 3:
+        if _groq_revalidate_lock.acquire(blocking=False):
+            def _groq_bg_revalidate():
+                try:
+                    _fetch_groq_news_rows(force_revalidate=True)
+                finally:
+                    _groq_revalidate_lock.release()
+            threading.Thread(target=_groq_bg_revalidate, daemon=True).start()
+        return cached_rows
     # 일별 한도 체크
     today = _now_kst().strftime("%Y-%m-%d")
     if _groq_grounding_daily_counter.get("date") != today:
@@ -28242,53 +28281,14 @@ def _push_dashboard_json() -> None:
         market_open = is_any_market_open()
         try:
             if market_open:
-                # 장중: get_all_sector_index + _sector_cache 실시간 가격
-                # v170.2 [#1]: snap의 bstp_name으로 섹터 직접 분류
-                # 이유: _sector_cache는 run_scan 흐름 종목만 채워져 대부분 빈칸
-                #       → 이제 _record_execution_snapshot이 bstp_name을 snap에 저장
-                #       → snap["bstp_name"]으로 바로 매칭 가능
-                snap_by_sector: dict = {}
-                for _scode, _sbuf in list(_execution_snapshots.items()):
-                    if not _sbuf or not _scode or len(_scode) != 6: continue
-                    _snap = _sbuf[-1]
-                    _sec_name = str(_snap.get("bstp_name") or "").strip()
-                    if not _sec_name:
-                        # 폴백: _sector_cache
-                        _sc = _sector_cache.get(_scode)
-                        _sec_name = ((_sc or {}).get("sector") or "") if isinstance(_sc, dict) else ""
-                    if not _sec_name:
-                        continue
-                    snap_by_sector.setdefault(_sec_name, []).append((_scode, _snap))
-
-                sector_list = get_all_sector_index() or []
-                for sec in sector_list[:12]:
-                    name = sec.get("bstp_name","")
-                    chg  = float(sec.get("change_rate") or 0)
-                    stocks_raw = []
-                    try:
-                        snaps_for_sec = snap_by_sector.get(name, [])
-                        snaps_for_sec.sort(key=lambda x: -float(x[1].get("change_rate") or 0))
-                        for _scode, _snap in snaps_for_sec[:8]:
-                            stocks_raw.append({
-                                "name": _resolve_stock_name(_scode,""),
-                                "code": _scode,
-                                "chg":  float(_snap.get("change_rate") or 0),
-                                "vol":  _fmt_vol(safe_int(_snap.get("today_vol") or 0)),
-                                "amt":  _fmt_amt(safe_int(_snap.get("acml_tr_pbmn") or 0)),
-                            })
-                    except Exception as _e:
-                        _swallow_exception(_e, "_push_dashboard_json:sectors_inner1")
-                    if name:
-                        sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
-                sectors_raw.sort(key=lambda x:-x["chg"])
-                # v169.28 [이슈2]: 섹터 종목 없으면 market_leader_state 대장주/follower 보완
+                # v172.0 [A]: 테마 섹터(market_leader_state) 1순위 빌드
+                # v172.0 [C]: leader 종목에 👑 표시 + 우선 정렬
                 try:
                     _leader_state = _read_market_leader_state()
                     _leader_sectors = _leader_state.get("sectors", [])
                     _today_str = _now_kst().strftime("%Y-%m-%d")
                     _sent_at = str(_leader_state.get("sent_at", "") or "")
                     if _leader_sectors and _sent_at.startswith(_today_str):
-                        _leader_sec_map: dict = {s["name"]: s for s in sectors_raw}
                         for lsec in _leader_sectors:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
@@ -28296,43 +28296,69 @@ def _push_dashboard_json() -> None:
                             followers = lsec.get("followers") or []
                             all_members = ([leader] if leader else []) + list(followers)
                             if not all_members: continue
-                            # 기존 섹터에 종목 보완
-                            matched = next((s for s in sectors_raw if theme in s["name"] or s["name"] in theme), None)
-                            if matched:
-                                existing_codes = {st["code"] for st in matched["stocks"]}
-                                for m in all_members:
-                                    mc = str(m.get("code","") or "")
-                                    if not mc or mc in existing_codes: continue
-                                    snap = _get_snap(mc)
-                                    matched["stocks"].append({
-                                        "name": m.get("name","") or _resolve_stock_name(mc,""),
-                                        "code": mc,
-                                        "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
-                                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
-                                    })
-                                matched["stocks"].sort(key=lambda x:-x["chg"])
-                                matched["stocks"] = matched["stocks"][:8]
-                            else:
-                                # 섹터 자체가 없으면 신규 추가
-                                new_stocks = []
-                                for m in all_members:
-                                    mc = str(m.get("code","") or "")
-                                    if not mc: continue
-                                    snap = _get_snap(mc)
-                                    new_stocks.append({
-                                        "name": m.get("name","") or _resolve_stock_name(mc,""),
-                                        "code": mc,
-                                        "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
-                                        "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                                        "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
-                                    })
-                                if new_stocks:
-                                    avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
-                                    sectors_raw.append({"name": theme, "chg": round(avg_chg,2), "stocks": new_stocks[:8]})
+                            _leader_code = str(leader.get("code","") or "")  # v172.0 [C]
+                            new_stocks = []
+                            for m in all_members:
+                                mc = str(m.get("code","") or "")
+                                if not mc: continue
+                                snap = _get_snap(mc)
+                                is_leader = bool(_leader_code) and (mc == _leader_code)  # v172.0 [C]
+                                base_name = m.get("name","") or _resolve_stock_name(mc,"")
+                                new_stocks.append({
+                                    "name": ("👑 " + base_name) if is_leader else base_name,  # v172.0 [C]
+                                    "code": mc,
+                                    "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
+                                    "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
+                                    "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                                    "is_leader": is_leader,  # v172.0 [C]
+                                })
+                            # v172.0 [C]: leader 우선 + 등락률 내림차순
+                            new_stocks.sort(key=lambda x: (not x.get("is_leader"), -x["chg"]))
+                            new_stocks = new_stocks[:8]
+                            if new_stocks:
+                                avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
+                                sectors_raw.append({"name": theme, "chg": round(avg_chg,2), "stocks": new_stocks})
                         sectors_raw.sort(key=lambda x:-x["chg"])
                 except Exception as _e:
-                    _swallow_exception(_e, "_push_dashboard_json:sectors_leader")
+                    _swallow_exception(_e, "_push_dashboard_json:themes_primary")
+
+                # v172.0 [A]: 거래소 업종 보완 — 테마가 5개 미만일 때만 추가 (테마 우선 노출)
+                snap_by_sector: dict = {}
+                for _scode, _sbuf in list(_execution_snapshots.items()):
+                    if not _sbuf or not _scode or len(_scode) != 6: continue
+                    _snap = _sbuf[-1]
+                    _sec_name = str(_snap.get("bstp_name") or "").strip()
+                    if not _sec_name:
+                        _sc = _sector_cache.get(_scode)
+                        _sec_name = ((_sc or {}).get("sector") or "") if isinstance(_sc, dict) else ""
+                    if not _sec_name:
+                        continue
+                    snap_by_sector.setdefault(_sec_name, []).append((_scode, _snap))
+
+                if len(sectors_raw) < 5:  # v172.0 [A]: 테마 5개 미만 시만 거래소 업종 보완
+                    try:
+                        sector_list = get_all_sector_index() or []
+                        existing_names = {s["name"] for s in sectors_raw}
+                        for sec in sector_list[:12]:
+                            name = sec.get("bstp_name","")
+                            chg  = float(sec.get("change_rate") or 0)
+                            if not name or name in existing_names: continue
+                            stocks_raw = []
+                            snaps_for_sec = snap_by_sector.get(name, [])
+                            snaps_for_sec.sort(key=lambda x: -float(x[1].get("change_rate") or 0))
+                            for _scode, _snap in snaps_for_sec[:8]:
+                                stocks_raw.append({
+                                    "name": _resolve_stock_name(_scode,""),
+                                    "code": _scode,
+                                    "chg":  float(_snap.get("change_rate") or 0),
+                                    "vol":  _fmt_vol(safe_int(_snap.get("today_vol") or 0)),
+                                    "amt":  _fmt_amt(safe_int(_snap.get("acml_tr_pbmn") or 0)),
+                                })
+                            sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
+                            if len(sectors_raw) >= 12: break
+                        sectors_raw.sort(key=lambda x:-x["chg"])
+                    except Exception as _e:
+                        _swallow_exception(_e, "_push_dashboard_json:exchange_secondary")
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
                 if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
