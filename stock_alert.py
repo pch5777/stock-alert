@@ -3,10 +3,27 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v172.0
-날짜: 2026-05-07
+버전: v172.1
+날짜: 2026-05-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v172.1 (2026-05-08): 포착 표시·CSS·섹터갱신 버그 3건 수정
+  [#1] captured_raw[:30] → [:50]
+       이유: hit=false(미도달) 종목이 hit=true 30개로 꽉 찬 목록에 밀려 대시보드에 안 보임.
+       개선점: 상한 50으로 확장. hit 우선 정렬은 유지.
+       주의점: 표시 개수만 늘림, 정렬 로직 변경 없음.
+  [#2] cap-row/cap-head grid 컬럼 조정 (코드↔등락률 간격 확보)
+       이유: 종목코드와 등락률이 너무 붙어 가독성 불편.
+       개선점: 코드 52→58px(+6), 등락률 44→40px(-4), 진입가 56→52px(-4),
+              수익률 48→44px(-4), 목표가 62→58px(-4), 손절가 58→54px(-4).
+              총 너비 474→460px — 480px 예산 내 유지.
+       주의점: 종목명(154px) 및 레이아웃 전체 그리드 변경 없음.
+  [#3] send_preopen_watchlist / send_premarket_risk_assessment 완료 후 _refresh_premarket_sectors() 훅 추가
+       이유: 07:30 액션보드·리스크 평가 발송 후 섹터 목록에 시나리오 점수가 즉시 반영 안 됨.
+             _premarket_action_board가 갱신되어도 _WEB_DASHBOARD_PREMARKET_SECTORS는
+             120분 주기 혹은 장마감 시점에만 갱신 → 대시보드에 최신 시나리오 미반영.
+       개선점: 두 함수 발송 완료 직후 daemon thread로 _refresh_premarket_sectors() 즉시 실행.
+       주의점: 비동기 thread라 발송 흐름 블로킹 없음. 휴장일은 is_holiday() 앞단 리턴으로 차단.
 - v172.0 (2026-05-07): 테마 섹터 우선 노출 + 대장주 👑 표시 + Groq SWR
   [#1] _push_dashboard_json sectors 빌드 — market_leader_state 1순위, 거래소 업종은 보완용
        이유: SECTOR LIST에 KOSPI200/레버리지/F-K200 같은 일반 지수 대신 AI/원전/2차전지 등
@@ -14730,6 +14747,8 @@ def send_preopen_watchlist():
             if item_cnt:
                 msg_parts.append(f"\n━━━━━━━━━━━━━━━\nℹ️ 시나리오 {item_cnt}건 기준으로 장전 후보를 재정렬했습니다.")
         send_by_level("\n\n".join([part for part in msg_parts if str(part).strip()]), level=ALERT_LEVEL_NORMAL)
+        # v172.1: 액션보드 발송 완료 후 장전 섹터 갱신 (시나리오 점수 반영)
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     except Exception as e:
         _log_warn_msg(f"⚠️ send_preopen_watchlist 오류: {e}")
 def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
@@ -28458,7 +28477,7 @@ def _push_dashboard_json() -> None:
                 })
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
             captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
-            captured_raw = captured_raw[:30]
+            captured_raw = captured_raw[:50]  # v172.1: hit=false 종목 잘림 방지
         except Exception as _e:
             _swallow_exception(_e, "_push_dashboard_json:captured_block")
 
@@ -28606,8 +28625,8 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .chg-v{font-size:11px;font-weight:700;text-align:right}
 .vol-v{font-size:10px;color:#c8e4f8;text-align:right}.amt-v{font-size:10px;color:#c8e4f8;text-align:right}
 /* 포착 7컬럼: 종목명 코드 등락률 진입가 수익률 목표가 손절가 */
-.cap-head{grid-template-columns:154px 52px 44px 56px 48px 62px 58px;column-gap:5px}
-.cap-row{display:grid;grid-template-columns:154px 52px 44px 56px 48px 62px 58px;column-gap:5px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
+.cap-head{grid-template-columns:154px 58px 40px 52px 44px 58px 54px;column-gap:5px}
+.cap-row{display:grid;grid-template-columns:154px 58px 40px 52px 44px 58px 54px;column-gap:5px;height:40px;padding:0 8px;align-items:center;border-bottom:1px solid #09111e;transition:background .1s}
 .cap-row:hover{background:#0d1e30}.cap-row.hit{background:#081510}
 .cap-nm{font-size:11px;color:#eef4fa;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hit-b{font-size:7px;font-weight:800;color:#0a0f1e;background:#00d97e;padding:0 3px;border-radius:2px;margin-left:2px;vertical-align:middle}
@@ -38867,6 +38886,8 @@ def send_premarket_risk_assessment():
         _save_premarket_risk_payload(payload)
         if sent_id is not None:
             _consume_preopen_buffers()
+        # v172.1: 리스크 평가 발송 완료 후 장전 섹터 갱신 (시나리오 점수 반영)
+        threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     except Exception as e:
         _log_error("send_premarket_risk_assessment", e)
 def _build_premarket_macro_sections(now_dt: datetime) -> str:
