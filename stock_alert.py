@@ -3,17 +3,30 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v171.3
+버전: v171.4
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v171.4 (2026-05-07): 대시보드 공백 진단용 디버그 로그 + SyntaxWarning 수정
+  [#1] _push_dashboard_json 4개 내부 except + 외부 except에 note 부착
+       이유: v171.3 배포 후 대시보드가 30분간 비어있는데 _swallow_exception 흔적 0건.
+             내부 except: pass가 묵음으로 흘려 어디서 막히는지 알 수 없었음.
+       개선점: cnt<=3 동안 즉시 로그, 5분에 1회 누적 로그 → 다음 로그에서 정확한
+              실패 단계 특정 가능 (sectors_inner1/sectors_leader/sectors_block/captured_block/main_block).
+       주의점: _swallow_exception은 자체 throttle 있어 로그 폭주 없음.
+  [#2] JSON 갱신 성공 시 첫 3회 명시 로그 ("📤 dashboard JSON 갱신 #N (sec=X, cap=Y, ...)")
+       이유: 함수 호출 자체가 안 되는 케이스와 호출은 되는데 데이터가 비는 케이스를 분리 진단.
+       개선점: 로그에 갱신 횟수와 각 영역 건수가 보이면 가설 확정 가능.
+  [#3] SyntaxWarning 2건 수정 (\d → \\d)
+       위치: changelog docstring 안의 정규식 메모, _DASHBOARD_HTML _cpify JS 정규식.
+       이유: Python 3.12+ 부팅 로그에 SyntaxWarning 노이즈. 동작에는 영향 없으나 정리.
 - v171.3 (2026-05-07): 섹터 블랙리스트 + 선진입 시간 게이팅 + 알람 종목코드 cp 버튼
   [#1] get_all_sector_index(): _is_excluded_sector_name 헬퍼 추가
        이유: KIS FHPUP02140000 응답에 KOSPI200 시리즈/레버리지/인버스/F-K200/TR/NTR/Nikkei
              /KRX 금현물 등 지수·파생 다수 포함. v171.2 코드범위 필터는 changelog만 있고
              실제 코드 누락 → 사용자 화면에 "Nikkei 225 Futures Leveraged Index",
              "KRX 금현물 레버리지" 등이 섹터로 노출됨.
-       개선점: 정규식 단어경계 처리(`^K[가-힣]`, `^K\d`, `^F-K\d`, `\bTR\b` 등)로 v171.1
+       개선점: 정규식 단어경계 처리(`^K[가-힣]`, `^K\\d`, `^F-K\\d`, `\\bTR\\b` 등)로 v171.1
               "K200 키워드가 K건설을 잘못 잡던" 결함 회피. 일반 거래소 업종(건설/기계·장비/
               운수창고/일반서비스 등)만 통과.
        주의점: KIS 응답에 새 패턴 추가되면 _SECTOR_EXCLUDE_PATTERNS 갱신 필요.
@@ -28249,8 +28262,8 @@ def _push_dashboard_json() -> None:
                                 "vol":  _fmt_vol(safe_int(_snap.get("today_vol") or 0)),
                                 "amt":  _fmt_amt(safe_int(_snap.get("acml_tr_pbmn") or 0)),
                             })
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _swallow_exception(_e, "_push_dashboard_json:sectors_inner1")
                     if name:
                         sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                 sectors_raw.sort(key=lambda x:-x["chg"])
@@ -28304,8 +28317,8 @@ def _push_dashboard_json() -> None:
                                     avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
                                     sectors_raw.append({"name": theme, "chg": round(avg_chg,2), "stocks": new_stocks[:8]})
                         sectors_raw.sort(key=lambda x:-x["chg"])
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _swallow_exception(_e, "_push_dashboard_json:sectors_leader")
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
                 if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
@@ -28333,8 +28346,8 @@ def _push_dashboard_json() -> None:
             else:
                 # 장마감/휴장: 캐시된 장전 섹터 사용
                 sectors_raw = list(_WEB_DASHBOARD_PREMARKET_SECTORS)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow_exception(_e, "_push_dashboard_json:sectors_block")
 
         # ── 포착 목록 (_entry_watch 기반 — 텔레그램 /list 동일 소스) v170.0 ──
         captured_raw = []
@@ -28406,8 +28419,8 @@ def _push_dashboard_json() -> None:
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
             captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
             captured_raw = captured_raw[:30]
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow_exception(_e, "_push_dashboard_json:captured_block")
 
         # ── 랭킹 (웹소켓 구독 종목 기반, 장마감 후 캐시 복원) v169.22 ──
         rank_base = []
@@ -28490,8 +28503,20 @@ def _push_dashboard_json() -> None:
         with open(tmp,"w",encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, _WEB_DASHBOARD_JSON)
+        # v171.4: JSON 갱신 성공 시 첫 3회만 디버그 로그
+        try:
+            global _PUSH_DASHBOARD_OK_COUNT
+            _PUSH_DASHBOARD_OK_COUNT = (_PUSH_DASHBOARD_OK_COUNT + 1) if "_PUSH_DASHBOARD_OK_COUNT" in globals() else 1
+            if _PUSH_DASHBOARD_OK_COUNT <= 3:
+                _log_info_msg(
+                    f"📤 dashboard JSON 갱신 #{_PUSH_DASHBOARD_OK_COUNT} "
+                    f"(sec={len(sectors_raw)}, cap={len(captured_raw)}, alr={len(alerts_snapshot)}, "
+                    f"rk_chg={len(rank_chg_out)})"
+                )
+        except Exception as _de:
+            _swallow_exception(_de, "dashboard_debug_log")
     except Exception as e:
-        _swallow_exception(e)
+        _swallow_exception(e, "_push_dashboard_json:main_block")
 
 
 # ── Flask 앱 ──────────────────────────────────────────────────
@@ -28686,7 +28711,7 @@ function renderCapture(){
 }
 function renderAlerts(){
   // v171.3 [#3]: body 텍스트의 6자리 종목코드를 cp 버튼으로 자동 변환 (가격/콤마 인접은 제외)
-  const _cpify=(s)=>String(s||"").replace(/(?<![\d,])(\d{6})(?![\d,])/g,
+  const _cpify=(s)=>String(s||"").replace(/(?<![\\d,])(\\d{6})(?![\\d,])/g,
     '<button class="cp" onclick="cp(this,\'$1\')">$1</button>');
   document.getElementById("alr-body").innerHTML=alerts.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
