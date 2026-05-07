@@ -3,10 +3,24 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v171.4
+버전: v171.5
 날짜: 2026-05-07
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v171.5 (2026-05-07): _cpify JS SyntaxError 수정 (대시보드 화면 공백 root cause)
+  [#1] _DASHBOARD_HTML 안 _cpify replace 두번째 인자 outer quote 변경
+       `'<button ... onclick="cp(this,\\'$1\\')">$1</button>'`
+       → `` `<button ... onclick="cp(this,'$1')">$1</button>` ``
+       이유: Python triple-quoted string에서 `\'`는 valid escape → string에 `'`만 저장됨.
+             결과 JS는 `'<button ... onclick="cp(this,'$1')">$1</button>'`이 되어
+             outer single-quote가 inner '$1'의 첫 quote에서 일찍 닫히면서 SyntaxError.
+             브라우저가 _cpify 정의에서 멈추면 후속 renderXxx() 함수도 실행 중단 → 화면 전체 공백.
+       개선점: outer quote를 backtick으로 변경. 백틱 안에서는 single quote 자유 사용,
+              `${...}` 보간 없으므로 안전, `$1`은 .replace의 capture group으로 정상 동작.
+       검증: ast로 _DASHBOARD_HTML 추출 후 _cpify 영역의 backtick wrap 확인 OK,
+            ${...} 보간 없음 OK.
+       주의점: v171.4의 #3 "SyntaxWarning 수정"은 이 문제와 별개. _cpify 정규식의
+              `\d` escape는 v171.3부터 file에 정상 저장되어 있었음(SyntaxWarning만 노이즈).
 - v171.4 (2026-05-07): 대시보드 공백 진단용 디버그 로그 + SyntaxWarning 수정
   [#1] _push_dashboard_json 4개 내부 except + 외부 except에 note 부착
        이유: v171.3 배포 후 대시보드가 30분간 비어있는데 _swallow_exception 흔적 0건.
@@ -28712,7 +28726,7 @@ function renderCapture(){
 function renderAlerts(){
   // v171.3 [#3]: body 텍스트의 6자리 종목코드를 cp 버튼으로 자동 변환 (가격/콤마 인접은 제외)
   const _cpify=(s)=>String(s||"").replace(/(?<![\\d,])(\\d{6})(?![\\d,])/g,
-    '<button class="cp" onclick="cp(this,\'$1\')">$1</button>');
+    `<button class="cp" onclick="cp(this,'$1')">$1</button>`);
   document.getElementById("alr-body").innerHTML=alerts.length===0
     ?'<div style="padding:20px 10px;text-align:center;color:#607080;font-size:11px">알람 없음</div>'
     :alerts.map(a=>`<div class="alr ${a.lvl}">
