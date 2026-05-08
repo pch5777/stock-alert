@@ -3,10 +3,48 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v172.1
+버전: v173.0
 날짜: 2026-05-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v173.0 (2026-05-08): SSE 실시간 푸시 (C안) + 섹터 목록 종목 없음 버그 3건 수정
+  [#1] SSE 인프라 추가: _SSE_SUBSCRIBERS / _SSE_LOCK / _sse_broadcast()
+       이유: 텔레그램 알람 발송 ↔ 대시보드 갱신 최대 ~14초 지연 (3초 쓰로틀 + 10초 폴링).
+       개선점: 알람 발송과 거의 동시(<2초)에 브라우저 화면 갱신.
+       주의점: dead Queue는 broadcast 시 자동 제거 (탭 닫기 후 누수 없음).
+  [#2] /api/stream Flask 엔드포인트: stream_with_context + 25초 keepalive + X-Accel-Buffering:no
+       이유: Railway/Nginx의 SSE 응답 버퍼링을 비활성화해야 즉시 push 작동.
+       개선점: 연결 즉시 현재 스냅샷 1회 전송 → 새 탭에서 즉시 최신 상태 표시.
+       주의점: Queue maxsize=20, 가득 차면 dead 처리. stream_with_context 필수.
+  [#3] send() — 단건 알람 SSE 브로드캐스트 훅
+       이유: 텔레그램과 동시에 단건 알람을 즉시 push (전체 스냅샷 빌드 비용 회피).
+       개선점: 알람 한 줄을 alerts.unshift + renderAlerts() 부분 렌더로 처리.
+       주의점: _SSE_SUBSCRIBERS가 비어있을 때만 skip — 봇 단독 실행 시 부하 0.
+  [#4] _DASHBOARD_HTML — EventSource 연결 + 5초 재연결 + 30초 폴링 폴백
+       이유: SSE 연결 끊겼을 때도 30초 내 복구 보장.
+       개선점: _applySnapshot 헬퍼로 fetchAndRender 와 SSE onmessage 코드 공유.
+       주의점: 폴링은 _sseOk=false일 때만 작동 (이중 갱신 방지).
+  [#5] _push_dashboard_json — os.replace 직후 전체 스냅샷 SSE 브로드캐스트
+       이유: 섹터·포착·랭킹 갱신 시점에 전체 스냅샷도 즉시 push.
+       진입 체인: 기존 _push_dashboard_json 트리거 경로 그대로 + SSE 추가만.
+
+  [#6] 버그 A — 섹터 종목 vol/amt 0/빈칸 표시 수정
+       이유: WebSocket 미구독 종목은 _get_snap()이 빈 dict 반환 → vol="0주", amt="0".
+       개선점:
+         (1) _collect_market_leader_theme_quotes: quote의 today_vol/acml_tr_pbmn raw 저장.
+         (2) _push_dashboard_json 테마 빌드: snap 비어있으면 m(market_leader_state) 폴백.
+         (3) _fmt_vol/_fmt_amt는 raw>0일 때만 호출, 그 외 "--" 표시.
+       주의점: m에 raw가 저장되지 않은 기존 sectors는 "--" 표시 (다음 섹터 알람부터 채워짐).
+  [#7] 버그 B — 거래소 업종 폴백 시 종목 빈 리스트 보완
+       이유: snap_by_sector가 비어있으면 거래소 업종 섹터에 종목 0개 노출.
+       개선점: 빈 stocks_raw일 때 _sector_cache 역매핑 + get_fluctuation_rank() 결과로 보완.
+       주의점: KIS API 호출은 보완 필요 시 1회만 lazy 로드 (블록당 최대 1회).
+  [#8] 버그 C — 섹터 브레이크아웃 알람 후 대시보드 미반영
+       이유: _detect_and_send_sector_breadth_alert는 send()만 하고 대시보드 연동 없음.
+       개선점: send() 직후 market_leader_state에 해당 섹터 병합 + _push_dashboard_json() 즉시 호출.
+       주의점: sent_at을 오늘 날짜로 갱신해야 _push_dashboard_json의 startswith(_today_str) 통과.
+       진입 체인: send() → SSE alert 단건 push → state 병합 → _push_dashboard_json → SSE 스냅샷.
+
 - v172.1 (2026-05-08): 포착 표시·CSS·섹터갱신 버그 3건 수정
   [#1] captured_raw[:30] → [:50]
        이유: hit=false(미도달) 종목이 hit=true 30개로 꽉 찬 목록에 밀려 대시보드에 안 보임.
@@ -27876,6 +27914,12 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
             if len(_alerts) > 50:
                 _alerts.pop()
         _save_dashboard_alerts()
+        # v173.0: SSE 즉시 단건 브로드캐스트 (연결된 클라이언트 있을 때만)
+        try:
+            if _SSE_SUBSCRIBERS:
+                _sse_broadcast({"type": "alert", "entry": alert_entry})
+        except Exception as _se:
+            _swallow_exception(_se, "send:sse_alert")
         threading.Thread(target=_push_dashboard_json, daemon=True).start()
     except Exception as _de:
         _swallow_exception(_de)
@@ -28058,6 +28102,29 @@ _WEB_DASHBOARD_LOCK          = threading.Lock()
 _WEB_DASHBOARD_LAST_PUSH: float = 0.0
 _WEB_DASHBOARD_THROTTLE_SEC  = 3.0
 _WEB_DASHBOARD_PREMARKET_SECTORS: list = []  # v169.14: 장전/장마감 섹터 캐시
+# v173.0: SSE 실시간 푸시 — 연결된 브라우저 큐 목록
+_SSE_SUBSCRIBERS: list = []
+_SSE_LOCK = threading.Lock()
+
+def _sse_broadcast(data: dict) -> None:
+    """v173.0: 연결된 모든 SSE 클라이언트에 JSON 이벤트 즉시 전송."""
+    try:
+        msg = "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+    except Exception as _je:
+        _swallow_exception(_je, "_sse_broadcast:dumps")
+        return
+    with _SSE_LOCK:
+        dead = []
+        for q in _SSE_SUBSCRIBERS:
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            try:
+                _SSE_SUBSCRIBERS.remove(q)
+            except ValueError:
+                pass
 _INFO_AUTO_PUSH_HASHES: dict = {}  # v169.17: 정보성 자동 알람 변경 감지 해시
 
 def _load_premarket_sectors() -> None:
@@ -28323,12 +28390,15 @@ def _push_dashboard_json() -> None:
                                 snap = _get_snap(mc)
                                 is_leader = bool(_leader_code) and (mc == _leader_code)  # v172.0 [C]
                                 base_name = m.get("name","") or _resolve_stock_name(mc,"")
+                                # v173.0 [bug A]: snap 없으면 m(market_leader_state) 폴백
+                                _vol_raw = safe_int(snap.get("today_vol") or 0) or safe_int(m.get("today_vol") or 0)
+                                _amt_raw = safe_int(snap.get("acml_tr_pbmn") or 0) or safe_int(m.get("acml_tr_pbmn") or 0)
                                 new_stocks.append({
                                     "name": ("👑 " + base_name) if is_leader else base_name,  # v172.0 [C]
                                     "code": mc,
                                     "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
-                                    "vol":  _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                                    "amt":  _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
+                                    "vol":  _fmt_vol(_vol_raw) if _vol_raw > 0 else "--",  # v173.0 [bug A]
+                                    "amt":  _fmt_amt(_amt_raw) if _amt_raw > 0 else "--",  # v173.0 [bug A]
                                     "is_leader": is_leader,  # v172.0 [C]
                                 })
                             # v172.0 [C]: leader 우선 + 등락률 내림차순
@@ -28358,6 +28428,14 @@ def _push_dashboard_json() -> None:
                     try:
                         sector_list = get_all_sector_index() or []
                         existing_names = {s["name"] for s in sectors_raw}
+                        # v173.0 [bug B]: 섹터→종목 역매핑 + fluctuation_rank 캐시 (블록 내 1회 빌드)
+                        _sec_to_codes = {}
+                        for _c, _info in list(_sector_cache.items()):
+                            if not isinstance(_info, dict): continue
+                            _sn = str(_info.get("sector") or "").strip()
+                            if not _sn: continue
+                            _sec_to_codes.setdefault(_sn, []).append(_c)
+                        _flux_by_code = None  # lazy 로드
                         for sec in sector_list[:12]:
                             name = sec.get("bstp_name","")
                             chg  = float(sec.get("change_rate") or 0)
@@ -28366,13 +28444,42 @@ def _push_dashboard_json() -> None:
                             snaps_for_sec = snap_by_sector.get(name, [])
                             snaps_for_sec.sort(key=lambda x: -float(x[1].get("change_rate") or 0))
                             for _scode, _snap in snaps_for_sec[:8]:
+                                _vraw = safe_int(_snap.get("today_vol") or 0)
+                                _araw = safe_int(_snap.get("acml_tr_pbmn") or 0)
                                 stocks_raw.append({
                                     "name": _resolve_stock_name(_scode,""),
                                     "code": _scode,
                                     "chg":  float(_snap.get("change_rate") or 0),
-                                    "vol":  _fmt_vol(safe_int(_snap.get("today_vol") or 0)),
-                                    "amt":  _fmt_amt(safe_int(_snap.get("acml_tr_pbmn") or 0)),
+                                    "vol":  _fmt_vol(_vraw) if _vraw > 0 else "--",  # v173.0 [bug B]
+                                    "amt":  _fmt_amt(_araw) if _araw > 0 else "--",  # v173.0 [bug B]
                                 })
+                            # v173.0 [bug B]: 스냅샷 없으면 fluctuation_rank 결과로 보완
+                            if not stocks_raw:
+                                if _flux_by_code is None:
+                                    _flux_by_code = {}
+                                    try:
+                                        for _r in (get_fluctuation_rank(market="J", sort="0") or []):
+                                            _rc = str(_r.get("code") or _r.get("mksc_shrn_iscd") or "").strip()
+                                            if _rc:
+                                                _flux_by_code[_rc] = _r
+                                    except Exception as _fe:
+                                        _swallow_exception(_fe, "_push_dashboard_json:flux_fallback")
+                                _candidates = []
+                                for _cc in _sec_to_codes.get(name, []):
+                                    _r = _flux_by_code.get(_cc)
+                                    if not _r: continue
+                                    _candidates.append((_cc, _r))
+                                _candidates.sort(key=lambda x: -float(x[1].get("change_rate") or 0))
+                                for _cc, _r in _candidates[:8]:
+                                    _vraw = safe_int(_r.get("today_vol") or _r.get("acml_vol") or 0)
+                                    _araw = safe_int(_r.get("acml_tr_pbmn") or 0)
+                                    stocks_raw.append({
+                                        "name": _resolve_stock_name(_cc, _r.get("name","") or ""),
+                                        "code": _cc,
+                                        "chg":  float(_r.get("change_rate") or 0),
+                                        "vol":  _fmt_vol(_vraw) if _vraw > 0 else "--",
+                                        "amt":  _fmt_amt(_araw) if _araw > 0 else "--",
+                                    })
                             sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                             if len(sectors_raw) >= 12: break
                         sectors_raw.sort(key=lambda x:-x["chg"])
@@ -28562,6 +28669,12 @@ def _push_dashboard_json() -> None:
         with open(tmp,"w",encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, _WEB_DASHBOARD_JSON)
+        # v173.0: SSE 전체 스냅샷 브로드캐스트 (섹터/포착/랭킹 갱신 시)
+        try:
+            if _SSE_SUBSCRIBERS:
+                _sse_broadcast(payload)
+        except Exception as _se:
+            _swallow_exception(_se, "_push_dashboard_json:sse_snapshot")
         # v171.4: JSON 갱신 성공 시 첫 3회만 디버그 로그
         try:
             global _PUSH_DASHBOARD_OK_COUNT
@@ -28819,28 +28932,56 @@ function renderAll(ts){
   if(ts) document.getElementById("ts").textContent=ts;
   else document.getElementById("ts").textContent=new Date().toLocaleTimeString("ko-KR");
 }
+function _applySnapshot(d){
+  if(d.sectors&&d.sectors.length) sectors=d.sectors;
+  if(d.captured&&d.captured.length) captured=d.captured;
+  if(d.alerts&&d.alerts.length) alerts=d.alerts;
+  if(d.rank_chg&&d.rank_chg.length) rChg=d.rank_chg;
+  if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
+  if(d.rank_view&&d.rank_view.length) rView=d.rank_view;
+  if(d.next_biz_day) document.getElementById("next-biz").textContent=d.next_biz_day;
+  if(d.rank_date) dataDate=d.rank_date;
+  if(d.market_open!==undefined){
+    marketOpen=d.market_open;
+    const badge=document.getElementById("mkt-badge");
+    badge.textContent=marketOpen?"🟢 장 운영중":"🔴 장 마감";
+    badge.style.color=marketOpen?"#00d97e":"#ff4444";
+    badge.style.borderColor=marketOpen?"#00d97e30":"#ff444430";
+  }
+  renderAll(d.updated_at);
+}
 async function fetchAndRender(){
   try{
     const res=await fetch("/api/data");
     if(!res.ok) throw new Error(res.status);
     const d=await res.json();
-    if(d.sectors&&d.sectors.length) sectors=d.sectors;
-    if(d.captured&&d.captured.length) captured=d.captured;
-    if(d.alerts&&d.alerts.length) alerts=d.alerts;
-    if(d.rank_chg&&d.rank_chg.length) rChg=d.rank_chg;
-    if(d.rank_vol&&d.rank_vol.length) rVol=d.rank_vol;
-    if(d.rank_view&&d.rank_view.length) rView=d.rank_view;
-    if(d.next_biz_day) document.getElementById("next-biz").textContent=d.next_biz_day;
-    if(d.rank_date) dataDate=d.rank_date;  // v169.22: 순위 기준 시점 (MM-DD HH:MM)
-    if(d.market_open!==undefined){
-      marketOpen=d.market_open;
-      const badge=document.getElementById("mkt-badge");
-      badge.textContent=marketOpen?"🟢 장 운영중":"🔴 장 마감";
-      badge.style.color=marketOpen?"#00d97e":"#ff4444";
-      badge.style.borderColor=marketOpen?"#00d97e30":"#ff444430";
-    }
-    renderAll(d.updated_at);
+    _applySnapshot(d);
   }catch(e){console.warn("fetch /api/data 실패:",e)}
+}
+// v173.0: SSE 실시간 연결 (즉시 갱신)
+let _sseOk=false;
+function _connectSSE(){
+  try{
+    const es=new EventSource("/api/stream");
+    es.onopen=()=>{_sseOk=true;};
+    es.onmessage=e=>{
+      try{
+        const d=JSON.parse(e.data);
+        if(d.type==="alert"&&d.entry){
+          alerts.unshift(d.entry);
+          if(alerts.length>50) alerts.pop();
+          renderAlerts();
+        } else {
+          _applySnapshot(d);
+        }
+      }catch(_e){}
+    };
+    es.onerror=()=>{
+      _sseOk=false;
+      try{es.close();}catch(_){}
+      setTimeout(_connectSSE,5000);
+    };
+  }catch(_e){setTimeout(_connectSSE,5000);}
 }
 function getNextBizDay(){
   const DAYS=["일","월","화","수","목","금","토"];
@@ -28857,7 +28998,9 @@ function getNextBizDay(){
 }
 document.getElementById("next-biz").textContent=getNextBizDay();
 fetchAndRender();
-setInterval(fetchAndRender,10000);
+_connectSSE();
+// v173.0: SSE 장애 시 폴링 폴백 (30초 — SSE 정상이면 미사용)
+setInterval(()=>{ if(!_sseOk) fetchAndRender(); },30000);
 </script>
 </body>
 </html>"""
@@ -28881,6 +29024,49 @@ def _flask_api_data():
         pass
     return _jsonify({"updated_at": "--", "sectors": [], "captured": [], "alerts": [],
                      "rank_chg": [], "rank_vol": [], "rank_view": []})
+
+@_flask_app.route("/api/stream")
+def _flask_api_stream():
+    """v173.0: SSE 스트림 — 브라우저 EventSource 연결, 알람/스냅샷 즉시 push."""
+    import queue as _queue
+    try:
+        from flask import Response as _Resp, stream_with_context as _swc
+    except Exception as _ie:
+        _swallow_exception(_ie, "_flask_api_stream:import")
+        return ("SSE unavailable", 503)
+    q = _queue.Queue(maxsize=20)
+    with _SSE_LOCK:
+        _SSE_SUBSCRIBERS.append(q)
+
+    def _generate():
+        try:
+            try:
+                if os.path.exists(_WEB_DASHBOARD_JSON):
+                    with open(_WEB_DASHBOARD_JSON, "r", encoding="utf-8") as f:
+                        yield "data: " + f.read().rstrip() + "\n\n"
+            except Exception as _se:
+                _swallow_exception(_se, "_flask_api_stream:snapshot")
+            while True:
+                try:
+                    msg = q.get(timeout=25)
+                    yield msg
+                except _queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _SSE_LOCK:
+                try:
+                    _SSE_SUBSCRIBERS.remove(q)
+                except ValueError:
+                    pass
+
+    return _Resp(
+        _swc(_generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @_flask_app.route("/health")
 def _flask_health():
@@ -38657,6 +38843,9 @@ def _collect_market_leader_theme_quotes(bucket: dict, quote_market_basis: str, m
             "change_rate": safe_float(quote.get("change_rate", 0)),
             "volume_ratio": safe_float(quote.get("volume_ratio", 0)),
             "market": quote.get("market", ""),
+            # v173.0: 대시보드 섹터 폴백용 raw vol/amt 저장
+            "today_vol": safe_int(quote.get("today_vol") or quote.get("acml_vol") or 0),
+            "acml_tr_pbmn": safe_int(quote.get("acml_tr_pbmn") or 0),
         })
         time.sleep(0.05)
     return quotes
@@ -38859,6 +39048,25 @@ def _detect_and_send_sector_breadth_alert() -> None:
                 _sector_breadth_alert_cache = {}
             _sector_breadth_alert_cache[sec] = now
             _log_info_msg(f"  📢 섹터 브레이크아웃 특보: {sec} {len(stocks)}종목 avg={avg_rate:+.1f}%")
+            # v173.0 [bug C]: 브레이크아웃 섹터를 market_leader_state에 즉시 병합 + 대시보드 갱신
+            try:
+                _state = _read_market_leader_state()
+                _existing = {str(s.get("theme","") or "") for s in (_state.get("sectors", []) or [])}
+                if sec not in _existing:
+                    _new_sector = {
+                        "theme": sec,
+                        "leader": top_stocks[0] if top_stocks else {},
+                        "followers": top_stocks[1:],
+                        "score": len(stocks),
+                    }
+                    _secs = list(_state.get("sectors", []) or [])
+                    _secs.insert(0, _new_sector)
+                    _state["sectors"] = _secs[:8]
+                    _state["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _save_market_leader_state(_state)
+                threading.Thread(target=_push_dashboard_json, daemon=True).start()
+            except Exception as _be:
+                _swallow_exception(_be, "sector_breadth:dashboard_sync")
     except Exception as e:
         _swallow_exception(e)
 
