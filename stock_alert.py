@@ -3,10 +3,25 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v173.0
+버전: v173.1
 날짜: 2026-05-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v173.1 (2026-05-08): 진단 로그 강화 + 시장주도 섹터 머지 (브레이크아웃 보존)
+  [#1] _push_dashboard_json 매 갱신마다 로그 (OK_COUNT <= 3 제한 제거)
+       이유: v173.0 배포 후 12:45 이후 갱신 로그 0건 — 실제 갱신 발생 여부 불명.
+       개선점: 매 갱신/throttle 차단/예외 모두 가시화 → 실시간 반영 진짜 원인 추적.
+       주의점: 진단 끝나면 1분 1회로 축소 가능 (별도 패치).
+  [#2] _push_dashboard_json throttle 차단 시 1분 1회 로그
+       이유: 호출은 되지만 throttle에 걸려 return하는 경우를 가시화.
+       개선점: ⏸ dashboard JSON throttle 차단 (last_push=Xs ago) 메시지로 차단 빈도 추적.
+  [#3] send_market_leading_sector_update의 sectors 머지
+       이유: 13:02 브레이크아웃 9개 섹터가 13:20 시장주도 발송으로 3개로 덮어씌워짐 →
+             대시보드 섹터 갑자기 비어보이는 현상. 사용자 의견: 브레이크아웃이 더 의미 있는
+             섹터 분류이므로 보존되어야 함.
+       개선점: 같은 theme만 새 데이터로 갱신, 그 외 기존 sectors는 모두 보존 (최대 12개).
+       진입 체인: send(msg) → _read_market_leader_state → 머지 → _save_market_leader_state.
+
 - v173.0 (2026-05-08): SSE 실시간 푸시 (C안) + 섹터 목록 종목 없음 버그 3건 수정
   [#1] SSE 인프라 추가: _SSE_SUBSCRIBERS / _SSE_LOCK / _sse_broadcast()
        이유: 텔레그램 알람 발송 ↔ 대시보드 갱신 최대 ~14초 지연 (3초 쓰로틀 + 10초 폴링).
@@ -28359,6 +28374,15 @@ def _push_dashboard_json() -> None:
     global _WEB_DASHBOARD_LAST_PUSH
     now_ts = time.time()
     if now_ts - _WEB_DASHBOARD_LAST_PUSH < _WEB_DASHBOARD_THROTTLE_SEC:
+        # v173.1: throttle 차단도 1분에 1회 가시화
+        try:
+            global _PUSH_THROTTLE_LAST_LOG
+            _last = globals().get("_PUSH_THROTTLE_LAST_LOG", 0.0)
+            if now_ts - _last >= 60:
+                _PUSH_THROTTLE_LAST_LOG = now_ts
+                _log_info_msg(f"⏸ dashboard JSON throttle 차단 (last_push={now_ts-_WEB_DASHBOARD_LAST_PUSH:.1f}s ago)")
+        except Exception:
+            pass
         return
     _WEB_DASHBOARD_LAST_PUSH = now_ts
     try:
@@ -28675,16 +28699,15 @@ def _push_dashboard_json() -> None:
                 _sse_broadcast(payload)
         except Exception as _se:
             _swallow_exception(_se, "_push_dashboard_json:sse_snapshot")
-        # v171.4: JSON 갱신 성공 시 첫 3회만 디버그 로그
+        # v173.1: JSON 갱신 매번 로그 (진단용 — 추후 1분 1회로 축소 가능)
         try:
             global _PUSH_DASHBOARD_OK_COUNT
             _PUSH_DASHBOARD_OK_COUNT = (_PUSH_DASHBOARD_OK_COUNT + 1) if "_PUSH_DASHBOARD_OK_COUNT" in globals() else 1
-            if _PUSH_DASHBOARD_OK_COUNT <= 3:
-                _log_info_msg(
-                    f"📤 dashboard JSON 갱신 #{_PUSH_DASHBOARD_OK_COUNT} "
-                    f"(sec={len(sectors_raw)}, cap={len(captured_raw)}, alr={len(alerts_snapshot)}, "
-                    f"rk_chg={len(rank_chg_out)})"
-                )
+            _log_info_msg(
+                f"📤 dashboard JSON 갱신 #{_PUSH_DASHBOARD_OK_COUNT} "
+                f"(sec={len(sectors_raw)}, cap={len(captured_raw)}, alr={len(alerts_snapshot)}, "
+                f"rk_chg={len(rank_chg_out)})"
+            )
         except Exception as _de:
             _swallow_exception(_de, "dashboard_debug_log")
     except Exception as e:
@@ -38973,16 +38996,32 @@ def send_market_leading_sector_update(force: bool = False):
             _log_info_msg("ℹ️ 시장 주도 섹터 생략 — 구성 변화 없음")
             return
         send(payload.get("msg", ""))
+        # v173.1: 기존 sectors 머지 — 브레이크아웃 섹터(13:02) 등이 시장주도 발송(13:20)에 사라지지 않게
+        try:
+            _prev_state = _read_market_leader_state() or {}
+            _prev_sectors = list(_prev_state.get("sectors", []) or [])
+            _new_sectors = list(payload.get("sectors", []) or [])
+            _new_themes = {str(s.get("theme", "") or "") for s in _new_sectors}
+            # 같은 theme은 새 데이터로 갱신, 그 외는 보존 (앞에 새 sectors, 뒤에 기존)
+            _merged = list(_new_sectors)
+            for _ps in _prev_sectors:
+                _pt = str(_ps.get("theme", "") or "")
+                if _pt and _pt not in _new_themes:
+                    _merged.append(_ps)
+            _merged = _merged[:12]  # 화면 슬롯 한계
+        except Exception as _me:
+            _swallow_exception(_me, "send_market_leader:merge")
+            _merged = list(payload.get("sectors", []) or [])
         _save_market_leader_state({
             "last_ts": now_ts,
             "last_digest": payload.get("digest", ""),
             "interval_min": payload.get("interval_min", 15),
             "market_heat": payload.get("market_heat", 0),
             "sent_at": payload.get("ts", ""),
-            "themes": [sec.get("theme", "") for sec in payload.get("sectors", [])],
-            "sectors": payload.get("sectors", []),  # v161.44: 선진입 풀 직결용
+            "themes": [sec.get("theme", "") for sec in _merged],
+            "sectors": _merged,  # v173.1: 머지 결과
         })
-        _log_info_msg(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 섹터, heat={payload.get('market_heat', 0)})")
+        _log_info_msg(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 신규, 머지후 {len(_merged)}개, heat={payload.get('market_heat', 0)})")
     except Exception as e:
         _log_error("send_market_leading_sector_update", e)
 def _detect_and_send_sector_breadth_alert() -> None:
