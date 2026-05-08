@@ -3,10 +3,41 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v173.1
+버전: v174.0
 날짜: 2026-05-08
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v174.0 (2026-05-08): 대시보드 실시간 갱신 분리 (알람 독립) — KIS 직접 구동
+  [#1] _build_realtime_sectors_from_kis() 신규 함수
+       이유: 사용자 요구 — 대시보드는 알람 side-effect가 아니라 시장 데이터로 직접 구동돼야 함.
+             기존: 알람 발생 시 _push_dashboard_json 호출 → 알람 없으면 갱신 없음.
+       개선점: KIS get_fluctuation_rank('J','0')+'NX' 직접 호출 → get_theme_sector_stocks 그룹핑
+              → ≥3종목, 평균≥3% 섹터 후보 산출 → market_leader_state.sectors 머지 갱신.
+       주의점: '네이버 랭킹 → 섹터' 알람 결과를 따르는 것이 아니라 KIS API로 직접 산출.
+              머지 정책은 v173.1과 동일 (같은 theme 갱신, 그 외 보존, 최대 12개).
+  [#2] _dashboard_realtime_loop() 신규 데몬 스레드
+       이유: 사용자가 '대시보드 갱신과 현재 시간 약 3분 차이' 지적 — 실시간성 부족.
+       개선점:
+         - 매 10초: _push_dashboard_json() → 종목 시세/포착/랭킹 즉시 반영 + SSE push
+         - 매 60초: _build_realtime_sectors_from_kis() → 섹터 재산출
+         - 장 마감 시 30초 sleep (KIS quota 보호)
+       주의점: KIS REST 호출 빈도 절약 위해 섹터 빌드는 60초 주기 (rate limit 안전).
+              종목 시세 자체는 WebSocket _execution_snapshots 기반이라 진짜 실시간.
+       진입 체인: main() → Thread(_dashboard_realtime_loop, daemon=True).start()
+  [#3] 알람 side-effect _push_dashboard_json 호출 4곳 제거
+       이유: '알람을 받아서 대시보드를 반영하는 식으로 하지 마라' (사용자 명시).
+       제거 위치:
+         - send() 내부 (단건 알람 발송 후) — SSE alert push만 유지
+         - update_dashboard() 끝 (텔레그램 dashboard 메시지 후)
+         - register_entry_watch 끝 (종목포착 알람 후)
+         - _detect_and_send_sector_breadth_alert (섹터 브레이크아웃 알람 후 sync 블록)
+       주의점: WebSocket 틱 수신(11013), main 시작 1회, 스케줄러 1분/5분 호출은 유지
+              (알람 무관 또는 안전망 역할).
+  [#4] market_leader_state에 realtime_updated_at 필드 추가 (디버그용)
+       이유: 실시간 빌더가 갱신했는지 알람이 갱신했는지 구분 필요.
+       개선점: 빌더가 머지할 때마다 sent_at + realtime_updated_at 동시 갱신.
+       주의점: 기존 sent_at은 알람 발송 시각 호환 유지 (기존 코드 영향 없음).
+
 - v173.1 (2026-05-08): 진단 로그 강화 + 시장주도 섹터 머지 (브레이크아웃 보존)
   [#1] _push_dashboard_json 매 갱신마다 로그 (OK_COUNT <= 3 제한 제거)
        이유: v173.0 배포 후 12:45 이후 갱신 로그 0건 — 실제 갱신 발생 여부 불명.
@@ -27935,7 +27966,7 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
                 _sse_broadcast({"type": "alert", "entry": alert_entry})
         except Exception as _se:
             _swallow_exception(_se, "send:sse_alert")
-        threading.Thread(target=_push_dashboard_json, daemon=True).start()
+        # v174.0: _push_dashboard_json 호출 제거 — 대시보드는 _dashboard_realtime_loop가 10초 주기로 독립 갱신
     except Exception as _de:
         _swallow_exception(_de)
     return msg_id
@@ -28104,7 +28135,7 @@ def update_dashboard(force: bool = False) -> None:
     # v169.14: 장 마감/휴장 시 장전 섹터도 갱신
     if not is_any_market_open():
         threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
-    threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    # v174.0: _push_dashboard_json 호출 제거 — _dashboard_realtime_loop가 독립 갱신
 # ══════════════════════════════════════════════════════════════
 # v169.9: 실시간 웹 대시보드
 # ══════════════════════════════════════════════════════════════
@@ -32801,12 +32832,8 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
             }
         elif safe_int(s.get("price", 0), 0) > safe_int(_detected_stocks[code].get("high_price", 0), 0):
             _detected_stocks[code]["high_price"] = safe_int(s.get("price", 0), 0)
-    # v169.28 [이슈4]: register_entry_watch 완료 후 대시보드 갱신 — send() 내 훅보다 늦게 실행되므로
-    # _entry_watch가 이미 등록된 상태에서 포착목록을 빌드 → 종목포착 알람 즉시 포착목록 반영
-    try:
-        threading.Thread(target=_push_dashboard_json, daemon=True).start()
-    except Exception as _pde:
-        _swallow_exception(_pde)
+    # v174.0: register_entry_watch 완료 후 _push_dashboard_json 호출 제거 —
+    # _dashboard_realtime_loop가 10초 주기로 _entry_watch 포함 포착목록 자동 갱신
     return True
 def _expire_entry_watch_for_upper_limit(code: str, name: str) -> None:
     """NEAR_UPPER/UPPER_LIMIT 발송 즉시 해당 종목 entry_watch 전부 만료 처리.
@@ -39024,6 +39051,139 @@ def send_market_leading_sector_update(force: bool = False):
         _log_info_msg(f"✅ 시장 주도 섹터 발송 완료 ({len(payload.get('sectors', []))}개 신규, 머지후 {len(_merged)}개, heat={payload.get('market_heat', 0)})")
     except Exception as e:
         _log_error("send_market_leading_sector_update", e)
+def _build_realtime_sectors_from_kis() -> None:
+    """v174.0: KIS 실시간 등락률 순위로 섹터/종목 직접 산출 → market_leader_state 갱신.
+
+    알람과 무관하게 호출되는 실시간 빌더. 60초 주기로 _dashboard_realtime_loop가 호출.
+    - get_fluctuation_rank('J', '0') 상승률순 + NXT는 'NX'
+    - get_theme_sector_stocks(code) 로 섹터 분류
+    - 섹터당 ≥3종목, 평균 ≥3% 일 때 sectors 후보로 채택
+    - v173.1 머지 정책 유지: 같은 theme은 새 데이터로 갱신, 그 외 기존 sectors 보존 (최대 12개)
+    """
+    if not is_market_open():
+        return
+    try:
+        # KRX + NXT 모두 수집 (NXT는 데이터 없을 수 있음 — 빈 리스트 fallback)
+        rising = []
+        try:
+            rising.extend(get_fluctuation_rank("J", "0") or [])
+        except Exception as _e1:
+            _swallow_exception(_e1, "rt_sectors:krx_rank")
+        try:
+            _nxt = get_fluctuation_rank("NX", "0") or []
+            # NXT 종목 코드는 KRX와 중복될 수 있음 — code 기준 중복 제거
+            _seen = {r.get("code") for r in rising}
+            for r in _nxt:
+                if r.get("code") and r.get("code") not in _seen:
+                    rising.append(r)
+        except Exception as _e2:
+            _swallow_exception(_e2, "rt_sectors:nxt_rank")
+        if not rising:
+            return
+        # 섹터별 그룹핑
+        sector_map: dict = {}
+        for r in rising:
+            code = normalize_stock_code(r.get("code", "") or "")
+            if not code:
+                continue
+            name = str(r.get("name", code) or code)
+            cr = safe_float(r.get("change_rate", 0), 0.0)
+            if cr < 3.0:  # 최소 상승률 (sector breadth 알람보다 낮음 — 더 많은 섹터 노출)
+                continue
+            try:
+                theme, _, _ = get_theme_sector_stocks(code)
+            except Exception:
+                theme = ""
+            sec = str(theme or "").strip()
+            if not sec or sec in ("기타업종", "기타", ""):
+                continue
+            sector_map.setdefault(sec, []).append({
+                "code": code,
+                "name": name,
+                "change_rate": cr,
+                "price": safe_int(r.get("price", 0), 0),
+                "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
+            })
+        # 섹터 후보 (3종목 이상, 평균 3% 이상)
+        new_sectors = []
+        for sec, stocks in sector_map.items():
+            if len(stocks) < 3:
+                continue
+            avg_rate = sum(s["change_rate"] for s in stocks) / len(stocks)
+            if avg_rate < 3.0:
+                continue
+            sorted_stocks = sorted(stocks, key=lambda x: x["change_rate"], reverse=True)
+            new_sectors.append({
+                "theme": sec,
+                "leader": sorted_stocks[0],
+                "followers": sorted_stocks[1:6],  # 최대 5개 보조
+                "score": int(avg_rate * len(stocks)),  # 종목수 × 평균상승률
+                "avg_rate": round(avg_rate, 2),
+                "count": len(stocks),
+            })
+        # 점수 내림차순
+        new_sectors.sort(key=lambda x: -x.get("score", 0))
+        new_sectors = new_sectors[:12]
+        if not new_sectors:
+            return
+        # 머지 (v173.1 정책 재사용): 같은 theme은 새 데이터로 갱신, 그 외 기존 sectors 보존
+        try:
+            _prev_state = _read_market_leader_state() or {}
+            _prev_sectors = list(_prev_state.get("sectors", []) or [])
+            _new_themes = {str(s.get("theme", "") or "") for s in new_sectors}
+            _merged = list(new_sectors)
+            for _ps in _prev_sectors:
+                _pt = str(_ps.get("theme", "") or "")
+                if _pt and _pt not in _new_themes:
+                    _merged.append(_ps)
+            _merged = _merged[:12]
+            _state = dict(_prev_state)
+            _state["sectors"] = _merged
+            _state["themes"] = [s.get("theme", "") for s in _merged]
+            _state["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _state["realtime_updated_at"] = _state["sent_at"]
+            _save_market_leader_state(_state)
+        except Exception as _me:
+            _swallow_exception(_me, "rt_sectors:merge")
+    except Exception as e:
+        _swallow_exception(e, "_build_realtime_sectors_from_kis")
+
+
+def _dashboard_realtime_loop() -> None:
+    """v174.0: 대시보드 실시간 갱신 루프 (알람과 완전 독립).
+
+    - 10초마다 _push_dashboard_json() → 종목 시세/포착/랭킹 즉시 반영 + SSE push
+    - 60초마다 _build_realtime_sectors_from_kis() → KIS 등락률 → 섹터 재산출
+    - 장 마감 시 30초 sleep (KIS quota 절약)
+    """
+    _last_sector_build = 0.0
+    _SECTOR_BUILD_INTERVAL = 60.0  # 초 단위
+    _PUSH_INTERVAL = 10.0
+    while True:
+        try:
+            now = time.time()
+            if not is_any_market_open():
+                # 장 마감 — 부하 최소화
+                time.sleep(30)
+                continue
+            # 60초마다 섹터 재산출
+            if now - _last_sector_build >= _SECTOR_BUILD_INTERVAL:
+                try:
+                    _build_realtime_sectors_from_kis()
+                    _last_sector_build = now
+                except Exception as _be:
+                    _swallow_exception(_be, "rt_loop:sector_build")
+                    _last_sector_build = now  # 실패해도 다음 사이클까지 대기
+            # 10초마다 대시보드 JSON 갱신 + SSE push
+            try:
+                _push_dashboard_json()
+            except Exception as _pe:
+                _swallow_exception(_pe, "rt_loop:push")
+        except Exception as e:
+            _swallow_exception(e, "_dashboard_realtime_loop")
+        time.sleep(_PUSH_INTERVAL)
+
+
 def _detect_and_send_sector_breadth_alert() -> None:
     """v165.40 [B]: 섹터 breadth 특보 — 동일 섹터 N개 이상 급등 시 섹터 특보 알람 발송.
     개별 알람이 섹터 제한에 걸려도 섹터 전체 상승 자체를 사용자에게 알려줌.
@@ -39087,25 +39247,8 @@ def _detect_and_send_sector_breadth_alert() -> None:
                 _sector_breadth_alert_cache = {}
             _sector_breadth_alert_cache[sec] = now
             _log_info_msg(f"  📢 섹터 브레이크아웃 특보: {sec} {len(stocks)}종목 avg={avg_rate:+.1f}%")
-            # v173.0 [bug C]: 브레이크아웃 섹터를 market_leader_state에 즉시 병합 + 대시보드 갱신
-            try:
-                _state = _read_market_leader_state()
-                _existing = {str(s.get("theme","") or "") for s in (_state.get("sectors", []) or [])}
-                if sec not in _existing:
-                    _new_sector = {
-                        "theme": sec,
-                        "leader": top_stocks[0] if top_stocks else {},
-                        "followers": top_stocks[1:],
-                        "score": len(stocks),
-                    }
-                    _secs = list(_state.get("sectors", []) or [])
-                    _secs.insert(0, _new_sector)
-                    _state["sectors"] = _secs[:8]
-                    _state["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    _save_market_leader_state(_state)
-                threading.Thread(target=_push_dashboard_json, daemon=True).start()
-            except Exception as _be:
-                _swallow_exception(_be, "sector_breadth:dashboard_sync")
+            # v174.0: sector breadth 알람의 dashboard sync 블록 제거 —
+            # _build_realtime_sectors_from_kis()가 60초마다 같은 섹터를 KIS 데이터로 직접 산출
     except Exception as e:
         _swallow_exception(e)
 
@@ -42381,6 +42524,8 @@ if __name__ == "__main__":
     update_dashboard(force=True)
     # update_dashboard → send() → 훅 실행 후 push 한 번 더 보장
     threading.Thread(target=_push_dashboard_json, daemon=True).start()
+    # v174.0: 대시보드 실시간 루프 시작 (10초 push, 60초 섹터 재산출 — 알람과 독립)
+    threading.Thread(target=_dashboard_realtime_loop, daemon=True).start()
     # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
     _migrate_legacy_files()
     _storage_diagnostics_once()
