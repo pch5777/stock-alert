@@ -3,10 +3,46 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v174.0
-날짜: 2026-05-08
+버전: v175.0
+날짜: 2026-05-11
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v175.0 (2026-05-11): P0 진단 패치 3종 — NXT/KRX 장 초반 지연 해소 (옵션 B-1)
+  배경: 2026-05-11 실측 — NXT 첫 A신호 14분36초, KRX 첫 A신호 28분 지연.
+        화면 상위 11종목 중 6종목(54%) A신호 미발생. 외부 알람 30분에 1회.
+        사용자 지적: "오전 NXT·KRX 모두 15분 지나 포착되는 건 비정상".
+
+  [#1] _fetch_groq_news_rows(): NXT 장 초반 30분(08:00~08:29) Groq 호출 생략
+       이유: 매일 08:06 부근 429 발생 → 4분30초 대기 후 실패 → NXT 사이클 지연 주범.
+             5/11 로그: 08:06:01 429 → 08:10:36 다음 단계 진입 (4분35초 손실).
+       개선점: 08:00~08:29 KST 호출 시 cached_rows 즉시 반환. 캐시 없으면 빈 리스트.
+               08:30 이후 정상 호출 복귀.
+       주의점: NXT 첫 30분 알람은 재료 점수 없이 KIS 데이터만으로 발송 (의도된 동작).
+               KRX 시간대(09:00~)는 미적용 (KRX는 Groq 429 빈도 낮음).
+       진입 체인: 함수 입구 시간 게이트만 추가, 기존 호출 흐름 보존.
+
+  [#2] _resolve_general_a_cut(): 장 초반 30분 A-cut 추가 완화 (72 → 65)
+       이유: 봇이 +11~16% 도달 후에야 A로 분류 → 사실상 후행. SK하이닉스 +9.8%,
+             삼성전자 +6.2%, KBI메탈 +15.5%가 "이슈 선감지 A급 미달"로 내부기록만 처리.
+       개선점: NXT 08:00~08:29 / KRX 09:00~09:29 시간대 한정
+               SURGE/EARLY_DETECT/NEAR_UPPER/MID_PULLBACK + score>=65 + change_rate>=3%
+               → A-cut을 65로 완화 (기본 72 → 65). 시간 종료 후 자동 복귀.
+       주의점: 화이트리스트 시그널 타입만 적용. reasons에 "🌅 장 초반 30분 A-cut 완화 (65)" 표기.
+       진입 체인: 기존 _resolve_general_a_cut 흐름 보존, return 직전 분기 추가.
+
+  [#3] FHKST117300C0 / FHKST649100C0 호출 비활성화 (URI 추정 오류)
+       이유: 5/11 단일 일자에 각 16회 404 누적. URI/파라미터 추정 구현 결함.
+             SKILL 섹션 2 규칙 22번 위반 사례. 규격서 미확인.
+       개선점:
+         - line ~17951 ⑨ 장마감 예상체결가: _safe_get → exp_close_data = {} 로 대체
+         - line ~17976 ⑩ 국내 증시자금: _safe_get → fund_data = {} 로 대체
+         후속 for/if 로직은 빈 dict로 자연스럽게 skip.
+       주의점: 규격서 수신 후 정확한 URI/파라미터로 재구현 필요. 후속 섹터 가점만 비활성.
+       진입 체인: _build_premarket_sector_snapshot() 내부 try 블록 보존, 호출만 차단.
+
+  진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅ (기존 v174.0 로직 보존)
+  검증: wc-l (정상 증가) / tail-5 (정상) / py_compile (OK)
+
 - v174.0 (2026-05-08): 대시보드 실시간 갱신 분리 (알람 독립) — KIS 직접 구동
   [#1] _build_realtime_sectors_from_kis() 신규 함수
        이유: 사용자 요구 — 대시보드는 알람 side-effect가 아니라 시장 데이터로 직접 구동돼야 함.
@@ -6531,6 +6567,15 @@ def _fetch_groq_news_rows(force_revalidate: bool = False) -> list[dict]:
     global _groq_grounding_cache, _groq_grounding_daily_counter
     if not GROQ_API_KEY:
         return []
+    # v175.0 P0-1: NXT 장 초반 30분(08:00~08:29 KST) Groq 호출 생략
+    # 이유: 매일 08:06 부근 429 발생 → 4분30초 대기 후 실패 → NXT 사이클 지연 주범
+    # 캐시 있으면 사용, 없으면 빈 결과 반환. 08:30 이후 정상 호출 복귀.
+    try:
+        _kst_now_g = _now_kst()
+        if _kst_now_g.hour == 8 and _kst_now_g.minute < 30:
+            return list(_groq_grounding_cache.get("rows", []))
+    except Exception:
+        pass
     now = time.time()
     cached_rows = list(_groq_grounding_cache.get("rows", []))
     cache_age = now - float(_groq_grounding_cache.get("ts", 0) or 0)
@@ -17949,18 +17994,9 @@ def _build_premarket_sector_snapshot() -> dict:
             _swallow_exception(e)
 
         # ⑨ 장마감 예상체결가 — v169.29 신규: 장마감 후 강세 예상 종목 섹터 가점
+        # v175.0 P0-3: FHKST117300C0 URI/파라미터 추정 오류로 404 16회/일 누적 → 호출 비활성화
         try:
-            exp_close_data = _safe_get(
-                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/exp-price-close",
-                "FHKST117300C0",
-                {
-                    "FID_RANK_SORT_CLS_CODE": "0",
-                    "FID_COND_MRKT_DIV_CODE": "J",
-                    "FID_COND_SCR_DIV_CODE": "11173",
-                    "FID_INPUT_ISCD": "0000",
-                    "FID_BLNG_CLS_CODE": "0",
-                },
-            )
+            exp_close_data: dict = {}  # v175.0: 호출 비활성 (규격서 수신 후 재활성화)
             for item in (exp_close_data.get("output1") or [])[:15]:
                 code = normalize_stock_code(str(item.get("stck_shrn_iscd") or ""))
                 name = str(item.get("hts_kor_isnm") or "")
@@ -17973,12 +18009,9 @@ def _build_premarket_sector_snapshot() -> dict:
             _swallow_exception(e)
 
         # ⑩ 국내 증시자금 종합 — v169.29 신규: 고객예탁금 증감으로 전체 시장 자금 흐름 반영
+        # v175.0 P0-3: FHKST649100C0 URI/파라미터 추정 오류로 404 16회/일 누적 → 호출 비활성화
         try:
-            fund_data = _safe_get(
-                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/market-fund",
-                "FHKST649100C0",
-                {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "0001"},
-            )
+            fund_data: dict = {}  # v175.0: 호출 비활성 (규격서 수신 후 재활성화)
             fund_rows = fund_data.get("output") or []
             if fund_rows:
                 latest = fund_rows[0]
@@ -33325,6 +33358,24 @@ def _resolve_general_a_cut(signal_type: str, score: int, change_rate: float = 0.
             soft_price = False
         if int(score or 0) >= INTRADAY_CAPTURE_RELAX_SCORE and soft_price and (support["direct_like"] or support["meaningful_theme"] or support["flow_support"] or proactive_support):
             a_cut = min(a_cut, INTRADAY_CAPTURE_RELAX_SCORE)
+    # v175.0 P0-2: 장 초반 30분(NXT 08:00~08:29 / KRX 09:00~09:29) A-cut 추가 완화
+    # 이유: 봇이 +11~16% 도달 후에야 A로 분류 → 사실상 후행. SK하이닉스 +9.8% 등 A급 미달 다수.
+    # 화이트리스트 시그널 + score>=65 + change_rate>=3% → A-cut=65로 완화. 시간 종료 후 자동 복귀.
+    try:
+        _kst_now_a = _now_kst()
+        _h_a, _m_a = _kst_now_a.hour, _kst_now_a.minute
+        _open30 = (_h_a == 8 and _m_a < 30) or (_h_a == 9 and _m_a < 30)
+        if _open30 and sig_type in ("SURGE", "EARLY_DETECT", "NEAR_UPPER", "MID_PULLBACK"):
+            try:
+                _cr_a = float(change_rate or 0.0)
+            except Exception:
+                _cr_a = 0.0
+            if int(score or 0) >= 65 and _cr_a >= 3.0:
+                a_cut = min(a_cut, 65)
+                if reasons is not None and isinstance(reasons, list):
+                    reasons.append("🌅 장 초반 30분 A-cut 완화 (65)")
+    except Exception:
+        pass
     return a_cut
 def _should_relax_general_a_threshold(signal_type: str, score: int, change_rate: float = 0.0,
                                      vol_ratio: float = 0.0, sector_info: dict | None = None,
