@@ -3,10 +3,49 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.1
+버전: v176.2
 날짜: 2026-05-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.2 (2026-05-13): 권장 3종 + 알람 영속화 강화 (사용자 추가 요청)
+  배경: v176.1 배포 후 알려진 한계 3가지 + 사용자 요청 "알람목록 텔레그램처럼 과거 보존".
+        v176.1 정상 부팅·VI 스레드 정상 (ERROR 0건).
+
+  [#1] 알람 영속화 강화 — FIFO 50건 → 1000건 (사용자 추가 요청)
+       이유: 사용자 지적 "알람목록이 텔레그램처럼 예전 알람 사라지지 않게".
+             기존 FIFO 50건 한도 → 장중 알람 50개 발생 시 오래된 알람부터 삭제됨.
+       개선점: 3개 위치 동시 변경 (50 → 1000):
+         - send() 내 FIFO pop 조건: len > 50 → len > 1000
+         - _save_dashboard_alerts: [:50] → [:1000]
+         - _load_dashboard_alerts: [:50] → [:1000]
+       주의점: web_dashboard_alerts.json 크기 증가 (1000건 × 약 500B = 약 500KB).
+               영속 스토리지 한도 대비 매우 적음. 화면 CSS는 스크롤이라 영향 없음.
+
+  [#2] 대시보드 섹터 표시 — 브레이크아웃 결과 1순위 격상 (사용자 화면 지적 5번)
+       이유: 사용자 화면 지적 — 좌측 섹터 LIST에 "필델릭스 연관 테마 (SURGE)" 같은
+             종목 1개짜리가 1순위로 노출. 실제 12종목 섹터 브레이크아웃 데이터는 알람에만 있고
+             대시보드 반영 안 됨.
+       개선점: _detect_and_send_sector_breadth_alert send() 직후
+         - 브레이크아웃 sector dict 구성 (theme/leader/followers/score/breakout_priority=True)
+         - market_leader_state.sectors에 1순위로 머지
+         - 정렬: breakout_priority=True 먼저 + score 내림차순 + 최대 12개
+       주의점: _build_realtime_sectors_from_kis()의 60초 머지와 충돌 없음 — 둘 다 같은
+               market_leader_state.sectors 갱신. breakout_priority 표식이 정렬 키 1순위.
+       진입 체인: _detect_and_send_sector_breadth_alert → _read_market_leader_state →
+                  머지 → _save_market_leader_state → 대시보드 빌더 자동 반영.
+
+  [#3] K값 학습 표본 임계 완화 + 분기 A/B/C 합산
+       이유: v176.1 학습 임계 5건 → 첫 K값 변동까지 시간 김. 분기 A/B/C 학습 미연결.
+       개선점:
+         - 표본 임계: total < 5 → total < 3 (초기 학습 가속)
+         - 합산: stat_e + stat_f → stat_e + stat_f + stat_a + stat_b + stat_c
+         - wins 동일 (A/B/C wins 합산)
+       주의점: track_signal_results 청산 시점에 _vi_update_outcome 자동 호출 →
+               _vi_history에 branch 표식이 있으면 branch_success_rate 자동 누적.
+               별도 분기 A/B/C 명시 호출 불필요 (이미 v176.1 [#B]에서 연결).
+
+  검증: wc-l (43,659) / tail-5 (정상) / py_compile (OK)
+
 - v176.1 (2026-05-13): v176.0 보완 4종 — 학습 연결·게이트 통합·해제 추적·알람 잘림 수정
   배경: v176.0 배포 후 사용자 지적 + 알려진 3가지 한계 보완.
 
@@ -18012,10 +18051,14 @@ def _vi_daily_learning_tune():
         # 분기 D/E/F 성공률 합산
         stat_e = _vi_learning["branch_success_rate"].get("E", {"wins": 0, "total": 0})
         stat_f = _vi_learning["branch_success_rate"].get("F", {"wins": 0, "total": 0})
-        total = stat_e["total"] + stat_f["total"]
-        if total < 5:
+        # v176.2 [#3]: 분기 A/B/C도 학습 표본에 합산
+        stat_a = _vi_learning["branch_success_rate"].get("A", {"wins": 0, "total": 0})
+        stat_b = _vi_learning["branch_success_rate"].get("B", {"wins": 0, "total": 0})
+        stat_c = _vi_learning["branch_success_rate"].get("C", {"wins": 0, "total": 0})
+        total = stat_e["total"] + stat_f["total"] + stat_a["total"] + stat_b["total"] + stat_c["total"]
+        if total < 3:  # v176.2 [#3]: 5 → 3 (초기 학습 가속)
             return  # 표본 부족 → 학습 보류
-        wins = stat_e["wins"] + stat_f["wins"]
+        wins = stat_e["wins"] + stat_f["wins"] + stat_a["wins"] + stat_b["wins"] + stat_c["wins"]
         win_rate = wins / max(total, 1)
         k = float(_vi_learning.get("context_threshold_k", 3.0) or 3.0)
         old_k = k
@@ -28796,7 +28839,8 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
         }
         with _lock:
             _alerts.insert(0, alert_entry)
-            if len(_alerts) > 50:
+            # v176.2 [#4]: FIFO 50 → 1000건 (텔레그램처럼 과거 알람 보존)
+            if len(_alerts) > 1000:
                 _alerts.pop()
         _save_dashboard_alerts()
         # v173.0: SSE 즉시 단건 브로드캐스트 (연결된 클라이언트 있을 때만)
@@ -29190,7 +29234,8 @@ def _load_dashboard_alerts() -> None:
             with open(_WEB_DASHBOARD_ALERTS_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    _WEB_DASHBOARD_ALERTS = data[:50]
+                    # v176.2 [#4]: 알람 영속화 강화 — 50 → 1000건 (텔레그램처럼 과거 보존)
+                    _WEB_DASHBOARD_ALERTS = data[:1000]
     except Exception:
         pass
 
@@ -29199,7 +29244,8 @@ def _save_dashboard_alerts() -> None:
     try:
         tmp = _WEB_DASHBOARD_ALERTS_JSON + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_WEB_DASHBOARD_ALERTS[:50], f, ensure_ascii=False)
+            # v176.2 [#4]: 알람 영속화 강화 — 50 → 1000건 보존
+            json.dump(_WEB_DASHBOARD_ALERTS[:1000], f, ensure_ascii=False)
         os.replace(tmp, _WEB_DASHBOARD_ALERTS_JSON)
     except Exception:
         pass
@@ -40104,8 +40150,51 @@ def _detect_and_send_sector_breadth_alert() -> None:
                 _sector_breadth_alert_cache = {}
             _sector_breadth_alert_cache[sec] = now
             _log_info_msg(f"  📢 섹터 브레이크아웃 특보: {sec} {len(stocks)}종목 avg={avg_rate:+.1f}%")
-            # v174.0: sector breadth 알람의 dashboard sync 블록 제거 —
-            # _build_realtime_sectors_from_kis()가 60초마다 같은 섹터를 KIS 데이터로 직접 산출
+            # v176.2 [#2]: 대시보드 섹터 1순위 격상 — 브레이크아웃 결과를 market_leader_state.sectors에 즉시 머지
+            # 사용자 지적: 대시보드 좌측 섹터 LIST에 "[종목명] 연관 테마"가 1개씩 나오는 결함 해소.
+            # 브레이크아웃은 진짜 다종목 섹터 → 1순위로 격상해야 정확한 정보 노출.
+            try:
+                _prev_state = _read_market_leader_state() or {}
+                _prev_sectors = list(_prev_state.get("sectors", []) or [])
+                # 브레이크아웃 sector dict 구성 (대시보드 빌더가 읽는 형식)
+                _breakout_sector = {
+                    "theme": sec,
+                    "leader": {
+                        "code": top_stocks[0]["code"], "name": top_stocks[0]["name"],
+                        "change_rate": top_stocks[0]["change_rate"],
+                    },
+                    "followers": [
+                        {"code": s["code"], "name": s["name"], "change_rate": s["change_rate"]}
+                        for s in top_stocks[1:]
+                    ],
+                    "score": int(avg_rate * len(stocks)),
+                    "avg_rate": round(avg_rate, 2),
+                    "count": len(stocks),
+                    "breakout_priority": True,  # 브레이크아웃 1순위 표식
+                    "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                # 머지: breakout 1순위로 앞에 + 기존 같은 theme 제거 + 최대 12개
+                _new_sectors = [_breakout_sector] + [
+                    s for s in _prev_sectors
+                    if str(s.get("theme", "") or "") != sec
+                ]
+                # breakout_priority 있는 것끼리 + score 정렬
+                _new_sectors.sort(
+                    key=lambda x: (
+                        not bool(x.get("breakout_priority")),  # priority 먼저
+                        -int(x.get("score", 0) or 0),          # score 내림차순
+                    )
+                )
+                _new_sectors = _new_sectors[:12]
+                _state = dict(_prev_state)
+                _state["sectors"] = _new_sectors
+                _state["themes"] = [s.get("theme", "") for s in _new_sectors]
+                _state["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _state["realtime_updated_at"] = _state["sent_at"]
+                _state["breakout_merged_at"] = _state["sent_at"]
+                _save_market_leader_state(_state)
+            except Exception as _be:
+                _swallow_exception(_be, "sector_breadth:dashboard_merge")
     except Exception as e:
         _swallow_exception(e)
 
