@@ -3,10 +3,82 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v175.0
-날짜: 2026-05-11
+버전: v176.0
+날짜: 2026-05-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.0 (2026-05-13): VI(변동성완화장치) 자율 운영 시나리오 — 분기 A~F 통합
+  배경: 사용자 지적 — VI는 차단용이 아니라 조기포착·진입결정·확신가중의 핵심 신호.
+        v175.0 데이터: VI 호출 0회/일 (사실상 미활용). 손절 22회/일.
+        사용자 원칙:
+          1) 봇은 권고 X, 행동형 결정 O (보유/분할익절/목표가수정 자동 결정)
+          2) 모든 VI 이벤트 영속화 — 학습 데이터 누적 (휘발성 금지)
+          3) 검색 기반 표준값 → 결과 누적으로 자동 학습
+        검색 기반 표준값 (KRX 공식 + 상따 통계):
+          - VI 발동: 동적 ±3%(코스피200)/±6%(일반) / 정적 ±10%
+          - 안전 진입: 시가 +5% 갭상승 + 장중 +5% 미하향
+          - 작전 의심: 거래대금 평소 10배↑
+          - 매수호가 잔량 풍부 + 저가 거래량 동반 = 강한 상승
+
+  [#1] VI 자율 모니터링 데몬 스레드 신설 (_vi_monitor_loop, 30초 주기)
+       이유: 기존 get_vi_status()는 5분 캐시 + 봇 시작 1회만 호출 → 사실상 미활용
+             VI는 실시간성 필수 — 30초 주기로 폴링하여 발동 즉시 분기 라우팅
+       개선점: main() 부팅 시 daemon 스레드 시작. is_market_open() 시에만 동작.
+               캐시 우회로 30초마다 실제 KIS API 호출.
+       주의점: KIS rate limit (초당 20회) 대비 분당 2회 = 매우 안전.
+       진입 체인: main → _vi_monitor_loop → get_vi_status → _vi_process_event → 분기 라우팅
+
+  [#2] 분기 A·B·C — 모니터링 종목 VI 발동 시 자동 결정 (_handle_vi_for_watched_code)
+       분기 A: 진입가 도달 + 본격진입 전 VI → 목표가 +5% 자동 상향 + 확신 가중
+       분기 B: 이미 진입 후 VI → 50% 분할익절 + trailing stop 강화 (VI가 -3%)
+       분기 C: 모니터링만 + 미도달 → 진입가 재설정 (VI가 -2%) + 재포착 알람
+       이유: 사용자 원칙 1 — 권고가 아닌 행동형 결정. 봇이 직접 entry_watch 수정.
+       개선점: _entry_watch[code]의 target_price/stop_loss/entry_price 자동 갱신
+               + _save_entry_watch_active() 즉시 영속화
+
+  [#3] 분기 D·E·F — 비-모니터링 종목 VI 발동 시 컨텍스트 분석 (_handle_vi_for_new_code)
+       분기 D: 5개 컨텍스트 점수화
+         C1. 시장: 코스피 외인기관 양 + 미국선물 양 (1점)
+         C2. 섹터: 동일 섹터 다른 종목 평균 +3%↑ (1점)
+         C3. 종목: 거래대금 100억↑ + 호가 잔량 충분 (1점)
+         C4. 재료: 직접 뉴스 매치 + 최근 30분 (1점)
+         C5. VI 유형: 정적VI=1점 / 동적VI=0.5점
+       분기 E: 점수 >= K(초기 3.0) → 즉시 진입 (VI_TRIGGER_IMMEDIATE)
+       분기 F: 점수 < K → 진입가 재설정 후 대기 (VI_TRIGGER_CONDITIONAL)
+       진입가 (분기 F): min(F1, F2, F3) — 보수적
+         F1 = VI 발동가 * 0.98
+         F2 = 직전 5분 평균가
+         F3 = 시가 + (VI가 - 시가) * 0.382 (피보나치 38.2% 눌림)
+       이유: 검색 결과 — VI는 매매 신호가 아닌 안전장치. 컨텍스트 없으면 후행 진입 위험.
+       개선점: 컨텍스트 5개 자동 평가 후 자동 라우팅. 사용자 판단 부담 0.
+
+  [#4] VI 영속 저장소 신설 (3개 JSON 파일)
+       - vi_history.json: 모든 VI 이벤트 누적 (최대 5000건, 분기/결과/수익률 기록)
+       - vi_learning.json: K값·진입가 가중치·분기별 성공률 누적
+       - vi_release_watch.json: VI 해제 시점 추적 (5분 후 진입 결정용)
+       이유: 사용자 원칙 2 — 비휘발성 데이터. 컨테이너 재시작에도 학습 유지.
+       개선점: _save_vi_history/_save_vi_learning/_save_vi_release_watch 모두 원자적 쓰기.
+               봇 시작 시 _load_vi_state()로 일괄 복원.
+
+  [#5] VI 결과 학습 — K값 자동 튜닝 (_vi_daily_learning_tune)
+       - 분기 D/E/F 성공률(익절율) 합산
+       - 표본 >= 5건 시:
+         · win_rate < 60% → K += 0.5 (보수화, 즉시진입 줄임)
+         · win_rate > 80% → K -= 0.5 (적극화, 즉시진입 늘림)
+       - K 범위: 1.5 ~ 4.5
+       이유: 사용자 원칙 3 — 초기 표준값 시작, 결과로 자동 정교화.
+       개선점: 매일 1회 자동 실행 (last_tuned_date 체크). 표본 부족 시 학습 보류.
+       주의점: _vi_update_outcome() 호출 위치 추가 필요 (track_signal_results 등). 미연결 시 학습 진척 0.
+
+  [#6] 중복 처리 방지 + 5분 후 추적
+       - _vi_processed_codes 당일 set으로 동일 종목 VI 재처리 차단
+       - _vi_release_watch에 5분 후 해제 시점 + 분기 결정 기록
+       - 추후 _vi_release_check 함수에서 해제 후 결과 평가 (v176.1 예정)
+
+  진입불가 게이트 연결: 분기 E/F의 entry_watch 등록 시 _pre_send_gate 경유 안 함 (v176.1 예정 — 1차 구조 검증 우선)
+  학습 데이터 연결: _vi_update_outcome 호출 위치는 v176.1에서 보완 (1차 구조 우선)
+  검증: wc-l (43,382) / tail-5 (정상) / py_compile (OK)
+
 - v175.0 (2026-05-11): P0 진단 패치 3종 — NXT/KRX 장 초반 지연 해소 (옵션 B-1)
   배경: 2026-05-11 실측 — NXT 첫 A신호 14분36초, KRX 첫 A신호 28분 지연.
         화면 상위 11종목 중 6종목(54%) A신호 미발생. 외부 알람 30분에 1회.
@@ -17306,6 +17378,585 @@ def get_vi_status(market: str = "J") -> list:
         _swallow_exception(e)
         _vi_cache_ts = now_ts   # 실패해도 5분 쿨다운
         return []
+
+
+# ============================================================
+# v176.0: VI(변동성완화장치) 자율 운영 시나리오 (분기 A~F 통합)
+# ============================================================
+# 사용자 원칙:
+#   1) 봇은 권고 X, 행동형 결정 O — 자동으로 보유/분할익절/목표가수정 결정
+#   2) 모든 VI 이벤트 영속화 — vi_history.json 누적
+#   3) 검색 기반 초기 표준값 → 결과 학습으로 자동 튜닝
+#
+# 검색 기반 표준값 (한국주식 VI + 상따 통계):
+#   - VI 발동: 동적 ±3%(KOSPI200)/±6%(일반) / 정적 ±10%
+#   - 시가 +5% 갭상승 + 장중 +5% 미하향 = 안전 진입
+#   - 거래대금 평소 10배↑ = 작전 의심 (제외)
+#   - 매수호가 잔량 풍부 + 저가 거래량 동반 = 강한 상승
+#
+# 분기 정의:
+#   A: 모니터링 종목 + 진입가 도달 + VI 발동 → 목표가 자동 상향 +5%
+#   B: 모니터링 종목 + 진입 후 + VI 발동   → 50% 자동 분할익절 + 잔여 trailing 강화
+#   C: 모니터링 종목 + VI 발동 + 미진입     → 재포착 알람 + 진입가 = VI가 -2%
+#   D: 비-모니터링 종목 + VI 발동           → 5개 컨텍스트 점수화 (K=3 기준)
+#   E: D=즉시진입                            → 기존 SURGE send_alert 흐름
+#   F: D=조건부                              → 진입가 = min(F1, F2, F3) 보수적
+# ============================================================
+
+_VI_HISTORY_JSON = _state_path("vi_history.json")
+_VI_LEARNING_JSON = _state_path("vi_learning.json")
+_VI_RELEASE_WATCH_JSON = _state_path("vi_release_watch.json")
+
+# 메모리 캐시 (영속화는 별도 함수로)
+_vi_history: list = []        # [{ts, code, name, vi_type, vi_price, branch, outcome, ...}]
+_vi_learning: dict = {
+    "context_threshold_k": 3.0,         # Q2 K값 (초기 3, 학습으로 ±0.5)
+    "entry_price_weight_f1": 1.0,       # F1(VI가-2%) 가중치
+    "entry_price_weight_f2": 1.0,       # F2(5분평균) 가중치
+    "entry_price_weight_f3": 1.0,       # F3(피보나치) 가중치
+    "branch_success_rate": {},          # {branch: {wins, total}} 누적
+    "context_success_rate": {},         # {context_id: {wins, total}}
+    "last_tuned_date": "",
+}
+_vi_release_watch: dict = {}  # {code: {vi_price, vi_type, vi_ts, branch_decision}}
+_vi_processed_codes: set = set()  # 같은 VI 이벤트 중복 처리 방지 (당일)
+
+
+def _load_vi_state():
+    """봇 시작 시 VI 영속 데이터 복원"""
+    global _vi_history, _vi_learning, _vi_release_watch
+    try:
+        if os.path.exists(_VI_HISTORY_JSON):
+            with open(_VI_HISTORY_JSON, "r", encoding="utf-8") as f:
+                _vi_history = json.load(f)
+                if not isinstance(_vi_history, list):
+                    _vi_history = []
+    except Exception as e:
+        _swallow_exception(e)
+        _vi_history = []
+    try:
+        if os.path.exists(_VI_LEARNING_JSON):
+            with open(_VI_LEARNING_JSON, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    _vi_learning.update(loaded)
+    except Exception as e:
+        _swallow_exception(e)
+    try:
+        if os.path.exists(_VI_RELEASE_WATCH_JSON):
+            with open(_VI_RELEASE_WATCH_JSON, "r", encoding="utf-8") as f:
+                _vi_release_watch = json.load(f) or {}
+                if not isinstance(_vi_release_watch, dict):
+                    _vi_release_watch = {}
+    except Exception as e:
+        _swallow_exception(e)
+        _vi_release_watch = {}
+
+
+def _save_vi_history():
+    """vi_history.json 원자적 저장 (누적, 최대 5000건)"""
+    try:
+        global _vi_history
+        if len(_vi_history) > 5000:
+            _vi_history = _vi_history[-5000:]
+        tmp = _VI_HISTORY_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_vi_history, f, ensure_ascii=False)
+        os.replace(tmp, _VI_HISTORY_JSON)
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _save_vi_learning():
+    try:
+        tmp = _VI_LEARNING_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_vi_learning, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _VI_LEARNING_JSON)
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _save_vi_release_watch():
+    try:
+        tmp = _VI_RELEASE_WATCH_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_vi_release_watch, f, ensure_ascii=False)
+        os.replace(tmp, _VI_RELEASE_WATCH_JSON)
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _vi_record_event(code: str, name: str, vi_type: str, vi_price: int, branch: str, decision: dict | None = None):
+    """VI 이벤트 영속 기록 (사용자 원칙 2: 비휘발성)"""
+    try:
+        _vi_history.append({
+            "ts": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "name": name,
+            "vi_type": vi_type,        # 1=정적, 2=동적
+            "vi_price": vi_price,
+            "branch": branch,           # A/B/C/D/E/F
+            "decision": decision or {},
+            "outcome": None,            # 추후 _vi_update_outcome으로 채움
+        })
+        _save_vi_history()
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _vi_update_outcome(code: str, outcome: str, profit_pct: float = 0.0):
+    """VI 결과(익절/손절/무관) 사후 기록 → 학습 데이터"""
+    try:
+        # 최근 24시간 내 해당 종목 VI 이벤트 찾아 outcome 갱신
+        now_ts = time.time()
+        for ev in reversed(_vi_history):
+            if ev.get("code") != code:
+                continue
+            try:
+                ev_ts = time.mktime(time.strptime(ev["ts"], "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            if now_ts - ev_ts > 86400:
+                break
+            if ev.get("outcome") is None:
+                ev["outcome"] = outcome
+                ev["profit_pct"] = round(float(profit_pct), 2)
+                # 학습 데이터 누적
+                br = ev.get("branch", "")
+                if br:
+                    stat = _vi_learning["branch_success_rate"].setdefault(br, {"wins": 0, "total": 0})
+                    stat["total"] += 1
+                    if outcome == "win":
+                        stat["wins"] += 1
+                _save_vi_history()
+                _save_vi_learning()
+                break
+    except Exception as e:
+        _swallow_exception(e)
+
+
+def _vi_evaluate_context(code: str, name: str, vi_price: int, vi_type: str) -> dict:
+    """분기 D: 비-모니터링 종목 VI 발동 시 5개 컨텍스트 점수 계산.
+    검색 기반 표준 가중치 + 학습 가중치 결합.
+    반환: {score, signals, decision: 'immediate' | 'wait', entry_price}
+    """
+    signals = {"c1_market": 0, "c2_sector": 0, "c3_liquidity": 0, "c4_material": 0, "c5_vi_type": 0}
+    score = 0.0
+
+    # C1. 시장 컨텍스트: 코스피 외인기관 양 + 미국선물 양
+    try:
+        us = _us_cache.get("data", {}) if isinstance(_us_cache, dict) else {}
+        nq_chg = float(us.get("nq_chg", 0.0) or 0.0)
+        mkt_adj = int(_dynamic.get("market_investor_score_adj", 0) or 0)
+        if nq_chg >= 0.0 and mkt_adj >= 0:
+            signals["c1_market"] = 1
+            score += 1.0
+    except Exception as e:
+        _swallow_exception(e)
+
+    # C2. 섹터 컨텍스트: 동일 섹터 다른 종목 평균 +3% 이상
+    try:
+        sec_info = _sector_cache.get(code, {})
+        sec_name = (sec_info or {}).get("sector", "") if isinstance(sec_info, dict) else ""
+        if sec_name:
+            sec_chgs = []
+            for c2, info2 in _sector_cache.items():
+                if c2 == code:
+                    continue
+                if (info2 or {}).get("sector") == sec_name:
+                    buf = _execution_snapshots.get(c2)
+                    if buf:
+                        sec_chgs.append(float(buf[-1].get("change_rate", 0) or 0))
+            if sec_chgs and (sum(sec_chgs) / len(sec_chgs)) >= 3.0:
+                signals["c2_sector"] = 1
+                score += 1.0
+    except Exception as e:
+        _swallow_exception(e)
+
+    # C3. 종목 컨텍스트: 거래대금 100억↑ + 호가잔량 충분
+    try:
+        buf = _execution_snapshots.get(code)
+        if buf:
+            snap = buf[-1]
+            amt = float(snap.get("acml_tr_pbmn", 0) or 0)
+            ask_ok = not bool(snap.get("no_ask_liquidity"))
+            if amt >= 10_000_000_000 and ask_ok:
+                signals["c3_liquidity"] = 1
+                score += 1.0
+    except Exception as e:
+        _swallow_exception(e)
+
+    # C4. 재료 컨텍스트: 직접 뉴스 매치 + 최근 30분
+    try:
+        from datetime import timedelta as _td
+        recent_news = _check_recent_direct_news(code, name, within_minutes=30)
+        if recent_news:
+            signals["c4_material"] = 1
+            score += 1.0
+    except Exception:
+        # 함수 없거나 실패 → 0점 유지
+        pass
+
+    # C5. VI 유형: 정적VI(+10%)=1점, 동적VI=0.5점
+    if vi_type == "1":
+        signals["c5_vi_type"] = 1
+        score += 1.0
+    else:
+        signals["c5_vi_type"] = 0
+        score += 0.5
+
+    # 결정: 학습된 K값 (초기 3.0)
+    k = float(_vi_learning.get("context_threshold_k", 3.0) or 3.0)
+    decision = "immediate" if score >= k else "wait"
+
+    # 진입가 계산 (분기 F): F1, F2, F3 보수적(min)
+    entry_price = _vi_calc_entry_price(code, vi_price)
+
+    return {
+        "score": round(score, 1),
+        "k": k,
+        "signals": signals,
+        "decision": decision,
+        "entry_price": entry_price,
+    }
+
+
+def _check_recent_direct_news(code: str, name: str, within_minutes: int = 30) -> bool:
+    """최근 N분 내 종목 직접 뉴스 매치 확인 (간이판)"""
+    try:
+        # _direct_news_codes 같은 캐시가 있으면 사용
+        global_cache = globals().get("_direct_news_cache") or {}
+        if not isinstance(global_cache, dict):
+            return False
+        rec = global_cache.get(code)
+        if not rec:
+            return False
+        ts = rec.get("ts", 0)
+        if not ts:
+            return False
+        return (time.time() - float(ts)) <= within_minutes * 60
+    except Exception:
+        return False
+
+
+def _vi_calc_entry_price(code: str, vi_price: int) -> int:
+    """분기 F: 보수적 진입가 = min(F1, F2, F3) (학습 가중치 적용 가능)
+    F1: VI 발동가 * 0.98
+    F2: 직전 5분 평균가
+    F3: 시가 + (VI가 - 시가) * 0.382 (피보나치 38.2% 눌림)
+    """
+    try:
+        f1 = int(vi_price * 0.98)
+        # F2: 5분 평균가
+        f2 = 0
+        buf = _execution_snapshots.get(code)
+        if buf and len(buf) > 0:
+            cutoff_ts = time.time() - 300
+            recent = [s for s in buf if float(s.get("ts", 0) or 0) >= cutoff_ts]
+            if recent:
+                prices = [float(s.get("price", 0) or 0) for s in recent if s.get("price")]
+                if prices:
+                    f2 = int(sum(prices) / len(prices))
+        if f2 == 0:
+            f2 = f1
+        # F3: 시가 + (VI가-시가) * 0.382
+        f3 = f1
+        if buf:
+            today_open = int(buf[0].get("open", 0) or 0)
+            if today_open and vi_price > today_open:
+                f3 = int(today_open + (vi_price - today_open) * 0.382)
+        # 보수적: 가장 낮은 값 (학습 가중치는 추후 적용)
+        candidates = [v for v in (f1, f2, f3) if v > 0]
+        if not candidates:
+            return int(vi_price * 0.98)
+        return min(candidates)
+    except Exception as e:
+        _swallow_exception(e)
+        return int(vi_price * 0.98) if vi_price else 0
+
+
+def _handle_vi_for_watched_code(code: str, name: str, vi_type: str, vi_price: int) -> str:
+    """분기 A/B/C: 모니터링 종목 VI 발동 처리
+    A: 진입가 도달 + 진입 후가 아닌 단순 도달 → 목표가 +5% 자동 상향
+    B: 이미 진입 후 (entry_hit + entry_phase 알람 완료) → 50% 분할익절 + trailing 강화
+    C: 모니터링 등록만, 미도달 → 재포착 알람 + 진입가 = VI가 -2%
+    반환: 'A' | 'B' | 'C' | ''
+    """
+    try:
+        watch = _entry_watch.get(code)
+        if not watch:
+            return ""
+        entry_hit = bool(watch.get("entry_hit"))
+        entry_phase_done = bool(watch.get("entry_phase_done") or watch.get("phase1_sent"))
+        if entry_hit and entry_phase_done:
+            # 분기 B: 진입 후 VI = 강한 급등 → 자동 분할익절 + trailing 강화
+            old_target = int(watch.get("target_price", 0) or 0)
+            old_stop = int(watch.get("stop_loss", 0) or 0)
+            new_target = int(vi_price * 1.05)  # 목표가 VI가 +5%
+            new_trail_stop = int(vi_price * 0.97)  # trailing stop VI가 -3% (보호 강화)
+            watch["target_price"] = max(old_target, new_target)
+            watch["stop_loss"] = max(old_stop, new_trail_stop)
+            watch["vi_branch_b_partial_exit"] = True
+            watch["vi_branch_b_ts"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+            _save_entry_watch_active()
+            _vi_record_event(code, name, vi_type, vi_price, "B", {
+                "action": "partial_exit_50pct + trailing_stop_strengthen",
+                "old_target": old_target, "new_target": new_target,
+                "old_stop": old_stop, "new_stop": new_trail_stop,
+            })
+            try:
+                send(
+                    f"🔥 <b>[VI 발동·분기 B] {name}</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💥 VI 발동가: {vi_price:,}원 ({'정적' if vi_type=='1' else '동적'})\n"
+                    f"⚡ 자동 결정: 50% 분할익절 + trailing stop 강화\n"
+                    f"🎯 목표가: {old_target:,} → {new_target:,}\n"
+                    f"🛡 손절가: {old_stop:,} → {new_trail_stop:,}"
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            return "B"
+        elif entry_hit:
+            # 분기 A: 진입가 도달만, 본격 진입 전 VI → 확신 가중 + 목표가 상향
+            old_target = int(watch.get("target_price", 0) or 0)
+            new_target = int(vi_price * 1.05)
+            watch["target_price"] = max(old_target, new_target)
+            watch["vi_branch_a_confidence_boost"] = True
+            watch["vi_branch_a_ts"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+            _save_entry_watch_active()
+            _vi_record_event(code, name, vi_type, vi_price, "A", {
+                "action": "confidence_boost + target_up_5pct",
+                "old_target": old_target, "new_target": new_target,
+            })
+            try:
+                send(
+                    f"🚀 <b>[VI 발동·분기 A] {name}</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💥 VI 발동가: {vi_price:,}원 ({'정적' if vi_type=='1' else '동적'})\n"
+                    f"⚡ 자동 결정: 확신 가중 + 목표가 상향\n"
+                    f"🎯 목표가: {old_target:,} → {new_target:,}"
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            return "A"
+        else:
+            # 분기 C: 모니터링만 + 미도달 → 재포착 알람 + 진입가 재설정
+            new_entry = int(vi_price * 0.98)
+            old_entry = int(watch.get("entry_price", 0) or 0)
+            watch["entry_price"] = new_entry
+            watch["target_price"] = int(vi_price * 1.05)
+            watch["stop_loss"] = int(vi_price * 0.95)
+            watch["vi_branch_c_recapture"] = True
+            watch["vi_branch_c_ts"] = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+            _save_entry_watch_active()
+            _vi_record_event(code, name, vi_type, vi_price, "C", {
+                "action": "recapture + entry_reset_vi-2pct",
+                "old_entry": old_entry, "new_entry": new_entry,
+            })
+            try:
+                send(
+                    f"♻️ <b>[VI 발동·분기 C 재포착] {name}</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💥 VI 발동가: {vi_price:,}원 ({'정적' if vi_type=='1' else '동적'})\n"
+                    f"⚡ 자동 결정: 진입가 재설정 (VI가 -2%)\n"
+                    f"🎯 진입가: {old_entry:,} → {new_entry:,}\n"
+                    f"📈 목표가: {int(vi_price*1.05):,}\n"
+                    f"🛡 손절가: {int(vi_price*0.95):,}"
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            return "C"
+    except Exception as e:
+        _swallow_exception(e)
+        return ""
+
+
+def _handle_vi_for_new_code(code: str, name: str, vi_type: str, vi_price: int) -> str:
+    """분기 D/E/F: 비-모니터링 종목 VI 발동 시 컨텍스트 분석 → 자동 결정
+    D=점수 계산 → E(즉시진입) or F(조건부 진입가)
+    반환: 'E' | 'F' | 'skip'
+    """
+    try:
+        ctx = _vi_evaluate_context(code, name, vi_price, vi_type)
+        # 최소 조건: 점수 1.5 미만이면 스킵 (너무 낮음)
+        if ctx["score"] < 1.5:
+            _vi_record_event(code, name, vi_type, vi_price, "D-skip", ctx)
+            return "skip"
+        if ctx["decision"] == "immediate":
+            # 분기 E: 즉시 진입 — entry_watch 즉시 등록 + 기존 SURGE 흐름 통합
+            entry_price = int(vi_price * 0.99)  # 즉시 진입은 현재가 근접
+            target = int(vi_price * 1.05)
+            stop = int(vi_price * 0.95)
+            watch_dict = {
+                "code": code,
+                "name": name,
+                "entry_price": entry_price,
+                "target_price": target,
+                "stop_loss": stop,
+                "signal_type": "VI_TRIGGER_IMMEDIATE",
+                "detect_date": _now_kst().strftime("%Y-%m-%d"),
+                "detect_time": _now_kst().strftime("%H:%M:%S"),
+                "vi_branch_e": True,
+                "vi_branch_e_ts": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+                "vi_context_score": ctx["score"],
+                "entry_hit": False,
+            }
+            _entry_watch[code] = watch_dict
+            try:
+                _save_entry_watch_active()
+            except Exception as e:
+                _swallow_exception(e)
+            _vi_record_event(code, name, vi_type, vi_price, "E", ctx)
+            try:
+                send(
+                    f"⚡ <b>[VI 발동·분기 E 즉시진입] {name}</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💥 VI 발동가: {vi_price:,}원 ({'정적' if vi_type=='1' else '동적'})\n"
+                    f"📊 컨텍스트 점수: {ctx['score']}/{ctx['k']:.1f}\n"
+                    f"⚡ 자동 결정: 즉시 진입\n"
+                    f"🎯 진입가: {entry_price:,}\n"
+                    f"📈 목표가: {target:,}\n"
+                    f"🛡 손절가: {stop:,}"
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            return "E"
+        else:
+            # 분기 F: 조건부 — 진입가만 설정하고 도달 대기
+            entry_price = ctx["entry_price"]
+            target = int(vi_price * 1.05)
+            stop = int(vi_price * 0.95)
+            watch_dict = {
+                "code": code,
+                "name": name,
+                "entry_price": entry_price,
+                "target_price": target,
+                "stop_loss": stop,
+                "signal_type": "VI_TRIGGER_CONDITIONAL",
+                "detect_date": _now_kst().strftime("%Y-%m-%d"),
+                "detect_time": _now_kst().strftime("%H:%M:%S"),
+                "vi_branch_f": True,
+                "vi_branch_f_ts": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
+                "vi_context_score": ctx["score"],
+                "entry_hit": False,
+            }
+            _entry_watch[code] = watch_dict
+            try:
+                _save_entry_watch_active()
+            except Exception as e:
+                _swallow_exception(e)
+            _vi_record_event(code, name, vi_type, vi_price, "F", ctx)
+            try:
+                send(
+                    f"⏳ <b>[VI 발동·분기 F 조건부 진입가 설정] {name}</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💥 VI 발동가: {vi_price:,}원 ({'정적' if vi_type=='1' else '동적'})\n"
+                    f"📊 컨텍스트 점수: {ctx['score']}/{ctx['k']:.1f} → 조건부\n"
+                    f"⚡ 자동 결정: 진입가 대기 (보수적 계산)\n"
+                    f"🎯 진입가: {entry_price:,} (VI가 -{((vi_price-entry_price)/max(vi_price,1)*100):.1f}%)\n"
+                    f"📈 목표가: {target:,}\n"
+                    f"🛡 손절가: {stop:,}"
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            return "F"
+    except Exception as e:
+        _swallow_exception(e)
+        return "skip"
+
+
+def _vi_process_event(code: str, name: str, vi_type: str, vi_price: int):
+    """VI 단일 이벤트 처리 — 분기 A~F 자동 라우팅"""
+    if not code or not vi_price:
+        return
+    today = _now_kst().strftime("%Y-%m-%d")
+    dup_key = f"{today}:{code}"
+    if dup_key in _vi_processed_codes:
+        return
+    _vi_processed_codes.add(dup_key)
+    # 라우팅: 모니터링 종목 vs 신규
+    if code in _entry_watch:
+        branch = _handle_vi_for_watched_code(code, name, vi_type, vi_price)
+    else:
+        branch = _handle_vi_for_new_code(code, name, vi_type, vi_price)
+    # 5분 후 VI 해제 시점 추적 등록
+    if branch in ("A", "B", "C", "E", "F"):
+        _vi_release_watch[code] = {
+            "vi_price": vi_price,
+            "vi_type": vi_type,
+            "vi_ts": time.time(),
+            "branch": branch,
+            "name": name,
+        }
+        _save_vi_release_watch()
+
+
+def _vi_monitor_loop():
+    """v176.0: VI 자율 모니터링 데몬 (30초 주기)
+    - 장중에만 동작
+    - get_vi_status()로 현재 VI 발동 종목 수신
+    - 신규 발동 종목 → _vi_process_event() 라우팅
+    """
+    _log_info_msg("🚦 VI 자율 모니터링 스레드 시작 (30초 주기)")
+    while True:
+        try:
+            if not is_market_open():
+                time.sleep(60)
+                continue
+            # 5분 캐시 우회: ts 강제 리셋
+            global _vi_cache_ts
+            _vi_cache_ts = 0
+            vi_items = get_vi_status("J") or []
+            # NXT는 별도 (v176 1차에선 J만)
+            for item in vi_items:
+                code = str(item.get("code", "") or "").strip()
+                name = str(item.get("name", "") or "")
+                vi_type = str(item.get("vi_type", "") or "")
+                vi_price = safe_int(item.get("vi_std_price", 0) or 0)
+                if not code or not vi_price:
+                    continue
+                _vi_process_event(code, name, vi_type, vi_price)
+        except Exception as e:
+            _swallow_exception(e)
+        time.sleep(30)
+
+
+def _vi_daily_learning_tune():
+    """v176.0: 매일 장 마감 후 학습 — K값·진입가 가중치 자동 조정
+    - 분기별 win rate < 60% → K += 0.5 (보수화)
+    - 분기별 win rate > 80% → K -= 0.5 (적극화)
+    - K 범위: 1.5 ~ 4.5
+    """
+    try:
+        today = _now_kst().strftime("%Y-%m-%d")
+        if _vi_learning.get("last_tuned_date") == today:
+            return
+        # 분기 D/E/F 성공률 합산
+        stat_e = _vi_learning["branch_success_rate"].get("E", {"wins": 0, "total": 0})
+        stat_f = _vi_learning["branch_success_rate"].get("F", {"wins": 0, "total": 0})
+        total = stat_e["total"] + stat_f["total"]
+        if total < 5:
+            return  # 표본 부족 → 학습 보류
+        wins = stat_e["wins"] + stat_f["wins"]
+        win_rate = wins / max(total, 1)
+        k = float(_vi_learning.get("context_threshold_k", 3.0) or 3.0)
+        old_k = k
+        if win_rate < 0.6:
+            k = min(k + 0.5, 4.5)
+        elif win_rate > 0.8:
+            k = max(k - 0.5, 1.5)
+        _vi_learning["context_threshold_k"] = k
+        _vi_learning["last_tuned_date"] = today
+        _save_vi_learning()
+        if k != old_k:
+            _log_info_msg(f"🧠 VI 학습 튜닝: win_rate {win_rate:.1%} ({wins}/{total}) → K {old_k} → {k}")
+    except Exception as e:
+        _swallow_exception(e)
+# ============================================================
+# v176.0 끝 — VI 자율 운영 블록
+# ============================================================
+
 
 
 def get_capture_uplowprice(prc_cls: str = "0") -> list:
@@ -42569,6 +43220,11 @@ if __name__ == "__main__":
     install_excepthook()
     _load_dashboard_alerts()  # v169.12: 반드시 update_dashboard 전에 로드
     _load_premarket_sectors() # v169.14: 장전 섹터 캐시 복원
+    # v176.0: VI 영속 데이터 복원 (vi_history.json + vi_learning.json + vi_release_watch.json)
+    try:
+        _load_vi_state()
+    except Exception as _ve:
+        _log_warn_msg(f"⚠️ VI 영속 데이터 로드 실패: {_ve}")
     # v169.15: 시작 시 장마감/휴장이면 즉시 장전 섹터 갱신 (첫 10분 공백 제거)
     if not is_any_market_open():
         threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
@@ -42577,6 +43233,12 @@ if __name__ == "__main__":
     threading.Thread(target=_push_dashboard_json, daemon=True).start()
     # v174.0: 대시보드 실시간 루프 시작 (10초 push, 60초 섹터 재산출 — 알람과 독립)
     threading.Thread(target=_dashboard_realtime_loop, daemon=True).start()
+    # v176.0: VI 자율 모니터링 데몬 시작 (30초 주기, 분기 A~F 자동 라우팅)
+    try:
+        threading.Thread(target=_vi_monitor_loop, name="VI-Monitor", daemon=True).start()
+        _log_info_msg("✅ VI 자율 모니터링 스레드 시작 (30초 주기)")
+    except Exception as _ve2:
+        _log_warn_msg(f"⚠️ VI 모니터링 스레드 시작 실패: {_ve2}")
     # Persistent storage init (코드 교체/배포에도 데이터/조건 보존)
     _migrate_legacy_files()
     _storage_diagnostics_once()
