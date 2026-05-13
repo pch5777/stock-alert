@@ -3,10 +3,54 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.0
+버전: v176.1
 날짜: 2026-05-13
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.1 (2026-05-13): v176.0 보완 4종 — 학습 연결·게이트 통합·해제 추적·알람 잘림 수정
+  배경: v176.0 배포 후 사용자 지적 + 알려진 3가지 한계 보완.
+
+  [#A] 알람 목록 잘림 수정 (send() 함수 내 alert_entry 빌더)
+       이유: 사용자 화면 알람 — title 60자 / body 8줄 한도로 [최우선 종목 TOP 5] 같은
+             다종목 알람이 중간에 잘림. [섹터 브레이크아웃] 12종목도 4~5개만 표시됨.
+       개선점:
+         - title  [:60]  → [:200] (3.3배 확대)
+         - body   lines[1:9]   → lines[1:50] (6.25배 확대)
+       주의점: 화면 CSS는 자동 스크롤로 처리되므로 길이 늘려도 레이아웃 영향 없음.
+
+  [#B] _vi_update_outcome 자동 호출 — 학습 데이터 누적 연결
+       이유: v176.0에서 _vi_update_outcome 함수는 정의됐으나 호출처 없음 → 학습 데이터 0건.
+       개선점: track_signal_results 내부 net_pnl_pct 분기 직전에 호출 추가.
+               청산되는 모든 종목(VI 발동 여부 무관) → _vi_history에서 해당 종목 검색 후 outcome 갱신.
+               _vi_learning.branch_success_rate 자동 누적.
+       주의점: rec.code가 _vi_history에 등록된 종목만 학습 카운트 증가.
+               VI 발동 안 한 종목은 _vi_history에 ev 없어 자동 skip (안전).
+
+  [#C] _ensure_signal_actionability 경유 — 분기 E/F 진입불가 게이트 통합
+       이유: v176.0 분기 E/F의 entry_watch 등록이 기존 진입불가 게이트 우회 → 상한가/관리종목/
+             동시호가 시간대 종목 무차별 등록 위험.
+       개선점: _handle_vi_for_new_code 내부 분기 E와 F 양쪽에 게이트 체크 추가.
+         - _gate_sig 임시 signal dict 구성 (code/name/entry/target/stop/market/score)
+         - _ensure_signal_actionability(gate_sig, source_label="vi_branch_e|f") 호출
+         - False 반환 시 _vi_record_event(branch="E-blocked"|"F-blocked") + return "blocked"
+       주의점: 우선주·스팩·상한가·관리종목·NXT전용시간대 비NXT 등 기존 차단 로직 자동 적용.
+
+  [#D] _vi_release_check — VI 발동 5분 후 결과 자동 평가 (학습 데이터 누적 강화)
+       이유: v176.0 _vi_release_watch는 기록만, 자동 평가 로직 없음 → 학습 데이터 진척 0.
+       개선점: 신규 함수 _vi_release_check() 추가
+         - _vi_release_watch 순회 → vi_ts 후 5분(300초) 경과 종목 평가
+         - 현재가: _execution_snapshots[code] 1순위, KIS get_stock_price 2순위
+         - 손익률 (cur_price - vi_price) / vi_price * 100
+         - 분류: +2%↑=win / -2%↓=loss / 그 외=flat
+         - _vi_update_outcome 호출 → _vi_history outcome 자동 채움
+         - 30분 초과 시 가격 확인 실패해도 강제 정리 (메모리 누수 방지)
+       진입 체인: _vi_monitor_loop 30초 사이클 내부에서 매번 호출 (별도 스레드 불필요).
+       주의점: 5분 = 단일가매매 종료 + 거래 재개 직후 시점. 실제 가격 흐름 반영.
+
+  검증: wc-l (43,565) / tail-5 (정상) / py_compile (OK)
+  학습 누적 시작: v176.1 배포 후부터 _vi_learning.branch_success_rate 데이터 자동 생성.
+                  K값 자동 튜닝은 표본 5건 누적 후 동작 (_vi_daily_learning_tune).
+
 - v176.0 (2026-05-13): VI(변동성완화장치) 자율 운영 시나리오 — 분기 A~F 통합
   배경: 사용자 지적 — VI는 차단용이 아니라 조기포착·진입결정·확신가중의 핵심 신호.
         v175.0 데이터: VI 호출 0회/일 (사실상 미활용). 손절 22회/일.
@@ -17788,6 +17832,20 @@ def _handle_vi_for_new_code(code: str, name: str, vi_type: str, vi_price: int) -
             entry_price = int(vi_price * 0.99)  # 즉시 진입은 현재가 근접
             target = int(vi_price * 1.05)
             stop = int(vi_price * 0.95)
+            # v176.1 [#C]: 진입불가 게이트 경유 — 상한가/동시호가/관리종목 차단
+            try:
+                _gate_sig = {
+                    "code": code, "name": name, "entry_price": entry_price,
+                    "target_price": target, "stop_loss": stop,
+                    "signal_type": "VI_TRIGGER_IMMEDIATE",
+                    "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""),
+                    "change_rate": 0.0, "score": int(ctx.get("score", 0) or 0) * 20,
+                }
+                if not _ensure_signal_actionability(_gate_sig, source_label="vi_branch_e"):
+                    _vi_record_event(code, name, vi_type, vi_price, "E-blocked", ctx)
+                    return "blocked"
+            except Exception as _ge:
+                _swallow_exception(_ge)
             watch_dict = {
                 "code": code,
                 "name": name,
@@ -17827,6 +17885,20 @@ def _handle_vi_for_new_code(code: str, name: str, vi_type: str, vi_price: int) -
             entry_price = ctx["entry_price"]
             target = int(vi_price * 1.05)
             stop = int(vi_price * 0.95)
+            # v176.1 [#C]: 진입불가 게이트 경유 — 분기 E와 동일
+            try:
+                _gate_sig = {
+                    "code": code, "name": name, "entry_price": entry_price,
+                    "target_price": target, "stop_loss": stop,
+                    "signal_type": "VI_TRIGGER_CONDITIONAL",
+                    "market": "KRX" if is_market_open() else ("NXT" if is_nxt_open() else ""),
+                    "change_rate": 0.0, "score": int(ctx.get("score", 0) or 0) * 20,
+                }
+                if not _ensure_signal_actionability(_gate_sig, source_label="vi_branch_f"):
+                    _vi_record_event(code, name, vi_type, vi_price, "F-blocked", ctx)
+                    return "blocked"
+            except Exception as _ge:
+                _swallow_exception(_ge)
             watch_dict = {
                 "code": code,
                 "name": name,
@@ -17917,6 +17989,11 @@ def _vi_monitor_loop():
                 if not code or not vi_price:
                     continue
                 _vi_process_event(code, name, vi_type, vi_price)
+            # v176.1 [#D]: 같은 사이클에서 release_check 실행 (별도 스레드 불필요)
+            try:
+                _vi_release_check()
+            except Exception as _rce:
+                _swallow_exception(_rce)
         except Exception as e:
             _swallow_exception(e)
         time.sleep(30)
@@ -17953,8 +18030,77 @@ def _vi_daily_learning_tune():
             _log_info_msg(f"🧠 VI 학습 튜닝: win_rate {win_rate:.1%} ({wins}/{total}) → K {old_k} → {k}")
     except Exception as e:
         _swallow_exception(e)
+
+
+def _vi_release_check():
+    """v176.1: VI 해제 5분 후 결과 자동 평가
+    - _vi_release_watch에 등록된 종목 순회
+    - VI 발동 후 5분 경과 시 현재가 vs VI 발동가 비교
+    - 결과를 _vi_history의 outcome 필드에 자동 기록 (학습 데이터 누적)
+    - +2% 이상 = win / -2% 이하 = loss / 그 외 = flat
+    """
+    try:
+        now_ts = time.time()
+        to_remove = []
+        for code, info in list(_vi_release_watch.items()):
+            try:
+                vi_ts = float(info.get("vi_ts", 0) or 0)
+                if not vi_ts:
+                    to_remove.append(code)
+                    continue
+                # 5분(300초) 경과 후 평가
+                if now_ts - vi_ts < 300:
+                    continue
+                vi_price = int(info.get("vi_price", 0) or 0)
+                if not vi_price:
+                    to_remove.append(code)
+                    continue
+                # 현재가 조회 (WebSocket 스냅샷 우선)
+                cur_price = 0
+                buf = _execution_snapshots.get(code)
+                if buf:
+                    cur_price = int(buf[-1].get("price", 0) or 0)
+                if not cur_price:
+                    # 스냅샷 없으면 KIS REST 호출 (rate limit 안전)
+                    try:
+                        p = get_stock_price(code)
+                        cur_price = int(p.get("price", 0) or 0)
+                    except Exception:
+                        cur_price = 0
+                if not cur_price:
+                    # 가격 확인 불가 → 다음 사이클에 재시도
+                    if now_ts - vi_ts > 1800:  # 30분 초과 시 강제 정리
+                        to_remove.append(code)
+                    continue
+                # 손익률 계산
+                pnl_pct = (cur_price - vi_price) / vi_price * 100
+                if pnl_pct >= 2.0:
+                    outcome = "win"
+                elif pnl_pct <= -2.0:
+                    outcome = "loss"
+                else:
+                    outcome = "flat"
+                # _vi_history outcome 갱신 (학습 데이터)
+                _vi_update_outcome(code, outcome, pnl_pct)
+                branch = info.get("branch", "")
+                name = info.get("name", code)
+                _log_info_msg(
+                    f"🚦 VI 해제 평가: {name}({code}) 분기 {branch} → {outcome} "
+                    f"({pnl_pct:+.1f}%, VI가 {vi_price:,} → 현재 {cur_price:,})"
+                )
+                to_remove.append(code)
+            except Exception as e:
+                _swallow_exception(e)
+                to_remove.append(code)
+        # 처리 완료 종목 제거
+        if to_remove:
+            for c in to_remove:
+                _vi_release_watch.pop(c, None)
+            _save_vi_release_watch()
+    except Exception as e:
+        _swallow_exception(e)
 # ============================================================
-# v176.0 끝 — VI 자율 운영 블록
+# v176.0 끝 — VI 자율 운영 블록 (v176.1: _vi_release_check 추가)
 # ============================================================
 
 
@@ -23685,6 +23831,14 @@ def _finalize_tracking_exit_record(rec, code, price, entry, exit_reason, today, 
         else:
             _log_info_msg(f"  📊 추적 완료(중복생략): {rec['name']} {net_pnl_pct:+.1f}%")
     global _consecutive_loss_count, _consecutive_win_count
+    # v176.1 [#B]: 청산 결과 → VI 학습 데이터 연결 (rec.code 기반)
+    try:
+        _vi_code = str(rec.get("code", "") or "").strip()
+        if _vi_code:
+            _vi_outcome = "loss" if net_pnl_pct <= 0 else "win"
+            _vi_update_outcome(_vi_code, _vi_outcome, float(net_pnl_pct or 0.0))
+    except Exception as _vie:
+        _swallow_exception(_vie)
     if net_pnl_pct <= 0:
         _consecutive_loss_count += 1
         _consecutive_win_count = 0
@@ -28625,8 +28779,9 @@ def send(text: str, *, reply_markup: dict | None = None) -> int | None:
             return msg_id
         clean = decorated_text.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","")
         lines = [l.strip() for l in clean.split("\n") if l.strip() and not l.strip().startswith("━")]
-        title = lines[0][:60] if lines else "알람"
-        body  = "\n".join(lines[1:9])
+        # v176.1: 알람 잘림 수정 — title 60→200자, body 8→50줄
+        title = lines[0][:200] if lines else "알람"
+        body  = "\n".join(lines[1:50])
         lvl   = "red" if any(k in clean for k in ["급등","SURGE","포착","돌파","상한"]) else \
                 "blue" if any(k in clean for k in ["시작","배포","완료","연결","✅","📌"]) else "yellow"
         import re as _re
