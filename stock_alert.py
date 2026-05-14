@@ -3,10 +3,38 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.5
+버전: v176.6
 날짜: 2026-05-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.6 (2026-05-14): v176.5 사후 검증 후 보완 — 거래소 업종 완전 차단 + 신규 상장 첫날 제외
+  배경: v176.5 배포 후 사용자 화면 보고 (15:32 KRX 정규장):
+        - 좌측 SECTOR LIST에 거래소 업종(금융, 제약, 음식료·담배, 전기·전자, 의료·정밀기기, 일반서비스) 여전히 표시.
+          → v176.5 [#2]는 _push_dashboard_json의 거래소 업종 보완 블록만 차단했고,
+          _build_realtime_sectors_from_kis 내부에서 들어오는 경로는 막지 못함.
+        - 우측 등락률 1위 폴레드(487580) +300.00% — 5/14 신규 상장 첫날, 공모가 기준 따따상.
+
+  [#1] _build_realtime_sectors_from_kis 거래소 업종 차단 (완전 차단)
+       이유: get_theme_sector_stocks(code)는 종목의 진짜 테마를 못 찾으면 21769~21772줄에서
+             KIS 거래소 업종명("전기·전자", "금융" 등)을 theme_name으로 fallback.
+             그 결과가 sector_map의 키로 들어가 market_leader_state.sectors에 저장.
+       개선점:
+         - 전역 캐시 _kis_exchange_sector_names_cache (10분 TTL) 추가.
+         - _build_realtime_sectors_from_kis 시작 시 get_all_sector_index()로 캐시 빌드.
+         - sector_map.setdefault 직전에 `if sec in _kis_exchange_sector_names_cache: continue`로 차단.
+       주의점: THEME_MAP + _dynamic_theme_map의 진짜 테마만 sectors에 진입.
+               진짜 테마 부족한 날엔 sectors 비거나 적게 노출 (사용자 요구가 우선).
+       위치: stock_alert.py 7895줄 전역 캐시 선언, 40213줄 캐시 빌드, sector_map 진입 가드.
+
+  [#2] 신규 상장 첫날 종목 (등락률 > 50%) 랭킹 제외
+       이유: 폴레드(487580) 5/14 신규 상장. 공모가 5,000원 → 시초가 16,500원 → 상한가 20,000원 따따상.
+             KIS 응답상 공모가 대비 +300% 계산은 정상이지만 일반 상한가(+30%) 종목들을 1위에서 밀어냄.
+       개선점: _rank_filter_and_format에서 `abs(chg) > 50.0` 종목 제외.
+       주의점: 일반 종목 상한가는 +30% 한도이므로 50% 임계는 신규 상장 식별에 안전 마진.
+               신규 상장 종목은 별도 모니터링이 필요한 케이스 (현재 단순 제외만).
+
+  검증: wc-l (편집 후 측정) / tail-5 (정상) / py_compile (OK)
+
 - v176.5 (2026-05-14): 사용자 보고 4종 근본 수정 — 랭킹 흔들림 / 섹터 거래소업종 제외 / 대장주 실시간 / NXT 분기
   배경: 사용자 화면 보고 (15:00 KRX 정규장 화면):
         - 등락률 상위 목록 순위가 자꾸 변동 (상한가 종목도 흔들림)
@@ -7893,6 +7921,8 @@ _upper_limit_alerted_today: dict = {}
 _vi_blocked_codes: dict = {}          # {code: expire_ts} — VI 발동 종목 (5분 캐시)
 _vi_cache_ts: float = 0.0             # 마지막 VI 조회 타임스탬프
 _market_investor_cache: dict = {}     # 시장별 외인기관 방향 캐시
+_kis_exchange_sector_names_cache: set = set()   # v176.6: KIS 거래소 표준 업종명 set (10분 캐시)
+_kis_exchange_sector_names_cache_ts: float = 0.0
 _capture_uplowprice_ts: float = 0.0   # 상하한가 포착 마지막 조회 ts
 _frgnmem_estimate_cache: list = []    # 외국계 가집계 캐시 (10분)
 _frgnmem_estimate_cache_ts: float = 0.0
@@ -29740,6 +29770,10 @@ def _push_dashboard_json() -> None:
                 if any(m in _n for m in _RANK_EXCLUDE_MARKERS): continue
                 if _re.search(r'우[B\d]*$', _n): continue
                 _chg = safe_float(it.get(key_chg) or 0, 0.0)
+                # v176.6: 신규 상장 첫날 종목 제외 (등락률 > 50% = 공모가 기준 따따상 종목).
+                # 일반 종목 상한가는 +30% 한도이므로 50% 임계는 신규 상장 식별에 안전.
+                if abs(_chg) > 50.0:
+                    continue
                 _vraw = safe_int(it.get(key_vol) or 0)
                 _araw = safe_int(it.get(key_amt) or 0)
                 out.append({
@@ -40211,6 +40245,20 @@ def _build_realtime_sectors_from_kis() -> None:
     if not is_market_open():
         return
     try:
+        # v176.6: 거래소 표준 업종명 캐시 빌드 (10분 TTL)
+        global _kis_exchange_sector_names_cache, _kis_exchange_sector_names_cache_ts
+        _now_ts_cache = time.time()
+        if (not _kis_exchange_sector_names_cache) or (_now_ts_cache - _kis_exchange_sector_names_cache_ts > 600):
+            try:
+                _ex_list = get_all_sector_index() or []
+                _kis_exchange_sector_names_cache = {
+                    str(s.get("bstp_name") or "").strip()
+                    for s in _ex_list
+                    if str(s.get("bstp_name") or "").strip()
+                }
+                _kis_exchange_sector_names_cache_ts = _now_ts_cache
+            except Exception as _ce:
+                _swallow_exception(_ce, "rt_sectors:exchange_cache")
         # KRX + NXT 모두 수집 (NXT는 데이터 없을 수 있음 — 빈 리스트 fallback)
         rising = []
         try:
@@ -40250,6 +40298,11 @@ def _build_realtime_sectors_from_kis() -> None:
                 continue
             # v176.3 Q2: single-stock SURGE auto theme ("XXX 연관 테마 (...)") blocked from sectors entry
             if " 연관 테마 (" in sec:
+                continue
+            # v176.6: 거래소 표준 업종(KIS bstp_name fallback) 차단.
+            # 사용자 요구: "거래소 업종은 실제 주도섹터와 전혀 관련 없다. 진짜 테마만 표시".
+            # _kis_exchange_sector_names_cache는 _build_realtime_sectors_from_kis 시작 시 1회 빌드.
+            if sec in _kis_exchange_sector_names_cache:
                 continue
             sector_map.setdefault(sec, []).append({
                 "code": code,
