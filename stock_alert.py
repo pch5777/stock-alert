@@ -3,10 +3,58 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.2
-날짜: 2026-05-13
+버전: v176.3
+날짜: 2026-05-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.3 (2026-05-14): 사용자 보고 3종 근본 수정 — 장초반 포착 지연 / 섹터 1순위 격상 / 한글 깨짐
+  배경: v176.2 배포 후 사용자 화면 보고 3종.
+        - NXT 08:15~ / KRX 09:32~ 첫 알람 (사용자 요구: 장 시작 1~2분 내 포착)
+        - 좌측 SECTOR LIST 1순위에 "필델릭스 연관 테마 (SURGE)" 같은 단일종목 섹터 노출
+        - 종목명 일부 깨짐 ("¢Éâèâèâ" 등 UTF-8→Latin-1 오디코드 패턴)
+
+  [#1] KRX burst 윈도 09:03:30 → 09:30:00 확장 (장 초반 포착 지연 해소)
+       이유: NXT burst는 08:00~08:59(59분) 충분했으나 KRX burst는 09:00~09:03:30(3.5분)으로 너무 짧음.
+             09:03:30 이후 SCAN_INTERVAL=20초로 복귀하지만 run_scan이 무거워 실질 수분~수십분 지연.
+       개선점: _is_krx_open_burst_window 종료 시각 9:30:00으로 확장. NXT 절도 맞춤. 15초 burst 간격 유지.
+       주의점: schedule.every(15초) 첫 호출은 봇 시작 후 15초 후. 부팅이 09:00 정각이면 09:00:15에 첫 burst.
+               _run_startup_scan_catchup(15495줄)이 09:00~09:15 burst 윈도 안이면 즉시 burst 실행.
+       위치: stock_alert.py 15445줄 _is_krx_open_burst_window 반환식.
+
+  [#2] 섹터 1순위 격상 근본 수정 (v176.2 [#2] 무력화 3중 차단)
+       이유: v176.2 [#2] _detect_and_send_sector_breadth_alert 패치 코드는 실재하나
+             (a) _build_realtime_sectors_from_kis 60초 머지가 priority=False로 덮어씀
+             (b) _push_dashboard_json이 chg(평균 등락률)만으로 재정렬 → 단일종목 SURGE +19%가
+                 12종목 평균 +5% 브레이크아웃보다 1순위로 올라감
+             (c) _auto_register_sector_from_signal이 "XXX 연관 테마" 단일종목 섹터를
+                 _dynamic_theme_map에 등록 → 진짜 섹터로 합류
+       개선점:
+         - _build_realtime_sectors_from_kis(40002줄): " 연관 테마 (" 패턴 sector 진입 차단
+         - _build_realtime_sectors_from_kis 머지(40034줄): _prev의 breakout_priority=True를
+           같은 theme의 new dict로 옮겨 보존 + priority 먼저 정렬
+         - _push_dashboard_json sectors_raw.append(29350줄): breakout_priority 필드 보존
+         - _push_dashboard_json 정렬 3곳(29351/29426/29452): (not priority, -chg) 키로 변경
+       주의점: 단일종목 SURGE 자체는 _dynamic_theme_map에 계속 등록(진입가 분석에 필요).
+               sectors 노출만 차단. 진짜 다종목 섹터(3종목 이상)로 자라면 다시 노출됨.
+       진입 체인: _detect_and_send_sector_breadth_alert → market_leader_state.sectors(priority=True) →
+                  _build_realtime_sectors_from_kis 60초 머지(priority 보존) → _push_dashboard_json
+                  (priority 정렬 1순위) → 대시보드 좌측 1순위 노출.
+
+  [#3] 글자 깨짐 근본 수정 (KIS 응답 utf-8 강제 + placeholder 가드 강화)
+       이유: KIS API 응답 Content-Type에 charset 미선언 시 requests가 ISO-8859-1로 falls back →
+             한글 종목명이 "¢Éâèâèâ" 같은 패턴으로 디코드. v163.6 placeholder 가드는 0xC0~0xFF만 검사해
+             "¢"(0xA2)·"¥"(0xA5) 등 0xA0~0xBF 문자가 다수인 패턴을 통과시킴.
+       개선점:
+         - safe_json_response(2068줄): resp.encoding 강제 utf-8 (charset 미선언 시) — 근본 차단
+         - _looks_like_placeholder_stock_name(15049줄): 0xC0~0xFF → 0xA0~0xFF 범위 확장
+         - _push_dashboard_json base_name(29333줄): placeholder 검증 + _resolve_stock_name 재조회
+         - _push_dashboard_json fluctuation_rank fallback(29418줄): name hint placeholder 검증
+         - _build_realtime_sectors_from_kis name(39994줄): 깨진 종목명을 _resolve_stock_name으로 복구
+       주의점: utf-8 강제는 KIS 응답이 실제로 utf-8이 아닐 경우 새 깨짐 가능. KIS 규격상 utf-8이 표준이라 안전.
+               Content-Type에 charset이 명시되어 있으면(예: "application/json; charset=UTF-8") 강제 적용 안 함.
+
+  검증: wc-l (편집 후 측정) / tail-5 (정상) / py_compile (OK)
+
 - v176.2 (2026-05-13): 권장 3종 + 알람 영속화 강화 (사용자 추가 요청)
   배경: v176.1 배포 후 알려진 한계 3가지 + 사용자 요청 "알람목록 텔레그램처럼 과거 보존".
         v176.1 정상 부팅·VI 스레드 정상 (ERROR 0건).
@@ -2065,6 +2113,22 @@ GEO_SECTOR_BIAS: dict = {}
 # --- HOTFIX: safe response JSON parsing (prevents JSONDecodeError / empty responses) ---
 def safe_json_response(resp):
     """Return parsed JSON safely; invalid/empty/HTML bodies become {} quietly."""
+    # v176.3 Q3: KIS API responses are UTF-8 but Content-Type often omits charset ->
+    # requests falls back to ISO-8859-1 -> Korean stock names become mojibake.
+    # Force resp.encoding=utf-8 when charset missing to block the root cause.
+    try:
+        if hasattr(resp, "encoding"):
+            try:
+                _ct = str((getattr(resp, "headers", {}) or {}).get("Content-Type", "") or "").lower()
+            except Exception:
+                _ct = ""
+            if "charset=" not in _ct:
+                try:
+                    resp.encoding = "utf-8"
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         txt = str(getattr(resp, "text", "") or "")
     except Exception:
@@ -15046,7 +15110,8 @@ def _looks_like_placeholder_stock_name(code: str, name_hint: str = "") -> bool:
     if compact.isdigit() and len(compact) >= 5:
         return True
     # v163.6: 인코딩 깨진 종목명 감지 — latin-1 대체 문자(ó á â ä 등) 포함 시 placeholder 처리
-    broken_chars = sum(1 for c in nm if ord(c) in range(0xC0, 0x100))
+    # v176.3 Q3: range 0xC0->0xA0 expanded. catches "¢"(0xA2),"¥"(0xA5),"§"(0xA7) UTF-8->Latin-1 mojibake.
+    broken_chars = sum(1 for c in nm if ord(c) in range(0xA0, 0x100))
     if broken_chars >= 2:
         return True
     return False
@@ -15442,7 +15507,8 @@ def _is_krx_open_burst_window(now: datetime | None = None) -> bool:
     if not is_market_open():
         return False
     cur = now.timetz().replace(tzinfo=None)
-    return dtime(9, 0, 0) <= cur <= dtime(9, 3, 30)
+    # v176.3 Q1: 09:03:30 -> 09:30:00 expand. NXT(08:00~08:59) alignment. 15s burst interval preserved.
+    return dtime(9, 0, 0) <= cur <= dtime(9, 30, 0)
 
 
 def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
@@ -29330,6 +29396,9 @@ def _push_dashboard_json() -> None:
                                 snap = _get_snap(mc)
                                 is_leader = bool(_leader_code) and (mc == _leader_code)  # v172.0 [C]
                                 base_name = m.get("name","") or _resolve_stock_name(mc,"")
+                                # v176.3 Q3: detect mojibake stock name -> re-resolve via cache
+                                if _looks_like_placeholder_stock_name(mc, base_name):
+                                    base_name = _resolve_stock_name(mc, "")
                                 # v173.0 [bug A]: snap 없으면 m(market_leader_state) 폴백
                                 _vol_raw = safe_int(snap.get("today_vol") or 0) or safe_int(m.get("today_vol") or 0)
                                 _amt_raw = safe_int(snap.get("acml_tr_pbmn") or 0) or safe_int(m.get("acml_tr_pbmn") or 0)
@@ -29346,8 +29415,15 @@ def _push_dashboard_json() -> None:
                             new_stocks = new_stocks[:8]
                             if new_stocks:
                                 avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
-                                sectors_raw.append({"name": theme, "chg": round(avg_chg,2), "stocks": new_stocks})
-                        sectors_raw.sort(key=lambda x:-x["chg"])
+                                # v176.3 Q2: preserve breakout_priority flag for dashboard 1st-place sorting
+                                sectors_raw.append({
+                                    "name": theme,
+                                    "chg": round(avg_chg,2),
+                                    "stocks": new_stocks,
+                                    "breakout_priority": bool(lsec.get("breakout_priority")),
+                                })
+                        # v176.3 Q2: priority first, then chg desc (block single-stock SURGE from beating breakout sector by chg)
+                        sectors_raw.sort(key=lambda x: (not bool(x.get("breakout_priority")), -x["chg"]))
                 except Exception as _e:
                     _swallow_exception(_e, "_push_dashboard_json:themes_primary")
 
@@ -29413,8 +29489,11 @@ def _push_dashboard_json() -> None:
                                 for _cc, _r in _candidates[:8]:
                                     _vraw = safe_int(_r.get("today_vol") or _r.get("acml_vol") or 0)
                                     _araw = safe_int(_r.get("acml_tr_pbmn") or 0)
+                                    # v176.3 Q3: drop mojibake hint -> _resolve_stock_name uses cache only
+                                    _raw_nm = _r.get("name","") or ""
+                                    _nm_hint = "" if _looks_like_placeholder_stock_name(_cc, _raw_nm) else _raw_nm
                                     stocks_raw.append({
-                                        "name": _resolve_stock_name(_cc, _r.get("name","") or ""),
+                                        "name": _resolve_stock_name(_cc, _nm_hint),
                                         "code": _cc,
                                         "chg":  float(_r.get("change_rate") or 0),
                                         "vol":  _fmt_vol(_vraw) if _vraw > 0 else "--",
@@ -29422,7 +29501,8 @@ def _push_dashboard_json() -> None:
                                     })
                             sectors_raw.append({"name":name,"chg":chg,"stocks":stocks_raw})
                             if len(sectors_raw) >= 12: break
-                        sectors_raw.sort(key=lambda x:-x["chg"])
+                        # v176.3 Q2: priority-preserving sort (preexisting priority entries stay on top)
+                        sectors_raw.sort(key=lambda x: (not bool(x.get("breakout_priority")), -x["chg"]))
                     except Exception as _e:
                         _swallow_exception(_e, "_push_dashboard_json:exchange_secondary")
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
@@ -29448,7 +29528,8 @@ def _push_dashboard_json() -> None:
                         avg = g["chg_sum"] / max(g["cnt"], 1)
                         top = sorted(g["stocks"], key=lambda x: -x["chg"])[:8]
                         sectors_raw.append({"name": sec_name, "chg": round(avg, 2), "stocks": top})
-                    sectors_raw.sort(key=lambda x: -x["chg"])
+                    # v176.3 Q2: priority-preserving sort (fallback dicts have no priority -> equivalent to chg sort)
+                    sectors_raw.sort(key=lambda x: (not bool(x.get("breakout_priority")), -x["chg"]))
             else:
                 # 장마감/휴장: 캐시된 장전 섹터 사용
                 sectors_raw = list(_WEB_DASHBOARD_PREMARKET_SECTORS)
@@ -39990,6 +40071,9 @@ def _build_realtime_sectors_from_kis() -> None:
             if not code:
                 continue
             name = str(r.get("name", code) or code)
+            # v176.3 Q3: recover mojibake KIS response name via cache
+            if _looks_like_placeholder_stock_name(code, name):
+                name = _resolve_stock_name(code, "") or code
             cr = safe_float(r.get("change_rate", 0), 0.0)
             if cr < 3.0:  # 최소 상승률 (sector breadth 알람보다 낮음 — 더 많은 섹터 노출)
                 continue
@@ -39999,6 +40083,9 @@ def _build_realtime_sectors_from_kis() -> None:
                 theme = ""
             sec = str(theme or "").strip()
             if not sec or sec in ("기타업종", "기타", ""):
+                continue
+            # v176.3 Q2: single-stock SURGE auto theme ("XXX 연관 테마 (...)") blocked from sectors entry
+            if " 연관 테마 (" in sec:
                 continue
             sector_map.setdefault(sec, []).append({
                 "code": code,
@@ -40030,15 +40117,32 @@ def _build_realtime_sectors_from_kis() -> None:
         if not new_sectors:
             return
         # 머지 (v173.1 정책 재사용): 같은 theme은 새 데이터로 갱신, 그 외 기존 sectors 보존
+        # v176.3 Q2: preserve breakout_priority=True from _prev when same theme appears in new_sectors
         try:
             _prev_state = _read_market_leader_state() or {}
             _prev_sectors = list(_prev_state.get("sectors", []) or [])
+            _prev_priority_themes = {
+                str(_ps.get("theme", "") or ""): True
+                for _ps in _prev_sectors
+                if bool(_ps.get("breakout_priority"))
+            }
+            for _ns in new_sectors:
+                _nt = str(_ns.get("theme", "") or "")
+                if _nt in _prev_priority_themes:
+                    _ns["breakout_priority"] = True
             _new_themes = {str(s.get("theme", "") or "") for s in new_sectors}
             _merged = list(new_sectors)
             for _ps in _prev_sectors:
                 _pt = str(_ps.get("theme", "") or "")
                 if _pt and _pt not in _new_themes:
                     _merged.append(_ps)
+            # v176.3 Q2: re-sort by priority first then score desc
+            _merged.sort(
+                key=lambda x: (
+                    not bool(x.get("breakout_priority")),
+                    -int(x.get("score", 0) or 0),
+                )
+            )
             _merged = _merged[:12]
             _state = dict(_prev_state)
             _state["sectors"] = _merged
