@@ -3,10 +3,34 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.3
+버전: v176.4
 날짜: 2026-05-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.4 (2026-05-14): 대시보드 섹터 stocks 등락률 stale 폴백 차단
+  배경: 사용자 화면 보고 — 민테크(452200) 대시보드에 +30.00% 표시, 그러나 5/14 실제 주가
+        4,445원(상한가 안착은 5/11 +29.96%). 검색으로 5/14 현재 상한가 아님 확인.
+        화면에 다수 종목이 동시에 ~30% 표시되어 정상 시장 분포로 보기 어려움.
+
+  [#1] _push_dashboard_json 섹터 stocks 빌더 stale 폴백 제거 (29408줄)
+       이유: 기존 코드 `float(snap.get("change_rate") or m.get("change_rate") or 0)`에서
+             WebSocket 미구독 종목은 snap={} → m(market_leader_state)의 며칠 묵은
+             change_rate를 그대로 노출. 민테크는 5/11 상한가 시점의 +29.96%가
+             market_leader_state.sectors에 저장되어 5/14에도 그대로 표시됨.
+       개선점:
+         - snap 있으면 그것만 사용
+         - snap 없으면 KIS get_stock_price(mc) 1회 보완
+         - 그래도 현재가/등락률 못 받으면 stocks 배열에서 제외 (continue)
+         - m.get("change_rate") 폴백 완전 제거
+       주의점: KIS API 추가 호출 발생 (종목 1개당 1회). _stock_price_cache가 5초 TTL로 보호.
+               대시보드는 1분 주기 갱신이라 분당 K개 종목 추가 호출. KIS_REST_LIMIT_PER_SEC=14 안전 범위.
+               제외된 종목은 알람·진입가 분석에는 영향 없음 (대시보드 sectors stocks 노출만).
+       사용자 요구: "현재가가 확인이 안 되는데 왜 섹터목록에 표시되냐?" → 미확인 종목 노출 차단.
+       진입 체인: _push_dashboard_json themes_primary 블록(29395줄~) → 종목별 snap 확인 →
+                  KIS 보완 → 못 받으면 continue → 정확한 값만 sectors stocks에 노출.
+
+  검증: wc-l (편집 후 측정) / tail-5 (정상) / py_compile (OK)
+
 - v176.3 (2026-05-14): 사용자 보고 3종 근본 수정 — 장초반 포착 지연 / 섹터 1순위 격상 / 한글 깨짐
   배경: v176.2 배포 후 사용자 화면 보고 3종.
         - NXT 08:15~ / KRX 09:32~ 첫 알람 (사용자 요구: 장 시작 1~2분 내 포착)
@@ -29399,15 +29423,35 @@ def _push_dashboard_json() -> None:
                                 # v176.3 Q3: detect mojibake stock name -> re-resolve via cache
                                 if _looks_like_placeholder_stock_name(mc, base_name):
                                     base_name = _resolve_stock_name(mc, "")
-                                # v173.0 [bug A]: snap 없으면 m(market_leader_state) 폴백
-                                _vol_raw = safe_int(snap.get("today_vol") or 0) or safe_int(m.get("today_vol") or 0)
-                                _amt_raw = safe_int(snap.get("acml_tr_pbmn") or 0) or safe_int(m.get("acml_tr_pbmn") or 0)
+                                # v176.4: snap(WebSocket)이 없으면 KIS get_stock_price 1회로 보완.
+                                # 그래도 현재가/등락률 못 받으면 stocks에서 제외 (stale m.change_rate 노출 차단).
+                                _cur_chg = None
+                                _cur_vol = 0
+                                _cur_amt = 0
+                                if snap:
+                                    _cur_chg = snap.get("change_rate")
+                                    _cur_vol = safe_int(snap.get("today_vol") or 0)
+                                    _cur_amt = safe_int(snap.get("acml_tr_pbmn") or 0)
+                                if _cur_chg is None:
+                                    try:
+                                        _kis_p = get_stock_price(mc) or {}
+                                        if _kis_p.get("change_rate") is not None:
+                                            _cur_chg = float(_kis_p.get("change_rate") or 0)
+                                            if not _cur_vol:
+                                                _cur_vol = safe_int(_kis_p.get("today_vol") or _kis_p.get("acml_vol") or 0)
+                                            if not _cur_amt:
+                                                _cur_amt = safe_int(_kis_p.get("acml_tr_pbmn") or 0)
+                                    except Exception as _ke:
+                                        _swallow_exception(_ke, "_push_dashboard_json:kis_fallback")
+                                if _cur_chg is None:
+                                    # 현재가 확인 불가 -> sectors stocks에서 제외 (사용자 요구: 미확인 종목 노출 금지)
+                                    continue
                                 new_stocks.append({
                                     "name": ("👑 " + base_name) if is_leader else base_name,  # v172.0 [C]
                                     "code": mc,
-                                    "chg":  float(snap.get("change_rate") or m.get("change_rate") or 0),
-                                    "vol":  _fmt_vol(_vol_raw) if _vol_raw > 0 else "--",  # v173.0 [bug A]
-                                    "amt":  _fmt_amt(_amt_raw) if _amt_raw > 0 else "--",  # v173.0 [bug A]
+                                    "chg":  float(_cur_chg),
+                                    "vol":  _fmt_vol(_cur_vol) if _cur_vol > 0 else "--",
+                                    "amt":  _fmt_amt(_cur_amt) if _cur_amt > 0 else "--",
                                     "is_leader": is_leader,  # v172.0 [C]
                                 })
                             # v172.0 [C]: leader 우선 + 등락률 내림차순
