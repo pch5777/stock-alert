@@ -3,10 +3,63 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.4
+버전: v176.5
 날짜: 2026-05-14
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v176.5 (2026-05-14): 사용자 보고 4종 근본 수정 — 랭킹 흔들림 / 섹터 거래소업종 제외 / 대장주 실시간 / NXT 분기
+  배경: 사용자 화면 보고 (15:00 KRX 정규장 화면):
+        - 등락률 상위 목록 순위가 자꾸 변동 (상한가 종목도 흔들림)
+        - 좌측 섹터 LIST에 거래소 업종(전기·전자, 금융, 일반서비스 등) 노출 — 진짜 주도섹터 아님
+        - 대장주(👑) 표시된 종목의 등락률이 같은 섹터 다른 종목보다 낮음
+        - NXT 시간대에는 NX 소스가 필요한데 KRX 소스 사용 가능성
+
+  [#1] 랭킹 3종(rank_chg/rank_vol/rank_view) KIS 직접 소스 + NXT 분기 (순위 흔들림 해소)
+       이유: 기존 코드는 _execution_snapshots(WebSocket 구독 종목)만으로 rank_base를 만들어 자체 정렬.
+             WebSocket 구독은 동적이라 rank_base 크기 변동 → 정렬 결과 흔들림.
+             상한가 종목도 호가 미세 변동에 따라 등락률 ±0.x% → 동률 종목과 순위 자주 뒤집힘.
+       개선점:
+         - rank_chg: get_fluctuation_rank(KRX="J" 또는 NXT="NX") 결과 그대로 사용
+         - rank_vol: get_volume_surge_stocks() / NXT 시간대는 get_nxt_surge_stocks() (있을 시)
+         - rank_view: get_hts_top_stocks() 결과 그대로 사용
+         - NXT 시간대 자동 분기: is_nxt_open() AND (NOT is_market_open()) → market="NX"
+         - ETF/선물/우선주/스팩 제외 필터 유지
+         - KIS 응답에 vol/amt 누락 시 _execution_snapshots에서 보완 (있을 때만)
+       주의점: KIS API 추가 호출 발생. _PUSH_INTERVAL=10초이므로 분당 18~30회 호출.
+               KIS_REST_LIMIT_PER_SEC=14 안전 범위.
+       위치: stock_alert.py 29656~ 부근 rank_base/rank_chg_out/rank_vol_out/rank_view_out 빌더.
+
+  [#2] 거래소 업종 sectors 표시 제외 (사용자 요구 직접 반영)
+       이유: 사용자 지적 — "거래소에서 정해진 업종(전기·전자, 금융 등)은 실제 주도섹터와 전혀 관련이 없다.
+             진짜 주도섹터는 테마(2차전지, AI·로봇 등)인데 왜 거래소 업종을 섹터로 인식하려고 하냐?"
+       개선점:
+         - _push_dashboard_json 거래소 업종 보완 블록(29487줄)을 if False로 비활성화
+         - 진짜 테마 섹터(market_leader_state.sectors)만 노출
+         - _execution_snapshots 폴백(29553)은 sectors_raw 완전 비어있을 때만 동작 (테마 섹터 0개일 때 안전망)
+       주의점: 테마 섹터가 적은 날엔 sectors 노출 종목 수 감소. 사용자 요구가 우선.
+       위치: stock_alert.py 29487줄 `if False and len(sectors_raw) < 5:` 비활성화.
+
+  [#3] 대장주(leader) 실시간 재평가 (왕관 표시 정확도 강화)
+       이유: 사용자 지적 — "왕관 종목이 되려 등락률이 낮다 → 대장주가 다른 것이라는 뜻".
+             원인: market_leader_state.sectors의 leader_code는 *알람 발송 시점* 등락률 1위 종목.
+             시간이 지나 다른 follower가 더 상승하면 leader 위치가 뒤집히지만 state에 반영 안 됨.
+       개선점: _push_dashboard_json new_stocks 정렬 후 현재 등락률 1위를 leader로 강제 재지정.
+         - is_leader 모두 False로 초기화 + 기존 "👑 " prefix 제거
+         - 정렬 후 첫 종목에 is_leader=True + "👑 " prefix 부여
+       주의점: state의 leader_code는 알람·기록용 의도로 보존 (대시보드 표시만 재평가).
+               대장주 의미: "현재 섹터를 주도하는 종목" = 현재 등락률 1위 (사용자 정의).
+       위치: stock_alert.py 29457줄 new_stocks.sort + leader 재지정.
+
+  [#4] _dashboard_realtime_loop 섹터 재산출 주기 60s → 30s (실시간성 강화)
+       이유: 사용자 지적 — "[섹터 브레이크아웃] 알람은 진짜 주도섹터 정보를 보내지만 실시간이 아니다".
+             거래소 업종 제거(#2) 후 진짜 테마 섹터의 실시간성이 중요해짐.
+       개선점: _SECTOR_BUILD_INTERVAL 60.0 → 30.0초로 단축.
+               _build_realtime_sectors_from_kis는 KIS get_fluctuation_rank("J"+"NX") 2회 호출.
+               30초 주기 = 분당 4회. KIS_REST_LIMIT_PER_SEC=14 안전.
+       위치: stock_alert.py 40278줄 _SECTOR_BUILD_INTERVAL.
+
+  검증: wc-l (편집 후 측정) / tail-5 (정상) / py_compile (OK)
+
 - v176.4 (2026-05-14): 대시보드 섹터 stocks 등락률 stale 폴백 차단
   배경: 사용자 화면 보고 — 민테크(452200) 대시보드에 +30.00% 표시, 그러나 5/14 실제 주가
         4,445원(상한가 안착은 5/11 +29.96%). 검색으로 5/14 현재 상한가 아님 확인.
@@ -29454,8 +29507,19 @@ def _push_dashboard_json() -> None:
                                     "amt":  _fmt_amt(_cur_amt) if _cur_amt > 0 else "--",
                                     "is_leader": is_leader,  # v172.0 [C]
                                 })
-                            # v172.0 [C]: leader 우선 + 등락률 내림차순
-                            new_stocks.sort(key=lambda x: (not x.get("is_leader"), -x["chg"]))
+                            # v176.5: 대장주 실시간 재평가 — 현재가 기준 등락률 1위 종목을 leader로 재지정.
+                            # 사용자 지적: "왕관 종목이 되려 등락률 더 낮음 → 대장주가 다른 것이라는 뜻".
+                            # 기존 leader_code(state에 저장된 시점)는 무시하고, 현재 stocks에서 등락률 1위를 leader로 표시.
+                            new_stocks.sort(key=lambda x: -x["chg"])
+                            for _ns in new_stocks:
+                                _ns["is_leader"] = False
+                                _nm0 = _ns.get("name", "") or ""
+                                if _nm0.startswith("👑 "):
+                                    _ns["name"] = _nm0[2:].lstrip()
+                            if new_stocks:
+                                _top = new_stocks[0]
+                                _top["is_leader"] = True
+                                _top["name"] = "👑 " + (_top.get("name", "") or "")
                             new_stocks = new_stocks[:8]
                             if new_stocks:
                                 avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
@@ -29484,7 +29548,10 @@ def _push_dashboard_json() -> None:
                         continue
                     snap_by_sector.setdefault(_sec_name, []).append((_scode, _snap))
 
-                if len(sectors_raw) < 5:  # v172.0 [A]: 테마 5개 미만 시만 거래소 업종 보완
+                # v176.5: 거래소 업종(전기·전자, 금융 등)은 진짜 주도섹터가 아니므로 sectors 표시 제외.
+                # 사용자 요구: "거래소에서 정해진 업종은 실제 주도섹터와 전혀 관련이 없는데 왜 섹터로 인식하려고 하냐?"
+                # 진짜 테마 섹터(market_leader_state.sectors)만 표시. _build_realtime_sectors_from_kis가 채움.
+                if False and len(sectors_raw) < 5:  # v172.0 [A]: 비활성화 (v176.5)
                     try:
                         sector_list = get_all_sector_index() or []
                         existing_names = {s["name"] for s in sectors_raw}
@@ -29653,38 +29720,91 @@ def _push_dashboard_json() -> None:
         except Exception as _e:
             _swallow_exception(_e, "_push_dashboard_json:captured_block")
 
-        # ── 랭킹 (웹소켓 구독 종목 기반, 장마감 후 캐시 복원) v169.22 ──
-        rank_base = []
+        # ── 랭킹 (KIS 직접 소스, NXT 시간대 자동 분기) v176.5 ──
+        # 사용자 요구: KIS 등락률/거래량/조회수 순위 소스를 그대로 받아 사용 (자체 정렬로 인한 흔들림 방지)
+        # NXT 시간대(KRX 마감 + NXT 운영)에는 NX 시장 소스 사용
+        rank_base = []  # legacy 호환 (캐시 빈 폴백용)
         rank_date_str = datetime.now().strftime("%m-%d %H:%M")
-        # v169.28 [이슈5]: 선물/우선주/ETF/지수 제외 필터
         _RANK_EXCLUDE_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
-        try:
-            for code, buf in list(_execution_snapshots.items()):
-                if not buf: continue
-                if not code or len(code) != 6: continue  # 지수코드(4자리 등) 제외
-                snap = buf[-1]
-                _rk_name = _resolve_stock_name(code,"")
-                # ETF/선물/인버스/레버리지 제외
-                if any(m in _rk_name for m in _RANK_EXCLUDE_MARKERS): continue
-                # 우선주 제외 (종목명 끝이 우/우B/1우B/2우B 등)
-                import re as _re
-                if _re.search(r'우[B\d]*$', _rk_name): continue
-                # v169.22: 300초 타임아웃 제거 — 장마감 직후 마지막 스냅도 저장 대상
-                rank_base.append({
-                    "name":    _rk_name,
-                    "code":    code,
-                    "chg":     float(snap.get("change_rate") or 0),
-                    "vol_raw": safe_int(snap.get("today_vol") or 0),
-                    "amt_raw": safe_int(snap.get("acml_tr_pbmn") or 0),
-                    "vol":     _fmt_vol(safe_int(snap.get("today_vol") or 0)),
-                    "amt":     _fmt_amt(safe_int(snap.get("acml_tr_pbmn") or 0)),
-                })
-        except Exception:
-            pass
+        import re as _re
+        _nxt_only = is_nxt_open() and (not is_market_open())  # KRX 마감 + NXT 운영
+        _kis_market = "NX" if _nxt_only else "J"
 
-        rank_chg_out  = sorted(rank_base, key=lambda x:-x["chg"])[:30]
-        rank_vol_out  = sorted(rank_base, key=lambda x:-x["vol_raw"])[:30]
-        rank_view_out = sorted(rank_base, key=lambda x:-x["amt_raw"])[:30]
+        def _rank_filter_and_format(items, key_chg, key_vol, key_amt, key_code, key_name):
+            out = []
+            for it in items or []:
+                if not isinstance(it, dict): continue
+                _c = str(it.get(key_code) or "").strip()
+                if not _c or len(_c) != 6: continue
+                _n = _resolve_stock_name(_c, str(it.get(key_name) or ""))
+                if any(m in _n for m in _RANK_EXCLUDE_MARKERS): continue
+                if _re.search(r'우[B\d]*$', _n): continue
+                _chg = safe_float(it.get(key_chg) or 0, 0.0)
+                _vraw = safe_int(it.get(key_vol) or 0)
+                _araw = safe_int(it.get(key_amt) or 0)
+                out.append({
+                    "name": _n, "code": _c,
+                    "chg": float(_chg),
+                    "vol_raw": _vraw, "amt_raw": _araw,
+                    "vol": _fmt_vol(_vraw) if _vraw > 0 else "--",
+                    "amt": _fmt_amt(_araw) if _araw > 0 else "--",
+                })
+            return out
+
+        # rank_chg: KIS 등락률 순위 직접 사용
+        rank_chg_out = []
+        try:
+            _fl_items = get_fluctuation_rank(_kis_market, "0") or []
+            rank_chg_out = _rank_filter_and_format(_fl_items, "change_rate", "today_vol", "trade_amount", "code", "name")[:30]
+            # KIS 등락률 응답은 vol/amt 없음 -> _execution_snapshots에서 보완
+            for _row in rank_chg_out:
+                if _row["vol_raw"] == 0 or _row["amt_raw"] == 0:
+                    _sb = _execution_snapshots.get(_row["code"])
+                    if _sb:
+                        _sn = _sb[-1]
+                        if _row["vol_raw"] == 0:
+                            _row["vol_raw"] = safe_int(_sn.get("today_vol") or 0)
+                            _row["vol"] = _fmt_vol(_row["vol_raw"]) if _row["vol_raw"] > 0 else "--"
+                        if _row["amt_raw"] == 0:
+                            _row["amt_raw"] = safe_int(_sn.get("acml_tr_pbmn") or 0)
+                            _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+        except Exception as _re1:
+            _swallow_exception(_re1, "rank_chg_kis")
+
+        # rank_vol: KIS 거래량 순위 직접 사용
+        rank_vol_out = []
+        try:
+            if _nxt_only:
+                _vs = get_nxt_surge_stocks() or [] if "get_nxt_surge_stocks" in globals() else []
+            else:
+                _vs = get_volume_surge_stocks() or []
+            rank_vol_out = _rank_filter_and_format(_vs, "change_rate", "today_vol", "trade_amount", "code", "name")
+            rank_vol_out.sort(key=lambda x: -x["vol_raw"])
+            rank_vol_out = rank_vol_out[:30]
+        except Exception as _re2:
+            _swallow_exception(_re2, "rank_vol_kis")
+
+        # rank_view: KIS HTS 조회상위 직접 사용
+        rank_view_out = []
+        try:
+            _hts = get_hts_top_stocks() or []
+            rank_view_out = _rank_filter_and_format(_hts, "change_rate", "today_vol", "trade_amount", "code", "name")[:30]
+            # HTS 응답에 chg/vol/amt 없으면 _execution_snapshots에서 보완
+            for _row in rank_view_out:
+                if _row["chg"] == 0.0 or _row["vol_raw"] == 0 or _row["amt_raw"] == 0:
+                    _sb = _execution_snapshots.get(_row["code"])
+                    if _sb:
+                        _sn = _sb[-1]
+                        if _row["chg"] == 0.0:
+                            _row["chg"] = float(safe_float(_sn.get("change_rate") or 0, 0.0))
+                        if _row["vol_raw"] == 0:
+                            _row["vol_raw"] = safe_int(_sn.get("today_vol") or 0)
+                            _row["vol"] = _fmt_vol(_row["vol_raw"]) if _row["vol_raw"] > 0 else "--"
+                        if _row["amt_raw"] == 0:
+                            _row["amt_raw"] = safe_int(_sn.get("acml_tr_pbmn") or 0)
+                            _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+        except Exception as _re3:
+            _swallow_exception(_re3, "rank_view_kis")
 
         if rank_base:
             # 장중 라이브 데이터 → 파일 저장
@@ -40208,7 +40328,7 @@ def _dashboard_realtime_loop() -> None:
     - 장 마감 시 30초 sleep (KIS quota 절약)
     """
     _last_sector_build = 0.0
-    _SECTOR_BUILD_INTERVAL = 60.0  # 초 단위
+    _SECTOR_BUILD_INTERVAL = 30.0  # v176.5: 60초 -> 30초 (테마 섹터 실시간성 강화. 거래소 업종 의존 제거 대응)
     _PUSH_INTERVAL = 10.0
     while True:
         try:
