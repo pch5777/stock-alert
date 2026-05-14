@@ -1,12 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.0
+버전: v177.1
 날짜: 2026-05-15
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.1 (2026-05-15): SyntaxWarning 노이즈 제거 + 장마감 예상체결가 재구현 + 예상체결지수 추이 신규
+  배경: v177.0 후속 — 사용자 권고사항 일괄 정리.
+        - 부팅 시 SyntaxWarning 노이즈 (모듈 docstring 내 정규식 예시 backslash d)
+        - FHKST117300C0 v175.0에서 비활성된 항목을 규격서(국내주식-120) 확보 후 재구현
+        - FHPST01840000 신규 — 규격서(국내주식-121) 확보 후 추가 (사용처 미통합)
+
+  [A] 모듈 docstring 첫 라인을 raw string으로 prefix — SyntaxWarning 제거
+       이유: docstring 내 정규식 예시(backslash d) 때문에 Python 부팅 시 DeprecationWarning 발생.
+       개선점: 파일 최상단 docstring을 raw 형태로 prefix → 모든 backslash escape 무력화.
+       주의점: docstring 의미·렌더링에 영향 없음.
+
+  [D] get_exp_closing_price_rank() 신규 — FHKST117300C0 장마감 예상체결가 재구현
+       이유: v175.0에서 URI 추정 오류로 호출 비활성. 규격서(국내주식-120) 확보 후 정확 구현.
+       개선점:
+         URI: /uapi/domestic-stock/v1/quotations/exp-closing-price (정답 확인)
+         파라미터: FID_COND_MRKT_DIV_CODE=J, FID_COND_SCR_DIV_CODE=11173,
+                  FID_INPUT_ISCD=0000/0001/1001, FID_BLNG_CLS_CODE=0,
+                  FID_RANK_SORT_CLS_CODE=0~4
+         응답: output1 array, 5분 캐시
+       주의점: 모의투자 미지원. 실전계좌 전용.
+
+  [D2] _build_realtime_sectors_from_kis 9번 항목 호출 재활성화
+       이유: 19064줄 exp_close_data 비활성 코드를 get_exp_closing_price_rank() 호출로 교체.
+       개선점: 장마감(15:30) 후 강세 예상 종목(상승률 1% 이상) 섹터 +1~6점 가점.
+       주의점: 5분 캐시로 API 호출 부담 최소화.
+
+  [E] get_exp_index_trend() 신규 — FHPST01840000 예상체결지수 추이
+       이유: 시장지수(코스피/코스닥) 예상체결 시계열 → 장시작 전 시장방향 선판단.
+       개선점:
+         URI: /uapi/domestic-stock/v1/quotations/exp-index-trend
+         파라미터: FID_COND_MRKT_DIV_CODE=U, FID_INPUT_ISCD=0001/1001,
+                  FID_INPUT_HOUR_1=10/30/60/600, FID_MKOP_CLS_CODE=1/2
+         응답: output array, 3분 캐시
+       주의점: 함수만 신규 추가. 사용처 통합은 별도 세션 (Surgical Changes 원칙).
+
+  검증: SyntaxWarning 0건 / py_compile OK / tail-5 메인루프 정상
+
 - v177.0 (2026-05-15): NXT 단독시간대 KRX전용 종목 원천 차단 — 주식기본조회 CTPF1002R 도입
   배경: 사용자 보고 (2026-05-14 18:22:18 LG디스플레이 034220 NXT단독시간대 알람 발송 사례):
         - 034220은 KRX 전용 종목인데 _NXT_INITIAL_CODES 화이트리스트(초기 640개)에 잘못 등록.
@@ -17459,6 +17496,108 @@ def get_exp_trans_updown_rank(before_open: bool = True) -> list:
         return []
 
 
+# v177.1: 캐시 (5분 TTL) — 장마감 예상체결가
+_exp_closing_cache: list = []
+_exp_closing_cache_ts: float = 0.0
+
+def get_exp_closing_price_rank(market: str = "0001", sort: str = "3") -> list:
+    """v177.1: 국내주식 장마감 예상체결가 (FHKST117300C0) — 규격서 국내주식-120 확인 완료.
+    URI: /uapi/domestic-stock/v1/quotations/exp-closing-price
+    파라미터: FID_COND_MRKT_DIV_CODE=J, FID_COND_SCR_DIV_CODE=11173,
+              FID_INPUT_ISCD(0000전체/0001거래소/1001코스닥), FID_BLNG_CLS_CODE=0,
+              FID_RANK_SORT_CLS_CODE(0전체/1상한가/2하한가/3상승률/4하락률)
+    응답: output1[] -> stck_shrn_iscd, hts_kor_isnm, stck_prpr, prdy_ctrt, cntg_vol
+    반환: [{"code","name","price","change_rate","exp_volume"}, ...]
+    """
+    global _exp_closing_cache, _exp_closing_cache_ts
+    if _exp_closing_cache and time.time() - _exp_closing_cache_ts < 300:
+        return _exp_closing_cache
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/exp-closing-price",
+            "FHKST117300C0",
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE":  "11173",
+                "FID_INPUT_ISCD":         market,
+                "FID_BLNG_CLS_CODE":      "0",
+                "FID_RANK_SORT_CLS_CODE": sort,
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output1") or data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            code = str(i.get("stck_shrn_iscd") or "").strip()
+            if not code:
+                continue
+            items.append({
+                "code":        code,
+                "name":        str(i.get("hts_kor_isnm") or ""),
+                "price":       safe_int(i.get("stck_prpr") or 0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "exp_volume":  safe_int(i.get("cntg_vol") or 0),
+                "market":      "KRX",
+            })
+        _exp_closing_cache = items
+        _exp_closing_cache_ts = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
+# v177.1: 캐시 (3분 TTL) — 예상체결지수 추이 시계열
+_exp_index_trend_cache: dict = {}
+_exp_index_trend_cache_ts: dict = {}
+
+def get_exp_index_trend(iscd: str = "0001", interval: str = "60", before_open: bool = True) -> list:
+    """v177.1: 국내주식 예상체결지수 추이 (FHPST01840000) — 규격서 국내주식-121 확인 완료.
+    URI: /uapi/domestic-stock/v1/quotations/exp-index-trend
+    파라미터: FID_COND_MRKT_DIV_CODE=U, FID_INPUT_ISCD(0001코스피/1001코스닥),
+              FID_INPUT_HOUR_1(10/30/60/600 초단위), FID_MKOP_CLS_CODE(1장시작전/2장마감)
+    응답: output[] -> stck_cntg_hour, bstp_nmix_prpr, prdy_vrss_sign,
+                       bstp_nmix_prdy_vrss, prdy_ctrt, acml_vol, acml_tr_pbmn
+    반환: [{"time","index","change","change_rate","vol","amt"}, ...] (시간 내림차순)
+    """
+    cache_key = f"{iscd}_{interval}_{1 if before_open else 2}"
+    if cache_key in _exp_index_trend_cache and time.time() - _exp_index_trend_cache_ts.get(cache_key, 0) < 180:
+        return _exp_index_trend_cache[cache_key]
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/exp-index-trend",
+            "FHPST01840000",
+            {
+                "FID_COND_MRKT_DIV_CODE": "U",
+                "FID_INPUT_ISCD":         iscd,
+                "FID_INPUT_HOUR_1":       interval,
+                "FID_MKOP_CLS_CODE":      "1" if before_open else "2",
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for i in (data.get("output") or []):
+            if not isinstance(i, dict):
+                continue
+            items.append({
+                "time":        str(i.get("stck_cntg_hour") or ""),
+                "index":       safe_float(i.get("bstp_nmix_prpr") or 0, 0.0),
+                "change":      safe_float(i.get("bstp_nmix_prdy_vrss") or 0, 0.0),
+                "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
+                "vol":         safe_int(i.get("acml_vol") or 0),
+                "amt":         safe_int(i.get("acml_tr_pbmn") or 0),
+            })
+        _exp_index_trend_cache[cache_key] = items
+        _exp_index_trend_cache_ts[cache_key] = time.time()
+        return items
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+
 def get_volume_power_rank(market: str = "J") -> list:
     """v167.0: 체결강도 상위 (FHPST01680000) — 매수 체결강도 상위.
     규격서: v1_국내주식-101
@@ -19061,13 +19200,12 @@ def _build_premarket_sector_snapshot() -> dict:
             _swallow_exception(e)
 
         # ⑨ 장마감 예상체결가 — v169.29 신규: 장마감 후 강세 예상 종목 섹터 가점
-        # v175.0 P0-3: FHKST117300C0 URI/파라미터 추정 오류로 404 16회/일 누적 → 호출 비활성화
+        # v177.1: FHKST117300C0 규격서 확인(국내주식-120) 후 재활성화 — get_exp_closing_price_rank() 사용
         try:
-            exp_close_data: dict = {}  # v175.0: 호출 비활성 (규격서 수신 후 재활성화)
-            for item in (exp_close_data.get("output1") or [])[:15]:
-                code = normalize_stock_code(str(item.get("stck_shrn_iscd") or ""))
-                name = str(item.get("hts_kor_isnm") or "")
-                chg = safe_float(item.get("prdy_ctrt") or 0, 0.0)
+            for item in get_exp_closing_price_rank(market="0000", sort="3")[:15]:
+                code = normalize_stock_code(str(item.get("code") or ""))
+                name = str(item.get("name") or "")
+                chg = safe_float(item.get("change_rate") or 0, 0.0)
                 if not code or chg < 1.0:
                     continue
                 sec = _code_to_sector(code, name)
