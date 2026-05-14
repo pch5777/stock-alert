@@ -3,10 +3,47 @@
 """
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v176.6
-날짜: 2026-05-14
+버전: v177.0
+날짜: 2026-05-15
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.0 (2026-05-15): NXT 단독시간대 KRX전용 종목 원천 차단 — 주식기본조회 CTPF1002R 도입
+  배경: 사용자 보고 (2026-05-14 18:22:18 LG디스플레이 034220 NXT단독시간대 알람 발송 사례):
+        - 034220은 KRX 전용 종목인데 _NXT_INITIAL_CODES 화이트리스트(초기 640개)에 잘못 등록.
+        - 기존 is_nxt_listed()는 화이트리스트 우선 → API 검증 없이 NXT 상장으로 판정 → 게이트 통과.
+        - 화이트리스트는 누적/오등록 가능성 상시 존재 → 종목별 KIS API 검증값이 정답.
+
+  [#1] get_stock_basic_info(code) 신규 — 주식기본조회 CTPF1002R 호출
+       이유: 종목코드 단위로 NXT 거래여부를 KIS 공식 응답으로 확인하는 유일한 경로.
+       개선점:
+         - URI: /uapi/domestic-stock/v1/quotations/search-stock-info
+         - 파라미터: PRDT_TYPE_CD=300, PDNO=<6자리코드>
+         - 응답 핵심: output.cptt_trad_tr_psbl_yn(NXT거래종목여부 Y/N), output.nxt_tr_stop_yn(NXT거래정지여부 Y/N)
+         - 24시간 메모리 캐시 + 영속파일(nxt_basic_info.json) 10건 단위 저장
+       주의점: 규격서 확인 완료(섹션 0 항목 9 준수). 추정 코딩 없음.
+
+  [#2] is_nxt_listed() 우선순위 변경 — API 검증값 최우선
+       이유: 화이트리스트는 KRX전용 종목 잘못 포함 가능성. API 검증값이 정확함.
+       개선점:
+         1순위: _nxt_basic_info_cache (API 검증값) — 캐시에 있으면 무조건 이 값
+         2순위: _nxt_confirmed_codes 화이트리스트 (50개 이상 시) — 캐시 없을 때만
+         3순위: _nxt_unavailable 블랙리스트 — fallback
+       주의점: 캐시 미수집 종목은 기존 로직 그대로 → 점진적 마이그레이션.
+
+  [#3] _ensure_signal_actionability 이중 방어선 추가
+       이유: 기존 게이트는 market="NXT" 마킹만 체크. 마킹된 신호도 KRX전용일 수 있음.
+       개선점: NXT 단독시간대(is_nxt_open() AND NOT is_market_open())에서 get_stock_basic_info()
+               조회 후 nxt_eligible=False면 강제 차단. 화이트리스트 오등록 무력화.
+       주의점: API 호출 비용 증가 — 단, 동일 종목 24시간 캐시 → 일일 1회 호출만 발생.
+
+  [#4] _load_nxt_basic_info_cache() 봇 시작 시 호출 — 캐시 영속 복원
+       이유: 재시작 후에도 API 검증값 유지 → 봇 부팅 즉시 차단 활성화.
+
+  진입 체인 연결: send_alert() → _ensure_signal_actionability() → get_stock_basic_info() ✅
+  진입불가 게이트 연결: _pre_send_gate() 경유 ✅ (기존 게이트 함수 내부에 통합)
+
+  검증: wc-l 44019→44107 / tail-5 (메인 루프 정상) / py_compile OK
+
 - v176.6 (2026-05-14): v176.5 사후 검증 후 보완 — 거래소 업종 완전 차단 + 신규 상장 첫날 제외
   배경: v176.5 배포 후 사용자 화면 보고 (15:32 KRX 정규장):
         - 좌측 SECTOR LIST에 거래소 업종(금융, 제약, 음식료·담배, 전기·전자, 의료·정밀기기, 일반서비스) 여전히 표시.
@@ -8337,10 +8374,15 @@ def is_any_market_open() -> bool:
     """
     return is_market_open() or is_nxt_open()
 def is_nxt_listed(code: str) -> bool:
-    """v165.27: NXT 상장 종목 판별 — 화이트리스트 우선, fallback은 기존 방식.
-    _nxt_confirmed_codes(volume-rank 실거래 누적)가 50개 이상이면 화이트리스트 기준.
-    빈 set이면 기존 _nxt_unavailable 블랙리스트 방식으로 fallback.
+    """v177.0: NXT 상장 종목 판별 — 주식기본조회(CTPF1002R) API 검증값 최우선.
+    1) get_stock_basic_info() 캐시에 있으면 cptt_trad_tr_psbl_yn 기준 (API 검증값)
+    2) 캐시 없으면 _nxt_confirmed_codes 화이트리스트 (50개 이상 시)
+    3) 둘 다 없으면 _nxt_unavailable 블랙리스트 fallback (목록 없으면 상장으로 간주)
     """
+    # v177.0: API 검증값 우선 — 화이트리스트 오등록(예: LG디스플레이 034220) 원천 차단
+    info = _nxt_basic_info_cache.get(code)
+    if isinstance(info, dict) and "nxt_eligible" in info:
+        return bool(info.get("nxt_eligible"))
     if len(_nxt_confirmed_codes) >= 50:
         return code in _nxt_confirmed_codes
     # fallback: 기존 방식 (목록에 없으면 상장으로 간주)
@@ -10708,6 +10750,7 @@ NXT_HOLDOVER_STATE_FILE     = _state_path("nxt_holdover_state.json")  # v165.5: 
 PRECLOSE_GAP_ENTRY_WATCH_FILE = _state_path("preclose_gap_entry_watch.json")
 PULLBACK_WAIT_WATCH_FILE   = _state_path("pullback_wait_watch.json")  # v165.23: 눌림 대기 감시 상태 파일
 NXT_CONFIRMED_FILE         = _state_path("nxt_confirmed_codes.json")  # v165.27: NXT 실거래 확인 종목 화이트리스트
+NXT_BASIC_INFO_FILE        = _state_path("nxt_basic_info.json")  # v177.0: 주식기본조회(CTPF1002R) NXT 거래여부 캐시
 REENTRY_WATCH_FILE = _state_path("reentry_watch.json")
 EXECUTION_SETUP_WATCH_FILE = _state_path("execution_setup_watch.json")
 EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC = int(os.getenv("EXECUTION_SETUP_STATE_SAVE_MIN_INTERVAL_SEC", "45") or "45")
@@ -16344,6 +16387,17 @@ def _ensure_signal_actionability(signal: dict, source_label: str = "") -> bool:
             f"(market={signal.get('market', '')})"
         )
         return False
+    # v177.0: NXT 단독시간대 KRX전용 종목 원천 차단 (이중 방어선)
+    # market="NXT" 마킹되었더라도 주식기본조회(CTPF1002R) cptt_trad_tr_psbl_yn=N이면 차단
+    # 화이트리스트 오등록(예: LG디스플레이 034220) 케이스 해결
+    if is_nxt_open() and not is_market_open():
+        _basic = get_stock_basic_info(code)
+        if isinstance(_basic, dict) and "nxt_eligible" in _basic and not _basic.get("nxt_eligible"):
+            _log_info_msg(
+                f"  ⏭ [게이트 차단] {signal.get('name', code)}({code}) — "
+                f"NXT 단독시간대 KRX전용 확정(주식기본조회 검증)"
+            )
+            return False
     return True
 
 def send_mid_pullback_alert(s: dict):
@@ -19481,6 +19535,76 @@ _NXT_INITIAL_CODES: frozenset = frozenset({
     "383800", "139480", "064760", "092790", "036620", "017800",
 })
 _nxt_confirmed_codes: set = set()  # v165.27: NXT 실거래 확인 종목 화이트리스트 (volume-rank 누적)
+_nxt_basic_info_cache: dict = {}  # v177.0: 주식기본조회 결과 캐시 {code: {nxt_eligible, nxt_halt, ts}}
+_NXT_BASIC_INFO_TTL = 86400  # v177.0: 24시간 TTL (일일 1회 검증)
+
+def get_stock_basic_info(code: str) -> dict:
+    """v177.0: 주식기본조회 (CTPF1002R) — 종목 KRX/NXT 거래여부 정확 판별.
+
+    응답 핵심 필드:
+      - cptt_trad_tr_psbl_yn: NXT 거래종목여부 (Y/N)
+      - nxt_tr_stop_yn:       NXT 거래정지여부 (Y/N)
+
+    반환: {nxt_eligible: bool, nxt_halt: bool, ts: float}
+          실패 시 빈 dict — 호출자는 기존 화이트리스트 fallback.
+    """
+    code = normalize_stock_code(code)
+    if not code or len(code) != 6:
+        return {}
+    cached = _nxt_basic_info_cache.get(code)
+    if isinstance(cached, dict) and (time.time() - cached.get("ts", 0)) < _NXT_BASIC_INFO_TTL:
+        return cached
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/search-stock-info",
+            "CTPF1002R",
+            {"PRDT_TYPE_CD": "300", "PDNO": code},
+        )
+        if not isinstance(data, dict):
+            return {}
+        out = data.get("output") or {}
+        if not isinstance(out, dict):
+            return {}
+        nxt_yn  = str(out.get("cptt_trad_tr_psbl_yn") or "").strip().upper()
+        halt_yn = str(out.get("nxt_tr_stop_yn") or "").strip().upper()
+        info = {
+            "nxt_eligible": (nxt_yn == "Y"),
+            "nxt_halt":     (halt_yn == "Y"),
+            "ts":           time.time(),
+        }
+        _nxt_basic_info_cache[code] = info
+        if len(_nxt_basic_info_cache) % 10 == 0:
+            _save_nxt_basic_info_cache()
+        return info
+    except Exception as e:
+        _swallow_exception(e)
+        return {}
+
+def _save_nxt_basic_info_cache() -> None:
+    """v177.0: 주식기본조회 NXT 캐시 영속 저장."""
+    try:
+        _write_json_atomic(NXT_BASIC_INFO_FILE, _nxt_basic_info_cache, indent=0)
+    except Exception as e:
+        _swallow_exception(e)
+
+def _load_nxt_basic_info_cache() -> None:
+    """v177.0: 주식기본조회 NXT 캐시 복원 — TTL 만료 항목은 자동 제거."""
+    global _nxt_basic_info_cache
+    try:
+        raw = _read_json_safe(NXT_BASIC_INFO_FILE, None)
+        if isinstance(raw, dict):
+            now_ts = time.time()
+            _nxt_basic_info_cache = {
+                str(k): v for k, v in raw.items()
+                if isinstance(v, dict) and (now_ts - v.get("ts", 0)) < _NXT_BASIC_INFO_TTL
+            }
+            _log_info_msg(f"📂 NXT 기본조회 캐시 {len(_nxt_basic_info_cache)}개 복원 (TTL 유효)")
+        else:
+            _nxt_basic_info_cache = {}
+    except Exception as e:
+        _swallow_exception(e)
+        _nxt_basic_info_cache = {}
+
 def get_nxt_info(code: str) -> dict:
     """
     NXT 종합 정보 (캐시 5분)
@@ -43885,6 +44009,7 @@ if __name__ == "__main__":
     _load_preclose_gap_entry_watch()
     _load_pullback_wait_watch()            # v165.23: 재시작 시 눌림 대기 감시 복원
     _load_nxt_confirmed_codes()            # v165.27: NXT 화이트리스트 복원
+    _load_nxt_basic_info_cache()           # v177.0: NXT 기본조회 캐시 복원
     _load_upper_limit_alerted_today()   # v161.14: 재시작 시 상한가 차단 목록 복원
     _load_alert_history()               # v161.15: 재시작 시 알람 쿨다운 이력 복원
     _load_yt_exclude_keywords()         # v161.36: 재시작 시 YouTube 제외 키워드 복원
