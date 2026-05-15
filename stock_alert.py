@@ -30102,7 +30102,8 @@ def _push_dashboard_json() -> None:
         except Exception as _re3:
             _swallow_exception(_re3, "rank_view_kis")
 
-        if rank_base:
+        # v176.7: rank_base는 legacy 호환용 빈 리스트 → KIS 직접 소스가 채워졌는지로 판정
+        if rank_chg_out or rank_vol_out or rank_view_out:
             # 장중 라이브 데이터 → 파일 저장
             try:
                 _write_json_atomic(_WEB_DASHBOARD_RANK_FILE, {
