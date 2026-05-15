@@ -38580,6 +38580,33 @@ def _handle_telegram_compact_toggle():
         else "📋 <b>상세 모드 ON</b>\n알림이 기존 상세 포맷으로 발송됩니다"
     )
     send(mode_str)
+def _handle_download_signal_log_command():
+    """signal_log.json 파일을 텔레그램으로 전송"""
+    if not os.path.exists(SIGNAL_LOG_FILE):
+        send("❌ <b>signal_log.json 없음</b>\n아직 신호가 기록되지 않았습니다.")
+        return
+    try:
+        size_kb = os.path.getsize(SIGNAL_LOG_FILE) // 1024
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(SIGNAL_LOG_FILE, "rb") as f:
+            resp = _tg_http_request(
+                "post",
+                "sendDocument",
+                data_payload={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": f"📋 signal_log.json  {ts_str}  ({size_kb}KB)",
+                },
+                files={"document": (f"signal_log_{datetime.now().strftime('%Y%m%d_%H%M')}.json", f)},
+                read_timeout=_TG_FILE_READ_TIMEOUT,
+                attempts=2,
+            )
+        if resp is not None and resp.status_code == 200:
+            send(f"✅ <b>signal_log.json 전송 완료</b>  ({size_kb}KB)")
+        else:
+            send("❌ 파일 전송 실패")
+    except Exception as e:
+        send(f"❌ 오류: {e}")
+
 def _handle_telegram_backup_command():
     send("💾 <b>수동 백업 시작...</b>")
     ok_gist = backup_to_gist()
@@ -38923,6 +38950,9 @@ def _dispatch_telegram_command(raw: str, text: str):
         return
     if text in ("/백업", "/backup"):
         _handle_telegram_backup_command()
+        return
+    if text in ("/download_signal_log", "/다운로드"):
+        _handle_download_signal_log_command()
         return
     if text.startswith("/result"):
         _handle_result_command(raw)
