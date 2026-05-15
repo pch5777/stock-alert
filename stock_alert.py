@@ -27445,6 +27445,13 @@ def _notify_trading_halt_cancel(watch: dict, use_nxt: bool = False, cur: dict | 
                 _clear_dart_halt_cache(code, "전날 halt 오늘 정상 거래 무음 해제")
                 _log_info_msg(f"  ℹ️ {name}({code}) 전날 거래정지 기록 무음 해제 (ts={_halt_ts:.0f})")
                 return
+    # v177.2: 호가 공백만으론 알람 발송 금지 — KIS 명시적 플래그 또는 DART 명시적 거래정지만 신뢰
+    # 이유: 점심 휴장 직후/일시 호가 공백 시 정상 종목 [포착 취소 — 거래정지] 오발송 반복
+    _explicit_kis_flag = _has_explicit_halt_market_flag(cur) if isinstance(cur, dict) else False
+    _explicit_dart = bool(halt_reason and ("거래정지" in halt_reason or "매매정지" in halt_reason))
+    if not (_explicit_kis_flag or _explicit_dart):
+        _log_info_msg(f"  🤫 거래정지 알람 보류: {name}({code}) — 명시적 KIS/DART 플래그 없음 (호가 일시 공백 추정)")
+        return
     _mark_trading_halt_state(code, title=halt_reason, name=name, source="entry_watch_cancel")
     # v165.6 [#3]: 발송 직전 현재가 재조회 — KRX 개장 직후 순간 플래그 오판 방어
     try:
@@ -30098,14 +30105,16 @@ def _push_dashboard_json() -> None:
             _swallow_exception(_re3, "rank_view_kis")
 
         # v176.7: rank_base는 legacy 호환용 빈 리스트 → KIS 직접 소스가 채워졌는지로 판정
+        # v177.1: 빈 리스트는 직전 캐시 유지 (KIS 일시 빈 응답 → 화면 비는 현상 방지)
         if rank_chg_out or rank_vol_out or rank_view_out:
-            # 장중 라이브 데이터 → 파일 저장
+            # 장중 라이브 데이터 → 파일 저장 (빈 개별 항목은 직전 캐시 fallback)
             try:
+                _saved_prev = _read_json_locked(_WEB_DASHBOARD_RANK_FILE) or {}
                 _write_json_atomic(_WEB_DASHBOARD_RANK_FILE, {
                     "rank_date": datetime.now().strftime("%m-%d %H:%M"),
-                    "rank_chg":  rank_chg_out,
-                    "rank_vol":  rank_vol_out,
-                    "rank_view": rank_view_out,
+                    "rank_chg":  rank_chg_out  if rank_chg_out  else (_saved_prev.get("rank_chg")  or []),
+                    "rank_vol":  rank_vol_out  if rank_vol_out  else (_saved_prev.get("rank_vol")  or []),
+                    "rank_view": rank_view_out if rank_view_out else (_saved_prev.get("rank_view") or []),
                 })
             except Exception:
                 pass
