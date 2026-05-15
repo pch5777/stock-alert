@@ -30557,21 +30557,6 @@ def _flask_api_stream():
 def _flask_health():
     return "ok", 200
 
-# v177.3: 진단용 상태파일 다운로드 (토큰 검증, 비공개 경로)
-@_flask_app.route("/_internal/dump-state-9k7p2x4m")
-def _flask_dump_state():
-    from flask import request as _req, abort as _abort
-    expected = os.environ.get("STATE_DUMP_TOKEN", "")
-    if not expected or _req.args.get("token", "") != expected:
-        _abort(404)
-    fname = _req.args.get("f", "signal_log.json")
-    if fname not in ("signal_log.json", "dynamic_params.json", "auto_tune_log.json", "early_detect_log.json"):
-        _abort(404)
-    path = _state_path(fname)
-    if not os.path.isfile(path):
-        _abort(404)
-    return _send_file(path, as_attachment=True, download_name=fname, mimetype="application/json")
-
 def _start_flask_server() -> None:
     """Flask를 daemon 스레드로 실행 — 봇 메인루프 블로킹 없음"""
     port = int(os.environ.get("PORT", 8080))
