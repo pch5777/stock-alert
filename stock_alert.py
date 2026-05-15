@@ -34768,7 +34768,8 @@ def _resolve_general_a_cut(signal_type: str, score: int, change_rate: float = 0.
                 _cr_a = float(change_rate or 0.0)
             except Exception:
                 _cr_a = 0.0
-            if int(score or 0) >= 65 and _cr_a >= 3.0:
+            # v177.5: change_rate 3.0% → 2.0% 완화 (SK하이닉스 +9.3% 등 +2~3% 초기 상승 진입 가능)
+            if int(score or 0) >= 65 and _cr_a >= 2.0:
                 a_cut = min(a_cut, 65)
                 if reasons is not None and isinstance(reasons, list):
                     reasons.append("🌅 장 초반 30분 A-cut 완화 (65)")
