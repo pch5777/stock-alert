@@ -5313,60 +5313,55 @@ def _fetch_major_investor_sector_flow() -> dict:
         _log_info_msg("  💰 메이저수급 API 오늘 비활성(연속 오류) → 스킵")
         return dict(_major_inv_sector_cache) if _major_inv_sector_cache.get("ts") else {"top_sectors": {"institution": [], "foreign": [], "both": []}}
 
-    # v165.38 [C]: 기관·외국인만 수집 (개인 제외) — 최대 4회 호출
-    investor_map = {"institution": "3", "foreign": "2"}
-    market_map   = {"J": "코스피", "Q": "코스닥"}
+    # v177.0: KIS 공식 스펙 교정 — FHPTJ04400000 (foreign-institution-total).
+    # 규격서: 국내주식-037. URL/TR_ID/파라미터를 공식 문서대로 교체.
+    # FID_ETC_CLS_CODE: 1=외국인, 2=기관계. 시장은 한 호출에 전체(0000) 포함 → 외인/기관 2회 호출.
+    investor_map = {"foreign": "1", "institution": "2"}
 
     sector_counts: dict[str, dict[str, int]] = {k: {} for k in investor_map}
     total_errors = 0
 
-    for inv_key, blng_code in investor_map.items():
-        for mkt_code in ("J", "Q"):
-            try:
-                data = _safe_get(
-                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/investor",
-                    "FHKST03030100",
-                    {
-                        "FID_COND_MRKT_DIV_CODE":  mkt_code,
-                        "FID_COND_SCR_DIV_CODE":   "20176",
-                        "FID_INPUT_ISCD":          "0000",
-                        "FID_DIV_CLS_CODE":        "0",
-                        "FID_BLNG_CLS_CODE":       blng_code,
-                        "FID_ETC_CLS_CODE":        "0",
-                        "FID_RANK_SORT_CLS_CODE":  "0",
-                        "FID_INPUT_CNT_1":         "30",
-                    },
-                )
-                items = data.get("output") or []
-                if not items:
-                    total_errors += 1
-                    if total_errors >= 2:  # v165.38: 2회 연속 빈 응답 → 오늘 비활성
-                        _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": "empty_output"})
-                        _log_warn_msg("⚠️ FHKST03030100 연속 빈 응답 → 오늘 비활성 처리")
-                        break
-                    continue
-                for item in items:
-                    code = normalize_stock_code(item.get("mksc_shrn_iscd", "") or "")
-                    if not code:
-                        continue
-                    try:
-                        theme_name, _, _ = get_theme_sector_stocks(code)
-                    except Exception:
-                        theme_name = "기타업종"
-                    if not theme_name or theme_name in ("기타업종", "기타", ""):
-                        continue
-                    sector_counts[inv_key][theme_name] = sector_counts[inv_key].get(theme_name, 0) + 1
-            except Exception as e:
+    for inv_key, etc_cls in investor_map.items():
+        try:
+            data = _safe_get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+                "FHPTJ04400000",
+                {
+                    "FID_COND_MRKT_DIV_CODE":  "V",
+                    "FID_COND_SCR_DIV_CODE":   "16449",
+                    "FID_INPUT_ISCD":          "0000",
+                    "FID_DIV_CLS_CODE":        "0",
+                    "FID_RANK_SORT_CLS_CODE":  "0",
+                    "FID_ETC_CLS_CODE":        etc_cls,
+                },
+            )
+            items = data.get("Output") or data.get("output") or []
+            if not items:
                 total_errors += 1
-                _swallow_exception(e)
-                if total_errors >= 2:  # v165.38: 2회 연속 예외 → 오늘 비활성
-                    _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": str(type(e).__name__)})
-                    _log_warn_msg(f"⚠️ FHKST03030100 연속 오류({type(e).__name__}) → 오늘 비활성 처리")
+                if total_errors >= 2:
+                    _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": "empty_output"})
+                    _log_warn_msg("⚠️ FHPTJ04400000 연속 빈 응답 → 오늘 비활성 처리")
                     break
-            time.sleep(0.15)  # KIS API 호출 간격
-        else:
-            continue
-        break  # 내부 break → 외부 for도 중단
+                continue
+            for item in items:
+                code = normalize_stock_code(item.get("mksc_shrn_iscd", "") or "")
+                if not code:
+                    continue
+                try:
+                    theme_name, _, _ = get_theme_sector_stocks(code)
+                except Exception:
+                    theme_name = "기타업종"
+                if not theme_name or theme_name in ("기타업종", "기타", ""):
+                    continue
+                sector_counts[inv_key][theme_name] = sector_counts[inv_key].get(theme_name, 0) + 1
+        except Exception as e:
+            total_errors += 1
+            _swallow_exception(e)
+            if total_errors >= 2:
+                _runtime_state_set(_disable_key, {"date": _now_kst().date().isoformat(), "reason": str(type(e).__name__)})
+                _log_warn_msg(f"⚠️ FHPTJ04400000 연속 오류({type(e).__name__}) → 오늘 비활성 처리")
+                break
+        time.sleep(0.15)  # KIS API 호출 간격
 
     # 상위 3 섹터 추출
     def _top3(d: dict) -> list:
