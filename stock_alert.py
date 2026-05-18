@@ -3,10 +3,11 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.1
-날짜: 2026-05-15
+버전: v177.2
+날짜: 2026-05-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.2 (2026-05-18): 5/18 운영 결과 버그수정 4종 (NXT/KRX burst threaded, get_fluctuation_rank 캐시, ETF 섹터 제외, dtFmt HH:MM:SS 분기)
 - v177.1 (2026-05-15): SyntaxWarning 노이즈 제거 + 장마감 예상체결가 재구현 + 예상체결지수 추이 신규
   배경: v177.0 후속 — 사용자 권고사항 일괄 정리.
         - 부팅 시 SyntaxWarning 노이즈 (모듈 docstring 내 정규식 예시 backslash d)
@@ -9595,6 +9596,7 @@ _SECTOR_EXCLUDE_PATTERNS = (
     _re.compile(r'Nikkei|S&P|다우|Dow|Index|지수', _re.IGNORECASE),
     _re.compile(r'KRX\s*금'),
     _re.compile(r'예측|비중상한|가치저변동성|중소형주|방어소비재|고배당'),
+    _re.compile(r'^ETF\b|ETF\('),                                  # v177.2: ETF(실물복제/수익증권) 등 ETF 업종명 제외
 )
 def _is_excluded_sector_name(name: str) -> bool:
     """KIS 응답 섹터명에서 지수/파생/레버리지/TR/F-K200 등을 거른다."""
@@ -17685,12 +17687,24 @@ def get_near_new_highlow_rank(high: bool = True) -> list:
         return []
 
 
+# v177.2: get_fluctuation_rank 캐시 (08:13 empty_output 후 종일 rk_chg=0 사고 방지)
+_fluctuation_rank_cache: dict = {}
+_fluctuation_rank_cache_ts: dict = {}
+_FLUCTUATION_RANK_CACHE_TTL = 60
+
 def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
     """v167.0: 등락률 순위 (FHPST01700000).
     규격서: v1_국내주식-088
     sort: 0=상승률순, 1=하락률순
     반환: [{"code","name","price","change_rate","volume_ratio"}, ...]
+    v177.2: 60초 캐시 + 빈 응답/예외 시 이전 캐시 재사용.
     """
+    cache_key = (market, sort)
+    now = time.time()
+    cached_items = _fluctuation_rank_cache.get(cache_key)
+    cached_ts = _fluctuation_rank_cache_ts.get(cache_key, 0)
+    if cached_items and (now - cached_ts) < _FLUCTUATION_RANK_CACHE_TTL:
+        return cached_items
     try:
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation",
@@ -17712,6 +17726,8 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
             },
         )
         if not isinstance(data, dict):  # v168.0: dict guard
+            if cached_items:
+                return cached_items  # v177.2: 빈 응답 → 이전 캐시 재사용
             return []
         items = []
         for i in (data.get("output") or []):
@@ -17728,9 +17744,17 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "volume_ratio": safe_float(i.get("vol_inrt") or 0, 0.0),
                 "market": "KRX" if market == "J" else "NXT",
             })
+        if not items:
+            if cached_items:
+                return cached_items  # v177.2: 빈 items → 이전 캐시 재사용
+            return []
+        _fluctuation_rank_cache[cache_key] = items  # v177.2: 캐시 갱신
+        _fluctuation_rank_cache_ts[cache_key] = now
         return items
     except Exception as e:
         _swallow_exception(e)
+        if cached_items:
+            return cached_items  # v177.2: 예외 시도 이전 캐시 재사용
         return []
 
 
@@ -30348,7 +30372,7 @@ function renderCapture(){
       }
       const eClr=s.hit?"#00d97e":"#eef4fa";
       // 포착시간/도달시간 표시
-      const dtFmt=ts=>{if(!ts)return"";const t=ts.includes(" ")?ts.split(" "):[ts.slice(0,10),ts.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
+      const dtFmt=ts=>{if(!ts)return"";const s=String(ts).trim();if(/^\d{2}:\d{2}(:\d{2})?$/.test(s))return s.slice(0,5);const t=s.includes(" ")?s.split(" "):[s.slice(0,10),s.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
       const fmtDate=d=>{if(!d)return"";const v=String(d).trim();return v.length===8?v.slice(4,6)+"/"+v.slice(6,8):v.length>=10?v.slice(5,10):v;};
       const capTs=s.detect_date?(fmtDate(s.detect_date)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():s.detect_time?(s.detect_time||"").slice(0,5):"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
@@ -44207,9 +44231,9 @@ if __name__ == "__main__":
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
     schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
     schedule.every(30).seconds.do(_leader_job(_run_surge_velocity_scan))  # v165.43: 경량 급등 감지 스캔 (거래량폭증+등락률 복합)
-    schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_premarket_burst_scan))
+    schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_nxt_premarket_burst_scan))
     schedule.every(NXT_AFTERMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_aftermarket_burst_scan))  # v165.26: NXT 애프터마켓 burst
-    schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_krx_open_burst_scan))
+    schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_krx_open_burst_scan))
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_material_first_scan))
     schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
