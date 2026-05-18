@@ -3,10 +3,11 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.4
+버전: v177.5
 날짜: 2026-05-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.5 (2026-05-18): NXT 시간대 대시보드 원천 수정 (#G1: get_stock_price NXT 분기로 sectors/rank_chg/rank_view 일괄 NXT 반영 / #G2: get_nxt_stock_price acml_tr_pbmn 거래대금 필드 추가 / #G3: rank_chg_out NXT일때 _rank_api_fallback 우회 → get_nxt_surge_stocks 정렬본 사용 / #G4: rank_vol_out NXT 행에 NX 시세로 거래대금 보완)
 - v177.4 (2026-05-18): NXT 등락률 실데이터 fetch + rank_chg_out 거래량/거래대금 보완 (#F: 17086 NXT 포함, _kis_mkt NX 매핑 / #E: 30090 get_stock_price() 단발 시세)
 - v177.3 (2026-05-18): 5/18 이후 결함 수정 4종 (dtFmt 백슬래시 이스케이프, rank_chg_out fallback 연결, rank_view_out 누락 종목 시세 보완, dtFmt 12/14자리 숫자 포맷 추가)
 - v177.2 (2026-05-18): 5/18 운영 결과 버그수정 4종 (NXT/KRX burst threaded, get_fluctuation_rank 캐시, ETF 섹터 제외, dtFmt HH:MM:SS 분기)
@@ -16496,6 +16497,16 @@ def send_mid_pullback_alert(s: dict):
 # 주가 조회
 # ============================================================
 def get_stock_price(code: str) -> dict:
+    # v177.5 #G1: NXT 단독 운영시간(KRX 마감 + NXT 개장)이면 NX 마켓 호출.
+    # sectors_raw / rank_chg_out / rank_view_out 보완 호출이 모두 이 함수를 거치므로
+    # 함수 한 곳에서만 분기하면 대시보드 전체가 NXT 실시간 데이터로 일관됨.
+    try:
+        if is_nxt_open() and (not is_market_open()) and _is_nxt_eligible(code):
+            _nx = get_nxt_stock_price(code)
+            if _nx:
+                return _nx
+    except Exception as _nxe:
+        _swallow_exception(_nxe, "get_stock_price:nxt_branch")
     url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
     params = {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code}
     data   = _safe_get(url, "FHKST01010100", params)
@@ -18794,6 +18805,7 @@ def get_nxt_stock_price(code: str) -> dict:
         "price": price, "change_rate": float(o.get("prdy_ctrt",0)),
         "volume_ratio": float(o.get("vol_inrt",0) or 0),
         "today_vol": int(o.get("acml_vol",0)),
+        "acml_tr_pbmn": int(o.get("acml_tr_pbmn",0) or 0),  # v177.5 #G2: NXT 거래대금 필드 추가
         "ask_qty": int(o.get("askp_rsqn1",0) or 0),
         "bid_qty": int(o.get("bidp_rsqn1",0) or 0),
         "ask_price": int(o.get("askp1",0) or 0),
@@ -30081,11 +30093,19 @@ def _push_dashboard_json() -> None:
         rank_chg_out = []
         try:
             _fl_items = get_fluctuation_rank(_kis_market, "0") or []
-            # v177.3: KIS 등락률 API 비활성/empty 시 _rank_api_fallback 결합본(naver_rise+거래대금+fluctuation 보강) 사용
-            if not _fl_items:
+            # v177.5 #G3: NXT 단독 운영시간엔 KRX 기반 _rank_api_fallback(naver_rise 등)을 우회.
+            # NX 등락률 응답이 비면 get_nxt_surge_stocks() 결과를 change_rate 정렬해 NXT 실데이터로 채움.
+            if not _fl_items and _nxt_only:
                 try:
-                    _market_label = "NXT" if _kis_market == "NX" else "KRX"
-                    _fb_items = _rank_api_fallback(_get_rank_api_disable_reason() or "empty_output", market=_market_label) or []
+                    _nxv = get_nxt_surge_stocks() or []
+                    _nxv.sort(key=lambda _r: float(_r.get("change_rate", 0) or 0), reverse=True)
+                    _fl_items = _nxv
+                except Exception as _nxfb:
+                    _swallow_exception(_nxfb, "rank_chg_nxt_fallback")
+            # v177.3: KIS 등락률 API 비활성/empty 시 _rank_api_fallback 결합본(naver_rise+거래대금+fluctuation 보강) 사용 (KRX 전용)
+            if not _fl_items and not _nxt_only:
+                try:
+                    _fb_items = _rank_api_fallback(_get_rank_api_disable_reason() or "empty_output", market="KRX") or []
                     _fb_items.sort(key=lambda _r: float(_r.get("change_rate", 0) or 0), reverse=True)
                     _fl_items = _fb_items
                 except Exception as _fb1:
@@ -30129,6 +30149,20 @@ def _push_dashboard_json() -> None:
             rank_vol_out = _rank_filter_and_format(_vs, "change_rate", "today_vol", "trade_amount", "code", "name")
             rank_vol_out.sort(key=lambda x: -x["vol_raw"])
             rank_vol_out = rank_vol_out[:30]
+            # v177.5 #G4: NXT 운영시간엔 get_nxt_surge_stocks 응답에 acml_tr_pbmn 없음 → NX 시세로 거래대금 보완.
+            if _nxt_only:
+                for _row in rank_vol_out:
+                    if _row["amt_raw"] == 0:
+                        try:
+                            _q = get_nxt_stock_price(_row["code"]) or {}
+                            if _q:
+                                _row["amt_raw"] = safe_int(_q.get("acml_tr_pbmn") or 0)
+                                _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+                                if _row["vol_raw"] == 0:
+                                    _row["vol_raw"] = safe_int(_q.get("today_vol") or 0)
+                                    _row["vol"] = _fmt_vol(_row["vol_raw"]) if _row["vol_raw"] > 0 else "--"
+                        except Exception as _rvq:
+                            _swallow_exception(_rvq, "rank_vol_nxt_amt_fill")
         except Exception as _re2:
             _swallow_exception(_re2, "rank_vol_kis")
 
