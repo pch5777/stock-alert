@@ -3,10 +3,11 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.3
+버전: v177.4
 날짜: 2026-05-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.4 (2026-05-18): NXT 등락률 실데이터 fetch + rank_chg_out 거래량/거래대금 보완 (#F: 17086 NXT 포함, _kis_mkt NX 매핑 / #E: 30090 get_stock_price() 단발 시세)
 - v177.3 (2026-05-18): 5/18 이후 결함 수정 4종 (dtFmt 백슬래시 이스케이프, rank_chg_out fallback 연결, rank_view_out 누락 종목 시세 보완, dtFmt 12/14자리 숫자 포맷 추가)
 - v177.2 (2026-05-18): 5/18 운영 결과 버그수정 4종 (NXT/KRX burst threaded, get_fluctuation_rank 캐시, ETF 섹터 제외, dtFmt HH:MM:SS 분기)
 - v177.1 (2026-05-15): SyntaxWarning 노이즈 제거 + 장마감 예상체결가 재구현 + 예상체결지수 추이 신규
@@ -17083,9 +17084,11 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
     # v168.0: rank API 비활성 시 KIS 등락률순위(FHPST01700000) 직접 보완
     # 목적: naver_rise 134건 한계 → KIS get_fluctuation_rank로 상승률 상위 누락 보완
     # (폴라리스AI/와이씨켐 등 naver 미포함 급등 종목 포착률↑)
-    if market in ("KRX", "J") and is_any_market_open():
+    # v177.4: NXT도 등락률 보완 대상에 포함 + market에 따라 KIS 시장코드 자동 매핑
+    if market in ("KRX", "J", "NXT") and is_any_market_open():
         try:
-            fluc_items = get_fluctuation_rank(market="J", sort="0")
+            _kis_mkt = "NX" if market == "NXT" else "J"   # v177.4: NXT일 때 NX 마켓 호출
+            fluc_items = get_fluctuation_rank(market=_kis_mkt, sort="0")
             existing_codes = {normalize_stock_code(r.get("code")) for r in items}
             added_fluc = 0
             for r in fluc_items:
@@ -17096,7 +17099,7 @@ def _rank_api_fallback(reason: str, *, status=None, ct=None, body=None, market: 
                     existing_codes.add(code)
                     added_fluc += 1
             if added_fluc:
-                _log_info_msg(f"  📈 [fluctuation_rank 보완] KIS등락률순위 {added_fluc}건 추가")
+                _log_info_msg(f"  📈 [fluctuation_rank 보완] KIS등락률순위[{market}] {added_fluc}건 추가")
         except Exception as _fluc_e:
             _swallow_exception(_fluc_e)
     return items
@@ -30100,6 +30103,19 @@ def _push_dashboard_json() -> None:
                         if _row["amt_raw"] == 0:
                             _row["amt_raw"] = safe_int(_sn.get("acml_tr_pbmn") or 0)
                             _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+                    # v177.4: _execution_snapshots 미보유 종목 → KIS 단발 시세로 보완 (fallback 종목 거래량/거래대금 빈 칸 채움)
+                    if _row["vol_raw"] == 0 or _row["amt_raw"] == 0:
+                        try:
+                            _q = get_stock_price(_row["code"]) or {}
+                            if _q:
+                                if _row["vol_raw"] == 0:
+                                    _row["vol_raw"] = safe_int(_q.get("today_vol") or 0)
+                                    _row["vol"] = _fmt_vol(_row["vol_raw"]) if _row["vol_raw"] > 0 else "--"
+                                if _row["amt_raw"] == 0:
+                                    _row["amt_raw"] = safe_int(_q.get("acml_tr_pbmn") or 0)
+                                    _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+                        except Exception as _rcq:
+                            _swallow_exception(_rcq, "rank_chg_quote_fill")
         except Exception as _re1:
             _swallow_exception(_re1, "rank_chg_kis")
 
