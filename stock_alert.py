@@ -3,10 +3,11 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.2
+버전: v177.3
 날짜: 2026-05-18
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.3 (2026-05-18): 5/18 이후 결함 수정 4종 (dtFmt 백슬래시 이스케이프, rank_chg_out fallback 연결, rank_view_out 누락 종목 시세 보완, dtFmt 12/14자리 숫자 포맷 추가)
 - v177.2 (2026-05-18): 5/18 운영 결과 버그수정 4종 (NXT/KRX burst threaded, get_fluctuation_rank 캐시, ETF 섹터 제외, dtFmt HH:MM:SS 분기)
 - v177.1 (2026-05-15): SyntaxWarning 노이즈 제거 + 장마감 예상체결가 재구현 + 예상체결지수 추이 신규
   배경: v177.0 후속 — 사용자 권고사항 일괄 정리.
@@ -30077,6 +30078,15 @@ def _push_dashboard_json() -> None:
         rank_chg_out = []
         try:
             _fl_items = get_fluctuation_rank(_kis_market, "0") or []
+            # v177.3: KIS 등락률 API 비활성/empty 시 _rank_api_fallback 결합본(naver_rise+거래대금+fluctuation 보강) 사용
+            if not _fl_items:
+                try:
+                    _market_label = "NXT" if _kis_market == "NX" else "KRX"
+                    _fb_items = _rank_api_fallback(_get_rank_api_disable_reason() or "empty_output", market=_market_label) or []
+                    _fb_items.sort(key=lambda _r: float(_r.get("change_rate", 0) or 0), reverse=True)
+                    _fl_items = _fb_items
+                except Exception as _fb1:
+                    _swallow_exception(_fb1, "rank_chg_fallback")
             rank_chg_out = _rank_filter_and_format(_fl_items, "change_rate", "today_vol", "trade_amount", "code", "name")[:30]
             # KIS 등락률 응답은 vol/amt 없음 -> _execution_snapshots에서 보완
             for _row in rank_chg_out:
@@ -30125,6 +30135,21 @@ def _push_dashboard_json() -> None:
                         if _row["amt_raw"] == 0:
                             _row["amt_raw"] = safe_int(_sn.get("acml_tr_pbmn") or 0)
                             _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+                    # v177.3: _execution_snapshots 미보유 종목 → KIS 단발 시세로 보완 (조회수 상위 6위 이후 누락 케이스)
+                    if _row["chg"] == 0.0 or _row["vol_raw"] == 0 or _row["amt_raw"] == 0:
+                        try:
+                            _q = get_stock_price(_row["code"]) or {}
+                            if _q:
+                                if _row["chg"] == 0.0:
+                                    _row["chg"] = float(safe_float(_q.get("change_rate") or 0, 0.0))
+                                if _row["vol_raw"] == 0:
+                                    _row["vol_raw"] = safe_int(_q.get("today_vol") or 0)
+                                    _row["vol"] = _fmt_vol(_row["vol_raw"]) if _row["vol_raw"] > 0 else "--"
+                                if _row["amt_raw"] == 0:
+                                    _row["amt_raw"] = safe_int(_q.get("acml_tr_pbmn") or 0)
+                                    _row["amt"] = _fmt_amt(_row["amt_raw"]) if _row["amt_raw"] > 0 else "--"
+                        except Exception as _rvq:
+                            _swallow_exception(_rvq, "rank_view_quote_fill")
         except Exception as _re3:
             _swallow_exception(_re3, "rank_view_kis")
 
@@ -30372,7 +30397,7 @@ function renderCapture(){
       }
       const eClr=s.hit?"#00d97e":"#eef4fa";
       // 포착시간/도달시간 표시
-      const dtFmt=ts=>{if(!ts)return"";const s=String(ts).trim();if(/^\d{2}:\d{2}(:\d{2})?$/.test(s))return s.slice(0,5);const t=s.includes(" ")?s.split(" "):[s.slice(0,10),s.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
+      const dtFmt=ts=>{if(!ts)return"";const s=String(ts).trim();if(/^\\d{2}:\\d{2}(:\\d{2})?$/.test(s))return s.slice(0,5);if(/^\\d{12}$/.test(s))return s.slice(4,6)+"-"+s.slice(6,8)+" "+s.slice(8,10)+":"+s.slice(10,12);if(/^\\d{14}$/.test(s))return s.slice(4,6)+"-"+s.slice(6,8)+" "+s.slice(8,10)+":"+s.slice(10,12);const t=s.includes(" ")?s.split(" "):[s.slice(0,10),s.slice(11,16)||""];return(t[0]||"").slice(5)+(t[1]?" "+(t[1]||"").slice(0,5):"");};
       const fmtDate=d=>{if(!d)return"";const v=String(d).trim();return v.length===8?v.slice(4,6)+"/"+v.slice(6,8):v.length>=10?v.slice(5,10):v;};
       const capTs=s.detect_date?(fmtDate(s.detect_date)+(s.detect_time?" "+(s.detect_time||"").slice(0,5):"")).trim():s.detect_time?(s.detect_time||"").slice(0,5):"";
       const hitTs=s.hit&&s.hit_time?dtFmt(s.hit_time):"";
