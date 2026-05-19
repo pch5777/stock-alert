@@ -3,10 +3,16 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.5
-날짜: 2026-05-18
+버전: v177.7
+날짜: 2026-05-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.7 (2026-05-19): KIS 등락률 API 규격서 일치 + ETF/우선주 필터 강화
+    #H: get_fluctuation_rank 파라미터 — fid_prc_cls_code 0→1(저가대비→종가대비, HTS 일치) / fid_vol_cnt "10000"→"" / fid_rsfl_rate1 "2"→"" (규격서 권장 전체)
+    #I: _RANK_EXCLUDE_MARKERS — PLUS/KIWOOM/RISE/WOORI/NH/KOACT/FOCUS/TIMEFOLIO 8개 ETF 발행사 추가
+    #J: 종목명 대문자 비교 + 우선주명 패턴 확장(우B/우C/우(전환))
+    #K: 섹터 빌더 폴백 — ETF/ETN/선물/옵션/스팩/수익증권/상장지수/관리종목/투자경고/투자위험/단기과열 11개 섹터 차단 + 종목명 우선주/ETF 필터
+- v177.6 (2026-05-19): 진단용 rank_chg KIS raw 응답 dump 추가 (#D: 5분 throttle로 _fl_items 상위 10건 로그 출력 — HTS와 대시보드 등락률 순위 차이 추적용)
 - v177.5 (2026-05-18): NXT 시간대 대시보드 원천 수정 (#G1: get_stock_price NXT 분기로 sectors/rank_chg/rank_view 일괄 NXT 반영 / #G2: get_nxt_stock_price acml_tr_pbmn 거래대금 필드 추가 / #G3: rank_chg_out NXT일때 _rank_api_fallback 우회 → get_nxt_surge_stocks 정렬본 사용 / #G4: rank_vol_out NXT 행에 NX 시세로 거래대금 보완)
 - v177.4 (2026-05-18): NXT 등락률 실데이터 fetch + rank_chg_out 거래량/거래대금 보완 (#F: 17086 NXT 포함, _kis_mkt NX 매핑 / #E: 30090 get_stock_price() 단발 시세)
 - v177.3 (2026-05-18): 5/18 이후 결함 수정 4종 (dtFmt 백슬래시 이스케이프, rank_chg_out fallback 연결, rank_view_out 누락 종목 시세 보완, dtFmt 12/14자리 숫자 포맷 추가)
@@ -17731,13 +17737,13 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "fid_input_iscd": "0000",
                 "fid_rank_sort_cls_code": sort,
                 "fid_input_cnt_1": "0",
-                "fid_prc_cls_code": "0",
+                "fid_prc_cls_code": "1",    # v177.7 #H: 0(저가대비)→1(종가대비) — HTS 등락률 순위와 일치
                 "fid_input_price_1": "", "fid_input_price_2": "",
-                "fid_vol_cnt": "10000",
+                "fid_vol_cnt": "",          # v177.7 #H: 10000→"" — 거래량 필터 제거 (규격서 권장 전체)
                 "fid_trgt_cls_code": "0",
                 "fid_trgt_exls_cls_code": "0",
                 "fid_div_cls_code": "0",
-                "fid_rsfl_rate1": "2",      # 2% 이상 상승만
+                "fid_rsfl_rate1": "",       # v177.7 #H: "2"→"" — 등락률 필터 제거 (규격서 권장 전체)
             },
         )
         if not isinstance(data, dict):  # v168.0: dict guard
@@ -29951,12 +29957,18 @@ def _push_dashboard_json() -> None:
                     except Exception as _e:
                         _swallow_exception(_e, "_push_dashboard_json:exchange_secondary")
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
+                # v177.7 #K: ETF/선물/옵션/스팩/관리종목 섹터 + 우선주 종목명 차단
+                _SECTOR_EXCLUDE_PAT = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
                 if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
                     for code, buf in list(_execution_snapshots.items()):
                         if not buf: continue
                         snap = buf[-1]
                         sec_name = (_sector_cache.get(code) or {}).get("sector") or "기타"
+                        if any(p in sec_name for p in _SECTOR_EXCLUDE_PAT): continue
+                        _sn_name = _resolve_stock_name(code, "")
+                        if _re.search(r'우[B\dC]*(\(전환\))?$', _sn_name): continue
+                        if any(m.upper() in _sn_name.upper() for m in _RANK_EXCLUDE_MARKERS): continue
                         chg_v = float(snap.get("change_rate") or 0)
                         if sec_name not in snap_groups:
                             snap_groups[sec_name] = {"chg_sum": 0, "cnt": 0, "stocks": []}
@@ -30059,7 +30071,8 @@ def _push_dashboard_json() -> None:
         # NXT 시간대(KRX 마감 + NXT 운영)에는 NX 시장 소스 사용
         rank_base = []  # legacy 호환 (캐시 빈 폴백용)
         rank_date_str = datetime.now().strftime("%m-%d %H:%M")
-        _RANK_EXCLUDE_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
+        # v177.7 #I: ETF 발행사 마커 + 우선주 + 신주인수권 패턴 강화
+        _RANK_EXCLUDE_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","PLUS","KIWOOM","RISE","WOORI","NH","KOACT","FOCUS","TIMEFOLIO","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
         import re as _re
         _nxt_only = is_nxt_open() and (not is_market_open())  # KRX 마감 + NXT 운영
         _kis_market = "NX" if _nxt_only else "J"
@@ -30071,8 +30084,10 @@ def _push_dashboard_json() -> None:
                 _c = str(it.get(key_code) or "").strip()
                 if not _c or len(_c) != 6: continue
                 _n = _resolve_stock_name(_c, str(it.get(key_name) or ""))
-                if any(m in _n for m in _RANK_EXCLUDE_MARKERS): continue
-                if _re.search(r'우[B\d]*$', _n): continue
+                # v177.7 #J: 대문자 비교(소문자 ETF명도 차단) + 우선주명 패턴 확장(우B/우C/우(전환))
+                _n_up = _n.upper()
+                if any(m.upper() in _n_up for m in _RANK_EXCLUDE_MARKERS): continue
+                if _re.search(r'우[B\dC]*(\(전환\))?$', _n): continue
                 _chg = safe_float(it.get(key_chg) or 0, 0.0)
                 # v176.6: 신규 상장 첫날 종목 제외 (등락률 > 50% = 공모가 기준 따따상 종목).
                 # 일반 종목 상한가는 +30% 한도이므로 50% 임계는 신규 상장 식별에 안전.
@@ -30110,6 +30125,20 @@ def _push_dashboard_json() -> None:
                     _fl_items = _fb_items
                 except Exception as _fb1:
                     _swallow_exception(_fb1, "rank_chg_fallback")
+            # v177.6 #D: rank_chg 진단용 raw dump (5분 throttle). HTS vs 대시보드 순위 차이 추적.
+            try:
+                _now_ts = time.time()
+                _last_dump = safe_float(_BURST_SCAN_STATE.get("rank_chg_dump_ts", 0.0), 0.0)
+                if _now_ts - _last_dump >= 300:
+                    _BURST_SCAN_STATE["rank_chg_dump_ts"] = _now_ts
+                    _top10 = []
+                    for _it in (_fl_items or [])[:10]:
+                        if not isinstance(_it, dict):
+                            continue
+                        _top10.append(f"{_it.get('name','?')}({_it.get('code','?')}){float(_it.get('change_rate',0) or 0):+.2f}%")
+                    _log_info_msg(f"  📊 rank_chg raw[{_kis_market}] {len(_fl_items)}건 top10: {' | '.join(_top10)}")
+            except Exception as _du:
+                _swallow_exception(_du, "rank_chg_dump")
             rank_chg_out = _rank_filter_and_format(_fl_items, "change_rate", "today_vol", "trade_amount", "code", "name")[:30]
             # KIS 등락률 응답은 vol/amt 없음 -> _execution_snapshots에서 보완
             for _row in rank_chg_out:
