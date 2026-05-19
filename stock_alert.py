@@ -3,10 +3,16 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.7
+버전: v177.8
 날짜: 2026-05-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.8 (2026-05-19): KIS API 파라미터 HTS 일치 + 우선주/ETF 섹터 완전 차단 + 도달시간 signal_log 폴백
+    #L: get_volume_surge_stocks FHPST01710000 — FID_DIV_CLS_CODE 0→1(보통주), FID_TRGT_EXLS_CLS_CODE "000000"→"1111111111"(HTS 조회대상제외 10개 비트 일치), FID_INPUT_PRICE_1 "1000"→""
+    #M: get_fluctuation_rank FHPST01700000 — fid_div_cls_code 0→1(보통주), fid_trgt_exls_cls_code 0→"1111111111", fid_trgt_cls_code 0→"111111111" (FHPST01710000 컨벤션 적용)
+    #N: _rank_filter_and_format 우선주 정규식 강화 — 후행 공백/특수문자 허용 + KOSPI 코드 끝자리 5/7/9 보조 차단
+    #O: captured_raw hit_time signal_log 폴백 — _entry_watch.entry_hit_time 빈 경우 signal_log code→hit_time index 참조
+    #P: _build_realtime_sectors_from_kis ETF/선물/스팩/관리종목 sector 차단 + leader/follower 종목명 ETF/우선주 진입 차단
 - v177.7 (2026-05-19): KIS 등락률 API 규격서 일치 + ETF/우선주 필터 강화
     #H: get_fluctuation_rank 파라미터 — fid_prc_cls_code 0→1(저가대비→종가대비, HTS 일치) / fid_vol_cnt "10000"→"" / fid_rsfl_rate1 "2"→"" (규격서 권장 전체)
     #I: _RANK_EXCLUDE_MARKERS — PLUS/KIWOOM/RISE/WOORI/NH/KOACT/FOCUS/TIMEFOLIO 8개 ETF 발행사 추가
@@ -17207,8 +17213,9 @@ def get_volume_surge_stocks() -> list:
     data = _safe_get(f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank",
                      "FHPST01710000", {
         "FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171","FID_INPUT_ISCD":"0000",
-        "FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111",
-        "FID_TRGT_EXLS_CLS_CODE":"000000","FID_INPUT_PRICE_1":"1000",
+        # v177.8 #L: DIV=1(보통주), EXLS=1111111111(HTS 일치: 투자위험/관리/정리/불성실/우선주/거래정지/ETF/ETN/신용불가/SPAC), PRICE 필터 제거
+        "FID_DIV_CLS_CODE":"1","FID_BLNG_CLS_CODE":"0","FID_TRGT_CLS_CODE":"111111111",
+        "FID_TRGT_EXLS_CLS_CODE":"1111111111","FID_INPUT_PRICE_1":"",
         "FID_INPUT_PRICE_2":"","FID_VOL_CNT":str(request_count),"FID_INPUT_DATE_1":"",
     })
     items = [_normalize_rank_candidate_item(i, "KRX", "KIS거래량")
@@ -17740,9 +17747,10 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "fid_prc_cls_code": "1",    # v177.7 #H: 0(저가대비)→1(종가대비) — HTS 등락률 순위와 일치
                 "fid_input_price_1": "", "fid_input_price_2": "",
                 "fid_vol_cnt": "",          # v177.7 #H: 10000→"" — 거래량 필터 제거 (규격서 권장 전체)
-                "fid_trgt_cls_code": "0",
-                "fid_trgt_exls_cls_code": "0",
-                "fid_div_cls_code": "0",
+                # v177.8 #M: FHPST01710000 컨벤션 적용 — 보통주만 + HTS 조회대상제외 10자리 비트 일치
+                "fid_trgt_cls_code": "111111111",
+                "fid_trgt_exls_cls_code": "1111111111",
+                "fid_div_cls_code": "1",
                 "fid_rsfl_rate1": "",       # v177.7 #H: "2"→"" — 등락률 필터 제거 (규격서 권장 전체)
             },
         )
@@ -29996,6 +30004,19 @@ def _push_dashboard_json() -> None:
         # ── 포착 목록 (_entry_watch 기반 — 텔레그램 /list 동일 소스) v170.0 ──
         captured_raw = []
         _ETF_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스")
+        # v177.8 #O: signal_log 기반 code→hit_time index (현재 push 1회만 빌드)
+        _hit_time_idx: dict = {}
+        try:
+            _slog = _read_json_locked(SIGNAL_LOG_FILE)
+            if isinstance(_slog, dict):
+                for _v in _slog.values():
+                    if not isinstance(_v, dict): continue
+                    _ht = _v.get("entry_hit_time") or _v.get("legacy_entry_hit_time") or ""
+                    _cc = normalize_stock_code(_v.get("code", "") or "")
+                    if _cc and _ht and _ht > _hit_time_idx.get(_cc, ""):
+                        _hit_time_idx[_cc] = _ht
+        except Exception as _hi:
+            _swallow_exception(_hi, "captured_raw:hit_time_index")
         try:
             seen_cap: set = set()
             # ① _entry_watch: 진입가 감시 중 + 진입 도달 후 목표가 추적 중
@@ -30022,6 +30043,10 @@ def _push_dashboard_json() -> None:
                 e_price   = safe_int(watch.get("entry_price") or 0)
                 hit = bool(watch.get("entry_hit")) or (
                     cur_price > 0 and e_price > 0 and cur_price >= e_price)
+                # v177.8 #O: hit_time signal_log 폴백 (watch.entry_hit_time 비었으면 _hit_time_idx 참조)
+                _ht_val = str(watch.get("entry_hit_time") or "")
+                if not _ht_val:
+                    _ht_val = _hit_time_idx.get(code, "")
                 captured_raw.append({
                     "name":         name,
                     "code":         code,
@@ -30034,7 +30059,7 @@ def _push_dashboard_json() -> None:
                     "miss_count":   int(watch.get("miss_count") or 0),
                     "detect_date":  str(watch.get("detect_date") or watch.get("first_detect_date") or ""),
                     "detect_time":  str(watch.get("detect_time") or watch.get("first_detect_time") or ""),
-                    "hit_time":     str(watch.get("entry_hit_time") or ""),
+                    "hit_time":     _ht_val,
                 })
             # ② _detected_stocks: 이월 종목 (entry_price 있으면 포함)
             for code, rec in list((_detected_stocks or {}).items()):
@@ -30046,6 +30071,8 @@ def _push_dashboard_json() -> None:
                 snap = _get_snap(code)
                 # v169.19: 장마감 후 snap 비어도 high_price 폴백
                 d_price = safe_int(snap.get("price") or rec.get("high_price") or 0)
+                # v177.8 #O: _detected_stocks 경로에도 hit_time signal_log 폴백 적용
+                _ht_val2 = str(rec.get("entry_hit_time") or "") or _hit_time_idx.get(code, "")
                 captured_raw.append({
                     "name":       name,
                     "code":       code,
@@ -30058,7 +30085,7 @@ def _push_dashboard_json() -> None:
                     "miss_count": 0,
                     "detect_date": str(rec.get("detect_date") or rec.get("first_detect_date") or ""),
                     "detect_time": str(rec.get("detect_time") or rec.get("first_detect_time") or ""),
-                    "hit_time":    "",
+                    "hit_time":    _ht_val2,
                 })
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
             captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
@@ -30087,7 +30114,9 @@ def _push_dashboard_json() -> None:
                 # v177.7 #J: 대문자 비교(소문자 ETF명도 차단) + 우선주명 패턴 확장(우B/우C/우(전환))
                 _n_up = _n.upper()
                 if any(m.upper() in _n_up for m in _RANK_EXCLUDE_MARKERS): continue
-                if _re.search(r'우[B\dC]*(\(전환\))?$', _n): continue
+                # v177.8 #N: 우선주 정규식 — "우" 뒤 후행 공백/특수문자/마커(NXT 등) 허용 + 종목코드 끝자리 보조 차단
+                if _re.search(r'우(?:[B\dC]+|\(전환\))?(?:\s|$|[^가-힣\w])', _n): continue
+                if _c[-1] in ('5','7','9') and ('우' in _n): continue
                 _chg = safe_float(it.get(key_chg) or 0, 0.0)
                 # v176.6: 신규 상장 첫날 종목 제외 (등락률 > 50% = 공모가 기준 따따상 종목).
                 # 일반 종목 상한가는 +30% 한도이므로 50% 임계는 신규 상장 식별에 안전.
@@ -40729,6 +40758,18 @@ def _build_realtime_sectors_from_kis() -> None:
             # 사용자 요구: "거래소 업종은 실제 주도섹터와 전혀 관련 없다. 진짜 테마만 표시".
             # _kis_exchange_sector_names_cache는 _build_realtime_sectors_from_kis 시작 시 1회 빌드.
             if sec in _kis_exchange_sector_names_cache:
+                continue
+            # v177.8 #P: ETF/선물/옵션/스팩/관리종목/투자경고 등 비매매 섹터 차단
+            if any(_pat in sec for _pat in ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")):
+                continue
+            # v177.8 #P: 종목명 자체가 ETF/우선주면 sector_map 진입 차단 (leader/follower 오염 방지)
+            _nm_up = name.upper()
+            if any(_m.upper() in _nm_up for _m in ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","PLUS","KIWOOM","RISE","WOORI","NH","KOACT","FOCUS","TIMEFOLIO","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")):
+                continue
+            import re as _re_pref
+            if _re_pref.search(r'우(?:[B\dC]+|\(전환\))?(?:\s|$|[^가-힣\w])', name):
+                continue
+            if code[-1] in ('5','7','9') and ('우' in name):
                 continue
             sector_map.setdefault(sec, []).append({
                 "code": code,
