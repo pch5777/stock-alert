@@ -3,10 +3,18 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.8
+버전: v177.10
 날짜: 2026-05-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.10 (2026-05-19): 섹터 게이트 거래소 업종 우회 + ETF 섹터 알람 차단 + 버스트 후보풀 throttle
+    #U: _detect_and_send_sector_breadth_alert ETF/선물/스팩/관리종목 + 거래소 표준 업종 차단 (사용자 v176.5 요구 일관 적용 — market_leader_state.json에 ETF 영구 저장 원인 제거)
+    #V: _apply_scan_sector_gate 거래소 표준 업종(전기·전자/금속/유통/의료·정밀기기 등)은 sector_counts 미증가 — 가온그룹 09:17 "전기·전자 10번째" 차단 같은 오차단 해소. 진짜 테마 종목만 한도 적용.
+    #W: _run_scan_burst_window refresh_dynamic_candidates 60초 throttle — 15초 burst마다 KIS 6개 API 중복 호출 부하 완화. burst frequency는 유지하되 후보풀 갱신만 60초 단위.
+- v177.9 (2026-05-19): v177.8 #M 롤백 (FHPST01700000 비트 컨벤션 미보장으로 포착 정지 의심) + ETF 섹터 캐시 잔존 차단 강화
+    #Q: get_fluctuation_rank FHPST01700000 — fid_div_cls_code/fid_trgt_cls_code/fid_trgt_exls_cls_code를 "0"으로 복귀. v177.7 prc_cls=1만 유지. 코드단 _rank_filter_and_format 필터가 우선주/ETF 차단 담당.
+    #R: _build_realtime_sectors_from_kis 머지 단계에서 _prev_sectors의 ETF/선물/스팩/관리종목 패턴 차단 (market_leader_state.json 캐시 잔존 정화)
+    #S: _push_dashboard_json sectors_block에서 market_leader_state 캐시 읽기 단계에 ETF/선물/스팩 패턴 차단 (1순위 출처 정화)
 - v177.8 (2026-05-19): KIS API 파라미터 HTS 일치 + 우선주/ETF 섹터 완전 차단 + 도달시간 signal_log 폴백
     #L: get_volume_surge_stocks FHPST01710000 — FID_DIV_CLS_CODE 0→1(보통주), FID_TRGT_EXLS_CLS_CODE "000000"→"1111111111"(HTS 조회대상제외 10개 비트 일치), FID_INPUT_PRICE_1 "1000"→""
     #M: get_fluctuation_rank FHPST01700000 — fid_div_cls_code 0→1(보통주), fid_trgt_exls_cls_code 0→"1111111111", fid_trgt_cls_code 0→"111111111" (FHPST01710000 컨벤션 적용)
@@ -15724,7 +15732,13 @@ def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
     label_map = {"nxt_premarket": "NXT장전", "nxt_aftermarket": "NXT애프터", "krx_open": "KRX오픈"}
     label = label_map.get(tag, tag)
     _log_info_msg(f"🚀 버스트 스캔 [{label}] 시작")
-    refresh_dynamic_candidates(force_rank=True)
+    # v177.10 #W: refresh_dynamic_candidates 60초 throttle — 15초 burst마다 KIS 6개 API 호출 부하 완화.
+    # 후보 풀은 60초 단위로만 갱신해도 충분 (개별 종목 분석은 매 burst 진행). burst frequency 효과 보존.
+    _refresh_key = f"{state_key}_refresh_ts"
+    _last_refresh = safe_float(_BURST_SCAN_STATE.get(_refresh_key, 0.0), 0.0)
+    if (time.time() - _last_refresh) >= 60:
+        refresh_dynamic_candidates(force_rank=True)
+        _BURST_SCAN_STATE[_refresh_key] = time.time()
     run_material_first_scan()
     run_scan()
 
@@ -17747,10 +17761,10 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "fid_prc_cls_code": "1",    # v177.7 #H: 0(저가대비)→1(종가대비) — HTS 등락률 순위와 일치
                 "fid_input_price_1": "", "fid_input_price_2": "",
                 "fid_vol_cnt": "",          # v177.7 #H: 10000→"" — 거래량 필터 제거 (규격서 권장 전체)
-                # v177.8 #M: FHPST01710000 컨벤션 적용 — 보통주만 + HTS 조회대상제외 10자리 비트 일치
-                "fid_trgt_cls_code": "111111111",
-                "fid_trgt_exls_cls_code": "1111111111",
-                "fid_div_cls_code": "1",
+                # v177.9 #Q: v177.8 #M 롤백 — 규격서가 "0:전체"만 명시. 비트 컨벤션 미보장 → API empty 응답 사고 위험. 코드단 _rank_filter_and_format 필터로 우선주/ETF 차단.
+                "fid_trgt_cls_code": "0",
+                "fid_trgt_exls_cls_code": "0",
+                "fid_div_cls_code": "0",
                 "fid_rsfl_rate1": "",       # v177.7 #H: "2"→"" — 등락률 필터 제거 (규격서 권장 전체)
             },
         )
@@ -29806,9 +29820,12 @@ def _push_dashboard_json() -> None:
                     _today_str = _now_kst().strftime("%Y-%m-%d")
                     _sent_at = str(_leader_state.get("sent_at", "") or "")
                     if _leader_sectors and _sent_at.startswith(_today_str):
+                        # v177.9 #S: market_leader_state 캐시 읽기 단계에서 ETF/선물/스팩 등 비매매 섹터 차단
+                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
                         for lsec in _leader_sectors:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
+                            if any(_p in theme for _p in _SECTOR_BLOCK_PAT_LS): continue
                             leader = lsec.get("leader") or {}
                             followers = lsec.get("followers") or []
                             all_members = ([leader] if leader else []) + list(followers)
@@ -40815,11 +40832,18 @@ def _build_realtime_sectors_from_kis() -> None:
                 if _nt in _prev_priority_themes:
                     _ns["breakout_priority"] = True
             _new_themes = {str(s.get("theme", "") or "") for s in new_sectors}
+            # v177.9 #R: _prev_sectors에서도 ETF/선물/스팩/관리종목 등 비매매 섹터 차단 (캐시 잔존 방지)
+            _SECTOR_BLOCK_PAT = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
             _merged = list(new_sectors)
             for _ps in _prev_sectors:
                 _pt = str(_ps.get("theme", "") or "")
-                if _pt and _pt not in _new_themes:
-                    _merged.append(_ps)
+                if not _pt or _pt in _new_themes:
+                    continue
+                if any(_p in _pt for _p in _SECTOR_BLOCK_PAT):
+                    continue
+                if _pt in _kis_exchange_sector_names_cache:
+                    continue
+                _merged.append(_ps)
             # v176.3 Q2: re-sort by priority first then score desc
             _merged.sort(
                 key=lambda x: (
@@ -40906,6 +40930,14 @@ def _detect_and_send_sector_breadth_alert() -> None:
             sec = str(theme or "").strip()
             if not sec or sec in ("기타업종", "기타", ""):
                 continue
+            # v177.10 #U: ETF/선물/스팩/관리종목 + 거래소 표준 업종 차단 (사용자 v176.5 요구 일관 적용)
+            if any(_p in sec for _p in ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")):
+                continue
+            try:
+                if sec in (_kis_exchange_sector_names_cache or set()):
+                    continue
+            except Exception:
+                pass
             sector_rising.setdefault(sec, []).append({"code": code, "name": name, "change_rate": cr})
         # 조건: 3개 이상 동시 급등 섹터 감지
         BREADTH_MIN = 3
@@ -43937,6 +43969,18 @@ def _apply_scan_sector_gate(alerts: list) -> list:
         if sec in _heat_top_sectors:
             base_limit += 2
 
+        # v177.10 #V: 거래소 표준 업종(전기·전자/금속/유통 등)은 진짜 테마 아님 → sector_counts 미증가, 한도 우회.
+        # 사용자 v176.5 요구 일관 적용. 가온그룹 09:17 "전기·전자 10번째" 차단 같은 오차단 해소.
+        _is_exchange_sector = False
+        try:
+            _is_exchange_sector = bool(sec) and (sec in (_kis_exchange_sector_names_cache or set()))
+        except Exception:
+            _is_exchange_sector = False
+        if _is_exchange_sector:
+            if not s.get("sector_theme") and sec != "기타":
+                s["sector_theme"] = sec
+            filtered_alerts.append(s)
+            continue
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
         if sector_counts[sec] <= base_limit:
             if not s.get("sector_theme") and sec != "기타":
