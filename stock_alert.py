@@ -3,10 +3,21 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.10
+버전: v177.11
 날짜: 2026-05-19
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.11 (2026-05-19): 한국 주식시장 일정 이벤트 통합 — Phase 1+2
+    Phase 1: market_calendar.json 정적 캘린더 (2026년 만기일/MSCI/KOSPI200/배당락/FOMC 24건) + _load_market_calendar/_get_market_events_today/_is_market_event_block_today
+    Phase 2: KIS 예탁원 API 5종 + 종목추정실적 1종 신규 구현
+      - get_ksd_paidin_capin HHKDB669100C0 (유상증자 → 권리락일)
+      - get_ksd_merger_split HHKDB669104C0 (합병분할 → 거래정지기간)
+      - get_ksd_sharehld_meet HHKDB669111C0 (주주총회)
+      - get_ksd_forfeit HHKDB669109C0 (실권주)
+      - get_ksd_mand_deposit HHKDB669110C0 (의무예치)
+      - get_estimate_perform HHKST668300C0 (종목추정실적)
+    이벤트 인덱스: _build_stock_event_index (매일 1회) + _get_stock_events_today(code) + _is_stock_event_block(code) + _format_stock_event_note(code)
+    적용: _dispatch_scan_alerts에 시장 이벤트 14:30 차단(네 마녀의 날) + 종목별 권리락/거래정지 D-1 차단 + 알람 message에 event_note 첨부
 - v177.10 (2026-05-19): 섹터 게이트 거래소 업종 우회 + ETF 섹터 알람 차단 + 버스트 후보풀 throttle
     #U: _detect_and_send_sector_breadth_alert ETF/선물/스팩/관리종목 + 거래소 표준 업종 차단 (사용자 v176.5 요구 일관 적용 — market_leader_state.json에 ETF 영구 저장 원인 제거)
     #V: _apply_scan_sector_gate 거래소 표준 업종(전기·전자/금속/유통/의료·정밀기기 등)은 sector_counts 미증가 — 가온그룹 09:17 "전기·전자 10번째" 차단 같은 오차단 해소. 진짜 테마 종목만 한도 적용.
@@ -17799,6 +17810,304 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
         if cached_items:
             return cached_items  # v177.2: 예외 시도 이전 캐시 재사용
         return []
+
+
+# ============================================================
+# v177.11 예탁원 일정 + 시장 이벤트 인프라
+# ============================================================
+_MARKET_CALENDAR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_calendar.json")
+_market_calendar_cache: dict = {}
+_market_calendar_cache_ts: float = 0.0
+_MARKET_CALENDAR_TTL = 3600  # 1시간 캐시
+
+def _load_market_calendar() -> dict:
+    """정적 market_calendar.json 로드 (1시간 캐시). 시장 전체 이벤트 (만기일/MSCI/배당락 등)."""
+    global _market_calendar_cache, _market_calendar_cache_ts
+    now = time.time()
+    if _market_calendar_cache and (now - _market_calendar_cache_ts) < _MARKET_CALENDAR_TTL:
+        return _market_calendar_cache
+    try:
+        with open(_MARKET_CALENDAR_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        idx: dict = {}
+        for ev in (data.get("events") or []):
+            d = str(ev.get("date") or "")
+            if not d: continue
+            idx.setdefault(d, []).append(ev)
+        _market_calendar_cache = idx
+        _market_calendar_cache_ts = now
+        return idx
+    except Exception as e:
+        _swallow_exception(e, "load_market_calendar")
+        return _market_calendar_cache or {}
+
+
+def _get_market_events_today() -> list:
+    """오늘 시장 전체 이벤트 리스트 반환 (만기일/리밸런싱/배당락/FOMC 등)."""
+    try:
+        today = _now_kst().strftime("%Y-%m-%d")
+        return list((_load_market_calendar() or {}).get(today, []))
+    except Exception as e:
+        _swallow_exception(e, "get_market_events_today")
+        return []
+
+
+def get_ksd_paidin_capin(f_dt: str = "", t_dt: str = "", sht_cd: str = "") -> list:
+    """v177.11: 예탁원정보 유상증자일정 — HHKDB669100C0. 규격서 국내주식-143.
+    GB1=1(청약일별), 기본 오늘부터 30일.
+    output: record_date, sht_cd, isin_name, fix_rate, disc_rate, fix_price, right_dt(권리락일)
+    """
+    try:
+        _now = _now_kst()
+        f_dt = f_dt or _now.strftime("%Y%m%d")
+        t_dt = t_dt or (_now + timedelta(days=30)).strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ksdinfo/paidin-capin",
+            "HHKDB669100C0",
+            {"CTS":"", "GB1":"1", "F_DT": f_dt, "T_DT": t_dt, "SHT_CD": sht_cd},
+        )
+        if not isinstance(data, dict): return []
+        return [i for i in (data.get("output") or data.get("output1") or []) if isinstance(i, dict)]
+    except Exception as e:
+        _swallow_exception(e, "ksd_paidin_capin"); return []
+
+
+def get_ksd_merger_split(f_dt: str = "", t_dt: str = "", sht_cd: str = "") -> list:
+    """v177.11: 예탁원정보 합병/분할일정 — HHKDB669104C0. 규격서 국내주식-147.
+    output: record_date, sht_cd, merge_type, merge_rate, td_stop_dt(거래정지기간), list_dt
+    """
+    try:
+        _now = _now_kst()
+        f_dt = f_dt or _now.strftime("%Y%m%d")
+        t_dt = t_dt or (_now + timedelta(days=30)).strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ksdinfo/merger-split",
+            "HHKDB669104C0",
+            {"CTS":"", "F_DT": f_dt, "T_DT": t_dt, "SHT_CD": sht_cd},
+        )
+        if not isinstance(data, dict): return []
+        return [i for i in (data.get("output1") or []) if isinstance(i, dict)]
+    except Exception as e:
+        _swallow_exception(e, "ksd_merger_split"); return []
+
+
+def get_ksd_sharehld_meet(f_dt: str = "", t_dt: str = "", sht_cd: str = "") -> list:
+    """v177.11: 예탁원정보 주주총회일정 — HHKDB669111C0. 규격서 국내주식-154.
+    output: record_date, sht_cd, isin_name, gen_meet_dt, gen_meet_type, agenda
+    """
+    try:
+        _now = _now_kst()
+        f_dt = f_dt or _now.strftime("%Y%m%d")
+        t_dt = t_dt or (_now + timedelta(days=30)).strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ksdinfo/sharehld-meet",
+            "HHKDB669111C0",
+            {"CTS":"", "F_DT": f_dt, "T_DT": t_dt, "SHT_CD": sht_cd},
+        )
+        if not isinstance(data, dict): return []
+        return [i for i in (data.get("output1") or []) if isinstance(i, dict)]
+    except Exception as e:
+        _swallow_exception(e, "ksd_sharehld_meet"); return []
+
+
+def get_ksd_forfeit(f_dt: str = "", t_dt: str = "", sht_cd: str = "") -> list:
+    """v177.11: 예탁원정보 실권주일정 — HHKDB669109C0. 규격서 국내주식-152.
+    output: record_date, sht_cd, subscr_dt, refund_dt, list_dt
+    """
+    try:
+        _now = _now_kst()
+        f_dt = f_dt or _now.strftime("%Y%m%d")
+        t_dt = t_dt or (_now + timedelta(days=30)).strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ksdinfo/forfeit",
+            "HHKDB669109C0",
+            {"SHT_CD": sht_cd, "T_DT": t_dt, "F_DT": f_dt, "CTS":""},
+        )
+        if not isinstance(data, dict): return []
+        return [i for i in (data.get("output1") or []) if isinstance(i, dict)]
+    except Exception as e:
+        _swallow_exception(e, "ksd_forfeit"); return []
+
+
+def get_ksd_mand_deposit(f_dt: str = "", t_dt: str = "", sht_cd: str = "") -> list:
+    """v177.11: 예탁원정보 의무예치일정 — HHKDB669110C0. 규격서 국내주식-153.
+    output: sht_cd, isin_name, stk_qty, depo_date, depo_reason
+    """
+    try:
+        _now = _now_kst()
+        f_dt = f_dt or _now.strftime("%Y%m%d")
+        t_dt = t_dt or (_now + timedelta(days=30)).strftime("%Y%m%d")
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/ksdinfo/mand-deposit",
+            "HHKDB669110C0",
+            {"T_DT": t_dt, "SHT_CD": sht_cd, "F_DT": f_dt, "CTS":""},
+        )
+        if not isinstance(data, dict): return []
+        return [i for i in (data.get("output1") or []) if isinstance(i, dict)]
+    except Exception as e:
+        _swallow_exception(e, "ksd_mand_deposit"); return []
+
+
+def get_estimate_perform(sht_cd: str) -> dict:
+    """v177.11: 국내주식 종목추정실적 — HHKST668300C0. 규격서 국내주식-187.
+    sht_cd 필수. output1: {sht_cd, item_kor_nm, estdate(추정일), rcmd_name(매수/관망), capital}
+    """
+    try:
+        if not sht_cd: return {}
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/estimate-perform",
+            "HHKST668300C0",
+            {"SHT_CD": sht_cd},
+        )
+        if not isinstance(data, dict): return {}
+        return data.get("output1") or {}
+    except Exception as e:
+        _swallow_exception(e, "estimate_perform"); return {}
+
+
+# ── 종목별 이벤트 인덱스 (매일 1회 빌드) ────────────────────────
+_stock_event_index: dict = {}
+_stock_event_index_date: str = ""
+
+def _build_stock_event_index() -> dict:
+    """KSD API 3종 (유상증자/합병분할/주총)을 종목코드별로 인덱싱.
+    매일 1회 호출 (장 시작 직후). 반환: {code: [event_dict, ...]}
+    """
+    global _stock_event_index, _stock_event_index_date
+    today = _now_kst().strftime("%Y-%m-%d")
+    if _stock_event_index_date == today and _stock_event_index:
+        return _stock_event_index
+    idx: dict = {}
+    try:
+        for it in get_ksd_paidin_capin():
+            code = str(it.get("sht_cd") or "").strip().lstrip("A")[:6]
+            if not code: continue
+            idx.setdefault(code, []).append({
+                "type": "paidin_capin",
+                "label": "유상증자",
+                "date": str(it.get("right_dt") or it.get("record_date") or ""),
+                "severity": "high",
+                "action": "block",
+                "raw": it,
+            })
+    except Exception as e:
+        _swallow_exception(e, "event_idx_paidin")
+    try:
+        for it in get_ksd_merger_split():
+            code = str(it.get("sht_cd") or "").strip().lstrip("A")[:6]
+            if not code: continue
+            idx.setdefault(code, []).append({
+                "type": "merger_split",
+                "label": f"{it.get('merge_type','합병/분할')}",
+                "date": str(it.get("record_date") or ""),
+                "td_stop_dt": str(it.get("td_stop_dt") or ""),
+                "severity": "high",
+                "action": "block",
+                "raw": it,
+            })
+    except Exception as e:
+        _swallow_exception(e, "event_idx_merger")
+    try:
+        for it in get_ksd_sharehld_meet():
+            code = str(it.get("sht_cd") or "").strip().lstrip("A")[:6]
+            if not code: continue
+            idx.setdefault(code, []).append({
+                "type": "sharehld_meet",
+                "label": f"{it.get('gen_meet_type','주총')}",
+                "date": str(it.get("gen_meet_dt") or ""),
+                "severity": "med",
+                "action": "note",
+                "raw": it,
+            })
+    except Exception as e:
+        _swallow_exception(e, "event_idx_sharehld")
+    _stock_event_index = idx
+    _stock_event_index_date = today
+    _log_info_msg(f"  📅 종목 이벤트 인덱스 빌드 완료: {len(idx)}종목 (유상증자/합병분할/주총)")
+    return idx
+
+
+def _get_stock_events_today(code: str) -> list:
+    """종목별 오늘 ~ +7일 이내 예정 이벤트 반환."""
+    if not code: return []
+    try:
+        idx = _build_stock_event_index()
+        events = idx.get(str(code).strip()[:6], [])
+        today = _now_kst().date()
+        out = []
+        for ev in events:
+            d_str = str(ev.get("date","") or "")
+            # 다양한 포맷 정규화 (YYYYMMDD / YYYY/MM/DD / YYYY-MM-DD)
+            ev_date = None
+            for fmt in ("%Y%m%d", "%Y/%m/%d", "%Y-%m-%d"):
+                try:
+                    ev_date = datetime.strptime(d_str[:10], fmt).date()
+                    break
+                except Exception:
+                    continue
+            if ev_date is None:
+                continue
+            delta = (ev_date - today).days
+            if -1 <= delta <= 7:
+                out.append({**ev, "days_ahead": delta})
+        return out
+    except Exception as e:
+        _swallow_exception(e, "get_stock_events_today")
+        return []
+
+
+def _is_stock_event_block(code: str) -> tuple[bool, str]:
+    """진입 차단 판정. (block, reason) 반환. 권리락일/거래정지/임박 합병분할 시 True."""
+    try:
+        evs = _get_stock_events_today(code)
+        for ev in evs:
+            action = str(ev.get("action") or "")
+            days = int(ev.get("days_ahead", 0))
+            if action == "block" and days <= 1:
+                return True, f"{ev.get('label','이벤트')} D{'+' if days >= 0 else ''}{days}"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _is_market_event_block_today() -> tuple[bool, str]:
+    """오늘 시장 이벤트 기반 진입 차단 판정 (네 마녀의 날 14:30 이후 등)."""
+    try:
+        evs = _get_market_events_today()
+        now = _now_kst()
+        cur_t = now.timetz().replace(tzinfo=None)
+        for ev in evs:
+            action = str(ev.get("action") or "")
+            if action == "block_after_1430" and cur_t >= dtime(14, 30, 0):
+                return True, f"{ev.get('label','이벤트')} (14:30 이후 진입 차단)"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _format_stock_event_note(code: str) -> str:
+    """알람 메시지 추가용 이벤트 노트 (없으면 빈 문자열)."""
+    try:
+        evs = _get_stock_events_today(code)
+        if not evs: return ""
+        parts = []
+        for ev in evs[:3]:
+            d = ev.get("days_ahead", 0)
+            tag = f"D{'+' if d >= 0 else ''}{d}"
+            parts.append(f"{ev.get('label','이벤트')} {tag}")
+        return " | ".join(parts)
+    except Exception:
+        return ""
+
+
+def _format_market_event_note_today() -> str:
+    """알람 메시지 헤더 노트 (오늘 시장 이벤트)."""
+    try:
+        evs = _get_market_events_today()
+        if not evs: return ""
+        return " · ".join(str(ev.get("label","")) for ev in evs if ev.get("label"))
+    except Exception:
+        return ""
 
 
 def get_market_investor_trend(iscd: str = "KSP") -> dict:
@@ -43997,11 +44306,28 @@ def _dispatch_scan_alerts(alerts: list) -> None:
     if not _dispatch_scan_lock.acquire(blocking=False):
         return
     try:
+        # v177.11: 시장 이벤트 차단 (네 마녀의 날 14:30 이후 등)
+        _mk_block, _mk_reason = _is_market_event_block_today()
+        if _mk_block:
+            _log_info_msg(f"  🛑 시장 이벤트 차단: {_mk_reason} → 모든 신규 알람 차단")
+            return
         _log_info_msg(f"  → {len(alerts)}개 감지! [{regime_label()}]")
         for s in alerts:
             if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
                 _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
                 continue
+            # v177.11: 종목별 이벤트 차단 (권리락일/거래정지/임박 합병분할)
+            _ev_block, _ev_reason = _is_stock_event_block(s.get("code", ""))
+            if _ev_block:
+                _log_info_msg(f"  🛑 이벤트 차단: {s.get('name','?')}({s.get('code','?')}) — {_ev_reason}")
+                continue
+            # v177.11: 알람 메시지에 이벤트 노트 첨부 (signal dict에 event_note 추가)
+            try:
+                _en = _format_stock_event_note(s.get("code", ""))
+                if _en:
+                    s["event_note"] = _en
+            except Exception:
+                pass
             is_nxt = s.get("market") == "NXT"
             hist_key = f"NXT_{s['code']}" if is_nxt else s["code"]
             _dispatch_general_alert_signal(s, hist_key=hist_key, source_label="일반 포착")
