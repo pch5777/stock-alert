@@ -3,10 +3,32 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.13
+버전: v177.15
 날짜: 2026-05-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.15 (2026-05-20): NXT 시간대 대시보드 섹터 갱신 복구
+    [#AD] _build_realtime_sectors_from_kis: is_market_open(KRX전용) → is_any_market_open(KRX+NXT)
+          이유: KRX 15:30 마감 후 즉시 return → NXT 시간대(~20:00) 섹터 전혀 갱신 안됨
+                → market_leader_state에 stale KRX 섹터 고착 → 하락 종목 표시 (v177.14 #AC와 동근인)
+          개선점: 15:30 이후에도 NXT 데이터로 섹터 계속 갱신 (NXT 상승 종목 3%+ 3개 이상 시 표시)
+    [#AD] KRX 마감 후에도 get_fluctuation_rank("J") 계속 호출 (기존 유지)
+          이유: KRX 종가 등락률(+3% 이상 종목)로 오늘 종가 기준 주요 섹터 산출 가능
+               마감 후에도 섹터 표시하려면 KRX 종가 데이터 필요
+          개선점: 15:30 이후 KRX 종가 + NXT 실시간 혼합으로 섹터 산출
+    진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅ (대시보드 표시 로직만 수정)
+
+- v177.14 (2026-05-20): 손실 섹터 대시보드 표시 차단
+    [#AC] _push_dashboard_json market_leader_state sectors: avg_chg < 0 섹터 표시 차단
+          이유: 장중 등록된 섹터가 이후 하락해 음수 avg_chg가 돼도 sectors_raw에 그대로 append됨
+                → 전기·전자 -6.01%, 화학 -4.98% 등 손실 섹터가 1~4위에 표시되는 버그
+          개선점: 현재 시점 평균 등락률 < 0인 섹터는 대시보드 표시 제외
+          주의점: avg_chg 계산은 현재 snap 기준(라인 30238) — 장 마감 후 snap 갱신 없으면 마지막 체결가 기준
+    [#AC] _SECTOR_BLOCK_PAT_LS에 "연관 테마" 추가
+          이유: "삼진제약 연관 테마 (SURGE) -8.21%" 등 단일종목 자동생성 테마가 market_leader_state 경로에서 필터 안됨
+               (_build_realtime_sectors_from_kis에는 있었으나 _push_dashboard_json 경로 누락)
+    진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅ (대시보드 표시 로직만 수정)
+
 - v177.13 (2026-05-20): [Groq자동] 섹터 대시보드 차단 + 도달시간 stale/누락 수정
     [#AB-1] _push_dashboard_json sectors_block: "Groq자동" 테마 대시보드 표시 차단
              이유: _detect_and_send_sector_breadth_alert가 오늘 생성한 [Groq자동] 섹터가
@@ -30167,7 +30189,8 @@ def _push_dashboard_json() -> None:
                     _sent_at = str(_leader_state.get("sent_at", "") or "")
                     if _leader_sectors and _sent_at.startswith(_today_str):
                         # v177.9 #S: market_leader_state 캐시 읽기 단계에서 ETF/선물/스팩 등 비매매 섹터 차단
-                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+                        # v177.14 #AC: 연관 테마(단일종목 자동생성) 패턴 추가
+                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열","연관 테마")
                         for lsec in _leader_sectors:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
@@ -30236,6 +30259,9 @@ def _push_dashboard_json() -> None:
                             new_stocks = new_stocks[:8]
                             if new_stocks:
                                 avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
+                                # v177.14 #AC: 현재 평균 손실 섹터 표시 차단 (등록 당시 +3%였어도 현재 음수면 숨김)
+                                if avg_chg < 0:
+                                    continue
                                 # v176.3 Q2: preserve breakout_priority flag for dashboard 1st-place sorting
                                 sectors_raw.append({
                                     "name": theme,
@@ -41118,7 +41144,10 @@ def _build_realtime_sectors_from_kis() -> None:
     - 섹터당 ≥3종목, 평균 ≥3% 일 때 sectors 후보로 채택
     - v173.1 머지 정책 유지: 같은 theme은 새 데이터로 갱신, 그 외 기존 sectors 보존 (최대 12개)
     """
-    if not is_market_open():
+    # v177.15 #AD: is_market_open()(KRX전용) → is_any_market_open()(KRX+NXT)
+    # 기존: KRX 15:30 마감 후 즉시 return → NXT 시간대(~20:00) 섹터 전혀 갱신 안됨
+    # 수정: NXT 개장 중이면 NXT fluctuation rank로 섹터 갱신 계속
+    if not is_any_market_open():
         return
     try:
         # v176.6: 거래소 표준 업종명 캐시 빌드 (10분 TTL)
@@ -41136,6 +41165,8 @@ def _build_realtime_sectors_from_kis() -> None:
             except Exception as _ce:
                 _swallow_exception(_ce, "rt_sectors:exchange_cache")
         # KRX + NXT 모두 수집 (NXT는 데이터 없을 수 있음 — 빈 리스트 fallback)
+        # v177.15 #AD: KRX 마감 후에도 get_fluctuation_rank("J") 호출 유지
+        # → KRX 종가 기준 +3% 이상 종목으로 오늘 주요 섹터 산출 가능 (마감 후 대시보드 종가섹터 표시)
         rising = []
         try:
             rising.extend(get_fluctuation_rank("J", "0") or [])
