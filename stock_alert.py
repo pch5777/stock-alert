@@ -3,10 +3,26 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.12
+버전: v177.13
 날짜: 2026-05-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.13 (2026-05-20): [Groq자동] 섹터 대시보드 차단 + 도달시간 stale/누락 수정
+    [#AB-1] _push_dashboard_json sectors_block: "Groq자동" 테마 대시보드 표시 차단
+             이유: _detect_and_send_sector_breadth_alert가 오늘 생성한 [Groq자동] 섹터가
+                   market_leader_state에 저장 → 섹터당 1종목임에도 1위 표시
+             개선점: 대시보드 섹터 목록에 [Groq자동] AI 자동생성 테마 완전 미노출
+             주의점: 텔레그램 알람(sector_breadth)은 그대로 발송 — 대시보드만 필터
+    [#AB-2] _build_realtime_sectors_from_kis sector_map: "Groq자동" 테마 실시간섹터 차단
+             이유: KIS 실시간 집계에서도 [Groq자동] 테마가 배제되도록 이중 차단
+    [#AA-1] _push_dashboard_json _hit_time_idx: detect_date == 오늘인 signal_log 레코드만 인덱싱
+             이유: 과거 날짜 hit_time이 오늘 포착 종목에 표시되는 stale 문제 (예: 05-07 도달시간)
+             개선점: 대시보드 도달시간이 오늘 날짜 기록만 반영
+    [#AA-2] _push_dashboard_json captured_raw: hit=True + hit_time 없으면 현재시간 즉시 기록
+             이유: cur_price >= e_price 실시간 hit 판정이지만 entry_hit_time 미저장 → 도달시간 공백
+             개선점: 진입가 도달 판정 즉시 현재시간으로 도달시간 표시
+    진입불가 게이트 연결: _pre_send_gate() 경유 확인 ✅ (대시보드 표시 로직만 수정)
+
 - v177.12 (2026-05-20): 장시작 포착 지연 해소 + 섹터 stale 제거
     [#X] _ensure_dynamic_candidates_fresh: stale 후보 있으면 비차단 백그라운드 갱신
          이유: refresh_dynamic_candidates(force_rank=True) 동기호출 60-120초 → run_scan 블로킹
@@ -30156,6 +30172,8 @@ def _push_dashboard_json() -> None:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
                             if any(_p in theme for _p in _SECTOR_BLOCK_PAT_LS): continue
+                            # v177.13 #AB-1: [Groq자동] AI 자동생성 테마 대시보드 표시 차단
+                            if "Groq자동" in theme: continue
                             leader = lsec.get("leader") or {}
                             followers = lsec.get("followers") or []
                             all_members = ([leader] if leader else []) + list(followers)
@@ -30352,12 +30370,18 @@ def _push_dashboard_json() -> None:
         captured_raw = []
         _ETF_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","ETF","ETN","선물","옵션","레버리지","인버스")
         # v177.8 #O: signal_log 기반 code→hit_time index (현재 push 1회만 빌드)
+        # v177.13 #AA-1: 오늘 날짜 기록만 인덱싱 (이전 날짜 stale hit_time 차단)
         _hit_time_idx: dict = {}
+        _today_cap_str = _now_kst().strftime("%Y-%m-%d")
         try:
             _slog = _read_json_locked(SIGNAL_LOG_FILE)
             if isinstance(_slog, dict):
                 for _v in _slog.values():
                     if not isinstance(_v, dict): continue
+                    # v177.13 #AA-1: detect_date가 오늘인 레코드만 인덱싱
+                    _rec_date = str(_v.get("detect_date") or _v.get("first_detect_date") or "")[:10]
+                    if _rec_date and _rec_date != _today_cap_str:
+                        continue
                     _ht = _v.get("entry_hit_time") or _v.get("legacy_entry_hit_time") or ""
                     _cc = normalize_stock_code(_v.get("code", "") or "")
                     if _cc and _ht and _ht > _hit_time_idx.get(_cc, ""):
@@ -30391,9 +30415,12 @@ def _push_dashboard_json() -> None:
                 hit = bool(watch.get("entry_hit")) or (
                     cur_price > 0 and e_price > 0 and cur_price >= e_price)
                 # v177.8 #O: hit_time signal_log 폴백 (watch.entry_hit_time 비었으면 _hit_time_idx 참조)
+                # v177.13 #AA-2: hit=True인데 hit_time 없으면 현재시간으로 즉시 기록
                 _ht_val = str(watch.get("entry_hit_time") or "")
                 if not _ht_val:
                     _ht_val = _hit_time_idx.get(code, "")
+                if hit and not _ht_val:
+                    _ht_val = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
                 captured_raw.append({
                     "name":         name,
                     "code":         code,
@@ -41147,6 +41174,9 @@ def _build_realtime_sectors_from_kis() -> None:
                 continue
             # v176.3 Q2: single-stock SURGE auto theme ("XXX 연관 테마 (...)") blocked from sectors entry
             if " 연관 테마 (" in sec:
+                continue
+            # v177.13 #AB-2: [Groq자동] AI 자동생성 테마 실시간섹터 반영 차단
+            if "Groq자동" in sec:
                 continue
             # v176.6: 거래소 표준 업종(KIS bstp_name fallback) 차단.
             # 사용자 요구: "거래소 업종은 실제 주도섹터와 전혀 관련 없다. 진짜 테마만 표시".
