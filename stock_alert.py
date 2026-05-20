@@ -3,11 +3,29 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.11
-날짜: 2026-05-19
+버전: v177.12
+날짜: 2026-05-20
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
-- v177.11 (2026-05-19): 한국 주식시장 일정 이벤트 통합 — Phase 1+2
+- v177.12 (2026-05-20): 장시작 포착 지연 해소 + 섹터 stale 제거
+    [#X] _ensure_dynamic_candidates_fresh: stale 후보 있으면 비차단 백그라운드 갱신
+         이유: refresh_dynamic_candidates(force_rank=True) 동기호출 60-120초 → run_scan 블로킹
+               → 09:00 burst_window 0-2분 포착 실패. 기존 후보로 즉시 스캔, 갱신은 bg thread.
+         개선점: 장시작 15초 burst부터 run_scan 즉시 실행 (후보 없을 때만 동기 블로킹 유지)
+         주의점: 후보 완전 비어있으면 여전히 동기 갱신 (초기 기동 안전 보장)
+    [#Y] _build_realtime_sectors_from_kis 머지: 어제 state carry 전면 차단
+         이유: _prev_state.sent_at이 어제면 _prev_sectors 전체 skip → [Groq자동] 어제 1종목 섹터가
+               오늘 대시보드 1위 점령 방지. 오늘 _detect_and_send_sector_breadth_alert 실행 후부터 carry허용.
+         개선점: 대시보드 섹터 목록이 오늘 실제 상승 섹터만 표시 (3종목 이상 3%+ 조건 충족)
+         주의점: 장 시작 초반(섹터 알람 미발송 전)엔 prev_sectors carry 없음 → new_sectors만 표시
+    진입 체인: _build_realtime_sectors_from_kis → market_leader_state.sectors → _push_dashboard_json ✅
+
+- v177.11 (2026-05-19): 한국 주식시장 일정 이벤트 통합 — Phase 1+2+3
+    Phase 3 (analyze 점수·포지션·손절 조정):
+      - 종목별 이벤트 감점: high severity D-2~D+2 → -10점 / med severity D-1~D+1 → -5점
+      - 시장 이벤트 감점: 만기일/배당락 high severity → -5점
+      - 만기일·고변동성: 포지션 50% 축소 + 손절 1.5×ATR 확대
+      - event_note 결과 dict에 첨부 (텔레그램 알람 reasons로 노출)
     Phase 1: market_calendar.json 정적 캘린더 (2026년 만기일/MSCI/KOSPI200/배당락/FOMC 24건) + _load_market_calendar/_get_market_events_today/_is_market_event_block_today
     Phase 2: KIS 예탁원 API 5종 + 종목추정실적 1종 신규 구현
       - get_ksd_paidin_capin HHKDB669100C0 (유상증자 → 권리락일)
@@ -16674,7 +16692,10 @@ def _ensure_dynamic_candidates_fresh() -> None:
             return
         oldest = min(float(v.get("added_ts", 0) or 0) for v in _dynamic_candidates.values())
         if not oldest or time.time() - oldest > ttl:
-            refresh_dynamic_candidates()
+            # v177.12 #X: 기존 후보가 있으면 백그라운드 갱신 — run_scan 즉시 진행 (장시작 0-2분 포착 지연 해소)
+            # 이유: refresh_dynamic_candidates(force_rank=True)가 KIS 6개 API 동기 호출 60-120초 블로킹.
+            #       09:00 burst_window에서 refresh 대기 중 burst 스캔 전체 지연 → 0-2분 포착 실패.
+            threading.Thread(target=refresh_dynamic_candidates, daemon=True, name="bg_refresh_candidates").start()
     except Exception as e:
         _swallow_exception(e)  # v105 structured silent-exception log
         try:
@@ -32883,6 +32904,51 @@ def _build_analyze_result(ctx: dict) -> dict:
     if execution_setup_required:
         reasons.append("🧭 초기 강세 내부포착 유지 — 재상승 체결 확인 후 실행형 알림")
     position = calc_position_size(signal_type, score, grade)
+    # v177.11 Phase 3: 시장/종목 이벤트 기반 점수·포지션·손절 조정
+    event_note = ""
+    try:
+        # ① 종목별 이벤트 감점 (권리락/합병분할 D-1~D+1 회피)
+        _ev_stock = _get_stock_events_today(code) if code else []
+        for _ev in _ev_stock:
+            _action = str(_ev.get("action") or "")
+            _days = int(_ev.get("days_ahead", 99))
+            _sev = str(_ev.get("severity") or "")
+            if _action == "block":
+                continue  # 이미 dispatch 단계에서 차단
+            if _sev == "high" and abs(_days) <= 2:
+                score = max(0, score - 10)
+                reasons.append(f"⚠️ 이벤트 감점 -10 ({_ev.get('label','')} D{'+' if _days>=0 else ''}{_days})")
+            elif _sev == "med" and abs(_days) <= 1:
+                score = max(0, score - 5)
+                reasons.append(f"⚠️ 이벤트 감점 -5 ({_ev.get('label','')} D{'+' if _days>=0 else ''}{_days})")
+        # ② 시장 이벤트 영향 (만기일/배당락/FOMC)
+        _ev_market = _get_market_events_today()
+        _is_high_vol_day = False
+        for _ev in _ev_market:
+            _t = str(_ev.get("type") or "")
+            _sev = str(_ev.get("severity") or "")
+            if _t in ("quad_witching", "option_expiry", "dividend_ex_date"):
+                _is_high_vol_day = True
+                if _sev == "high":
+                    score = max(0, score - 5)
+                    reasons.append(f"⚠️ {_ev.get('label','')} 변동성 -5")
+        # ③ 만기일·고변동성 → 포지션 50%, 손절 ATR×1.5 확대
+        if _is_high_vol_day:
+            try:
+                position = max(int((position or 0) * 0.5), 1) if position else position
+                _orig_stop = ctx.get("stop_loss") or 0
+                _entry = ctx.get("entry_price") or 0
+                if _orig_stop > 0 and _entry > 0 and _entry > _orig_stop:
+                    _gap = _entry - _orig_stop
+                    _new_stop = max(int(_entry - _gap * 1.5), 1)
+                    ctx["stop_loss"] = _new_stop
+                    reasons.append(f"🛡️ 만기일 손절 확대 {_orig_stop:,}→{_new_stop:,}")
+            except Exception:
+                pass
+        # ④ 이벤트 노트 (알람 메시지 추가용)
+        event_note = _format_stock_event_note(code) if code else ""
+    except Exception as _eve:
+        _swallow_exception(_eve, "analyze_event_adjust")
     us = ctx.get("us", {}) or {}
     earnings = ctx.get("earnings", {}) or {}
     _dart_r = ctx.get("dart_risk_meta", {}) or {}
@@ -32918,6 +32984,8 @@ def _build_analyze_result(ctx: dict) -> dict:
         "crossday_episode_reclaim_ratio": float(crossday_ctx.get("reclaim_ratio", 0.0) or 0.0),
         # v161.17: market 필드 명시적 보존 — analyze() 결과가 원본 stock market을 잃지 않도록
         "market": str(stock.get("market", "") or ""),
+        # v177.11 Phase 3: 이벤트 노트 (텔레그램 알람 메시지에 추가용)
+        "event_note": event_note,
     }
 def analyze(stock: dict) -> dict:
     ctx = _bootstrap_analyze_context(stock)
@@ -41144,7 +41212,16 @@ def _build_realtime_sectors_from_kis() -> None:
             # v177.9 #R: _prev_sectors에서도 ETF/선물/스팩/관리종목 등 비매매 섹터 차단 (캐시 잔존 방지)
             _SECTOR_BLOCK_PAT = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
             _merged = list(new_sectors)
+            # v177.12 #Y: 어제 state 전체를 carry 금지 — [Groq자동] 1종목 섹터 어제 데이터 1위 방지
+            # 개별 sector dict에 per-sector sent_at 없으므로 top-level state.sent_at 날짜로 판단.
+            # _detect_and_send_sector_breadth_alert가 오늘 실행됐으면 sent_at=today → carry허용.
+            # 어제 마지막 상태만 있으면 sent_at=yesterday → carry전면차단, new_sectors만 사용.
+            _today_sec_str = datetime.now().strftime("%Y-%m-%d")
+            _prev_state_date = str(_prev_state.get("sent_at") or "")[:10]
+            _carry_prev_sectors = (_prev_state_date == _today_sec_str)
             for _ps in _prev_sectors:
+                if not _carry_prev_sectors:
+                    continue  # 어제 state → 전 섹터 skip
                 _pt = str(_ps.get("theme", "") or "")
                 if not _pt or _pt in _new_themes:
                     continue
