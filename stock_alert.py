@@ -3,10 +3,30 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.8
+버전: v179.0
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v179.0 (2026-05-22): event-driven fast path (스캔 batch 우회) — 알람 latency 5분 → 5초
+    [#20] 사용자 지적 — "12분만에 종목포착 됨 개선된게 전혀 없음"
+    근본 결함:
+      - run_scan loop 332 종목 순차 analyze → 1회 cycle 5-10분 소요
+      - send_alert가 loop 종료 후 batch 발송 → 첫 종목 detect 후 알람까지 수분 지연
+      - 패치로 못 고침 (analyze 자체가 병목)
+    재설계 (event-driven):
+      - WebSocket tick (H0STCNT0) 도착 즉시 _ws_evaluate_trigger 호출
+      - 종목당 baseline (60초 윈도) 대비 change_rate 누적 +1.5% trigger
+      - trigger 발생 → spawn thread → 단일 종목 analyze → 즉시 send_alert
+      - 종목당 5분 cooldown + 2초 평가 throttle
+      - 기존 run_scan loop는 backup 유지 (WS 미구독 종목 + 새 종목 발굴)
+    제한:
+      - WebSocket 구독 종목 (WS_MAX_SUBSCRIPTIONS=41)에 한해 fast path 적용
+      - 비구독 종목은 기존 scan batch 경로 그대로
+    효과:
+      - 구독 41 종목 detect 즉시 발송 (5초 이내)
+      - 사용자 인지 알람 시점 = 실제 detect 시점에 근접
+      - run_scan은 부가 분석 (새 종목 발굴) 역할만
+
 - v178.8 (2026-05-22): 진단용 상태 파일 API 엔드포인트 추가
     [#19] Flask /api/state/* 엔드포인트 신설
           - GET /api/state/_list → DATA_DIR 내 .json 파일 목록 (name/size/mtime)
@@ -11618,6 +11638,119 @@ _ws_last_sync_ts: float = 0.0           # 마지막 구독 동기화 시각
 _ws_reconnect_count: int = 0
 _ws_stats = {"recv_count": 0, "parse_errors": 0, "reconnects": 0, "subscribe_ok": 0, "subscribe_fail": 0}
 
+# ════════════════════════════════════════════════════════════════
+# v179.0: WebSocket tick → event-driven fast path
+# 기존 run_scan loop는 5-10분 batch 발송 → 사용자 인지 알람 지연 5분+
+# 신규: WebSocket 체결 tick 도착 즉시 trigger 평가 → 단일 종목 analyze + send_alert
+# 효과: 구독 41 종목에 한해 알람 latency 5분 → 5초
+# ════════════════════════════════════════════════════════════════
+_WS_TRIGGER_THRESHOLD_PCT     = float(os.environ.get("WS_TRIGGER_THRESHOLD_PCT", "1.5") or "1.5")    # 1분 baseline 대비 +1.5% 누적 시 trigger
+_WS_TRIGGER_COOLDOWN_SEC      = int(os.environ.get("WS_TRIGGER_COOLDOWN_SEC", "300") or "300")        # 종목당 알람 cooldown 5분
+_WS_TRIGGER_MIN_EVAL_INTERVAL = float(os.environ.get("WS_TRIGGER_MIN_EVAL_INTERVAL", "2.0") or "2.0") # 종목당 trigger 평가 2초 throttle
+_WS_TRIGGER_BASELINE_TTL      = int(os.environ.get("WS_TRIGGER_BASELINE_TTL", "60") or "60")          # baseline 유효 60초 (만료 후 재설정)
+_ws_trigger_last_eval: dict = {}   # code → ts (마지막 trigger 평가 시각)
+_ws_trigger_alerted: dict = {}     # code → ts (마지막 fast-path 발송 시각)
+_ws_trigger_baseline: dict = {}    # code → {"price": x, "ts": y, "chg": z}
+_ws_trigger_lock = threading.Lock()
+_ws_trigger_stats = {"eval": 0, "throttle": 0, "cooldown": 0, "baseline_set": 0, "trigger_fire": 0, "analyze_pass": 0, "analyze_drop": 0}
+
+def _ws_evaluate_trigger(code: str, payload: dict, market: str) -> None:
+    """v179.0: WebSocket tick 1건마다 호출. 가격 변동 trigger 검사 + 단일 종목 fast path 실행.
+    스캔 batch loop를 우회해 사용자 인지 알람 latency를 5분 → 5초로 단축.
+    """
+    try:
+        if not is_any_market_open():
+            return
+        if _runtime_version_blocked:
+            return
+        now = time.time()
+        with _ws_trigger_lock:
+            _ws_trigger_stats["eval"] += 1
+            last_eval = _ws_trigger_last_eval.get(code, 0.0)
+            if now - last_eval < _WS_TRIGGER_MIN_EVAL_INTERVAL:
+                _ws_trigger_stats["throttle"] += 1
+                return
+            _ws_trigger_last_eval[code] = now
+            last_alert = _ws_trigger_alerted.get(code, 0.0)
+            if now - last_alert < _WS_TRIGGER_COOLDOWN_SEC:
+                _ws_trigger_stats["cooldown"] += 1
+                return
+        cur_price = int(payload.get("price", 0) or 0)
+        cur_chg   = float(payload.get("change_rate", 0.0) or 0.0)
+        if cur_price <= 0:
+            return
+        baseline = _ws_trigger_baseline.get(code)
+        if baseline is None or (now - float(baseline.get("ts", 0.0) or 0.0)) > _WS_TRIGGER_BASELINE_TTL:
+            _ws_trigger_baseline[code] = {"price": cur_price, "ts": now, "chg": cur_chg}
+            _ws_trigger_stats["baseline_set"] += 1
+            return
+        base_chg = float(baseline.get("chg", 0.0) or 0.0)
+        chg_delta = cur_chg - base_chg
+        if chg_delta < _WS_TRIGGER_THRESHOLD_PCT:
+            return
+        # trigger 발생 — fast path 실행
+        with _ws_trigger_lock:
+            _ws_trigger_alerted[code] = now
+            _ws_trigger_stats["trigger_fire"] += 1
+        threading.Thread(
+            target=_ws_fast_analyze_and_send,
+            args=(code, cur_price, cur_chg, market, chg_delta),
+            daemon=True,
+            name=f"ws_fast_{code}",
+        ).start()
+    except Exception as e:
+        _swallow_exception(e, "_ws_evaluate_trigger")
+
+def _ws_fast_analyze_and_send(code: str, price: int, change_rate: float, market: str, chg_delta: float) -> None:
+    """v179.0: 단일 종목 즉시 analyze + send_alert. scan batch 우회.
+    호출 경로: _ws_evaluate_trigger trigger 발생 → spawn thread → 이 함수.
+    """
+    try:
+        if not is_any_market_open() or _runtime_version_blocked:
+            return
+        # 리더 lock 확인 (passive replica는 발송 안 함)
+        if not _RUNTIME_IS_LEADER:
+            return
+        name = _resolve_stock_name(code, "")
+        if not is_trade_candidate_name(name):
+            return
+        # _dynamic_candidates 자동 등록 (없으면)
+        try:
+            if code not in _dynamic_candidates:
+                _dynamic_candidates[code] = {
+                    "name": name,
+                    "desc": "WS실시간trigger",
+                    "added_ts": time.time(),
+                }
+        except Exception as _ce:
+            _swallow_exception(_ce, "ws_fast:dyn_cand_add")
+        # KIS 현재가 보완 (volume_ratio, today_vol 정확도용)
+        try:
+            cur = get_stock_price(code) or {}
+        except Exception:
+            cur = {}
+        stock = {
+            "code": code,
+            "name": name,
+            "price": int(cur.get("price", price) or price),
+            "change_rate": float(cur.get("change_rate", change_rate) or change_rate),
+            "volume_ratio": float(cur.get("volume_ratio", 0) or 0),
+            "today_vol": int(cur.get("today_vol", 0) or 0),
+            "market": str(market or "KRX"),
+        }
+        result = analyze(stock)
+        if not isinstance(result, dict) or not result:
+            with _ws_trigger_lock:
+                _ws_trigger_stats["analyze_drop"] += 1
+            return
+        with _ws_trigger_lock:
+            _ws_trigger_stats["analyze_pass"] += 1
+        # 즉시 발송 (send_alert 내부에서 cooldown/dedup/NEAR_UPPER 차단 등 게이트 다 거침)
+        send_alert(result)
+        _log_info_msg(f"  ⚡ [WS fast] {name}({code}) chg{change_rate:+.2f}% Δ{chg_delta:+.2f}% → analyze pass → 즉시 발송")
+    except Exception as e:
+        _swallow_exception(e, "_ws_fast_analyze_and_send")
+
 # H0STCNT0 체결 데이터 필드 순서 (KIS API 공식 명세)
 _WS_H0STCNT0_FIELDS = [
     "stock_code",       # 0: 유가증권 단축 종목코드
@@ -11788,6 +11921,12 @@ def _ws_on_message(data: str) -> None:
                     market = "NXT"
                 _record_execution_snapshot(item["code"], item["payload"], market=market)
                 _ws_stats["recv_count"] += 1
+                # v179.0: tick → event-driven trigger 평가 → 단일 종목 fast path
+                # scan batch (5-10분) 우회. analyze latency 5분 → 5초로 단축.
+                try:
+                    _ws_evaluate_trigger(item["code"], item["payload"], market)
+                except Exception as _te:
+                    _swallow_exception(_te, "ws_on_message:trigger_eval")
             except Exception as e:
                 _swallow_exception(e)
         # v169.9: 틱 수신 즉시 대시보드 갱신 (3초 쓰로틀)
