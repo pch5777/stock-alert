@@ -3,10 +3,29 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.3
+버전: v178.4
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.4 (2026-05-21): _build_sectors_from_theme_pool 재설계 (theme-first → stock-first)
+    [#14] 등락률 상위 종목 누락 결함 해소
+          기존 theme-first 결함:
+            - 모든 theme 순회 → 종목 적은 theme 누락
+            - _AUTO_RE 정규식이 "연관 테마/Groq자동/[자동감지]" 일괄 차단 → 정상 동행 그룹도 차단
+            - 같은 stock set 가진 multiple 신규이슈 theme 중복 표시
+            - 등락률 상위 종목 절반이 어떤 섹터에도 안 보이는 결함
+          신규 stock-first:
+            - KRX top 50 + NXT top 50 = 등락률 상위 종목 풀 구성
+            - 각 종목의 ALL theme tag 수집 (THEME_MAP + _dynamic_theme_map + _sector_cache)
+            - theme별 stocks 그룹핑 + signature dedup (같은 stock set은 1개로 통합)
+            - 대표 theme 선정 (신규이슈/Groq자동/연관 priority 낮춤, 구체적 이름 우선)
+            - score = stock_count × avg_change_rate → 상위 12개
+            - ETF/우선주/스팩/관리종목/신규상장 자동 제외
+          핵심 차이:
+            - 등락률 상위 종목 모두가 시작점 → 누락 차단
+            - _AUTO_RE 차단 폐기 → 자연스러운 ≥2 stocks 필터로 단독 종목 자동 제외
+            - dedup으로 LG 계열 3중복 sector 자동 통합
+
 - v178.3 (2026-05-21): 의미없는 동적 테마 일괄 정리 + carry 종목 허위 도달시간 정리
     [#11] _register_emergent_issue_theme 필터 키워드 확장:
           숫자+선 (7800선/코스피1만), 특징주/이슈주/관심종목, 매경 자이앤트 등 추가
@@ -41636,138 +41655,178 @@ def _detect_and_send_sector_breadth_alert() -> None:
         _swallow_exception(e)
 
 # ════════════════════════════════════════════════════════════
-# v178.0 [#1 교체] sector-first 빌더 — 테마풀 기반 (기존 _build_realtime_sectors_from_kis 대체 예정)
+# v178.4 재설계: stock-first 클러스터링 (theme-first 폐기)
 # ════════════════════════════════════════════════════════════
 def _build_sectors_from_theme_pool() -> None:
-    """v178.0 [#1 교체]: sector-first 섹터 빌더.
+    """v178.4 재설계: stock-first 섹터 클러스터링.
 
-    기존 _build_realtime_sectors_from_kis(종목→섹터 추론 + 3종목/3% 임계값) 폐기.
+    이전 방식(v178.0~v178.3) 결함:
+      - theme-first 순회: 모든 theme 돌리며 stocks 매칭 → 매칭 종목 적은 theme 누락
+      - _AUTO_RE 정규식이 "연관 테마/Groq자동/[자동감지]" 일괄 차단 → 정상 동행 그룹 차단
+      - 같은 stock set 가진 multiple 신규이슈 theme 중복 표시 ("LG 계열" 3중복 등)
+      - 등락률 상위 종목 절반 이상이 어떤 섹터에도 매칭 안 됨
 
-    동작:
-      1. THEME_MAP (하드코딩) + _dynamic_theme_map (246개) 통합 풀
-      2. KIS fluctuation_rank(KRX+NXT) + snap 캐시에서 현재가/등락률 수집 → rate_map
-      3. 각 테마: 매칭된 종목 ≥ 2개 + 양수 등락률만 점수화
-      4. 점수 = 매칭종목수 × 평균등락률 → 상위 12개 테마 채택
-      5. market_leader_state.sectors 저장
+    새 방식 (stock-first):
+      1. KIS get_fluctuation_rank(KRX top 50 + NXT top 50) → top_stocks 풀 구성
+      2. 각 종목의 ALL theme tag 수집 (THEME_MAP + _dynamic_theme_map + _sector_cache)
+      3. theme별 매칭 종목 그룹핑 (≥2종목 필수)
+      4. 같은 stock set 가진 theme들 dedup → 대표 theme 선정
+         (신규이슈/Groq자동/연관/자동감지 우선순위 낮춤, 구체적 이름 우선)
+      5. score = stock_count × avg_change_rate → 상위 12개
+      6. ETF/우선주/스팩/관리종목 자동 제외
 
-    임계값 폐기 → 상대순위 기반. 단일종목 섹터 자동 차단(≥2 매칭 필요).
+    핵심 차이:
+      - 등락률 상위 종목 모두가 theme 풀의 시작점 → 어떤 종목도 누락 안 됨
+      - _AUTO_RE 차단 폐기 → 자연스러운 ≥2종목 필터로 단독 종목 자동 제외
+      - signature dedup → 같은 stock 그룹 중복 sector 차단
     """
     if not is_any_market_open():
         return
     try:
-        # 1. 테마풀 통합 (THEME_MAP + _dynamic_theme_map)
-        all_themes = {}
-        _BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
-        import re as _re_th
-        _AUTO_RE = _re_th.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
-        for tk, ti in THEME_MAP.items():
-            if any(_p in tk for _p in _BLOCK): continue
-            if _AUTO_RE.search(tk): continue
-            stocks = ti.get("stocks", [])
-            if len(stocks) >= 2:
-                all_themes[tk] = (stocks, "고정테마")
-        for tk, ti in _dynamic_theme_map.items():
-            desc = ti.get("desc", tk)
-            if any(_p in desc for _p in _BLOCK): continue
-            if _AUTO_RE.search(desc): continue
-            stocks = ti.get("stocks", [])
-            if len(stocks) >= 2 and desc not in all_themes:
-                all_themes[desc] = (stocks, "동적테마")
-        if not all_themes:
-            return
-
-        # 2. 현재가/등락률 rate_map 빌드 (KIS fluctuation_rank + snap 캐시)
-        rate_map: dict = {}
+        # ── 1. 등락률 상위 종목 수집 (KRX top 50 + NXT top 50) ──
+        top_stocks: dict = {}
+        import re as _re_st
+        _BLOCK_MK = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","PLUS","KIWOOM","RISE","WOORI","NH","KOACT","FOCUS","TIMEFOLIO","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
+        _PFR_PAT = _re_st.compile(r'우(?:[B\dC]+|\(전환\))?(?:\s|$|[^가-힣\w])')
+        def _ingest_rank_row(r: dict):
+            code = normalize_stock_code(r.get("code", "") or "")
+            if not code or code in top_stocks:
+                return
+            cr = safe_float(r.get("change_rate", 0), 0.0)
+            if cr <= 0:
+                return
+            nm = str(r.get("name", code) or code)
+            if _looks_like_placeholder_stock_name(code, nm):
+                nm = _resolve_stock_name(code, "") or code
+            nm_up = nm.upper()
+            if any(_m.upper() in nm_up for _m in _BLOCK_MK):
+                return
+            if _PFR_PAT.search(nm):
+                return
+            # 신규 상장 첫날 (등락률 > 50%) 제외
+            if cr > 50.0:
+                return
+            top_stocks[code] = {
+                "name": nm,
+                "change_rate": cr,
+                "price": safe_int(r.get("price", 0), 0),
+                "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
+            }
         try:
-            for r in (get_fluctuation_rank("J", "0") or []):
-                code = normalize_stock_code(r.get("code", "") or "")
-                if not code: continue
-                rate_map[code] = {
-                    "change_rate": safe_float(r.get("change_rate", 0), 0.0),
-                    "price": safe_int(r.get("price", 0), 0),
-                    "name": str(r.get("name", code) or code),
-                    "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
-                }
+            for r in (get_fluctuation_rank("J", "0") or [])[:50]:
+                _ingest_rank_row(r)
         except Exception as _e1:
-            _swallow_exception(_e1, "sector_theme_pool:krx_rank")
+            _swallow_exception(_e1, "sector_v4:krx_rank")
         try:
-            for r in (get_fluctuation_rank("NX", "0") or []):
-                code = normalize_stock_code(r.get("code", "") or "")
-                if not code or code in rate_map: continue
-                rate_map[code] = {
-                    "change_rate": safe_float(r.get("change_rate", 0), 0.0),
-                    "price": safe_int(r.get("price", 0), 0),
-                    "name": str(r.get("name", code) or code),
-                    "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
-                }
+            for r in (get_fluctuation_rank("NX", "0") or [])[:50]:
+                _ingest_rank_row(r)
         except Exception as _e2:
-            _swallow_exception(_e2, "sector_theme_pool:nxt_rank")
-        try:
-            for _theme_key, ti_pair in list(all_themes.items()):
-                stocks_list, _src = ti_pair
-                for c, _n in stocks_list:
-                    c = normalize_stock_code(c)
-                    if not c or c in rate_map:
-                        continue
-                    snap = _get_snap(c)
-                    if not snap:
-                        continue
-                    cr = snap.get("change_rate")
-                    if cr is None:
-                        continue
-                    rate_map[c] = {
-                        "change_rate": float(cr),
-                        "price": safe_int(snap.get("price", 0), 0),
-                        "name": str(snap.get("name", c) or c),
-                        "vol_ratio": safe_float(snap.get("vol_ratio", 0), 0.0),
-                    }
-        except Exception as _e3:
-            _swallow_exception(_e3, "sector_theme_pool:snap_merge")
-        if not rate_map:
+            _swallow_exception(_e2, "sector_v4:nxt_rank")
+        if not top_stocks:
             return
 
-        # 3. 각 테마 점수화 — 매칭 ≥ 2개 + 양수 평균
-        sector_scores = []
-        for theme, (stocks, src_label) in all_themes.items():
-            members = []
-            for c, n in stocks:
-                c = normalize_stock_code(c)
-                if c and c in rate_map and rate_map[c]["change_rate"] > 0:
-                    info = rate_map[c]
-                    nm = info.get("name") or n or c
-                    if _looks_like_placeholder_stock_name(c, nm):
-                        nm = _resolve_stock_name(c, "") or n or c
-                    members.append({
-                        "code": c,
-                        "name": nm,
-                        "change_rate": info["change_rate"],
-                        "price": info.get("price", 0),
-                        "vol_ratio": info.get("vol_ratio", 0),
-                    })
-            if len(members) < 2:
+        # ── 2. 종목별 ALL theme tag 수집 ──
+        code_to_themes: dict = {}  # code -> set(theme_name)
+        # 2-1. THEME_MAP (하드코딩)
+        try:
+            for theme_key, theme_info in THEME_MAP.items():
+                stocks_in_theme = theme_info.get("stocks", [])
+                for stock_code, _ in stocks_in_theme:
+                    stock_code = normalize_stock_code(stock_code)
+                    if stock_code in top_stocks:
+                        code_to_themes.setdefault(stock_code, set()).add(str(theme_key))
+        except Exception as _e3:
+            _swallow_exception(_e3, "sector_v4:theme_map_walk")
+        # 2-2. _dynamic_theme_map (Groq 자동 포함)
+        try:
+            for theme_key, theme_info in _dynamic_theme_map.items():
+                desc = str(theme_info.get("desc", theme_key) or theme_key)
+                stocks_in_theme = theme_info.get("stocks", [])
+                for stock_code, _ in stocks_in_theme:
+                    stock_code = normalize_stock_code(stock_code)
+                    if stock_code in top_stocks:
+                        code_to_themes.setdefault(stock_code, set()).add(desc)
+        except Exception as _e4:
+            _swallow_exception(_e4, "sector_v4:dyn_theme_walk")
+        # 2-3. _sector_cache (KIS 동업종 정보)
+        try:
+            for code in list(top_stocks.keys()):
+                sec_info = _sector_cache.get(code)
+                if isinstance(sec_info, dict):
+                    sec_name = str(sec_info.get("sector", "") or "").strip()
+                    if sec_name and not any(_p in sec_name for _p in ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목")):
+                        code_to_themes.setdefault(code, set()).add(sec_name)
+        except Exception as _e5:
+            _swallow_exception(_e5, "sector_v4:sector_cache_walk")
+
+        # ── 3. theme별 stocks 그룹핑 ──
+        theme_to_codes: dict = {}  # theme_name -> set(code)
+        for code, themes in code_to_themes.items():
+            for theme in themes:
+                theme_to_codes.setdefault(theme, set()).add(code)
+
+        # ── 4. 같은 stock set 가진 theme dedup (signature 기반) ──
+        # 차단 키워드 가진 theme 제거 (ETF/관리종목 등 매장된 채로 들어옴)
+        _THEME_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+        sig_to_themes: dict = {}  # frozenset(codes) -> list of theme names
+        for theme, codes in theme_to_codes.items():
+            if len(codes) < 2:
                 continue
+            if any(_p in theme for _p in _THEME_BLOCK):
+                continue
+            sig = frozenset(codes)
+            sig_to_themes.setdefault(sig, []).append(theme)
+
+        # 대표 theme 선정: 자동생성/모호한 이름의 priority 낮춤
+        def _theme_priority(t: str) -> tuple:
+            return (
+                1 if "신규이슈" in t else 0,
+                1 if "Groq자동" in t else 0,
+                1 if "[자동감지]" in t else 0,
+                1 if "연관" in t else 0,
+                1 if "groq_auto_" in t else 0,
+                -len(t),  # 긴 이름이 더 구체적 (negative for sort ascending = max length first)
+            )
+
+        # ── 5. 섹터 후보 빌드 ──
+        sector_candidates = []
+        for sig, theme_list in sig_to_themes.items():
+            theme_list.sort(key=_theme_priority)
+            rep_theme = theme_list[0]
+            members = []
+            for code in sig:
+                info = top_stocks[code]
+                members.append({
+                    "code": code,
+                    "name": info["name"],
+                    "change_rate": info["change_rate"],
+                    "price": info["price"],
+                    "vol_ratio": info["vol_ratio"],
+                })
+            members.sort(key=lambda x: -x["change_rate"])
             avg_rate = sum(m["change_rate"] for m in members) / len(members)
             if avg_rate <= 0:
                 continue
-            sorted_members = sorted(members, key=lambda x: -x["change_rate"])
             score = round(len(members) * avg_rate, 2)
-            sector_scores.append({
-                "theme": theme,
-                "leader": sorted_members[0],
-                "followers": sorted_members[1:8],
+            sector_candidates.append({
+                "theme": rep_theme,
+                "leader": members[0],
+                "followers": members[1:8],
                 "score": score,
                 "avg_rate": round(avg_rate, 2),
                 "count": len(members),
-                "source": src_label,
+                "source": "stock_first_v178_4",
+                "alt_themes": theme_list[1:5],  # 대안 theme 5개까지 기록 (디버그)
             })
 
-        # 4. 점수 내림차순 → 상위 12개
-        sector_scores.sort(key=lambda x: -x["score"])
-        top_sectors = sector_scores[:12]
-        if not top_sectors:
+        if not sector_candidates:
             return
 
-        # 5. market_leader_state 저장
+        # ── 6. 점수 내림차순 → 상위 12개 ──
+        sector_candidates.sort(key=lambda x: -x["score"])
+        top_sectors = sector_candidates[:12]
+
+        # ── 7. market_leader_state 저장 ──
         try:
             prev = _read_market_leader_state() or {}
             prev_sectors = list(prev.get("sectors", []) or [])
@@ -41776,17 +41835,23 @@ def _build_sectors_from_theme_pool() -> None:
             for ps in prev_sectors:
                 t = str(ps.get("theme", "") or "")
                 if t and t not in new_theme_set:
-                    merged.append(ps)
+                    # 이전 sector도 ≥2 stocks 충족하면 유지
+                    _f = ps.get("followers") or []
+                    _has_leader = bool(ps.get("leader"))
+                    _total_cnt = (1 if _has_leader else 0) + len(_f)
+                    if _total_cnt >= 2:
+                        merged.append(ps)
             merged = merged[:12]
             state = {
-                "sent_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),  # v178.1 fix: match _push_dashboard_json startswith check
+                "sent_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
                 "themes": [s["theme"] for s in merged],
                 "sectors": merged,
-                "source": "theme_pool_v178",
+                "source": "stock_first_v178_4",
             }
             _save_market_leader_state(state)
+            _log_info_msg(f"  📊 [섹터 v178.4] {len(top_sectors)}개 빌드 | top={top_sectors[0].get('theme','')} ({top_sectors[0].get('count',0)}종목, avg{top_sectors[0].get('avg_rate',0):+.1f}%)")
         except Exception as _se:
-            _swallow_exception(_se, "sector_theme_pool:save_state")
+            _swallow_exception(_se, "sector_v4:save_state")
     except Exception as e:
         _log_error("_build_sectors_from_theme_pool", e)
 
