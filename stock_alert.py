@@ -3,10 +3,28 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.0
+버전: v178.2
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.2 (2026-05-21): 다중 결함 일괄 패치 — run_scan 블로킹/종가매매 catchup/도달 허위표시/노이즈 차단
+    [#1] run_price_first_scan _leader_job → _threaded_leader_job
+         이유: 단일 스레드 schedule 라이브러리에서 run_scan이 30+분 블로킹 →
+               14:35/15:08/19:10 종가매매 + 15분 워치독 등 모든 at()/every() job 미실행
+         증거: 정상이면 SCAN_INTERVAL=20초로 하루 수백 회, 실제 하루 8회만 실행
+    [#2] _maybe_run_preclose_gap_alert_catchup 호출 추가 (main loop 시작 직전 스레드)
+         이유: 함수 정의만 되고 호출 위치 0건 — 봇 재시작 시 놓친 종가매매 복구 불가
+    [#6] _push_dashboard_json captured hit 판정 cur_price>=e_price 폐기
+         이유: carry 이월 종목 재시작 즉시 hit=True → v177.13 #AA-2가 hit_time을 현재시간 자동 생성
+               → "실제 도달 없는데 도달 표시" (현대오토에버 등 5종목 14:37 허위 도달)
+         수정: entry_hit 플래그가 명시적으로 True일 때만 hit 표시 + 자동 hit_time 생성 폐기
+    [#5] build_correlation_theme candidates에 빈 문자열 종목명 차단
+         이유: s.get("name", c) → name=""일 때 default 안 적용 → "['', '현대모비스', '']" 출력
+    [#7] _register_emergent_issue_theme 의미없는 키워드 필터 추가
+         이유: "ai" 1단어, "59만원·하이닉스 400만원…노무라" 등 종목명/증권사 혼합 키워드 동적 테마 인플레이션
+    [#8] _record_entry_blocked 쿨다운 30초 → 3600초
+         이유: carry 종목이 매 15~30분 동일 차단 로그 도배
+
 - v178.0 (2026-05-21): 본질 재설계 — 임계값 미세조정 폐기, sector-first 빌더 + 누락 종목 강제 편입 + 종가강세 익일 시드
     근거: signal_log 통계 — 오늘 신호 18건 중 NEAR_UPPER 9건(50%) 진입 불가 노이즈. 11개 상한가 중 6개 후보 풀 미진입.
           어제 actionable 21건 vs 오늘 신호 매칭 0/21 = 시나리오 → 익일 carry 시스템 사실상 실패.
@@ -20590,7 +20608,7 @@ def build_correlation_theme(code: str, name: str) -> list:
         for s in (get_volume_surge_stocks() + get_upper_limit_stocks()):
             c = s.get("code","")
             if c and c != code:
-                candidates[c] = s.get("name", c)
+                candidates[c] = s.get("name") or _resolve_stock_name(c, "") or c  # v178.2 fix: 빈 문자열 방지 (s.get("name", c)는 ""일 때 default 안 적용)
         # 최대 20개 후보만 계산 (API 부하 방지)
         peers = []
         for peer_code, peer_name in list(candidates.items())[:20]:
@@ -27634,11 +27652,11 @@ def _record_entry_blocked(watch: dict, reason: str, blocked_price: int):
                 break
         if updated:
             _write_json_atomic(SIGNAL_LOG_FILE, data, indent=2)
-        # v161.3 #9: 종목별 30초 쿨다운으로 중복 경고 억제
+        # v178.2: 쿨다운 30초 → 3600초 (carry 종목 매 15~30분 동일 차단 반복 로그 도배 차단)
         blocked_code = str(watch.get("code") or "")
         _cooldown_key = f"{blocked_code}_{reason}"
         _now_ts = time.time()
-        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= 30:
+        if _now_ts - _entry_blocked_log_cooldown.get(_cooldown_key, 0) >= 3600:
             _entry_blocked_log_cooldown[_cooldown_key] = _now_ts
             _log_warn_msg(f"  🚫 진입불가 기록: {watch.get('name','')} {reason} @ {int(blocked_price or 0):,}")
     except Exception as e:
@@ -30479,15 +30497,18 @@ def _push_dashboard_json() -> None:
                     watch.get("change_at_detect") or 0
                 )
                 e_price   = safe_int(watch.get("entry_price") or 0)
-                hit = bool(watch.get("entry_hit")) or (
-                    cur_price > 0 and e_price > 0 and cur_price >= e_price)
+                # v178.2 [#6 fix]: 도달 판정에서 cur_price >= e_price 실시간 체크 폐기
+                # 이유: carry 이월 종목이 재시작 시 cur_price >= e_price면 즉시 hit=True →
+                #       v177.13 #AA-2가 hit_time을 현재시간으로 자동 기록 → "실제 도달 없는데 도달 표시"
+                # 수정: entry_hit 플래그가 명시적으로 True일 때만 hit 표시 (signal_log/_entry_watch에 기록된 실제 도달)
+                hit = bool(watch.get("entry_hit"))
                 # v177.8 #O: hit_time signal_log 폴백 (watch.entry_hit_time 비었으면 _hit_time_idx 참조)
-                # v177.13 #AA-2: hit=True인데 hit_time 없으면 현재시간으로 즉시 기록
                 _ht_val = str(watch.get("entry_hit_time") or "")
                 if not _ht_val:
                     _ht_val = _hit_time_idx.get(code, "")
-                if hit and not _ht_val:
-                    _ht_val = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+                # v178.2 [#6 fix]: hit=True인데 hit_time 없으면 → 자동 기록 폐기 (허위 시간 생성 방지)
+                # 실제 hit 이벤트 발생 시점에 register_entry_hit() 등에서 명시적으로 entry_hit_time을 세팅하므로
+                # 여기서 fallback으로 현재시간을 박는 건 carry 종목에 허위 도달시간을 만드는 부작용만 있음
                 captured_raw.append({
                     "name":         name,
                     "code":         code,
@@ -34037,6 +34058,18 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
     theme = str(issue.get("theme", "") or "").strip()
     theme_key_raw = str(issue.get("theme_key", "") or "").strip()
     if not theme or not theme_key_raw:
+        return
+    # v178.2 [#7 fix]: 의미없는 단일/일반 키워드 + 종목명·증권사 혼합 키워드 차단 (동적 테마 인플레이션 차단)
+    _theme_norm = theme.lower().strip()
+    if len(_theme_norm) <= 2:  # "ai" 등 너무 짧은 키워드 차단
+        return
+    # 종목명+증권사 패턴 차단 ("59만원·하이닉스 400만원…노무라" 같은 의미 모호 키워드)
+    _BLOCK_TOKENS = ("만원", "노무라", "하이닉스 400", "59만", "코스피 1만")
+    if any(_t in theme for _t in _BLOCK_TOKENS):
+        return
+    # 일반 시장 코멘트성 표현 차단
+    _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각")
+    if any(_t in theme for _t in _GENERIC_TERMS):
         return
     try:
         today = datetime.now().strftime("%m%d")
@@ -45270,7 +45303,7 @@ if __name__ == "__main__":
             _send_startup_banner_once()
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
-    schedule.every(SCAN_INTERVAL).seconds.do(_leader_job(run_price_first_scan))
+    schedule.every(SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_price_first_scan))  # v178.2: blocking → threaded (run_scan 30분+ 블로킹 → 14:35/15:08 종가매매 + 워치독 미실행 해소)
     schedule.every(30).seconds.do(_leader_job(_run_surge_velocity_scan))  # v165.43: 경량 급등 감지 스캔 (거래량폭증+등락률 복합)
     schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_nxt_premarket_burst_scan))
     schedule.every(NXT_AFTERMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_aftermarket_burst_scan))  # v165.26: NXT 애프터마켓 burst
@@ -45376,6 +45409,11 @@ if __name__ == "__main__":
     schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
     threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
+    # v178.2: 봇 재시작 시 종가매매 14:35/15:08/19:10 catchup 호출 (정의만 있고 호출 0건 결함 수정)
+    try:
+        threading.Thread(target=_maybe_run_preclose_gap_alert_catchup, daemon=True).start()
+    except Exception as _ce:
+        _log_warn_msg(f"⚠️ preclose catchup 시작 실패: {_ce}")
     while True:
         try:
             schedule.run_pending()
