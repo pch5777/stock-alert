@@ -31114,6 +31114,22 @@ def _flask_api_stream():
 def _flask_health():
     return "ok", 200
 
+@_flask_app.route("/api/signal_log")
+def _flask_api_signal_log():
+    """signal_log.json 반환 (진단용) — DIAG_API_KEY 환경변수 설정 시 키 검증"""
+    from flask import request as _req
+    _api_key = os.environ.get("DIAG_API_KEY", "")
+    _req_key = _req.headers.get("X-Diag-Key") or _req.args.get("key", "")
+    if _api_key and _req_key != _api_key:
+        return _jsonify({"error": "unauthorized"}), 401
+    try:
+        if os.path.exists(SIGNAL_LOG_FILE):
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                return _FlaskResponse(f.read(), mimetype="application/json")
+        return _jsonify({"error": "signal_log.json not found"}), 404
+    except Exception as e:
+        return _jsonify({"error": str(e)}), 500
+
 def _start_flask_server() -> None:
     """Flask를 daemon 스레드로 실행 — 봇 메인루프 블로킹 없음"""
     port = int(os.environ.get("PORT", 8080))
