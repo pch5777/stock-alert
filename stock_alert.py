@@ -3,10 +3,21 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.15
-날짜: 2026-05-20
+버전: v177.16
+날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v177.16 (2026-05-21): 장시작 포착 지연 + NXT 오전 섹터 빈값 + 단일종목 섹터 1위 해소
+    [#AE] _run_scan_burst_window refresh 동기→백그라운드 (장시작 0~2분 포착 실패 해소)
+          이유: 첫 09:00 burst 시 동기 refresh_dynamic_candidates → KIS 6개 API 60~120초 블로킹 → run_scan 지연
+          개선점: 후보 풀이 비어있을 때만 동기 호출 fallback, 평소엔 백그라운드 스레드로 갱신
+    [#AF] _build_realtime_sectors_from_kis NXT 임계값 완화 (NXT 오전 섹터 빈값 해소)
+          이유: NXT 08:00~08:59 거래량 작음 → 동일 섹터 3종목 3%+ 충족 불가 → new_sectors=[] → state 갱신 0회
+          개선점: NXT 단독시간대(is_nxt_open AND NOT is_market_open) 임계값 완화 — 등락률 3%→1.5%, 종목수 3→2, 평균 3%→1.5%
+    [#AG] _push_dashboard_json min_stocks 가드 + 차단 정규식 강화 (단일종목 섹터 1위 해소)
+          이유: new_stocks가 1개여도 sectors_raw 등록 + "연관 테마" 부분문자열 매칭은 "X 연관 지정학 테마" 차단 실패
+          개선점: stocks 2개 미만 차단 + 정규식 r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]" 도입
+
 - v177.15 (2026-05-20): NXT 시간대 대시보드 섹터 갱신 복구
     [#AD] _build_realtime_sectors_from_kis: is_market_open(KRX전용) → is_any_market_open(KRX+NXT)
           이유: KRX 15:30 마감 후 즉시 return → NXT 시간대(~20:00) 섹터 전혀 갱신 안됨
@@ -15804,8 +15815,16 @@ def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
     _refresh_key = f"{state_key}_refresh_ts"
     _last_refresh = safe_float(_BURST_SCAN_STATE.get(_refresh_key, 0.0), 0.0)
     if (time.time() - _last_refresh) >= 60:
-        refresh_dynamic_candidates(force_rank=True)
+        # v177.16 #AE: 동기 호출 → 백그라운드. 장시작 0~2분 포착 실패 해소.
+        # KIS 6개 API 60~120초 블로킹이 run_scan을 지연시키는 문제 차단.
         _BURST_SCAN_STATE[_refresh_key] = time.time()
+        if not _dynamic_candidates:
+            refresh_dynamic_candidates(force_rank=True)  # 후보 완전 비어있을 때만 동기 fallback
+        else:
+            threading.Thread(
+                target=lambda: refresh_dynamic_candidates(force_rank=True),
+                daemon=True, name=f"bg_refresh_{tag}"
+            ).start()
     run_material_first_scan()
     run_scan()
 
@@ -30190,12 +30209,16 @@ def _push_dashboard_json() -> None:
                     if _leader_sectors and _sent_at.startswith(_today_str):
                         # v177.9 #S: market_leader_state 캐시 읽기 단계에서 ETF/선물/스팩 등 비매매 섹터 차단
                         # v177.14 #AC: 연관 테마(단일종목 자동생성) 패턴 추가
-                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열","연관 테마")
+                        # v177.16 #AG: "연관 테마" 부분문자열 → 정규식으로 "X 연관 지정학 테마", "X 연관 이슈" 등 단어 사이 끼는 케이스 차단
+                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+                        import re as _re_sec_block
+                        _AUTO_SECTOR_RE = _re_sec_block.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
                         for lsec in _leader_sectors:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
                             if any(_p in theme for _p in _SECTOR_BLOCK_PAT_LS): continue
-                            # v177.13 #AB-1: [Groq자동] AI 자동생성 테마 대시보드 표시 차단
+                            if _AUTO_SECTOR_RE.search(theme): continue
+                            # v177.13 #AB-1: [Groq자동] AI 자동생성 테마 대시보드 표시 차단 (정규식에 포함됐지만 명시적 유지)
                             if "Groq자동" in theme: continue
                             leader = lsec.get("leader") or {}
                             followers = lsec.get("followers") or []
@@ -30257,6 +30280,9 @@ def _push_dashboard_json() -> None:
                                 _top["is_leader"] = True
                                 _top["name"] = "👑 " + (_top.get("name", "") or "")
                             new_stocks = new_stocks[:8]
+                            # v177.16 #AG: 단일종목 섹터(stocks 2개 미만) 차단 — 1위가 "LG전자 1개"인 비정상 섹터 해소
+                            if len(new_stocks) < 2:
+                                continue
                             if new_stocks:
                                 avg_chg = sum(x["chg"] for x in new_stocks) / len(new_stocks)
                                 # v177.14 #AC: 현재 평균 손실 섹터 표시 차단 (등록 당시 +3%였어도 현재 음수면 숨김)
@@ -41165,6 +41191,13 @@ def _build_realtime_sectors_from_kis() -> None:
     # 수정: NXT 개장 중이면 NXT fluctuation rank로 섹터 갱신 계속
     if not is_any_market_open():
         return
+    # v177.16 #AF: NXT 단독시간대 임계값 완화 (NXT 오전 섹터 빈값 해소).
+    # NXT 08:00~08:59 거래량 작음 → 3종목 3%+ 충족 불가 → new_sectors=[] → state 갱신 0회.
+    # 어제 sent_at으로 carry 전면차단 → sectors 빈 상태 유지. 임계값을 NXT 시간대만 절반으로.
+    _nxt_only = is_nxt_open() and not is_market_open()
+    _MIN_CR  = 1.5 if _nxt_only else 3.0
+    _MIN_CNT = 2   if _nxt_only else 3
+    _MIN_AVG = 1.5 if _nxt_only else 3.0
     try:
         # v176.6: 거래소 표준 업종명 캐시 빌드 (10분 TTL)
         global _kis_exchange_sector_names_cache, _kis_exchange_sector_names_cache_ts
@@ -41210,7 +41243,7 @@ def _build_realtime_sectors_from_kis() -> None:
             if _looks_like_placeholder_stock_name(code, name):
                 name = _resolve_stock_name(code, "") or code
             cr = safe_float(r.get("change_rate", 0), 0.0)
-            if cr < 3.0:  # 최소 상승률 (sector breadth 알람보다 낮음 — 더 많은 섹터 노출)
+            if cr < _MIN_CR:  # v177.16 #AF: NXT 시간대 1.5%, KRX 3.0%
                 continue
             try:
                 theme, _, _ = get_theme_sector_stocks(code)
@@ -41249,13 +41282,13 @@ def _build_realtime_sectors_from_kis() -> None:
                 "price": safe_int(r.get("price", 0), 0),
                 "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
             })
-        # 섹터 후보 (3종목 이상, 평균 3% 이상)
+        # 섹터 후보 (v177.16 #AF: NXT 2종목/1.5%, KRX 3종목/3.0%)
         new_sectors = []
         for sec, stocks in sector_map.items():
-            if len(stocks) < 3:
+            if len(stocks) < _MIN_CNT:
                 continue
             avg_rate = sum(s["change_rate"] for s in stocks) / len(stocks)
-            if avg_rate < 3.0:
+            if avg_rate < _MIN_AVG:
                 continue
             sorted_stocks = sorted(stocks, key=lambda x: x["change_rate"], reverse=True)
             new_sectors.append({
