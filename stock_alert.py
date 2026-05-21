@@ -30407,7 +30407,7 @@ def _push_dashboard_json() -> None:
                         sec_name = (_sector_cache.get(code) or {}).get("sector") or "기타"
                         if any(p in sec_name for p in _SECTOR_EXCLUDE_PAT): continue
                         _sn_name = _resolve_stock_name(code, "")
-                        if _re.search(r'우[B\dC]*(\(전환\))?$', _sn_name): continue
+                        if re.search(r'우[B\dC]*(\(전환\))?$', _sn_name): continue  # v178.1 fix: _re not defined here, use module-level re
                         if any(m.upper() in _sn_name.upper() for m in _RANK_EXCLUDE_MARKERS): continue
                         chg_v = float(snap.get("change_rate") or 0)
                         if sec_name not in snap_groups:
@@ -41681,7 +41681,7 @@ def _build_sectors_from_theme_pool() -> None:
                     merged.append(ps)
             merged = merged[:12]
             state = {
-                "sent_at": _now_kst().strftime("%Y%m%d-%H%M%S"),
+                "sent_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),  # v178.1 fix: match _push_dashboard_json startswith check
                 "themes": [s["theme"] for s in merged],
                 "sectors": merged,
                 "source": "theme_pool_v178",
