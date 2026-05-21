@@ -3,10 +3,31 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.5
+버전: v178.6
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.6 (2026-05-21): _build_sectors_from_theme_pool 로직 자체 재설계 (패치 누적 폐기)
+    [#16] 사용자 지적 — "이것도 패치만하다가 문제는 계속돼. 로직자체를 바꿔야지"
+    근본 원인:
+      - v178.0~v178.5 누적 패치 모두 출력 단계 필터링 (theme명 키워드 차단)
+      - _dynamic_theme_map에 노이즈 (issue_*/groq_auto_*/auto_*) 들어오는 source는 그대로
+      - 새 노이즈 패턴 등장할 때마다 차단 키워드 추가하는 모드 → 끝없는 패치
+      - 사용자 화면: "업종미상 2위", "신규이슈·ai", "LS ELECTRIC 연관 자동발굴 테마" 등 계속 출현
+    근본 해결:
+      A. _dynamic_theme_map source 단계 화이트리스트 (큐레이션 항목만 허용)
+         - key prefix issue_/groq_auto_/auto_ 시작 시 통째 SKIP
+         - desc에 "자동발굴/auto_discover/연관 자동발굴" 포함 시 통째 SKIP
+      B. _sector_cache default 차단 (exact match + substring 둘 다 적용)
+         - 업종미상/기타/미분류/unknown/UNKNOWN/-/N/A
+      C. signature dedup → overlap dedup (≥70% 공유 시 우선순위 높은 1개로 머지)
+         - LG 3중복 같은 동일 그룹뿐 아니라 비슷한 stock set도 자연 통합
+      D. THEME_MAP은 신뢰 (수동 큐레이션)
+    효과:
+      - 새 노이즈 패턴 등장해도 prefix/desc 체크에서 차단됨 (키워드 추가 불필요)
+      - 출력 단계 키워드 차단 코드 단순화 (v178.5의 "신규이슈·{kw≤3}" 같은 미세 분기 폐기)
+      - SECTOR LIST에 신뢰 가능한 theme만 노출
+
 - v178.5 (2026-05-21): v178.4 stock-first 운영 검증 후 발견된 결함 3종 추가 패치
     [#15-A] _sector_cache "업종미상" / "기타" / "미분류" / "unknown" 차단
             증상: 사진에 "업종미상 +21.70%" 섹터 표시. _sector_cache의 default 값이 그대로 theme 됨.
@@ -41685,30 +41706,31 @@ def _detect_and_send_sector_breadth_alert() -> None:
         _swallow_exception(e)
 
 # ════════════════════════════════════════════════════════════
-# v178.4 재설계: stock-first 클러스터링 (theme-first 폐기)
+# v178.6 로직 재설계: 신뢰 소스 화이트리스트 + overlap dedup
 # ════════════════════════════════════════════════════════════
 def _build_sectors_from_theme_pool() -> None:
-    """v178.4 재설계: stock-first 섹터 클러스터링.
+    """v178.6 로직 재설계: 신뢰 가능한 sector 소스만 사용.
 
-    이전 방식(v178.0~v178.3) 결함:
-      - theme-first 순회: 모든 theme 돌리며 stocks 매칭 → 매칭 종목 적은 theme 누락
-      - _AUTO_RE 정규식이 "연관 테마/Groq자동/[자동감지]" 일괄 차단 → 정상 동행 그룹 차단
-      - 같은 stock set 가진 multiple 신규이슈 theme 중복 표시 ("LG 계열" 3중복 등)
-      - 등락률 상위 종목 절반 이상이 어떤 섹터에도 매칭 안 됨
+    v178.0~v178.5 누적 결함의 근본 원인:
+      - _dynamic_theme_map에 노이즈 (issue_*/groq_auto_*/auto_*) 다량 포함
+      - 노이즈 차단을 패치마다 추가했으나 새로운 패턴 계속 등장 (모멘텀 부각, 7800선, 집들이 마케팅, ai...)
+      - 패치 누락분이 SECTOR LIST에 그대로 노출 (사용자: "또 안된다")
 
-    새 방식 (stock-first):
-      1. KIS get_fluctuation_rank(KRX top 50 + NXT top 50) → top_stocks 풀 구성
-      2. 각 종목의 ALL theme tag 수집 (THEME_MAP + _dynamic_theme_map + _sector_cache)
-      3. theme별 매칭 종목 그룹핑 (≥2종목 필수)
-      4. 같은 stock set 가진 theme들 dedup → 대표 theme 선정
-         (신규이슈/Groq자동/연관/자동감지 우선순위 낮춤, 구체적 이름 우선)
-      5. score = stock_count × avg_change_rate → 상위 12개
-      6. ETF/우선주/스팩/관리종목 자동 제외
+    v178.6 새 방식 — 화이트리스트 접근:
+      1. _dynamic_theme_map 진입 시 key prefix 검사:
+         - issue_* / groq_auto_* / auto_* 시작 → SKIP (노이즈 소스 통째로 차단)
+         - 그 외 (큐레이션된 dynamic theme) → 허용
+      2. _sector_cache 진입 시 default value 차단:
+         - 업종미상/기타/미분류/unknown/공백 → SKIP
+      3. THEME_MAP은 모두 신뢰 (수동 큐레이션)
+      4. theme별 stocks 그룹핑 (≥2종목)
+      5. overlap-based dedup: 두 sector가 stocks ≥70% 공유 → 우선순위 높은 1개로 머지
+      6. score = stock_count × avg_change_rate → 상위 12개
 
-    핵심 차이:
-      - 등락률 상위 종목 모두가 theme 풀의 시작점 → 어떤 종목도 누락 안 됨
-      - _AUTO_RE 차단 폐기 → 자연스러운 ≥2종목 필터로 단독 종목 자동 제외
-      - signature dedup → 같은 stock 그룹 중복 sector 차단
+    핵심 차이 vs v178.5:
+      - 노이즈를 출력 단계에서 필터링 → 소스 단계에서 차단 (단순화)
+      - 패치 키워드 누적 폐기 — 새 패턴 등장해도 prefix 차단으로 막힘
+      - signature dedup → overlap dedup (LG 3중복 + 비슷한 stock set도 자연 통합)
     """
     if not is_any_market_open():
         return
@@ -41767,29 +41789,46 @@ def _build_sectors_from_theme_pool() -> None:
                         code_to_themes.setdefault(stock_code, set()).add(str(theme_key))
         except Exception as _e3:
             _swallow_exception(_e3, "sector_v4:theme_map_walk")
-        # 2-2. _dynamic_theme_map (Groq 자동 포함)
+        # 2-2. _dynamic_theme_map (큐레이션된 항목만 — v178.6 핵심 변경)
+        # 노이즈 소스 통째 차단: key prefix issue_*/groq_auto_*/auto_* 전체 SKIP
+        # 이유: v178.0~v178.5 패치마다 새 노이즈 패턴 등장 → source에서 차단
+        _NOISE_KEY_PREFIX = ("issue_", "groq_auto_", "auto_")
+        _NOISE_DESC_PAT = ("자동발굴", "auto_discover", "연관 자동발굴")
         try:
             for theme_key, theme_info in _dynamic_theme_map.items():
+                _key_str = str(theme_key or "")
+                # v178.6: key prefix 통째 차단
+                if any(_key_str.startswith(_p) for _p in _NOISE_KEY_PREFIX):
+                    continue
                 desc = str(theme_info.get("desc", theme_key) or theme_key)
+                # v178.6: desc 패턴도 통째 차단
+                if any(_p in desc for _p in _NOISE_DESC_PAT):
+                    continue
                 stocks_in_theme = theme_info.get("stocks", [])
                 for stock_code, _ in stocks_in_theme:
                     stock_code = normalize_stock_code(stock_code)
                     if stock_code in top_stocks:
                         code_to_themes.setdefault(stock_code, set()).add(desc)
         except Exception as _e4:
-            _swallow_exception(_e4, "sector_v4:dyn_theme_walk")
-        # 2-3. _sector_cache (KIS 동업종 정보)
-        # v178.5 fix: 업종미상/기타/미분류 등 의미없는 default 값 제외
-        _SEC_CACHE_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목","업종미상","기타","기타업종","미분류","unknown")
+            _swallow_exception(_e4, "sector_v6:dyn_theme_walk")
+        # 2-3. _sector_cache (KIS 동업종 정보) — default 값 차단
+        _SEC_CACHE_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목","업종미상","기타","기타업종","미분류","unknown","UNKNOWN","-","N/A")
         try:
             for code in list(top_stocks.keys()):
                 sec_info = _sector_cache.get(code)
                 if isinstance(sec_info, dict):
                     sec_name = str(sec_info.get("sector", "") or "").strip()
-                    if sec_name and not any(_p in sec_name for _p in _SEC_CACHE_BLOCK):
-                        code_to_themes.setdefault(code, set()).add(sec_name)
+                    if not sec_name:
+                        continue
+                    # v178.6: exact match block (substring 아닌 정확 일치)
+                    if sec_name in _SEC_CACHE_BLOCK:
+                        continue
+                    # substring 부분도 차단 (예: "업종미상 (KOSDAQ)" 같은 변형)
+                    if any(_p in sec_name for _p in ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목","업종미상","미분류")):
+                        continue
+                    code_to_themes.setdefault(code, set()).add(sec_name)
         except Exception as _e5:
-            _swallow_exception(_e5, "sector_v4:sector_cache_walk")
+            _swallow_exception(_e5, "sector_v6:sector_cache_walk")
 
         # ── 3. theme별 stocks 그룹핑 ──
         theme_to_codes: dict = {}  # theme_name -> set(code)
@@ -41797,50 +41836,69 @@ def _build_sectors_from_theme_pool() -> None:
             for theme in themes:
                 theme_to_codes.setdefault(theme, set()).add(code)
 
-        # ── 4. 같은 stock set 가진 theme dedup (signature 기반) ──
-        # v178.5: 차단 키워드 확장 + 신규이슈 suffix 길이 체크 + 자동발굴 차단
+        # ── 4. ≥2 stocks 필터 + sector 후보 단일 리스트 빌드 ──
+        # v178.6: signature dedup → overlap dedup으로 교체. 모든 candidate를 평면 리스트로 모은 후 overlap 머지.
         _THEME_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열",
-                        "업종미상","기타업종","미분류","자동발굴","auto_discover")
-        # 신규이슈/groq_auto 등 prefix 뒤 keyword 길이 ≤ 2이면 차단 ("신규이슈·ai", "groq_auto_ai" 등)
-        import re as _re_st_block
-        _SHORT_KW_PAT = _re_st_block.compile(r"(?:신규이슈·|groq_auto_|issue_)\s*([^·\s_]{1,2})\s*$")
-        sig_to_themes: dict = {}  # frozenset(codes) -> list of theme names
+                        "업종미상","기타업종","미분류")
+        raw_candidates = []  # [{"theme", "codes_set", "priority"}]
+        # 대표 theme 우선순위 점수 (낮을수록 우선)
+        def _theme_priority_score(t: str) -> int:
+            score = 0
+            if "신규이슈" in t: score += 100
+            if "Groq자동" in t: score += 100
+            if "[자동감지]" in t: score += 100
+            if "groq_auto" in t.lower(): score += 100
+            if "연관" in t: score += 50
+            # 긴 이름은 더 구체적이므로 우선 (negative 가산)
+            score -= len(t)
+            return score
         for theme, codes in theme_to_codes.items():
             if len(codes) < 2:
                 continue
             if any(_p in theme for _p in _THEME_BLOCK):
                 continue
-            # v178.5: 신규이슈·짧은키워드 차단
-            if _SHORT_KW_PAT.search(theme):
-                continue
-            # v178.5: 한 글자 또는 일반 시장 코멘트성 신규이슈 차단
+            # 신규이슈· prefix 뒤 keyword 짧으면 차단
             if "신규이슈·" in theme:
                 _kw = theme.split("신규이슈·", 1)[-1].strip()
-                if len(_kw) <= 3:  # "ai", "코스피" 등 너무 일반적
+                if len(_kw) <= 3:
                     continue
-                if any(_g in _kw for _g in ("부각", "주목", "관심", "특징주", "이슈주", "관심종목", "테마주")):
-                    continue
-            sig = frozenset(codes)
-            sig_to_themes.setdefault(sig, []).append(theme)
+            raw_candidates.append({
+                "theme": theme,
+                "codes": set(codes),
+                "priority": _theme_priority_score(theme),
+            })
 
-        # 대표 theme 선정: 자동생성/모호한 이름의 priority 낮춤
-        def _theme_priority(t: str) -> tuple:
-            return (
-                1 if "신규이슈" in t else 0,
-                1 if "Groq자동" in t else 0,
-                1 if "[자동감지]" in t else 0,
-                1 if "연관" in t else 0,
-                1 if "groq_auto_" in t else 0,
-                -len(t),  # 긴 이름이 더 구체적 (negative for sort ascending = max length first)
-            )
+        # ── 4-B. overlap 기반 dedup (≥70% 공유 시 우선순위 높은 1개로 머지) ──
+        # 우선순위 낮은 순(score 작은 순 = 더 좋은 theme)으로 정렬 후 머지
+        raw_candidates.sort(key=lambda x: x["priority"])
+        OVERLAP_THRESHOLD = 0.70
+        merged_sectors = []
+        for cand in raw_candidates:
+            absorbed = False
+            for ms in merged_sectors:
+                inter = cand["codes"] & ms["codes"]
+                smaller_size = min(len(cand["codes"]), len(ms["codes"]))
+                if smaller_size > 0 and (len(inter) / smaller_size) >= OVERLAP_THRESHOLD:
+                    # 머지: 작은 쪽을 큰 쪽 또는 우선순위 좋은 쪽에 합침
+                    ms["codes"] |= cand["codes"]
+                    ms.setdefault("alt_themes", []).append(cand["theme"])
+                    absorbed = True
+                    break
+            if not absorbed:
+                merged_sectors.append({
+                    "theme": cand["theme"],
+                    "codes": cand["codes"],
+                    "alt_themes": [],
+                })
 
-        # ── 5. 섹터 후보 빌드 ──
+        # ── 5. 점수 계산 + 정렬 ──
         sector_candidates = []
-        for sig, theme_list in sig_to_themes.items():
-            theme_list.sort(key=_theme_priority)
-            rep_theme = theme_list[0]
+        for ms in merged_sectors:
+            codes = ms["codes"]
             members = []
-            for code in sig:
+            for code in codes:
+                if code not in top_stocks:
+                    continue
                 info = top_stocks[code]
                 members.append({
                     "code": code,
@@ -41849,20 +41907,22 @@ def _build_sectors_from_theme_pool() -> None:
                     "price": info["price"],
                     "vol_ratio": info["vol_ratio"],
                 })
+            if len(members) < 2:
+                continue
             members.sort(key=lambda x: -x["change_rate"])
             avg_rate = sum(m["change_rate"] for m in members) / len(members)
             if avg_rate <= 0:
                 continue
             score = round(len(members) * avg_rate, 2)
             sector_candidates.append({
-                "theme": rep_theme,
+                "theme": ms["theme"],
                 "leader": members[0],
                 "followers": members[1:8],
                 "score": score,
                 "avg_rate": round(avg_rate, 2),
                 "count": len(members),
-                "source": "stock_first_v178_4",
-                "alt_themes": theme_list[1:5],  # 대안 theme 5개까지 기록 (디버그)
+                "source": "stock_first_v178_6",
+                "alt_themes": ms.get("alt_themes", [])[:5],
             })
 
         if not sector_candidates:
@@ -41892,12 +41952,12 @@ def _build_sectors_from_theme_pool() -> None:
                 "sent_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
                 "themes": [s["theme"] for s in merged],
                 "sectors": merged,
-                "source": "stock_first_v178_4",
+                "source": "stock_first_v178_6",
             }
             _save_market_leader_state(state)
-            _log_info_msg(f"  📊 [섹터 v178.4] {len(top_sectors)}개 빌드 | top={top_sectors[0].get('theme','')} ({top_sectors[0].get('count',0)}종목, avg{top_sectors[0].get('avg_rate',0):+.1f}%)")
+            _log_info_msg(f"  📊 [섹터 v178.6] {len(top_sectors)}개 빌드 | top={top_sectors[0].get('theme','')} ({top_sectors[0].get('count',0)}종목, avg{top_sectors[0].get('avg_rate',0):+.1f}%)")
         except Exception as _se:
-            _swallow_exception(_se, "sector_v4:save_state")
+            _swallow_exception(_se, "sector_v6:save_state")
     except Exception as e:
         _log_error("_build_sectors_from_theme_pool", e)
 
