@@ -3,10 +3,21 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.2
+버전: v178.3
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.3 (2026-05-21): 의미없는 동적 테마 일괄 정리 + carry 종목 허위 도달시간 정리
+    [#11] _register_emergent_issue_theme 필터 키워드 확장:
+          숫자+선 (7800선/코스피1만), 특징주/이슈주/관심종목, 매경 자이앤트 등 추가
+    [#12] load_dynamic_themes 로드 시점에 #7/#11 필터 일괄 적용 → 기존 의미없는 테마 정리 + 파일 즉시 반영
+          이유: v178.2 #7 필터는 새 생성만 차단, dynamic_themes.json에 저장된 기존 항목 그대로 로드되어
+                대시보드 SECTOR LIST에 "신규이슈·모멘텀 부각" 등 잔존
+    [#13] _load_entry_watch_active carry 종목 허위 entry_hit_time 정리:
+          detect_date < today + entry_hit_time이 today 패턴이면 entry_hit/hit_time/hit_price/hit_date/hit_clock 정리
+          이유: 어제 detect된 종목이 오늘 cur_price >= e_price 만족 시 _sync_watch_entry_hit_from_price가
+                자동으로 entry_hit=True + 현재시간 hit_time 박음 → "현대오토에버 05/21 14:37 허위 도달" 표시
+
 - v178.2 (2026-05-21): 다중 결함 일괄 패치 — run_scan 블로킹/종가매매 catchup/도달 허위표시/노이즈 차단
     [#1] run_price_first_scan _leader_job → _threaded_leader_job
          이유: 단일 스레드 schedule 라이브러리에서 run_scan이 30+분 블로킹 →
@@ -11355,6 +11366,25 @@ def _load_entry_watch_active() -> None:
             watch.setdefault("entry_reference_time", "")
             watch.setdefault("entry_reference_price", 0)
             watch["entry_watch_state"] = "active"
+            # v178.3 [#13]: carry 이월 종목의 허위 entry_hit_time 정리
+            # 이전 _sync_watch_entry_hit_from_price + v177.13 #AA-2 부작용:
+            # 어제 detect된 종목이 오늘 cur_price >= e_price 만족 시 entry_hit=True + 현재시간 hit_time 기록 →
+            # 실제 entry_price 도달 이벤트 없는데 "오늘 14:37 도달" 등 허위 표시.
+            # 수정: detect_date < today + entry_hit_time이 today 패턴이면 정리 (실제 도달은 detect_date에 발생해야 정상)
+            try:
+                _today_str = _now_kst().strftime("%Y-%m-%d")
+                _detect_date_str = str(watch.get("detect_date") or watch.get("first_detect_date") or "")[:10]
+                _eht = str(watch.get("entry_hit_time") or "")
+                if _detect_date_str and _detect_date_str < _today_str and _eht.startswith(_today_str):
+                    # carry 종목인데 hit_time이 오늘 → 허위 가능성 높음, 정리
+                    watch["entry_hit"] = False
+                    watch.pop("entry_hit_time", None)
+                    watch.pop("entry_hit_price", None)
+                    watch.pop("entry_hit_date", None)
+                    watch.pop("entry_hit_clock", None)
+                    watch["entry_hit_locked"] = False
+            except Exception as _ce:
+                _swallow_exception(_ce, "v178.3:carry_hit_purge")
             restored[str(key)] = watch
         _entry_watch = restored
         if raw != restored:
@@ -20751,6 +20781,37 @@ def load_dynamic_themes():
             k: v for k, v in data.items()
             if now_ts - float(v.get("ts", 0) or 0) < _theme_ttl(v)
         }
+        # v178.3 [#12]: 의미없는 키워드 테마 일괄 정리 (#7/#11 필터를 기존 cache에도 적용)
+        try:
+            import re as _re_clean
+            _BLOCK_TOKENS = ("만원", "노무라", "하이닉스 400", "59만", "코스피 1만", "특징주", "이슈주", "관심종목")
+            _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각", "매경 자이앤트")
+            _purged_count = 0
+            for _k in list(_dynamic_theme_map.keys()):
+                _v = _dynamic_theme_map.get(_k, {})
+                _desc = str(_v.get("desc", "") or "")
+                _desc_norm = _desc.lower().strip()
+                _should_purge = False
+                if len(_desc_norm) <= 2:
+                    _should_purge = True
+                elif _re_clean.search(r"\d[,\d]*\s*선|코스피\s*\d|코스닥\s*\d", _desc):
+                    _should_purge = True
+                elif any(_t in _desc for _t in _BLOCK_TOKENS):
+                    _should_purge = True
+                elif any(_t in _desc for _t in _GENERIC_TERMS):
+                    _should_purge = True
+                if _should_purge:
+                    _dynamic_theme_map.pop(_k, None)
+                    _purged_count += 1
+            if _purged_count > 0:
+                _log_info_msg(f"  🧹 [v178.3] 의미없는 동적 테마 {_purged_count}개 정리 완료")
+                # 파일에도 즉시 반영
+                try:
+                    _write_json_atomic(DYNAMIC_THEME_FILE, {k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()}, indent=2)
+                except Exception as _we:
+                    _swallow_exception(_we, "v178.3:theme_purge_write")
+        except Exception as _pe:
+            _swallow_exception(_pe, "v178.3:theme_purge")
         if _dynamic_theme_map:
             _log_info_msg(f"  📂 동적 테마 {len(_dynamic_theme_map)}개 복원")
     except Exception as e:
@@ -34059,16 +34120,20 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
     theme_key_raw = str(issue.get("theme_key", "") or "").strip()
     if not theme or not theme_key_raw:
         return
-    # v178.2 [#7 fix]: 의미없는 단일/일반 키워드 + 종목명·증권사 혼합 키워드 차단 (동적 테마 인플레이션 차단)
+    # v178.2 [#7] + v178.3 [#11]: 의미없는 단일/일반 키워드 + 종목명·증권사 혼합 차단
     _theme_norm = theme.lower().strip()
     if len(_theme_norm) <= 2:  # "ai" 등 너무 짧은 키워드 차단
         return
+    # v178.3 #11: 코스피/지수 단어 차단 ("7800선", "7,800선", "코스피 1만 1000" 등)
+    import re as _re_blk
+    if _re_blk.search(r"\d[,\d]*\s*선|코스피\s*\d|코스닥\s*\d", theme):
+        return
     # 종목명+증권사 패턴 차단 ("59만원·하이닉스 400만원…노무라" 같은 의미 모호 키워드)
-    _BLOCK_TOKENS = ("만원", "노무라", "하이닉스 400", "59만", "코스피 1만")
+    _BLOCK_TOKENS = ("만원", "노무라", "하이닉스 400", "59만", "코스피 1만", "특징주", "이슈주", "관심종목")
     if any(_t in theme for _t in _BLOCK_TOKENS):
         return
     # 일반 시장 코멘트성 표현 차단
-    _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각")
+    _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각", "매경 자이앤트")
     if any(_t in theme for _t in _GENERIC_TERMS):
         return
     try:
