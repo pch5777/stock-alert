@@ -3,10 +3,25 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v177.16
+버전: v178.0
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.0 (2026-05-21): 본질 재설계 — 임계값 미세조정 폐기, sector-first 빌더 + 누락 종목 강제 편입 + 종가강세 익일 시드
+    근거: signal_log 통계 — 오늘 신호 18건 중 NEAR_UPPER 9건(50%) 진입 불가 노이즈. 11개 상한가 중 6개 후보 풀 미진입.
+          어제 actionable 21건 vs 오늘 신호 매칭 0/21 = 시나리오 → 익일 carry 시스템 사실상 실패.
+    [#5] 워치독 28% 필터 삭제 — 상한가급도 candidate_miss 진단 포함 (사각지대 차단)
+    [#6] 워치독 candidate_miss 임계값 override 폐기 — _force_inject_missing_candidates로 교체 (누락 종목 직접 강제 편입)
+    [#7] NEAR_UPPER 알람 발송 차단 — 진입 불가 노이즈 제거 (signal_log 기록은 유지)
+    [#1] sector-first 빌더 `_build_sectors_from_theme_pool` 신설 → _dashboard_realtime_loop 호출 교체
+         - THEME_MAP + _dynamic_theme_map 246개 사전풀 기반 점수 = 매칭종목수 × 평균등락률 → 상위 12
+         - 기존 종목→섹터 추론 + 3종목/3% 임계값 폐기 (11개 상한가 11개 섹터 분산 시 모두 미달)
+    [#1 보강] SURGE_VELOCITY volume-rank cap 30 → 50 확장
+    [#1 안전망] 15분 주기 `_force_inject_missing_candidates` 정기 호출 — 워치독 의존 차단
+    [#4] 종가강세 익일 시드 `_build_next_open_seed_v178` + `_seed_dynamic_candidates_from_v178_next_open` 신설
+         - 어제 SURGE/MID_PULLBACK/EARLY_DETECT 신호 종목 중 등락률 ≥ +5% → 다음날 _dynamic_candidates 사전 시드
+         - 기존 build_next_open_watchlist 의존도 ↓ (매칭 0% 사실상 미작동)
+
 - v177.16 (2026-05-21): 장시작 포착 지연 + NXT 오전 섹터 빈값 + 단일종목 섹터 1위 해소
     [#AE] _run_scan_burst_window refresh 동기→백그라운드 (장시작 0~2분 포착 실패 해소)
           이유: 첫 09:00 burst 시 동기 refresh_dynamic_candidates → KIS 6개 API 60~120초 블로킹 → run_scan 지연
@@ -5844,18 +5859,18 @@ def _watchdog_apply_relax(main_reason: str) -> list:
             _watchdog_relaxed_until = time.time() + relax_sec
             changes.append(f"min_score_normal {old_n} → {new_n} (호가차단 완화, {_WATCHDOG_RELAX_MIN}분 후 복원)")
     elif main_reason == "candidate_miss":
-        # v161.27: 파라미터로 부분 완화 가능한 항목 즉시 적용
-        # ① RANK_SESSION_TOP_N 일시 확대 → 더 많은 종목이 랭킹후보로 편입
-        old_top_n = int(_dynamic.get("rank_session_top_n_override", 0) or RANK_SESSION_TOP_N)
-        new_top_n = min(old_top_n + 50, 150)
-        _dynamic["rank_session_top_n_override"] = new_top_n
-        # ② UNIVERSE_MAX_PER_THEME 일시 완화 → 테마 내 후순위 종목도 편입
-        old_theme_cap = int(_dynamic.get("universe_max_per_theme_override", 0) or 8)
-        new_theme_cap = min(old_theme_cap + 4, 15)
-        _dynamic["universe_max_per_theme_override"] = new_theme_cap
-        _watchdog_relaxed_until = time.time() + relax_sec
-        changes.append(f"🔧 candidate_miss 완화: rank_top_n {old_top_n}→{new_top_n}, theme_cap {old_theme_cap}→{new_theme_cap} ({_WATCHDOG_RELAX_MIN}분 후 복원)")
-        changes.append("🔴 구조 문제 병존: fallback 체인 점검 필요 (코드 수정 요망)")
+        # v178.0 [#6 교체]: 임계값 override 폐기 → 누락 종목 직접 강제 편입
+        # 이전: rank_session_top_n_override / universe_max_per_theme_override 임시 조정 → 효과 0%
+        # 신규: _force_inject_missing_candidates() = 외부상승 리스트 vs _dynamic_candidates 비교 → 누락 종목 즉시 후보 풀 추가
+        try:
+            _injected = _force_inject_missing_candidates(max_inject=50)
+            if _injected > 0:
+                changes.append(f"🔧 [v178] candidate_miss 누락 종목 {_injected}건 후보 풀 강제 편입")
+            else:
+                changes.append("🔴 candidate_miss 감지 — 외부상승 리스트와 후보 풀 모두 비어있음 (소스 점검 필요)")
+        except Exception as _fie:
+            _swallow_exception(_fie, "watchdog:force_inject")
+            changes.append("🔴 candidate_miss 감지 — force_inject 실행 실패")
     elif main_reason == "기타":
         # 원인 불명 — min_score만 소폭 완화
         old_n = int(_dynamic.get("min_score_normal", 56))
@@ -5895,6 +5910,7 @@ def _load_intraday_watchdog_rising() -> list:
         market=market_basis,
     )
     # v165.38 [A]: 알람 불가 종목 제거 → candidate_miss 오판 방지
+    # v178.0 [#5]: 28% 필터 삭제 — 상한가급 종목도 워치독 진단에 포함 (사각지대 차단)
     filtered = []
     for r in raw:
         _nm = str(r.get("name", "") or "").replace(" ", "")
@@ -5905,9 +5921,8 @@ def _load_intraday_watchdog_rising() -> list:
         # 스팩주
         if "스팩" in _nm or "SPAC" in _nm.upper():
             continue
-        # 상한가급 (≥28%): 게이트에서 선차단이 정상 → 워치독 리스트 제외
-        if _cr >= 28.0:
-            continue
+        # v178.0 [#5] 폐기: 28% 이상 필터 제거 — 상한가급 종목도 누락 진단 대상
+        # 이유: 11개 상한가 종목 중 6개 후보 풀 미진입 = 워치독이 진단조차 못 함
         filtered.append(r)
     return filtered[:WATCHDOG_RANK_TOP_N]
 def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
@@ -31367,6 +31382,11 @@ def _build_send_alert_compact_text(signal: dict, visuals: dict) -> str:
     return f"{visuals['lvl_icon']}{visuals['emoji']} {visuals['name_dot']}<b>{signal['name']}</b>  {signal['change_rate']:+.1f}%  {signal['score']}점 ({_signal_total_score_label(signal['score'])}){visuals['nxt_badge']}\n현재가 {price:,}원"
 def send_alert(signal: dict):
     global _last_external_alert_ts
+    # v178.0 [#7]: NEAR_UPPER 알람 발송 차단 — 진입 불가 신호 노이즈 제거
+    # 이유: signal_log 18건 중 9건(50%) NEAR_UPPER, 모두 +25% 이상 = 진입 무의미
+    # signal_log 기록은 유지(분석용), 텔레그램 발송만 차단
+    if signal.get("signal_type") == "NEAR_UPPER":
+        return
     if not _ensure_signal_actionability(signal, source_label="일반 포착"):
         return
     signal["name"] = _resolve_stock_name(signal.get("code", ""), signal.get("name", ""))
@@ -41378,13 +41398,16 @@ def _dashboard_realtime_loop() -> None:
                 time.sleep(30)
                 continue
             # 60초마다 섹터 재산출
+            # v178.0 [#1 교체]: _build_realtime_sectors_from_kis(임계값 분산 빌더) → _build_sectors_from_theme_pool(테마풀 기반)
+            # 이유: 종목→섹터 추론 + 3종목/3% 임계값 = 11개 상한가 11개 섹터 분산 시 모두 미달
+            # 신규: THEME_MAP + _dynamic_theme_map 246개 사전풀 기반 → 점수 = 매칭종목수 × 평균등락률
             if now - _last_sector_build >= _SECTOR_BUILD_INTERVAL:
                 try:
-                    _build_realtime_sectors_from_kis()
+                    _build_sectors_from_theme_pool()
                     _last_sector_build = now
                 except Exception as _be:
                     _swallow_exception(_be, "rt_loop:sector_build")
-                    _last_sector_build = now  # 실패해도 다음 사이클까지 대기
+                    _last_sector_build = now
             # 10초마다 대시보드 JSON 갱신 + SSE push
             try:
                 _push_dashboard_json()
@@ -41513,6 +41536,314 @@ def _detect_and_send_sector_breadth_alert() -> None:
                 _swallow_exception(_be, "sector_breadth:dashboard_merge")
     except Exception as e:
         _swallow_exception(e)
+
+# ════════════════════════════════════════════════════════════
+# v178.0 [#1 교체] sector-first 빌더 — 테마풀 기반 (기존 _build_realtime_sectors_from_kis 대체 예정)
+# ════════════════════════════════════════════════════════════
+def _build_sectors_from_theme_pool() -> None:
+    """v178.0 [#1 교체]: sector-first 섹터 빌더.
+
+    기존 _build_realtime_sectors_from_kis(종목→섹터 추론 + 3종목/3% 임계값) 폐기.
+
+    동작:
+      1. THEME_MAP (하드코딩) + _dynamic_theme_map (246개) 통합 풀
+      2. KIS fluctuation_rank(KRX+NXT) + snap 캐시에서 현재가/등락률 수집 → rate_map
+      3. 각 테마: 매칭된 종목 ≥ 2개 + 양수 등락률만 점수화
+      4. 점수 = 매칭종목수 × 평균등락률 → 상위 12개 테마 채택
+      5. market_leader_state.sectors 저장
+
+    임계값 폐기 → 상대순위 기반. 단일종목 섹터 자동 차단(≥2 매칭 필요).
+    """
+    if not is_any_market_open():
+        return
+    try:
+        # 1. 테마풀 통합 (THEME_MAP + _dynamic_theme_map)
+        all_themes = {}
+        _BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+        import re as _re_th
+        _AUTO_RE = _re_th.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
+        for tk, ti in THEME_MAP.items():
+            if any(_p in tk for _p in _BLOCK): continue
+            if _AUTO_RE.search(tk): continue
+            stocks = ti.get("stocks", [])
+            if len(stocks) >= 2:
+                all_themes[tk] = (stocks, "고정테마")
+        for tk, ti in _dynamic_theme_map.items():
+            desc = ti.get("desc", tk)
+            if any(_p in desc for _p in _BLOCK): continue
+            if _AUTO_RE.search(desc): continue
+            stocks = ti.get("stocks", [])
+            if len(stocks) >= 2 and desc not in all_themes:
+                all_themes[desc] = (stocks, "동적테마")
+        if not all_themes:
+            return
+
+        # 2. 현재가/등락률 rate_map 빌드 (KIS fluctuation_rank + snap 캐시)
+        rate_map: dict = {}
+        try:
+            for r in (get_fluctuation_rank("J", "0") or []):
+                code = normalize_stock_code(r.get("code", "") or "")
+                if not code: continue
+                rate_map[code] = {
+                    "change_rate": safe_float(r.get("change_rate", 0), 0.0),
+                    "price": safe_int(r.get("price", 0), 0),
+                    "name": str(r.get("name", code) or code),
+                    "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
+                }
+        except Exception as _e1:
+            _swallow_exception(_e1, "sector_theme_pool:krx_rank")
+        try:
+            for r in (get_fluctuation_rank("NX", "0") or []):
+                code = normalize_stock_code(r.get("code", "") or "")
+                if not code or code in rate_map: continue
+                rate_map[code] = {
+                    "change_rate": safe_float(r.get("change_rate", 0), 0.0),
+                    "price": safe_int(r.get("price", 0), 0),
+                    "name": str(r.get("name", code) or code),
+                    "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
+                }
+        except Exception as _e2:
+            _swallow_exception(_e2, "sector_theme_pool:nxt_rank")
+        try:
+            for _theme_key, ti_pair in list(all_themes.items()):
+                stocks_list, _src = ti_pair
+                for c, _n in stocks_list:
+                    c = normalize_stock_code(c)
+                    if not c or c in rate_map:
+                        continue
+                    snap = _get_snap(c)
+                    if not snap:
+                        continue
+                    cr = snap.get("change_rate")
+                    if cr is None:
+                        continue
+                    rate_map[c] = {
+                        "change_rate": float(cr),
+                        "price": safe_int(snap.get("price", 0), 0),
+                        "name": str(snap.get("name", c) or c),
+                        "vol_ratio": safe_float(snap.get("vol_ratio", 0), 0.0),
+                    }
+        except Exception as _e3:
+            _swallow_exception(_e3, "sector_theme_pool:snap_merge")
+        if not rate_map:
+            return
+
+        # 3. 각 테마 점수화 — 매칭 ≥ 2개 + 양수 평균
+        sector_scores = []
+        for theme, (stocks, src_label) in all_themes.items():
+            members = []
+            for c, n in stocks:
+                c = normalize_stock_code(c)
+                if c and c in rate_map and rate_map[c]["change_rate"] > 0:
+                    info = rate_map[c]
+                    nm = info.get("name") or n or c
+                    if _looks_like_placeholder_stock_name(c, nm):
+                        nm = _resolve_stock_name(c, "") or n or c
+                    members.append({
+                        "code": c,
+                        "name": nm,
+                        "change_rate": info["change_rate"],
+                        "price": info.get("price", 0),
+                        "vol_ratio": info.get("vol_ratio", 0),
+                    })
+            if len(members) < 2:
+                continue
+            avg_rate = sum(m["change_rate"] for m in members) / len(members)
+            if avg_rate <= 0:
+                continue
+            sorted_members = sorted(members, key=lambda x: -x["change_rate"])
+            score = round(len(members) * avg_rate, 2)
+            sector_scores.append({
+                "theme": theme,
+                "leader": sorted_members[0],
+                "followers": sorted_members[1:8],
+                "score": score,
+                "avg_rate": round(avg_rate, 2),
+                "count": len(members),
+                "source": src_label,
+            })
+
+        # 4. 점수 내림차순 → 상위 12개
+        sector_scores.sort(key=lambda x: -x["score"])
+        top_sectors = sector_scores[:12]
+        if not top_sectors:
+            return
+
+        # 5. market_leader_state 저장
+        try:
+            prev = _read_market_leader_state() or {}
+            prev_sectors = list(prev.get("sectors", []) or [])
+            new_theme_set = {s["theme"] for s in top_sectors}
+            merged = list(top_sectors)
+            for ps in prev_sectors:
+                t = str(ps.get("theme", "") or "")
+                if t and t not in new_theme_set:
+                    merged.append(ps)
+            merged = merged[:12]
+            state = {
+                "sent_at": _now_kst().strftime("%Y%m%d-%H%M%S"),
+                "themes": [s["theme"] for s in merged],
+                "sectors": merged,
+                "source": "theme_pool_v178",
+            }
+            _save_market_leader_state(state)
+        except Exception as _se:
+            _swallow_exception(_se, "sector_theme_pool:save_state")
+    except Exception as e:
+        _log_error("_build_sectors_from_theme_pool", e)
+
+def _force_inject_missing_candidates(max_inject: int = 50) -> int:
+    """v178.0 [#1 보강]: 외부 상승 리스트 vs _dynamic_candidates 비교 →
+    누락 종목을 _dynamic_candidates에 즉시 강제 편입.
+
+    기존 워치독 candidate_miss 처리는 임계값(rank_session_top_n_override) 조정만 → 효과 0%.
+    이제는 누락 종목 코드 자체를 직접 강제 추가 → 다음 스캔에서 분석/포착 가능.
+
+    호출 시점: 워치독 candidate_miss 감지 시 + 주기적(15분) 안전망.
+    """
+    if not is_any_market_open():
+        return 0
+    try:
+        # 1. 외부 상승 리스트 수집 (네이버 상승 + 다중소스)
+        external = []
+        try:
+            external = _fetch_external_rank_top(
+                min_change=3.0, top_n=100, market=_resolve_watchdog_market_basis()
+            ) or []
+        except Exception as _fe:
+            _swallow_exception(_fe, "force_inject:fetch_external")
+        if not external:
+            return 0
+        # 2. _dynamic_candidates에 없는 종목 추출
+        existing = set()
+        try:
+            for c in list(_dynamic_candidates.keys() if isinstance(_dynamic_candidates, dict) else []):
+                ck = normalize_stock_code(c)
+                if ck: existing.add(ck)
+        except Exception as _ee:
+            _swallow_exception(_ee, "force_inject:scan_existing")
+        missing = []
+        for r in external:
+            c = normalize_stock_code(r.get("code", "") or "")
+            if not c or c in existing:
+                continue
+            nm = str(r.get("name", "") or "").replace(" ", "")
+            # 우선주/스팩 제외 (포지션 진입 불가)
+            if re.search(r'우[B0-9]*$', nm):
+                continue
+            if "스팩" in nm or "SPAC" in nm.upper():
+                continue
+            missing.append({
+                "code": c,
+                "name": str(r.get("name", c) or c),
+                "change_rate": safe_float(r.get("change_rate", 0), 0.0),
+                "desc": "v178_force_inject",
+            })
+        if not missing:
+            return 0
+        # 3. _dynamic_candidates에 직접 추가 (최대 max_inject개)
+        added = 0
+        for m in missing[:max_inject]:
+            try:
+                _dynamic_candidates[m["code"]] = {
+                    "name": m["name"],
+                    "desc": m["desc"],
+                    "added_ts": time.time(),
+                    "v178_force": True,
+                    "src_change_rate": m["change_rate"],
+                }
+                added += 1
+            except Exception:
+                continue
+        if added > 0:
+            _log_info_msg(f"  🔧 [v178 force_inject] 누락 종목 {added}건 후보 풀 강제 편입 (외부상승 vs _dynamic_candidates 비교)")
+        return added
+    except Exception as e:
+        _log_error("_force_inject_missing_candidates", e)
+        return 0
+
+def _build_next_open_seed_v178(max_codes: int = 30) -> list:
+    """v178.0 [#4 교체]: 종가강세 익일 시드 — 어제 강세 종목 다음날 후보 자동 편입.
+
+    기존 시나리오 → 익일 carry 매칭 0% (signal_log 검증) → 폐기.
+
+    신규 룰:
+      - signal_log 어제(detect_date) 신호 종목
+      - 신호 타입 SURGE / MID_PULLBACK / EARLY_DETECT (NEAR_UPPER 제외 — 진입 불가 노이즈)
+      - 첫 신호 시점 등락률 ≥ +5% (의미 있는 강세)
+      - 최대 30개 (change_rate 내림차순)
+
+    호출 시점: 다음날 봇 시작 시 _dynamic_candidates 사전 시드. on_market_close에서도 호출 가능.
+    """
+    try:
+        from datetime import timedelta as _td
+        siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
+        if not isinstance(siglog, dict) or not siglog:
+            return []
+        yesterday = (_now_kst() - _td(days=1)).strftime("%Y%m%d")
+        valid_types = {"SURGE", "MID_PULLBACK", "EARLY_DETECT"}
+        candidates: dict = {}
+        for _k, v in siglog.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get("detect_date") != yesterday:
+                continue
+            st = str(v.get("signal_type", "") or "").upper()
+            if st not in valid_types:
+                continue
+            cr = safe_float(v.get("change_at_detect", 0), 0.0)
+            if cr < 5.0:
+                continue
+            c = normalize_stock_code(v.get("code", "") or "")
+            if not c:
+                continue
+            # 우선주/스팩 제외
+            nm = str(v.get("name", "") or "").replace(" ", "")
+            if re.search(r'우[B0-9]*$', nm):
+                continue
+            if "스팩" in nm or "SPAC" in nm.upper():
+                continue
+            # 같은 코드 여러 신호면 최대 등락률 유지
+            if c not in candidates or candidates[c]["yesterday_change"] < cr:
+                candidates[c] = {
+                    "code": c,
+                    "name": v.get("name", c) or c,
+                    "yesterday_change": cr,
+                    "yesterday_signal_type": st,
+                }
+        result = sorted(candidates.values(), key=lambda x: -x["yesterday_change"])[:max_codes]
+        return result
+    except Exception as e:
+        _log_error("_build_next_open_seed_v178", e)
+        return []
+
+def _seed_dynamic_candidates_from_v178_next_open() -> int:
+    """v178.0 [#4 교체]: 봇 시작 시 _build_next_open_seed_v178 결과를 _dynamic_candidates에 사전 시드."""
+    try:
+        seeds = _build_next_open_seed_v178(max_codes=30)
+        if not seeds:
+            return 0
+        added = 0
+        for s in seeds:
+            c = s["code"]
+            if c in _dynamic_candidates:
+                continue
+            try:
+                _dynamic_candidates[c] = {
+                    "name": s["name"],
+                    "desc": f"v178_next_open_seed [어제 {s['yesterday_signal_type']} +{s['yesterday_change']:.1f}%]",
+                    "added_ts": time.time(),
+                    "v178_next_open_seed": True,
+                }
+                added += 1
+            except Exception:
+                continue
+        if added > 0:
+            _log_info_msg(f"  🌅 [v178 next_open_seed] 어제 강세 종목 {added}건 후보 풀 사전 시드")
+        return added
+    except Exception as e:
+        _log_error("_seed_dynamic_candidates_from_v178_next_open", e)
+        return 0
 
 def send_premarket_risk_update_if_changed():
     if is_holiday():
@@ -44644,7 +44975,9 @@ def _run_surge_velocity_scan() -> None:
                         "FID_TRGT_EXLS_CLS_CODE": "000000",
                         "FID_INPUT_PRICE_1": "1000",
                         "FID_INPUT_PRICE_2": "",
-                        "FID_VOL_CNT": "30",
+                        # v178.0 [#4 보강]: volume-rank cap 30 → 50 확장 (KIS 한도 내)
+                        # 이유: 30건 cap이 매번 같은 종목 점유 → 신규 종목 진입 차단
+                        "FID_VOL_CNT": "50",
                         "FID_INPUT_DATE_1": "",
                     },
                 )
@@ -44926,6 +45259,12 @@ if __name__ == "__main__":
     _load_dynamic_params()          # ★ 재시작 후 조정된 파라미터 복원
     _load_youtube_gemini_cache()    # v162.1: 재시작 후 YouTube Gemini 캐시 복원
     _load_gemini_grounding_cache()  # v163.6: 재시작 후 grounding 재료 캐시 복원
+    # v178.0 [#4 교체]: 종가강세 익일 시드 — 어제 SURGE/MID_PULLBACK +5%↑ 종목 사전 편입
+    # 이전: build_next_open_watchlist → carry 등록 매칭 0% → 폐기 후 신규 룰 도입
+    try:
+        _seed_dynamic_candidates_from_v178_next_open()
+    except Exception as _ns_e:
+        _log_warn_msg(f"⚠️ v178 next_open_seed 실패: {_ns_e}")
     if _try_acquire_leader_lock():
         if _enforce_runtime_version_lock(notify=True):
             _send_startup_banner_once()
@@ -44986,6 +45325,8 @@ if __name__ == "__main__":
     schedule.every(1).minutes.do(lambda: threading.Thread(target=_push_dashboard_json, daemon=True).start() if is_any_market_open() else None)
     schedule.every(10).minutes.do(_leader_job(run_major_investor_sector_scan))  # v165.35: 메이저 수급 섹터 흐름
     schedule.every(15).minutes.do(_leader_job(run_intraday_watchdog))  # v83: 장중 워치독
+    # v178.0 [#1 안전망]: 15분 주기로 누락 종목 강제 편입 (워치독 candidate_miss 의존 안 하고 정기 보강)
+    schedule.every(15).minutes.do(_leader_job(lambda: _force_inject_missing_candidates(max_inject=30)))
     schedule.every(15).minutes.do(_leader_job(_run_pullback_wait_monitor))  # v165.23: 눌림 대기 감시
     schedule.every().day.at("15:45").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest()))
     schedule.every().day.at("20:10").do(_leader_job(lambda: None if is_holiday() else _send_market_scenario_digest(force=True)))
