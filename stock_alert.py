@@ -3,10 +3,23 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.4
+버전: v178.5
 날짜: 2026-05-21
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.5 (2026-05-21): v178.4 stock-first 운영 검증 후 발견된 결함 3종 추가 패치
+    [#15-A] _sector_cache "업종미상" / "기타" / "미분류" / "unknown" 차단
+            증상: 사진에 "업종미상 +21.70%" 섹터 표시. _sector_cache의 default 값이 그대로 theme 됨.
+    [#15-B] "신규이슈·ai" 등 짧은 키워드 필터 강화
+            증상: theme="신규이슈·ai" (7자) → 기존 len(theme)<=2 필터 통과
+            수정: 신규이슈· prefix 뒤 keyword 부분 길이 ≤3자 차단 + raw_term 길이도 동시 체크
+    [#15-C] auto_discover ("X 연관 자동발굴 테마") 차단
+            증상: "LS ELECTRIC 연관 자동발굴 테마" 표시. v178.4가 _AUTO_RE를 폐기하면서 같이 통과됨.
+            수정: 차단 키워드에 "자동발굴", "auto_discover" 추가
+                  v178.4가 의도한 "연관" 일반 차단 폐기는 유지, 구체적 패턴만 차단
+    [#15-D] _register_emergent_issue_theme + load_dynamic_themes 둘 다 강화 키워드 적용
+            "집들이 마케팅", "주목", "관심", "테마주" 등 일반 시장 코멘트 추가 차단
+
 - v178.4 (2026-05-21): _build_sectors_from_theme_pool 재설계 (theme-first → stock-first)
     [#14] 등락률 상위 종목 누락 결함 해소
           기존 theme-first 결함:
@@ -20800,11 +20813,13 @@ def load_dynamic_themes():
             k: v for k, v in data.items()
             if now_ts - float(v.get("ts", 0) or 0) < _theme_ttl(v)
         }
-        # v178.3 [#12]: 의미없는 키워드 테마 일괄 정리 (#7/#11 필터를 기존 cache에도 적용)
+        # v178.3 [#12] + v178.5 [#15]: 의미없는 키워드 테마 일괄 정리
         try:
             import re as _re_clean
             _BLOCK_TOKENS = ("만원", "노무라", "하이닉스 400", "59만", "코스피 1만", "특징주", "이슈주", "관심종목")
-            _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각", "매경 자이앤트")
+            _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각",
+                              "매경 자이앤트", "집들이 마케팅", "주목", "관심", "테마주")
+            _BLOCK_PREFIX = ("자동발굴", "auto_discover")
             _purged_count = 0
             for _k in list(_dynamic_theme_map.keys()):
                 _v = _dynamic_theme_map.get(_k, {})
@@ -20819,11 +20834,18 @@ def load_dynamic_themes():
                     _should_purge = True
                 elif any(_t in _desc for _t in _GENERIC_TERMS):
                     _should_purge = True
+                elif any(_p in _desc for _p in _BLOCK_PREFIX) or any(_p in _k for _p in _BLOCK_PREFIX):
+                    _should_purge = True
+                # v178.5: "신규이슈·" 뒤 키워드 ≤3자 차단 ("신규이슈·ai" 등)
+                elif "신규이슈·" in _desc:
+                    _kw = _desc.split("신규이슈·", 1)[-1].strip()
+                    if len(_kw) <= 3:
+                        _should_purge = True
                 if _should_purge:
                     _dynamic_theme_map.pop(_k, None)
                     _purged_count += 1
             if _purged_count > 0:
-                _log_info_msg(f"  🧹 [v178.3] 의미없는 동적 테마 {_purged_count}개 정리 완료")
+                _log_info_msg(f"  🧹 [v178.5] 의미없는 동적 테마 {_purged_count}개 정리 완료")
                 # 파일에도 즉시 반영
                 try:
                     _write_json_atomic(DYNAMIC_THEME_FILE, {k: {**v, "stocks": v.get("stocks", [])} for k, v in _dynamic_theme_map.items()}, indent=2)
@@ -34139,10 +34161,17 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
     theme_key_raw = str(issue.get("theme_key", "") or "").strip()
     if not theme or not theme_key_raw:
         return
-    # v178.2 [#7] + v178.3 [#11]: 의미없는 단일/일반 키워드 + 종목명·증권사 혼합 차단
+    # v178.2 [#7] + v178.3 [#11] + v178.5 [#15]: 의미없는 단일/일반 키워드 + 종목명·증권사 혼합 차단
     _theme_norm = theme.lower().strip()
-    if len(_theme_norm) <= 2:  # "ai" 등 너무 짧은 키워드 차단
+    # v178.5: raw_term(원본 키워드)와 theme suffix 둘 다 체크
+    _raw_term = str(issue.get("raw_term", "") or "").strip()
+    if len(_theme_norm) <= 2 or len(_raw_term) <= 2:  # "ai" 등 너무 짧은 키워드 차단
         return
+    # 신규이슈· prefix 뒤 keyword 부분 길이 체크 ("신규이슈·ai" 같은 케이스)
+    if "신규이슈·" in theme:
+        _kw_part = theme.split("신규이슈·", 1)[-1].strip()
+        if len(_kw_part) <= 3:
+            return
     # v178.3 #11: 코스피/지수 단어 차단 ("7800선", "7,800선", "코스피 1만 1000" 등)
     import re as _re_blk
     if _re_blk.search(r"\d[,\d]*\s*선|코스피\s*\d|코스닥\s*\d", theme):
@@ -34152,7 +34181,8 @@ def _register_emergent_issue_theme(code: str, name: str, issue: dict | None, tri
     if any(_t in theme for _t in _BLOCK_TOKENS):
         return
     # 일반 시장 코멘트성 표현 차단
-    _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각", "매경 자이앤트")
+    _GENERIC_TERMS = ("모멘텀 부각", "주주 반발", "노사", "강세 부각", "약세 부각", "급등 부각", "급락 부각", "매경 자이앤트",
+                      "집들이 마케팅", "주목", "관심", "테마주")
     if any(_t in theme for _t in _GENERIC_TERMS):
         return
     try:
@@ -41749,12 +41779,14 @@ def _build_sectors_from_theme_pool() -> None:
         except Exception as _e4:
             _swallow_exception(_e4, "sector_v4:dyn_theme_walk")
         # 2-3. _sector_cache (KIS 동업종 정보)
+        # v178.5 fix: 업종미상/기타/미분류 등 의미없는 default 값 제외
+        _SEC_CACHE_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목","업종미상","기타","기타업종","미분류","unknown")
         try:
             for code in list(top_stocks.keys()):
                 sec_info = _sector_cache.get(code)
                 if isinstance(sec_info, dict):
                     sec_name = str(sec_info.get("sector", "") or "").strip()
-                    if sec_name and not any(_p in sec_name for _p in ("ETF","ETN","선물","옵션","스팩","SPAC","관리종목")):
+                    if sec_name and not any(_p in sec_name for _p in _SEC_CACHE_BLOCK):
                         code_to_themes.setdefault(code, set()).add(sec_name)
         except Exception as _e5:
             _swallow_exception(_e5, "sector_v4:sector_cache_walk")
@@ -41766,14 +41798,28 @@ def _build_sectors_from_theme_pool() -> None:
                 theme_to_codes.setdefault(theme, set()).add(code)
 
         # ── 4. 같은 stock set 가진 theme dedup (signature 기반) ──
-        # 차단 키워드 가진 theme 제거 (ETF/관리종목 등 매장된 채로 들어옴)
-        _THEME_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+        # v178.5: 차단 키워드 확장 + 신규이슈 suffix 길이 체크 + 자동발굴 차단
+        _THEME_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열",
+                        "업종미상","기타업종","미분류","자동발굴","auto_discover")
+        # 신규이슈/groq_auto 등 prefix 뒤 keyword 길이 ≤ 2이면 차단 ("신규이슈·ai", "groq_auto_ai" 등)
+        import re as _re_st_block
+        _SHORT_KW_PAT = _re_st_block.compile(r"(?:신규이슈·|groq_auto_|issue_)\s*([^·\s_]{1,2})\s*$")
         sig_to_themes: dict = {}  # frozenset(codes) -> list of theme names
         for theme, codes in theme_to_codes.items():
             if len(codes) < 2:
                 continue
             if any(_p in theme for _p in _THEME_BLOCK):
                 continue
+            # v178.5: 신규이슈·짧은키워드 차단
+            if _SHORT_KW_PAT.search(theme):
+                continue
+            # v178.5: 한 글자 또는 일반 시장 코멘트성 신규이슈 차단
+            if "신규이슈·" in theme:
+                _kw = theme.split("신규이슈·", 1)[-1].strip()
+                if len(_kw) <= 3:  # "ai", "코스피" 등 너무 일반적
+                    continue
+                if any(_g in _kw for _g in ("부각", "주목", "관심", "특징주", "이슈주", "관심종목", "테마주")):
+                    continue
             sig = frozenset(codes)
             sig_to_themes.setdefault(sig, []).append(theme)
 
