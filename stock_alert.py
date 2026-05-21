@@ -3,10 +3,24 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v179.0
+버전: v179.1
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v179.1 (2026-05-22): WS 구독 커버리지 확대 — 등락률 상위 종목 자동 편입
+    [#21] v179.0 fast path가 _entry_watch/prewarm 종목만 커버 → 장 시작 새 종목 미구독
+    근본 결함:
+      - _ws_get_target_codes()가 entry_watch/prewarm/exec_setup만 반환
+      - 장 시작 시 새 종목이 움직여도 WS 미구독 → fast path 미발동
+      - 실제 41 슬롯 대부분 비어있어 활용 불가
+    수정:
+      - _ws_get_target_codes()에 4순위 추가: _fluctuation_rank_cache 상위 종목
+      - KRX("J") 상위 30개 + NXT("NX") 상위 30개 → 빈 슬롯 채움
+      - 등락률 캐시가 없으면 graceful skip (기존 동작 유지)
+    효과:
+      - WS 구독 풀 = watch/prewarm + 실시간 등락률 상위 종목
+      - 장 시작 직후 급등 종목 WS 구독 → fast path 즉시 발동 가능
+
 - v179.0 (2026-05-22): event-driven fast path (스캔 batch 우회) — 알람 latency 5분 → 5초
     [#20] 사용자 지적 — "12분만에 종목포착 됨 개선된게 전혀 없음"
     근본 결함:
@@ -12012,7 +12026,10 @@ def _ws_unsubscribe(ws, code: str) -> bool:
 
 
 def _ws_get_target_codes() -> list[str]:
-    """현재 구독 대상 종목 코드 리스트 반환 — _entry_watch + _exec_speed_prewarm 기반."""
+    """현재 구독 대상 종목 코드 리스트 반환 — _entry_watch + prewarm + 등락률 상위 종목.
+    v179.1: _fluctuation_rank_cache 상위 종목을 4순위로 추가 — 장 시작 직후
+    새 종목이 움직일 때 WS fast path가 즉시 발동하도록 커버리지 확대.
+    """
     targets = set()
     # 1순위: entry_watch 활성 종목
     try:
@@ -12036,6 +12053,27 @@ def _ws_get_target_codes() -> list[str]:
             code = normalize_stock_code(code)
             if code:
                 targets.add(code)
+    except Exception:
+        pass
+    # 4순위: 등락률 상위 종목 (v179.1 추가) — KRX/NXT 등락률 캐시에서 상위 N개
+    # WS_MAX_SUBSCRIPTIONS=41 슬롯 중 1~3순위 사용 후 나머지를 채움
+    _RANK_FILL_LIMIT = WS_MAX_SUBSCRIPTIONS  # 최대 41개 채우기
+    try:
+        rank_codes: list[str] = []
+        for _market_key in [("J", "0"), ("NX", "0")]:
+            cached = _fluctuation_rank_cache.get(_market_key) or []
+            for item in cached[:30]:  # 각 시장 상위 30개만 참조
+                code = normalize_stock_code(item.get("code", ""))
+                if code and code not in targets:
+                    rank_codes.append(code)
+        # 중복 제거 순서 유지
+        seen: set[str] = set()
+        for code in rank_codes:
+            if code not in seen and code not in targets:
+                seen.add(code)
+                targets.add(code)
+                if len(targets) >= _RANK_FILL_LIMIT:
+                    break
     except Exception:
         pass
     return list(targets)
