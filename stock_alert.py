@@ -3,10 +3,34 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.6
-날짜: 2026-05-21
+버전: v178.7
+날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.7 (2026-05-22): 워치독 자가 진단 정확도 ↑ + 미국시장 데이터 prewarm
+    [#17] _collect_intraday_watchdog_state: reasons={} default fallback 폐기
+          이전 결함: shadow_capture 비어있으면 무조건 main_reason="candidate_miss"
+                    → 실제는 run_scan 블로킹/스레드 이슈여도 candidate_miss로 오진
+                    → 봇이 발송한 "코드수정 요청" 알람이 4개 함수 점검 요청했지만 그 4개는 정상
+          수정:
+            - reasons={} 일 때 _dynamic_candidates 크기 + last_run_scan_ts 기반 분류
+            - candidate_count < 10 → "candidate_miss" (진짜 후보 풀 비어있음)
+            - last_scan_age > silence_sec → "scan_silent" (스캔 미실행)
+            - 그 외 → "analyze_pathway_silent" (analyze 단계 결함)
+          + _build_watchdog_code_change_request specs에 scan_silent/analyze_pathway_silent 추가
+          + run_scan() finally에 _last_run_scan_ts 갱신
+    [#18] 미국시장 데이터 prewarm + KIS ETF proxy fallback
+          이전 결함:
+            - 봇 재시작 시 _us_cache 비어있음 → 첫 Yahoo 호출 HTML 응답 → nasdaq_chg=0.0
+            - /us 명령 시 3회 재시도 모두 0.0 → "🌐 미국시장 데이터 수집 중" 알람 발송
+            - KIS 해외선물 API (_fetch_kis_futures_price) CME 미신청으로 비활성
+          수정:
+            - 봇 시작 시 백그라운드 thread로 get_us_market_signals() 1회 prewarm
+            - KIS overseas ETF proxy (QQQ=NASDAQ100, SPY=S&P500) fallback 추가
+              Yahoo+Stooq 모두 실패 시 → KIS HHDFS00000300으로 QQQ/SPY 가격 → prev_close 비교
+          한계:
+            - VIX/DXY/SOX/BTC는 KIS 미지원 (다른 fallback 없음)
+
 - v178.6 (2026-05-21): _build_sectors_from_theme_pool 로직 자체 재설계 (패치 누적 폐기)
     [#16] 사용자 지적 — "이것도 패치만하다가 문제는 계속돼. 로직자체를 바꿔야지"
     근본 원인:
@@ -5840,10 +5864,25 @@ def _build_watchdog_code_change_request(main_reason: str, reasons: dict, rising:
     specs = {
         "candidate_miss": {
             "title": "후보군 미포착",
-            "symptom": "외부 상승 종목은 있는데 후보군/포착 체인에 거의 안 올라옵니다.",
-            "inspect": ["_fetch_external_rank_top", "_rank_api_fallback", "build_stock_universe", "analyze"],
-            "route": "외부 상승 랭킹 → fallback 체인 → 유니버스 편입 → analyze 후보화",
-            "request": "fallback 체인/유니버스 편입/후보화 조건 코드 점검 필요",
+            "symptom": "외부 상승 종목은 있는데 후보군 자체에 거의 안 올라옵니다. (_dynamic_candidates 비어있음 확인됨)",
+            "inspect": ["refresh_dynamic_candidates", "_collect_market_rank_candidates", "_rank_api_fallback", "_put_candidate"],
+            "route": "12개 외부 소스 합집합 → _put_candidate → _dynamic_candidates 편입",
+            "request": "refresh_dynamic_candidates 12개 소스 출력 + is_trade_candidate_name 필터 점검",
+        },
+        # v178.7 [#17]: 워치독 진단 결과 정확한 reason 분류 추가
+        "scan_silent": {
+            "title": "run_scan 실행 정지",
+            "symptom": "후보 풀은 채워져 있는데 run_scan이 silence_sec 이상 안 돌고 있습니다. analyze 호출 자체가 0.",
+            "inspect": ["run_scan", "_run_scan_body", "_run_scan_global_lock", "_threaded_leader_job", "schedule.run_pending"],
+            "route": "schedule → _threaded_leader_job(run_price_first_scan) → run_scan → analyze",
+            "request": "run_scan 블로킹/락/스레드 상태 점검 필요. v178.2 threaded scan 적용 확인.",
+        },
+        "analyze_pathway_silent": {
+            "title": "analyze 경로 차단 미기록",
+            "symptom": "후보 풀 있고 run_scan은 도는데 shadow_capture에 차단 사유가 안 쌓입니다. analyze 단계에서 silent reject 가능성.",
+            "inspect": ["analyze", "_apply_analyze_signal_quality", "_apply_analyze_market_context", "_apply_analyze_entry_and_filters", "_record_shadow_capture"],
+            "route": "_dynamic_candidates → analyze → 6단계 게이트 → shadow_capture 기록",
+            "request": "analyze 6단계 게이트의 silent return 경로 점검 + shadow_capture 기록 누락 위치 찾기",
         },
     }
     spec = specs.get(main_reason)
@@ -6027,7 +6066,33 @@ def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
         return None
     since_ts = now_ts - silence_sec
     reasons = _watchdog_collect_block_reasons(since_ts)
-    main_reason = max(reasons, key=reasons.get) if reasons else "candidate_miss"
+    # v178.7 [#17]: reasons 비어있을 때 candidate_miss 자동 폴백 폐기 → 정확한 원인 분류
+    # 이전: reasons={} → main_reason="candidate_miss" (default) → 4개 함수 점검 요청 오발
+    # 결함: shadow_capture 비어있는 이유 구분 못 함:
+    #       (a) 후보 풀 자체 비어있음 (진짜 candidate_miss)
+    #       (b) run_scan 미실행 (schedule 블로킹 등) → analyze 호출 안 됨
+    #       (c) 후보 풀 있고 analyze 도는데 모든 종목이 reject 사유 기록 안 되는 경로
+    if reasons:
+        main_reason = max(reasons, key=reasons.get)
+    else:
+        # reasons={} → _dynamic_candidates 상태로 원인 분류
+        try:
+            _candidate_count = len(_dynamic_candidates) if isinstance(_dynamic_candidates, dict) else 0
+        except Exception:
+            _candidate_count = 0
+        try:
+            _last_scan_age = now_ts - float(globals().get("_last_run_scan_ts", 0.0) or 0.0)
+        except Exception:
+            _last_scan_age = 999999.0
+        if _candidate_count < 10:
+            # 후보 풀이 거의 비어있음 → 진짜 candidate_miss
+            main_reason = "candidate_miss"
+        elif _last_scan_age > silence_sec:
+            # scan이 silence_sec 이상 안 돈 상태 → scan_silent (블로킹/스레드 이슈)
+            main_reason = "scan_silent"
+        else:
+            # scan은 돌고 후보도 있는데 shadow_capture 비어있음 → analyze 경로 결함
+            main_reason = "analyze_pathway_silent"
     return {
         "rising": rising,
         "n_rising": n_rising,
@@ -6036,6 +6101,9 @@ def _collect_intraday_watchdog_state(now_ts: float) -> dict | None:
         "reasons": reasons,
         "total_blocked": sum(reasons.values()),
         "main_reason": main_reason,
+        # v178.7: 진단 보조 정보 추가
+        "_dynamic_candidates_count": (len(_dynamic_candidates) if isinstance(_dynamic_candidates, dict) else 0),
+        "_last_scan_age_sec": int(max(0, now_ts - float(globals().get("_last_run_scan_ts", 0.0) or 0.0))),
     }
 def _build_intraday_watchdog_lines(state: dict, relax_changes: list[str]) -> list[str]:
     rising = state["rising"]
@@ -43538,6 +43606,22 @@ def get_us_market_signals() -> dict:
                 kis_price = _fetch_kis_overseas_price(sym, excd)
                 if kis_price and kis_price > 0:
                     values[f"{key}_last"] = kis_price
+        # v178.7 [#18]: Yahoo+Stooq 모두 실패 시 KIS 해외주식 ETF로 NASDAQ/S&P proxy
+        # QQQ = NASDAQ 100 ETF, SPY = S&P 500 ETF — KIS HHDFS00000300 안정 작동
+        # cache의 prev_close와 비교해 change_rate 계산
+        _kis_etf_proxy = [
+            ("QQQ", "NAS", "nasdaq", "nasdaq_prev_close_qqq"),
+            ("SPY", "NAS", "sp500",  "sp500_prev_close_spy"),
+        ]
+        for _esym, _excd, _key, _prev_key in _kis_etf_proxy:
+            if values.get(f"{_key}_chg", 0.0) == 0.0:  # Yahoo+Stooq 모두 실패한 경우만
+                _ep = _fetch_kis_overseas_price(_esym, _excd)
+                if _ep and _ep > 0:
+                    _prev = _us_cache.get(_prev_key, 0.0)
+                    if _prev and _prev > 0:
+                        values[f"{_key}_chg"] = round((_ep - _prev) / _prev * 100, 2)
+                        _log_info_msg(f"  🇺🇸 KIS {_esym} fallback → {_key} {values[f'{_key}_chg']:+.2f}%")
+                    _us_cache[_prev_key] = _ep
         # v167.0: KIS 해외선물 현재가 → Yahoo 실패 시 NQ/ES/GC/CL 보완
         # 거래소 코드: NQ=CME 나스닥선물, ES=CME S&P500선물, GC=COMEX 금선물, CL=NYMEX WTI선물
         _kis_fut_map = [
@@ -45311,6 +45395,7 @@ def _run_surge_velocity_scan() -> None:
     finally:
         _surge_velocity_lock.release()
 
+_last_run_scan_ts: float = 0.0  # v178.7 [#17]: 워치독 진단용 마지막 run_scan 종료 시각
 def run_scan():
     # v165.42: 스캔 전체 레벨 락 — catch-up 스캔과 정규 스캔 동시 실행 차단
     # 기존 _dispatch_scan_lock은 dispatch 단계만 보호 → analyze 단계부터 중복 실행 방지 필요
@@ -45320,6 +45405,8 @@ def run_scan():
     try:
         _run_scan_body()
     finally:
+        global _last_run_scan_ts
+        _last_run_scan_ts = time.time()  # v178.7: 워치독이 scan 실행 여부 진단
         _run_scan_global_lock.release()
 
 def _run_scan_body():
@@ -45645,6 +45732,13 @@ if __name__ == "__main__":
     schedule.every(180).minutes.do(_leader_job(_auto_push_us_market_info))
     threading.Thread(target=_refresh_premarket_sectors, daemon=True).start()
     threading.Thread(target=_auto_push_us_market_info, daemon=True).start()
+    # v178.7 [#18]: 미국시장 데이터 prewarm — 봇 시작 시 백그라운드로 get_us_market_signals() 1회 호출
+    # 이유: 봇 재시작 후 _us_cache 비어있음 → 첫 Yahoo 호출이 HTML 응답 시 nasdaq_chg=0.0 → /us 알람 트리거
+    #        + KIS ETF proxy (QQQ/SPY) 호출로 prev_close 사전 채우기 → 다음 /us 호출은 정상 chg 계산
+    try:
+        threading.Thread(target=get_us_market_signals, daemon=True, name="us_market_prewarm").start()
+    except Exception as _pe:
+        _log_warn_msg(f"⚠️ 미국시장 prewarm 시작 실패: {_pe}")
     # v178.2: 봇 재시작 시 종가매매 14:35/15:08/19:10 catchup 호출 (정의만 있고 호출 0건 결함 수정)
     try:
         threading.Thread(target=_maybe_run_preclose_gap_alert_catchup, daemon=True).start()
