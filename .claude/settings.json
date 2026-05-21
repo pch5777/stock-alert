@@ -1,0 +1,33 @@
+{
+  "mode": "hybrid",
+  "workingDirectory": "D:\\한국주식투자 통합관리프로그램 제작",
+  "projectName": "한국주식투자 통합관리 봇",
+  "model": "claude-opus-4-1-20250805",
+  "permissions": {
+    "allowList": [
+      "Skill(anthropic-skills:kr-stock-manager)",
+      "Bash(*stock_alert.py*)",
+      "Bash(cd*)",
+      "Bash(wc -l*)",
+      "Bash(tail*)",
+      "Bash(python*)",
+      "Bash(cp*)",
+      "Bash(git*)"
+    ]
+  },
+  "hooks": {
+    "on_session_start": [
+      "Check SKILL.md version at top",
+      "Confirm stock_alert.py in current directory",
+      "Load project memory from .claude/memory.md if exists"
+    ]
+  },
+  "files": {
+    "backup_pattern": "*.bak_*",
+    "exclude": [
+      "__pycache__",
+      "*.pyc",
+      ".tmp.*"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "stock_alert_local",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "stock_alert.py"
+      ],
+      "port": 8080,
+      "env": {
+        "PORT": "8080",
+        "DEBUG": "0"
+      }
+    }
+  ]
+}

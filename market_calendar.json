@@ -1,0 +1,30 @@
+{
+  "_comment": "한국 주식시장 정적 일정 — 사용자 수동 입력. 만기일/리밸런싱/배당락 등. 자동 수집 불가 이벤트.",
+  "_format": "events: [{date: YYYY-MM-DD, type: <event_type>, label: <ko>, affect: <market|kospi200|kosdaq150>, severity: <high|med|low>, action: <block|note|score_down|score_up>, note: <설명>}]",
+  "events": [
+    {"date": "2026-03-12", "type": "quad_witching", "label": "네 마녀의 날 (선물옵션 동시만기)", "affect": "market", "severity": "high", "action": "block_after_1430", "note": "KOSPI200 대형주 변동성 폭증. 14:30 이후 신규 진입 차단."},
+    {"date": "2026-06-11", "type": "quad_witching", "label": "네 마녀의 날 (선물옵션 동시만기)", "affect": "market", "severity": "high", "action": "block_after_1430", "note": "KOSPI200 대형주 변동성 폭증. 14:30 이후 신규 진입 차단."},
+    {"date": "2026-09-10", "type": "quad_witching", "label": "네 마녀의 날 (선물옵션 동시만기)", "affect": "market", "severity": "high", "action": "block_after_1430", "note": "KOSPI200 대형주 변동성 폭증. 14:30 이후 신규 진입 차단."},
+    {"date": "2026-12-10", "type": "quad_witching", "label": "네 마녀의 날 (선물옵션 동시만기)", "affect": "market", "severity": "high", "action": "block_after_1430", "note": "KOSPI200 대형주 변동성 폭증. 14:30 이후 신규 진입 차단."},
+    {"date": "2026-04-09", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-05-14", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-07-09", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-08-13", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-10-08", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-11-12", "type": "option_expiry", "label": "월간 옵션 만기일", "affect": "kospi200", "severity": "med", "action": "note", "note": "KOSPI200 행사가 근처 종목 횡보."},
+    {"date": "2026-06-12", "type": "kospi200_review", "label": "KOSPI200 정기변경 적용일", "affect": "kospi200", "severity": "high", "action": "note", "note": "편입 종목 패시브 매수, 제외 종목 매도 폭주."},
+    {"date": "2026-12-11", "type": "kospi200_review", "label": "KOSPI200 정기변경 적용일", "affect": "kospi200", "severity": "high", "action": "note", "note": "편입 종목 패시브 매수, 제외 종목 매도 폭주."},
+    {"date": "2026-02-27", "type": "msci_rebalance", "label": "MSCI 분기 리밸런싱 적용일", "affect": "market", "severity": "high", "action": "note", "note": "MSCI 편입 외인 패시브 매수."},
+    {"date": "2026-05-29", "type": "msci_rebalance", "label": "MSCI 분기 리밸런싱 적용일", "affect": "market", "severity": "high", "action": "note", "note": "MSCI 편입 외인 패시브 매수."},
+    {"date": "2026-08-28", "type": "msci_rebalance", "label": "MSCI 분기 리밸런싱 적용일", "affect": "market", "severity": "high", "action": "note", "note": "MSCI 편입 외인 패시브 매수."},
+    {"date": "2026-11-27", "type": "msci_rebalance", "label": "MSCI 분기 리밸런싱 적용일", "affect": "market", "severity": "high", "action": "note", "note": "MSCI 편입 외인 패시브 매수."},
+    {"date": "2026-12-29", "type": "dividend_ex_date", "label": "배당락일 (대부분 12월결산 종목)", "affect": "market", "severity": "high", "action": "note", "note": "배당락 갭다운. 신규 진입 시 배당률 -만큼 손실 인지."},
+    {"date": "2026-03-19", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-05-01", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-06-19", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-07-31", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-09-18", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-10-30", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."},
+    {"date": "2026-12-11", "type": "fomc", "label": "미국 FOMC 발표 (한국 새벽)", "affect": "market", "severity": "med", "action": "note", "note": "글로벌 시장 변동성."}
+  ]
+}
