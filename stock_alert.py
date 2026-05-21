@@ -3,10 +3,29 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v178.7
+버전: v178.8
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v178.8 (2026-05-22): 진단용 상태 파일 API 엔드포인트 추가
+    [#19] Flask /api/state/* 엔드포인트 신설
+          - GET /api/state/_list → DATA_DIR 내 .json 파일 목록 (name/size/mtime)
+          - GET /api/state/<filename> → 특정 상태 JSON 반환
+          보안:
+            - .json 확장자만 허용
+            - 경로 분리자 (/ \\), 상대경로 (..) 차단
+            - DATA_DIR 외부 파일 접근 차단 (normpath 검증)
+            - 50MB 초과 파일 거부 (413)
+            - DIAG_API_KEY 설정 시 X-Diag-Key 헤더 또는 ?key= 쿼리 검증
+          용도:
+            - preclose_gap_run_state.json (종가매매 발송 상태 확인)
+            - market_leader_state.json (섹터 상태)
+            - entry_watch_active.json (포착 종목)
+            - dynamic_themes.json (테마 풀)
+            - carry_stocks.json (이월 종목)
+            - 기타 모든 .json 상태 파일 즉시 조회 가능
+          효과: 봇 진단 시 텔레그램 /list 명령 의존 없이 외부 도구로 정확한 상태 확인 가능
+
 - v178.7 (2026-05-22): 워치독 자가 진단 정확도 ↑ + 미국시장 데이터 prewarm
     [#17] _collect_intraday_watchdog_state: reasons={} default fallback 폐기
           이전 결함: shadow_capture 비어있으면 무조건 main_reason="candidate_miss"
@@ -31380,6 +31399,76 @@ def _flask_api_signal_log():
             with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
                 return _FlaskResponse(f.read(), mimetype="application/json")
         return _jsonify({"error": "signal_log.json not found"}), 404
+    except Exception as e:
+        return _jsonify({"error": str(e)}), 500
+
+@_flask_app.route("/api/state/_list")
+def _flask_api_state_list():
+    """v178.8 [#19]: DATA_DIR 내 진단용 상태 파일 목록 반환.
+    응답: {"files": [{"name": "preclose_gap_run_state.json", "size": 1234, "mtime": 1700000000.0}, ...]}
+    """
+    from flask import request as _req
+    _api_key = os.environ.get("DIAG_API_KEY", "")
+    _req_key = _req.headers.get("X-Diag-Key") or _req.args.get("key", "")
+    if _api_key and _req_key != _api_key:
+        return _jsonify({"error": "unauthorized"}), 401
+    try:
+        files = []
+        if os.path.isdir(DATA_DIR):
+            for fn in sorted(os.listdir(DATA_DIR)):
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(DATA_DIR, fn)
+                try:
+                    st = os.stat(fp)
+                    files.append({
+                        "name": fn,
+                        "size": int(st.st_size),
+                        "mtime": float(st.st_mtime),
+                    })
+                except Exception as _se:
+                    _swallow_exception(_se)
+        return _jsonify({"files": files, "count": len(files)})
+    except Exception as e:
+        return _jsonify({"error": str(e)}), 500
+
+@_flask_app.route("/api/state/<filename>")
+def _flask_api_state_file(filename: str):
+    """v178.8 [#19]: 단일 상태 JSON 파일 반환 (진단용).
+    예: /api/state/preclose_gap_run_state.json
+    보안:
+      - filename은 .json 확장자 필수
+      - 경로 분리자(/ \\), 상대경로(..) 차단
+      - DIAG_API_KEY 설정 시 키 검증
+      - DATA_DIR 외 파일 접근 차단
+    """
+    from flask import request as _req
+    _api_key = os.environ.get("DIAG_API_KEY", "")
+    _req_key = _req.headers.get("X-Diag-Key") or _req.args.get("key", "")
+    if _api_key and _req_key != _api_key:
+        return _jsonify({"error": "unauthorized"}), 401
+    # Security checks
+    if not isinstance(filename, str) or not filename:
+        return _jsonify({"error": "invalid filename"}), 400
+    if not filename.endswith(".json"):
+        return _jsonify({"error": "only .json files allowed"}), 400
+    if "/" in filename or "\\" in filename or ".." in filename or filename.startswith("."):
+        return _jsonify({"error": "invalid path"}), 400
+    try:
+        fp = os.path.join(DATA_DIR, filename)
+        # Ensure file is inside DATA_DIR (defense-in-depth)
+        if not os.path.normpath(fp).startswith(os.path.normpath(DATA_DIR)):
+            return _jsonify({"error": "path outside DATA_DIR"}), 400
+        if not os.path.exists(fp):
+            return _jsonify({"error": f"{filename} not found"}), 404
+        # Size limit (refuse if > 50MB to prevent accidental abuse)
+        try:
+            if os.path.getsize(fp) > 50 * 1024 * 1024:
+                return _jsonify({"error": "file too large (>50MB)"}), 413
+        except Exception:
+            pass
+        with open(fp, "r", encoding="utf-8") as f:
+            return _FlaskResponse(f.read(), mimetype="application/json")
     except Exception as e:
         return _jsonify({"error": str(e)}), 500
 
