@@ -3,10 +3,29 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v179.1
+버전: v180.0
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v180.0 (2026-05-22): 다중소스 익일 갭상승 시드 재설계 + 종목 차단 필터 신설
+    [#25] 조기 포착 실패 원인 — 시드 소스 부족 + 필터 부재
+    수정:
+      - _is_tradable_for_seed() 신설: 우선주/스팩/ETF/ETN/선물/옵션/거래정지/mrkt_alrm(02,03)/iscd_stat(51-54,58) 차단
+        → VI(변동성완화), 투자주의(01) 는 차단 제외
+      - _build_next_open_seed_v178 재설계: 3소스 통합 (signal_log NEAR_UPPER + sector leaders + theme map)
+        → 점수 임계 ≥5 편입, SURGE/NEAR_UPPER≥10%→+5, +5~10%→+3, MID_PULLBACK→+2, issue_→+5, groq_auto_→+3, sector→+2
+      - 시드 스케줄 3시점: 07:30(NXT 오전 전) / 15:00(KRX 선진입) / 19:30(NXT 선진입)
+      - 시점 분기: 15:00 이후 호출 시 오늘 날짜 기준 (장중/마감 후 모두 커버)
+
+- v179.2 (2026-05-22): 섹터 노이즈 차단 + acml_vol 교체 + 거래량 가중치
+    [#22] 대시보드 섹터 목록 — 업종미상 1위, groq_auto_ 노이즈, 저거래량 종목 상위 랭크
+    수정:
+      - _SECTOR_BLOCK_PAT_LS: "업종미상","기타업종","미분류","unknown","UNKNOWN" 추가
+      - _RAW_KEY_PREFIX_LS 신설: "issue_","groq_auto_","auto_" prefix 섹터 차단
+      - _save_market_leader_state: 저장 시점에도 동일 필터 적용 (디스크 잔존 방지)
+      - get_fluctuation_rank: acml_vol 필드 추가 (vol_inrt → FHPST01700000에 없는 필드 → 항상 0 반환 버그 수정)
+      - 섹터 스코어: log1p 기반 vol_weight 적용 (avg_vol 기준 0.5~2.0 가중)
+
 - v179.1 (2026-05-22): WS 구독 커버리지 확대 — 등락률 상위 종목 자동 편입
     [#21] v179.0 fast path가 _entry_watch/prewarm 종목만 커버 → 장 시작 새 종목 미구독
     근본 결함:
