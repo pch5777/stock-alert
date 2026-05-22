@@ -3,10 +3,20 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v180.1
+버전: v180.2
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v180.2 (2026-05-22): 장 마감 후 섹터 목록 노이즈 필터 누락 수정
+    [#27] v179.2 prefix 필터가 market_open 블록에만 적용 → 장 마감 후(premarket 경로) 미필터
+          21:56 스크린샷: groq_auto_AI 인프라, issue_자배증결기세포 등 여전히 표시
+    근본 원인:
+      - is_any_market_open()=False → else → _WEB_DASHBOARD_PREMARKET_SECTORS 직접 사용
+      - _refresh_premarket_sectors() + _load_premarket_sectors() 두 경로 모두 필터 없었음
+    수정:
+      - _refresh_premarket_sectors(): top 리스트 필터 추가 (issue_/groq_auto_/auto_ prefix + 노이즈 패턴)
+      - _load_premarket_sectors(): 파일 복원 시 동일 필터 적용
+
 - v180.1 (2026-05-22): 미국시장 "수집 중" 알람 제거
     [#26] v178.7 prewarm 패치 무효화 — prewarm이 nasdaq_chg=0.0으로 캐시 채움 → 30분 TTL 고정
           재시도 시 _us_cache.clear()가 prev_close 포함 전부 삭제 → KIS fallback 계산 불가 → 3회 모두 0.0
@@ -30403,6 +30413,20 @@ def _load_premarket_sectors() -> None:
             with open(_WEB_DASHBOARD_PREMARKET_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
+                    # v180.2: 파일 복원 시에도 노이즈 섹터 필터 (저장된 파일에 잔존 방지)
+                    _LD_BLOCK_PFX = ("issue_", "groq_auto_", "auto_")
+                    _LD_BLOCK_PAT = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수",
+                                     "관리종목","투자경고","투자위험","단기과열",
+                                     "업종미상","기타업종","미분류","unknown","UNKNOWN")
+                    import re as _re_ld
+                    _LD_AUTO_RE = _re_ld.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
+                    data = [
+                        s for s in data
+                        if not any(str(s.get("name","") or "").startswith(_p) for _p in _LD_BLOCK_PFX)
+                        and not any(_p in str(s.get("name","") or "") for _p in _LD_BLOCK_PAT)
+                        and not _LD_AUTO_RE.search(str(s.get("name","") or ""))
+                        and str(s.get("name","") or "") not in ("기타", "-", "N/A")
+                    ]
                     _WEB_DASHBOARD_PREMARKET_SECTORS = data
     except Exception:
         pass
@@ -30455,6 +30479,21 @@ def _refresh_premarket_sectors() -> None:
         if not top:
             return
 
+        # v180.2: _refresh_premarket_sectors 경로에도 동일 노이즈 필터 적용
+        # (v179.2는 market_open 블록에만 적용 → 장 마감 후 premarket 경로 미필터 버그)
+        _PRE_BLOCK_PREFIX = ("issue_", "groq_auto_", "auto_")
+        _PRE_BLOCK_PAT    = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수",
+                             "관리종목","투자경고","투자위험","단기과열",
+                             "업종미상","기타업종","미분류","unknown","UNKNOWN")
+        import re as _re_pre
+        _PRE_AUTO_RE = _re_pre.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
+        top = [
+            item for item in top
+            if not any(str(item.get("sector","") or "").startswith(_p) for _p in _PRE_BLOCK_PREFIX)
+            and not any(_p in str(item.get("sector","") or "") for _p in _PRE_BLOCK_PAT)
+            and not _PRE_AUTO_RE.search(str(item.get("sector","") or ""))
+            and str(item.get("sector","") or "") not in ("기타", "-", "N/A")
+        ]
         sectors_out = []
         etc_stocks = []  # 섹터 미확인 종목 → 기타로
         for item in top:
