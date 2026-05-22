@@ -3,10 +3,17 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v180.0
+버전: v180.1
 날짜: 2026-05-22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v180.1 (2026-05-22): 미국시장 "수집 중" 알람 제거
+    [#26] v178.7 prewarm 패치 무효화 — prewarm이 nasdaq_chg=0.0으로 캐시 채움 → 30분 TTL 고정
+          재시도 시 _us_cache.clear()가 prev_close 포함 전부 삭제 → KIS fallback 계산 불가 → 3회 모두 0.0
+    수정:
+      - _us_cache.clear() → _us_cache.pop("ts", None): ts만 삭제, prev_close 보존
+      - nasdaq_chg=0.0 시 "수집 중" send() 제거 → 조용히 return (자동/수동 /us 모두)
+
 - v180.0 (2026-05-22): 다중소스 익일 갭상승 시드 재설계 + 종목 차단 필터 신설
     [#25] 조기 포착 실패 원인 — 시드 소스 부족 + 필터 부재
     수정:
@@ -40018,13 +40025,13 @@ def _handle_telegram_us_command():
             us = None
             for attempt in range(3):
                 if attempt > 0:
-                    _us_cache.clear()   # crumb 포함 전체 초기화 후 재시도
+                    _us_cache.pop("ts", None)   # v180.1: ts만 제거 → prev_close 보존, KIS fallback 유지
                     time.sleep(12)
                 us = get_us_market_signals()
                 if float(us.get("nasdaq_chg", 0.0) or 0.0) != 0.0:
                     break
             if not us or float(us.get("nasdaq_chg", 0.0) or 0.0) == 0.0:
-                send("🌐 미국시장 데이터 수집 중입니다. 잠시 후 /us 를 다시 시도해 주세요.")
+                # v180.1: "수집 중" 알람 제거 — 데이터 미확보 시 조용히 종료 (자동/수동 모두)
                 return
             gap_emoji = {"gap_up": "⬆️ 갭상승 기대", "flat": "➡️ 갭 없음", "gap_down": "⬇️ 갭하락 주의"}
             regime_kor = {"panic": "🔵 급락장", "risk_off": "🔵 약세장", "neutral": "🟡 보통장",
