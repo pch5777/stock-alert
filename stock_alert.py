@@ -18254,6 +18254,7 @@ def get_fluctuation_rank(market: str = "J", sort: str = "0") -> list:
                 "price": safe_int(i.get("stck_prpr") or 0),
                 "change_rate": safe_float(i.get("prdy_ctrt") or 0, 0.0),
                 "volume_ratio": safe_float(i.get("vol_inrt") or 0, 0.0),
+                "acml_vol": safe_int(i.get("acml_vol") or 0),
                 "market": "KRX" if market == "J" else "NXT",
             })
         if not items:
@@ -30630,12 +30631,19 @@ def _push_dashboard_json() -> None:
                         # v177.9 #S: market_leader_state 캐시 읽기 단계에서 ETF/선물/스팩 등 비매매 섹터 차단
                         # v177.14 #AC: 연관 테마(단일종목 자동생성) 패턴 추가
                         # v177.16 #AG: "연관 테마" 부분문자열 → 정규식으로 "X 연관 지정학 테마", "X 연관 이슈" 등 단어 사이 끼는 케이스 차단
-                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+                        # v179.2: "업종미상/기타/미분류/unknown" + raw prefix(issue_/groq_auto_/auto_) 차단 추가
+                        _SECTOR_BLOCK_PAT_LS = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열",
+                                                "업종미상","기타업종","미분류","unknown","UNKNOWN")
                         import re as _re_sec_block
                         _AUTO_SECTOR_RE = _re_sec_block.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
+                        _RAW_KEY_PREFIX_LS = ("issue_", "groq_auto_", "auto_")
                         for lsec in _leader_sectors:
                             theme = str(lsec.get("theme","") or "")
                             if not theme: continue
+                            # v179.2: raw key prefix (저장된 dynamic theme key) 차단
+                            if any(theme.startswith(_p) for _p in _RAW_KEY_PREFIX_LS): continue
+                            # v179.2: exact match 차단 (theme == "기타" 정확 일치)
+                            if theme in ("기타", "-", "N/A"): continue
                             if any(_p in theme for _p in _SECTOR_BLOCK_PAT_LS): continue
                             if _AUTO_SECTOR_RE.search(theme): continue
                             # v177.13 #AB-1: [Groq자동] AI 자동생성 테마 대시보드 표시 차단 (정규식에 포함됐지만 명시적 유지)
@@ -41410,6 +41418,24 @@ def _read_market_leader_state() -> dict:
     return state if isinstance(state, dict) else {}
 def _save_market_leader_state(state: dict):
     try:
+        # v179.2: 저장 시점에 노이즈 섹터 필터 — 디스크 잔존 방지
+        if isinstance(state, dict) and isinstance(state.get("sectors"), list):
+            _RAW_PFX = ("issue_", "groq_auto_", "auto_")
+            _BLOCK_KW = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목",
+                         "투자경고","투자위험","단기과열","업종미상","기타업종","미분류","unknown","UNKNOWN")
+            _EXACT_BLOCK = ("기타", "-", "N/A", "")
+            import re as _re_sv
+            _AUTO_RE = _re_sv.compile(r"연관\s*(테마|지정학|이슈)|Groq자동|\[자동감지\]")
+            def _ok(theme: str) -> bool:
+                if theme in _EXACT_BLOCK: return False
+                if any(theme.startswith(_p) for _p in _RAW_PFX): return False
+                if any(_kw in theme for _kw in _BLOCK_KW): return False
+                if _AUTO_RE.search(theme): return False
+                return True
+            filtered = [s for s in state["sectors"] if isinstance(s, dict) and _ok(str(s.get("theme","") or ""))]
+            state = dict(state)
+            state["sectors"] = filtered
+            state["themes"] = [str(s.get("theme","") or "") for s in filtered]
         _write_json_atomic(MARKET_LEADER_STATE_FILE, state if isinstance(state, dict) else {}, indent=2)
     except Exception as e:
         _log_warn_msg(f"⚠️ 시장 주도 섹터 상태 저장 실패: {e}")
@@ -42097,6 +42123,7 @@ def _build_sectors_from_theme_pool() -> None:
                 "change_rate": cr,
                 "price": safe_int(r.get("price", 0), 0),
                 "vol_ratio": safe_float(r.get("volume_ratio", 0), 0.0),
+                "acml_vol": safe_int(r.get("acml_vol", 0), 0),
             }
         try:
             for r in (get_fluctuation_rank("J", "0") or [])[:50]:
@@ -42240,6 +42267,7 @@ def _build_sectors_from_theme_pool() -> None:
                     "change_rate": info["change_rate"],
                     "price": info["price"],
                     "vol_ratio": info["vol_ratio"],
+                    "acml_vol": info.get("acml_vol", 0),
                 })
             if len(members) < 2:
                 continue
@@ -42247,7 +42275,11 @@ def _build_sectors_from_theme_pool() -> None:
             avg_rate = sum(m["change_rate"] for m in members) / len(members)
             if avg_rate <= 0:
                 continue
-            score = round(len(members) * avg_rate, 2)
+            # 거래량 가중치: 섹터 내 평균 누적거래량 기반 로그 스케일 (소형주 고등락률 억제)
+            import math as _math
+            avg_vol = sum(m.get("acml_vol", 0) for m in members) / len(members)
+            vol_weight = max(0.5, min(2.0, _math.log1p(avg_vol / 100000) / _math.log1p(10)))
+            score = round(len(members) * avg_rate * vol_weight, 2)
             sector_candidates.append({
                 "theme": ms["theme"],
                 "leader": members[0],
@@ -42365,56 +42397,243 @@ def _force_inject_missing_candidates(max_inject: int = 50) -> int:
         _log_error("_force_inject_missing_candidates", e)
         return 0
 
+def _is_tradable_for_seed(code: str, name: str = "", extra: dict | None = None) -> tuple[bool, str]:
+    """v180.0 [신설]: 시드 편입 가능 여부 종합 판정.
+
+    차단 항목 (사용자 확정):
+      - 거래정지 (trading_halt_state.json)
+      - 거래정지 D-1 예정 (market_event_index)
+      - 관리종목 / 투자위험(03) / 투자경고(02) / 단기과열 (mrkt_alrm_cls_code)
+      - 우선주 / 스팩 (종목명 패턴)
+      - ETF / ETN / 선물 / 옵션 / 수익증권 / 상장지수 / 레버리지 / 인버스 (종목명 패턴)
+      - 신규상장 첫날 (등락률 > 50%, extra["change_rate"])
+      - NXT 시간대 KRX 전용 종목 (현재 시점 NXT만 열려있는 경우)
+
+    제외: 투자주의(01) — 약한 등급, 차단하지 않음 (사용자 결정)
+          상승/하방 VI — 일시적 변동성 완화, 종목 위험 아님 (사용자 지적)
+
+    반환: (tradable: bool, reason: str)
+    """
+    extra = extra or {}
+    code = normalize_stock_code(code or "")
+    if not code:
+        return False, "empty_code"
+    nm = str(name or "").replace(" ", "")
+    nm_up = nm.upper()
+
+    # 1. 우선주 (종목명 끝 "우", "우B", "우C", "우(전환)" 등)
+    if re.search(r'우[B0-9]*$', nm) or "우(전환)" in nm:
+        return False, "preferred_stock"
+
+    # 2. 스팩
+    if "스팩" in nm or "SPAC" in nm_up:
+        return False, "spac"
+
+    # 3. ETF/ETN/선물/옵션/수익증권/상장지수/레버리지/인버스
+    _NON_STOCK = ("ETF", "ETN", "선물", "옵션", "레버리지", "인버스", "수익증권", "상장지수",
+                  "KODEX", "TIGER", "KOSEF", "KBSTAR", "ARIRANG", "HANARO", "ACE", "SOL",
+                  "PLUS", "KIWOOM", "RISE", "WOORI", "NH", "KOACT", "FOCUS", "TIMEFOLIO")
+    for _m in _NON_STOCK:
+        if _m in nm_up:
+            return False, f"non_stock:{_m}"
+
+    # 4. 신규 상장 첫날 (등락률 > 50% — 일반 종목 상한가 ±30% 한도)
+    cr = safe_float(extra.get("change_rate", 0), 0.0)
+    if cr > 50.0:
+        return False, "new_listing_first_day"
+
+    # 5. 거래정지 (trading_halt_state.json)
+    try:
+        if code in (_trading_halt_state or {}):
+            return False, "trading_halt"
+    except Exception:
+        pass
+
+    # 6. mrkt_alrm_cls_code: 02=투자경고, 03=투자위험 차단 (01=투자주의는 미차단)
+    _alrm = str(extra.get("mrkt_alrm_cls_code", "") or "").strip()
+    if _alrm in ("02", "03"):
+        return False, f"mrkt_alrm:{_alrm}"
+
+    # 7. 관리종목 / 단기과열 (iscd_stat_cls_code)
+    _iscd = str(extra.get("iscd_stat_cls_code", "") or "").strip()
+    # 51=관리종목, 52=투자위험예고, 53=투자위험, 54=투자경고, 58=단기과열
+    if _iscd in ("51", "52", "53", "54", "58"):
+        return False, f"iscd_stat:{_iscd}"
+
+    # 8. 거래정지 D-1 (market_event_index — 익일 매매 불가)
+    try:
+        if _is_stock_event_block(code):
+            return False, "event_halt_dminus1"
+    except Exception:
+        pass
+
+    # 9. NXT 시간대 KRX 전용 종목 차단 (현재 KRX 닫혀있고 NXT만 열린 경우)
+    try:
+        if is_nxt_open() and not is_market_open():
+            # NXT 전용 시간대 — KRX 전용 종목이면 매매 불가
+            if not is_nxt_listed(code):
+                return False, "nxt_time_krx_only_stock"
+    except Exception:
+        pass
+
+    return True, "ok"
+
 def _build_next_open_seed_v178(max_codes: int = 30) -> list:
-    """v178.0 [#4 교체]: 종가강세 익일 시드 — 어제 강세 종목 다음날 후보 자동 편입.
+    """v180.0 [재설계]: 다중 소스 통합 익일 갭상승 후보 시드.
 
-    기존 시나리오 → 익일 carry 매칭 0% (signal_log 검증) → 폐기.
+    v178.0 결함:
+      - signal_log SURGE/MID_PULLBACK/EARLY_DETECT만 → NEAR_UPPER(상한가) 제외
+      - 5/22 top10 종목들 = 5/21 상한가급 → 시드 누락 → 시초가 갭상승 직격
+      - 정보성 알람 등록 종목 (섹터 강제감시) 미시드
+      - 신규이슈/AI재료/외인기관 매수 미반영
 
-    신규 룰:
-      - signal_log 어제(detect_date) 신호 종목
-      - 신호 타입 SURGE / MID_PULLBACK / EARLY_DETECT (NEAR_UPPER 제외 — 진입 불가 노이즈)
-      - 첫 신호 시점 등락률 ≥ +5% (의미 있는 강세)
-      - 최대 30개 (change_rate 내림차순)
+    v180.0 다중 소스:
+      A. signal_log 어제 강세 (SURGE/MID_PULLBACK/EARLY_DETECT/NEAR_UPPER, ≥3% 완화)
+         - NEAR_UPPER 포함 → 상한가급도 익일 갭상승 후보
+      B. market_leader_state 어제 발송 섹터 leader/followers (정보성 알람 풀)
+      C. _dynamic_theme_map issue_*/groq_auto_* 어제 등록 종목 (신규이슈/AI재료)
+      D. carry_stocks 영속 풀 (재시작 회복)
 
-    호출 시점: 다음날 봇 시작 시 _dynamic_candidates 사전 시드. on_market_close에서도 호출 가능.
+    점수 산식:
+      + 5: 어제 SURGE/NEAR_UPPER ≥ +10%
+      + 3: 어제 SURGE/NEAR_UPPER +5~10%
+      + 2: 어제 MID_PULLBACK/EARLY_DETECT ≥ +5%
+      + 5: 신규이슈 (issue_*) 종목
+      + 3: AI 재료 (groq_auto_*) 종목
+      + 2: 정보성 알람 (market_leader_state) 등록
+    임계: 점수 ≥ 5 → 시드 편입.
+
+    호출 시점: 봇 시작 + 매일 16:00 (장 마감 후) + 22:00 (최종).
     """
     try:
         from datetime import timedelta as _td
-        siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
-        if not isinstance(siglog, dict) or not siglog:
-            return []
-        yesterday = (_now_kst() - _td(days=1)).strftime("%Y%m%d")
-        valid_types = {"SURGE", "MID_PULLBACK", "EARLY_DETECT"}
-        candidates: dict = {}
-        for _k, v in siglog.items():
-            if not isinstance(v, dict):
-                continue
-            if v.get("detect_date") != yesterday:
-                continue
-            st = str(v.get("signal_type", "") or "").upper()
-            if st not in valid_types:
-                continue
-            cr = safe_float(v.get("change_at_detect", 0), 0.0)
-            if cr < 5.0:
-                continue
-            c = normalize_stock_code(v.get("code", "") or "")
+        # v180.0: 호출 시점 분기 — 15:25 이후 또는 19:50 호출은 오늘 데이터 기준 (KRX 마감 후 NXT/익일용)
+        _now = _now_kst()
+        _hhmm = _now.hour * 100 + _now.minute
+        if _hhmm >= 1500:
+            yesterday = _now.strftime("%Y%m%d")  # 오늘 데이터 사용
+            _seed_basis = "today"
+        else:
+            yesterday = (_now - _td(days=1)).strftime("%Y%m%d")  # 어제 데이터 사용
+            _seed_basis = "yesterday"
+        candidates: dict = {}  # code -> {name, score, sources}
+        blocked_log: dict = {}  # reason -> count (진단용)
+        def _add(c: str, name: str, pts: int, src: str, extra: dict = None):
+            c = normalize_stock_code(c)
             if not c:
-                continue
-            # 우선주/스팩 제외
-            nm = str(v.get("name", "") or "").replace(" ", "")
-            if re.search(r'우[B0-9]*$', nm):
-                continue
-            if "스팩" in nm or "SPAC" in nm.upper():
-                continue
-            # 같은 코드 여러 신호면 최대 등락률 유지
-            if c not in candidates or candidates[c]["yesterday_change"] < cr:
+                return
+            # v180.0: 종합 차단 함수 통합 — 우선주/스팩/ETF/관리종목/거래정지 등
+            ok, reason = _is_tradable_for_seed(c, name or "", extra or {})
+            if not ok:
+                blocked_log[reason] = blocked_log.get(reason, 0) + 1
+                return
+            cur = candidates.get(c)
+            if cur is None:
                 candidates[c] = {
-                    "code": c,
-                    "name": v.get("name", c) or c,
-                    "yesterday_change": cr,
-                    "yesterday_signal_type": st,
+                    "code": c, "name": name or c, "score": pts,
+                    "sources": [src], "yesterday_change": 0.0,
+                    "yesterday_signal_type": "MULTI",
                 }
-        result = sorted(candidates.values(), key=lambda x: -x["yesterday_change"])[:max_codes]
+                if extra:
+                    candidates[c].update(extra)
+            else:
+                cur["score"] += pts
+                if src not in cur["sources"]:
+                    cur["sources"].append(src)
+                if extra:
+                    for k, v in extra.items():
+                        if k == "yesterday_change" and float(v) > cur.get("yesterday_change", 0):
+                            cur[k] = v
+                        elif k not in cur:
+                            cur[k] = v
+
+        # A. signal_log 어제 강세 (NEAR_UPPER 포함)
+        try:
+            siglog = _read_json_safe(SIGNAL_LOG_FILE, {})
+            if isinstance(siglog, dict):
+                valid_types = {"SURGE", "MID_PULLBACK", "EARLY_DETECT", "NEAR_UPPER"}
+                for _k, v in siglog.items():
+                    if not isinstance(v, dict):
+                        continue
+                    if v.get("detect_date") != yesterday:
+                        continue
+                    st = str(v.get("signal_type", "") or "").upper()
+                    if st not in valid_types:
+                        continue
+                    cr = safe_float(v.get("change_at_detect", 0), 0.0)
+                    if cr < 3.0:
+                        continue
+                    if st in ("SURGE", "NEAR_UPPER"):
+                        pts = 5 if cr >= 10.0 else 3
+                    else:
+                        pts = 2 if cr >= 5.0 else 0
+                    if pts == 0:
+                        continue
+                    _add(
+                        v.get("code", ""), v.get("name", "") or "",
+                        pts, f"siglog_{st}",
+                        {
+                            "yesterday_change": cr,
+                            "yesterday_signal_type": st,
+                            "change_rate": cr,
+                            "mrkt_alrm_cls_code": str(v.get("mrkt_alrm_cls_code", "") or ""),
+                            "iscd_stat_cls_code": str(v.get("iscd_stat_cls_code", "") or ""),
+                        },
+                    )
+        except Exception as _ea:
+            _swallow_exception(_ea, "next_open_seed_v180:siglog")
+
+        # B. market_leader_state 어제(또는 오늘) 발송 섹터 leader/followers
+        try:
+            mls = _read_market_leader_state() or {}
+            sent_at = str(mls.get("sent_at", "") or "")
+            _ref_date_str = (_now if _seed_basis == "today" else (_now - _td(days=1))).strftime("%Y-%m-%d")
+            if sent_at.startswith(_ref_date_str):
+                for sec in mls.get("sectors", []) or []:
+                    if not isinstance(sec, dict):
+                        continue
+                    leader = sec.get("leader") or {}
+                    followers = sec.get("followers") or []
+                    all_mem = ([leader] if leader else []) + list(followers)
+                    for m in all_mem:
+                        if not isinstance(m, dict):
+                            continue
+                        _add(
+                            m.get("code", ""), m.get("name", "") or "",
+                            2, "market_leader_sector",
+                        )
+        except Exception as _eb:
+            _swallow_exception(_eb, "next_open_seed_v180:market_leader")
+
+        # C. _dynamic_theme_map issue_* / groq_auto_* 어제 등록 종목
+        try:
+            for theme_key, theme_info in (_dynamic_theme_map or {}).items():
+                if not isinstance(theme_info, dict):
+                    continue
+                key_str = str(theme_key or "")
+                is_issue = key_str.startswith("issue_")
+                is_groq = key_str.startswith("groq_auto_")
+                if not (is_issue or is_groq):
+                    continue
+                added_ts = safe_float(theme_info.get("added_ts", 0), 0.0)
+                if added_ts > 0:
+                    added_day = time.strftime("%Y%m%d", time.localtime(added_ts))
+                    if added_day != yesterday:
+                        continue
+                pts = 5 if is_issue else 3
+                src = "issue_theme" if is_issue else "groq_ai_theme"
+                for stock_code, stock_name in theme_info.get("stocks", []) or []:
+                    _add(stock_code, stock_name or "", pts, src)
+        except Exception as _ec:
+            _swallow_exception(_ec, "next_open_seed_v180:dynamic_theme")
+
+        # 점수 임계 ≥ 5 + 점수 내림차순 + 등락률 보조키
+        filtered = [c for c in candidates.values() if c.get("score", 0) >= 5]
+        result = sorted(filtered, key=lambda x: (-x["score"], -x.get("yesterday_change", 0)))[:max_codes]
+        # v180.0: 진단 로그 — 차단된 종목 사유별 카운트
+        if blocked_log:
+            _blk_summary = ", ".join(f"{k}:{v}" for k, v in sorted(blocked_log.items(), key=lambda x: -x[1])[:5])
+            _log_info_msg(f"  🚫 [v180 seed filter] 차단 {sum(blocked_log.values())}건 — {_blk_summary}")
         return result
     except Exception as e:
         _log_error("_build_next_open_seed_v178", e)
@@ -42432,17 +42651,22 @@ def _seed_dynamic_candidates_from_v178_next_open() -> int:
             if c in _dynamic_candidates:
                 continue
             try:
+                _src_str = ",".join(s.get("sources", [])[:3])
                 _dynamic_candidates[c] = {
                     "name": s["name"],
-                    "desc": f"v178_next_open_seed [어제 {s['yesterday_signal_type']} +{s['yesterday_change']:.1f}%]",
+                    "desc": f"v180_next_open_seed [score={s.get('score',0)} {_src_str}]",
                     "added_ts": time.time(),
                     "v178_next_open_seed": True,
+                    "v180_score": s.get("score", 0),
+                    "v180_sources": s.get("sources", []),
                 }
                 added += 1
             except Exception:
                 continue
         if added > 0:
-            _log_info_msg(f"  🌅 [v178 next_open_seed] 어제 강세 종목 {added}건 후보 풀 사전 시드")
+            from datetime import datetime as _dt_lg
+            _hh = _dt_lg.now().strftime("%H:%M")
+            _log_info_msg(f"  🌅 [v180 next_open_seed @{_hh}] 다중소스 후보 {added}건 후보 풀 사전 시드 (siglog+sector+issue+groq)")
         return added
     except Exception as e:
         _log_error("_seed_dynamic_candidates_from_v178_next_open", e)
@@ -45908,6 +46132,19 @@ if __name__ == "__main__":
     schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
     schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
     schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
+    # v180.0: 다중소스 익일 갭상승 후보 시드 — 운영시간 기반 3시점 트리거
+    #  07:30 → NXT 오전(08:00~09:00) 직전 시드 + 익일 시초가 준비
+    #  15:00 → KRX 14:35/15:08 선진입 직후, KRX 동시호가(15:20) 전 시드 + NXT 애프터(15:30~) 준비
+    #  19:30 → NXT 19:10 선진입 직후, NXT 마감(20:00) 전 시드 + 익일 시초가 최종 확정
+    schedule.every().day.at("07:30").do(_leader_job(
+        lambda: None if is_holiday() else _seed_dynamic_candidates_from_v178_next_open()
+    ))
+    schedule.every().day.at("15:00").do(_leader_job(
+        lambda: None if is_holiday() else _seed_dynamic_candidates_from_v178_next_open()
+    ))
+    schedule.every().day.at("19:30").do(_leader_job(
+        lambda: None if is_holiday() else _seed_dynamic_candidates_from_v178_next_open()
+    ))
     # v163: 코스피 지수 스냅샷 2분 간격 — 회복력(Resilience) 계산용
     schedule.every(2).minutes.do(record_index_snapshot)
     schedule.every().day.at("08:50").do(_leader_job(send_premarket_briefing))
