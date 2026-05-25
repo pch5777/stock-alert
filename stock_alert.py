@@ -3,10 +3,19 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v181.0
-날짜: 2026-05-22
+버전: v181.1
+날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v181.1 (2026-05-26): 도달 종목 이력 유지 수정
+    [#29] 도달(entry_hit=True) 종목이 등록시각+3일 후 캡처 목록에서 消滅
+    근본 결함:
+      - expire_ts = 등록시각+3일 → 도달 후 3일차 이전에 만료되면 도달 이력 사라짐
+      - _purge_stale_entry_watch_hits가 hit+expired 즉시 삭제
+      - 미도달 만료 종목은 런타임 중 정리 안 됨 (재시작 전까지 누적)
+    수정:
+      1. hit 종목 → entry_hit_time 기준 7일 유지 (_HIT_RETAIN_SECONDS=7일)
+      2. 미도달 expire_ts 초과 종목 → _purge_stale_entry_watch_hits에서 런타임 정리
 - v181.0 (2026-05-22): 섹터 목록 전면 재설계 — 통합 풀 + 가중평균 + 활성 필터 + 단일종목 허용
     [#28] 사용자 지적 — "마이너스 종목이 있는데 강세 테마? 0주/0원 종목이 섹터에 표시"
     근본 결함:
@@ -6361,11 +6370,15 @@ def _format_signal_type_stats_line(stats: dict) -> str:
 CACHE_TTL_SECONDS = 3600
 MAX_CACHE_SIZE = 5000
 _exec_speed_cache = {}  # [v41.85] 모듈 레벨 선언 누락 수정 (NameError 방지)
+_HIT_RETAIN_SECONDS = 86400 * 7  # v181.1: 도달 종목 hit_time 기준 7일 유지
+
 def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
-    """v71: 장중 30분마다 _entry_watch에서 stale entry_hit 제거.
+    """v71: 장중 30분마다 _entry_watch에서 stale entry_hit/만료 watch 제거.
     기존: 재시작 시 _load_entry_watch_active()에서만 정리 → 장 중 쌓인 stale hit이
     _collect_actionable_position_limit_codes()에 의해 23~26개 유령 보유로 오카운트됨.
     수정: clean_expired_cache() 호출 시 함께 재검증해 장중에도 실시간 정리.
+    v181.1: hit 종목 → hit_time 기준 7일 유지 (이전: 등록시각+3일로 삭제되어 도달 이력 消滅)
+            미도달 expire 종목 → 런타임 중 정리 (이전: 재시작 전까지 stale 누적)
     """
     global _entry_watch
     if not isinstance(_entry_watch, dict) or not _entry_watch:
@@ -6379,26 +6392,38 @@ def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
         for key, watch in list(_entry_watch.items()):
             if not isinstance(watch, dict):
                 continue
-            if not (watch.get("entry_hit") or watch.get("entry_hit_locked")):
-                continue
             code = normalize_stock_code(watch.get("code"))
-            # v169.0 [#2]: 당일 포착 entry_hit watch는 signal_log 불일치 무관하게 당일 유지
-            # 이유: _mark_entry_hit_in_signal_log 후에도 status!=추적중이면 latest_rec=None or actionable=False
-            #       → 동기화 직후 수십 분 내 stale 정리 → 재포착 → 재트리거 반복
+            is_hit = bool(watch.get("entry_hit") or watch.get("entry_hit_locked"))
+            # v169.0 [#2]: 당일 포착 종목은 만료 전 삭제 금지
             detect_date = str(watch.get("detect_date") or watch.get("first_detect_date") or "")
-            # v169.27: entry_hit 유무 무관 당일 종목 전체 삭제 금지
             if detect_date == today_str:
                 expire_ts = float(watch.get("expire_ts", 0) or 0)
                 if not expire_ts or now_ts < expire_ts:
                     continue  # 당일 종목은 만료 전까지 무조건 유지
-            latest_rec = latest_by_code.get(code) if code else None
-            if not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
-                purged.append(key)
+            # v181.1: hit 종목 → hit_time 기준 7일 유지
+            if is_hit:
+                _eht = str(watch.get("entry_hit_time") or "")
+                if _eht:
+                    try:
+                        _ht_ts = datetime.fromisoformat(_eht[:19]).timestamp()
+                        if now_ts - _ht_ts < _HIT_RETAIN_SECONDS:
+                            continue  # hit 후 7일 이내 → 유지
+                    except Exception:
+                        pass
+                latest_rec = latest_by_code.get(code) if code else None
+                if not _is_actionable_entry_watch(watch, latest_rec=latest_rec, now_ts=now_ts):
+                    purged.append(key)
+            else:
+                # v181.1: 미도달 만료 watch → 런타임 중 정리
+                expire_ts = float(watch.get("expire_ts", 0) or 0)
+                if expire_ts and now_ts >= expire_ts:
+                    purged.append(key)
         for key in purged:
             w = _entry_watch.pop(key, None)
             if w:
                 code = normalize_stock_code(w.get("code", ""))
-                _log_info_msg(f"  🗑 stale entry_hit 정리: {w.get('name', code)} ({code}) key={key}")
+                hit_flag = bool(w.get("entry_hit") or w.get("entry_hit_locked"))
+                _log_info_msg(f"  🗑 stale {'entry_hit' if hit_flag else '미도달만료'} 정리: {w.get('name', code)} ({code}) key={key}")
         if purged:
             _save_entry_watch_active()
             if notify:
