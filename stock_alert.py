@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v181.1
+버전: v181.2
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v181.2 (2026-05-26): 대시보드 헤더 봇 버전 표시
+    [#30] 장 마감/운영중 badge 옆에 현재 봇 버전(예: v181.2) 표시
+    - payload에 bot_version 필드 추가
+    - HTML #bot-ver span 추가 (mkt-badge 우측)
+    - JS _applySnapshot에서 bot_version 수신 시 업데이트
 - v181.1 (2026-05-26): 도달 종목 이력 유지 수정
     [#29] 도달(entry_hit=True) 종목이 등록시각+3일 후 캡처 목록에서 消滅
     근본 결함:
@@ -31305,6 +31310,7 @@ def _push_dashboard_json() -> None:
             "rank_date":    rank_date_str,
             "next_biz_day": _next_biz_day_str(),
             "market_open":  is_any_market_open(),
+            "bot_version":  BOT_VERSION,
             "sectors":      sectors_raw,
             "captured":     captured_raw,
             "alerts":       alerts_snapshot,
@@ -31415,6 +31421,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 <div id="hdr">
   <span class="logo">📈 실시간 주식 보드</span>
   <span class="badge" id="mkt-badge">🟢 장 운영중</span>
+  <span id="bot-ver" style="font-size:10px;color:#607080;margin-left:4px"></span>
   <span class="ts">다음 영업일: <b id="next-biz">--</b> &nbsp;|&nbsp; 마지막 갱신: <b id="ts">--:--:--</b></span>
 </div>
 <div id="main">
@@ -31594,6 +31601,7 @@ function _applySnapshot(d){
     badge.style.color=marketOpen?"#00d97e":"#ff4444";
     badge.style.borderColor=marketOpen?"#00d97e30":"#ff444430";
   }
+  if(d.bot_version){const vEl=document.getElementById("bot-ver");if(vEl)vEl.textContent=d.bot_version;}
   renderAll(d.updated_at);
 }
 async function fetchAndRender(){
