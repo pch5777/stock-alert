@@ -3,10 +3,21 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v181.2
+버전: v181.3
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v181.3 (2026-05-26): captured_raw signal_log 폴백 — 삭제된 도달 종목 복원
+    [#31] _entry_watch expire_ts 만료로 삭제된 entry_hit=True 종목이 대시보드에서 消滅
+    근본 결함: _entry_watch 삭제 → entry_watch_active.json 동반 삭제 → captured_raw ①② 경로 누락
+    해결: ③ signal_log 폴백 경로 추가
+      - signal_log에서 entry_hit=True + entry_hit_date 7일 이내 레코드
+      - seen_cap 미포함 코드만 hit=True로 captured_raw에 추가
+      - 이미 삭제된 5/22 도달 종목 복원 가능
+    진입불가 게이트 연결: 표시 전용 경로 (send_alert 없음) ✅
+    이유: 부분패치(v181.1)로는 이미 삭제된 종목 복원 불가 → 근본 해결(§12 원칙)
+    개선점: 재시작/expire_ts 만료와 무관하게 도달 이력 7일 영속 표시
+    주의점: _load_signal_history() 5분 TTL 캐시 사용 — 실시간 반영 아님
 - v181.2 (2026-05-26): 대시보드 헤더 봇 버전 표시
     [#30] 장 마감/운영중 badge 옆에 현재 봇 버전(예: v181.2) 표시
     - payload에 bot_version 필드 추가
@@ -31096,6 +31107,49 @@ def _push_dashboard_json() -> None:
                     "detect_time": str(rec.get("detect_time") or rec.get("first_detect_time") or ""),
                     "hit_time":    _ht_val2,
                 })
+            # ③ signal_log 폴백: _entry_watch에서 이미 삭제된 entry_hit=True 종목 복원 (7일 이내)
+            # 근거: entry_watch expire_ts 만료로 런타임/파일에서 삭제돼도 signal_log는 영속 유지
+            try:
+                _sl_fb_data = _load_signal_history()
+                _sl_fb_cutoff = (_now_kst() - timedelta(days=7)).strftime("%Y-%m-%d")
+                for _sl_rec in (_sl_fb_data or {}).values():
+                    if not isinstance(_sl_rec, dict): continue
+                    if not _sl_rec.get("entry_hit"): continue
+                    _sl_code = normalize_stock_code(_sl_rec.get("code", "") or "")
+                    if not _sl_code or len(_sl_code) != 6: continue
+                    if _sl_code in seen_cap: continue
+                    # entry_hit_date 우선, 없으면 entry_hit_time 앞 10자
+                    _sl_hit_date = str(_sl_rec.get("entry_hit_date") or "")
+                    if not _sl_hit_date:
+                        _sl_ht_raw = str(_sl_rec.get("entry_hit_time") or "")
+                        _sl_hit_date = _sl_ht_raw[:10] if len(_sl_ht_raw) >= 10 else ""
+                    if not _sl_hit_date or _sl_hit_date < _sl_fb_cutoff: continue
+                    _sl_name = _sl_rec.get("name","") or _resolve_stock_name(_sl_code,"")
+                    if any(m in _sl_name for m in _ETF_MARKERS): continue
+                    seen_cap.add(_sl_code)
+                    _sl_snap = _get_snap(_sl_code)
+                    _sl_price = safe_int(
+                        _sl_snap.get("price") or
+                        _sl_rec.get("entry_hit_price") or
+                        _sl_rec.get("entry_price") or 0
+                    )
+                    _sl_chg = float(_sl_snap.get("change_rate") or 0)
+                    captured_raw.append({
+                        "name":        _sl_name,
+                        "code":        _sl_code,
+                        "price":       _sl_price,
+                        "entry":       safe_int(_sl_rec.get("entry_price") or 0),
+                        "target":      safe_int(_sl_rec.get("target_price") or 0),
+                        "stop":        safe_int(_sl_rec.get("stop_loss") or 0),
+                        "hit":         True,
+                        "chg":         _sl_chg,
+                        "miss_count":  0,
+                        "detect_date": str(_sl_rec.get("detect_date") or _sl_rec.get("first_detect_date") or ""),
+                        "detect_time": str(_sl_rec.get("detect_time") or _sl_rec.get("first_detect_time") or ""),
+                        "hit_time":    str(_sl_rec.get("entry_hit_time") or ""),
+                    })
+            except Exception as _sl_fb_e:
+                _swallow_exception(_sl_fb_e, "captured_raw:signal_log_fallback")
             # hit 종목 상단 우선, 동순위는 등락률 내림차순
             captured_raw.sort(key=lambda x: (not x["hit"], -x["chg"]))
             captured_raw = captured_raw[:50]  # v172.1: hit=false 종목 잘림 방지
