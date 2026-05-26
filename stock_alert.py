@@ -3,10 +3,25 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v183.0
+버전: v184.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v184.0 (2026-05-26): 대시보드 섹터 차단 정책 제거 — 알람·대시보드 일치
+
+  배경: 알람은 동적 섹터(Groq자동/연관 테마 SURGE/거래소 표준업종) 정상 발송 중이지만
+        _build_realtime_sectors_from_kis는 셋 다 차단 → 대시보드에서만 표시 안 됨.
+        사용자 요구(2026-05-26): 알람·대시보드 데이터 일치시킬 것.
+
+  [#1] _build_realtime_sectors_from_kis: 차단 3종 제거
+       - " 연관 테마 (" 포함 차단 (v176.3 Q2) 제거
+       - "Groq자동" 포함 차단 (v177.13 #AB-2) 제거
+       - 거래소 표준업종(KIS bstp_name) 차단 (v176.6) 제거
+       기타업종/ETF/선물/옵션/스팩/관리종목 차단은 유지 (실제 비매매)
+
+  [#2] _prev_sectors carry 경로: 거래소 표준업종 차단 제거
+       _SECTOR_BLOCK_PAT (ETF/ETN/선물/옵션/스팩 등 비매매)은 유지
+
 - v183.0 (2026-05-26): WebSocket 매수/매도 거래량 활용 시스템 (조기포착+눌림목+학습 통합)
 
   [#1] _ws_parse_execution_data: 매수/매도 거래량 5개 필드 추출 추가
@@ -42354,17 +42369,9 @@ def _build_realtime_sectors_from_kis() -> None:
             sec = str(theme or "").strip()
             if not sec or sec in ("기타업종", "기타", ""):
                 continue
-            # v176.3 Q2: single-stock SURGE auto theme ("XXX 연관 테마 (...)") blocked from sectors entry
-            if " 연관 테마 (" in sec:
-                continue
-            # v177.13 #AB-2: [Groq자동] AI 자동생성 테마 실시간섹터 반영 차단
-            if "Groq자동" in sec:
-                continue
-            # v176.6: 거래소 표준 업종(KIS bstp_name fallback) 차단.
-            # 사용자 요구: "거래소 업종은 실제 주도섹터와 전혀 관련 없다. 진짜 테마만 표시".
-            # _kis_exchange_sector_names_cache는 _build_realtime_sectors_from_kis 시작 시 1회 빌드.
-            if sec in _kis_exchange_sector_names_cache:
-                continue
+            # v184.0: 동적 테마 차단 정책 제거 — 알람과 대시보드 일치
+            # 기존 차단: " 연관 테마 (", "Groq자동", 거래소 표준업종
+            # 사용자 요구(2026-05-26): 알람으로 정상 발송되는 동적/SURGE/거래소업종을 대시보드에서도 표시
             # v177.8 #P: ETF/선물/옵션/스팩/관리종목/투자경고 등 비매매 섹터 차단
             if any(_pat in sec for _pat in ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")):
                 continue
@@ -42439,8 +42446,7 @@ def _build_realtime_sectors_from_kis() -> None:
                     continue
                 if any(_p in _pt for _p in _SECTOR_BLOCK_PAT):
                     continue
-                if _pt in _kis_exchange_sector_names_cache:
-                    continue
+                # v184.0: 거래소 표준업종 차단 제거 — 알람·대시보드 일치
                 _merged.append(_ps)
             # v176.3 Q2: re-sort by priority first then score desc
             _merged.sort(
