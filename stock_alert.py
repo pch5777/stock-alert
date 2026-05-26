@@ -3,10 +3,40 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v181.3
+버전: v182.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v182.0 (2026-05-26): 정각 워치독 + 07:30 fan-out + schedule 블로킹 워치독 (구조 재설계)
+    [#32] NXT 08:00 / KRX 09:00 / 선진입 14:35·15:08·19:10 정각 트리거 누락 차단
+    근본 원인: schedule 단일 스레드 + 07:30 sync 잡 4개 직렬 → 24분+ 블로킹 → 정각 burst 지연
+    실측 (5/22): NXT 08:00 → 첫 포착 08:24:23 = 24분 23초 지연
+    실측 (5/26 v181.3 fresh boot): NXT 08:00 → 첫 burst 08:03:54 = 3분 54초 지연 (부팅 1분 22초)
+
+    [#1] _market_open_watchdog_thread — 별도 daemon, 1초 폴링
+         - 정각 ±5초 윈도우 안에서 burst·preclose 강제 trigger
+         - _BURST_SCAN_STATE 일자별 1회 락(today_str) → 기존 schedule.every().day.at()과 이중 실행 방지
+         - 트리거 5종: NXT 08:00 / KRX 09:00 / KRX선진입 14:35·15:08 / NXT선진입 19:10
+    [#2] _run_0730_batch — ThreadPoolExecutor max_workers=4 fan-out
+         - 기존: _send_preopen_watchlist_once + _send_premarket_risk_assessment_once + _seed_dynamic_candidates_from_v178_next_open 3개 직렬 호출
+         - 신규: 3개 잡 병렬 → 24분+ → 5~7분 단축 예상
+         - 일자별 1회 락 (batch_0730_triggered_today)
+    [#3] _schedule_run_pending_watchdog — 별도 daemon, 10초 폴링
+         - _BURST_SCAN_STATE.last_pending_run_ts 미갱신 2분+ 감지
+         - 현재가 burst 윈도우면 직접 _run_scan_burst_window 호출
+         - 메인루프에 last_pending_run_ts = time.time() heartbeat 추가
+    [#A] hotfix: _push_dashboard_json UnboundLocalError 차단
+         실측 (5/26 08:03:58): "cannot access local variable '_RANK_EXCLUDE_MARKERS'"
+         원인: sectors fallback(30986)에서 참조 + rank 빌더(31165)에서 정의 → 함수 스코프 local 충돌
+         수정: sectors fallback 인라인 튜플(_SEC_FB_EXCLUDE_MARKERS) 사용
+
+    이유: 부분패치(특정 잡만 threaded로 바꿈) 거부 — 다른 sync 잡이 같은 문제 재발 가능
+    개선점: schedule 블로킹과 무관하게 NXT/KRX 첫 포착 정각 보장 + 07:30 직렬 → 병렬
+    주의점: 워치독 trigger + 기존 schedule.every().day.at("14:35") 등이 동시 존재 →
+            _BURST_SCAN_STATE 일자별 락으로만 차단. 락 키 오타 시 이중 실행 위험.
+    진입불가 게이트 연결: 신규 워치독은 기존 _run_scan_burst_window/_job_preclose_* 호출만 함.
+                       send_alert 신규 경로 0건 — _pre_send_gate 영향 없음 ✅
+
 - v181.3 (2026-05-26): captured_raw signal_log 폴백 — 삭제된 도달 종목 복원
     [#31] _entry_watch expire_ts 만료로 삭제된 entry_hit=True 종목이 대시보드에서 消滅
     근본 결함: _entry_watch 삭제 → entry_watch_active.json 동반 삭제 → captured_raw ①② 경로 누락
@@ -16268,6 +16298,15 @@ _BURST_SCAN_STATE = {
     "nxt_aftermarket_last_ts": 0.0,   # v165.26: NXT 애프터마켓 burst 상태
     "krx_open_last_ts": 0.0,
     "startup_catchup_done": "",
+    # v182.0: 정각 워치독 일자별 1회 락 (KST date string "YYYY-MM-DD")
+    "nxt_open_triggered_today":     "",
+    "krx_open_triggered_today":     "",
+    "preclose_krx1_triggered_today": "",
+    "preclose_krx2_triggered_today": "",
+    "preclose_nxt_triggered_today":  "",
+    "batch_0730_triggered_today":   "",
+    # v182.0: schedule.run_pending() 마지막 실행 ts — 워치독이 블로킹 감지
+    "last_pending_run_ts": 0.0,
 }
 
 
@@ -16286,6 +16325,122 @@ def _is_krx_open_burst_window(now: datetime | None = None) -> bool:
     cur = now.timetz().replace(tzinfo=None)
     # v176.3 Q1: 09:03:30 -> 09:30:00 expand. NXT(08:00~08:59) alignment. 15s burst interval preserved.
     return dtime(9, 0, 0) <= cur <= dtime(9, 30, 0)
+
+
+# v182.0 [#1]: 정각 트리거 워치독 — schedule 단일 스레드 블로킹과 무관하게 NXT 08:00 / KRX 09:00 /
+# 선진입 14:35·15:08·19:10 정각에 burst·preclose 강제 실행. 일자별 1회 락으로 이중 실행 방지.
+# 1초 폴링 + 정각 ±5초 윈도우 안에서 단 1회만 실행.
+def _market_open_watchdog_thread() -> None:
+    """별도 daemon 스레드. 메인 schedule.run_pending() 블로킹과 독립.
+    NXT/KRX 개장·선진입 정각에 무거운 잡이 지연되지 않도록 직접 trigger.
+    """
+    _log_info_msg("🛡️ 시장 정각 워치독 시작 (NXT08:00·KRX09:00·선진입14:35/15:08/19:10)")
+    while True:
+        try:
+            time.sleep(1)
+            if is_holiday():
+                continue
+            now = _now_kst()
+            today_str = now.strftime("%Y-%m-%d")
+            cur_t = now.timetz().replace(tzinfo=None)
+            # 리더 락 + 런타임 락 체크 (schedule._leader_job 동일 가드)
+            if _runtime_version_blocked:
+                continue
+            if not _try_acquire_leader_lock():
+                continue
+            # NXT 08:00:00 ~ 08:00:05
+            if dtime(8, 0, 0) <= cur_t <= dtime(8, 0, 5):
+                if _BURST_SCAN_STATE.get("nxt_open_triggered_today") != today_str:
+                    _BURST_SCAN_STATE["nxt_open_triggered_today"] = today_str
+                    _log_info_msg("🛡️ 워치독 trigger: NXT 08:00 정각 burst")
+                    threading.Thread(
+                        target=lambda: _run_scan_burst_window("nxt_premarket", NXT_PREMARKET_BURST_INTERVAL_SEC),
+                        daemon=True, name="watchdog_nxt_open"
+                    ).start()
+            # KRX 09:00:00 ~ 09:00:05
+            elif dtime(9, 0, 0) <= cur_t <= dtime(9, 0, 5):
+                if _BURST_SCAN_STATE.get("krx_open_triggered_today") != today_str:
+                    _BURST_SCAN_STATE["krx_open_triggered_today"] = today_str
+                    _log_info_msg("🛡️ 워치독 trigger: KRX 09:00 정각 burst")
+                    threading.Thread(
+                        target=lambda: _run_scan_burst_window("krx_open", KRX_OPEN_BURST_INTERVAL_SEC),
+                        daemon=True, name="watchdog_krx_open"
+                    ).start()
+            # 선진입 KRX 1차 14:35:00 ~ 14:35:05
+            elif dtime(14, 35, 0) <= cur_t <= dtime(14, 35, 5):
+                if _BURST_SCAN_STATE.get("preclose_krx1_triggered_today") != today_str:
+                    _BURST_SCAN_STATE["preclose_krx1_triggered_today"] = today_str
+                    _log_info_msg("🛡️ 워치독 trigger: 선진입 KRX 1차 14:35")
+                    threading.Thread(target=_job_preclose_krx_initial, daemon=True, name="watchdog_preclose_krx1").start()
+            # 선진입 KRX 최종 15:08:00 ~ 15:08:05
+            elif dtime(15, 8, 0) <= cur_t <= dtime(15, 8, 5):
+                if _BURST_SCAN_STATE.get("preclose_krx2_triggered_today") != today_str:
+                    _BURST_SCAN_STATE["preclose_krx2_triggered_today"] = today_str
+                    _log_info_msg("🛡️ 워치독 trigger: 선진입 KRX 최종 15:08")
+                    threading.Thread(target=_job_preclose_krx_final, daemon=True, name="watchdog_preclose_krx2").start()
+            # 선진입 NXT 19:10:00 ~ 19:10:05
+            elif dtime(19, 10, 0) <= cur_t <= dtime(19, 10, 5):
+                if _BURST_SCAN_STATE.get("preclose_nxt_triggered_today") != today_str:
+                    _BURST_SCAN_STATE["preclose_nxt_triggered_today"] = today_str
+                    _log_info_msg("🛡️ 워치독 trigger: 선진입 NXT 19:10")
+                    threading.Thread(target=_job_preclose_nxt_final, daemon=True, name="watchdog_preclose_nxt").start()
+        except Exception as _we:
+            _swallow_exception(_we, "market_open_watchdog")
+
+
+# v182.0 [#2]: 07:30 4개 잡 ThreadPoolExecutor 병렬 실행
+# 기존: 4개 직렬 → 24분+ 블로킹 → 08:00 NXT burst 지연
+# 신규: ThreadPoolExecutor max_workers=4 → 가장 느린 잡 1개 소요시간으로 단축 (예상 5~7분)
+def _run_0730_batch() -> None:
+    """07:30 잡 4개를 별도 스레드 풀에서 동시 실행."""
+    today_str = _now_kst().strftime("%Y-%m-%d")
+    if _BURST_SCAN_STATE.get("batch_0730_triggered_today") == today_str:
+        return  # 일자별 1회만
+    _BURST_SCAN_STATE["batch_0730_triggered_today"] = today_str
+    if is_holiday():
+        return
+    _log_info_msg("🛡️ 07:30 배치 fan-out 시작 (4잡 병렬)")
+    from concurrent.futures import ThreadPoolExecutor
+    def _safe_run(fn, name):
+        try:
+            fn()
+        except Exception as _be:
+            _log_warn_msg(f"⚠️ 0730_batch[{name}] 실패: {_be}")
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="batch0730") as ex:
+        ex.submit(_safe_run, _send_preopen_watchlist_once,            "preopen_watchlist")
+        ex.submit(_safe_run, _send_premarket_risk_assessment_once,    "risk_assessment")
+        ex.submit(_safe_run, _seed_dynamic_candidates_from_v178_next_open, "next_open_seed")
+        # reset_daily_caches는 05:00 별도 스케줄러에서 처리 — 여기서 제외
+    _log_info_msg("🛡️ 07:30 배치 fan-out 완료")
+
+
+# v182.0 [#3]: schedule.run_pending() 블로킹 워치독
+# 메인 루프 schedule이 2분 이상 멈추면 (무거운 sync 잡 블로킹) 현재 burst 윈도우 직접 실행.
+def _schedule_run_pending_watchdog() -> None:
+    """schedule 블로킹 감지 + burst 윈도우 직접 실행 보조."""
+    _log_info_msg("🛡️ schedule 블로킹 워치독 시작 (10초 폴링, 2분 임계)")
+    while True:
+        try:
+            time.sleep(10)
+            _last = float(_BURST_SCAN_STATE.get("last_pending_run_ts") or 0.0)
+            if _last <= 0:
+                continue
+            _gap = time.time() - _last
+            if _gap > 120:
+                _log_warn_msg(f"⚠️ schedule blocked {int(_gap)}s — burst 윈도우 직접 실행 검토")
+                now = _now_kst()
+                if _is_nxt_premarket_burst_window(now):
+                    threading.Thread(
+                        target=lambda: _run_scan_burst_window("nxt_premarket", NXT_PREMARKET_BURST_INTERVAL_SEC),
+                        daemon=True, name="watchdog_blocked_nxt"
+                    ).start()
+                elif _is_krx_open_burst_window(now):
+                    threading.Thread(
+                        target=lambda: _run_scan_burst_window("krx_open", KRX_OPEN_BURST_INTERVAL_SEC),
+                        daemon=True, name="watchdog_blocked_krx"
+                    ).start()
+        except Exception as _swe:
+            _swallow_exception(_swe, "schedule_watchdog")
 
 
 def _run_scan_burst_window(tag: str, interval_sec: int) -> None:
@@ -30974,6 +31129,9 @@ def _push_dashboard_json() -> None:
                 # v169.26: KRX API 결과 없거나 종목 0개 → _execution_snapshots 폴백
                 # v177.7 #K: ETF/선물/옵션/스팩/관리종목 섹터 + 우선주 종목명 차단
                 _SECTOR_EXCLUDE_PAT = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열")
+                # v182.0 [#A]: UnboundLocalError fix — _RANK_EXCLUDE_MARKERS는 함수 후반(rank 빌더)에서 정의되므로
+                # 여기서 참조하면 동일 이름 함수-스코프 local 충돌. 인라인 튜플로 분리.
+                _SEC_FB_EXCLUDE_MARKERS = ("KODEX","TIGER","KOSEF","KBSTAR","ARIRANG","HANARO","ACE","SOL","PLUS","KIWOOM","RISE","WOORI","NH","KOACT","FOCUS","TIMEFOLIO","ETF","ETN","선물","옵션","레버리지","인버스","스팩","SPAC")
                 if not sectors_raw or not any(s["stocks"] for s in sectors_raw):
                     snap_groups: dict = {}
                     for code, buf in list(_execution_snapshots.items()):
@@ -30983,7 +31141,7 @@ def _push_dashboard_json() -> None:
                         if any(p in sec_name for p in _SECTOR_EXCLUDE_PAT): continue
                         _sn_name = _resolve_stock_name(code, "")
                         if re.search(r'우[B\dC]*(\(전환\))?$', _sn_name): continue  # v178.1 fix: _re not defined here, use module-level re
-                        if any(m.upper() in _sn_name.upper() for m in _RANK_EXCLUDE_MARKERS): continue
+                        if any(m.upper() in _sn_name.upper() for m in _SEC_FB_EXCLUDE_MARKERS): continue
                         chg_v = float(snap.get("change_rate") or 0)
                         if sec_name not in snap_groups:
                             snap_groups[sec_name] = {"chg_sum": 0, "cnt": 0, "stocks": []}
@@ -46348,16 +46506,15 @@ if __name__ == "__main__":
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
     schedule.every().day.at("05:00").do(reset_daily_caches)  # [v41.84]
     schedule.every(30).minutes.do(_leader_job(_prune_all_caches))
-    schedule.every().day.at("07:30").do(_send_preopen_watchlist_once)  # v37.9: 익개장 전 워치리스트 요약
-    schedule.every().day.at("07:30").do(_send_premarket_risk_assessment_once)  # 장전 리스크 평가 full
+    # v182.0 [#2]: 07:30 4개 잡 → fan-out 1개로 통합 (ThreadPoolExecutor 병렬 → 24분+ 직렬 블로킹 해소)
+    # 기존: _send_preopen_watchlist_once + _send_premarket_risk_assessment_once + _seed_dynamic_candidates_from_v178_next_open
+    # 통합: _run_0730_batch (max_workers=4) — 함수 내부에서 일자별 1회 락 + 비휴일 체크
+    schedule.every().day.at("07:30").do(_threaded_leader_job(_run_0730_batch))
     schedule.every().day.at("08:30").do(_send_premarket_risk_update_once)  # 변화 있을 때만 짧은 업데이트
     # v180.0: 다중소스 익일 갭상승 후보 시드 — 운영시간 기반 3시점 트리거
-    #  07:30 → NXT 오전(08:00~09:00) 직전 시드 + 익일 시초가 준비
+    #  07:30 → _run_0730_batch에서 처리 (위)
     #  15:00 → KRX 14:35/15:08 선진입 직후, KRX 동시호가(15:20) 전 시드 + NXT 애프터(15:30~) 준비
     #  19:30 → NXT 19:10 선진입 직후, NXT 마감(20:00) 전 시드 + 익일 시초가 최종 확정
-    schedule.every().day.at("07:30").do(_leader_job(
-        lambda: None if is_holiday() else _seed_dynamic_candidates_from_v178_next_open()
-    ))
     schedule.every().day.at("15:00").do(_leader_job(
         lambda: None if is_holiday() else _seed_dynamic_candidates_from_v178_next_open()
     ))
@@ -46466,9 +46623,17 @@ if __name__ == "__main__":
         threading.Thread(target=_maybe_run_preclose_gap_alert_catchup, daemon=True).start()
     except Exception as _ce:
         _log_warn_msg(f"⚠️ preclose catchup 시작 실패: {_ce}")
+    # v182.0 [#1+#3]: 정각 트리거 워치독 + schedule 블로킹 워치독 daemon launch
+    # 메인 schedule.run_pending() 블로킹과 완전 독립적으로 NXT/KRX/선진입 정각 보장
+    try:
+        threading.Thread(target=_market_open_watchdog_thread, daemon=True, name="market_open_watchdog").start()
+        threading.Thread(target=_schedule_run_pending_watchdog, daemon=True, name="schedule_blocking_watchdog").start()
+    except Exception as _wt_e:
+        _log_warn_msg(f"⚠️ v182.0 워치독 스레드 시작 실패: {_wt_e}")
     while True:
         try:
             schedule.run_pending()
+            _BURST_SCAN_STATE["last_pending_run_ts"] = time.time()  # v182.0: 블로킹 워치독용 heartbeat
             time.sleep(1)
         except Exception as _e:
             _log_warn_msg(f"⚠️ 메인 루프 오류: {_e}")
