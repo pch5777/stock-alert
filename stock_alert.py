@@ -3,10 +3,25 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v185.0
+버전: v186.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v186.0 (2026-05-26): _build_sectors_from_theme_pool 2-C KIS fallback 추가
+
+  근본 원인: THEME_MAP + _dynamic_theme_map stocks 목록에 없는 종목은
+             아무 섹터에도 배정 안됨. Groq이 단독 섹터로 잘못 분류한 종목
+             (예: 삼화콘덴서→[Groq자동]반도체재료감지) 포함 모든 고강도 상승
+             미배정 종목이 대시보드 SECTOR LIST에서 누락되는 구조적 결함.
+
+  [#1] _build_sectors_from_theme_pool 2-C 단계 신설
+       - chg≥10% + 테마 미배정 종목 상위 20개 대상
+       - get_theme_sector_stocks() 호출 → KIS 업종명으로 code_to_themes 편입
+       - 비매매·노이즈 업종 차단 유지 (ETF/스팩/기타업종 등)
+       이유: 삼화콘덴서(+30%) → KIS 전기·전자 → 이미 대시보드에 나오는 전기·전자 섹터에 합류
+       개선점: Groq 단독분류 오류·THEME_MAP 미등재 모든 고강도 종목 공통 해소
+       주의점: get_theme_sector_stocks() 캐시 있으면 KIS API 미발생, 없으면 최대 20회
+
 - v185.0 (2026-05-26): _build_sectors_from_theme_pool groq_auto_ 일괄차단 → 품질필터 교체
 
   근본 원인: _build_sectors_from_theme_pool 2-B 블록에서 groq_auto_/issue_/auto_ prefix를
@@ -42802,6 +42817,32 @@ def _build_sectors_from_theme_pool() -> None:
                         code_to_themes.setdefault(stock_code, set()).add(desc)
         except Exception as _e7:
             _swallow_exception(_e7, "sector_v181:dyn_theme")
+
+        # ── 2-C. KIS 업종 fallback — THEME_MAP·_dynamic_theme_map 미배정 고강도 종목 ──
+        # v186.0: chg≥10% + 테마 미배정 종목은 get_theme_sector_stocks()로 KIS 업종 직접 조회
+        # 이유: Groq이 단독 섹터 잘못 분류하거나 어떤 테마맵에도 없는 종목이
+        #       아무 섹터에도 안 들어가는 구조적 누락을 해소.
+        #       (예: 삼화콘덴서→[Groq자동]반도체재료감지 단독, 실제 KIS업종은 전기·전자)
+        # 제한: 상위 20종목만 (KIS API 과호출 방지, 캐시 있으면 미발생)
+        _KIS_FALLBACK_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수",
+                               "관리종목","투자경고","투자위험","단기과열","업종미상","기타업종",
+                               "기타","미분류","unknown","동일업종","")
+        try:
+            _unmatched = sorted(
+                [c for c in candidate_pool if c not in code_to_themes and candidate_pool[c]["chg"] >= 10.0],
+                key=lambda c: -candidate_pool[c]["chg"]
+            )[:20]
+            for _uc in _unmatched:
+                try:
+                    _kis_theme, _, _ = get_theme_sector_stocks(_uc)
+                    _kis_sec = str(_kis_theme or "").strip()
+                    if not _kis_sec or any(_b in _kis_sec for _b in _KIS_FALLBACK_BLOCK):
+                        continue
+                    code_to_themes.setdefault(_uc, set()).add(_kis_sec)
+                except Exception:
+                    pass
+        except Exception as _e8:
+            _swallow_exception(_e8, "sector_v181:kis_fallback")
 
         # ── 3. theme별 멤버 그룹 ──
         theme_to_codes: dict = {}
