@@ -3,10 +3,37 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v186.0
+버전: v187.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v187.0 (2026-05-26): prdy_vrss_sign 단독 상한가 오판 차단 — 상한가 후 눌림 종목 포착 복원
+
+  근본 원인: prdy_vrss_sign=="1" 단독으로 상한가급 판정 → stale 캐시(WebSocket 실패 시)
+             또는 상한가 후 눌림 구간(chg 20~26%)에서도 상한가급으로 오판.
+             → NEAR_UPPER 강제 변환 → send_alert() 무소음 드롭(line 32473)
+             또는 _detect_entry_block_reason() upper_limit_reached 차단.
+             오판 방지 로직은 등록만 skip하고 차단 자체는 해제 안 해 실질적 포착 0건.
+
+  [#1] _pre_send_upper_block() line 17239
+       이유: prdy_sign=="1" 단독 → 상한가 오판
+       개선점: (prdy_sign=="1" and change_rate>=27.0) — chg<27%면 상한가 미도달로 처리
+       주의점: chg>=29.0 독립 조건 유지 — 상한가 판정 구멍 없음
+
+  [#2] _detect_entry_block_reason() line 29328
+       이유: upper_price=0일 때 prdy_vrss_sign=="1" 단독 is_upper_price_hit=True 오판
+       개선점: (prdy_vrss_sign=="1" and change_rate>=27.0) or change_rate>=29.0
+
+  [#3] _build_general_alert_dispatch_context() line 35600
+       이유: _live_sign=="1" 단독 _is_upper_hit=True → 전체 종목 NEAR_UPPER 강제변환 오판
+       개선점: (_live_sign=="1" and _live_cr>=27.0) — chg<27% SURGE 신호 보존
+
+  [#4] _handle_general_alert_entry_block() 오판 방지 행동 보완
+       이유: 오판 방지가 등록 skip만 하고 차단(return False) 유지 → 실질 차단과 동일
+       개선점: chg<28% 오판 확인 시 return True(차단 해제) → 정상 dispatch 경로 복귀
+       진입 체인: _handle_general_alert_entry_block → return True → _finalize_general_alert_dispatch ✅
+       진입불가 게이트 연결: _pre_send_upper_block() 경유 확인 ✅
+
 - v186.0 (2026-05-26): _build_sectors_from_theme_pool 2-C KIS fallback 추가
 
   근본 원인: THEME_MAP + _dynamic_theme_map stocks 목록에 없는 종목은
@@ -17236,7 +17263,7 @@ def _pre_send_upper_block(signal: dict) -> str:
     prdy_sign = str(signal.get("prdy_vrss_sign", "") or "")
     is_upper_hit = (
         (upper_price > 0 and price >= upper_price)
-        or prdy_sign == "1"
+        or (prdy_sign == "1" and change_rate >= 27.0)
         or change_rate >= 29.0
     )
     if is_upper_hit:
@@ -29325,7 +29352,7 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
         is_upper_price_hit = price >= upper_price
     else:
         # upper_price 미수신(0) — 기존 로직 유지 (보수적)
-        is_upper_price_hit = (prdy_vrss_sign == "1") or change_rate >= 29.0
+        is_upper_price_hit = (prdy_vrss_sign == "1" and change_rate >= 27.0) or change_rate >= 29.0
     upper_like = is_upper_price_hit or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
@@ -35597,7 +35624,7 @@ def _build_general_alert_dispatch_context(s: dict, hist_key: str | None) -> dict
     _live_cr = safe_float(s.get("change_rate", 0), 0.0)
     _live_upper = safe_int((live or {}).get("upper_price", 0), 0)
     _live_sign  = str((live or {}).get("prdy_vrss_sign", "") or "")
-    _is_upper_hit = (_live_upper > 0 and live_price >= _live_upper) or _live_sign == "1" or _live_cr >= 29.0
+    _is_upper_hit = (_live_upper > 0 and live_price >= _live_upper) or (_live_sign == "1" and _live_cr >= 27.0) or _live_cr >= 29.0
     if _is_upper_hit and s.get("signal_type") not in ("UPPER_LIMIT", "NEAR_UPPER"):
         s["signal_type"] = "NEAR_UPPER"
         _log_info_msg(f"  ⏭ {s.get('name', s.get('code',''))} 상한가급({_live_cr:.1f}%) → NEAR_UPPER 강제 변환")
@@ -35678,8 +35705,9 @@ def _handle_general_alert_entry_block(ctx: dict, source_label: str) -> bool:
             _upper_limit_alerted_today[code] = today
             _save_upper_limit_alerted_today()
         else:
-            # 실제 상한가 미도달 — 등록 skip, 다음 사이클에 재시도 가능
-            _log_info_msg(f"  ⚠️ upper_limit_reached 오판 방지: {s.get('name', code)}({code}) 등락률 {_live_chg:.1f}% < 28% — 차단 등록 skip")
+            # 실제 상한가 미도달 — 차단 자체 해제, 재포착 허용
+            _log_info_msg(f"  ⚠️ upper_limit_reached 오판 방지: {s.get('name', code)}({code}) 등락률 {_live_chg:.1f}% < 28% — 차단 해제, 재포착 허용")
+            return True
     _log_suppressed_alert(
         s["code"],
         s["name"],
