@@ -3,10 +3,54 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v182.0
+버전: v183.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v183.0 (2026-05-26): WebSocket 매수/매도 거래량 활용 시스템 (조기포착+눌림목+학습 통합)
+
+  [#1] _ws_parse_execution_data: 매수/매도 거래량 5개 필드 추출 추가
+       이유: HTS [0301] 차트 하단 매수/매도 거래량 바차트 데이터 활용. REST API에는 매수/매도 구분 없고 KIS WebSocket H0STCNT0 전용.
+       개선점: total_sell_qty(chunk[19]), total_buy_qty(chunk[20]), buy_ratio(chunk[22]), sell_exec_cnt(15), buy_exec_cnt(16) 추출.
+       주의점: 당일 누적값 — 장시작 0~2분 포착 시점에도 구독 즉시 누적 비율 활용 가능.
+
+  [#2] _record_execution_snapshot: 매수/매도 거래량 5개 필드 snapshot 저장
+       이유: get_execution_speed_metrics에서 윈도우 내 매수/매도 압력 추출용.
+       개선점: total_buy_qty/total_sell_qty/buy_ratio/sell_exec_cnt/buy_exec_cnt 누적 기록.
+
+  [#3] _build_execution_speed_metrics_base + get_execution_speed_metrics: buy_ratio + buy_pressure_trend 출력 추가
+       이유: 진입 판단 함수가 매수/매도 압력 활용 가능하도록 출력 확장.
+       개선점:
+         - buy_ratio: 최근 샘플 기준 당일 매수비율 (%)
+         - buy_qty_delta/sell_qty_delta: 윈도우 내 매수/매도 증가분
+         - buy_pressure_trend: 강세지속/강세전환/매수우위/중립/매도우위/약세전환/약세지속
+       주의점: 윈도우 내 첫/마지막 샘플 누적값 차이로 압력 추세 계산.
+
+  [#4] _entry_execution_judgement: 매수강세/매도지속 보정 (조기포착+눌림목 통합 활용)
+       이유: 조기포착 진입 + 눌림목 회복 진입 시 매수/매도 압력 직접 활용.
+       개선점:
+         - 매도압력 지속(약세지속 + buy_ratio < min-5) → 보류 우선 강제 (눌림 아닌 추세하락 차단)
+         - 매수강세(강세전환/강세지속) + 매수비율 충족 → 진입 적합 보강 (눌림목 회복 즉시 매수 전환 감지)
+         - 보통 등급에서 강세전환 + speed≥60 → 진입 적합 승격
+       진입 체인: get_execution_speed_metrics → _entry_execution_judgement → analyze() → _dispatch_alert() 연결 확인 ✅
+       진입불가 게이트 연결: _pre_send_gate() 경유 확인 — 기존 게이트 영향 없음 ✅
+
+  [#5] _build_signal_log_feature_snapshot: 매수/매도 거래량 6개 필드 진입 시점 기록
+       이유: 학습 데이터 누적 → 사후 승률 분석 → 임계값 자동 조정.
+       개선점: buy_ratio_at_detect, total_buy/sell_qty_at_detect, buy/sell_qty_delta_at_detect, buy_pressure_trend_at_detect.
+
+  [#6] _dynamic 신규 키 3개 + _auto_tune_buy_ratio_feedback() 학습 함수
+       이유: 매수비율 임계값을 fzone_min_exec_strength 패턴 따라 동적 조정 (장기 자동 최적화).
+       개선점:
+         - min_buy_ratio (기본 50, 범위 45~60): 진입 적합 최소 매수비율
+         - min_buy_ratio_pullback (52): 눌림목 회복 최소 매수비율
+         - min_buy_pressure_window (55, 범위 50~65): 윈도우 내 매수압력 최소
+         - 학습: 매수비율 50% 이상 vs 미만 종목 승률 비교 → 우위 15%p 이상이면 +2, 차이 5%p 미만이면 -2
+         - 매수압력 강세/약세 승률 비교 → 매수압력 윈도우 임계값 자동 조정 (차이 20%p 이상 +2)
+       주의점: 학습 발동 최소 샘플 10건 (high/low 각 5건 이상).
+
+  검증: 무결성 3종(wc -l/tail-5/ast.parse) 통과 필요
+
 - v182.0 (2026-05-26): 정각 워치독 + 07:30 fan-out + schedule 블로킹 워치독 (구조 재설계)
     [#32] NXT 08:00 / KRX 09:00 / 선진입 14:35·15:08·19:10 정각 트리거 누락 차단
     근본 원인: schedule 단일 스레드 + 07:30 sync 잡 4개 직렬 → 24분+ 블로킹 → 정각 burst 지연
@@ -12045,6 +12089,12 @@ def _ws_parse_execution_data(raw_data: str) -> list[dict]:
                     "exec_vol": int(chunk[12]) if chunk[12] else 0,
                     "exec_strength": float(chunk[18]) if chunk[18] else 0.0,
                     "acml_tr_pbmn": int(chunk[14]) if chunk[14] else 0,
+                    # v183.0: WebSocket 매수/매도 거래량 추출 (당일 누적값)
+                    "total_sell_qty": int(chunk[19]) if chunk[19] else 0,
+                    "total_buy_qty": int(chunk[20]) if chunk[20] else 0,
+                    "buy_ratio": float(chunk[22]) if chunk[22] else 0.0,
+                    "sell_exec_cnt": int(chunk[15]) if chunk[15] else 0,
+                    "buy_exec_cnt": int(chunk[16]) if chunk[16] else 0,
                     # v163: VI 발동 기준가 (정적VI, 0이면 미발동)
                     "vi_price": int(float(chunk[45])) if len(chunk) > 45 and chunk[45] else 0,
                 }
@@ -12473,6 +12523,12 @@ def _record_execution_snapshot(code: str, payload: dict, market: str = "KRX") ->
         "acml_tr_pbmn": safe_int(payload.get("acml_tr_pbmn", 0)),
         "high": safe_int(payload.get("high", 0)),
         "low": safe_int(payload.get("low", 0)),
+        # v183.0: WebSocket 매수/매도 거래량 (당일 누적). buy_ratio = 매수비율(%)
+        "total_sell_qty": safe_int(payload.get("total_sell_qty", 0)),
+        "total_buy_qty": safe_int(payload.get("total_buy_qty", 0)),
+        "buy_ratio": float(payload.get("buy_ratio", 0.0) or 0.0),
+        "sell_exec_cnt": safe_int(payload.get("sell_exec_cnt", 0)),
+        "buy_exec_cnt": safe_int(payload.get("buy_exec_cnt", 0)),
         # v163: VI 발동 기준가 저장
         "vi_price": safe_int(payload.get("vi_price", 0)),
         # v170.2: 섹터명 저장 — 대시보드 섹터 분류용 (WebSocket 틱엔 없으므로 이전 값 유지)
@@ -12518,6 +12574,13 @@ def _build_execution_speed_metrics_base(current_price: int | None = None) -> dic
         "recent_valid_samples": 0,
         "flow_state": "중립",
         "summary": "샘플 부족",
+        # v183.0: WebSocket 매수/매도 거래량 (snapshot 최근 샘플 기준)
+        "total_buy_qty": 0,
+        "total_sell_qty": 0,
+        "buy_ratio": 0.0,
+        "buy_qty_delta": 0,
+        "sell_qty_delta": 0,
+        "buy_pressure_trend": "중립",
     }
 def _collect_execution_speed_window_samples(code: str, now_ts: float, window_sec: int, out: dict) -> tuple[list, list]:
     samples = [s for s in (_execution_snapshots.get(code) or []) if float(s.get("ts", 0) or 0) >= now_ts - window_sec]
@@ -12723,6 +12786,32 @@ def get_execution_speed_metrics(code: str, current_price: int | None = None, win
     avg_bid_ratio, active_ratio = _calc_execution_speed_bid_context(valid, samples, out, mean_amount)
     out["dip_resilience_score"] = _calc_execution_speed_dip_score(valid, peak_price, mean_amount, out["pullback_pct"])
     out["execution_speed_score"] = int(_calc_execution_speed_score(mean_amount, mean_rate, len(valid), active_ratio, consistency, avg_bid_ratio, out["freshness_score"], recent_profile["accel_ratio"], last_active_age_sec))
+    # v183.0: WebSocket 매수/매도 거래량 추출 + 압력 추세 계산
+    if samples:
+        last_s = samples[-1]
+        out["total_buy_qty"] = safe_int(last_s.get("total_buy_qty", 0), 0)
+        out["total_sell_qty"] = safe_int(last_s.get("total_sell_qty", 0), 0)
+        out["buy_ratio"] = round(float(last_s.get("buy_ratio", 0.0) or 0.0), 1)
+        # 윈도우 내 매수/매도 거래량 증가분 (누적값 차이)
+        first_s = samples[0]
+        prev_buy = safe_int(first_s.get("total_buy_qty", 0), 0)
+        prev_sell = safe_int(first_s.get("total_sell_qty", 0), 0)
+        out["buy_qty_delta"] = max(out["total_buy_qty"] - prev_buy, 0)
+        out["sell_qty_delta"] = max(out["total_sell_qty"] - prev_sell, 0)
+        # 압력 추세: 윈도우 내 buy_qty 증가분 vs sell_qty 증가분
+        total_delta = out["buy_qty_delta"] + out["sell_qty_delta"]
+        if total_delta > 0:
+            window_buy_pct = (out["buy_qty_delta"] / total_delta) * 100.0
+            if window_buy_pct >= 60.0:
+                out["buy_pressure_trend"] = "강세지속" if out["buy_ratio"] >= 55.0 else "강세전환"
+            elif window_buy_pct >= 52.0:
+                out["buy_pressure_trend"] = "매수우위"
+            elif window_buy_pct <= 40.0:
+                out["buy_pressure_trend"] = "약세지속" if out["buy_ratio"] <= 45.0 else "약세전환"
+            elif window_buy_pct <= 48.0:
+                out["buy_pressure_trend"] = "매도우위"
+            else:
+                out["buy_pressure_trend"] = "중립"
     return _finalize_execution_speed_metrics(out, samples, valid, last_price, peak_price)
 def _tick_exec_speed_prewarm() -> None:
     """포착 직후 등록된 종목의 체결속도 스냅샷을 사전 누적 (진입가 도달 시 샘플 부족 최소화).
@@ -12792,16 +12881,29 @@ def _entry_execution_judgement(metrics: dict | None = None) -> tuple[str, str]:
     freshness_score = int(metrics.get("freshness_score", 0) or 0)
     flow_state = str(metrics.get("flow_state", "중립") or "중립")
     last_active_age_sec = int(metrics.get("last_active_age_sec", 999) or 999)
+    # v183.0: WebSocket 매수/매도 거래량 기반 판정 보정
+    buy_ratio = float(metrics.get("buy_ratio", 0.0) or 0.0)
+    pressure_trend = str(metrics.get("buy_pressure_trend", "중립") or "중립")
+    min_buy_ratio = float(_dynamic.get("min_buy_ratio", 50.0) or 50.0) if "_dynamic" in globals() else 50.0
     if not metrics.get("ready"):
         if metrics.get("provisional") and speed_score >= 68 and dip_score >= 55 and freshness_score >= 70 and flow_state in {"가속", "유지"}:
             return ("참고", f"🟡 예비판단상 체결 살아있음 — {flow_state}, 최근 유효체결 {last_active_age_sec}초 전")
         return ("참고", "⚠️ 체결속도 샘플 부족 — 진입 시 추가 확인")
     if last_active_age_sec > EXEC_SPEED_STALE_WARN_SEC or freshness_score < 40:
         return ("보류 우선", f"⚠️ 최근 체결이 끊김 — 마지막 유효체결 {last_active_age_sec}초 전")
+    # v183.0: 매도 압력 지속 시 보류 우선 강제
+    if pressure_trend == "약세지속" and buy_ratio > 0 and buy_ratio < (min_buy_ratio - 5.0):
+        return ("보류 우선", f"⚠️ 매도압력 지속 (매수비율 {buy_ratio:.0f}% / {pressure_trend}) — 진입보류")
     if speed_score >= 75 and dip_score >= 70 and filtered_ratio <= 0.60 and flow_state != "둔화":
+        # v183.0: 매수강세 보정 (강세전환/강세지속 시 진입 적합 라벨 보강)
+        if pressure_trend in {"강세전환", "강세지속"} and buy_ratio >= min_buy_ratio:
+            return ("진입 적합", f"✅ {flow_state} + 매수강세 ({pressure_trend}, 매수비율 {buy_ratio:.0f}%) — 유효체결 {last_active_age_sec}초 전")
         return ("진입 적합", f"✅ {flow_state} 흐름 유지 — 최근 유효체결 {last_active_age_sec}초 전")
     if speed_score < 40 or dip_score < 40 or filtered_ratio > 0.75:
         return ("보류 우선", "⚠️ 하락 중 체결 유지 약함 — 진입보류 우선")
+    # v183.0: 보통 등급에서 강세 보정 (매수강세 + 매수비율 충족 → 진입 적합 승격)
+    if pressure_trend in {"강세전환", "강세지속"} and buy_ratio >= (min_buy_ratio + 5.0) and speed_score >= 60:
+        return ("진입 적합", f"✅ 매수강세 우위 ({pressure_trend}, 매수비율 {buy_ratio:.0f}%) — 흐름 {flow_state}")
     if flow_state == "둔화":
         return ("보통", f"🟡 체결은 이어지지만 둔화 중 — 최근 유효체결 {last_active_age_sec}초 전")
     return ("보통", f"🟡 체결속도는 보통 수준 — {flow_state}, 최근 유효체결 {last_active_age_sec}초 전")
@@ -24234,6 +24336,13 @@ def _build_signal_log_feature_snapshot(stock: dict, indic: dict, exec_metrics: d
         "execution_speed_score": int(exec_metrics.get("execution_speed_score", 0) or 0),
         "dip_resilience_score": int(exec_metrics.get("dip_resilience_score", 0) or 0),
         "micro_trade_filtered_ratio": float(exec_metrics.get("micro_trade_filtered_ratio", 0.0) or 0.0),
+        # v183.0: WebSocket 매수/매도 거래량 학습 데이터 기록 (진입 시점)
+        "buy_ratio_at_detect": round(float(exec_metrics.get("buy_ratio", 0.0) or 0.0), 1),
+        "total_buy_qty_at_detect": int(exec_metrics.get("total_buy_qty", 0) or 0),
+        "total_sell_qty_at_detect": int(exec_metrics.get("total_sell_qty", 0) or 0),
+        "buy_qty_delta_at_detect": int(exec_metrics.get("buy_qty_delta", 0) or 0),
+        "sell_qty_delta_at_detect": int(exec_metrics.get("sell_qty_delta", 0) or 0),
+        "buy_pressure_trend_at_detect": str(exec_metrics.get("buy_pressure_trend", "중립") or "중립"),
         "execution_setup_required": bool(stock.get("execution_setup_required")),
         "resurge_mode": bool(stock.get("resurge_mode")),
         "entry_soft_block_allowed": bool(stock.get("entry_soft_block_allowed")),
@@ -25991,6 +26100,10 @@ _dynamic = {
     "feat_w_sector":    1.0,    # 섹터 모멘텀 가중치
     "feat_w_nxt":       1.0,    # NXT 보정 가중치
     "feat_w_geo":       1.0,    # 지정학 이벤트 섹터 보정 가중치
+    # ── v183.0: WebSocket 매수/매도 거래량 임계값 (학습으로 자동조정) ──
+    "min_buy_ratio":             50.0,   # 진입 적합 최소 매수비율 (%) — 보통 50, 학습으로 45~60 범위 조정
+    "min_buy_ratio_pullback":    52.0,   # 눌림목 회복 진입 최소 매수비율 (%)
+    "min_buy_pressure_window":   55.0,   # 윈도우 내 매수압력 최소(%) — 강세지속/강세전환 판정 기준
     # ── 시장 국면 판단 ──
     "regime_mode":         "normal",   # "bull" / "normal" / "bear" / "crash"
     "regime_score_mult":   1.0,        # 신호 점수 배율 (하락장 0.7, 상승장 1.2)
@@ -26567,6 +26680,78 @@ def _auto_tune_entry_pullback_ratio_feedback(data: dict, completed: list, tune_s
     except Exception as e:
         _log_error('_auto_tune_entry_pullback_ratio_feedback', e)
     return changes
+def _auto_tune_buy_ratio_feedback(data: dict, completed: list, tune_state: dict) -> list:
+    """v183.0: WebSocket buy_ratio_at_detect 분포 기반 min_buy_ratio 자동조정.
+    - 매수비율 50% 이상 vs 미만 종목의 승률 비교
+    - 50% 이상이 명확히 우월하면 min_buy_ratio 상향 (필터 강화)
+    - 50% 이상도 승률 낮으면 임계값 의미 없음 → 하향
+    """
+    changes = []
+    try:
+        if not isinstance(data, dict) or not completed:
+            return changes
+        recs_with_br = [r for r in completed if isinstance(r, dict)
+                        and isinstance(r.get('feature_snapshot'), dict)
+                        and float(r['feature_snapshot'].get('buy_ratio_at_detect', 0) or 0) > 0]
+        if len(recs_with_br) < 10:
+            return changes
+        cur_min = float(_dynamic.get('min_buy_ratio', 50.0) or 50.0)
+        high_br = [r for r in recs_with_br
+                   if float(r['feature_snapshot'].get('buy_ratio_at_detect', 0) or 0) >= cur_min]
+        low_br = [r for r in recs_with_br
+                  if float(r['feature_snapshot'].get('buy_ratio_at_detect', 0) or 0) < cur_min]
+        if len(high_br) < 5 or len(low_br) < 5:
+            return changes
+        high_rate = sum(1 for r in high_br if float(r.get('pnl_pct', 0) or 0) > 0) / len(high_br)
+        low_rate = sum(1 for r in low_br if float(r.get('pnl_pct', 0) or 0) > 0) / len(low_br)
+        if high_rate - low_rate >= 0.15 and high_rate >= 0.55 and cur_min < 60.0:
+            new_min = round(min(cur_min + 2.0, 60.0), 1)
+            if new_min != cur_min:
+                _dynamic['min_buy_ratio'] = new_min
+                tune_state['last_buy_ratio_reason'] = f'high_advantage_{int((high_rate-low_rate)*100)}pp'
+                tune_state['last_buy_ratio_ts'] = time.time()
+                changes.append(
+                    f"💪 매수비율 임계 강화: {cur_min:.0f}→{new_min:.0f}% "
+                    f"(고매수비율 승률 {high_rate*100:.0f}% / 저매수비율 {low_rate*100:.0f}%, {len(recs_with_br)}건)"
+                )
+        elif abs(high_rate - low_rate) < 0.05 and high_rate < 0.50 and cur_min > 45.0:
+            new_min = round(max(cur_min - 2.0, 45.0), 1)
+            if new_min != cur_min:
+                _dynamic['min_buy_ratio'] = new_min
+                tune_state['last_buy_ratio_reason'] = f'low_advantage_{int(abs(high_rate-low_rate)*100)}pp'
+                tune_state['last_buy_ratio_ts'] = time.time()
+                changes.append(
+                    f"📉 매수비율 임계 완화: {cur_min:.0f}→{new_min:.0f}% "
+                    f"(매수비율 필터 효과 미미, 고/저 승률 차이 {abs(high_rate-low_rate)*100:.0f}%p)"
+                )
+        strong_recs = [r for r in recs_with_br
+                       if str(r['feature_snapshot'].get('buy_pressure_trend_at_detect', '') or '')
+                       in {'강세지속', '강세전환'}]
+        weak_recs = [r for r in recs_with_br
+                     if str(r['feature_snapshot'].get('buy_pressure_trend_at_detect', '') or '')
+                     in {'약세지속', '약세전환'}]
+        if len(strong_recs) >= 5 and len(weak_recs) >= 5:
+            strong_rate = sum(1 for r in strong_recs if float(r.get('pnl_pct', 0) or 0) > 0) / len(strong_recs)
+            weak_rate = sum(1 for r in weak_recs if float(r.get('pnl_pct', 0) or 0) > 0) / len(weak_recs)
+            cur_pw = float(_dynamic.get('min_buy_pressure_window', 55.0) or 55.0)
+            if strong_rate - weak_rate >= 0.20 and cur_pw < 65.0:
+                new_pw = round(min(cur_pw + 2.0, 65.0), 1)
+                if new_pw != cur_pw:
+                    _dynamic['min_buy_pressure_window'] = new_pw
+                    changes.append(
+                        f"⚡ 매수압력 윈도우 강화: {cur_pw:.0f}→{new_pw:.0f}% "
+                        f"(강세 승률 {strong_rate*100:.0f}% / 약세 {weak_rate*100:.0f}%)"
+                    )
+            elif strong_rate - weak_rate < 0.05 and cur_pw > 50.0:
+                new_pw = round(max(cur_pw - 2.0, 50.0), 1)
+                if new_pw != cur_pw:
+                    _dynamic['min_buy_pressure_window'] = new_pw
+                    changes.append(
+                        f"📉 매수압력 윈도우 완화: {cur_pw:.0f}→{new_pw:.0f}% (차이 미미)"
+                    )
+    except Exception as e:
+        _log_error('_auto_tune_buy_ratio_feedback', e)
+    return changes
 def _auto_tune_load_completed_records():
     try:
         data = _read_json_locked(SIGNAL_LOG_FILE)
@@ -26748,6 +26933,8 @@ def _auto_tune_apply_signal_type_tuning(by_type, data, completed, tune_state, ch
         if changed:
             changes.extend(changed)
     changes.extend(_auto_tune_entry_pullback_ratio_feedback(data, completed, tune_state))
+    # v183.0: WebSocket 매수/매도 거래량 임계값 자동조정
+    changes.extend(_auto_tune_buy_ratio_feedback(data, completed, tune_state))
     rate = sum(1 for r in completed if r["pnl_pct"] > 0) / len(completed)
     old_n = _dynamic["min_score_normal"]
     old_s = _dynamic["min_score_strict"]
