@@ -3,10 +3,25 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v184.0
+버전: v185.0
 날짜: 2026-05-26
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v185.0 (2026-05-26): _build_sectors_from_theme_pool groq_auto_ 일괄차단 → 품질필터 교체
+
+  근본 원인: _build_sectors_from_theme_pool 2-B 블록에서 groq_auto_/issue_/auto_ prefix를
+             일괄 차단 → Groq 동적 섹터만 갖는 종목(삼화콘덴서 유형)은 등락률 1위여도 대시보드 미출현.
+             v184.0은 _build_realtime_sectors_from_kis 차단만 제거했으나
+             실제 대시보드 호출 함수는 v178.0에서 _build_sectors_from_theme_pool로 교체됨 → 결함 잔존.
+
+  [#1] _build_sectors_from_theme_pool 2-B 블록: 일괄 차단 → 품질 필터 교체
+       - 변경 전: groq_auto_/issue_/auto_ prefix → continue (전량 차단)
+       - 변경 후: 해당 prefix 섹터도 멤버 중 chg≥15% 1종목 OR chg≥10% 2종목 충족 시 허용
+                  미충족 시 기존처럼 차단 (노이즈 방어 유지)
+       이유: 알람은 Groq 동적 섹터 정상 발송, 대시보드만 차단 → 불일치 구조 해소
+       개선점: 삼화콘덴서 유형(상한가급 Groq 단일섹터) + Groq 복수 강세 섹터 모두 해소
+       주의점: 10%/15% 임계값 이하 Groq 섹터는 여전히 차단 (노이즈 방어)
+
 - v184.0 (2026-05-26): 대시보드 섹터 차단 정책 제거 — 알람·대시보드 일치
 
   배경: 알람은 동적 섹터(Groq자동/연관 테마 SURGE/거래소 표준업종) 정상 발송 중이지만
@@ -42752,14 +42767,31 @@ def _build_sectors_from_theme_pool() -> None:
                         code_to_themes.setdefault(stock_code, set()).add(str(theme_key))
         except Exception as _e6:
             _swallow_exception(_e6, "sector_v181:theme_map")
-        # 2-B. _dynamic_theme_map (curated — prefix 차단 후)
-        _NOISE_KEY_PREFIX = ("issue_", "groq_auto_", "auto_")
+        # 2-B. _dynamic_theme_map (품질 필터 기반 — groq_auto_/issue_/auto_ prefix는 강세 조건 충족 시만 허용)
+        # v185.0: groq_auto_ 일괄 차단 → 품질 필터로 교체
+        # 이유: 삼화콘덴서(+30%) 등 상한가급 Groq 동적 섹터가 대시보드에서만 제외되는 구조적 결함 수정
+        # 규칙: groq_auto_/issue_/auto_ prefix 섹터는 멤버 중 chg≥15% 1종목 OR chg≥10% 2종목 충족 시 허용
+        _STRICT_PREFIX = ("issue_", "groq_auto_", "auto_")
         _NOISE_DESC_PAT = ("자동발굴", "auto_discover", "연관 자동발굴")
         try:
             for theme_key, theme_info in _dynamic_theme_map.items():
                 _key_str = str(theme_key or "")
-                if any(_key_str.startswith(_p) for _p in _NOISE_KEY_PREFIX):
-                    continue
+                _is_strict = any(_key_str.startswith(_p) for _p in _STRICT_PREFIX)
+                if _is_strict:
+                    # 품질 필터: 멤버 중 강세 종목이 있어야만 허용
+                    _theme_stocks = theme_info.get("stocks", [])
+                    _strong_codes = [
+                        normalize_stock_code(sc)
+                        for sc, _ in _theme_stocks
+                        if normalize_stock_code(sc) in candidate_pool
+                        and candidate_pool[normalize_stock_code(sc)]["chg"] >= 10.0
+                    ]
+                    _very_strong = any(
+                        candidate_pool[c]["chg"] >= 15.0 for c in _strong_codes
+                    )
+                    # chg≥15% 1종목 OR chg≥10% 2종목 미충족 → 노이즈로 차단
+                    if not (_very_strong or len(_strong_codes) >= 2):
+                        continue
                 desc = str(theme_info.get("desc", theme_key) or theme_key)
                 if any(_p in desc for _p in _NOISE_DESC_PAT):
                     continue
