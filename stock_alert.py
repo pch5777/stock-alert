@@ -3,10 +3,17 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v190.0
+버전: v191.0
 날짜: 2026-05-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v191.0 (2026-05-27): 대시보드 섹터 종목 최소 6행 패딩
+
+  [#1] _DASHBOARD_HTML secHTML(): 섹터 종목 최소 6행 보장
+       이유: 섹터 종목 수가 6개 미만이면 행 수가 들쑥날쑥 → 시안성 저하
+       개선점: ss 필터 후 null 패딩으로 6행 최소 보장. 빈 행은 빈 .stk-row (높이 23px 유지)
+       주의점: 없음
+
 - v190.0 (2026-05-27): stale price 차단 + 일반 포착 알람 재포착 dedup 강화
 
   근본 원인 1 (stale price): send_mid_pullback_alert()가 시그널 생성 시점 snapshot(`s["price"]`)을
@@ -32289,17 +32296,18 @@ function secHTML(list,offset){
     const rank=(li*2)+offset+1,pos=sec.chg>=0,ac=pos?"#ff4444":"#00d97e";
     const _excl=/(?:우[B\\d]*|스팩|SPAC|KODEX|TIGER|KOSEF|KBSTAR|ARIRANG|HANARO|ACE|SOL)$/i;
     const ss=[...sec.stocks].filter(s=>!_excl.test(s.name)).sort((a,b)=>b.chg-a.chg);
+    const padded=[...ss,...Array(Math.max(0,6-ss.length)).fill(null)];
     return `<div class="sec-sub ${pos?"pos":"neg"}">
       <div class="sec-rnk" style="background:${ac}">${rank}</div>
       <span class="sec-nm">${sec.name}</span>
       <span class="sec-chg" style="color:${ac}">${fg(sec.chg)}</span></div>
-      ${ss.map(s=>`<div class="stk-row">
+      ${padded.map(s=>s?`<div class="stk-row">
         <span class="stk-nm">${s.name}</span>
         <button class="cp" onclick="cp(this,'${s.code}')">${s.code}</button>
         <span class="chg-v" style="color:${cc(s.chg)}">${fg(s.chg)}</span>
         <span class="vol-v">${s.vol||""}</span>
         <span class="amt-v">${s.amt||""}</span>
-      </div>`).join("")}`;
+      </div>`:`<div class="stk-row"></div>`).join("")}`;
   }).join("");
 }
 function renderCapture(){
