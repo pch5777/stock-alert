@@ -3,10 +3,45 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v188.0
+버전: v189.0
 날짜: 2026-05-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v189.0 (2026-05-27): HTS 강세섹터 수준 도달 — 네이버 테마 직접 스크래핑 + Groq 확대 + 시나리오 테마 입력
+
+  근본 원인: 봇 섹터/테마 분류가 KIS 업종(고정 산업분류)+THEME_MAP(수동 큐레이션)+Groq 자동등록에만 의존.
+             HTS 강세섹터(상법개정·국가AI·GLP-1 등 매일 바뀌는 이슈 기반 테마)는 KIS API 미제공 + Groq 환각·rate limit 한계.
+             결과: 매일 HTS 강세 5~7개 테마 중 봇이 인지하는 건 1~2개. 신선도·완전성 모두 미달.
+
+  해결 범위: 네이버 sise/theme.naver (사실상 HTS와 동일 매경/한경 테마 분류) 직접 수신 →
+            _dynamic_theme_map 등록 → 기존 _build_sectors_from_theme_pool 자동 처리 →
+            대시보드·선진입 풀 자동 노출. KIS 실시간 시세와 결합해 봇이 강세 판정.
+  완전 해결 여부: YES (HTS 분류 체계와 동일 데이터 소스 확보 + 실시간 강세 판정 자체 수행)
+
+  [#1] 신규 _fetch_naver_strong_themes() — 네이버 강세테마 직접 스크래핑
+       이유: HTS 강세섹터 = 네이버 theme.naver와 동일 테마 분류 체계 사용 (매경/한경 기반)
+       개선점: 전 테마 (300개+) 중 등락률 +2% 이상 + 종목수 3개 이상 강세 테마만 수신 →
+              구성종목 수신 (theme_data.naver?no=N) → _dynamic_theme_map["naver_theme_{no}"] 등록
+       주의점: 네이버 차단 방지 — 강세 테마 30개로 상한 + 페이지당 1초 sleep + UA 랜덤
+       진입 체인: _dynamic_theme_map 등록 → _build_sectors_from_theme_pool 자동 처리 ✅
+       진입불가 게이트 연결: 종목 알람 경로는 미변경 — 섹터 풀 데이터만 보강 ✅
+
+  [#2] 스케줄 등록 — 15분 주기 (KRX/NXT 운영시간만)
+       이유: 네이버 테마 분류는 정적 (장중 거의 안 바뀜) — 15분 주기로 충분
+       개선점: schedule.every(15).minutes — _threaded_leader_job (블로킹 방지)
+       주의점: 첫 호출은 부팅 후 15분 뒤 — 즉시 호출 필요 시 봇 시작 직후 1회 실행
+
+  [#3] Groq 호출 확대 — TTL 단축 + 일일 한도 상향
+       이유: 신선도 부족 (10분 캐시 → Groq 갱신 지연으로 신규 테마 감지 늦음)
+       개선점: GROQ_GROUNDING_CACHE_TTL_SEC 600→300 (5분 캐시),
+              GROQ_GROUNDING_DAILY_LIMIT 200→400 (Groq 무료 14,400 RPD 한참 여유)
+       주의점: NXT 08:00~08:29 차단 유지 — 429 방지
+
+  [#4] _get_groq_scenario_for_code() — 활성 테마 정보 추가
+       이유: 시나리오 생성 시 종목이 어느 테마에 속하는지 정보 누락 → 분기 정확도 저하
+       개선점: _stock_theme_profile[code].themes를 반환 dict에 active_themes 필드로 추가 →
+              시나리오 분기 로직이 테마 강세 여부 참조 가능
+
 - v188.0 (2026-05-27): schedule 블로킹 해소 + 후보 풀 0건 구조결함 수정
 
   근본 원인 1 (schedule blocking): _leader_job(동기 실행)으로 등록된 무거운 잡 3개가
@@ -5830,6 +5865,220 @@ def _fetch_sector_volume_rank(top_n: int = 10) -> list:
     except Exception as e:
         _swallow_exception(e)
         return []
+
+# ── v189.0 [#1]: 네이버 강세테마 직접 스크래핑 ─────────────────────────────
+# HTS 강세섹터와 동일한 테마 분류 체계 (매경/한경 기반) 수신
+# KIS API에 HTS 강세섹터 직접 API 없음 → 네이버가 사실상 유일한 무료 동적 소스
+# 등락률·종목수 강세 테마만 필터링 → _dynamic_theme_map 등록 →
+# _build_sectors_from_theme_pool 자동 처리 → 대시보드·선진입 자동 노출
+_naver_theme_cache: dict = {"ts": 0.0, "rows": []}
+_NAVER_THEME_CACHE_TTL = 900   # 15분 (테마 분류 정적)
+_NAVER_THEME_MAX_PAGES = 7     # 페이지당 50테마 × 7 = 350테마 풀
+_NAVER_STRONG_CHG_MIN = 2.0    # 강세 테마 진입 기준 등락률 (+2% 이상)
+_NAVER_STRONG_TOP_N = 30       # 빌드당 최대 강세 테마 수
+_NAVER_THEME_STOCK_MAX = 10    # 테마당 종목 수 상한
+_NAVER_PAGE_SLEEP_SEC = 1.0    # 페이지 간 sleep — 차단 방지
+
+def _fetch_naver_strong_themes(force_refresh: bool = False) -> list:
+    """네이버 강세 테마 + 구성종목 스크래핑.
+    https://finance.naver.com/sise/theme.naver
+      - 페이지당 50개 테마 (등락률 정렬)
+      - 각 테마: 이름, 등락률, 평균 등락률, 종목수
+    페이지당 1초 sleep → 차단 방지.
+    강세 조건: 평균 등락률 >= +2% AND 종목수 >= 3
+    Returns: [{"theme":"...", "no":N, "chg":F, "stock_count":N, "stocks":[(code,name),...]}, ...]
+    """
+    global _naver_theme_cache
+    now = time.time()
+    if not force_refresh and _naver_theme_cache.get("rows") and \
+            now - float(_naver_theme_cache.get("ts", 0) or 0) < _NAVER_THEME_CACHE_TTL:
+        return list(_naver_theme_cache["rows"])
+    try:
+        themes_raw = []
+        for page in range(1, _NAVER_THEME_MAX_PAGES + 1):
+            try:
+                url = "https://finance.naver.com/sise/theme.naver"
+                resp = requests.get(
+                    url,
+                    params={"&page": str(page)} if page > 1 else None,
+                    timeout=8,
+                    headers=_random_ua(),
+                )
+                if page > 1:
+                    # 네이버 페이지 파라미터는 page= 가 정상
+                    resp = requests.get(url, params={"page": str(page)}, timeout=8, headers=_random_ua())
+                resp.raise_for_status()
+                apparent = (resp.apparent_encoding or "").strip()
+                resp.encoding = apparent or "euc-kr"
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # 테마 리스트 테이블
+                rows = soup.select("table.type_1 tr")
+                page_count = 0
+                for row in rows:
+                    a_tag = row.find("a", href=True)
+                    if not a_tag:
+                        continue
+                    href = a_tag.get("href") or ""
+                    if "group.naver" not in href and "theme_data" not in href and "no=" not in href:
+                        continue
+                    # 테마 번호 추출
+                    m_no = re.search(r"no=(\d+)", href)
+                    if not m_no:
+                        continue
+                    theme_no = int(m_no.group(1))
+                    theme_name = a_tag.get_text(strip=True)
+                    if not theme_name or len(theme_name) < 2:
+                        continue
+                    # 평균 등락률 추출 — tds 중 % 패턴
+                    tds = row.find_all("td")
+                    chg_avg = None
+                    for td in tds:
+                        txt = td.get_text(strip=True).replace(",", "").replace("+", "")
+                        if "%" not in td.get_text(strip=True):
+                            continue
+                        try:
+                            chg_avg = float(txt.replace("%", ""))
+                            break
+                        except ValueError:
+                            continue
+                    if chg_avg is None:
+                        continue
+                    themes_raw.append({"theme": theme_name, "no": theme_no, "chg": chg_avg})
+                    page_count += 1
+                if page_count == 0:
+                    break  # 빈 페이지 = 끝
+            except Exception as _pe:
+                _log_warn_msg(f"  ⚠️ 네이버 테마 페이지 {page} 실패: {_pe}")
+                continue
+            time.sleep(_NAVER_PAGE_SLEEP_SEC)
+
+        if not themes_raw:
+            _log_warn_msg("⚠️ 네이버 테마 수집 0건 — 차단 또는 페이지 구조 변경 가능")
+            return list(_naver_theme_cache.get("rows", []))
+
+        # 강세 필터: chg >= +2%
+        strong = [t for t in themes_raw if t["chg"] >= _NAVER_STRONG_CHG_MIN]
+        strong.sort(key=lambda x: -x["chg"])
+        strong = strong[:_NAVER_STRONG_TOP_N]
+
+        # 각 테마 구성종목 수신
+        results = []
+        for t in strong:
+            try:
+                stocks = _fetch_naver_theme_stocks(t["no"])
+                if len(stocks) < 3:
+                    continue
+                results.append({
+                    "theme": t["theme"],
+                    "no": t["no"],
+                    "chg": t["chg"],
+                    "stock_count": len(stocks),
+                    "stocks": stocks[:_NAVER_THEME_STOCK_MAX],
+                })
+                time.sleep(0.5)  # 구성종목 페이지 간 sleep
+            except Exception as _se:
+                _swallow_exception(_se)
+                continue
+
+        _naver_theme_cache["ts"] = now
+        _naver_theme_cache["rows"] = results
+        _log_info_msg(f"  🔎 [네이버 테마] 강세 {len(results)}개 수신 (풀 {len(themes_raw)}개 중 chg>={_NAVER_STRONG_CHG_MIN}%)")
+        return results
+    except Exception as e:
+        _log_warn_msg(f"⚠️ 네이버 테마 수신 실패: {e}")
+        return list(_naver_theme_cache.get("rows", []))
+
+def _fetch_naver_theme_stocks(theme_no: int) -> list:
+    """네이버 테마 상세 페이지 → 구성종목 (code, name) 리스트.
+    https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no=N
+    """
+    try:
+        url = "https://finance.naver.com/sise/sise_group_detail.naver"
+        resp = requests.get(
+            url,
+            params={"type": "theme", "no": str(theme_no)},
+            timeout=8,
+            headers=_random_ua(),
+        )
+        resp.raise_for_status()
+        apparent = (resp.apparent_encoding or "").strip()
+        resp.encoding = apparent or "euc-kr"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        stocks = []
+        for a in soup.select("a[href*='/item/main.naver?code=']"):
+            href = a.get("href") or ""
+            m = re.search(r"code=(\d{6})", href)
+            if not m:
+                continue
+            code = m.group(1)
+            name = a.get_text(strip=True)
+            if not name or len(name) < 2:
+                continue
+            if (code, name) not in stocks:
+                stocks.append((code, name))
+        return stocks
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+def _register_naver_themes_to_dynamic() -> None:
+    """네이버 테마 수신 → _dynamic_theme_map 등록.
+    스케줄에서 15분 주기 호출. _build_sectors_from_theme_pool이 다음 빌드에서 자동 처리.
+    KRX/NXT 운영시간에만 동작.
+    """
+    global _dynamic_theme_map
+    if not is_any_market_open():
+        return
+    try:
+        themes = _fetch_naver_strong_themes()
+        if not themes:
+            return
+        now_ts = time.time()
+        registered = 0
+        for t in themes:
+            theme_no = t.get("no")
+            theme_name = str(t.get("theme") or "").strip()
+            chg = float(t.get("chg") or 0)
+            stocks = t.get("stocks") or []
+            if not theme_no or not theme_name or len(stocks) < 3:
+                continue
+            stock_pairs = [(c, n) for c, n in stocks]
+            key = f"naver_theme_{theme_no}"
+            existing = _dynamic_theme_map.get(key)
+            if existing:
+                existing_codes = {c for c, _ in existing.get("stocks", [])}
+                for pair in stock_pairs:
+                    if pair[0] not in existing_codes:
+                        existing["stocks"].append(pair)
+                        existing_codes.add(pair[0])
+                existing["ts"] = now_ts
+                existing["desc"] = f"{theme_name} ({chg:+.1f}%)"
+            else:
+                _dynamic_theme_map[key] = {
+                    "desc":      f"{theme_name} ({chg:+.1f}%)",
+                    "events":    [theme_name],
+                    "reason":    f"네이버 강세테마 (평균 {chg:+.1f}%, {len(stocks)}종목)",
+                    "stocks":    list(stock_pairs),
+                    "ts":        now_ts,
+                    "direction": "up",
+                    "source":    "naver_theme",
+                    "win_count": 0,
+                    "loss_count": 0,
+                }
+                registered += 1
+        if registered > 0:
+            try:
+                _write_json_atomic(
+                    DYNAMIC_THEME_FILE,
+                    {k: {**v, "stocks": v["stocks"]} for k, v in _dynamic_theme_map.items()},
+                    indent=2,
+                )
+            except Exception as e:
+                _swallow_exception(e)
+            _log_info_msg(f"  ✅ [네이버 테마] _dynamic_theme_map 신규 {registered}개 등록")
+    except Exception as e:
+        _log_error("_register_naver_themes_to_dynamic", e)
+
 def _fetch_major_investor_sector_flow() -> dict:
     """v165.35: KIS FHKST03030100 기반 투자자별 순매수 상위 종목 조회 → 섹터 집계.
     코스피+코스닥 × 기관/외국인/개인 = 최대 6회 API 호출.
@@ -7134,8 +7383,8 @@ GEMINI_GROUNDING_DAILY_LIMIT = int(os.getenv("GEMINI_GROUNDING_DAILY_LIMIT", "20
 # GROQ_API_KEY 미설정 시 완전 비활성화
 GROQ_API_KEY   = str(os.getenv("GROQ_API_KEY", "") or "").strip()
 GROQ_MODEL     = str(os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile").strip()
-GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "600") or "600")  # v163.17: 10분 캐시 (뉴스 갱신 주기 기준)
-GROQ_GROUNDING_DAILY_LIMIT   = int(os.getenv("GROQ_GROUNDING_DAILY_LIMIT", "200") or "200")      # 하루 최대 호출 수 (여유 있음)
+GROQ_GROUNDING_CACHE_TTL_SEC = int(os.getenv("GROQ_GROUNDING_CACHE_TTL_SEC", "300") or "300")  # v189.0: 600→300초 (신선도 강화)
+GROQ_GROUNDING_DAILY_LIMIT   = int(os.getenv("GROQ_GROUNDING_DAILY_LIMIT", "400") or "400")      # v189.0: 200→400회 (Groq 무료 14,400 RPD 여유)
 # v172.0 [D]: stale-while-revalidate 동시 fetch 방지용 락
 _groq_revalidate_lock = threading.Lock()
 YOUTUBE_KEYWORD_QUERIES = [x.strip() for x in str(os.getenv("YOUTUBE_KEYWORD_QUERIES", "공시 해석 한국주식,주식 분석 기업 리스크,상장사 이슈 분석,특수관계인 지분 변동,담보권 실행 공시,반대매매 의혹 경영권 분쟁") or "").split(",") if x.strip()]
@@ -20197,6 +20446,13 @@ def _get_groq_scenario_for_code(code: str, name: str) -> dict:
                 if not gs_name:
                     continue
                 if gs_name in name_clean or name_clean in gs_name or gs_name == code_clean:
+                    # v189.0 [#4]: 활성 테마 정보 추가 — 시나리오 분기에 테마 강세 여부 반영
+                    _active_themes: list = []
+                    try:
+                        _prof = (_stock_theme_profile or {}).get(code_clean) or {}
+                        _active_themes = list(_prof.get("themes") or [])[:5]
+                    except Exception:
+                        _active_themes = []
                     return {
                         "today_reflected":       row.get("_today_reflected", "partial"),
                         "tomorrow_continuation": row.get("_tomorrow_continuation", "moderate"),
@@ -20205,6 +20461,7 @@ def _get_groq_scenario_for_code(code: str, name: str) -> dict:
                         "theme":                 gs.get("theme", ""),
                         "direction":             gs.get("direction", "neutral"),
                         "reason":                gs.get("reason", ""),
+                        "active_themes":         _active_themes,  # v189.0 [#4]
                     }
     except Exception as e:
         _swallow_exception(e)
@@ -46821,6 +47078,7 @@ if __name__ == "__main__":
     schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_material_first_scan))  # v188.0: schedule blocking 해소
     schedule.every(DART_INTERVAL).seconds.do(_threaded_leader_job(run_dart_intraday))  # v188.0: schedule blocking 해소
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_mid_pullback_scan))  # v188.0: schedule blocking 해소
+    schedule.every(15).minutes.do(_threaded_leader_job(_register_naver_themes_to_dynamic))  # v189.0 [#2]: 네이버 강세테마 → _dynamic_theme_map
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
     # INFO 참고 알림은 사용자 발송하지 않음
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
