@@ -3,10 +3,45 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v189.0
+버전: v190.0
 날짜: 2026-05-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v190.0 (2026-05-27): stale price 차단 + 일반 포착 알람 재포착 dedup 강화
+
+  근본 원인 1 (stale price): send_mid_pullback_alert()가 시그널 생성 시점 snapshot(`s["price"]`)을
+                              dispatch 시점까지 그대로 사용 → 시그널 생성 ~ dispatch 사이 5~30분 지연
+                              시 표시된 현재가가 실제 시장가와 수백원 괴리.
+                              사례(5/27 13:15:57): 안국약품 알람 현재가 11,310원 / HTS 13:15 1분봉
+                              실제 11,060~11,150 → 봇 +160원 stale.
+                              _send_entry_phase_alert는 v161.13에서 live refresh 추가됐으나 MID_PULLBACK은 누락.
+
+  근본 원인 2 (재포착 dedup): _finalize_general_alert_dispatch() dedup 조건이 score 동일 + change_rate
+                              차이 < 0.1% 만 봄. 정상 시세변동(15분 만에 score 156→127, chg 5.6%→5.2%)
+                              에서도 차이가 임계 초과 → dedup 무력화 → 동일 종목 재포착 알람.
+                              entry_hit 분기는 entry_hit=True 케이스만 차단 → 포착 후 entry_hit 미달
+                              상태에서 재포착 시 그대로 통과.
+                              사례(5/26): LG디스플레이 12:37+12:52 두 번, AP위성 13:36+13:48 두 번.
+
+  해결 범위:
+    - send_mid_pullback_alert: dispatch 직전 KIS live price 재조회 → s["price"]/s["change_rate"] 갱신
+    - _finalize_general_alert_dispatch: ✓ 로그 emit 전 notify_count + 60분 시간 기반 차단 추가
+  완전 해결 여부: YES (refresh 실패 시만 기존 값 유지 / 60분내 동일 종목 dispatch 차단)
+
+  [#1] send_mid_pullback_alert() live price 강제 갱신
+       이유: signal snapshot 가격을 그대로 사용 → dispatch 지연 시간만큼 stale
+       개선점: get_stock_price()/get_nxt_stock_price()로 dispatch 직전 재조회 → s 갱신
+       주의점: 조회 실패 시 graceful — 기존 값 유지 + WARNING 로그
+       진입 체인: send_mid_pullback_alert → _build_capture_focus_price_line ✅
+
+  [#2] _finalize_general_alert_dispatch() 재포착 60분 dedup 게이트
+       이유: 기존 score/change_rate 일치 조건이 정상 시세변동에 무력화
+       개선점: 동일 code + notify_count≥1 + 마지막 dispatch < 3600초 시 ⏭ 재포착 차단
+       주의점: signal_type 클래스 분리 (SURGE/NEAR_UPPER/UPPER_LIMIT 한 그룹 / MID_PULLBACK/ENTRY_POINT 한 그룹)
+              → 진짜 신규 신호(SURGE→MID_PULLBACK 전환 등)는 통과 허용
+       진입 체인: _finalize_general_alert_dispatch → 재포착 차단 시 send_alert 미호출 ✅
+       진입불가 게이트 연결: _pre_send_upper_block 경유 유지 ✅
+
 - v189.0 (2026-05-27): HTS 강세섹터 수준 도달 — 네이버 테마 직접 스크래핑 + Groq 확대 + 시나리오 테마 입력
 
   근본 원인: 봇 섹터/테마 분류가 KIS 업종(고정 산업분류)+THEME_MAP(수동 큐레이션)+Groq 자동등록에만 의존.
@@ -17645,6 +17680,30 @@ def send_mid_pullback_alert(s: dict):
         return
     stock_name = _resolve_stock_name(s.get("code", ""), s.get("name", ""))
     s["name"] = stock_name
+    # v190.0 [#1]: dispatch 직전 KIS live price 재조회 — stale snapshot 차단
+    # 이유: signal 생성 후 dispatch 사이 수분~수십분 지연 → s["price"]가 stale
+    # 사례: 안국약품 5/27 13:15:57 알람 11,310원 vs HTS 13:15 1분봉 실제 11,060~11,150 (+160원 stale)
+    try:
+        _code_live = str(s.get("code", "") or "").strip()
+        if _code_live:
+            _live_cur = {}
+            _is_nxt = str(s.get("market", "") or "").upper() == "NXT" and is_nxt_open()
+            if _is_nxt:
+                _live_cur = get_nxt_stock_price(_code_live) or {}
+            else:
+                _live_cur = get_stock_price(_code_live) or {}
+            _lp = safe_int(_live_cur.get("price", 0) or _live_cur.get("stck_prpr", 0), 0)
+            if _lp > 0:
+                _lc = safe_float(
+                    _live_cur.get("change_rate", 0) or _live_cur.get("prdy_ctrt", 0),
+                    safe_float(s.get("change_rate", 0), 0.0),
+                )
+                s["price"] = _lp
+                s["change_rate"] = _lc
+            else:
+                _log_warn_msg(f"  ⚠️ live price 재조회 결과 0 — 기존 snapshot 유지: {stock_name}({_code_live})")
+    except Exception as _le:
+        _log_warn_msg(f"  ⚠️ live price 재조회 실패 (기존 snapshot 유지): {stock_name} — {_le}")
     entry_price = safe_int(s.get("entry_price", 0), 0)
     if str(s.get("signal_type") or "").upper() in ("MID_PULLBACK", "ENTRY_POINT") and entry_price > 0:
         s["_capture_focus_secondary_label"] = "대표진입가"
@@ -36217,6 +36276,32 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         _log_info_msg(f"  ⏭ {name} — upper_limit_reached 당일 재알람 차단")
         save_signal_log(s)
         return False
+    # v190.0 [#2]: 재포착 60분 dedup 게이트 — 동일 종목 동일 클래스 중복 dispatch 차단
+    # 이유: 기존 score/change_rate 일치 조건이 정상 시세변동(score 156→127, chg 5.6→5.2)에 무력화
+    # 사례: 5/26 LG디스플레이 12:37+12:52, AP위성 13:36+13:48 두 번 발송
+    # 그룹: SURGE/NEAR_UPPER/UPPER_LIMIT/STRONG_BUY (상승강도) / MID_PULLBACK/ENTRY_POINT (눌림) — 같은 그룹 내만 차단
+    try:
+        _new_sig_type_v190 = str(signal_type or "").upper()
+        _surge_grp = {"SURGE", "NEAR_UPPER", "UPPER_LIMIT", "STRONG_BUY"}
+        _pull_grp  = {"MID_PULLBACK", "ENTRY_POINT"}
+        _new_grp = "S" if _new_sig_type_v190 in _surge_grp else ("P" if _new_sig_type_v190 in _pull_grp else "")
+        if _new_grp and code:
+            _, _existing_watch_v190 = _find_existing_entry_hit_watch(code)
+            if _existing_watch_v190 is not None:
+                _old_sig_type_v190 = str(_existing_watch_v190.get("signal_type") or "").upper()
+                _old_grp = "S" if _old_sig_type_v190 in _surge_grp else ("P" if _old_sig_type_v190 in _pull_grp else "")
+                _last_notify_ts_v190 = float(_existing_watch_v190.get("last_notified_ts", 0) or 0)
+                _notify_cnt_v190 = safe_int(_existing_watch_v190.get("notify_count", 0), 0)
+                _elapsed_v190 = time.time() - _last_notify_ts_v190 if _last_notify_ts_v190 > 0 else 99999
+                if _new_grp == _old_grp and _notify_cnt_v190 >= 1 and _elapsed_v190 < 3600:
+                    _log_info_msg(
+                        f"  ⏭ 재포착 차단 (v190): {name} — {_old_sig_type_v190}→{_new_sig_type_v190} "
+                        f"동일 클래스, 마지막 {int(_elapsed_v190//60)}분 전, notify_cnt={_notify_cnt_v190}"
+                    )
+                    save_signal_log(s)
+                    return False
+    except Exception as _re_v190:
+        _swallow_exception(_re_v190, "v190_recapture_gate")
     _log_info_msg(f"  ✓ {name}{ctx.get('mkt_tag','')} {safe_float(s.get('change_rate',0),0.0):+.1f}% [{signal_type}] {safe_int(s.get('score',0),0)}점 [{grade_upper}]")
     # v163.6: NXT SURGE 동일 종목 2시간 텔레그램 쿨다운 — 에스투더블유류 7회 중복 발송 방지
     # 진입가 도달 알람은 예외(쿨다운 미적용)
