@@ -3,10 +3,31 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v187.0
-날짜: 2026-05-26
+버전: v188.0
+날짜: 2026-05-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v188.0 (2026-05-27): schedule 블로킹 해소 + 후보 풀 0건 구조결함 수정
+
+  근본 원인 1 (schedule blocking): _leader_job(동기 실행)으로 등록된 무거운 잡 3개가
+                                    schedule 단일 스레드 점유 → 128~248s 반복 블로킹 →
+                                    09:00 KRX burst 직후 모든 후속 잡 지연.
+
+  근본 원인 2 (후보 풀 0건): get_fluctuation_rank 응답에 acml_tr_pbmn 필드 없음
+                              → _ingest_row()의 _amt = 항상 0 → 1억 미만 필터에서
+                              모든 종목 탈락 → _build_sectors_from_theme_pool 풀 0건
+                              → 섹터 빌드 영구 실패.
+
+  [#1] run_material_first_scan / run_dart_intraday / run_mid_pullback_scan 스레드화
+       이유: schedule 단일 스레드에서 동기 실행 → 2~4분 블로킹 누적
+       개선점: _leader_job → _threaded_leader_job 변경 — 별도 스레드 실행
+       주의점: KIS REST limiter가 동시 호출 제한, 동일 함수 중복실행 방지 잠금 유지
+
+  [#2] _build_sectors_from_theme_pool._ingest_row() _amt 계산 보강
+       이유: get_fluctuation_rank 응답에 acml_tr_pbmn 누락 → _amt 항상 0 → 필터 전멸
+       개선점: _amt<=0 시 _vol*_price로 추정 + _amt>0일 때만 1억 필터 적용
+       주의점: _amt=0(추정 불가)인 경우 통과 허용 — 풀 0건 회피
+
 - v187.0 (2026-05-26): prdy_vrss_sign 단독 상한가 오판 차단 — 상한가 후 눌림 종목 포착 복원
 
   근본 원인: prdy_vrss_sign=="1" 단독으로 상한가급 판정 → stale 캐시(WebSocket 실패 시)
@@ -42743,10 +42764,15 @@ def _build_sectors_from_theme_pool() -> None:
             # v181.0: chg>50% 신규주 제외 폐기 (사용자: 약세장 신규주 수급 인정)
             _vol = safe_int(r.get("today_vol") or r.get("acml_vol") or 0)
             _amt = safe_int(r.get("trade_amount") or r.get("acml_tr_pbmn") or 0)
+            # v188.0: get_fluctuation_rank 응답에 acml_tr_pbmn 없음 → vol*price 추정
+            if _amt <= 0:
+                _price_calc = safe_int(r.get("price") or 0)
+                if _vol > 0 and _price_calc > 0:
+                    _amt = _vol * _price_calc
             # v181.0: 거래량 0 + 거래대금 1억 미만 차단
             if _vol <= 0:
                 return
-            if _amt < 100_000_000:
+            if _amt > 0 and _amt < 100_000_000:
                 return
             if code in candidate_pool:
                 # 더 정확한 값(높은 chg)으로 갱신
@@ -46792,9 +46818,9 @@ if __name__ == "__main__":
     schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_nxt_premarket_burst_scan))
     schedule.every(NXT_AFTERMARKET_BURST_INTERVAL_SEC).seconds.do(_leader_job(_run_nxt_aftermarket_burst_scan))  # v165.26: NXT 애프터마켓 burst
     schedule.every(KRX_OPEN_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_krx_open_burst_scan))
-    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_leader_job(run_material_first_scan))
-    schedule.every(DART_INTERVAL).seconds.do(_leader_job(run_dart_intraday))
-    schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_leader_job(run_mid_pullback_scan))
+    schedule.every(NEWS_SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_material_first_scan))  # v188.0: schedule blocking 해소
+    schedule.every(DART_INTERVAL).seconds.do(_threaded_leader_job(run_dart_intraday))  # v188.0: schedule blocking 해소
+    schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_mid_pullback_scan))  # v188.0: schedule blocking 해소
     schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
     # INFO 참고 알림은 사용자 발송하지 않음
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
