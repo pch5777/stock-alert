@@ -3,10 +3,57 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v190.1
+버전: v190.2
 날짜: 2026-05-27
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v190.2 (2026-05-27): schedule 블로킹 해소 + 섹터 알람 중복 차단 + 섹터 dedup + NXT 실시간
+
+  근본 원인 1 (schedule blocked): send_market_leading_sector_update가 _leader_job(메인스레드)으로 실행 →
+                                  내부 KIS API 60+회 순차 호출 → 8~14분 메인루프 블로킹 → 모든 scheduled job 지연.
+                                  v188.0에서 run_material_first_scan/dart/pullback 3종은 _threaded_leader_job으로
+                                  교체됐으나 이 함수만 누락 → 5/27 17:10~17:24 (817s) 블로킹 발생.
+
+  근본 원인 2 (섹터 알람 중복): _build_sectors_from_theme_pool이 60초 주기로 market_leader_state.json 덮어쓸 때
+                                last_ts/last_digest/interval_min/market_heat 미포함 → send_market_leading_sector_update
+                                10분 gate 무효화 → last_ts=0 평가 → 5~6분 간격 동일 섹터 알람 중복 발송.
+                                사례 5/27: 17:24:47 + 17:30:40 동일 "3개 신규, heat=100" 발송.
+
+  근본 원인 3 (섹터 1,2위 동일): _push_dashboard_json sectors_raw 정렬만 하고 종목 멤버십 dedup 없음.
+                                  Groq/Naver가 같은 종목군에 다른 테마명 등록(예: "신규이슈·디앤디파마텍 mash" /
+                                  "신규이슈·'上'…mash 모멘텀") → 두 섹터가 디앤디파마텍·삼성에스디에스 동일 표시.
+
+  근본 원인 4 (NXT 시간대 섹터 미반영): _push_dashboard_json 종목 현재가 조회가 WebSocket snap(KRX 마감 후 동결) →
+                                       fallback도 get_stock_price(KRX API) → NXT-only 시간대(16:00~20:00)에도
+                                       KRX 종가 그대로 표시 + 정렬. NXT 시장 변동 미반영.
+
+  해결 범위:
+    - line 47175: _leader_job(lambda) → _threaded_leader_job(send_market_leading_sector_update)
+    - line 43356 부근: state = {**prev, ...} 머지로 last_ts 등 보존
+    - line 31647 부근: sectors_raw sort 후 leader code 기준 dedup
+    - line 31570 부근: NXT-only 시간대 시 get_nxt_stock_price 우선 조회
+  완전 해결 여부: YES
+
+  [#1] send_market_leading_sector_update → _threaded_leader_job
+       이유: 메인스레드 8-14분 블로킹 → schedule 전체 정지
+       개선점: 별도 스레드 실행 + _leader_job_running 가드로 동시 실행 차단
+       주의점: 함수 자체는 내부적으로 cache + 순차 호출 그대로 유지(재설계 불필요)
+
+  [#2] _build_sectors_from_theme_pool state 저장 시 **prev 머지
+       이유: last_ts 누락 덮어쓰기 → send_market_leading_sector_update gate 무효화
+       개선점: prev 전체 dict 머지 후 sent_at/themes/sectors/source/pool_size/build_ts 갱신
+       주의점: prev에 노이즈 필드가 있어도 _save_market_leader_state가 sectors 필터링 → 무영향
+
+  [#3] _push_dashboard_json sectors_raw leader code dedup
+       이유: 테마명 다르나 종목 동일 → 1,2위 동일 표시
+       개선점: sort 후 _seen_leaders 셋으로 leader code 첫 출현만 유지 (score 높은 쪽 보존)
+       주의점: leader가 다른데 followers만 겹치는 경우는 별개 섹터 유지
+
+  [#4] _push_dashboard_json NXT-only 시간대 NXT 실시간 가격 우선
+       이유: KRX 마감 후 WebSocket snap 동결 + get_stock_price KRX → NXT 변동 미반영
+       개선점: is_nxt_open() and not is_market_open() 분기 시 get_nxt_stock_price 우선 호출
+       주의점: 조회 실패 시 기존 snap → get_stock_price 폴백 순서 유지 (graceful degradation)
+
 - v190.1 (2026-05-27): 대시보드 섹터 종목 최소 6행 패딩
 
   [#1] _DASHBOARD_HTML secHTML(): 섹터 종목 최소 6행 보장
@@ -31567,7 +31614,19 @@ def _push_dashboard_json() -> None:
                                 _cur_chg = None
                                 _cur_vol = 0
                                 _cur_amt = 0
-                                if snap:
+                                # v190.2: NXT-only 시간대(KRX 마감+NXT 운영)는 NXT 실시간 가격 우선
+                                # KRX 종가 snap 동결 우회 → 섹터 등락률/순위가 NXT 시장 상황 반영
+                                _is_nxt_only_disp = is_nxt_open() and not is_market_open()
+                                if _is_nxt_only_disp:
+                                    try:
+                                        _nxt_p = get_nxt_stock_price(mc) or {}
+                                        if _nxt_p.get("change_rate") is not None:
+                                            _cur_chg = float(_nxt_p.get("change_rate") or 0)
+                                            _cur_vol = safe_int(_nxt_p.get("today_vol") or _nxt_p.get("acml_vol") or 0)
+                                            _cur_amt = safe_int(_nxt_p.get("acml_tr_pbmn") or 0)
+                                    except Exception as _ne:
+                                        _swallow_exception(_ne, "_push_dashboard_json:nxt_realtime")
+                                if _cur_chg is None and snap:
                                     _cur_chg = snap.get("change_rate")
                                     _cur_vol = safe_int(snap.get("today_vol") or 0)
                                     _cur_amt = safe_int(snap.get("acml_tr_pbmn") or 0)
@@ -31645,6 +31704,19 @@ def _push_dashboard_json() -> None:
                                 })
                         # v181.0: score 우선 정렬 (멤버수×가중평균×동조비율). priority는 보조.
                         sectors_raw.sort(key=lambda x: (not bool(x.get("breakout_priority")), -x.get("score", x.get("chg", 0))))
+                        # v190.2: 같은 leader(top1) 종목 가진 섹터 dedup — 1,2위가 동일 종목 표시되는 현상 차단
+                        # 테마명 다르나 종목 동일(예: "신규이슈·디앤디파마텍 mash" / "신규이슈·'上'…mash 모멘텀")
+                        _seen_leaders = set()
+                        _deduped = []
+                        for _sec in sectors_raw:
+                            _stks = _sec.get("stocks", []) or []
+                            _ldr_code = str(_stks[0].get("code", "") if _stks else "")
+                            if _ldr_code and _ldr_code in _seen_leaders:
+                                continue
+                            if _ldr_code:
+                                _seen_leaders.add(_ldr_code)
+                            _deduped.append(_sec)
+                        sectors_raw = _deduped
                 except Exception as _e:
                     _swallow_exception(_e, "_push_dashboard_json:themes_primary")
 
@@ -43353,7 +43425,10 @@ def _build_sectors_from_theme_pool() -> None:
                     if _total_cnt >= 1:
                         merged.append(ps)
             merged = merged[:15]
+            # v190.2: prev state 머지 — last_ts/last_digest/interval_min/market_heat 보존
+            # 미보존 시 send_market_leading_sector_update 10분 gate 무효화 → 동일 섹터 알람 중복 발송
             state = {
+                **prev,
                 "sent_at": _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
                 "themes": [s["theme"] for s in merged],
                 "sectors": merged,
@@ -47172,7 +47247,7 @@ if __name__ == "__main__":
     schedule.every(DART_INTERVAL).seconds.do(_threaded_leader_job(run_dart_intraday))  # v188.0: schedule blocking 해소
     schedule.every(MID_PULLBACK_SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_mid_pullback_scan))  # v188.0: schedule blocking 해소
     schedule.every(15).minutes.do(_threaded_leader_job(_register_naver_themes_to_dynamic))  # v189.0 [#2]: 네이버 강세테마 → _dynamic_theme_map
-    schedule.every(5).minutes.do(_leader_job(lambda: send_market_leading_sector_update(force=False)))
+    schedule.every(5).minutes.do(_threaded_leader_job(send_market_leading_sector_update))  # v190.2: _leader_job→_threaded (8-14분 메인스레드 블로킹 해소)
     # INFO 참고 알림은 사용자 발송하지 않음
     schedule.every(30).minutes.do(clean_expired_cache)  # [v41.84]
     schedule.every().day.at("05:00").do(reset_daily_caches)  # [v41.84]
