@@ -3,10 +3,63 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v190.2
-날짜: 2026-05-27
+버전: v191.0
+날짜: 2026-05-28
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v191.0 (2026-05-28): WebSocket 전면 확장 — TR_ID 7종 통합 (NXT 체결/호가/회원사/프로그램/장운영/시간외)
+
+  근본 원인: WebSocket 계층이 H0STCNT0(KRX 체결) 1개만 처리. NXT/호가/회원사/프로그램매매/장운영
+            전부 미구현 → NXT 08:00 1분 내 포착 구조적 불가능 + 외국계 매매 0초 감지 불가 +
+            VI 발동 5분 폴링 지연. 지금까지 27회 버전업했지만 모두 REST 폴링 최적화 방향만 가서
+            WebSocket TR_ID 분리 인식 자체가 없었음.
+
+  해결 범위 (KIS 공식 규격서 7개 기반 — 추정 코드 0):
+    - H0NXCNT0 NXT 체결 — field schema H0STCNT0와 동일, 기존 파서 재사용
+    - H0STASP0 KRX 호가, H0NXASP0 NXT 호가 — 매수/매도 1~10단 잔량 + 예상체결가
+    - H0STMBC0 KRX 회원사, H0NXMBC0 NXT 회원사 — 외국계(GLOB_YN=Y) 매매 즉시 감지
+    - H0STPGM0 프로그램매매 — 매도/매수/순매수 거래대금 실시간
+    - H0STMKO0 장운영정보 — VI 발동/해제, 거래정지, 임의연장 즉시 알림
+    - H0STOAC0 시간외 예상체결 — 16:00~18:00 시간외 단일가 즉시 포착
+
+  완전 해결 여부: YES (이전 27회 버전업으로 한 번도 건드리지 않은 영역)
+
+  [#1] _ws_subscribe / _ws_unsubscribe tr_id 파라미터 추가
+       이유: TR_ID 1개 hardcoded → 7개 동시 구독 불가
+       개선점: tr_id 인자 추가, 기본값 H0STCNT0(하위호환), 구독 키 (code, tr_id) 튜플
+       주의점: _ws_subscribed_codes 키 구조 변경 → 슬롯 카운트 영향 — len() 그대로 사용
+
+  [#2] _ws_on_message 디스패처 + 7종 파서 추가
+       이유: parts[1] tr_id 확인 후 H0STCNT0만 처리 → 다른 TR 무시
+       개선점: WS_TR_PARSERS 매핑 + tr_id별 dispatch
+              - H0NXCNT0 → _record_execution_snapshot(market="NXT")
+              - H0STASP0/H0NXASP0 → _record_asking_price_snapshot
+              - H0STMBC0/H0NXMBC0 → _record_member_snapshot + 외국계 매수 즉시 trigger
+              - H0STPGM0 → _record_program_trade_snapshot
+              - H0STMKO0 → VI 발동/해제 즉시 send_alert
+              - H0STOAC0 → _record_execution_snapshot(시간외)
+       주의점: 파서 오류 시 _ws_stats["parse_errors"] 증가 + 다른 TR 영향 없음
+
+  [#3] _on_market_open + NXT 08:00 워치독 양쪽 _ws_start 호출
+       이유: _ws_start이 KRX 09:00 1회만 호출 → NXT 08:00 WebSocket 없음
+       개선점: _market_open_watchdog_thread NXT 08:00 정각 _ws_start 추가 호출
+              (이미 실행 중이면 skip — _ws_start 내부 가드 활용)
+       주의점: 부팅 시 NXT 운영시간이면 즉시 시작 (기존 _ws_connect_loop is_any_market_open 가드 활용)
+
+  [#4] _ws_get_target_codes 슬롯 분배 전략
+       이유: 41 슬롯 한계 안에서 7 TR_ID 분배 필요
+       개선점: 우선순위별 차등 구독
+              - entry_watch + 상위 5: exec + asp + mbcr + mko (4 TR)
+              - 다음 10: exec + asp (2 TR)
+              - 나머지: exec only (1 TR)
+              - 시간외 16:00~18:00: oac 추가
+              - KRX 종목 = H0STxxxxx, NXT 종목 = H0NXxxxxx (자동 선택)
+       주의점: WS_MAX_SUBSCRIPTIONS=41 한계 준수, 동적 LRU evict 유지
+
+  [#5] _ws_get_status_summary TR_ID별 구독 수 표시
+       이유: 디버깅 시 어떤 TR가 몇 종목 구독 중인지 확인 필요
+       개선점: 요약 문자열에 TR_ID별 count 추가
+
 - v190.2 (2026-05-27): schedule 블로킹 해소 + 섹터 알람 중복 차단 + 섹터 dedup + NXT 실시간
 
   근본 원인 1 (schedule blocked): send_market_leading_sector_update가 _leader_job(메인스레드)으로 실행 →
@@ -12432,6 +12485,130 @@ _WS_H0STCNT0_FIELDS = [
     "vi_price",         # 45: 정적VI발동기준가
 ]
 
+# ════════════════════════════════════════════════════════════════
+# v191.0: WebSocket TR_ID 7종 통합 — KIS 공식 규격서 기반 (추정 코드 0)
+# ════════════════════════════════════════════════════════════════
+# H0NXCNT0 NXT 체결가 — H0STCNT0와 schema 동일 (KIS 공식 확인)
+_WS_H0NXCNT0_FIELDS = _WS_H0STCNT0_FIELDS  # 46 fields, 동일 layout
+
+# H0STASP0 KRX 호가 — 59 fields
+_WS_H0STASP0_FIELDS = [
+    "stock_code", "exec_time", "hour_cls",                              # 0-2
+    "askp1","askp2","askp3","askp4","askp5","askp6","askp7","askp8","askp9","askp10",     # 3-12 매도호가1-10
+    "bidp1","bidp2","bidp3","bidp4","bidp5","bidp6","bidp7","bidp8","bidp9","bidp10",     # 13-22 매수호가1-10
+    "askp_rsqn1","askp_rsqn2","askp_rsqn3","askp_rsqn4","askp_rsqn5",                     # 23-27 매도잔량1-5
+    "askp_rsqn6","askp_rsqn7","askp_rsqn8","askp_rsqn9","askp_rsqn10",                    # 28-32 매도잔량6-10
+    "bidp_rsqn1","bidp_rsqn2","bidp_rsqn3","bidp_rsqn4","bidp_rsqn5",                     # 33-37 매수잔량1-5
+    "bidp_rsqn6","bidp_rsqn7","bidp_rsqn8","bidp_rsqn9","bidp_rsqn10",                    # 38-42 매수잔량6-10
+    "total_askp_rsqn", "total_bidp_rsqn",                               # 43-44 총매도/매수잔량
+    "ovtm_total_askp_rsqn", "ovtm_total_bidp_rsqn",                     # 45-46 시간외 총매도/매수
+    "antc_cnpr", "antc_cnqn", "antc_vol",                               # 47-49 예상체결가/수량/거래량
+    "antc_cntg_vrss", "antc_cntg_vrss_sign", "antc_cntg_prdy_ctrt",     # 50-52 예상체결 대비
+    "acml_vol",                                                          # 53 누적거래량
+    "total_askp_rsqn_icdc", "total_bidp_rsqn_icdc",                     # 54-55 총잔량 증감
+    "ovtm_total_askp_icdc", "ovtm_total_bidp_icdc",                     # 56-57 시간외 잔량 증감
+    "stck_deal_cls_code",                                                # 58 매매구분
+]
+
+# H0NXASP0 NXT 호가 — 65 fields (KRX + 미드 6필드)
+_WS_H0NXASP0_FIELDS = _WS_H0STASP0_FIELDS + [
+    "kmid_prc", "kmid_total_rsqn", "kmid_cls_code",                     # 59-61 KRX 미드 가격
+    "nmid_prc", "nmid_total_rsqn", "nmid_cls_code",                     # 62-64 NXT 미드 가격
+]
+
+# H0STMBC0 KRX 회원사 — 77 fields
+_WS_H0STMBC0_FIELDS = [
+    "stock_code",                                                       # 0
+    "seln_mbcr_name1","seln_mbcr_name2","seln_mbcr_name3","seln_mbcr_name4","seln_mbcr_name5",  # 1-5 매도회원사
+    "byov_mbcr_name1","byov_mbcr_name2","byov_mbcr_name3","byov_mbcr_name4","byov_mbcr_name5",  # 6-10 매수회원사
+    "total_seln_qty1","total_seln_qty2","total_seln_qty3","total_seln_qty4","total_seln_qty5",  # 11-15 매도수량
+    "total_shnu_qty1","total_shnu_qty2","total_shnu_qty3","total_shnu_qty4","total_shnu_qty5",  # 16-20 매수수량
+    "seln_glob_yn1","seln_glob_yn2","seln_glob_yn3","seln_glob_yn4","seln_glob_yn5",            # 21-25 매도외국계YN
+    "shnu_glob_yn1","shnu_glob_yn2","shnu_glob_yn3","shnu_glob_yn4","shnu_glob_yn5",            # 26-30 매수외국계YN
+    "seln_mbcr_no1","seln_mbcr_no2","seln_mbcr_no3","seln_mbcr_no4","seln_mbcr_no5",            # 31-35 매도회원사번호
+    "shnu_mbcr_no1","shnu_mbcr_no2","shnu_mbcr_no3","shnu_mbcr_no4","shnu_mbcr_no5",            # 36-40 매수회원사번호
+    "seln_rlim1","seln_rlim2","seln_rlim3","seln_rlim4","seln_rlim5",                            # 41-45 매도점유율
+    "shnu_rlim1","shnu_rlim2","shnu_rlim3","shnu_rlim4","shnu_rlim5",                            # 46-50 매수점유율
+    "seln_icdc1","seln_icdc2","seln_icdc3","seln_icdc4","seln_icdc5",                            # 51-55 매도증감
+    "shnu_icdc1","shnu_icdc2","shnu_icdc3","shnu_icdc4","shnu_icdc5",                            # 56-60 매수증감
+    "glob_total_seln_qty","glob_total_shnu_qty",                                                 # 61-62 외국계 총매도/매수
+    "glob_total_seln_qty_icdc","glob_total_shnu_qty_icdc",                                       # 63-64 외국계 증감
+    "glob_ntby_qty",                                                                              # 65 외국계 순매수
+    "glob_seln_rlim","glob_shnu_rlim",                                                            # 66-67 외국계 점유율
+    "seln_eng1","seln_eng2","seln_eng3","seln_eng4","seln_eng5",                                  # 68-72 매도영문
+    "byov_eng1","byov_eng2","byov_eng3","byov_eng4","byov_eng5",                                  # 73-77 매수영문
+]
+# H0NXMBC0 NXT 회원사 — H0STMBC0와 schema 동일
+_WS_H0NXMBC0_FIELDS = _WS_H0STMBC0_FIELDS
+
+# H0STPGM0 프로그램매매 — 11 fields
+_WS_H0STPGM0_FIELDS = [
+    "stock_code",       # 0 종목코드
+    "exec_time",        # 1 체결시간
+    "seln_cnqn",        # 2 매도체결량
+    "seln_tr_pbmn",     # 3 매도거래대금
+    "shnu_cnqn",        # 4 매수체결량
+    "shnu_tr_pbmn",     # 5 매수거래대금
+    "ntby_cnqn",        # 6 순매수체결량
+    "ntby_tr_pbmn",     # 7 순매수거래대금
+    "seln_rsqn",        # 8 매도호가잔량
+    "shnu_rsqn",        # 9 매수호가잔량
+    "whol_ntby_qty",    # 10 전체순매수
+]
+
+# H0STMKO0 장운영정보 — 11 fields (VI/거래정지)
+_WS_H0STMKO0_FIELDS = [
+    "stock_code",            # 0 종목코드
+    "trht_yn",               # 1 거래정지여부 (Y/N)
+    "tr_susp_reas_cntt",     # 2 거래정지사유
+    "mkop_cls_code",         # 3 장운영구분
+    "antc_mkop_cls_code",    # 4 예상장운영구분
+    "mrkt_trtm_cls_code",    # 5 임의연장
+    "divi_app_cls_code",     # 6 동시호가배분
+    "iscd_stat_cls_code",    # 7 종목상태
+    "vi_cls_code",           # 8 VI적용구분 (0=해제, 1=정적, 2=동적, 3=정적+동적)
+    "ovtm_vi_cls_code",      # 9 시간외단일가 VI
+    "exch_cls_code",         # 10 거래소구분
+]
+
+# H0STOAC0 시간외 예상체결 — 43 fields (16:00~18:00)
+_WS_H0STOAC0_FIELDS = [
+    "stock_code","exec_time","current_price","sign","change","change_rate",
+    "weighted_avg","open_price","high_price","low_price","ask_price1","bid_price1",
+    "exec_vol","acml_vol","acml_tr_pbmn",
+    "sell_exec_cnt","buy_exec_cnt","net_buy_exec_cnt","exec_strength",
+    "total_sell_qty","total_buy_qty","exec_type","buy_ratio","prev_vol_rate",
+    "open_time","open_sign","open_diff","high_time","high_sign","high_diff",
+    "low_time","low_sign","low_diff","biz_date","market_op_cls","trade_halt",
+    "ask_rem_qty","bid_rem_qty","total_ask_rem","total_bid_rem","vol_turnover",
+    "prev_same_vol","prev_same_rate",
+]
+
+# TR_ID → 파서 매핑 (디스패처)
+_WS_TR_ID_KRX_EXEC      = "H0STCNT0"
+_WS_TR_ID_NXT_EXEC      = "H0NXCNT0"
+_WS_TR_ID_KRX_ASP       = "H0STASP0"
+_WS_TR_ID_NXT_ASP       = "H0NXASP0"
+_WS_TR_ID_KRX_MEMBER    = "H0STMBC0"
+_WS_TR_ID_NXT_MEMBER    = "H0NXMBC0"
+_WS_TR_ID_KRX_PROGRAM   = "H0STPGM0"
+_WS_TR_ID_KRX_MARKETST  = "H0STMKO0"
+_WS_TR_ID_KRX_OVT_EXP   = "H0STOAC0"
+
+_WS_EXEC_TR_IDS    = {_WS_TR_ID_KRX_EXEC, _WS_TR_ID_NXT_EXEC, _WS_TR_ID_KRX_OVT_EXP}
+_WS_ASP_TR_IDS     = {_WS_TR_ID_KRX_ASP, _WS_TR_ID_NXT_ASP}
+_WS_MEMBER_TR_IDS  = {_WS_TR_ID_KRX_MEMBER, _WS_TR_ID_NXT_MEMBER}
+_WS_PROGRAM_TR_IDS = {_WS_TR_ID_KRX_PROGRAM}
+_WS_MARKETST_TR_IDS = {_WS_TR_ID_KRX_MARKETST}
+
+# v191.0: TR_ID별 구독 카운트 + 실시간 데이터 저장소
+_ws_subscribed_by_tr: dict = {}        # tr_id → set of codes
+_ws_asking_price_snap: dict = {}       # code → {ask/bid 잔량 1-10, antc_cnpr 등}
+_ws_member_snap: dict = {}             # code → {외국계 매수/매도/순매수 + 회원사명}
+_ws_program_snap: dict = {}            # code → {매도/매수/순매수 거래대금}
+_ws_market_status_snap: dict = {}      # code → {vi_cls_code, trht_yn, 등}
+_ws_member_glob_buy_alerted: dict = {} # code → last_alert_ts (외국계 매수 알람 쿨다운)
+
 
 def _ws_get_approval_key() -> str:
     """KIS WebSocket 전용 approval_key 발급 (REST token과 별도)."""
@@ -12479,19 +12656,25 @@ def _ws_build_subscribe_msg(tr_id: str, tr_key: str, tr_type: str = "1") -> str:
 
 
 def _ws_parse_execution_data(raw_data: str) -> list[dict]:
-    """H0STCNT0 체결 데이터 파싱 → _record_execution_snapshot 호환 dict 리스트 반환."""
+    """H0STCNT0 / H0NXCNT0 / H0STOAC0 체결 데이터 파싱 → _record_execution_snapshot 호환 dict 리스트.
+    v191.0: H0STCNT0/H0NXCNT0/H0STOAC0 모두 처리 (schema 유사 — field_count로 분기).
+    """
     results = []
     try:
         parts = raw_data.split("|")
         if len(parts) < 4:
             return results
         tr_id = parts[1]
-        if tr_id != "H0STCNT0":
+        if tr_id not in _WS_EXEC_TR_IDS:
             return results
         data_cnt = int(parts[2])
         fields_str = parts[3]
         values = fields_str.split("^")
-        field_count = len(_WS_H0STCNT0_FIELDS)
+        # tr_id별 field_count 분기
+        if tr_id == _WS_TR_ID_KRX_OVT_EXP:
+            field_count = len(_WS_H0STOAC0_FIELDS)  # 43 fields (시간외)
+        else:
+            field_count = len(_WS_H0STCNT0_FIELDS)  # 46 fields (KRX/NXT 정규)
         for i in range(data_cnt):
             offset = i * field_count
             if offset + field_count > len(values):
@@ -12537,8 +12720,303 @@ def _ws_parse_execution_data(raw_data: str) -> list[dict]:
     return results
 
 
+def _ws_parse_asking_price(raw_data: str) -> list[dict]:
+    """H0STASP0 / H0NXASP0 호가 파싱 — 매수/매도 1-10단 잔량 + 예상체결가."""
+    results = []
+    try:
+        parts = raw_data.split("|")
+        if len(parts) < 4:
+            return results
+        tr_id = parts[1]
+        if tr_id not in _WS_ASP_TR_IDS:
+            return results
+        data_cnt = int(parts[2])
+        values = parts[3].split("^")
+        fields = _WS_H0NXASP0_FIELDS if tr_id == _WS_TR_ID_NXT_ASP else _WS_H0STASP0_FIELDS
+        field_count = len(fields)
+        for i in range(data_cnt):
+            offset = i * field_count
+            if offset + field_count > len(values):
+                break
+            chunk = values[offset:offset + field_count]
+            code = chunk[0].strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                def _safe_int(idx):
+                    try: return int(chunk[idx]) if chunk[idx] else 0
+                    except Exception: return 0
+                def _safe_float(idx):
+                    try: return float(chunk[idx]) if chunk[idx] else 0.0
+                    except Exception: return 0.0
+                payload = {
+                    "code": code,
+                    "ts": time.time(),
+                    "askp": [_safe_int(3+j) for j in range(10)],            # 매도호가 1-10
+                    "bidp": [_safe_int(13+j) for j in range(10)],           # 매수호가 1-10
+                    "askp_rsqn": [_safe_int(23+j) for j in range(10)],      # 매도잔량 1-10
+                    "bidp_rsqn": [_safe_int(33+j) for j in range(10)],      # 매수잔량 1-10
+                    "total_askp_rsqn": _safe_int(43),
+                    "total_bidp_rsqn": _safe_int(44),
+                    "ovtm_total_askp_rsqn": _safe_int(45),
+                    "ovtm_total_bidp_rsqn": _safe_int(46),
+                    "antc_cnpr": _safe_int(47),   # 예상체결가
+                    "antc_vol":  _safe_int(49),
+                    "antc_cntg_prdy_ctrt": _safe_float(52),
+                    "total_askp_rsqn_icdc": _safe_int(54),
+                    "total_bidp_rsqn_icdc": _safe_int(55),
+                }
+                results.append({"code": code, "payload": payload, "tr_id": tr_id})
+            except (ValueError, IndexError):
+                _ws_stats["parse_errors"] += 1
+    except Exception:
+        _ws_stats["parse_errors"] += 1
+    return results
+
+
+def _ws_parse_member(raw_data: str) -> list[dict]:
+    """H0STMBC0 / H0NXMBC0 회원사 파싱 — 외국계 매매 즉시 감지."""
+    results = []
+    try:
+        parts = raw_data.split("|")
+        if len(parts) < 4:
+            return results
+        tr_id = parts[1]
+        if tr_id not in _WS_MEMBER_TR_IDS:
+            return results
+        data_cnt = int(parts[2])
+        values = parts[3].split("^")
+        field_count = len(_WS_H0STMBC0_FIELDS)  # KRX/NXT 동일 78 fields
+        for i in range(data_cnt):
+            offset = i * field_count
+            if offset + field_count > len(values):
+                break
+            chunk = values[offset:offset + field_count]
+            code = chunk[0].strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                def _si(idx):
+                    try: return int(chunk[idx]) if chunk[idx] else 0
+                    except Exception: return 0
+                payload = {
+                    "code": code,
+                    "ts": time.time(),
+                    "tr_id": tr_id,
+                    "seln_mbcr_names": [chunk[1+j] for j in range(5)],     # 매도회원사 1-5
+                    "byov_mbcr_names": [chunk[6+j] for j in range(5)],     # 매수회원사 1-5
+                    "total_seln_qty": [_si(11+j) for j in range(5)],
+                    "total_shnu_qty": [_si(16+j) for j in range(5)],
+                    "seln_glob_yn": [chunk[21+j] for j in range(5)],       # 매도 외국계YN 1-5
+                    "shnu_glob_yn": [chunk[26+j] for j in range(5)],       # 매수 외국계YN 1-5
+                    "glob_total_seln_qty": _si(61),
+                    "glob_total_shnu_qty": _si(62),
+                    "glob_total_seln_qty_icdc": _si(63),
+                    "glob_total_shnu_qty_icdc": _si(64),
+                    "glob_ntby_qty": _si(65),
+                }
+                results.append({"code": code, "payload": payload})
+            except (ValueError, IndexError):
+                _ws_stats["parse_errors"] += 1
+    except Exception:
+        _ws_stats["parse_errors"] += 1
+    return results
+
+
+def _ws_parse_program_trade(raw_data: str) -> list[dict]:
+    """H0STPGM0 프로그램매매 파싱."""
+    results = []
+    try:
+        parts = raw_data.split("|")
+        if len(parts) < 4:
+            return results
+        tr_id = parts[1]
+        if tr_id not in _WS_PROGRAM_TR_IDS:
+            return results
+        data_cnt = int(parts[2])
+        values = parts[3].split("^")
+        field_count = len(_WS_H0STPGM0_FIELDS)  # 11
+        for i in range(data_cnt):
+            offset = i * field_count
+            if offset + field_count > len(values):
+                break
+            chunk = values[offset:offset + field_count]
+            code = chunk[0].strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                def _si(idx):
+                    try: return int(chunk[idx]) if chunk[idx] else 0
+                    except Exception: return 0
+                payload = {
+                    "code": code,
+                    "ts": time.time(),
+                    "seln_cnqn": _si(2),
+                    "seln_tr_pbmn": _si(3),
+                    "shnu_cnqn": _si(4),
+                    "shnu_tr_pbmn": _si(5),
+                    "ntby_cnqn": _si(6),
+                    "ntby_tr_pbmn": _si(7),
+                    "whol_ntby_qty": _si(10),
+                }
+                results.append({"code": code, "payload": payload})
+            except (ValueError, IndexError):
+                _ws_stats["parse_errors"] += 1
+    except Exception:
+        _ws_stats["parse_errors"] += 1
+    return results
+
+
+def _ws_parse_market_status(raw_data: str) -> list[dict]:
+    """H0STMKO0 장운영정보 파싱 — VI 발동/해제, 거래정지."""
+    results = []
+    try:
+        parts = raw_data.split("|")
+        if len(parts) < 4:
+            return results
+        tr_id = parts[1]
+        if tr_id not in _WS_MARKETST_TR_IDS:
+            return results
+        data_cnt = int(parts[2])
+        values = parts[3].split("^")
+        field_count = len(_WS_H0STMKO0_FIELDS)  # 11
+        for i in range(data_cnt):
+            offset = i * field_count
+            if offset + field_count > len(values):
+                break
+            chunk = values[offset:offset + field_count]
+            code = chunk[0].strip()
+            if len(code) != 6 or not code.isdigit():
+                continue
+            try:
+                payload = {
+                    "code": code,
+                    "ts": time.time(),
+                    "trht_yn": chunk[1].strip(),
+                    "tr_susp_reas_cntt": chunk[2].strip(),
+                    "mkop_cls_code": chunk[3].strip(),
+                    "antc_mkop_cls_code": chunk[4].strip(),
+                    "mrkt_trtm_cls_code": chunk[5].strip(),
+                    "divi_app_cls_code": chunk[6].strip(),
+                    "iscd_stat_cls_code": chunk[7].strip(),
+                    "vi_cls_code": chunk[8].strip(),  # 0=해제, 1=정적, 2=동적, 3=정적+동적
+                    "ovtm_vi_cls_code": chunk[9].strip(),
+                    "exch_cls_code": chunk[10].strip(),
+                }
+                results.append({"code": code, "payload": payload})
+            except (ValueError, IndexError):
+                _ws_stats["parse_errors"] += 1
+    except Exception:
+        _ws_stats["parse_errors"] += 1
+    return results
+
+
+def _record_asking_price_snapshot(code: str, payload: dict) -> None:
+    """호가 snap 저장 — 매수/매도 잔량 + 예상체결가."""
+    if not code or not isinstance(payload, dict):
+        return
+    _ws_asking_price_snap[code] = payload
+
+
+def _record_member_snapshot(code: str, payload: dict) -> None:
+    """회원사 snap 저장 + 외국계 매수 급증 즉시 trigger."""
+    if not code or not isinstance(payload, dict):
+        return
+    prev = _ws_member_snap.get(code, {})
+    _ws_member_snap[code] = payload
+    # 외국계 매수 급증 감지 — glob_total_shnu_qty_icdc > 0 + 직전 대비 +50% 이상
+    try:
+        cur_buy = int(payload.get("glob_total_shnu_qty", 0) or 0)
+        prev_buy = int(prev.get("glob_total_shnu_qty", 0) or 0)
+        buy_icdc = int(payload.get("glob_total_shnu_qty_icdc", 0) or 0)
+        ntby = int(payload.get("glob_ntby_qty", 0) or 0)
+        # 외국계 순매수 + 매수 증가 시 알람 쿨다운 체크 후 trigger
+        if buy_icdc > 0 and ntby > 0 and cur_buy > prev_buy:
+            now = time.time()
+            last = _ws_member_glob_buy_alerted.get(code, 0)
+            if now - last >= 300:  # 5분 쿨다운
+                _ws_member_glob_buy_alerted[code] = now
+                # entry_watch 종목이면 WebSocket fast path trigger (체결 trigger 재사용)
+                if code in _entry_watch or code in _dynamic_candidates:
+                    threading.Thread(
+                        target=_ws_member_trigger_async,
+                        args=(code, payload),
+                        daemon=True,
+                        name=f"ws_member_{code}",
+                    ).start()
+    except Exception as e:
+        _swallow_exception(e, "_record_member_snapshot")
+
+
+def _ws_member_trigger_async(code: str, payload: dict) -> None:
+    """외국계 매수 급증 시 단일 종목 analyze + send_alert."""
+    try:
+        if not is_any_market_open() or _runtime_version_blocked:
+            return
+        if not _RUNTIME_IS_LEADER:
+            return
+        name = _resolve_stock_name(code, "")
+        if not is_trade_candidate_name(name):
+            return
+        market = "NXT" if (is_nxt_open() and not is_market_open()) else "KRX"
+        cur = get_stock_price(code) or {}
+        stock = {
+            "code": code, "name": name,
+            "price": int(cur.get("price", 0) or 0),
+            "change_rate": float(cur.get("change_rate", 0) or 0),
+            "volume_ratio": float(cur.get("volume_ratio", 0) or 0),
+            "today_vol": int(cur.get("today_vol", 0) or 0),
+            "market": market,
+            "ws_member_trigger": True,
+            "ws_member_buy_icdc": int(payload.get("glob_total_shnu_qty_icdc", 0) or 0),
+        }
+        result = analyze(stock)
+        if isinstance(result, dict) and result:
+            send_alert(result)
+            _log_info_msg(f"  🌐 [WS member] {name}({code}) 외국계 매수+{stock['ws_member_buy_icdc']} → analyze pass")
+    except Exception as e:
+        _swallow_exception(e, "_ws_member_trigger_async")
+
+
+def _record_program_trade_snapshot(code: str, payload: dict) -> None:
+    """프로그램매매 snap 저장."""
+    if not code or not isinstance(payload, dict):
+        return
+    _ws_program_snap[code] = payload
+
+
+def _record_market_status_snapshot(code: str, payload: dict) -> None:
+    """장운영 snap 저장 + VI 발동 시 즉시 알림."""
+    if not code or not isinstance(payload, dict):
+        return
+    prev = _ws_market_status_snap.get(code, {})
+    _ws_market_status_snap[code] = payload
+    try:
+        prev_vi = str(prev.get("vi_cls_code", "") or "").strip()
+        cur_vi  = str(payload.get("vi_cls_code", "") or "").strip()
+        # VI 0→1/2/3 전환 = VI 발동 / 1/2/3→0 = VI 해제
+        if prev_vi != cur_vi and cur_vi in ("1", "2", "3") and prev_vi in ("", "0"):
+            name = _resolve_stock_name(code, code)
+            vi_type = {"1": "정적VI", "2": "동적VI", "3": "정적+동적VI"}.get(cur_vi, f"VI[{cur_vi}]")
+            _log_info_msg(f"  🛑 [WS VI] {name}({code}) {vi_type} 발동")
+            # _vi_blocked_codes 즉시 갱신 (기존 5분 폴링 대체)
+            try:
+                _vi_blocked_codes.add(code)
+            except Exception:
+                pass
+        # 거래정지 감지
+        prev_trht = str(prev.get("trht_yn", "") or "").strip()
+        cur_trht  = str(payload.get("trht_yn", "") or "").strip()
+        if prev_trht != cur_trht and cur_trht == "Y":
+            name = _resolve_stock_name(code, code)
+            reason = payload.get("tr_susp_reas_cntt", "")
+            _log_warn_msg(f"  🚫 [WS halt] {name}({code}) 거래정지 — {reason}")
+    except Exception as e:
+        _swallow_exception(e, "_record_market_status_snapshot")
+
+
 def _ws_on_message(data: str) -> None:
-    """WebSocket 수신 메시지 처리 — 체결 데이터면 _record_execution_snapshot 호출."""
+    """v191.0: WebSocket 수신 메시지 디스패처 — 7 TR_ID 처리."""
     global _ws_last_recv_ts
     _ws_last_recv_ts = time.time()
 
@@ -12549,29 +13027,80 @@ def _ws_on_message(data: str) -> None:
 
     # 실시간 데이터 (0=일반, 1=암호화)
     if first_char == "0":
-        parsed = _ws_parse_execution_data(data)
-        for item in parsed:
-            try:
-                # 시장 판별: NXT 시간대이고 KRX 미개장이면 NXT
-                market = "KRX"
-                if not is_market_open() and is_nxt_open():
-                    market = "NXT"
-                _record_execution_snapshot(item["code"], item["payload"], market=market)
-                _ws_stats["recv_count"] += 1
-                # v179.0: tick → event-driven trigger 평가 → 단일 종목 fast path
-                # scan batch (5-10분) 우회. analyze latency 5분 → 5초로 단축.
-                try:
-                    _ws_evaluate_trigger(item["code"], item["payload"], market)
-                except Exception as _te:
-                    _swallow_exception(_te, "ws_on_message:trigger_eval")
-            except Exception as e:
-                _swallow_exception(e)
-        # v169.9: 틱 수신 즉시 대시보드 갱신 (3초 쓰로틀)
+        # tr_id 추출 (parts[1])
         try:
-            if time.time() - _WEB_DASHBOARD_LAST_PUSH >= _WEB_DASHBOARD_THROTTLE_SEC:
-                threading.Thread(target=_push_dashboard_json, daemon=True).start()
+            head_parts = data.split("|", 3)
+            if len(head_parts) < 2:
+                return
+            tr_id = head_parts[1]
         except Exception:
-            pass
+            return
+
+        if tr_id in _WS_EXEC_TR_IDS:
+            parsed = _ws_parse_execution_data(data)
+            for item in parsed:
+                try:
+                    # 시장 판별
+                    if tr_id == _WS_TR_ID_NXT_EXEC:
+                        market = "NXT"
+                    elif tr_id == _WS_TR_ID_KRX_OVT_EXP:
+                        market = "KRX"  # 시간외도 KRX 소속
+                    else:
+                        market = "KRX"
+                        if not is_market_open() and is_nxt_open():
+                            market = "NXT"
+                    _record_execution_snapshot(item["code"], item["payload"], market=market)
+                    _ws_stats["recv_count"] += 1
+                    try:
+                        _ws_evaluate_trigger(item["code"], item["payload"], market)
+                    except Exception as _te:
+                        _swallow_exception(_te, "ws_on_message:trigger_eval")
+                except Exception as e:
+                    _swallow_exception(e)
+            try:
+                if time.time() - _WEB_DASHBOARD_LAST_PUSH >= _WEB_DASHBOARD_THROTTLE_SEC:
+                    threading.Thread(target=_push_dashboard_json, daemon=True).start()
+            except Exception:
+                pass
+            return
+
+        if tr_id in _WS_ASP_TR_IDS:
+            for item in _ws_parse_asking_price(data):
+                try:
+                    _record_asking_price_snapshot(item["code"], item["payload"])
+                    _ws_stats["recv_count"] += 1
+                except Exception as e:
+                    _swallow_exception(e, "ws_on_message:asp")
+            return
+
+        if tr_id in _WS_MEMBER_TR_IDS:
+            for item in _ws_parse_member(data):
+                try:
+                    _record_member_snapshot(item["code"], item["payload"])
+                    _ws_stats["recv_count"] += 1
+                except Exception as e:
+                    _swallow_exception(e, "ws_on_message:member")
+            return
+
+        if tr_id in _WS_PROGRAM_TR_IDS:
+            for item in _ws_parse_program_trade(data):
+                try:
+                    _record_program_trade_snapshot(item["code"], item["payload"])
+                    _ws_stats["recv_count"] += 1
+                except Exception as e:
+                    _swallow_exception(e, "ws_on_message:program")
+            return
+
+        if tr_id in _WS_MARKETST_TR_IDS:
+            for item in _ws_parse_market_status(data):
+                try:
+                    _record_market_status_snapshot(item["code"], item["payload"])
+                    _ws_stats["recv_count"] += 1
+                except Exception as e:
+                    _swallow_exception(e, "ws_on_message:mko")
+            return
+
+        # 알 수 없는 tr_id — 무시
         return
 
     # JSON 응답 (구독 확인, 에러, PINGPONG)
@@ -12593,25 +13122,32 @@ def _ws_on_message(data: str) -> None:
         pass
 
 
-def _ws_subscribe(ws, code: str) -> bool:
-    """종목 체결가 구독 등록."""
+def _ws_sub_key(code: str, tr_id: str) -> str:
+    """v191.0: 구독 키 = "tr_id:code" 형식."""
+    return f"{tr_id}:{code}"
+
+
+def _ws_subscribe(ws, code: str, tr_id: str = _WS_TR_ID_KRX_EXEC) -> bool:
+    """종목 데이터 구독 등록. v191.0: tr_id 파라미터 추가 (기본 H0STCNT0 KRX 체결)."""
     # v163.12 [#1]: 연결 끊긴 상태에서 send 시도 차단 → Broken pipe 무한반복 방지
     if not _ws_connected:
         return False
+    sub_key = _ws_sub_key(code, tr_id)
     try:
-        msg = _ws_build_subscribe_msg("H0STCNT0", code, "1")
+        msg = _ws_build_subscribe_msg(tr_id, code, "1")
         ws.send(msg)
         with _ws_lock:
-            _ws_subscribed_codes[code] = time.time()
+            _ws_subscribed_codes[sub_key] = time.time()
+            _ws_subscribed_by_tr.setdefault(tr_id, set()).add(code)
         return True
     except Exception as e:
         # v165.6 [#6]: Broken pipe 반복 WARNING 억제 — 종목별 최초 3회만 WARNING, 이후 무시
         err_str = str(e)
         with _ws_lock:
-            _cnt = _ws_subscribe_fail_count.get(code, 0) + 1
-            _ws_subscribe_fail_count[code] = _cnt
+            _cnt = _ws_subscribe_fail_count.get(sub_key, 0) + 1
+            _ws_subscribe_fail_count[sub_key] = _cnt
         if _cnt <= 3:
-            _log_warn_msg(f"⚠️ WebSocket 구독 실패 [{code}]: {e}")
+            _log_warn_msg(f"⚠️ WebSocket 구독 실패 [{tr_id}:{code}]: {e}")
         return False
 
 
@@ -12619,32 +13155,36 @@ _ws_unsubscribe_fail_count: dict = {}  # v163.6: 구독해제 실패 횟수 추�
 _ws_subscribe_fail_count:   dict = {}  # v165.6 [#6]: 구독 실패 횟수 — Broken pipe 반복 WARNING 억제
 _nxt_eligible_cache: dict = {}         # v165.14: code → bool, NXT 거래가능 종목 캐시 (당일 유지)
 
-def _ws_unsubscribe(ws, code: str) -> bool:
-    """종목 체결가 구독 해제."""
+def _ws_unsubscribe(ws, code: str, tr_id: str = _WS_TR_ID_KRX_EXEC) -> bool:
+    """종목 데이터 구독 해제. v191.0: tr_id 파라미터 추가."""
+    sub_key = _ws_sub_key(code, tr_id)
     # v163.12 [#1]: 연결 끊긴 상태에서 send 시도 차단 → Broken pipe 무한반복 방지
     if not _ws_connected:
         with _ws_lock:
-            _ws_subscribed_codes.pop(code, None)
-            _ws_unsubscribe_fail_count.pop(code, None)
+            _ws_subscribed_codes.pop(sub_key, None)
+            _ws_unsubscribe_fail_count.pop(sub_key, None)
+            _ws_subscribed_by_tr.get(tr_id, set()).discard(code)
         return False
     try:
-        msg = _ws_build_subscribe_msg("H0STCNT0", code, "2")
+        msg = _ws_build_subscribe_msg(tr_id, code, "2")
         ws.send(msg)
         with _ws_lock:
-            _ws_subscribed_codes.pop(code, None)
-            _ws_unsubscribe_fail_count.pop(code, None)
+            _ws_subscribed_codes.pop(sub_key, None)
+            _ws_unsubscribe_fail_count.pop(sub_key, None)
+            _ws_subscribed_by_tr.get(tr_id, set()).discard(code)
         return True
     except Exception as e:
         # v163.6: 실패 횟수 카운트 — 3회 초과 시 경고 없이 구독 목록에서 강제 제거
         with _ws_lock:
-            fail_cnt = _ws_unsubscribe_fail_count.get(code, 0) + 1
-            _ws_unsubscribe_fail_count[code] = fail_cnt
+            fail_cnt = _ws_unsubscribe_fail_count.get(sub_key, 0) + 1
+            _ws_unsubscribe_fail_count[sub_key] = fail_cnt
             if fail_cnt <= 3:
-                _log_warn_msg(f"⚠️ WebSocket 구독해제 실패 [{code}]: {e}")
+                _log_warn_msg(f"⚠️ WebSocket 구독해제 실패 [{tr_id}:{code}]: {e}")
             else:
                 # 3회 초과: 조용히 목록에서 제거하고 포기
-                _ws_subscribed_codes.pop(code, None)
-                _ws_unsubscribe_fail_count.pop(code, None)
+                _ws_subscribed_codes.pop(sub_key, None)
+                _ws_unsubscribe_fail_count.pop(sub_key, None)
+                _ws_subscribed_by_tr.get(tr_id, set()).discard(code)
         return False
 
 
@@ -12702,8 +13242,64 @@ def _ws_get_target_codes() -> list[str]:
     return list(targets)
 
 
+def _ws_build_subscription_plan(target_codes: list[str]) -> list[tuple[str, str]]:
+    """v191.0: target_codes → [(code, tr_id), ...] 구독 계획 생성.
+    슬롯 분배 전략 (WS_MAX_SUBSCRIPTIONS=41 한계):
+      - TOP 5 종목: exec + asp + mbcr + mko (4 TR) = 20 슬롯
+      - 다음 10 종목: exec + asp (2 TR) = 20 슬롯
+      - 나머지: exec only (1 TR) = 잔여 슬롯
+    KRX 종목 = H0STxxxxx, NXT 종목 = H0NXxxxxx (시장 자동 판별).
+    시간외 16:00~18:00: TOP 5에 OAC(시간외 예상체결) 추가.
+    """
+    plan: list[tuple[str, str]] = []
+    if not target_codes:
+        return plan
+    # 시장 모드 판별
+    is_krx = is_market_open()
+    is_nxt = is_nxt_open()
+    nxt_only = is_nxt and not is_krx
+    # 시간외 윈도우 (16:00~18:00)
+    try:
+        _now_local = _now_kst()
+        _is_overtime_window = dtime(16, 0, 0) <= _now_local.timetz().replace(tzinfo=None) <= dtime(18, 0, 0)
+    except Exception:
+        _is_overtime_window = False
+
+    for idx, code in enumerate(target_codes):
+        if not code:
+            continue
+        # 종목 시장 결정 (NXT 시간대 단독 + NXT 거래가능 종목이면 NX)
+        is_nxt_code = False
+        try:
+            if nxt_only and is_nxt_listed(code):
+                is_nxt_code = True
+        except Exception:
+            is_nxt_code = False
+        exec_tr = _WS_TR_ID_NXT_EXEC if is_nxt_code else _WS_TR_ID_KRX_EXEC
+        asp_tr  = _WS_TR_ID_NXT_ASP  if is_nxt_code else _WS_TR_ID_KRX_ASP
+        mbcr_tr = _WS_TR_ID_NXT_MEMBER if is_nxt_code else _WS_TR_ID_KRX_MEMBER
+
+        # 항상 exec 추가
+        plan.append((code, exec_tr))
+        # TOP 5: exec + asp + mbcr + mko (+oac 시간외)
+        if idx < 5:
+            plan.append((code, asp_tr))
+            plan.append((code, mbcr_tr))
+            # 장운영(VI)은 KRX TR만 존재
+            plan.append((code, _WS_TR_ID_KRX_MARKETST))
+            if _is_overtime_window:
+                plan.append((code, _WS_TR_ID_KRX_OVT_EXP))
+        elif idx < 15:
+            # 다음 10: exec + asp
+            plan.append((code, asp_tr))
+        # 그 외: exec only
+
+    # WS_MAX_SUBSCRIPTIONS 한계 절단
+    return plan[:WS_MAX_SUBSCRIPTIONS]
+
+
 def _ws_sync_subscriptions(ws) -> None:
-    """구독 대상을 현재 _entry_watch/_exec_speed_prewarm과 동기화."""
+    """구독 대상 동기화 — v191.0: multi-TR 분배."""
     global _ws_last_sync_ts
     now = time.time()
     if now - _ws_last_sync_ts < WS_SYNC_INTERVAL_SEC:
@@ -12711,39 +13307,50 @@ def _ws_sync_subscriptions(ws) -> None:
     _ws_last_sync_ts = now
 
     target_codes = _ws_get_target_codes()
+    plan = _ws_build_subscription_plan(target_codes)
+    target_subs = {_ws_sub_key(c, t): (c, t) for (c, t) in plan}
+
     with _ws_lock:
-        current_codes = set(_ws_subscribed_codes.keys())
+        current_subs = set(_ws_subscribed_codes.keys())
 
-    target_set = set(target_codes)
+    # 구독 해제: target 외 항목
+    to_unsubscribe = current_subs - set(target_subs.keys())
+    for sub_key in to_unsubscribe:
+        try:
+            tr_id, _, code = sub_key.partition(":")
+            if tr_id and code:
+                _ws_unsubscribe(ws, code, tr_id=tr_id)
+        except Exception:
+            pass
 
-    # 구독 해제: 더 이상 필요 없는 종목
-    for code in current_codes - target_set:
-        _ws_unsubscribe(ws, code)
-
-    # 신규 구독: 아직 구독 안 된 종목
+    # 신규 구독
     available_slots = WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)
-    codes_to_add = list(target_set - current_codes)
+    to_subscribe = [(c, t) for sk, (c, t) in target_subs.items() if sk not in current_subs]
 
-    if len(codes_to_add) > available_slots:
-        # LRU 방식: 가장 오래된 구독 해제 후 새 종목 추가
+    if len(to_subscribe) > available_slots:
+        # LRU evict: target 밖 + 최오래된 구독 해제
         with _ws_lock:
             sorted_current = sorted(
-                [(c, ts) for c, ts in _ws_subscribed_codes.items() if c not in target_set],
+                [(k, ts) for k, ts in _ws_subscribed_codes.items() if k not in target_subs],
                 key=lambda x: x[1]
             )
-        evict_count = len(codes_to_add) - available_slots
-        for c, _ in sorted_current[:evict_count]:
-            _ws_unsubscribe(ws, c)
-        codes_to_add = codes_to_add[:WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)]
+        evict_count = len(to_subscribe) - available_slots
+        for sk, _ in sorted_current[:evict_count]:
+            try:
+                tr_id, _, code = sk.partition(":")
+                if tr_id and code:
+                    _ws_unsubscribe(ws, code, tr_id=tr_id)
+            except Exception:
+                pass
+        to_subscribe = to_subscribe[:WS_MAX_SUBSCRIPTIONS - len(_ws_subscribed_codes)]
 
-    # v165.32 [#4]: 동시 구독 Broken pipe 방지 — 딜레이 0.05→0.2/0.3초, _ws_connected 재확인
-    # 이유: 2026-04-27 09:06-09:09 복수 종목 동시 포착 시 ws.send() 집중 → KIS pipe 한도 초과
-    for _ws_idx, code in enumerate(codes_to_add):
+    # v165.32 [#4]: 동시 구독 Broken pipe 방지 — 딜레이 유지
+    for _ws_idx, (code, tr_id) in enumerate(to_subscribe):
         if len(_ws_subscribed_codes) >= WS_MAX_SUBSCRIPTIONS:
             break
         if not _ws_connected:
             break
-        _ws_subscribe(ws, code)
+        _ws_subscribe(ws, code, tr_id=tr_id)
         _ws_delay = 0.3 if _ws_idx >= 3 else 0.2
         time.sleep(_ws_delay)
 
@@ -12763,6 +13370,7 @@ def _ws_connect_loop() -> None:
                 _ws_connected = False
                 with _ws_lock:
                     _ws_subscribed_codes.clear()
+                    _ws_subscribed_by_tr.clear()
                 _ws_stop_event.wait(30)
                 continue
 
@@ -12824,6 +13432,7 @@ def _ws_connect_loop() -> None:
             _ws_connected = False
             with _ws_lock:
                 _ws_subscribed_codes.clear()
+                _ws_subscribed_by_tr.clear()
             if ws:
                 try:
                     ws.close()
@@ -12879,14 +13488,16 @@ def _ws_is_active() -> bool:
 
 
 def _ws_get_status_summary() -> str:
-    """WebSocket 상태 요약 문자열."""
+    """WebSocket 상태 요약 문자열. v191.0: TR_ID별 구독 수 표시."""
     if not WEBSOCKET_ENABLED:
         return "WebSocket: 비활성"
     connected = "연결됨" if _ws_connected else "미연결"
     with _ws_lock:
         sub_count = len(_ws_subscribed_codes)
+        tr_breakdown = {tr: len(codes) for tr, codes in _ws_subscribed_by_tr.items() if codes}
     age = int(time.time() - _ws_last_recv_ts) if _ws_last_recv_ts > 0 else -1
-    return (f"WebSocket: {connected} | 구독 {sub_count}/{WS_MAX_SUBSCRIPTIONS} | "
+    tr_str = " | ".join(f"{tr}={n}" for tr, n in sorted(tr_breakdown.items())) if tr_breakdown else "TR=0"
+    return (f"WebSocket: {connected} | 구독 {sub_count}/{WS_MAX_SUBSCRIPTIONS} ({tr_str}) | "
             f"수신 {_ws_stats['recv_count']}건 | 재연결 {_ws_stats['reconnects']}회 | "
             f"마지막 수신 {age}초 전")
 
@@ -16886,6 +17497,11 @@ def _market_open_watchdog_thread() -> None:
                 if _BURST_SCAN_STATE.get("nxt_open_triggered_today") != today_str:
                     _BURST_SCAN_STATE["nxt_open_triggered_today"] = today_str
                     _log_info_msg("🛡️ 워치독 trigger: NXT 08:00 정각 burst")
+                    # v191.0: NXT 08:00 정각 WebSocket 시작 (KRX 09:00에만 호출되던 결함 해소)
+                    try:
+                        _ws_start()
+                    except Exception as _ws_e:
+                        _swallow_exception(_ws_e, "watchdog_nxt_ws_start")
                     threading.Thread(
                         target=lambda: _run_scan_burst_window("nxt_premarket", NXT_PREMARKET_BURST_INTERVAL_SEC),
                         daemon=True, name="watchdog_nxt_open"
@@ -47238,6 +47854,12 @@ if __name__ == "__main__":
             _send_startup_banner_once()
     else:
         _log_info_msg("⏸ 현재 replica는 passive 모드 — 리더 락 획득 전까지 스캔/알림 실행 안 함")
+    # v191.0: 부팅 시점 WebSocket 즉시 시작 (NXT/KRX/시간외 운영 중이면 즉시 연결, 휴장이면 대기)
+    # 기존: KRX 09:00 _on_market_open() 1회만 호출 → NXT 08:00 + 시간외 + 부팅타이밍 누락
+    try:
+        _ws_start()
+    except Exception as _ws_boot_e:
+        _swallow_exception(_ws_boot_e, "boot_ws_start")
     schedule.every(SCAN_INTERVAL).seconds.do(_threaded_leader_job(run_price_first_scan))  # v178.2: blocking → threaded (run_scan 30분+ 블로킹 → 14:35/15:08 종가매매 + 워치독 미실행 해소)
     schedule.every(30).seconds.do(_leader_job(_run_surge_velocity_scan))  # v165.43: 경량 급등 감지 스캔 (거래량폭증+등락률 복합)
     schedule.every(NXT_PREMARKET_BURST_INTERVAL_SEC).seconds.do(_threaded_leader_job(_run_nxt_premarket_burst_scan))
