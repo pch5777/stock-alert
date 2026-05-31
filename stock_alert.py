@@ -18107,6 +18107,9 @@ def _dispatch_mid_pullback_signal(signal: dict) -> None:
     _log_info_msg(f"  ✓ 눌림목 {tag}: {signal.get('name','')} [{signal.get('grade','C')}등급] {signal.get('score',0)}점")
 def run_mid_pullback_scan():
     """90초마다 전체 후보군 눌림목 체크"""
+    # v192.0 돌팬티: 구 눌림목 포착(analyze 우회 직접 dispatch) 비활성.
+    #   포착은 run_scan→_scan_dolpanty_candidates 단일 경로로 통합.
+    return
     krx_open = is_market_open()
     nxt_open = is_nxt_open()
     if (not krx_open and not nxt_open) or _bot_paused:
@@ -26437,14 +26440,19 @@ def _maybe_warn_overnight_risk_exit(code: str, rec_name: str, entry: int, pnl_no
         risk_key = f"overnight_risk_{code}"
         if risk_key in _tracking_notified:
             return
-        risk = calc_overnight_risk(code, rec_name, entry, pnl_now)
-        if risk["level"] != "high":
-            return
+        # v192.0 돌팬티: 종가 오버나이트 판정 — 모멘텀 유지 + 악재 부재면 보유, 아니면 청산.
+        ov = _dp_overnight_ok(code)
         _tracking_notified.add(risk_key)
+        if ov.get("ok"):
+            decision = "🟢 <b>오버나이트 보유</b> — 익일 시초가 갭상승 청산 대기"
+        else:
+            decision = "🔴 <b>종가 청산</b> — 모멘텀 약화 (지금 전량 매도)"
         send_with_chart_buttons(
-            f"🔵 <b>[{rec_name}] 오버나이트 위험 긴급 알림</b>\n"
-            f"  {risk['reason']}\n"
-            f"  현재 {pnl_now:+.1f}% — 마감 전 매도 고려",
+            f"🌙 <b>[{rec_name}] 종가 오버나이트 판정</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 현재 수익률 {pnl_now:+.1f}%\n"
+            f"{decision}\n"
+            f"근거: {ov.get('reason','')}",
             code, rec_name
         )
     except Exception as e:
@@ -26719,6 +26727,15 @@ def _process_tracking_result_record(data, today, log_key, rec):
     handled_target, target_updated = _handle_tracking_target_reached(data, log_key, rec, code, price, entry, target)
     if handled_target:
         return target_updated or True
+    # v192.0 돌팬티: 자금이탈 손절 — 지지 변곡점 이탈 OR 매도 체결 가속 (PDF 손절 규칙)
+    try:
+        _dp_support = safe_int(rec.get("dp_support", 0), 0)
+        _sl = _dp_check_stoploss(code, entry, support=_dp_support)
+        if _sl.get("hit"):
+            _finalize_tracking_exit_record(rec, code, price, entry, f"손절({_sl.get('reason','자금이탈')})", today, log_key)
+            return True
+    except Exception as _dpe:
+        _swallow_exception(_dpe)
     exit_reason = None
     if price <= stop:
         # v165.46 [4]: 분할매수 종목은 손절도 분할 처리
@@ -35248,17 +35265,8 @@ def _build_analyze_result(ctx: dict) -> dict:
         "event_note": event_note,
     }
 def analyze(stock: dict) -> dict:
-    ctx = _bootstrap_analyze_context(stock)
-    if not ctx:
-        return {}
-    if not _apply_analyze_signal_quality(ctx):
-        return {}
-    _apply_analyze_theme_context(ctx)
-    if not _apply_analyze_market_context(ctx):
-        return {}
-    if not _apply_analyze_entry_and_filters(ctx):
-        return {}
-    return _build_analyze_result(ctx)
+    # v192.0: 돌팬티 변곡점 엔진으로 전면 위임 (기존 점수/포착 로직 대체).
+    return _dp_analyze(stock)
 # ============================================================
 # 조기 포착
 # ============================================================
@@ -45969,79 +45977,40 @@ def calc_position_size(signal_type: str, score: int, grade: str) -> dict:
 # ============================================================
 def calc_dynamic_stop_target(code: str, entry: int, signal_type: str | None = None) -> tuple:
     """
-    시장 변동성 + 국면 + 신호유형에 따라 손절/목표가 배수 동적 조정.
-    v41.61: 신호유형별 SIGNAL_STOP_PARAMS 적용 + 종목 ATR 변동성 구간 보정.
+    v192.0 돌팬티: 지지 변곡점(라운드피겨/분봉 저점) 기반 손절 + 분할 목표.
+    기존 ATR/regime 배수 로직 대체.
     반환: (stop, target, stop_pct, target_pct, atr_used)
     """
-    atr = get_atr(code)
-    if not atr:
-        _rm   = get_atr_regime_mult()
-        _stop_pct   = max(0.05, 0.07 * _rm)
-        _target_pct = max(0.08, 0.15 / _rm)
-        # v161.28: entry=0 방어 — entry가 0이면 stop/target 모두 0이 되므로 즉시 (0,0) 반환 방지
-        if entry <= 0:
-            return 0, 0, 7.0, 10.0, False
-        stop   = int(entry * (1 - _stop_pct)   / 10) * 10
-        target = int(entry * (1 + _target_pct) / 10) * 10
-        # v161.28: atr=0 fallback에도 클램핑 적용 (v161.25는 atr>0 분기에만 있었음)
-        min_stop   = int(entry * 0.93 / 10) * 10
-        min_target = int(entry * 1.10 / 10) * 10
-        if stop <= 0 or stop >= entry:
-            stop = min_stop
-        if target <= entry:
-            target = min_target
-        return stop, target, round(_stop_pct*100,1), round(_target_pct*100,1), False
-    regime_info = get_market_regime()
-    regime  = regime_info.get("mode", "normal")
-    nxt_only = regime_info.get("nxt_only", False)
-    # ── v41.61 #8: 신호유형별 기본 배수 선택 ──
-    sig_params = SIGNAL_STOP_PARAMS.get(signal_type or "", {})
-    stop_m  = _dynamic.get("atr_stop_mult",   sig_params.get("stop_mult", ATR_STOP_MULT))
-    tgt_m   = _dynamic.get("atr_target_mult", sig_params.get("target_mult", ATR_TARGET_MULT))
-    # signal_type이 명시된 경우 해당 유형 배수를 우선 적용
-    if signal_type and signal_type in SIGNAL_STOP_PARAMS:
-        stop_m = sig_params["stop_mult"]
-        tgt_m  = sig_params["target_mult"]
-    # ── v41.61 #8: 종목별 ATR 변동성 구간 보정 ──
-    # 저변동(ATR<1.5%) → 손절 타이트, 목표 보수적
-    # 고변동(ATR>4.0%) → 손절 여유, 목표 확대
-    atr_pct = atr / entry * 100 if entry > 0 else 2.0
-    if atr_pct < 1.5:
-        stop_m  = max(stop_m * 0.85, 0.8)    # 저변동: 타이트
-        tgt_m   = max(tgt_m * 0.85, 1.5)
-    elif atr_pct > 4.0:
-        stop_m  = min(stop_m * 1.25, 3.5)    # 고변동: 여유
-        tgt_m   = min(tgt_m * 1.20, 6.0)
-    # 시장 국면 보정
-    if regime == "crash":
-        stop_m  = max(stop_m  * 0.8, 1.0)
-        tgt_m   = max(tgt_m   * 0.7, 2.0)
-    elif regime == "bear":
-        stop_m  = max(stop_m  * 0.9, 1.0)
-        tgt_m   = max(tgt_m   * 0.8, 2.0)
-    elif regime == "bull":
-        tgt_m   = min(tgt_m   * 1.2, 5.0)
-    # NXT 단독 시간대 보정: v41.64 시간대별 세분화
-    if nxt_only:
-        _nxt_p = get_nxt_params()
-        if _nxt_p:
-            stop_m  = max(stop_m  * _nxt_p.get("stop_mult", 1.0),   1.0)
-            tgt_m   = max(tgt_m   * _nxt_p.get("target_mult", 1.0), 1.5)
-        else:
-            stop_m  = max(stop_m  * 0.85, 1.0)
-            tgt_m   = max(tgt_m   * 0.80, 1.5)
-    stop      = int((entry - atr * stop_m)  / 10) * 10
-    target    = int((entry + atr * tgt_m)   / 10) * 10
-    # v161.25: ATR 과대 시 음수/0 결과 방지 — entry 기반 고정비율 하한 보장
-    min_stop   = int(entry * 0.93 / 10) * 10   # 최대 -7% 손절
-    min_target = int(entry * 1.10 / 10) * 10   # 최소 +10% 목표
+    if not entry or entry <= 0:
+        return 0, 0, 0.0, 0.0, 0.0
+    support = 0
+    try:
+        candles = _dp_minute_candles(code, 40)
+        if len(candles) >= 6:
+            recent_low = min(c["low"] for c in candles[-5:])
+            near_rf, rf_lvl = _dp_near_round_figure(entry, _dp_p("round_figure_tol_pct"))
+            support = max(rf_lvl, recent_low) if near_rf else recent_low
+    except Exception as e:
+        _swallow_exception(e)
+    break_pct = _dp_p("stop_support_break_pct")
+    if support and 0 < support < entry:
+        stop = int(support * (1 - break_pct / 100) / 10) * 10
+    else:
+        stop = int(entry * (1 - break_pct / 100) / 10) * 10
+    # 분할 목표: 종가갭은 단일(+5%), 그 외 1차 목표(+3%) 대표값
+    if signal_type == DP_SIGNAL_PRECLOSE_GAP:
+        target_pct = _dp_p("target_single_pct")
+    else:
+        target_pct = _dp_p("target1_pct")
+    target = int(entry * (1 + target_pct / 100) / 10) * 10
+    # 하한 방어
     if stop <= 0 or stop >= entry:
-        stop = min_stop
+        stop = int(entry * 0.97 / 10) * 10
     if target <= entry:
-        target = min_target
-    stop_pct  = round((entry - stop)   / entry * 100, 1) if entry > 0 else 7.0
-    tgt_pct   = round((target - entry) / entry * 100, 1) if entry > 0 else 10.0
-    return stop, target, stop_pct, tgt_pct, True
+        target = int(entry * 1.03 / 10) * 10
+    stop_pct = round((entry - stop) / entry * 100, 1) if entry else 0.0
+    tgt_pct = round((target - entry) / entry * 100, 1) if entry else 0.0
+    return stop, target, stop_pct, tgt_pct, 0.0
 # ============================================================
 # 📅 ④ 실적 발표 전후 필터
 # ============================================================
@@ -47489,6 +47458,420 @@ def _run_scan_followup_hooks() -> None:
     check_reentry_watch()
     _check_upper_limit_release()   # v161.24: 상한가 풀림 감지
     track_signal_results()
+# ════════════════════════════════════════════════════════════
+# 🩲 돌팬티(DolPanty) 주도주 변곡점 포착 엔진 — v192.0
+# 전략 출처: 트레이더 돌팬티 실전 매매 가이드 v3
+#   ① 거래대금 상위 주도주 + 하한선(1,500억) + 시선의 신선함
+#   ② 시소 메커니즘 (대형주 강세 ↔ 테마 자금이동)
+#   ③ 변곡점: 라운드피겨/전고점 지지 + 분봉 이평수렴→장대양봉 돌파 + 체결속도 가속
+#   ④ 손절: 지지 변곡점 이탈 + 자금이탈(매도 체결 가속)
+#   ⑤ 목표: 분할익절 / 오버나이트는 모멘텀 유지 시
+# 기존 포착/점수/청산 로직 전면 대체. analyze()/calc_dynamic_stop_target() 위임.
+# ════════════════════════════════════════════════════════════
+DP_PARAMS = {
+    # 후보 게이트
+    "trade_value_floor_eok":   float(os.getenv("DP_TV_FLOOR_EOK", "1500")),  # 거래대금 하한(억)
+    "trade_value_active_eok":  float(os.getenv("DP_TV_ACTIVE_EOK", "3000")), # 활발장 상향 기준(억)
+    "trade_value_active_count": int(os.getenv("DP_TV_ACTIVE_CNT", "5")),     # 3000억↑ N개↑ → 활발장
+    "min_price":               int(os.getenv("DP_MIN_PRICE", "1000")),
+    "candidate_top_n":         int(os.getenv("DP_CAND_TOPN", "40")),
+    # 변곡점
+    "round_figure_tol_pct":    float(os.getenv("DP_RF_TOL", "0.5")),     # 라운드피겨 근접 ±%
+    "prev_high_support_band_pct": float(os.getenv("DP_PH_BAND", "0.5")), # 전고점 지지 밴드 ±%
+    "ma_converge_pct":         float(os.getenv("DP_MA_CONV", "0.8")),    # 이평수렴 폭 ≤%
+    "breakout_body_pct":       float(os.getenv("DP_BO_BODY", "1.5")),    # 장대양봉 몸통 ≥%
+    "breakout_vol_mult":       float(os.getenv("DP_BO_VOL", "3.0")),     # 돌파 거래량 ≥직전5봉평균 배수
+    "second_wave_vol_mult":    float(os.getenv("DP_2W_VOL", "1.0")),     # 2차돌파 거래대금 ≥1차고점 배수
+    "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.4")),     # 조정 거래량 마름 ≤상승평균 배수
+    # 체결속도
+    "exec_accel_ratio":        float(os.getenv("DP_EXEC_ACCEL", "2.0")), # 체결 가속 ≥배수
+    "exec_buy_ratio":          float(os.getenv("DP_EXEC_BUY", "0.60")),  # 매수 체결비율 ≥
+    # 손절
+    "stop_support_break_pct":  float(os.getenv("DP_STOP_BREAK", "1.0")), # 지지선 이탈 -%
+    "stop_sell_ratio":         float(os.getenv("DP_STOP_SELL", "0.65")), # 매도 체결비율 ≥ → 자금이탈
+    # 목표
+    "target1_pct":             float(os.getenv("DP_TGT1", "3.0")),
+    "target2_pct":             float(os.getenv("DP_TGT2", "6.0")),
+    "target_single_pct":       float(os.getenv("DP_TGT_SINGLE", "5.0")),
+    # 오버나이트
+    "overnight_min_cttg":      float(os.getenv("DP_ON_CTTG", "100")),    # 종가 체결강도 ≥
+    # 시드
+    "seed_krw":                int(os.getenv("DP_SEED_KRW", "1000000")),
+    # 포착 점수 컷
+    "score_cut_a":             int(os.getenv("DP_CUT_A", "75")),
+    "score_cut_b":             int(os.getenv("DP_CUT_B", "65")),
+}
+# 신규 신호타입 (단계별 다중)
+DP_SIGNAL_INFLECTION   = "dp_inflection"    # 변곡점 1차 진입
+DP_SIGNAL_BREAKOUT_ADD = "dp_breakout_add"  # 2차 돌파 분할 추가
+DP_SIGNAL_PRECLOSE_GAP = "dp_preclose_gap"  # 종가매매 익일 갭
+# 신호 라벨은 get_signal_label() 내부 SIGNAL_LABELS에 등록됨 (v192.0)
+
+def _dp_p(key: str):
+    """돌팬티 파라미터 게터 — _dynamic["dp_<key>"] 오버라이드 우선 (학습 자동조정 반영)."""
+    try:
+        ov = _dynamic.get(f"dp_{key}")
+        if ov is not None:
+            return ov
+    except Exception:
+        pass
+    return DP_PARAMS.get(key)
+
+def _dp_tv_eok(raw) -> float:
+    """거래대금 원/억 자동 정규화 → 억 단위."""
+    v = safe_float(raw, 0.0)
+    if v <= 0:
+        return 0.0
+    return v / 1e8 if v > 1e7 else v
+
+def _dp_round_figure_levels(price: int) -> list:
+    """가격 인근 심리적 마디(라운드피겨) 후보 — 호가단위 변경대 근사."""
+    if price <= 0:
+        return []
+    mag = 1
+    while mag * 10 <= price:
+        mag *= 10
+    levels = set()
+    for step in (mag, mag // 2):
+        if step <= 0:
+            continue
+        base = (price // step) * step
+        levels.add(base)
+        levels.add(base + step)
+    return sorted(l for l in levels if l > 0)
+
+def _dp_near_round_figure(price: int, tol_pct: float) -> tuple:
+    """가격이 라운드피겨 근접인지. 반환: (hit, level)."""
+    for lvl in _dp_round_figure_levels(price):
+        if lvl > 0 and abs(price - lvl) / lvl * 100 <= tol_pct:
+            return True, lvl
+    return False, 0
+
+def _dp_minute_candles(code: str, count: int = 40) -> list:
+    """돌팬티 변곡점용 분봉 — high/low 포함 (기존 _get_minute_data엔 high/low 없음).
+    반환: 시간 오름차순 [{"time","open","high","low","close","volume"}]."""
+    try:
+        data = _safe_get(
+            f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            "FHKST03010200",
+            {
+                "FID_ETC_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_HOUR_1": datetime.now().strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "N",
+            },
+        )
+        out = []
+        for i in (data.get("output2") or [])[:count]:
+            o = safe_int(i.get("stck_oprc", 0), 0)
+            h = safe_int(i.get("stck_hgpr", 0), 0)
+            l = safe_int(i.get("stck_lwpr", 0), 0)
+            c = safe_int(i.get("stck_prpr", 0), 0)
+            v = safe_int(i.get("cntg_vol", 0), 0)
+            t = str(i.get("stck_cntg_hour", "") or "")
+            if c:
+                out.append({"time": t, "open": o or c, "high": h or c, "low": l or c, "close": c, "volume": v})
+        out.reverse()  # KIS 응답은 최신→과거, 시간 오름차순으로 정렬
+        return out
+    except Exception as e:
+        _swallow_exception(e)
+        return []
+
+def _dp_ma(candles: list, n: int) -> float:
+    if len(candles) < n:
+        return 0.0
+    return sum(c["close"] for c in candles[-n:]) / n
+
+def _dp_check_inflection(code: str, candles: list | None = None) -> dict:
+    """변곡점 판정: 단기이평 수렴 → 대량 장대양봉 전고 돌파 + 라운드피겨/전고 지지.
+    반환: {"hit","kind","reasons","prev_high","support","breakout_price","second_wave"}."""
+    out = {"hit": False, "kind": "", "reasons": [], "prev_high": 0,
+           "support": 0, "breakout_price": 0, "second_wave": False}
+    if candles is None:
+        candles = _dp_minute_candles(code, 40)
+    if len(candles) < 21:
+        return out
+    last = candles[-1]
+    prior = candles[:-1]
+    price = last["close"]
+    if price <= 0 or last["open"] <= 0:
+        return out
+    ma5, ma10, ma20 = _dp_ma(candles, 5), _dp_ma(candles, 10), _dp_ma(candles, 20)
+    reasons = []
+    # ① 단기 이평 수렴
+    if ma5 and ma10 and ma20:
+        spread = (max(ma5, ma10, ma20) - min(ma5, ma10, ma20)) / price * 100
+        converged = spread <= _dp_p("ma_converge_pct")
+    else:
+        spread, converged = 99.0, False
+    # ② 장대양봉
+    body_pct = (last["close"] - last["open"]) / last["open"] * 100
+    big_candle = body_pct >= _dp_p("breakout_body_pct")
+    # ③ 대량 거래량
+    avg_vol5 = sum(c["volume"] for c in prior[-5:]) / 5 if len(prior) >= 5 else 0
+    vol_ok = avg_vol5 > 0 and last["volume"] >= avg_vol5 * _dp_p("breakout_vol_mult")
+    # ④ 전고점 돌파
+    prev_high = max(c["high"] for c in prior[-20:]) if prior else 0
+    breakout = prev_high > 0 and last["close"] > prev_high
+    # ⑤ 라운드피겨 / 전고 지지
+    near_rf, rf_lvl = _dp_near_round_figure(price, _dp_p("round_figure_tol_pct"))
+    # ⑥ 2차 돌파: 직전 고점 거래대금 상회 (조정 거래량 마름 → 재돌파)
+    second_wave = False
+    if len(candles) >= 12:
+        wave1_val = max(c["close"] * c["volume"] for c in candles[-12:-3])
+        wave2_val = last["close"] * last["volume"]
+        if wave1_val > 0 and wave2_val >= wave1_val * _dp_p("second_wave_vol_mult"):
+            second_wave = True
+    if converged and big_candle and vol_ok and breakout:
+        out["hit"] = True
+        out["kind"] = "ma_converge_breakout"
+        reasons.append(f"📉 단기이평 수렴(폭 {spread:.2f}%) 후 상방 돌파")
+        reasons.append(f"🕯 대량 장대양봉 +{body_pct:.1f}% (거래량 {last['volume']/avg_vol5:.1f}배)")
+        reasons.append(f"🚀 분봉 전고 {prev_high:,}원 돌파")
+        if near_rf:
+            reasons.append(f"🎯 라운드피겨 {rf_lvl:,}원 지지대")
+        if second_wave:
+            reasons.append("🔁 2차 돌파 거래대금 1차고점 상회")
+        out["prev_high"] = prev_high
+        out["support"] = rf_lvl if near_rf else prev_high
+        out["breakout_price"] = price
+        out["second_wave"] = second_wave
+    out["reasons"] = reasons
+    return out
+
+def _dp_buy_ratio_frac(m: dict) -> float:
+    """get_execution_speed_metrics의 buy_ratio(0~100 스케일)를 0~1 분수로 정규화."""
+    br = safe_float(m.get("buy_ratio", 0.0), 0.0)
+    return br / 100.0 if br > 1.0 else br
+
+def _dp_check_exec_accel(code: str, price: int = 0) -> dict:
+    """체결속도 가속 + 매수 체결비율 (수급 연속성)."""
+    m = get_execution_speed_metrics(code, current_price=price)
+    accel = safe_float(m.get("acceleration_ratio", 1.0), 1.0)
+    buy_r = _dp_buy_ratio_frac(m)
+    hit = accel >= _dp_p("exec_accel_ratio") and buy_r >= _dp_p("exec_buy_ratio")
+    return {"hit": hit, "accel": accel, "buy_ratio": buy_r,
+            "flow_state": str(m.get("flow_state", "") or "")}
+
+def _dp_is_active_market(focus: list) -> bool:
+    """활발장 판정: 거래대금 3000억↑ 종목이 N개 이상."""
+    cnt = sum(1 for s in focus if _dp_tv_eok(s.get("trade_value", 0)) >= _dp_p("trade_value_active_eok"))
+    return cnt >= _dp_p("trade_value_active_count")
+
+def _dp_seesaw_adjust(stock: dict) -> tuple:
+    """시소 메커니즘: 대형주 강세장이면 테마 진입 자제(감점), 조정장이면 가점."""
+    try:
+        regime = get_market_regime().get("mode", "normal")
+    except Exception:
+        regime = "normal"
+    r = str(regime or "").lower()
+    if r in ("bull", "risk_on"):
+        return -5, "⚖️ 시소: 대형주 강세 — 테마 진입 자제(-5)"
+    if r in ("bear", "risk_off", "neutral", "normal"):
+        return +5, "⚖️ 시소: 유동성 테마 이동 우호(+5)"
+    return 0, ""
+
+def _dp_score(stock: dict, inflection: dict, exec_ctx: dict, active_market: bool) -> tuple:
+    """돌팬티 종합 점수. 반환: (score, reasons, seesaw_adj)."""
+    code = normalize_stock_code(stock.get("code", ""))
+    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+    vol_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
+    tv_eok = _dp_tv_eok(stock.get("trade_value", 0))
+    score = 50
+    reasons = list(inflection.get("reasons", []))
+    # 변곡점
+    if inflection.get("hit"):
+        score += 20
+    if inflection.get("second_wave"):
+        score += 10
+    # 체결속도 가속
+    if exec_ctx.get("hit"):
+        score += 15
+        reasons.append(f"⚡ 체결속도 가속 {exec_ctx['accel']:.1f}배 / 매수 {exec_ctx['buy_ratio']*100:.0f}% ({exec_ctx['flow_state']})")
+    # 거래대금
+    if tv_eok >= _dp_p("trade_value_active_eok"):
+        score += 10
+        reasons.append(f"💰 거래대금 {tv_eok:,.0f}억 — 압도적 주도주")
+    elif tv_eok >= _dp_p("trade_value_floor_eok"):
+        score += 5
+        reasons.append(f"💰 거래대금 {tv_eok:,.0f}억 — 주도주 기준 충족")
+    if active_market:
+        reasons.append("🔥 활발장 — 거래대금 상위 집중")
+    # 시소
+    seesaw_adj, seesaw_msg = _dp_seesaw_adjust(stock)
+    score += seesaw_adj
+    if seesaw_msg:
+        reasons.append(seesaw_msg)
+    # 학습 보너스 (기존 adaptive feedback 구조 재사용)
+    try:
+        bonus, bonus_reasons = _calc_adaptive_feedback_bonus(
+            code, theme="", signal_type=DP_SIGNAL_INFLECTION,
+            change_rate=change_rate, vol_ratio=vol_ratio)
+        score += int(bonus or 0)
+        reasons.extend(bonus_reasons or [])
+    except Exception as e:
+        _swallow_exception(e)
+    return score, reasons, seesaw_adj
+
+def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
+    """돌팬티 포착 엔진 — analyze() 대체. 게이트 통과+변곡점 시 신호 dict 반환, 아니면 {}."""
+    code = normalize_stock_code(stock.get("code", ""))
+    name = _resolve_stock_name(code, stock.get("name", code))
+    if not code:
+        return {}
+    if not is_trade_candidate_name(name):
+        return {}
+    price = safe_int(stock.get("price", 0), 0)
+    if price < _dp_p("min_price"):
+        return {}
+    # ── 거래대금 하한 게이트 (소외 잡주 배제) ──
+    tv_eok = _dp_tv_eok(stock.get("trade_value", 0))
+    if tv_eok <= 0:
+        q = get_stock_price(code)
+        # get_stock_price는 acml_tr_pbmn(원) 키로 거래대금 제공
+        tv_eok = _dp_tv_eok(q.get("acml_tr_pbmn", 0))
+        if price <= 0:
+            price = safe_int(q.get("price", 0), 0)
+    if tv_eok < _dp_p("trade_value_floor_eok"):
+        _log_suppressed_alert(code, name, f"거래대금 {tv_eok:,.0f}억 < 하한 {_dp_p('trade_value_floor_eok'):,.0f}억",
+                              DP_SIGNAL_INFLECTION, {"trade_value_eok": tv_eok, "price": price})
+        return {}
+    stock = dict(stock)
+    stock["trade_value"] = tv_eok * 1e8
+    stock["price"] = price
+    # ── 변곡점 판정 ──
+    candles = _dp_minute_candles(code, 40)
+    inflection = _dp_check_inflection(code, candles)
+    if not inflection.get("hit"):
+        return {}
+    # ── 체결속도 가속 ──
+    exec_ctx = _dp_check_exec_accel(code, price=price)
+    # ── 점수 ──
+    score, reasons, _ = _dp_score(stock, inflection, exec_ctx, active_market)
+    cut_a, cut_b = _dp_p("score_cut_a"), _dp_p("score_cut_b")
+    if score < cut_b:
+        _log_suppressed_alert(code, name, f"돌팬티 점수 {score} < 컷 {cut_b}",
+                              DP_SIGNAL_INFLECTION, {"score": score, "price": price})
+        return {}
+    grade = "A" if score >= cut_a else "B"
+    is_buy = True
+    signal_type = DP_SIGNAL_BREAKOUT_ADD if inflection.get("second_wave") else DP_SIGNAL_INFLECTION
+    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+    volume_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
+    expected_entry = inflection.get("breakout_price") or price
+    detail_summary = " / ".join([str(r) for r in reasons[:6] if r])
+    return {
+        "code": code,
+        "name": name,
+        "price": price,
+        "change_rate": change_rate,
+        "volume_ratio": volume_ratio,
+        "score": score,
+        "grade": grade,
+        "signal_type": signal_type,
+        "reasons": reasons,
+        "sector": "",
+        "theme": "",
+        "high": safe_int(stock.get("high", 0), 0),
+        "low": safe_int(stock.get("low", 0), 0),
+        "acml_tr_pbmn": safe_int(stock.get("trade_value", 0), 0),
+        "is_buy": is_buy,
+        "is_strong": grade == "A",
+        "summary": detail_summary,
+        "capture_label": "🩲 돌팬티 변곡점",
+        "expected_entry": expected_entry,
+        "entry_source": "변곡점돌파가",
+        "nxt_info": "",
+        "decision_label": "🟢 진입 대상",
+        "direct_news_hit": False,
+        "sector_info": {},
+        "countertrend": {},
+        "nxt_delta": 0.0,
+        "market": stock.get("market", "KRX"),
+        "detected_at": datetime.now().isoformat(),
+        "dp_support": inflection.get("support", 0),
+        "dp_prev_high": inflection.get("prev_high", 0),
+        "dp_second_wave": inflection.get("second_wave", False),
+    }
+
+def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
+    """돌팬티 메인 스캔 — 거래대금 상위 후보 풀 → 변곡점 포착."""
+    if not is_any_market_open():
+        return
+    try:
+        focus = get_market_rank_focus_stocks(scan_limit_per_market=_dp_p("candidate_top_n"))
+    except Exception as e:
+        _swallow_exception(e)
+        return
+    if not focus:
+        return
+    active = _dp_is_active_market(focus)
+    for s in focus:
+        code = normalize_stock_code(s.get("code", ""))
+        if not code or code in seen:
+            continue
+        try:
+            r = _dp_analyze(s, active_market=active)
+            if isinstance(r, dict) and r:
+                _append_scan_alert(alerts, seen, r, hist_key=f"DP_{code}", seen_code=code)
+        except Exception as e:
+            _swallow_exception(e)
+
+def _dp_check_stoploss(code: str, entry: int, support: int = 0) -> dict:
+    """손절 판정: 지지 변곡점 하향 이탈 OR 자금 이탈(매도 체결 가속).
+    반환: {"hit","reason","price"}."""
+    out = {"hit": False, "reason": "", "price": 0}
+    q = get_stock_price(code)
+    price = safe_int(q.get("price", 0), 0)
+    out["price"] = price
+    if price <= 0:
+        return out
+    # ① 지지선 하향 이탈
+    if support and support > 0:
+        break_line = int(support * (1 - _dp_p("stop_support_break_pct") / 100))
+        if price < break_line:
+            out["hit"] = True
+            out["reason"] = f"지지 변곡점 {support:,}원 하향 이탈 ({price:,}원)"
+            return out
+    elif entry and price < int(entry * (1 - _dp_p("stop_support_break_pct") / 100)):
+        out["hit"] = True
+        out["reason"] = f"진입가 {entry:,}원 대비 -{_dp_p('stop_support_break_pct'):.1f}% 이탈"
+        return out
+    # ② 자금 이탈: 매도 체결비율 급증
+    m = get_execution_speed_metrics(code, current_price=price)
+    buy_r = _dp_buy_ratio_frac(m) if m.get("buy_ratio") not in (None, 0, 0.0) else 1.0
+    sell_r = 1.0 - buy_r
+    if sell_r >= _dp_p("stop_sell_ratio"):
+        out["hit"] = True
+        out["reason"] = f"자금 이탈 — 매도 체결 {sell_r*100:.0f}% ({m.get('flow_state','')})"
+    return out
+
+def _dp_overnight_ok(code: str) -> dict:
+    """오버나이트 허용 판정: 모멘텀 유지(종가 체결강도) + 악재 부재.
+    반환: {"ok","reason"}."""
+    out = {"ok": False, "reason": ""}
+    try:
+        vp = {s.get("code"): s for s in get_volume_power_rank("J")}
+        rec = vp.get(code) or {}
+        cttg = safe_float(rec.get("cttg_str", 0.0), 0.0)
+    except Exception as e:
+        _swallow_exception(e)
+        cttg = 0.0
+    if cttg < _dp_p("overnight_min_cttg"):
+        out["reason"] = f"종가 체결강도 {cttg:.0f} < {_dp_p('overnight_min_cttg'):.0f} — 모멘텀 약화, 청산"
+        return out
+    # 악재 부재 확인 (기존 직접뉴스 감지 재사용)
+    try:
+        if _check_recent_direct_news(code, _resolve_stock_name(code, code), within_minutes=120):
+            out["reason"] = "최근 직접 뉴스 감지 — 변동성 위험, 청산"
+            return out
+    except Exception as e:
+        _swallow_exception(e)
+    out["ok"] = True
+    out["reason"] = f"모멘텀 유지(체결강도 {cttg:.0f}) + 악재 부재 → 오버나이트 허용"
+    return out
+
 def run_price_first_scan() -> None:
     run_scan()
 
@@ -47681,18 +48064,8 @@ def _run_scan_body():
             except Exception as _exp_e:
                 _swallow_exception(_exp_e)
         _drain_run_scan_repair_queue(alerts, seen)
-        _scan_overnight_watchlist_candidates(alerts, seen, ctx["krx_open"])
-        _scan_scenario_action_board_candidates(alerts, seen, ctx["krx_open"])
-        _scan_issue_prewatch_candidates(alerts, seen)
-        if ctx["krx_open"]:
-            _scan_krx_market_candidates(alerts, seen)
-        if ctx["nxt_open"]:
-            _scan_nxt_market_candidates(alerts, seen)
-        _scan_quiet_absorption_candidates(alerts, seen)
-        _scan_rank_and_theme_candidates(alerts, seen)
-        _scan_sector_leader_follow_candidates(alerts, seen)
-        _scan_fzone_vwap_bounce_candidates(alerts, seen)
-        _scan_early_pullback_candidates(alerts, seen, ctx["krx_open"], ctx["nxt_open"])
+        # v192.0: 돌팬티 변곡점 엔진 단일 포착 (기존 10종 수집기 전면 대체)
+        _scan_dolpanty_candidates(alerts, seen)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_sector_gate")
         alerts = _apply_scan_sector_gate(alerts)
         alerts = _sanitize_run_scan_alerts(alerts, stage="pre_portfolio_filter")
