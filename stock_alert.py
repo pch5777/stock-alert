@@ -3,10 +3,16 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v193.2
+버전: v193.3
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v193.3 (2026-06-01): 구버전 비dp_ 포착 완전 제거 (익영업일 매도 전략 전환)
+  [#1] _entry_watch 스캔 시작 시 비dp_ 항목 영구 삭제 (1회성 cleanup + 이후 방지)
+  [#2] 대시보드 ①②③ 경로 모두 dp_ 신호만 표시
+  [#3] signal_log 폴백 7일 → 2일 (익영업일 매도 = 최대 2일 보유)
+  이유: dp_ 전략 전환 후 구버전 SURGE/MID_PULLBACK 등 포착이 대시보드에 잔류
+  주의점: 비dp_ entry_watch 삭제는 스캔 루프마다 실행 — 첫 스캔 후 자동 정리
 - v193.2 (2026-06-01): 대시보드 stale 종목포착 영구표시 수정
   [#1] _push_dashboard_json ① entry_watch: detect_date != today → 대시보드 제외
   [#2] _push_dashboard_json ③ signal_log 폴백: 7일 → 당일(!=today) 제한
@@ -29607,7 +29613,6 @@ def _push_dashboard_json() -> None:
         try:
             seen_cap: set = set()
             # ① _entry_watch: 진입가 감시 중 + 진입 도달 후 목표가 추적 중
-            _cap_today_str = _now_kst().strftime("%Y-%m-%d")
             for _, watch in list((_entry_watch or {}).items()):
                 if not isinstance(watch, dict): continue
                 code = normalize_stock_code(watch.get("code",""))
@@ -29615,9 +29620,9 @@ def _push_dashboard_json() -> None:
                 if not code or len(code) != 6: continue
                 if any(m in name for m in _ETF_MARKERS): continue
                 if code in seen_cap: continue
-                # v193.2: 당일 포착이 아닌 stale entry_watch 대시보드 표시 제외
-                _w_date = str(watch.get("detect_date") or watch.get("first_detect_date") or "")[:10]
-                if _w_date and _w_date != _cap_today_str: continue
+                # v193.3: 구버전 비dp_ 신호 대시보드 제외 (SURGE/MID_PULLBACK 등 이전 로직 포착)
+                _w_sig = str(watch.get("signal_type") or "")
+                if _w_sig and not _w_sig.startswith("dp_"): continue
                 seen_cap.add(code)
                 snap    = _get_snap(code)
                 # v169.25: 장 시작 직후 snap 비어도 watch 내 모든 가격 폴백
@@ -29662,6 +29667,9 @@ def _push_dashboard_json() -> None:
             for code, rec in list((_detected_stocks or {}).items()):
                 code = normalize_stock_code(str(code or ""))
                 if not code or len(code) != 6 or code in seen_cap: continue
+                # v193.3: 구버전 비dp_ 신호 제외
+                _ds_sig = str(rec.get("signal_type") or "")
+                if _ds_sig and not _ds_sig.startswith("dp_"): continue
                 name = rec.get("name","") or _resolve_stock_name(code,"")
                 if any(m in name for m in _ETF_MARKERS): continue
                 seen_cap.add(code)
@@ -29684,15 +29692,17 @@ def _push_dashboard_json() -> None:
                     "detect_time": str(rec.get("detect_time") or rec.get("first_detect_time") or ""),
                     "hit_time":    _ht_val2,
                 })
-            # ③ signal_log 폴백: _entry_watch에서 이미 삭제된 entry_hit=True 종목 복원 (당일만)
-            # v193.2: 7일 → 당일 제한 — dp_ clear 후 stale 재표시 방지
-            # 근거: dp_ 단일종목 전략에서 이전 포착 재표시 불필요 + 사용자 혼란 방지
+            # ③ signal_log 폴백: _entry_watch 삭제된 dp_ entry_hit 복원 (2일 이내)
+            # v193.3: 7일 → 2일 (익영업일 매도 전략 — 최대 보유 2일)
+            # dp_ 신호만 복원 (구버전 SURGE/MID_PULLBACK 등 영구 제외)
             try:
                 _sl_fb_data = _load_signal_history()
-                _sl_fb_cutoff = _now_kst().strftime("%Y-%m-%d")  # 당일만
+                _sl_fb_cutoff = (_now_kst() - timedelta(days=2)).strftime("%Y-%m-%d")
                 for _sl_rec in (_sl_fb_data or {}).values():
                     if not isinstance(_sl_rec, dict): continue
                     if not _sl_rec.get("entry_hit"): continue
+                    # v193.3: dp_ 신호만 복원 (구버전 비dp_ 영구 제외)
+                    if not str(_sl_rec.get("signal_type") or "").startswith("dp_"): continue
                     _sl_code = normalize_stock_code(_sl_rec.get("code", "") or "")
                     if not _sl_code or len(_sl_code) != 6: continue
                     if _sl_code in seen_cap: continue
@@ -29701,7 +29711,7 @@ def _push_dashboard_json() -> None:
                     if not _sl_hit_date:
                         _sl_ht_raw = str(_sl_rec.get("entry_hit_time") or "")
                         _sl_hit_date = _sl_ht_raw[:10] if len(_sl_ht_raw) >= 10 else ""
-                    if not _sl_hit_date or _sl_hit_date != _sl_fb_cutoff: continue  # v193.2: 당일만
+                    if not _sl_hit_date or _sl_hit_date < _sl_fb_cutoff: continue  # v193.3: 2일 이내
                     _sl_name = _sl_rec.get("name","") or _resolve_stock_name(_sl_code,"")
                     if any(m in _sl_name for m in _ETF_MARKERS): continue
                     seen_cap.add(_sl_code)
@@ -45024,6 +45034,18 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
     if not is_any_market_open():
         return
     _dp_seesaw_check_and_alert()  # v193.0: 레짐 변경 감지 + 시소 알람
+    # v193.3: _entry_watch에서 구버전 비dp_ 항목 영구 삭제 (익영업일 매도 전략 전환)
+    try:
+        global _entry_watch
+        _stale_keys = [k for k, w in list((_entry_watch or {}).items())
+                       if isinstance(w, dict) and not str(w.get("signal_type") or "").startswith("dp_")]
+        if _stale_keys:
+            for _sk in _stale_keys:
+                _entry_watch.pop(_sk, None)
+            _save_entry_watch_active()
+            _log_info_msg(f"  🗑 구버전 비dp_ entry_watch {len(_stale_keys)}건 삭제")
+    except Exception as _ew_purge_e:
+        _swallow_exception(_ew_purge_e)
     try:
         focus = get_market_rank_focus_stocks(scan_limit_per_market=_dp_p("candidate_top_n"))
     except Exception as e:
