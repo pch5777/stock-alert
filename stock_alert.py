@@ -3,10 +3,22 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v194.0
+버전: v195.0
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v195.0 (2026-06-01): 돌팬티 진입철학 정정 — 돌파매수 폐기, 눌림목(숨고르기) 매수 전환 (구조변경)
+  근본문제: _dp_check_inflection이 전고돌파 양봉=매수 → 남들 FOMO 살 때 사는 정반대 로직.
+            LG(거래대금1위 주도주)처럼 추세진행 종목 변곡점 수렴조건 미충족으로 영구 누락.
+  철학: 모멘텀 살아있는 주도주가 "숨고를 때(눌림)" 매수, "남들 살 때(돌파)" 매도.
+  [#1] _dp_check_pullback_entry 신설 — 눌림목 진입 (DP_SIGNAL_PULLBACK)
+       ① 상승추세 생존(당일등락 ≥2% & MA20 위) ② peak 대비 1~5% 눌림(5%초과=큰낙폭 거부)
+       ③ 눌림 거래량 마름(상승 ×0.4 이하) ④ 라운드피겨/MA20/전고 지지 ⑤ 반등초입 양봉 ⑥ 자금이탈 아님
+  [#2] _dp_analyze 진입 _dp_check_inflection → _dp_check_pullback_entry 교체
+  [#3] 가격체계: 진입=반등초입 현재가 / 손절=지지×(1-1%) / 목표1=직전고점 / 목표2=고점×1.03
+       (손익비 유리: 눌림 저점 진입, 손절 타이트, 목표 고점~돌파)
+  [#4] 거래대금 게이트/후보풀/점수/연속성 전부 유지 — 주도주 선별기준 불변
+  주의: _dp_check_inflection 함수는 향후 청산(FOMO 익절) 신호용으로 보존, 진입엔 미사용
 - v194.0 (2026-06-01): dp_ 종목포착 로직 완성 — 5개 요구사항 통합 (구조변경)
   [Req1] _dp_minute_candles market 파라미터 + FID_PW_DATA_INCU_YN Y (전일분봉 포함)
          → 장초반 09:00~09:20 21봉 확보 + NXT 분봉 NX 조회 (24시간 포착 실작동)
@@ -71,6 +83,9 @@ SIG_LABELS = {
     "ENTRY_POINT": "눌림목", "STRONG_BUY": "강력매수",
     "PRECLOSE_GAP_ENTRY": "종가선진입",
     "OPENING_GAP_ENTRY":  "시초가진입",
+    "dp_pullback":   "🩲 돌팬티 눌림목",
+    "dp_inflection": "🩲 돌팬티 변곡점",
+    "dp_breakout_add": "🩲 돌팬티 2차돌파",
 }
 SIG_TITLES = {
     "UPPER_LIMIT": "상한가 감지", "NEAR_UPPER": "상한가 근접",
@@ -44806,6 +44821,13 @@ DP_PARAMS = {
     "breakout_vol_mult":       float(os.getenv("DP_BO_VOL", "3.0")),     # 돌파 거래량 ≥직전5봉평균 배수
     "second_wave_vol_mult":    float(os.getenv("DP_2W_VOL", "1.0")),     # 2차돌파 거래대금 ≥1차고점 배수
     "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.4")),     # 조정 거래량 마름 ≤상승평균 배수
+    # v195.0 눌림목 진입 (숨고르기 매수) — 돌팬티 핵심
+    "pullback_min_pct":        float(os.getenv("DP_PB_MIN", "1.0")),     # 눌림 최소 깊이 (peak 대비 ≥%)
+    "pullback_max_pct":        float(os.getenv("DP_PB_MAX", "5.0")),     # 눌림 최대 깊이 (peak 대비 ≤% — 초과=큰낙폭 거부)
+    "pullback_rebound_pct":    float(os.getenv("DP_PB_REB", "0.3")),     # 반등 초입 확인 (저점 대비 ≥%)
+    "pullback_support_tol_pct":float(os.getenv("DP_PB_SUP_TOL", "1.0")), # 지지 근접 허용 ±%
+    "pullback_uptrend_min_chg":float(os.getenv("DP_PB_UPMIN", "2.0")),   # 상승추세 생존 (당일 등락률 ≥%)
+    "pullback_lookback":       int(os.getenv("DP_PB_LOOKBACK", "20")),   # 눌림 탐색 분봉 수
     # 체결속도
     "exec_accel_ratio":        float(os.getenv("DP_EXEC_ACCEL", "2.0")), # 체결 가속 ≥배수
     "exec_buy_ratio":          float(os.getenv("DP_EXEC_BUY", "0.60")),  # 매수 체결비율 ≥
@@ -44828,6 +44850,7 @@ DP_PARAMS = {
 DP_SIGNAL_INFLECTION   = "dp_inflection"    # 변곡점 1차 진입
 DP_SIGNAL_BREAKOUT_ADD = "dp_breakout_add"  # 2차 돌파 분할 추가
 DP_SIGNAL_PRECLOSE_GAP = "dp_preclose_gap"  # 종가매매 익일 갭
+DP_SIGNAL_PULLBACK     = "dp_pullback"      # v195.0 눌림목 진입 (숨고르기 매수) — 핵심
 # 신호 라벨은 get_signal_label() 내부 SIGNAL_LABELS에 등록됨 (v192.0)
 
 def _dp_p(key: str):
@@ -44966,6 +44989,112 @@ def _dp_ma(candles: list, n: int) -> float:
         return 0.0
     return sum(c["close"] for c in candles[-n:]) / n
 
+def _dp_check_pullback_entry(code: str, candles: list | None = None, market: str = "KRX",
+                             day_change_rate: float = 0.0) -> dict:
+    """v195.0 돌팬티 핵심 — 눌림목(숨고르기) 진입 판정.
+    철학: 남들 살 때(돌파) 사지 않고, 모멘텀 살아있는 종목이 숨고를 때(눌림) 산다.
+
+    조건:
+      ① 상승추세 생존: 당일 등락률 ≥ 임계 + 단기추세 상승
+      ② 고점(peak) 형성 후 눌림: peak 대비 1.0~5.0% 하락 (5% 초과 = 큰낙폭 거부)
+      ③ 눌림 거래량 마름: 눌림 구간 평균 < 상승 구간 평균 × 0.4
+      ④ 지지: 라운드피겨 / MA20 / 직전 전고 근접
+      ⑤ 반등 초입: 눌림 저점 대비 반등 시작 (저점 대비 ≥0.3%)
+      ⑥ 자금이탈 아님: 매도 체결비율 과도 아님 (손절 게이트와 동일 기준)
+    반환: {"hit","kind","reasons","peak","support","pullback_low","entry_price"}."""
+    out = {"hit": False, "kind": "", "reasons": [], "peak": 0,
+           "support": 0, "pullback_low": 0, "entry_price": 0}
+    if candles is None:
+        candles = _dp_minute_candles(code, 40, market=market)
+    lookback = int(_dp_p("pullback_lookback") or 20)
+    if len(candles) < max(lookback, 21):
+        return out
+    last = candles[-1]
+    price = last["close"]
+    if price <= 0:
+        return out
+    # ① 상승추세 생존 — 당일 등락률 양호 + MA20 위
+    ma20 = _dp_ma(candles, 20)
+    if day_change_rate < _dp_p("pullback_uptrend_min_chg"):
+        return out
+    if ma20 > 0 and price < ma20:
+        return out  # MA20 하회 = 추세 붕괴
+    # ② peak 형성 후 눌림 — lookback 내 고점 탐색
+    window = candles[-lookback:]
+    peak_idx_rel = max(range(len(window)), key=lambda i: window[i]["high"])
+    peak = window[peak_idx_rel]["high"]
+    if peak <= 0:
+        return out
+    # peak 이후 구간(눌림 구간)이 있어야 함
+    after_peak = window[peak_idx_rel + 1:]
+    if len(after_peak) < 2:
+        return out  # peak가 너무 최근 = 아직 눌림 안 옴 (돌파 직후)
+    pullback_low = min(c["low"] for c in after_peak)
+    if pullback_low <= 0:
+        return out
+    drop_pct = (peak - pullback_low) / peak * 100
+    pb_min = _dp_p("pullback_min_pct")
+    pb_max = _dp_p("pullback_max_pct")
+    if drop_pct < pb_min:
+        return out  # 눌림 너무 얕음 = 아직 안 쉼
+    if drop_pct > pb_max:
+        return out  # 큰낙폭 = 추세붕괴 거부
+    # ③ 눌림 거래량 마름 — 상승구간(peak 전 5봉) vs 눌림구간 평균
+    pre_peak = window[max(0, peak_idx_rel - 5):peak_idx_rel + 1]
+    up_vol = sum(c["volume"] for c in pre_peak) / len(pre_peak) if pre_peak else 0
+    pb_vol = sum(c["volume"] for c in after_peak) / len(after_peak) if after_peak else 0
+    if up_vol <= 0 or pb_vol > up_vol * _dp_p("pullback_vol_dry_mult"):
+        return out  # 거래량 안 마름 = 매도 출회(큰낙폭) → 거부
+    # ④ 지지 — 라운드피겨 / MA20 / peak이전 전고 근접
+    near_rf, rf_lvl = _dp_near_round_figure(pullback_low, _dp_p("pullback_support_tol_pct"))
+    support = 0
+    sup_reason = ""
+    tol = _dp_p("pullback_support_tol_pct")
+    if near_rf:
+        support = rf_lvl
+        sup_reason = f"라운드피겨 {rf_lvl:,}원"
+    elif ma20 > 0 and abs(pullback_low - ma20) / ma20 * 100 <= tol:
+        support = int(ma20)
+        sup_reason = f"MA20 {int(ma20):,}원"
+    else:
+        # 직전 전고(peak 이전 구간 고점) 근접 지지
+        pre_high = max((c["high"] for c in window[:peak_idx_rel]), default=0)
+        if pre_high > 0 and abs(pullback_low - pre_high) / pre_high * 100 <= tol * 2:
+            support = pre_high
+            sup_reason = f"직전 전고 {pre_high:,}원"
+    if support <= 0:
+        support = pullback_low  # 지지 미검출 시 눌림 저점 자체를 지지로
+        sup_reason = f"눌림 저점 {pullback_low:,}원"
+    # ⑤ 반등 초입 — 현재가가 눌림 저점 대비 반등 시작
+    rebound_pct = (price - pullback_low) / pullback_low * 100 if pullback_low else 0
+    if rebound_pct < _dp_p("pullback_rebound_pct"):
+        return out  # 아직 반등 안 함 (계속 흘러내림)
+    # 현재봉 양봉 전환 확인 (반등 초입)
+    if last["close"] < last["open"]:
+        return out  # 음봉 = 아직 하락 중
+    # ⑥ 자금이탈 아님 — 매도 체결비율 과도하면 거부
+    try:
+        m = get_execution_speed_metrics(code, current_price=price)
+        buy_r = _dp_buy_ratio_frac(m) if m.get("buy_ratio") not in (None, 0, 0.0) else 1.0
+        if (1.0 - buy_r) >= _dp_p("stop_sell_ratio"):
+            return out  # 매도 우위 = 자금이탈 중 → 거부
+    except Exception as e:
+        _swallow_exception(e)
+    # ── 통과 ──
+    out["hit"] = True
+    out["kind"] = "pullback_reclaim"
+    out["peak"] = peak
+    out["support"] = support
+    out["pullback_low"] = pullback_low
+    out["entry_price"] = price
+    out["reasons"] = [
+        f"📉 고점 {peak:,}원 대비 {drop_pct:.1f}% 눌림 (숨고르기)",
+        f"🤏 눌림 거래량 마름 ({pb_vol/up_vol:.2f}배 ≤ {_dp_p('pullback_vol_dry_mult')})",
+        f"🛡 지지: {sup_reason}",
+        f"↗️ 반등 초입 +{rebound_pct:.1f}% (저점 대비)",
+    ]
+    return out
+
 def _dp_check_inflection(code: str, candles: list | None = None, market: str = "KRX") -> dict:
     """변곡점 판정: 단기이평 수렴 → 대량 장대양봉 전고 돌파 + 라운드피겨/전고 지지.
     반환: {"hit","kind","reasons","prev_high","support","breakout_price","second_wave"}."""
@@ -45091,7 +45220,7 @@ def _dp_score(stock: dict, inflection: dict, exec_ctx: dict, active_market: bool
     # 학습 보너스 (기존 adaptive feedback 구조 재사용)
     try:
         bonus, bonus_reasons = _calc_adaptive_feedback_bonus(
-            code, theme="", signal_type=DP_SIGNAL_INFLECTION,
+            code, theme="", signal_type=DP_SIGNAL_PULLBACK,
             change_rate=change_rate, vol_ratio=vol_ratio)
         score += int(bonus or 0)
         reasons.extend(bonus_reasons or [])
@@ -45126,37 +45255,43 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     stock = dict(stock)
     stock["trade_value"] = tv_eok * 1e8
     stock["price"] = price
-    # ── 변곡점 판정 ── v194.0: market 전달 (NXT 분봉 NX 조회)
+    # ── v195.0 눌림목(숨고르기) 진입 판정 — 돌팬티 핵심 ──
+    # 철학: 돌파(남들 살 때) 매수 폐기. 모멘텀 살아있는 주도주가 눌릴 때 매수.
     _dp_mkt = str(stock.get("market", "KRX") or "KRX")
+    _day_chg = safe_float(stock.get("change_rate", 0.0), 0.0)
     candles = _dp_minute_candles(code, 40, market=_dp_mkt)
-    inflection = _dp_check_inflection(code, candles, market=_dp_mkt)
-    if not inflection.get("hit"):
+    pullback = _dp_check_pullback_entry(code, candles, market=_dp_mkt, day_change_rate=_day_chg)
+    if not pullback.get("hit"):
+        _log_suppressed_alert(code, name, "눌림목 미형성 (돌파/추세붕괴/거래량과다)",
+                              DP_SIGNAL_PULLBACK, {"price": price, "day_chg": _day_chg})
         return {}
-    # ── 체결속도 가속 ──
+    # ── 체결속도 가속 (수급 연속성 가점) ──
     exec_ctx = _dp_check_exec_accel(code, price=price)
-    # ── 점수 ──
-    score, reasons, _ = _dp_score(stock, inflection, exec_ctx, active_market)
+    # ── 점수 (눌림목 컨텍스트) ──
+    score, reasons, _ = _dp_score(stock, pullback, exec_ctx, active_market)
     cut_a = _dp_p("score_cut_a")
-    # v193.0: bull 장세 시 진입 자제 — score_cut_b 동적 상향 (65 → 70)
+    # bull 장세 시 진입 자제 — score_cut_b 동적 상향 (65 → 70)
     _regime_now = str(get_market_regime().get("mode", "normal") or "").lower()
     cut_b = 70 if _regime_now in ("bull", "risk_on") else _dp_p("score_cut_b")
     if score < cut_b:
         _log_suppressed_alert(code, name, f"돌팬티 점수 {score} < 컷 {cut_b}",
-                              DP_SIGNAL_INFLECTION, {"score": score, "price": price})
+                              DP_SIGNAL_PULLBACK, {"score": score, "price": price})
         return {}
     grade = "A" if score >= cut_a else "B"
     is_buy = True
-    signal_type = DP_SIGNAL_BREAKOUT_ADD if inflection.get("second_wave") else DP_SIGNAL_INFLECTION
-    change_rate = safe_float(stock.get("change_rate", 0.0), 0.0)
+    signal_type = DP_SIGNAL_PULLBACK
+    change_rate = _day_chg
     volume_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
-    expected_entry = inflection.get("breakout_price") or price
-    detail_summary = " / ".join([str(r) for r in reasons[:6] if r])
-    # v193.1: entry_price / stop_loss / target_price 명시 — 대시보드 표시 + entry_watch 정상 작동
-    _support = inflection.get("support", 0) or expected_entry
+    # ── v195.0 가격 체계: 눌림목 기준 (손익비 유리) ──
+    _peak    = safe_int(pullback.get("peak", 0), 0)
+    _support = safe_int(pullback.get("support", 0), 0) or price
+    expected_entry = safe_int(pullback.get("entry_price", 0), 0) or price  # 반등 초입 현재가
+    # 손절: 지지 하향 이탈 (눌림 깨짐 = 시나리오 실패)
     _stop_loss = int(_support * (1 - _dp_p("stop_support_break_pct") / 100))
-    _target1   = int(expected_entry * (1 + _dp_p("target1_pct") / 100))
-    # v194.0: 2단계 목표 — 1차 도달 시 50% 익절 + 2차 트레일링 (분할익절 활용)
-    _target2   = int(expected_entry * (1 + _dp_p("target2_pct") / 100))
+    # 목표1: 직전 고점 되돌림 / 목표2: 고점 돌파 급등 (남들 FOMO 살 때 익절)
+    _target1 = _peak if _peak > expected_entry else int(expected_entry * (1 + _dp_p("target1_pct") / 100))
+    _target2 = int(_peak * (1 + _dp_p("target1_pct") / 100)) if _peak > 0 else int(expected_entry * (1 + _dp_p("target2_pct") / 100))
+    detail_summary = " / ".join([str(r) for r in reasons[:6] if r])
     return {
         "code": code,
         "name": name,
@@ -45175,14 +45310,14 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
         "is_buy": is_buy,
         "is_strong": grade == "A",
         "summary": detail_summary,
-        "capture_label": "🩲 돌팬티 변곡점",
-        "entry_price":   expected_entry,   # v193.1: 명시적 설정
+        "capture_label": "🩲 돌팬티 눌림목",
+        "entry_price":   expected_entry,
         "planned_entry_price": expected_entry,
-        "stop_loss":     _stop_loss,        # v193.1: 지지변곡점 -1% 손절
-        "target_price":  _target1,          # v193.1: 1차 목표가
-        "target_price_phase2": _target2,    # v194.0: 2차 목표가 (+6%)
+        "stop_loss":     _stop_loss,        # 지지 -1% 이탈 손절
+        "target_price":  _target1,          # 1차: 직전 고점 되돌림
+        "target_price_phase2": _target2,    # 2차: 고점 돌파 급등 익절
         "expected_entry": expected_entry,
-        "entry_source": "변곡점돌파가",
+        "entry_source": "눌림목지지반등",
         "nxt_info": "",
         "decision_label": "🟢 진입 대상",
         "direct_news_hit": False,
@@ -45191,9 +45326,9 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
         "nxt_delta": 0.0,
         "market": stock.get("market", "KRX"),
         "detected_at": datetime.now().isoformat(),
-        "dp_support": inflection.get("support", 0),
-        "dp_prev_high": inflection.get("prev_high", 0),
-        "dp_second_wave": inflection.get("second_wave", False),
+        "dp_support": _support,
+        "dp_peak": _peak,
+        "dp_pullback_low": safe_int(pullback.get("pullback_low", 0), 0),
     }
 
 def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
