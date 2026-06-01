@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v193.4
+버전: v193.5
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v193.5 (2026-06-01): NXT 누락 보완
+  [#1] _dp_overnight_ok: market 파라미터 추가, NXT = 등락률 +1% 기준 대체 (체결강도 API 없음)
+  [#2] send_dp_preclose_position_summary: NXT 종목 get_nxt_stock_price() 분기 + market 저장
+  [#3] send_dp_overnight_clearance_alert: NXT 종목 get_nxt_stock_price() 분기
+  [#4] 스케줄 08:01 추가 — NXT 08:00 오픈 후 청산 대기 알람
 - v193.4 (2026-06-01): dp_ 익영업일 매도 전략 — 전체 시스템 정합성 수정
   [#1] MAX_CARRY_DAYS 3 → 2 (entry_watch expire_ts 연동)
   [#2] _HIT_RETAIN_SECONDS 7일 → 2일
@@ -22939,15 +22944,20 @@ def send_dp_preclose_position_summary() -> None:
             entry = safe_int(w.get("entry_price", 0), 0)
             stop  = safe_int(w.get("stop_loss", 0), 0)
             tgt   = safe_int(w.get("target_price", 0), 0)
+            _is_nxt_pos = str(w.get("market") or "").upper() == "NXT"
             try:
-                q = get_stock_price(code)
+                # v193.5: NXT 종목은 NXT 실시간 가격 우선
+                if _is_nxt_pos and is_nxt_open():
+                    q = get_nxt_stock_price(code) or get_stock_price(code)
+                else:
+                    q = get_stock_price(code)
                 price = safe_int(q.get("price", 0), 0) or entry
                 chg   = safe_float(q.get("change_rate", 0), 0.0)
             except Exception:
                 price, chg = entry, 0.0
             pnl = round((price - entry) / entry * 100, 2) if entry else 0.0
             # 오버나이트 판정
-            ov = _dp_overnight_ok(code)
+            ov = _dp_overnight_ok(code, market="NXT" if _is_nxt_pos else "KRX")
             ov_ok = ov.get("ok", False)
             ov_emoji = "🟢" if ov_ok else "🔴"
             ov_label = "오버나이트 보유" if ov_ok else "종가 청산"
@@ -22956,6 +22966,7 @@ def send_dp_preclose_position_summary() -> None:
                     "code": code, "name": name,
                     "entry": entry, "stop": stop, "target": tgt,
                     "close_price": price,
+                    "market": "NXT" if _is_nxt_pos else "KRX",
                 })
             lines.append(
                 f"{'🩲'} <b>{name}</b> <code>{code}</code>\n"
@@ -22982,8 +22993,13 @@ def send_dp_overnight_clearance_alert() -> None:
             entry  = safe_int(e.get("entry", 0), 0)
             stop   = safe_int(e.get("stop", 0), 0)
             tgt    = safe_int(e.get("target", 0), 0)
+            _is_nxt_e = str(e.get("market") or "").upper() == "NXT"
             try:
-                q = get_stock_price(code)
+                # v193.5: NXT 종목은 NXT 시초가 우선
+                if _is_nxt_e and is_nxt_open():
+                    q = get_nxt_stock_price(code) or get_stock_price(code)
+                else:
+                    q = get_stock_price(code)
                 price = safe_int(q.get("price", 0), 0) or entry
                 chg   = safe_float(q.get("change_rate", 0), 0.0)
             except Exception:
@@ -45202,14 +45218,25 @@ def _dp_check_stoploss(code: str, entry: int, support: int = 0) -> dict:
         out["reason"] = f"자금 이탈 — 매도 체결 {sell_r*100:.0f}% ({m.get('flow_state','')})"
     return out
 
-def _dp_overnight_ok(code: str) -> dict:
+def _dp_overnight_ok(code: str, market: str = "KRX") -> dict:
     """오버나이트 허용 판정: 모멘텀 유지(종가 체결강도) + 악재 부재.
-    반환: {"ok","reason"}."""
+    반환: {"ok","reason"}. v193.5: market 파라미터 추가 — NXT/KRX 분기."""
     out = {"ok": False, "reason": ""}
+    _is_nxt = str(market or "").upper() == "NXT"
     try:
-        vp = {s.get("code"): s for s in get_volume_power_rank("J")}
-        rec = vp.get(code) or {}
-        cttg = safe_float(rec.get("cttg_str", 0.0), 0.0)
+        if _is_nxt:
+            # NXT: 체결강도 API 없음 → 현재가 등락률 + 체결 방향으로 근사
+            q = get_nxt_stock_price(code) or {}
+            chg = safe_float(q.get("change_rate", 0), 0.0)
+            # NXT 오버나이트 기준: 당일 등락률 +1% 이상 유지
+            if chg < 1.0:
+                out["reason"] = f"NXT 등락률 {chg:.1f}% < +1% — 모멘텀 약화, 청산"
+                return out
+            cttg = 100.0  # 기준 충족 처리 (등락률로 대체)
+        else:
+            vp = {s.get("code"): s for s in get_volume_power_rank("J")}
+            rec = vp.get(code) or {}
+            cttg = safe_float(rec.get("cttg_str", 0.0), 0.0)
     except Exception as e:
         _swallow_exception(e)
         cttg = 0.0
@@ -45738,8 +45765,12 @@ if __name__ == "__main__":
     schedule.every().day.at("19:40").do(_leader_job(
         lambda: None if is_holiday() else send_dp_preclose_position_summary()
     ))
-    # v193.4: 익일 09:01 오버나이트 dp_ 포지션 청산 대기 알람
+    # v193.4: 익일 09:01 KRX 오버나이트 dp_ 포지션 청산 대기 알람
     schedule.every().day.at("09:01").do(_leader_job(
+        lambda: None if is_holiday() else send_dp_overnight_clearance_alert()
+    ))
+    # v193.5: 익일 08:01 NXT 오버나이트 dp_ 포지션 청산 대기 알람 (NXT 08:00 오픈)
+    schedule.every().day.at("08:01").do(_leader_job(
         lambda: None if is_holiday() else send_dp_overnight_clearance_alert()
     ))
     # NXT 완전 마감 후 — 결과 집계 + 재진입 초기화 + 미입력 알림
