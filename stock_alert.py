@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.4
+버전: v195.5
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -45049,9 +45049,15 @@ def _dp_minute_candles(code: str, count: int = 40, market: str = "KRX") -> list:
             _mkt_div = "UN"  # 통합 — KRX + NXT 전체 당일 흐름
         else:
             _mkt_div = "J"   # KRX 정규장
-        # v195.1: UN/NXT 분봉은 오늘 것만(N) — 전일 분봉 혼입 시 어제 peak 오감지 방지
-        # KRX 장초반(J)만 Y — 21봉 확보용
-        _pw_yn = "N" if _mkt_div == "UN" else "Y"
+        # v195.5: 전일 분봉 포함 여부
+        # NXT 선장(08:00~09:00): UN + Y — 전영업일 NXT 분봉 포함 → 08:00부터 즉시 21봉 확보
+        # NXT 후장(15:30~20:00): UN + N — 어제 KRX 분봉 혼입 방지 (어제 peak 오감지)
+        # KRX 장중 (J): Y — 장초반 09:00~09:21 대응
+        _is_nxt_premarket_time = _now_kst().hour == 8
+        if _mkt_div == "UN":
+            _pw_yn = "Y" if _is_nxt_premarket_time else "N"
+        else:
+            _pw_yn = "Y"
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             "FHKST03010200",
