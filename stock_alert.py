@@ -3,10 +3,28 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v192.2
+버전: v193.1
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v193.1 (2026-06-01): 돌팬티 포착 0건 버그 수정 2종
+  [#1] _dp_check_inflection: MA 수렴 계산을 prior 기반으로 수정
+       이유: 돌파 캔들(last) 포함 MA5 계산 시 +3% 장대양봉이 MA5를 끌어올려
+             spread > 0.8% → converged=False → inflection.hit 항상 False → 포착 0건
+       수정: _dp_ma(candles,...) → _dp_ma(prior,...) (돌파 이전 수렴 측정)
+  [#2] _dp_analyze: entry_price / stop_loss / target_price 명시 추가
+       이유: 기존 dict에 entry_price 누락 → dispatch 파이프라인 fallback 처리(현재가 대입)
+             stop_loss=0, target_price=0 → 대시보드 목표가/손절가 공백 + entry_watch 작동 불가
+       수정: entry_price=expected_entry, stop_loss=support×(1-1%), target_price=entry×(1+3%)
+  주의점: prior = candles[:-1] (최소 20개 필요 → len(candles)>=21 조건 유지)
+- v193.0 (2026-06-01): 시소 메커니즘 강화 + 후보풀 확대
+  [#1] DP_CAND_TOPN 40 → 80 (RVOL 게이트가 분봉 API 호출 전 선차단으로 성능 영향 최소)
+  [#2] bull/risk_on 장세 시 score_cut_b 동적 65→70 (_dp_analyze 내 레짐 실시간 체크)
+  [#3] _dp_seesaw_check_and_alert(): 레짐 변경 시 텔레그램 시소 알람 발송 (bull↔normal 전환)
+  [#4] 대시보드 payload "seesaw" 필드 추가 + 헤더 배지 표시 (bull=빨강/normal=초록)
+  이유: PDF 원칙 "대형주 강세 시 테마 단타 극도 자제" — 기존 -5점 조정은 너무 약함
+  개선점: bull 장세엔 컷 상향으로 실질 진입 차단 + 시소 상태 즉각 알람
+  주의점: _DP_SEESAW_LAST_REGIME 최초 세션 시작 시 알람 스킵 (prev="" 조건)
 - v192.2 (2026-06-01): RVOL 거래대금 필터 + 구버전 감시 삭제 + dp_ 신호 전용 손절/오버나이트
 - v192.1 (2026-06-01): 대시보드 거래대금상위 정렬 + 포착 시 기존 감시 전부 삭제
 - v192.0 (2026-05-30): 돌팬티 변곡점 포착엔진 전면 교체 — 거래대금 주도주 이평수렴 돌파 + 체결속도 가속 + 지지이탈 손절
@@ -29907,6 +29925,20 @@ def _push_dashboard_json() -> None:
         with _WEB_DASHBOARD_LOCK:
             alerts_snapshot = list(_WEB_DASHBOARD_ALERTS)
 
+        # v193.0: 시소 레짐 상태 대시보드 포함
+        try:
+            _regime_dash = get_market_regime()
+            _regime_mode_dash = str(_regime_dash.get("mode", "normal") or "").lower()
+            _is_bull_dash = _regime_mode_dash in ("bull", "risk_on")
+            _seesaw_payload = {
+                "mode":      _regime_mode_dash,
+                "is_bull":   _is_bull_dash,
+                "label":     "대형주 강세 — 진입 자제" if _is_bull_dash else "테마 유동성 우호",
+                "score_cut_b": 70 if _is_bull_dash else int(_dp_p("score_cut_b")),
+            }
+        except Exception as _sw_e:
+            _swallow_exception(_sw_e, "seesaw_payload")
+            _seesaw_payload = {"mode": "normal", "is_bull": False, "label": "", "score_cut_b": 65}
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
             "data_date":    datetime.now().strftime("%m-%d"),
@@ -29920,6 +29952,7 @@ def _push_dashboard_json() -> None:
             "rank_chg":     rank_chg_out,
             "rank_vol":     rank_vol_out,
             "rank_view":    rank_view_out,
+            "seesaw":       _seesaw_payload,
         }
         tmp = _WEB_DASHBOARD_JSON + ".tmp"
         with open(tmp,"w",encoding="utf-8") as f:
@@ -29966,6 +29999,9 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 #hdr{height:34px;display:flex;align-items:center;gap:10px;padding:0 12px;background:#0c1525;border-bottom:1px solid #1e293b;flex-shrink:0;position:sticky;top:0;z-index:10}
 .logo{font-weight:800;font-size:14px;letter-spacing:-.5px}
 .badge{font-size:10px;font-weight:700;color:#00d97e;background:#00d97e15;border:1px solid #00d97e30;border-radius:20px;padding:1px 8px}
+.seesaw-badge{font-size:10px;font-weight:700;border-radius:20px;padding:1px 8px;transition:all .3s}
+.seesaw-badge.bull{color:#ff4444;background:#ff444415;border:1px solid #ff444430}
+.seesaw-badge.normal{color:#00d97e;background:#00d97e15;border:1px solid #00d97e30}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
 #main{display:grid;grid-template-columns:330px 330px 520px 370px 370px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
@@ -30024,6 +30060,7 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 <div id="hdr">
   <span class="logo">📈 실시간 주식 보드</span>
   <span class="badge" id="mkt-badge">🟢 장 운영중</span>
+  <span class="seesaw-badge normal" id="seesaw-badge">⚖️ 테마 우호</span>
   <span id="bot-ver" style="font-size:10px;color:#607080;margin-left:4px"></span>
   <span class="ts">다음 영업일: <b id="next-biz">--</b> &nbsp;|&nbsp; 마지막 갱신: <b id="ts">--:--:--</b></span>
 </div>
@@ -30206,6 +30243,16 @@ function _applySnapshot(d){
     badge.style.borderColor=marketOpen?"#00d97e30":"#ff444430";
   }
   if(d.bot_version){const vEl=document.getElementById("bot-ver");if(vEl)vEl.textContent=d.bot_version;}
+  if(d.seesaw){
+    const sw=d.seesaw;
+    const swEl=document.getElementById("seesaw-badge");
+    if(swEl){
+      const isBull=sw.is_bull;
+      swEl.textContent=isBull?"⚖️ 대형주 강세 — 자제":"⚖️ 테마 우호";
+      swEl.className="seesaw-badge "+(isBull?"bull":"normal");
+      swEl.title=sw.label+" (진입컷: "+sw.score_cut_b+"점)";
+    }
+  }
   renderAll(d.updated_at);
 }
 async function fetchAndRender(){
@@ -44570,7 +44617,7 @@ DP_PARAMS = {
     "trade_value_active_eok":  float(os.getenv("DP_TV_ACTIVE_EOK", "3000")), # 활발장 상향 기준(억)
     "trade_value_active_count": int(os.getenv("DP_TV_ACTIVE_CNT", "5")),     # 3000억↑ N개↑ → 활발장
     "min_price":               int(os.getenv("DP_MIN_PRICE", "1000")),
-    "candidate_top_n":         int(os.getenv("DP_CAND_TOPN", "40")),
+    "candidate_top_n":         int(os.getenv("DP_CAND_TOPN", "80")),
     # 변곡점
     "round_figure_tol_pct":    float(os.getenv("DP_RF_TOL", "0.5")),     # 라운드피겨 근접 ±%
     "prev_high_support_band_pct": float(os.getenv("DP_PH_BAND", "0.5")), # 전고점 지지 밴드 ±%
@@ -44749,9 +44796,11 @@ def _dp_check_inflection(code: str, candles: list | None = None) -> dict:
     price = last["close"]
     if price <= 0 or last["open"] <= 0:
         return out
-    ma5, ma10, ma20 = _dp_ma(candles, 5), _dp_ma(candles, 10), _dp_ma(candles, 20)
+    # v193.1: prior 기반 MA 계산 — 돌파 캔들(last)이 MA를 끌어올려 spread 오증가 방지
+    # MA는 돌파 이전 상태를 측정해야 "수렴 후 돌파" 패턴 포착 가능
+    ma5, ma10, ma20 = _dp_ma(prior, 5), _dp_ma(prior, 10), _dp_ma(prior, 20)
     reasons = []
-    # ① 단기 이평 수렴
+    # ① 단기 이평 수렴 (돌파 이전 prior 기준)
     if ma5 and ma10 and ma20:
         spread = (max(ma5, ma10, ma20) - min(ma5, ma10, ma20)) / price * 100
         converged = spread <= _dp_p("ma_converge_pct")
@@ -44902,7 +44951,10 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     exec_ctx = _dp_check_exec_accel(code, price=price)
     # ── 점수 ──
     score, reasons, _ = _dp_score(stock, inflection, exec_ctx, active_market)
-    cut_a, cut_b = _dp_p("score_cut_a"), _dp_p("score_cut_b")
+    cut_a = _dp_p("score_cut_a")
+    # v193.0: bull 장세 시 진입 자제 — score_cut_b 동적 상향 (65 → 70)
+    _regime_now = str(get_market_regime().get("mode", "normal") or "").lower()
+    cut_b = 70 if _regime_now in ("bull", "risk_on") else _dp_p("score_cut_b")
     if score < cut_b:
         _log_suppressed_alert(code, name, f"돌팬티 점수 {score} < 컷 {cut_b}",
                               DP_SIGNAL_INFLECTION, {"score": score, "price": price})
@@ -44914,6 +44966,10 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     volume_ratio = safe_float(stock.get("volume_ratio", 0.0), 0.0)
     expected_entry = inflection.get("breakout_price") or price
     detail_summary = " / ".join([str(r) for r in reasons[:6] if r])
+    # v193.1: entry_price / stop_loss / target_price 명시 — 대시보드 표시 + entry_watch 정상 작동
+    _support = inflection.get("support", 0) or expected_entry
+    _stop_loss = int(_support * (1 - _dp_p("stop_support_break_pct") / 100))
+    _target1   = int(expected_entry * (1 + _dp_p("target1_pct") / 100))
     return {
         "code": code,
         "name": name,
@@ -44933,6 +44989,10 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
         "is_strong": grade == "A",
         "summary": detail_summary,
         "capture_label": "🩲 돌팬티 변곡점",
+        "entry_price":   expected_entry,   # v193.1: 명시적 설정
+        "planned_entry_price": expected_entry,
+        "stop_loss":     _stop_loss,        # v193.1: 지지변곡점 -1% 손절
+        "target_price":  _target1,          # v193.1: 1차 목표가
         "expected_entry": expected_entry,
         "entry_source": "변곡점돌파가",
         "nxt_info": "",
@@ -44952,6 +45012,7 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
     """돌팬티 메인 스캔 — 거래대금 상위 후보 풀 → 변곡점 포착."""
     if not is_any_market_open():
         return
+    _dp_seesaw_check_and_alert()  # v193.0: 레짐 변경 감지 + 시소 알람
     try:
         focus = get_market_rank_focus_stocks(scan_limit_per_market=_dp_p("candidate_top_n"))
     except Exception as e:
@@ -45024,6 +45085,44 @@ def _dp_overnight_ok(code: str) -> dict:
     out["ok"] = True
     out["reason"] = f"모멘텀 유지(체결강도 {cttg:.0f}) + 악재 부재 → 오버나이트 허용"
     return out
+
+# v193.0: 시소 메커니즘 레짐 변경 감지 + 텔레그램 알람
+_DP_SEESAW_LAST_REGIME: str = ""
+
+def _dp_seesaw_check_and_alert() -> None:
+    """레짐 변경 시 시소 상태 텔레그램 알람 발송.
+    bull/risk_on → 돌팬티 진입 자제 경보 / 복귀 시 해제 알람."""
+    global _DP_SEESAW_LAST_REGIME
+    try:
+        regime_info = get_market_regime()
+        mode = str(regime_info.get("mode", "normal") or "").lower()
+        if mode == _DP_SEESAW_LAST_REGIME:
+            return
+        prev = _DP_SEESAW_LAST_REGIME
+        _DP_SEESAW_LAST_REGIME = mode
+        if not prev:
+            return  # 최초 세션 시작 시 알람 스킵
+        is_bull = mode in ("bull", "risk_on")
+        was_bull = prev in ("bull", "risk_on")
+        if is_bull and not was_bull:
+            msg = (
+                "⚖️ <b>[시소] 대형주 강세 전환</b>\n"
+                f"레짐: <code>{prev}</code> → <code>{mode}</code>\n"
+                "🔴 돌팬티 진입 자제 — 진입 컷 65→<b>70점</b> 상향\n"
+                "💡 테마/신규상장주 유동성 분산 중 — 신중 진입"
+            )
+            send_telegram(msg, parse_mode="HTML")
+        elif not is_bull and was_bull:
+            cut_b = _dp_p("score_cut_b")
+            msg = (
+                "⚖️ <b>[시소] 대형주 숨고르기 전환</b>\n"
+                f"레짐: <code>{prev}</code> → <code>{mode}</code>\n"
+                f"🟢 돌팬티 진입 재개 — 진입 컷 복귀 <b>{cut_b}점</b>\n"
+                "💡 테마/신규상장주 유동성 이동 우호"
+            )
+            send_telegram(msg, parse_mode="HTML")
+    except Exception as e:
+        _swallow_exception(e)
 
 def run_price_first_scan() -> None:
     run_scan()
