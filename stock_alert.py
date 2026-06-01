@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.1
+버전: v195.2
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -39147,7 +39147,7 @@ def _handle_dp_check_command(raw: str) -> None:
         c1 = tv_ok
         c2 = len(candles) >= max(lookback, 21)
         c3 = day_chg_combined >= _dp_p("pullback_uptrend_min_chg")
-        c4 = ma20 <= 0 or price >= ma20
+        c4 = ma20 <= 0 or price >= ma20 * (1 - _dp_p("pullback_support_tol_pct") / 100)
         c5 = len(after_peak) >= 2
         c6 = _dp_p("pullback_min_pct") <= drop_pct <= _dp_p("pullback_max_pct")
         c7 = up_vol > 0 and vol_ratio_pb <= _dp_p("pullback_vol_dry_mult")
@@ -44904,7 +44904,7 @@ DP_PARAMS = {
     "breakout_body_pct":       float(os.getenv("DP_BO_BODY", "1.5")),    # 장대양봉 몸통 ≥%
     "breakout_vol_mult":       float(os.getenv("DP_BO_VOL", "3.0")),     # 돌파 거래량 ≥직전5봉평균 배수
     "second_wave_vol_mult":    float(os.getenv("DP_2W_VOL", "1.0")),     # 2차돌파 거래대금 ≥1차고점 배수
-    "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.4")),     # 조정 거래량 마름 ≤상승평균 배수
+    "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.65")),    # v195.2: 0.4→0.65 (대형폭등주 현실화)
     # v195.0 눌림목 진입 (숨고르기 매수) — 돌팬티 핵심
     "pullback_min_pct":        float(os.getenv("DP_PB_MIN", "1.0")),     # 눌림 최소 깊이 (peak 대비 ≥%)
     "pullback_max_pct":        float(os.getenv("DP_PB_MAX", "5.0")),     # 눌림 최대 깊이 (peak 대비 ≤% — 초과=큰낙폭 거부)
@@ -45111,8 +45111,9 @@ def _dp_check_pullback_entry(code: str, candles: list | None = None, market: str
     ma20 = _dp_ma(candles, 20)
     if day_change_rate < _dp_p("pullback_uptrend_min_chg"):
         return out
-    if ma20 > 0 and price < ma20:
-        return out  # MA20 하회 = 추세 붕괴
+    # v195.2: MA20 ±support_tol% 이내면 지지권으로 인정 (눌림목에서 MA20 근처로 내려오는 게 정상)
+    if ma20 > 0 and price < ma20 * (1 - _dp_p("pullback_support_tol_pct") / 100):
+        return out  # MA20 1% 초과 하회 = 추세 붕괴
     # ② peak 형성 후 눌림 — lookback 내 고점 탐색
     window = candles[-lookback:]
     peak_idx_rel = max(range(len(window)), key=lambda i: window[i]["high"])
