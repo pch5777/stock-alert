@@ -39099,14 +39099,14 @@ def _handle_dp_check_command(raw: str) -> None:
     """v195.1 /dp_check [종목코드] — dp_ 눌림목 포착 조건 실시간 진단."""
     parts = raw.strip().split()
     if len(parts) < 2:
-        send("사용법: <code>/dp_check 017670</code>", parse_mode="HTML")
+        send("사용법: <code>/dp_check 017670</code>")
         return
     code = normalize_stock_code(parts[1].strip())
     if not code:
         send(f"❌ 종목코드 인식 불가: {parts[1]}")
         return
     name = _resolve_stock_name(code, code)
-    send(f"🔍 <b>[{name}({code})] dp_ 포착 조건 진단 중...</b>", parse_mode="HTML")
+    send(f"🔍 <b>[{name}({code})] dp_ 포착 조건 진단 중...</b>")
     try:
         # ① 거래대금 게이트
         q = get_stock_price(code) or {}
@@ -39172,7 +39172,7 @@ def _handle_dp_check_command(raw: str) -> None:
             "━━━━━━━━━━━━━━━",
             f"{'🟢 전조건 통과 → 포착 가능' if all([c1,c2,c3,c4,c5,c6,c7,c8]) else '🔴 탈락 — ❌ 조건 확인'}",
         ]
-        send("\n".join(lines), parse_mode="HTML")
+        send("\n".join(lines))
     except Exception as e:
         send(f"❌ 진단 오류: {e}")
 
