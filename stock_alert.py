@@ -3,10 +3,16 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v193.1
+버전: v193.2
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v193.2 (2026-06-01): 대시보드 stale 종목포착 영구표시 수정
+  [#1] _push_dashboard_json ① entry_watch: detect_date != today → 대시보드 제외
+  [#2] _push_dashboard_json ③ signal_log 폴백: 7일 → 당일(!=today) 제한
+  이유: dp_ clear 후에도 signal_log 7일 복원이 재표시 → 구버전 포착이 영구 잔류
+  개선점: 당일 포착만 표시 (dp_ 단일종목 전략과 일치)
+  주의점: 전날 포착 이월 포지션 표시 안 됨 — 의도된 동작
 - v193.1 (2026-06-01): 돌팬티 포착 0건 버그 수정 2종
   [#1] _dp_check_inflection: MA 수렴 계산을 prior 기반으로 수정
        이유: 돌파 캔들(last) 포함 MA5 계산 시 +3% 장대양봉이 MA5를 끌어올려
@@ -29601,6 +29607,7 @@ def _push_dashboard_json() -> None:
         try:
             seen_cap: set = set()
             # ① _entry_watch: 진입가 감시 중 + 진입 도달 후 목표가 추적 중
+            _cap_today_str = _now_kst().strftime("%Y-%m-%d")
             for _, watch in list((_entry_watch or {}).items()):
                 if not isinstance(watch, dict): continue
                 code = normalize_stock_code(watch.get("code",""))
@@ -29608,6 +29615,9 @@ def _push_dashboard_json() -> None:
                 if not code or len(code) != 6: continue
                 if any(m in name for m in _ETF_MARKERS): continue
                 if code in seen_cap: continue
+                # v193.2: 당일 포착이 아닌 stale entry_watch 대시보드 표시 제외
+                _w_date = str(watch.get("detect_date") or watch.get("first_detect_date") or "")[:10]
+                if _w_date and _w_date != _cap_today_str: continue
                 seen_cap.add(code)
                 snap    = _get_snap(code)
                 # v169.25: 장 시작 직후 snap 비어도 watch 내 모든 가격 폴백
@@ -29674,11 +29684,12 @@ def _push_dashboard_json() -> None:
                     "detect_time": str(rec.get("detect_time") or rec.get("first_detect_time") or ""),
                     "hit_time":    _ht_val2,
                 })
-            # ③ signal_log 폴백: _entry_watch에서 이미 삭제된 entry_hit=True 종목 복원 (7일 이내)
-            # 근거: entry_watch expire_ts 만료로 런타임/파일에서 삭제돼도 signal_log는 영속 유지
+            # ③ signal_log 폴백: _entry_watch에서 이미 삭제된 entry_hit=True 종목 복원 (당일만)
+            # v193.2: 7일 → 당일 제한 — dp_ clear 후 stale 재표시 방지
+            # 근거: dp_ 단일종목 전략에서 이전 포착 재표시 불필요 + 사용자 혼란 방지
             try:
                 _sl_fb_data = _load_signal_history()
-                _sl_fb_cutoff = (_now_kst() - timedelta(days=7)).strftime("%Y-%m-%d")
+                _sl_fb_cutoff = _now_kst().strftime("%Y-%m-%d")  # 당일만
                 for _sl_rec in (_sl_fb_data or {}).values():
                     if not isinstance(_sl_rec, dict): continue
                     if not _sl_rec.get("entry_hit"): continue
@@ -29690,7 +29701,7 @@ def _push_dashboard_json() -> None:
                     if not _sl_hit_date:
                         _sl_ht_raw = str(_sl_rec.get("entry_hit_time") or "")
                         _sl_hit_date = _sl_ht_raw[:10] if len(_sl_ht_raw) >= 10 else ""
-                    if not _sl_hit_date or _sl_hit_date < _sl_fb_cutoff: continue
+                    if not _sl_hit_date or _sl_hit_date != _sl_fb_cutoff: continue  # v193.2: 당일만
                     _sl_name = _sl_rec.get("name","") or _resolve_stock_name(_sl_code,"")
                     if any(m in _sl_name for m in _ETF_MARKERS): continue
                     seen_cap.add(_sl_code)
