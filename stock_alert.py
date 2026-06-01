@@ -3,10 +3,20 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v193.5
+버전: v194.0
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v194.0 (2026-06-01): dp_ 종목포착 로직 완성 — 5개 요구사항 통합 (구조변경)
+  [Req1] _dp_minute_candles market 파라미터 + FID_PW_DATA_INCU_YN Y (전일분봉 포함)
+         → 장초반 09:00~09:20 21봉 확보 + NXT 분봉 NX 조회 (24시간 포착 실작동)
+         _dp_check_inflection/_dp_analyze에 market 전달
+  [Req2] _dp_analyze target_price_phase2(+6%) 추가 → 1차 도달 50% 익절 + 2차 트레일링
+  [Req4] 검증: dp_ 레코드 _process_tracking_result_record 경유 ATR 동적 트레일링 작동 (코드변경 없음)
+  [Req5] _dp_market_strength(): 대형주/신규주/테마섹터 강세 판정 (5분 캐시)
+         신규주 = get_daily_data 이력 <20거래일 + 등락률 ≥5% (통상 신규주)
+         대시보드 상단 강세 배너 3칩(on/off) + 신규주 강세 전환 시 종목명 알람(상세는 알람에만)
+         _dp_seesaw_check_and_alert 재구조화 — 신규주 체크를 레짐 변경과 독립 실행
 - v193.5 (2026-06-01): NXT 누락 보완
   [#1] _dp_overnight_ok: market 파라미터 추가, NXT = 등락률 +1% 기준 대체 (체결강도 API 없음)
   [#2] send_dp_preclose_position_summary: NXT 종목 get_nxt_stock_price() 분기 + market 저장
@@ -30084,6 +30094,17 @@ def _push_dashboard_json() -> None:
         except Exception as _sw_e:
             _swallow_exception(_sw_e, "seesaw_payload")
             _seesaw_payload = {"mode": "normal", "is_bull": False, "label": "", "score_cut_b": 65}
+        # v194.0: 대형주/신규주/테마섹터 강세 배너 (상단 표시, 종목명은 알람에만)
+        try:
+            _st = _dp_market_strength()
+            _strength_payload = {
+                "big_cap":     bool(_st.get("big_cap")),
+                "new_listing": bool(_st.get("new_listing")),
+                "theme":       bool(_st.get("theme")),
+            }
+        except Exception as _ste:
+            _swallow_exception(_ste, "strength_payload")
+            _strength_payload = {"big_cap": False, "new_listing": False, "theme": False}
         payload = {
             "updated_at":   datetime.now().strftime("%H:%M:%S"),
             "data_date":    datetime.now().strftime("%m-%d"),
@@ -30098,6 +30119,7 @@ def _push_dashboard_json() -> None:
             "rank_vol":     rank_vol_out,
             "rank_view":    rank_view_out,
             "seesaw":       _seesaw_payload,
+            "market_strength": _strength_payload,
         }
         tmp = _WEB_DASHBOARD_JSON + ".tmp"
         with open(tmp,"w",encoding="utf-8") as f:
@@ -30147,6 +30169,9 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
 .seesaw-badge{font-size:10px;font-weight:700;border-radius:20px;padding:1px 8px;transition:all .3s}
 .seesaw-badge.bull{color:#ff4444;background:#ff444415;border:1px solid #ff444430}
 .seesaw-badge.normal{color:#00d97e;background:#00d97e15;border:1px solid #00d97e30}
+.str-chip{font-size:10px;font-weight:700;border-radius:20px;padding:1px 8px;border:1px solid;transition:all .3s}
+.str-chip.on{color:#ff4444;background:#ff444418;border-color:#ff444445}
+.str-chip.off{color:#5a6b7a;background:#1e293b30;border-color:#33415540}
 .ts{font-size:10px;color:#b8ccd8;margin-left:auto}
 #main{display:grid;grid-template-columns:330px 330px 520px 370px 370px;height:calc(100vh - 34px)}
 .col{display:flex;flex-direction:column;border-right:1px solid #1e293b;overflow:hidden}
@@ -30206,6 +30231,9 @@ body{background:#070d1a;color:#e2e8f0;font-family:"Noto Sans KR","Apple SD Gothi
   <span class="logo">📈 실시간 주식 보드</span>
   <span class="badge" id="mkt-badge">🟢 장 운영중</span>
   <span class="seesaw-badge normal" id="seesaw-badge">⚖️ 테마 우호</span>
+  <span class="str-chip off" id="str-bigcap">🏛 대형주</span>
+  <span class="str-chip off" id="str-newlist">🆕 신규주</span>
+  <span class="str-chip off" id="str-theme">🔥 테마섹터</span>
   <span id="bot-ver" style="font-size:10px;color:#607080;margin-left:4px"></span>
   <span class="ts">다음 영업일: <b id="next-biz">--</b> &nbsp;|&nbsp; 마지막 갱신: <b id="ts">--:--:--</b></span>
 </div>
@@ -30397,6 +30425,13 @@ function _applySnapshot(d){
       swEl.className="seesaw-badge "+(isBull?"bull":"normal");
       swEl.title=sw.label+" (진입컷: "+sw.score_cut_b+"점)";
     }
+  }
+  if(d.market_strength){
+    const ms=d.market_strength;
+    const setChip=(id,on)=>{const el=document.getElementById(id);if(el)el.className="str-chip "+(on?"on":"off");};
+    setChip("str-bigcap",ms.big_cap);
+    setChip("str-newlist",ms.new_listing);
+    setChip("str-theme",ms.theme);
   }
   renderAll(d.updated_at);
 }
@@ -44891,19 +44926,23 @@ def _dp_near_round_figure(price: int, tol_pct: float) -> tuple:
             return True, lvl
     return False, 0
 
-def _dp_minute_candles(code: str, count: int = 40) -> list:
+def _dp_minute_candles(code: str, count: int = 40, market: str = "KRX") -> list:
     """돌팬티 변곡점용 분봉 — high/low 포함 (기존 _get_minute_data엔 high/low 없음).
-    반환: 시간 오름차순 [{"time","open","high","low","close","volume"}]."""
+    반환: 시간 오름차순 [{"time","open","high","low","close","volume"}].
+    v194.0: market 파라미터 + 전일 분봉 포함(연속성) — 장초반/NXT 포착 가능."""
     try:
+        # v194.0: NXT 종목은 NX 시장 분봉 조회 (KRX 동결 데이터 회피)
+        _mkt_div = "NX" if str(market or "").upper() == "NXT" else "J"
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             "FHKST03010200",
             {
                 "FID_ETC_CLS_CODE": "",
-                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_MRKT_DIV_CODE": _mkt_div,
                 "FID_INPUT_ISCD": code,
                 "FID_INPUT_HOUR_1": datetime.now().strftime("%H%M%S"),
-                "FID_PW_DATA_INCU_YN": "N",
+                # v194.0: Y → 전일 분봉 포함 → 장초반 09:00~09:20 21봉 확보 + 거래대금 연속성
+                "FID_PW_DATA_INCU_YN": "Y",
             },
         )
         out = []
@@ -44927,13 +44966,13 @@ def _dp_ma(candles: list, n: int) -> float:
         return 0.0
     return sum(c["close"] for c in candles[-n:]) / n
 
-def _dp_check_inflection(code: str, candles: list | None = None) -> dict:
+def _dp_check_inflection(code: str, candles: list | None = None, market: str = "KRX") -> dict:
     """변곡점 판정: 단기이평 수렴 → 대량 장대양봉 전고 돌파 + 라운드피겨/전고 지지.
     반환: {"hit","kind","reasons","prev_high","support","breakout_price","second_wave"}."""
     out = {"hit": False, "kind": "", "reasons": [], "prev_high": 0,
            "support": 0, "breakout_price": 0, "second_wave": False}
     if candles is None:
-        candles = _dp_minute_candles(code, 40)
+        candles = _dp_minute_candles(code, 40, market=market)
     if len(candles) < 21:
         return out
     last = candles[-1]
@@ -45087,9 +45126,10 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     stock = dict(stock)
     stock["trade_value"] = tv_eok * 1e8
     stock["price"] = price
-    # ── 변곡점 판정 ──
-    candles = _dp_minute_candles(code, 40)
-    inflection = _dp_check_inflection(code, candles)
+    # ── 변곡점 판정 ── v194.0: market 전달 (NXT 분봉 NX 조회)
+    _dp_mkt = str(stock.get("market", "KRX") or "KRX")
+    candles = _dp_minute_candles(code, 40, market=_dp_mkt)
+    inflection = _dp_check_inflection(code, candles, market=_dp_mkt)
     if not inflection.get("hit"):
         return {}
     # ── 체결속도 가속 ──
@@ -45115,6 +45155,8 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     _support = inflection.get("support", 0) or expected_entry
     _stop_loss = int(_support * (1 - _dp_p("stop_support_break_pct") / 100))
     _target1   = int(expected_entry * (1 + _dp_p("target1_pct") / 100))
+    # v194.0: 2단계 목표 — 1차 도달 시 50% 익절 + 2차 트레일링 (분할익절 활용)
+    _target2   = int(expected_entry * (1 + _dp_p("target2_pct") / 100))
     return {
         "code": code,
         "name": name,
@@ -45138,6 +45180,7 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
         "planned_entry_price": expected_entry,
         "stop_loss":     _stop_loss,        # v193.1: 지지변곡점 -1% 손절
         "target_price":  _target1,          # v193.1: 1차 목표가
+        "target_price_phase2": _target2,    # v194.0: 2차 목표가 (+6%)
         "expected_entry": expected_entry,
         "entry_source": "변곡점돌파가",
         "nxt_info": "",
@@ -45254,13 +45297,103 @@ def _dp_overnight_ok(code: str, market: str = "KRX") -> dict:
     out["reason"] = f"모멘텀 유지(체결강도 {cttg:.0f}) + 악재 부재 → 오버나이트 허용"
     return out
 
+# v194.0: 대형주/신규주/테마섹터 강세 모니터링
+_DP_STRENGTH_CACHE: dict = {"ts": 0.0, "data": None}
+_DP_STRENGTH_TTL_SEC = 300  # 5분 캐시
+
+def _dp_is_new_listing(code: str) -> bool:
+    """통상 신규주 판별 — 일봉 이력 < 20거래일(약 1개월) 이면 신규주."""
+    try:
+        daily = get_daily_data(code, 30)
+        return 0 < len(daily) < 20
+    except Exception:
+        return False
+
+def _dp_market_strength(force: bool = False) -> dict:
+    """대형주/신규주/테마섹터 강세 판정. 5분 캐시.
+    반환: {big_cap, new_listing, theme, new_listing_names, regime}."""
+    now = time.time()
+    if not force and _DP_STRENGTH_CACHE.get("data") and now - _DP_STRENGTH_CACHE["ts"] < _DP_STRENGTH_TTL_SEC:
+        return _DP_STRENGTH_CACHE["data"]
+    out = {"big_cap": False, "new_listing": False, "theme": False,
+           "new_listing_names": [], "regime": "normal"}
+    try:
+        # ① 대형주 강세: 레짐
+        regime = str(get_market_regime().get("mode", "normal") or "").lower()
+        out["regime"] = regime
+        out["big_cap"] = regime in ("bull", "risk_on")
+        # ② 신규주 강세: 거래대금 상위 종목 중 신규주 + 등락률 강세
+        new_names = []
+        try:
+            focus = get_market_rank_focus_stocks(scan_limit_per_market=40) or []
+            for s in focus[:30]:  # 상위 30만 검사 (API 비용 제한)
+                code = normalize_stock_code(s.get("code", ""))
+                cr = safe_float(s.get("change_rate", 0), 0.0)
+                if not code or cr < 5.0:
+                    continue
+                if _dp_is_new_listing(code):
+                    nm = _resolve_stock_name(code, s.get("name", code))
+                    new_names.append(f"{nm}({code}) {cr:+.1f}%")
+                if len(new_names) >= 5:
+                    break
+        except Exception as _fe:
+            _swallow_exception(_fe)
+        out["new_listing"] = len(new_names) >= 2  # 2종목 이상 → 신규주 강세
+        out["new_listing_names"] = new_names
+        # ③ 테마섹터 강세: 네이버 rise breadth — 동일 섹터 3개+ 8% 이상
+        try:
+            rising = _fetch_naver_rank("rise", top_n=60) or []
+            sector_cnt: dict = {}
+            for r in rising:
+                cr = safe_float(r.get("change_rate", 0), 0.0)
+                if cr < 8.0:
+                    continue
+                rc = normalize_stock_code(r.get("code", ""))
+                try:
+                    theme, _, _ = get_theme_sector_stocks(rc)
+                except Exception:
+                    theme = ""
+                sec = str(theme or "").strip()
+                if sec and sec not in ("기타", "기타업종", ""):
+                    sector_cnt[sec] = sector_cnt.get(sec, 0) + 1
+            out["theme"] = any(v >= 3 for v in sector_cnt.values())
+        except Exception as _te:
+            _swallow_exception(_te)
+    except Exception as e:
+        _swallow_exception(e)
+    _DP_STRENGTH_CACHE["ts"] = now
+    _DP_STRENGTH_CACHE["data"] = out
+    return out
+
 # v193.0: 시소 메커니즘 레짐 변경 감지 + 텔레그램 알람
 _DP_SEESAW_LAST_REGIME: str = ""
+_DP_NEW_LISTING_LAST: bool = False
 
 def _dp_seesaw_check_and_alert() -> None:
-    """레짐 변경 시 시소 상태 텔레그램 알람 발송.
-    bull/risk_on → 돌팬티 진입 자제 경보 / 복귀 시 해제 알람."""
-    global _DP_SEESAW_LAST_REGIME
+    """레짐 변경 시 시소 상태 + 신규주 강세 텔레그램 알람 발송."""
+    global _DP_SEESAW_LAST_REGIME, _DP_NEW_LISTING_LAST
+    # v194.0: 신규주 강세 전환 알람 — 레짐 변경과 독립적으로 매 스캔 체크
+    try:
+        strength = _dp_market_strength()
+        new_now = bool(strength.get("new_listing"))
+        if new_now and not _DP_NEW_LISTING_LAST:
+            names = strength.get("new_listing_names") or []
+            name_lines = "\n".join(f"  • {n}" for n in names)
+            _big_cap = strength.get("big_cap")
+            _seesaw_hint = ("⚠️ 대형주 강세 동반 — 신규주 변동성 주의" if _big_cap
+                            else "💡 대형주 약세 동반 — 시소 작동, 테마/신규주 압축 공략 구간")
+            send_telegram(
+                "🆕 <b>[신규주 강세 감지]</b>\n"
+                "유동성이 신규 상장주로 이동 중 — 거래대금 상위 진입\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"{name_lines}\n"
+                f"{_seesaw_hint}",
+                parse_mode="HTML",
+            )
+        _DP_NEW_LISTING_LAST = new_now
+    except Exception as _ne:
+        _swallow_exception(_ne)
+    # 레짐 변경 시소 알람
     try:
         regime_info = get_market_regime()
         mode = str(regime_info.get("mode", "normal") or "").lower()
