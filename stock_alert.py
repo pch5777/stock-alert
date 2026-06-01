@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.3
+버전: v195.4
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -39154,7 +39154,8 @@ def _handle_dp_check_command(raw: str) -> None:
 
         last = candles[-1] if candles else {}
         rebound_pct = (last.get("close",0) - pullback_low) / pullback_low * 100 if pullback_low else 0
-        c8 = rebound_pct >= _dp_p("pullback_rebound_pct") and last.get("close",0) >= last.get("open",1)
+        c8 = (rebound_pct >= _dp_p("pullback_rebound_pct") and
+              (rebound_pct >= 1.0 or last.get("close",0) >= last.get("open",1)))
 
         lines = [
             f"🩲 <b>dp_ 눌림목 진단 — {name}({code})</b>",
@@ -45164,9 +45165,10 @@ def _dp_check_pullback_entry(code: str, candles: list | None = None, market: str
     rebound_pct = (price - pullback_low) / pullback_low * 100 if pullback_low else 0
     if rebound_pct < _dp_p("pullback_rebound_pct"):
         return out  # 아직 반등 안 함 (계속 흘러내림)
-    # 현재봉 양봉 전환 확인 (반등 초입)
-    if last["close"] < last["open"]:
-        return out  # 음봉 = 아직 하락 중
+    # v195.4: 반등 1% 이상이면 봉 방향 무관 (저점서 충분히 반등했으면 음봉도 허용)
+    # 반등 1% 미만이면 양봉 필수 (아직 반등 초입 확인 안 됨)
+    if rebound_pct < 1.0 and last["close"] < last["open"]:
+        return out  # 반등 작고 음봉 = 아직 하락 중
     # ⑥ 자금이탈 아님 — 매도 체결비율 과도하면 거부
     try:
         m = get_execution_speed_metrics(code, current_price=price)
