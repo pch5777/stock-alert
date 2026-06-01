@@ -3,10 +3,11 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v192.1
+버전: v192.2
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v192.2 (2026-06-01): RVOL 거래대금 필터 + 구버전 감시 삭제 + dp_ 신호 전용 손절/오버나이트
 - v192.1 (2026-06-01): 대시보드 거래대금상위 정렬 + 포착 시 기존 감시 전부 삭제
 - v192.0 (2026-05-30): 돌팬티 변곡점 포착엔진 전면 교체 — 거래대금 주도주 이평수렴 돌파 + 체결속도 가속 + 지지이탈 손절
 
@@ -23514,12 +23515,14 @@ def _maybe_warn_theme_rotation_exit(rec: dict, code: str, rec_name: str, pnl_now
         )
     except Exception as e:
         _swallow_exception(e)
-def _maybe_warn_overnight_risk_exit(code: str, rec_name: str, entry: int, pnl_now: float) -> None:
+def _maybe_warn_overnight_risk_exit(code: str, rec_name: str, entry: int, pnl_now: float, signal_type: str = "") -> None:
+    # v192.2: dp_ 신호에만 dp_overnight_ok 적용. 비dp 신호는 무시(기존 로직 없으므로 skip).
+    if not str(signal_type or "").startswith("dp_"):
+        return
     try:
         risk_key = f"overnight_risk_{code}"
         if risk_key in _tracking_notified:
             return
-        # v192.0 돌팬티: 종가 오버나이트 판정 — 모멘텀 유지 + 악재 부재면 보유, 아니면 청산.
         ov = _dp_overnight_ok(code)
         _tracking_notified.add(risk_key)
         if ov.get("ok"):
@@ -23561,7 +23564,7 @@ def _process_tracking_trailing_mode(data, log_key, rec, code, rec_name, price, e
             updated = True
     _maybe_warn_force_pattern_exit(code, rec_name, price, pnl_now)
     _maybe_warn_theme_rotation_exit(rec, code, rec_name, pnl_now)
-    _maybe_warn_overnight_risk_exit(code, rec_name, entry, pnl_now)
+    _maybe_warn_overnight_risk_exit(code, rec_name, entry, pnl_now, signal_type=rec.get("signal_type", ""))
     if price > rec.get("trailing_stop", trail_stop):
         return False, updated
     gross_pnl_pct = round((price - entry) / entry * 100, 2) if entry else 0
@@ -23806,15 +23809,16 @@ def _process_tracking_result_record(data, today, log_key, rec):
     handled_target, target_updated = _handle_tracking_target_reached(data, log_key, rec, code, price, entry, target)
     if handled_target:
         return target_updated or True
-    # v192.0 돌팬티: 자금이탈 손절 — 지지 변곡점 이탈 OR 매도 체결 가속 (PDF 손절 규칙)
-    try:
-        _dp_support = safe_int(rec.get("dp_support", 0), 0)
-        _sl = _dp_check_stoploss(code, entry, support=_dp_support)
-        if _sl.get("hit"):
-            _finalize_tracking_exit_record(rec, code, price, entry, f"손절({_sl.get('reason','자금이탈')})", today, log_key)
-            return True
-    except Exception as _dpe:
-        _swallow_exception(_dpe)
+    # v192.2: dp_ 신호에만 자금이탈 손절 적용
+    if str(rec.get("signal_type", "") or "").startswith("dp_"):
+        try:
+            _dp_support = safe_int(rec.get("dp_support", 0), 0)
+            _sl = _dp_check_stoploss(code, entry, support=_dp_support)
+            if _sl.get("hit"):
+                _finalize_tracking_exit_record(rec, code, price, entry, f"손절({_sl.get('reason','자금이탈')})", today, log_key)
+                return True
+        except Exception as _dpe:
+            _swallow_exception(_dpe)
     exit_reason = None
     if price <= stop:
         # v165.46 [4]: 분할매수 종목은 손절도 분할 처리
@@ -44560,7 +44564,9 @@ def _run_scan_followup_hooks() -> None:
 # ════════════════════════════════════════════════════════════
 DP_PARAMS = {
     # 후보 게이트
-    "trade_value_floor_eok":   float(os.getenv("DP_TV_FLOOR_EOK", "1500")),  # 거래대금 하한(억)
+    "trade_value_floor_eok":   float(os.getenv("DP_TV_FLOOR_EOK", "1300")),  # 절대값 하한(억) — RVOL 미달 시 fallback
+    "trade_value_min_actual_eok": float(os.getenv("DP_TV_MIN_ACTUAL", "30")), # 최소 실거래대금(억) — 노이즈 방지
+    "rvol_min":                float(os.getenv("DP_RVOL_MIN", "2.0")),       # RVOL 최소배수 (전일대비 속도)
     "trade_value_active_eok":  float(os.getenv("DP_TV_ACTIVE_EOK", "3000")), # 활발장 상향 기준(억)
     "trade_value_active_count": int(os.getenv("DP_TV_ACTIVE_CNT", "5")),     # 3000억↑ N개↑ → 활발장
     "min_price":               int(os.getenv("DP_MIN_PRICE", "1000")),
@@ -44613,6 +44619,62 @@ def _dp_tv_eok(raw) -> float:
     if v <= 0:
         return 0.0
     return v / 1e8 if v > 1e7 else v
+
+def _dp_elapsed_and_total_min() -> tuple:
+    """현재 시각 기준 세션 경과분 / 세션 총 분수 반환.
+    KRX 09:00~15:30=390분 / NXT프리 08:00~09:00=60분 / NXT시간외 15:30~20:00=270분."""
+    now = _now_kst()
+    h, m = now.hour, now.minute
+    if 9 <= h < 15 or (h == 15 and m <= 30):
+        elapsed = (h - 9) * 60 + m
+        total = 390
+    elif h == 8:
+        elapsed = m
+        total = 60
+    elif (h == 15 and m > 30) or h in (16, 17, 18, 19) or (h == 20 and m == 0):
+        elapsed = (h - 15) * 60 + (m - 30) if h == 15 else (h - 15) * 60 + m - 30
+        total = 270
+    else:
+        elapsed, total = 390, 390  # 장외 — 보정 없음
+    return max(elapsed, 5), total
+
+def _dp_calc_rvol(tv_today_eok: float, code: str) -> float:
+    """RVOL 근사 = 당일 속도 / 전일 속도.
+    당일속도 = tv_today / elapsed_min.
+    전일속도 = prev_day_total_tv / 390.
+    전일 데이터 없으면 0.0 반환."""
+    try:
+        elapsed, _ = _dp_elapsed_and_total_min()
+        today_rate = tv_today_eok / elapsed  # 억/분
+        daily = get_daily_data(code, 3)
+        if not daily or len(daily) < 2:
+            return 0.0
+        prev = daily[-2]  # 전일 (마지막이 당일일 수 있어 -2)
+        prev_tv_eok = _dp_tv_eok(safe_float(prev.get("acml_tr_pbmn", 0) or prev.get("trade_amount", 0), 0.0))
+        if prev_tv_eok <= 0:
+            return 0.0
+        prev_rate = prev_tv_eok / 390.0
+        return round(today_rate / prev_rate, 2) if prev_rate else 0.0
+    except Exception as e:
+        _swallow_exception(e)
+        return 0.0
+
+def _dp_tv_pass(tv_today_eok: float, code: str) -> tuple:
+    """거래대금 통과 판정. 반환: (pass: bool, reason: str)
+    조건: (RVOL≥2.0 AND 실제≥30억) OR 실제≥1300억"""
+    floor = _dp_p("trade_value_floor_eok")      # 1300억
+    min_actual = _dp_p("trade_value_min_actual_eok")  # 30억
+    rvol_min = _dp_p("rvol_min")                # 2.0
+    # 절대값 기준 통과
+    if tv_today_eok >= floor:
+        return True, f"거래대금 {tv_today_eok:,.0f}억 ≥ 하한 {floor:.0f}억"
+    # RVOL 기준 통과
+    if tv_today_eok >= min_actual:
+        rvol = _dp_calc_rvol(tv_today_eok, code)
+        if rvol >= rvol_min:
+            return True, f"RVOL {rvol:.1f}배 (거래대금 {tv_today_eok:,.0f}억 × 속도)"
+        return False, f"거래대금 {tv_today_eok:,.0f}억 < {floor:.0f}억 + RVOL {rvol:.1f} < {rvol_min}"
+    return False, f"거래대금 {tv_today_eok:,.0f}억 < 최소 {min_actual:.0f}억"
 
 def _dp_round_figure_levels(price: int) -> list:
     """가격 인근 심리적 마디(라운드피겨) 후보 — 호가단위 변경대 근사."""
@@ -44815,16 +44877,17 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
     price = safe_int(stock.get("price", 0), 0)
     if price < _dp_p("min_price"):
         return {}
-    # ── 거래대금 하한 게이트 (소외 잡주 배제) ──
+    # ── 거래대금 게이트 — RVOL 기반 (v192.2) ──
+    # 조건: (RVOL≥2.0 AND 실제≥30억) OR 실제≥1300억
     tv_eok = _dp_tv_eok(stock.get("trade_value", 0))
     if tv_eok <= 0:
         q = get_stock_price(code)
-        # get_stock_price는 acml_tr_pbmn(원) 키로 거래대금 제공
         tv_eok = _dp_tv_eok(q.get("acml_tr_pbmn", 0))
         if price <= 0:
             price = safe_int(q.get("price", 0), 0)
-    if tv_eok < _dp_p("trade_value_floor_eok"):
-        _log_suppressed_alert(code, name, f"거래대금 {tv_eok:,.0f}억 < 하한 {_dp_p('trade_value_floor_eok'):,.0f}억",
+    tv_ok, tv_reason = _dp_tv_pass(tv_eok, code)
+    if not tv_ok:
+        _log_suppressed_alert(code, name, tv_reason,
                               DP_SIGNAL_INFLECTION, {"trade_value_eok": tv_eok, "price": price})
         return {}
     stock = dict(stock)
@@ -45286,6 +45349,17 @@ if __name__ == "__main__":
             _log_info_msg(f"🗑 봇 시작 시 stale entry_hit {_phits}건 정리")
     except Exception as _pe:
         _log_warn_msg(f"⚠️ stale entry_hit 정리 오류: {_pe}")
+    # v192.2: 비dp_ 구버전 감시 항목 영구 삭제 (v192 포착엔진 교체 후 구버전 신호 제거)
+    try:
+        _old_keys = [k for k, w in (_entry_watch or {}).items()
+                     if not str((w or {}).get("signal_type", "") or "").startswith("dp_")]
+        if _old_keys:
+            for k in _old_keys:
+                _entry_watch.pop(k, None)
+            _save_entry_watch_active()
+            _log_info_msg(f"🗑 v192 엔진 전환 — 구버전 감시 {len(_old_keys)}건 삭제")
+    except Exception as _dp_purge_e:
+        _log_warn_msg(f"⚠️ 구버전 감시 정리 오류: {_dp_purge_e}")
     _load_preclose_gap_entry_watch()
     _load_pullback_wait_watch()            # v165.23: 재시작 시 눌림 대기 감시 복원
     _load_nxt_confirmed_codes()            # v165.27: NXT 화이트리스트 복원
