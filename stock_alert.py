@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.2
+버전: v195.3
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -44904,7 +44904,7 @@ DP_PARAMS = {
     "breakout_body_pct":       float(os.getenv("DP_BO_BODY", "1.5")),    # 장대양봉 몸통 ≥%
     "breakout_vol_mult":       float(os.getenv("DP_BO_VOL", "3.0")),     # 돌파 거래량 ≥직전5봉평균 배수
     "second_wave_vol_mult":    float(os.getenv("DP_2W_VOL", "1.0")),     # 2차돌파 거래대금 ≥1차고점 배수
-    "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.65")),    # v195.2: 0.4→0.65 (대형폭등주 현실화)
+    "pullback_vol_dry_mult":   float(os.getenv("DP_PB_DRY", "0.80")),    # v195.3: 0.65→0.80 (SKT 실데이터 기반)
     # v195.0 눌림목 진입 (숨고르기 매수) — 돌팬티 핵심
     "pullback_min_pct":        float(os.getenv("DP_PB_MIN", "1.0")),     # 눌림 최소 깊이 (peak 대비 ≥%)
     "pullback_max_pct":        float(os.getenv("DP_PB_MAX", "5.0")),     # 눌림 최대 깊이 (peak 대비 ≤% — 초과=큰낙폭 거부)
