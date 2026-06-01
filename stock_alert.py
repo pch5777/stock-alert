@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.5
+버전: v195.6
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -14734,6 +14734,12 @@ def _schedule_run_pending_watchdog() -> None:
                     threading.Thread(
                         target=lambda: _run_scan_burst_window("krx_open", KRX_OPEN_BURST_INTERVAL_SEC),
                         daemon=True, name="watchdog_blocked_krx"
+                    ).start()
+                elif _is_nxt_aftermarket_burst_window(now):
+                    # v195.6: NXT 후장(15:30~20:00) schedule 블로킹 시 직접 스캔 실행
+                    threading.Thread(
+                        target=_run_nxt_aftermarket_burst_scan,
+                        daemon=True, name="watchdog_blocked_nxt_after"
                     ).start()
         except Exception as _swe:
             _swallow_exception(_swe, "schedule_watchdog")
