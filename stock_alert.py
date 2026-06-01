@@ -3,10 +3,17 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v193.3
+버전: v193.4
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v193.4 (2026-06-01): dp_ 익영업일 매도 전략 — 전체 시스템 정합성 수정
+  [#1] MAX_CARRY_DAYS 3 → 2 (entry_watch expire_ts 연동)
+  [#2] _HIT_RETAIN_SECONDS 7일 → 2일
+  [#3] send_dp_preclose_position_summary(): 15:10/19:40 보유 dp_ 종목 요약+오버나이트 판정 알람
+  [#4] send_dp_overnight_clearance_alert(): 익일 09:01 청산 대기 알람
+  [#5] dp_overnight_approved.json 상태파일 — 오버나이트 허용 포지션 익일 전달
+  스케줄: 15:10 KRX / 19:40 NXT 요약 / 09:01 익일 청산 대기
 - v193.3 (2026-06-01): 구버전 비dp_ 포착 완전 제거 (익영업일 매도 전략 전환)
   [#1] _entry_watch 스캔 시작 시 비dp_ 항목 영구 삭제 (1회성 cleanup + 이후 방지)
   [#2] 대시보드 ①②③ 경로 모두 dp_ 신호만 표시
@@ -4054,7 +4061,7 @@ def _format_signal_type_stats_line(stats: dict) -> str:
 CACHE_TTL_SECONDS = 3600
 MAX_CACHE_SIZE = 5000
 _exec_speed_cache = {}  # [v41.85] 모듈 레벨 선언 누락 수정 (NameError 방지)
-_HIT_RETAIN_SECONDS = 86400 * 7  # v181.1: 도달 종목 hit_time 기준 7일 유지
+_HIT_RETAIN_SECONDS = 86400 * 2  # v193.4: dp_ 익영업일 매도 전략 → 최대 2일 유지
 
 def _purge_stale_entry_watch_hits(notify: bool = False) -> int:
     """v71: 장중 30분마다 _entry_watch에서 stale entry_hit/만료 watch 제거.
@@ -4307,7 +4314,7 @@ ENTRY_PULLBACK_MISS_LOOKBACK = 30
 ENTRY_PULLBACK_RESULT_LOOKBACK = 16
 ENTRY_PULLBACK_MISS_MIN_SAMPLES = 8
 ENTRY_PULLBACK_RESULT_MIN_SAMPLES = 8
-MAX_CARRY_DAYS        = 3
+MAX_CARRY_DAYS        = 2  # v193.4: dp_ 익영업일 매도 전략 전환
 CARRY_FILE            = _state_path("carry_stocks.json")
 EARLY_LOG_FILE        = _state_path("early_detect_log.json")
 # ATR
@@ -22893,6 +22900,107 @@ def _build_overnight_risk_alert_message(limit_items: int | None = None, include_
         except Exception as e:
             _swallow_exception(e)
     return msg.rstrip()
+# v193.4: dp_ 익영업일 매도 전략 — 장 마감 전 보유 종목 요약 + 오버나이트 판정
+_DP_OVERNIGHT_STATE_FILE = _state_path("dp_overnight_approved.json")
+
+def _dp_save_overnight_approved(entries: list) -> None:
+    """오버나이트 허용된 dp_ 포지션 저장 — 익일 09:01 청산 대기 알람용."""
+    try:
+        _write_json_atomic(_DP_OVERNIGHT_STATE_FILE, {
+            "date": _now_kst().strftime("%Y-%m-%d"),
+            "entries": entries,
+        })
+    except Exception as e:
+        _swallow_exception(e)
+
+def _dp_load_overnight_approved() -> list:
+    try:
+        data = _read_json_safe(_DP_OVERNIGHT_STATE_FILE, {})
+        if data.get("date") == _now_kst().strftime("%Y-%m-%d"):
+            return list(data.get("entries") or [])
+    except Exception:
+        pass
+    return []
+
+def send_dp_preclose_position_summary() -> None:
+    """v193.4: 장 마감 전 15:10 — 보유 dp_ 종목 요약 + 오버나이트 판정 알람."""
+    try:
+        dp_positions = [
+            (k, w) for k, w in list((_entry_watch or {}).items())
+            if isinstance(w, dict) and str(w.get("signal_type") or "").startswith("dp_")
+        ]
+        if not dp_positions:
+            return
+        overnight_approved = []
+        lines = ["⚖️ <b>[장 마감 전 dp_ 포지션 요약]</b>", "━━━━━━━━━━━━━━━"]
+        for _, w in dp_positions:
+            code = normalize_stock_code(w.get("code", ""))
+            name = w.get("name", code)
+            entry = safe_int(w.get("entry_price", 0), 0)
+            stop  = safe_int(w.get("stop_loss", 0), 0)
+            tgt   = safe_int(w.get("target_price", 0), 0)
+            try:
+                q = get_stock_price(code)
+                price = safe_int(q.get("price", 0), 0) or entry
+                chg   = safe_float(q.get("change_rate", 0), 0.0)
+            except Exception:
+                price, chg = entry, 0.0
+            pnl = round((price - entry) / entry * 100, 2) if entry else 0.0
+            # 오버나이트 판정
+            ov = _dp_overnight_ok(code)
+            ov_ok = ov.get("ok", False)
+            ov_emoji = "🟢" if ov_ok else "🔴"
+            ov_label = "오버나이트 보유" if ov_ok else "종가 청산"
+            if ov_ok:
+                overnight_approved.append({
+                    "code": code, "name": name,
+                    "entry": entry, "stop": stop, "target": tgt,
+                    "close_price": price,
+                })
+            lines.append(
+                f"{'🩲'} <b>{name}</b> <code>{code}</code>\n"
+                f"  진입 {entry:,}  현재 {price:,} ({chg:+.1f}%)  손익 {pnl:+.2f}%\n"
+                f"  목표 {tgt:,}  손절 {stop:,}\n"
+                f"  {ov_emoji} <b>{ov_label}</b> — {ov.get('reason','')}"
+            )
+        send("\n".join(lines))
+        if overnight_approved:
+            _dp_save_overnight_approved(overnight_approved)
+    except Exception as e:
+        _log_error("send_dp_preclose_position_summary", e)
+
+def send_dp_overnight_clearance_alert() -> None:
+    """v193.4: 익일 09:01 — 오버나이트 보유 dp_ 종목 청산 대기 알람."""
+    try:
+        entries = _dp_load_overnight_approved()
+        if not entries:
+            return
+        lines = ["🔔 <b>[오버나이트 dp_ 포지션 — 익일 청산 대기]</b>", "━━━━━━━━━━━━━━━"]
+        for e in entries:
+            code   = normalize_stock_code(e.get("code", ""))
+            name   = e.get("name", code)
+            entry  = safe_int(e.get("entry", 0), 0)
+            stop   = safe_int(e.get("stop", 0), 0)
+            tgt    = safe_int(e.get("target", 0), 0)
+            try:
+                q = get_stock_price(code)
+                price = safe_int(q.get("price", 0), 0) or entry
+                chg   = safe_float(q.get("change_rate", 0), 0.0)
+            except Exception:
+                price, chg = entry, 0.0
+            pnl = round((price - entry) / entry * 100, 2) if entry else 0.0
+            lines.append(
+                f"🩲 <b>{name}</b> <code>{code}</code>\n"
+                f"  진입 {entry:,}  시초가 {price:,} ({chg:+.1f}%)  손익 {pnl:+.2f}%\n"
+                f"  🎯 목표 {tgt:,}  🛑 손절 {stop:,}\n"
+                f"  ⚡ 갭상승 시 목표가 도달 확인 후 청산 / 손절가 하향 이탈 시 즉시 손절"
+            )
+        send("\n".join(lines))
+        # 알람 발송 후 파일 초기화 (중복 방지)
+        _write_json_atomic(_DP_OVERNIGHT_STATE_FILE, {"date": "", "entries": []})
+    except Exception as e:
+        _log_error("send_dp_overnight_clearance_alert", e)
+
 def send_overnight_risk_alerts():
     """장 마감 후 추적 중 종목 오버나이트 위험도 알림"""
     try:
@@ -45618,9 +45726,21 @@ if __name__ == "__main__":
     schedule.every().day.at("15:10").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
     ))
+    # v193.4: 15:10 dp_ 보유 포지션 요약 + 오버나이트 판정 알람
+    schedule.every().day.at("15:10").do(_leader_job(
+        lambda: None if is_holiday() else send_dp_preclose_position_summary()
+    ))
     # NXT 오버나이트 위험 알림 (19:40 — NXT 마감 20분 전)
     schedule.every().day.at("19:40").do(_leader_job(
         lambda: None if is_holiday() else send_overnight_risk_alerts()
+    ))
+    # v193.4: 19:40 NXT dp_ 보유 포지션 요약 + 오버나이트 판정 알람
+    schedule.every().day.at("19:40").do(_leader_job(
+        lambda: None if is_holiday() else send_dp_preclose_position_summary()
+    ))
+    # v193.4: 익일 09:01 오버나이트 dp_ 포지션 청산 대기 알람
+    schedule.every().day.at("09:01").do(_leader_job(
+        lambda: None if is_holiday() else send_dp_overnight_clearance_alert()
     ))
     # NXT 완전 마감 후 — 결과 집계 + 재진입 초기화 + 미입력 알림
     schedule.every().day.at("20:05").do(_leader_job(
