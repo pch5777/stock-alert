@@ -3,7 +3,7 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.0
+버전: v195.1
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
@@ -39095,6 +39095,87 @@ def _handle_telegram_overnight_command():
         except Exception as e:
             send(f"❌ 오류: {e}")
     threading.Thread(target=_run_overnight, daemon=True).start()
+def _handle_dp_check_command(raw: str) -> None:
+    """v195.1 /dp_check [종목코드] — dp_ 눌림목 포착 조건 실시간 진단."""
+    parts = raw.strip().split()
+    if len(parts) < 2:
+        send("사용법: <code>/dp_check 017670</code>", parse_mode="HTML")
+        return
+    code = normalize_stock_code(parts[1].strip())
+    if not code:
+        send(f"❌ 종목코드 인식 불가: {parts[1]}")
+        return
+    name = _resolve_stock_name(code, code)
+    send(f"🔍 <b>[{name}({code})] dp_ 포착 조건 진단 중...</b>", parse_mode="HTML")
+    try:
+        # ① 거래대금 게이트
+        q = get_stock_price(code) or {}
+        price = safe_int(q.get("price", 0), 0)
+        day_chg_krx = safe_float(q.get("change_rate", 0), 0.0)
+        tv_raw = safe_float(q.get("acml_tr_pbmn", 0), 0.0)
+        tv_eok = _dp_tv_eok(tv_raw)
+        tv_ok, tv_reason = _dp_tv_pass(tv_eok, code)
+
+        # NXT 여부
+        _is_nxt = is_nxt_open() and not is_market_open()
+        day_chg_nxt = 0.0
+        if _is_nxt:
+            nq = get_nxt_stock_price(code) or {}
+            day_chg_nxt = safe_float(nq.get("change_rate", 0), 0.0)
+        day_chg_combined = day_chg_nxt if (_is_nxt and abs(day_chg_nxt) > abs(day_chg_krx)) else day_chg_krx
+
+        # ② 분봉 수신
+        mkt = "NXT" if _is_nxt else "KRX"
+        candles = _dp_minute_candles(code, 40, market=mkt)
+
+        # ③ 눌림목 판정 dry-run (상세 분기 직접 재현)
+        lookback = int(_dp_p("pullback_lookback") or 20)
+        ma20 = _dp_ma(candles, 20) if candles else 0
+        window = candles[-lookback:] if len(candles) >= lookback else candles
+        peak_idx = max(range(len(window)), key=lambda i: window[i]["high"]) if window else -1
+        peak = window[peak_idx]["high"] if peak_idx >= 0 else 0
+        after_peak = window[peak_idx + 1:] if peak_idx >= 0 else []
+        pullback_low = min(c["low"] for c in after_peak) if after_peak else 0
+        drop_pct = (peak - pullback_low) / peak * 100 if peak > 0 else 0
+        pre_peak = window[max(0, peak_idx - 5): peak_idx + 1] if peak_idx >= 0 else []
+        up_vol = sum(c["volume"] for c in pre_peak) / len(pre_peak) if pre_peak else 0
+        pb_vol = sum(c["volume"] for c in after_peak) / len(after_peak) if after_peak else 0
+        vol_ratio_pb = pb_vol / up_vol if up_vol > 0 else 99.0
+
+        def chk(ok): return "✅" if ok else "❌"
+
+        c1 = tv_ok
+        c2 = len(candles) >= max(lookback, 21)
+        c3 = day_chg_combined >= _dp_p("pullback_uptrend_min_chg")
+        c4 = ma20 <= 0 or price >= ma20
+        c5 = len(after_peak) >= 2
+        c6 = _dp_p("pullback_min_pct") <= drop_pct <= _dp_p("pullback_max_pct")
+        c7 = up_vol > 0 and vol_ratio_pb <= _dp_p("pullback_vol_dry_mult")
+
+        last = candles[-1] if candles else {}
+        rebound_pct = (last.get("close",0) - pullback_low) / pullback_low * 100 if pullback_low else 0
+        c8 = rebound_pct >= _dp_p("pullback_rebound_pct") and last.get("close",0) >= last.get("open",1)
+
+        lines = [
+            f"🩲 <b>dp_ 눌림목 진단 — {name}({code})</b>",
+            f"시장: {mkt}  |  현재가: {price:,}원  |  거래대금: {tv_eok:,.0f}억",
+            f"당일등락: KRX {day_chg_krx:+.2f}%  NXT {day_chg_nxt:+.2f}%  (사용: {day_chg_combined:+.2f}%)",
+            "━━━━━━━━━━━━━━━",
+            f"{chk(c1)} 거래대금 게이트: {tv_reason}",
+            f"{chk(c2)} 분봉 수: {len(candles)}개 (필요 {max(lookback,21)}개)",
+            f"{chk(c3)} 당일등락 ≥{_dp_p('pullback_uptrend_min_chg')}%: {day_chg_combined:+.2f}%",
+            f"{chk(c4)} MA20 위: 현재 {price:,} / MA20 {int(ma20):,}",
+            f"{chk(c5)} peak 후 눌림구간: {len(after_peak)}봉 (필요 2봉↑)",
+            f"{chk(c6)} 눌림 깊이 1~5%: {drop_pct:.2f}% (peak {peak:,}→저 {pullback_low:,})",
+            f"{chk(c7)} 거래량 마름 ≤{_dp_p('pullback_vol_dry_mult')}: {vol_ratio_pb:.2f}배",
+            f"{chk(c8)} 반등 초입 양봉: 반등 {rebound_pct:.2f}%",
+            "━━━━━━━━━━━━━━━",
+            f"{'🟢 전조건 통과 → 포착 가능' if all([c1,c2,c3,c4,c5,c6,c7,c8]) else '🔴 탈락 — ❌ 조건 확인'}",
+        ]
+        send("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        send(f"❌ 진단 오류: {e}")
+
 def _handle_telegram_test_command():
     send(
         f"🧪 <b>기능 점검</b>  {BOT_VERSION}\n"
@@ -39167,6 +39248,9 @@ def _dispatch_telegram_command(raw: str, text: str):
         return
     if text.startswith("/test"):
         _handle_telegram_test_command()
+        return
+    if text.startswith("/dp_check") or text.startswith("/포착확인"):
+        _handle_dp_check_command(raw)
         return
     handler = exact_handlers.get(text)
     if handler:
@@ -44954,8 +45038,19 @@ def _dp_minute_candles(code: str, count: int = 40, market: str = "KRX") -> list:
     반환: 시간 오름차순 [{"time","open","high","low","close","volume"}].
     v194.0: market 파라미터 + 전일 분봉 포함(연속성) — 장초반/NXT 포착 가능."""
     try:
-        # v194.0: NXT 종목은 NX 시장 분봉 조회 (KRX 동결 데이터 회피)
-        _mkt_div = "NX" if str(market or "").upper() == "NXT" else "J"
+        # v195.1: 분봉 시장 코드 선택
+        # NXT 전용 시간(KRX 마감 후) → UN(통합): KRX당일 분봉 + NXT 분봉 연속 조회 (전체 당일 흐름)
+        # KRX 장중 → J: KRX 분봉 (기존)
+        # NXT 선장(08~09) → UN: KRX전일+NXT프리 통합
+        _is_nxt_only = is_nxt_open() and not is_market_open()
+        _is_nxt_pre  = str(market or "").upper() == "NXT" and _now_kst().hour == 8
+        if _is_nxt_only or _is_nxt_pre:
+            _mkt_div = "UN"  # 통합 — KRX + NXT 전체 당일 흐름
+        else:
+            _mkt_div = "J"   # KRX 정규장
+        # v195.1: UN/NXT 분봉은 오늘 것만(N) — 전일 분봉 혼입 시 어제 peak 오감지 방지
+        # KRX 장초반(J)만 Y — 21봉 확보용
+        _pw_yn = "N" if _mkt_div == "UN" else "Y"
         data = _safe_get(
             f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
             "FHKST03010200",
@@ -44964,8 +45059,7 @@ def _dp_minute_candles(code: str, count: int = 40, market: str = "KRX") -> list:
                 "FID_COND_MRKT_DIV_CODE": _mkt_div,
                 "FID_INPUT_ISCD": code,
                 "FID_INPUT_HOUR_1": datetime.now().strftime("%H%M%S"),
-                # v194.0: Y → 전일 분봉 포함 → 장초반 09:00~09:20 21봉 확보 + 거래대금 연속성
-                "FID_PW_DATA_INCU_YN": "Y",
+                "FID_PW_DATA_INCU_YN": _pw_yn,
             },
         )
         out = []
