@@ -33082,7 +33082,7 @@ function renderRanking(){
   rh.style.display="grid";
   const sections=[
     {title:"🔥 등락률 상위",color:"#00d97e",data:[...rChg].sort((a,b)=>b.chg-a.chg)},
-    {title:"📊 거래량 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.vol_raw-a.vol_raw)},
+    {title:"📊 거래대금 상위",color:"#60a5fa",data:[...rVol].sort((a,b)=>b.amt_raw-a.amt_raw)},
     {title:"👁 조회수 상위",color:"#a78bfa",data:[...rView].sort((a,b)=>b.amt_raw-a.amt_raw)},
   ];
   // v169.27: 각 섹션 flex:1(1/3 균등) + 내부 리스트만 overflow-y:auto
@@ -47381,6 +47381,17 @@ def _dispatch_scan_alerts(alerts: list) -> None:
             _log_info_msg(f"  🛑 시장 이벤트 차단: {_mk_reason} → 모든 신규 알람 차단")
             return
         _log_info_msg(f"  → {len(alerts)}개 감지! [{regime_label()}]")
+        # v192.1: 돌팬티 포착 시 기존 모니터링 전부 삭제 — 시드 100만/단일 종목 전략
+        # 새 신호 진입 전 잔여 감시 종목 제거하여 중복 감시 방지
+        if any(s.get("signal_type", "").startswith("dp_") for s in alerts):
+            try:
+                global _entry_watch
+                if _entry_watch:
+                    _log_info_msg(f"  🗑 돌팬티 포착 — 기존 감시 {len(_entry_watch)}건 전부 삭제 후 진입")
+                    _entry_watch = {}
+                    _save_entry_watch_active()
+            except Exception as _ew_e:
+                _swallow_exception(_ew_e)
         for s in alerts:
             if is_scoring_only_instrument(s.get("code", ""), s.get("name", "")):
                 _log_info_msg(f"  ⏭ 점수전용 종목 제외: {s.get('name', s.get('code',''))}")
