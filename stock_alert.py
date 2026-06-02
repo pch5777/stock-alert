@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.1
+버전: v196.2
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.2 (2026-06-02): dp_ 재포착 쿨다운 키 불일치 수정
+  근본: _append_scan_alert 쿨다운 체크는 DP_{code}, dispatch 기록은 {code} → 키 불일치
+        → 쿨다운 영구 미작동 → 매 스캔 같은 종목 재포착 + "1차 도달" 재알람 반복
+        → 학습 데이터 단일 record 반복갱신, 신규 trade 누적 안 됨
+  수정: hist_key를 dispatch와 동일하게 (NXT_{code}/{code})
 - v196.1 (2026-06-02): dp_ 도달표시 일관성 + 강세섹터 섹터목록 반영
   [#1] captured_raw 같은종목 중복 watch 시 entry_hit watch 우선 정렬 (재포착 시 옛 record 표시 버그)
   [#2] _detect_entry_block_reason: dp_ 신호 no_ask_liquidity/fake_breakout 면제 (시장가 즉시진입)
@@ -45565,7 +45570,10 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
         try:
             r = _dp_analyze(s, active_market=active)
             if isinstance(r, dict) and r:
-                _append_scan_alert(alerts, seen, r, hist_key=f"DP_{code}", seen_code=code)
+                # v196.2: hist_key를 dispatch와 일치 (NXT_{code}/{code}) — DP_{code} 불일치로
+                # 쿨다운 영구 미작동 → 매 스캔 재포착·"도달" 재알람 반복 버그 수정
+                _hk = f"NXT_{code}" if str(r.get("market") or "").upper() == "NXT" else code
+                _append_scan_alert(alerts, seen, r, hist_key=_hk, seen_code=code)
         except Exception as e:
             _swallow_exception(e)
 
