@@ -3,10 +3,14 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.9
+버전: v197.0
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v197.0 (2026-06-02): dp_ 재포착 차단 단일 진실 소스 — 당일 알람기록 영속화
+  근본: 보유 체크가 entry_watch/signal_log 상태에 의존 → 재시작·레이스·상태변화로 누락
+  수정: _dp_alerted_today.json — 당일 알람 보낸 dp_ 코드 즉시 영속 기록
+        스캔 시 "오늘 알람 보냈으면 재포착 스킵" 단순 확인. 전일 자동 소멸(익일 재포착 허용)
 - v196.9 (2026-06-02): dp_ "바닥 형성 확인" 추가 메시지 억제
   통합 메시지(눌림목 포착+1차 도달) 후 _send_phase1_entry_alert_message가
   confirm_bottom_and_signal로 "👀 바닥 형성 확인" 별도 발송 → dp_엔 중복. dp_ early return.
@@ -45051,6 +45055,39 @@ def _run_scan_followup_hooks() -> None:
 #   ⑤ 목표: 분할익절 / 오버나이트는 모멘텀 유지 시
 # 기존 포착/점수/청산 로직 전면 대체. analyze()/calc_dynamic_stop_target() 위임.
 # ════════════════════════════════════════════════════════════
+
+# v197.0: 당일 dp_ 알람 보낸 종목 영속 기록 — 재포착·중복알람 단일 진실 소스
+# entry_watch/signal_log 상태 따질 필요 없이 "오늘 알람 보냈으면 다시 안 보냄"
+_DP_ALERTED_TODAY_FILE = _state_path("dp_alerted_today.json")
+_dp_alerted_today: dict = {}  # {code: "YYYYMMDD"}
+
+def _load_dp_alerted_today() -> None:
+    global _dp_alerted_today
+    try:
+        data = _read_json_safe(_DP_ALERTED_TODAY_FILE, {})
+        today = datetime.now().strftime("%Y%m%d")
+        # 당일 것만 유지 (전일 자동 소멸 → 익일 재포착 허용)
+        _dp_alerted_today = {k: v for k, v in (data or {}).items() if v == today}
+    except Exception:
+        _dp_alerted_today = {}
+
+def _is_dp_alerted_today(code: str) -> bool:
+    today = datetime.now().strftime("%Y%m%d")
+    return _dp_alerted_today.get(normalize_stock_code(code or "")) == today
+
+def _mark_dp_alerted_today(code: str) -> None:
+    code = normalize_stock_code(code or "")
+    if not code:
+        return
+    today = datetime.now().strftime("%Y%m%d")
+    if _dp_alerted_today.get(code) == today:
+        return
+    _dp_alerted_today[code] = today
+    try:
+        _write_json_atomic(_DP_ALERTED_TODAY_FILE, _dp_alerted_today)
+    except Exception as e:
+        _swallow_exception(e)
+
 DP_PARAMS = {
     # 후보 게이트
     "trade_value_floor_eok":   float(os.getenv("DP_TV_FLOOR_EOK", "1300")),  # 절대값 하한(억) — RVOL 미달 시 fallback
@@ -45623,51 +45660,26 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
     if not focus:
         return
     active = _dp_is_active_market(focus)
-    # v196.3: 이미 보유/감시 중인 dp_ 종목 집합 — 재포착 차단 (30분 쿨다운 후 재알람 방지)
-    # v196.8: entry_watch(휘발 가능) + 당일 dp_ signal_log(즉시 영속 저장) 양쪽 체크
-    #         → 재시작/저장레이스에도 같은 종목 재포착 방지
-    _held_codes = set()
-    try:
-        for _w in list((_entry_watch or {}).values()):
-            if isinstance(_w, dict) and str(_w.get("signal_type") or "").startswith("dp_"):
-                _hc = normalize_stock_code(_w.get("code", ""))
-                if _hc:
-                    _held_codes.add(_hc)
-    except Exception:
-        pass
-    # v196.8: 당일 dp_ signal_log 활성 추적 종목도 보유로 간주 (재시작 후에도 영속)
-    try:
-        _today_str = datetime.now().strftime("%Y%m%d")
-        _slog = _read_json_safe(SIGNAL_LOG_FILE, {})
-        for _rec in (_slog or {}).values():
-            if not isinstance(_rec, dict):
-                continue
-            if not str(_rec.get("signal_type") or "").startswith("dp_"):
-                continue
-            if str(_rec.get("status") or "") not in TRACK_ACTIVE_STATUSES:
-                continue
-            _rd = str(_rec.get("detect_date") or _rec.get("first_detect_date") or "").replace("-", "")
-            if _rd and _rd != _today_str:
-                continue  # 당일 종목만 (전일 이월은 만료 처리에 맡김)
-            _rc = normalize_stock_code(_rec.get("code", ""))
-            if _rc:
-                _held_codes.add(_rc)
-    except Exception as _hse:
-        _swallow_exception(_hse, "dp_held_signal_log")
+    # v197.0: 단일 진실 소스 — 당일 알람 보낸 dp_ 종목(_dp_alerted_today)만 확인
+    # entry_watch/signal_log 상태 따질 필요 없음. "오늘 알람 보냈으면 다시 안 보냄"
+    _load_dp_alerted_today()
     for s in focus:
         code = normalize_stock_code(s.get("code", ""))
         if not code or code in seen:
             continue
-        # v196.3: 이미 감시/보유 중이면 재포착 스킵 — 포지션 닫힐 때까지 재알람 없음
-        if code in _held_codes:
+        # v197.0: 당일 이미 알람 보낸 종목이면 재포착 스킵 (재시작·레이스 무관)
+        if _is_dp_alerted_today(code):
             continue
         try:
             r = _dp_analyze(s, active_market=active)
             if isinstance(r, dict) and r:
-                # v196.2: hist_key를 dispatch와 일치 (NXT_{code}/{code}) — DP_{code} 불일치로
-                # 쿨다운 영구 미작동 → 매 스캔 재포착·"도달" 재알람 반복 버그 수정
+                # v196.2: hist_key를 dispatch와 일치 (NXT_{code}/{code})
                 _hk = f"NXT_{code}" if str(r.get("market") or "").upper() == "NXT" else code
+                _before = len(seen)
                 _append_scan_alert(alerts, seen, r, hist_key=_hk, seen_code=code)
+                # v197.0: 실제 알람 큐에 추가됐으면(seen 증가) 당일 알람 기록 → 재포착 차단
+                if len(seen) > _before:
+                    _mark_dp_alerted_today(code)
         except Exception as e:
             _swallow_exception(e)
 
