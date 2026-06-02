@@ -3,10 +3,14 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.7
+버전: v196.8
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.8 (2026-06-02): 보유중 종목 재포착 차단 강화 — signal_log 기준 추가
+  근본: 보유 체크가 _entry_watch만 봄 → 재시작/저장레이스로 watch 휘발 시 재포착
+        (배포 8회 = 재시작 8회 → 매번 그날 주도주 재포착되어 같은 종목 반복 알람)
+  수정: 당일 dp_ signal_log(즉시 영속 저장) 활성 추적 종목도 보유로 간주 → 재시작에도 안전
 - v196.7 (2026-06-02): dp_ 포착알람+진입알람 단일 통합 (이중 메시지 폐기)
   근본: _finalize_general_alert_dispatch가 dp_에 send_alert("급등 감지")+immediate-hit("1차 도달")
         2개 메시지 발송. 비dp_는 의도된 분리지만 dp_(포착=즉시진입)엔 중복.
@@ -45614,6 +45618,8 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
         return
     active = _dp_is_active_market(focus)
     # v196.3: 이미 보유/감시 중인 dp_ 종목 집합 — 재포착 차단 (30분 쿨다운 후 재알람 방지)
+    # v196.8: entry_watch(휘발 가능) + 당일 dp_ signal_log(즉시 영속 저장) 양쪽 체크
+    #         → 재시작/저장레이스에도 같은 종목 재포착 방지
     _held_codes = set()
     try:
         for _w in list((_entry_watch or {}).values()):
@@ -45623,6 +45629,25 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
                     _held_codes.add(_hc)
     except Exception:
         pass
+    # v196.8: 당일 dp_ signal_log 활성 추적 종목도 보유로 간주 (재시작 후에도 영속)
+    try:
+        _today_str = datetime.now().strftime("%Y%m%d")
+        _slog = _read_json_safe(SIGNAL_LOG_FILE, {})
+        for _rec in (_slog or {}).values():
+            if not isinstance(_rec, dict):
+                continue
+            if not str(_rec.get("signal_type") or "").startswith("dp_"):
+                continue
+            if str(_rec.get("status") or "") not in TRACK_ACTIVE_STATUSES:
+                continue
+            _rd = str(_rec.get("detect_date") or _rec.get("first_detect_date") or "").replace("-", "")
+            if _rd and _rd != _today_str:
+                continue  # 당일 종목만 (전일 이월은 만료 처리에 맡김)
+            _rc = normalize_stock_code(_rec.get("code", ""))
+            if _rc:
+                _held_codes.add(_rc)
+    except Exception as _hse:
+        _swallow_exception(_hse, "dp_held_signal_log")
     for s in focus:
         code = normalize_stock_code(s.get("code", ""))
         if not code or code in seen:
