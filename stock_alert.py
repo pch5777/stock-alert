@@ -3,10 +3,16 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.5
+버전: v196.6
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.6 (2026-06-02): dp_ 중복 도달알람 정확 수정 (v196.5 교정)
+  근본: 두 경로(즉시-hit, 모니터)는 watch dict+notify_count 공유하나
+        _send_entry_phase_alert가 notify_count≥2 까지 허용(리마인더 2회) → dp_도 2회 발송
+  v196.5 오류: 등록 시 notify_count=2 박음 → 즉시-hit 알람까지 억제될 위험
+  v196.6 수정: notify_count 안 건드림 + _send_entry_phase_alert에서 dp_만 1회 제한(_max_notify=1)
+        → 즉시-hit 1회 발송, 모니터 재발송 차단. 비dp_는 2회 유지
 - v196.5 (2026-06-02): dp_ 중복 도달알람 차단
   근본: dp_ 즉시진입 시 포착알람("급등+1차도달") 발송 후, entry_watch 모니터가
         별도 "1차 진입가 도달" 또 발송 → 같은 종목 도달알람 2개
@@ -26631,14 +26637,11 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
     _prior_entry_hit_time = str(ctx.get("prior_entry_hit_time", "") or "")
     # v196.4: dp_ 신호 = 포착=반등초입 즉시진입 → 등록 즉시 entry_hit=True (도달 대기 없음)
     # 도달 안 한 종목이 수익률 표시되던 문제 근본 해결 (dp_엔 미도달 상태가 없음)
+    # v196.6: notify_count는 건드리지 않음 — 즉시-hit 알람이 발송되도록 (중복은 _send_entry_phase_alert에서 dp_ 1회 제한)
     _is_dp = str(s.get("signal_type", "")).startswith("dp_")
     if _is_dp and not _prior_entry_hit:
         _prior_entry_hit = True
         _prior_entry_hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        # v196.5: 포착 알람이 곧 진입 알람 → 모니터의 별도 "1차 진입가 도달" 재발송 차단
-        # notify 카운트/시각을 세팅해 _send_entry_phase_alert가 "이미 알림 완료"로 판단하게 함
-        _prior_last_notified_ts = time.time()
-        _prior_notify_count = max(2, _prior_notify_count)  # ≥2 → 모니터 알람 억제
     return {
         "code": ctx["code"],
         "name": ctx["stock_name"],
@@ -27551,7 +27554,10 @@ def _send_entry_phase_alert(watch: dict, cur: dict, price: int, entry: int, use_
     last_ts = watch.get("last_notified_ts", 0)
     notify_count = safe_int(watch.get("notify_count", 0), 0)
     cooldown_sec = ENTRY_REWATCH_MINS * 60
-    if notify_count >= 2:
+    # v196.6: dp_ = 포착=즉시진입 → 진입 알람 1회만 (즉시-hit 1회 후 모니터 재발송 차단)
+    # 기존 비dp_는 2회까지 허용(리마인더) 유지
+    _max_notify = 1 if str(watch.get("signal_type", "")).startswith("dp_") else 2
+    if notify_count >= _max_notify:
         return False
     if now_ts - last_ts < cooldown_sec:
         return False
