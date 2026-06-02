@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.0
+버전: v196.1
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.1 (2026-06-02): dp_ 도달표시 일관성 + 강세섹터 섹터목록 반영
+  [#1] captured_raw 같은종목 중복 watch 시 entry_hit watch 우선 정렬 (재포착 시 옛 record 표시 버그)
+  [#2] _detect_entry_block_reason: dp_ 신호 no_ask_liquidity/fake_breakout 면제 (시장가 즉시진입)
+  [#3] 강세섹터 breadth live 저장(_BREADTH_SECTORS_LIVE) → _build_sectors_from_theme_pool 병합
+       알람엔 뜨는데 섹터목록 누락되던 테마(제약 등) 주입
 - v196.0 (2026-06-02): 대시보드 동결 방어 + dp_ 즉시 도달 마킹
   [#2 대시보드 동결] 근본원인: _push_dashboard_json이 10:02 hang → realtime 루프 정지 → 화면 전체 동결
        - 타임스탬프 가드: 진행중 push 스킵, 30초 초과(hang)면 새 push 허용
@@ -3079,6 +3084,7 @@ _sector_volume_cache: dict = {"ts": 0, "data": []}
 #  "top_sectors": {"institution": [str,...], "foreign": [str,...], "both": [str,...]}}
 _major_inv_sector_cache: dict = {"ts": 0, "institution": {}, "foreign": {}, "individual": {}, "top_sectors": {}}
 _sector_breadth_alert_cache: dict | None = None  # v165.40 [B]: 섹터 breadth 특보 쿨다운 캐시 {섹터명: 마지막발송ts}
+_BREADTH_SECTORS_LIVE: dict = {}  # v196.1: 강세섹터 live {섹터명: {stocks, ts}} — 섹터목록 병합용
 
 def _fetch_sector_volume_rank(top_n: int = 10) -> list:
     """v161.26: 네이버 증권 업종별 시세에서 거래대금 순위 집계.
@@ -27658,6 +27664,13 @@ def _detect_entry_block_reason(cur: dict, watch: dict, price: int, entry: int) -
         # upper_price 미수신(0) — 기존 로직 유지 (보수적)
         is_upper_price_hit = (prdy_vrss_sign == "1" and change_rate >= 27.0) or change_rate >= 29.0
     upper_like = is_upper_price_hit or sig_type in ("UPPER_LIMIT", "NEAR_UPPER")
+    # v196.1: dp_ 눌림목 = 반등초입 시장가 즉시진입 → no_ask_liquidity/fake_breakout 면제
+    # (호가잔량/가짜돌파 체크는 지정가 돌파모델용 — 눌림목 매수엔 부적합)
+    # 단, 상한가 잠김(limit_up_locked)은 실제 체결 불가이므로 유지
+    if sig_type.startswith("DP_"):
+        if upper_like and ask_qty <= 0 and bid_qty > 0:
+            return "limit_up_locked"
+        return ""
     if upper_like and ask_qty <= 0 and bid_qty > 0:
         return "limit_up_locked"
     if upper_like and ask_qty <= 0:
@@ -29801,7 +29814,16 @@ def _push_dashboard_json_inner() -> None:
         try:
             seen_cap: set = set()
             # ① _entry_watch: 진입가 감시 중 + 진입 도달 후 목표가 추적 중
-            for _, watch in list((_entry_watch or {}).items()):
+            # v196.1: 같은 종목 중복 watch 시 entry_hit=True인 watch 우선 (재포착 시 도달 미표시 버그 수정)
+            _watch_items = sorted(
+                [(_k, _w) for _k, _w in list((_entry_watch or {}).items()) if isinstance(_w, dict)],
+                key=lambda kv: (
+                    1 if (kv[1].get("entry_hit") or kv[1].get("entry_hit_locked")) else 0,
+                    str(kv[1].get("entry_hit_time") or kv[1].get("detect_time") or ""),
+                ),
+                reverse=True,
+            )
+            for _, watch in _watch_items:
                 if not isinstance(watch, dict): continue
                 code = normalize_stock_code(watch.get("code",""))
                 name = watch.get("name","") or _resolve_stock_name(code,"")
@@ -41093,7 +41115,7 @@ def _detect_and_send_sector_breadth_alert() -> None:
     """
     if not is_market_open():
         return
-    global _sector_breadth_alert_cache
+    global _sector_breadth_alert_cache, _BREADTH_SECTORS_LIVE
     now = time.time()
     try:
         # 네이버 rise에서 상위 종목 수집
@@ -41127,6 +41149,19 @@ def _detect_and_send_sector_breadth_alert() -> None:
         # 조건: 3개 이상 동시 급등 섹터 감지
         BREADTH_MIN = 3
         BREADTH_MIN_RATE = 8.0
+        # v196.1: 3+ 멤버 강세섹터를 live 저장 → 섹터목록(_build_sectors_from_theme_pool)이 병합
+        # (쿨다운 무관하게 매 감지마다 갱신 — 알람과 섹터목록 불일치 해소)
+        try:
+            _live = {}
+            for _sec, _stks in sector_rising.items():
+                if len(_stks) >= BREADTH_MIN:
+                    _live[_sec] = {
+                        "stocks": sorted(_stks, key=lambda x: -x["change_rate"])[:8],
+                        "ts": now,
+                    }
+            _BREADTH_SECTORS_LIVE = _live
+        except Exception as _ble:
+            _swallow_exception(_ble, "breadth_live_store")
         for sec, stocks in sector_rising.items():
             if len(stocks) < BREADTH_MIN:
                 continue
@@ -41402,6 +41437,27 @@ def _build_sectors_from_theme_pool() -> None:
         for code, themes in code_to_themes.items():
             for theme in themes:
                 theme_to_codes.setdefault(theme, set()).add(code)
+        # v196.1: 강세섹터 breadth live 병합 — 알람엔 뜨는데 섹터목록 누락되던 테마(제약 등) 주입
+        # candidate_pool에 없는 종목도 breadth 종목으로 풀에 추가 (chg≥8% 확정 종목)
+        try:
+            for _bsec, _binfo in list((_BREADTH_SECTORS_LIVE or {}).items()):
+                if time.time() - float(_binfo.get("ts", 0)) > 600:  # 10분 이내만
+                    continue
+                if any(_p in _bsec for _p in ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열","기타","미분류")):
+                    continue
+                for _bs in _binfo.get("stocks", []):
+                    _bc = normalize_stock_code(_bs.get("code", ""))
+                    if not _bc:
+                        continue
+                    if _bc not in candidate_pool:
+                        candidate_pool[_bc] = {
+                            "code": _bc, "name": _bs.get("name", _bc),
+                            "chg": safe_float(_bs.get("change_rate", 0), 0.0),
+                            "vol": 1, "amt": 100_000_000, "sources": {"breadth"},
+                        }
+                    theme_to_codes.setdefault(_bsec, set()).add(_bc)
+        except Exception as _bme:
+            _swallow_exception(_bme, "sector_v181:breadth_merge")
 
         # ── 4. 노이즈 테마명 차단 + 후보 빌드 ──
         _THEME_BLOCK = ("ETF","ETN","선물","옵션","스팩","SPAC","수익증권","상장지수","관리종목","투자경고","투자위험","단기과열",
