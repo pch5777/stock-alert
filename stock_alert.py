@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.2
+버전: v196.3
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.3 (2026-06-02): 보유중 종목 재포착 차단 + 포착시간 표시 수정
+  [#1] _scan_dolpanty_candidates: 이미 entry_watch에 있는 dp_ 종목 재포착 스킵
+       (30분 쿨다운으론 부족 — 보유 중이면 포지션 닫힐 때까지 재알람 0)
+  [#2] dp_analyze detect_date/detect_time 명시 + detected_at을 datetime 객체로
+       (ISO 문자열이라 resolver datetime 체크 실패 → 대시보드 포착시간 누락)
 - v196.2 (2026-06-02): dp_ 재포착 쿨다운 키 불일치 수정
   근본: _append_scan_alert 쿨다운 체크는 DP_{code}, dispatch 기록은 {code} → 키 불일치
         → 쿨다운 영구 미작동 → 매 스캔 같은 종목 재포착 + "1차 도달" 재알람 반복
@@ -45532,7 +45537,9 @@ def _dp_analyze(stock: dict, active_market: bool = False) -> dict:
         "countertrend": {},
         "nxt_delta": 0.0,
         "market": stock.get("market", "KRX"),
-        "detected_at": datetime.now().isoformat(),
+        "detected_at": datetime.now(),  # v196.3: datetime 객체 (resolver의 isinstance(datetime) 통과)
+        "detect_date": datetime.now().strftime("%Y%m%d"),   # v196.3: 명시 — 대시보드 포착시간 보장
+        "detect_time": datetime.now().strftime("%H:%M:%S"),
         "dp_support": _support,
         "dp_peak": _peak,
         "dp_pullback_low": safe_int(pullback.get("pullback_low", 0), 0),
@@ -45563,9 +45570,22 @@ def _scan_dolpanty_candidates(alerts: list, seen: set) -> None:
     if not focus:
         return
     active = _dp_is_active_market(focus)
+    # v196.3: 이미 보유/감시 중인 dp_ 종목 집합 — 재포착 차단 (30분 쿨다운 후 재알람 방지)
+    _held_codes = set()
+    try:
+        for _w in list((_entry_watch or {}).values()):
+            if isinstance(_w, dict) and str(_w.get("signal_type") or "").startswith("dp_"):
+                _hc = normalize_stock_code(_w.get("code", ""))
+                if _hc:
+                    _held_codes.add(_hc)
+    except Exception:
+        pass
     for s in focus:
         code = normalize_stock_code(s.get("code", ""))
         if not code or code in seen:
+            continue
+        # v196.3: 이미 감시/보유 중이면 재포착 스킵 — 포지션 닫힐 때까지 재알람 없음
+        if code in _held_codes:
             continue
         try:
             r = _dp_analyze(s, active_market=active)
