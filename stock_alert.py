@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.4
+버전: v196.5
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.5 (2026-06-02): dp_ 중복 도달알람 차단
+  근본: dp_ 즉시진입 시 포착알람("급등+1차도달") 발송 후, entry_watch 모니터가
+        별도 "1차 진입가 도달" 또 발송 → 같은 종목 도달알람 2개
+  수정: dp_ 등록 시 notify_count≥2 + last_notified_ts 세팅 → 모니터 재발송 억제
+        (즉시-hit 알람은 notify_count 안 읽으므로 1회 정상 발송)
 - v196.4 (2026-06-02): dp_ 즉시진입 도달마킹 근본수정 + 미도달 표시
   [#1] _build_entry_watch_active_record: dp_ 신호는 등록 즉시 entry_hit=True
        (포착=반등초입 즉시진입 → dp_엔 미도달 상태 없음. 도달 파이프라인 게이트 우회)
@@ -26630,6 +26635,10 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
     if _is_dp and not _prior_entry_hit:
         _prior_entry_hit = True
         _prior_entry_hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # v196.5: 포착 알람이 곧 진입 알람 → 모니터의 별도 "1차 진입가 도달" 재발송 차단
+        # notify 카운트/시각을 세팅해 _send_entry_phase_alert가 "이미 알림 완료"로 판단하게 함
+        _prior_last_notified_ts = time.time()
+        _prior_notify_count = max(2, _prior_notify_count)  # ≥2 → 모니터 알람 억제
     return {
         "code": ctx["code"],
         "name": ctx["stock_name"],
