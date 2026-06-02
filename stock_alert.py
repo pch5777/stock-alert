@@ -3,10 +3,13 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.8
+버전: v196.9
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.9 (2026-06-02): dp_ "바닥 형성 확인" 추가 메시지 억제
+  통합 메시지(눌림목 포착+1차 도달) 후 _send_phase1_entry_alert_message가
+  confirm_bottom_and_signal로 "👀 바닥 형성 확인" 별도 발송 → dp_엔 중복. dp_ early return.
 - v196.8 (2026-06-02): 보유중 종목 재포착 차단 강화 — signal_log 기준 추가
   근본: 보유 체크가 _entry_watch만 봄 → 재시작/저장레이스로 watch 휘발 시 재포착
         (배포 8회 = 재시작 8회 → 매번 그날 주도주 재포착되어 같은 종목 반복 알람)
@@ -27426,6 +27429,9 @@ def _send_phase1_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
     watch["phase1_price"] = price
     watch["phase1_pct"] = p1_pct
     watch["signal_strength"] = strength
+    # v196.9: dp_ 는 통합 메시지 1개로 끝 — 별도 "바닥 형성 확인" 추가 발송 억제
+    if str(watch.get("signal_type") or "").startswith("dp_"):
+        return
     bottom_check = confirm_bottom_and_signal(
         watch,
         price,
