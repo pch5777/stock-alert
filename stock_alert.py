@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.6
+버전: v196.7
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.7 (2026-06-02): dp_ 포착알람+진입알람 단일 통합 (이중 메시지 폐기)
+  근본: _finalize_general_alert_dispatch가 dp_에 send_alert("급등 감지")+immediate-hit("1차 도달")
+        2개 메시지 발송. 비dp_는 의도된 분리지만 dp_(포착=즉시진입)엔 중복.
+  수정: dp_는 send_alert 스킵 + merge_capture_phase1=True 통합 메시지 1회 발송
+        (_build_integrated_pullback_phase1_message에 dp_ 추가). 병합 실패 시만 fallback.
 - v196.6 (2026-06-02): dp_ 중복 도달알람 정확 수정 (v196.5 교정)
   근본: 두 경로(즉시-hit, 모니터)는 watch dict+notify_count 공유하나
         _send_entry_phase_alert가 notify_count≥2 까지 허용(리마인더 2회) → dp_도 2회 발송
@@ -27385,7 +27390,9 @@ def _send_phase1_entry_alert_message(watch: dict, cur: dict, price: int, entry: 
     strength_emoji = {"강한": "🔥", "보통": "📊", "약한": "⚠️"}.get(strength, "📊")
     nxt_delta_block = _format_nxt_transition_delta_block(watch)
     reach_note_block = f"│ 🛠 회복모드 근접도달 허용  (+{_get_dynamic_entry_reach_slack_pct(watch)*100:.1f}%)\n" if reach_via_recovery else ""
-    if merge_capture_phase1 and str(watch.get("signal_type") or "").upper() in ("MID_PULLBACK", "ENTRY_POINT"):
+    # v196.7: dp_ 도 통합 메시지 사용 (포착=즉시진입 단일 알람)
+    if merge_capture_phase1 and (str(watch.get("signal_type") or "").upper() in ("MID_PULLBACK", "ENTRY_POINT")
+                                 or str(watch.get("signal_type") or "").startswith("dp_")):
         merged_message = _build_integrated_pullback_phase1_message(
             cur, watch, price, entry, ctx["diff_str"], strength, p1_pct, ctx["stop_pct"], ctx["tgt_pct"], ctx["entry_hit_ts"], nxt_notice=ctx["nxt_notice"]
         )
@@ -34469,7 +34476,10 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         _log_info_msg(f"  🚫 [게이트 선차단] {name} — {_gate_block} (진입감시 등록 스킵)")
         save_signal_log(s)
         return False
-    send_alert(s)
+    # v196.7: dp_ = 포착=즉시진입 → 포착알람("급등 감지")+진입알람 분리 발송 폐기, 단일 통합 알람으로
+    _is_dp_sig = str(signal_type or "").startswith("dp_")
+    if not _is_dp_sig:
+        send_alert(s)
     _alert_history[ctx["hist_key"]] = {
         "ts": time.time(),
         "score": safe_int(s.get("score", 0), 0),
@@ -34495,7 +34505,13 @@ def _finalize_general_alert_dispatch(ctx: dict) -> bool:
         watch_key = None
     else:
         watch_key = register_entry_watch(s)
-    _maybe_send_immediate_entry_hit_from_signal(s, watch_key=watch_key, merge_capture_phase1=False)
+    # v196.7: dp_는 통합 메시지(capture+entry) 1회 발송. 병합 실패 시에만 포착 알람 fallback.
+    if _is_dp_sig:
+        _merged_dp = _maybe_send_immediate_entry_hit_from_signal(s, watch_key=watch_key, merge_capture_phase1=True)
+        if not _merged_dp:
+            send_alert(s)
+    else:
+        _maybe_send_immediate_entry_hit_from_signal(s, watch_key=watch_key, merge_capture_phase1=False)
     # v165.9: "1차 진입가 도달" 헤더가 실제로 발송됐는데 entry_hit 미기록된 경우 동기화
     # 원인: _maybe_send_immediate_entry_hit_from_signal에서 no_ask_liquidity 등으로 차단되면
     #       entry_hit=True 기록 없이 return → 2시간 후 재포착 시 신규 포착으로 오인 → 동일 알람 재발송
