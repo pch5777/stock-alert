@@ -3,10 +3,15 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v196.3
+버전: v196.4
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.4 (2026-06-02): dp_ 즉시진입 도달마킹 근본수정 + 미도달 표시
+  [#1] _build_entry_watch_active_record: dp_ 신호는 등록 즉시 entry_hit=True
+       (포착=반등초입 즉시진입 → dp_엔 미도달 상태 없음. 도달 파이프라인 게이트 우회)
+       → 도달 안 한 종목이 수익률 표시되던 문제 근본 해결
+  [#2] 대시보드 미도달 종목 %(수익률처럼 보임) → "미도달" 텍스트 명시
 - v196.3 (2026-06-02): 보유중 종목 재포착 차단 + 포착시간 표시 수정
   [#1] _scan_dolpanty_candidates: 이미 entry_watch에 있는 dp_ 종목 재포착 스킵
        (30분 쿨다운으론 부족 — 보유 중이면 포지션 닫힐 때까지 재알람 0)
@@ -26619,6 +26624,12 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
     # v169.5: 대표갱신 시 entry_hit 승계 — 기존 entry_hit=True 소실 → 재알람 방지
     _prior_entry_hit = bool(ctx.get("prior_entry_hit", False))
     _prior_entry_hit_time = str(ctx.get("prior_entry_hit_time", "") or "")
+    # v196.4: dp_ 신호 = 포착=반등초입 즉시진입 → 등록 즉시 entry_hit=True (도달 대기 없음)
+    # 도달 안 한 종목이 수익률 표시되던 문제 근본 해결 (dp_엔 미도달 상태가 없음)
+    _is_dp = str(s.get("signal_type", "")).startswith("dp_")
+    if _is_dp and not _prior_entry_hit:
+        _prior_entry_hit = True
+        _prior_entry_hit_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     return {
         "code": ctx["code"],
         "name": ctx["stock_name"],
@@ -26634,6 +26645,7 @@ def _build_entry_watch_active_record(s: dict, ctx: dict) -> dict:
         "notify_count": _prior_notify_count,           # v161.31: 기존 notify 횟수 승계
         "entry_hit": _prior_entry_hit,                 # v169.5: entry_hit 승계 (True이면 재알람 방지)
         "entry_hit_time": _prior_entry_hit_time,       # v169.5
+        "entry_hit_price": int(entry or 0) if _prior_entry_hit else 0,  # v196.4: dp_ 즉시진입가
         "miss_count": ctx["previous_miss_count"] + len(ctx["old_items"]),
         "registered_ts": time.time(),
         "expire_ts": s.get("expire_ts") or (time.time() + 86400 * ctx["expire_days"]) if ctx["expire_days"] > 0 else (s.get("expire_ts") or time.time() + 3600),
@@ -30409,9 +30421,9 @@ function renderCapture(){
           pnlTxt=(diff>=0?"+":"")+diff.toFixed(1)+"%";
           pnlClr=diff>=0?"#fbbf24":"#c084fc";
         } else {
-          // 미도달 → 진입가까지 거리
-          pnlTxt=(diff>=0?"↑":"")+diff.toFixed(1)+"%";
-          pnlClr=diff>=0?"#60a5fa":"#94a3b8";  // 파랑=이미 진입가 넘음(지연), 회색=아직 못 미침
+          // v196.4: 미도달 종목은 %(수익률처럼 보임) 대신 "미도달" 명시
+          pnlTxt="미도달";
+          pnlClr="#94a3b8";
         }
       }
       const eClr=s.hit?"#00d97e":"#eef4fa";
