@@ -3,10 +3,17 @@
 r"""
 📈 KIS 주식 급등 알림 봇
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-버전: v195.6
+버전: v196.0
 날짜: 2026-06-01
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [변경 이력]
+- v196.0 (2026-06-02): 대시보드 동결 방어 + dp_ 즉시 도달 마킹
+  [#2 대시보드 동결] 근본원인: _push_dashboard_json이 10:02 hang → realtime 루프 정지 → 화면 전체 동결
+       - 타임스탬프 가드: 진행중 push 스킵, 30초 초과(hang)면 새 push 허용
+       - realtime 루프: push를 워치독 스레드로 실행 + 15초 join → hang해도 루프 계속
+  [#3 수익률 without 도달] dp_ 신호 포착=반등초입 즉시진입 → 즉시 hit 마킹
+       기존 price<=entry(하락대기 모델)는 눌림목 부적합 → 반등 후 price>entry라 hit 안 붙던 버그
+  미해결: [#4 오토튠] dp_ 파라미터 학습 미구현 + MIN_SAMPLES=10 미달 / schedule 20분 블로킹 근본추적 (별도)
 - v195.0 (2026-06-01): 돌팬티 진입철학 정정 — 돌파매수 폐기, 눌림목(숨고르기) 매수 전환 (구조변경)
   근본문제: _dp_check_inflection이 전고돌파 양봉=매수 → 남들 FOMO 살 때 사는 정반대 로직.
             LG(거래대금1위 주도주)처럼 추세진행 종목 변곡점 수렴조건 미충족으로 영구 누락.
@@ -27540,6 +27547,11 @@ def _should_immediate_first_entry_hit_from_signal(signal: dict | None = None, wa
     watch = watch if isinstance(watch, dict) else {}
     price = safe_int(signal.get("price", 0), 0)
     entry = safe_int(watch.get("entry_price", signal.get("entry_price", 0)), 0)
+    # v196.0: dp_ 신호는 포착=반등초입 즉시진입 → 도달 대기 없이 즉시 hit
+    # (기존 price<=entry는 돌파/하락대기 모델 — 눌림목엔 부적합, 반등 후 price>entry라 hit 안 붙던 버그)
+    _sig_type = str(signal.get("signal_type") or watch.get("signal_type") or "")
+    if _sig_type.startswith("dp_") and price > 0 and entry > 0:
+        return True
     return bool(price > 0 and entry > 0 and price <= entry)
 
 def _sync_watch_entry_hit_from_price(watch: dict | None, price: int) -> bool:
@@ -29161,6 +29173,10 @@ _WEB_DASHBOARD_ALERTS: list  = []
 _WEB_DASHBOARD_LOCK          = threading.Lock()
 _WEB_DASHBOARD_LAST_PUSH: float = 0.0
 _WEB_DASHBOARD_THROTTLE_SEC  = 3.0
+# v196.0: push 동시실행 방지 — 타임스탬프 가드 (좀비 hang이 영구 점유 못하게)
+_PUSH_DASHBOARD_INFLIGHT_TS: float = 0.0
+_PUSH_DASHBOARD_GUARD        = threading.Lock()
+_PUSH_DASHBOARD_STALE_SEC    = 30.0  # 30초 넘게 진행 중이면 hang으로 간주, 새 push 허용
 _WEB_DASHBOARD_PREMARKET_SECTORS: list = []  # v169.14: 장전/장마감 섹터 캐시
 # v173.0: SSE 실시간 푸시 — 연결된 브라우저 큐 목록
 _SSE_SUBSCRIBERS: list = []
@@ -29447,6 +29463,23 @@ def _get_snap(code: str) -> dict:
 
 def _push_dashboard_json() -> None:
     """웹 대시보드 JSON 원자적 갱신 — 웹소켓 스냅샷 직접 사용"""
+    global _PUSH_DASHBOARD_INFLIGHT_TS
+    # v196.0: 타임스탬프 가드 — 진행 중이면 스킵, 단 30초 초과(hang)면 새 push 허용
+    now = time.time()
+    with _PUSH_DASHBOARD_GUARD:
+        inflight = _PUSH_DASHBOARD_INFLIGHT_TS
+        if inflight > 0 and (now - inflight) < _PUSH_DASHBOARD_STALE_SEC:
+            return  # 정상 진행 중인 push 있음 → 스킵
+        _PUSH_DASHBOARD_INFLIGHT_TS = now
+    try:
+        _push_dashboard_json_inner()
+    finally:
+        with _PUSH_DASHBOARD_GUARD:
+            # 자신이 등록한 ts일 때만 해제 (stale 후 새 push가 덮어썼으면 건드리지 않음)
+            if _PUSH_DASHBOARD_INFLIGHT_TS == now:
+                _PUSH_DASHBOARD_INFLIGHT_TS = 0.0
+
+def _push_dashboard_json_inner() -> None:
     global _WEB_DASHBOARD_LAST_PUSH
     now_ts = time.time()
     if now_ts - _WEB_DASHBOARD_LAST_PUSH < _WEB_DASHBOARD_THROTTLE_SEC:
@@ -41037,9 +41070,13 @@ def _dashboard_realtime_loop() -> None:
                 except Exception as _be:
                     _swallow_exception(_be, "rt_loop:sector_build")
                     _last_sector_build = now
-            # 10초마다 대시보드 JSON 갱신 + SSE push
+            # v196.0: push를 워치독 스레드로 실행 — 단일 push가 hang해도 루프는 계속 돈다
             try:
-                _push_dashboard_json()
+                _pt = threading.Thread(target=_push_dashboard_json, daemon=True, name="rt_push")
+                _pt.start()
+                _pt.join(timeout=15.0)  # 15초 내 미완료 → 포기하고 루프 계속 (다음 주기 재시도)
+                if _pt.is_alive():
+                    _log_warn_msg("⚠️ dashboard push 15s 초과 — 루프 계속 (hang 방어)")
             except Exception as _pe:
                 _swallow_exception(_pe, "rt_loop:push")
         except Exception as e:
